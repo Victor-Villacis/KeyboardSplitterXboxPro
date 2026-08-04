@@ -30,7 +30,7 @@ ksx-capture = { path = "crates/ksx-capture" }
 ksx-output = { path = "crates/ksx-output" }
 ksx-platform = { path = "crates/ksx-platform" }
 ksx-games = { path = "crates/ksx-games" }
-vigem-client = { path = "crates/vigem-client", features = ["unstable_xtarget_notification"] }
+vigem-client = { path = "crates/vigem-client", features = ["unstable_xtarget_notification", "unstable_ds4"] }
 # shared
 bitflags = "2"
 thiserror = "2"

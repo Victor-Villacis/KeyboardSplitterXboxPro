@@ -51,18 +51,31 @@ requires a rewrite later.
   keyboard device* (VHF-based) is not needed for any current use case — synthetic
   injection covers it.
 
-## E4 — More than 4 controllers (8-player)?
+## E4 — More than 4 controllers — **MEASURED 2026-08-04: cheap after all**
 
-**Verdict: possible, with the one hard truth: XInput stops at 4.**
+**Superseded by experiment.** This section used to say the only route past four
+players was HIDMaestro or vJoy. That was wrong, and `research/m6.5-ds4-findings.md`
+has the measurement:
 
-- The 4-slot cap is Windows' `xusb22.sys`/XInput architecture, not ksx. No virtual bus
-  can create XInput slot 5.
-- Beyond 4 → **HID/DirectInput pads**: HIDMaestro non-Xbox profiles are unlimited;
-  MAME, RetroArch/SDL, and Steam Input games happily use 8+ DirectInput pads (X-Men
-  6-player cab territory). Same E1 backend unlocks it: slots 1–4 = X360/XInput,
-  slots 5+ = HID personas.
-- ksx-core already treats slot count as data, not a constant; config schema won't
-  change. **Priority: low until the cab grows past 4 players.**
+> Six ViGEm **DS4** targets plugged and enumerated while four X360 pads already
+> held every XInput slot — and the XInput count did not move. DS4 targets are
+> plain HID devices; they neither consume nor compete for XInput's four slots.
+
+So **>4 players is a ViGEmBus feature**: one driver, already installed, no second
+stack, no protocol client to write. The cabinet shape is slots **1–4 as X360**
+(genuine `xusb22.sys` XInput, maximum compatibility) and **slots 5+ as DS4**
+(HID/DirectInput — MAME, RetroArch, SDL and Steam Input all read those). An
+XInput-only game still sees four; that is Windows, not ksx.
+
+The 4-slot cap itself is unchanged and unfixable: no virtual bus can create
+XInput slot 5. What changed is that we no longer need XInput for players 5+.
+
+**Blocked on one bug**: `IOCTL_DS4_SUBMIT_REPORT` currently fails with
+`ERROR_NO_MORE_ITEMS` on every pad, so ksx can create DS4 pads but not drive
+them. The vendored client's DS4 path has never been exercised by anyone
+(upstream ships no DS4 example or test). Fix that, then the persona plumbing is
+the ~2–4 day job sketched in the plan. `MAX_SLOTS = 4` in `ksx-core/src/slot.rs`
+also has to rise, with its validation sites.
 
 ## E5 — AI-drivable CLI (accepted into CURRENT scope, not deferred)
 
