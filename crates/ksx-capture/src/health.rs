@@ -49,19 +49,28 @@ impl HealthHandle {
         }
     }
 
-    pub(crate) fn set_reboot_required(&self) {
+    // The setters are public because a `CaptureBackend` may live in another
+    // crate (the M6 WinUSB backend) or in a test harness, and a backend that
+    // cannot publish its own health is a backend whose stalls are invisible.
+    // Nothing outside a backend should ever call them.
+
+    /// Backend-facing: slot exhaustion detected (reboot required).
+    pub fn set_reboot_required(&self) {
         self.0.reboot_required.store(true, Ordering::Relaxed);
     }
 
-    pub(crate) fn set_watchdog_tripped(&self) {
+    /// Backend-facing: the stall watchdog fired and passthrough was forced.
+    pub fn set_watchdog_tripped(&self) {
         self.0.watchdog_tripped.store(true, Ordering::Relaxed);
     }
 
-    pub(crate) fn add_dropped(&self, n: u64) {
+    /// Backend-facing: `n` events were dropped by a full event channel.
+    pub fn add_dropped(&self, n: u64) {
         self.0.dropped_events.fetch_add(n, Ordering::Relaxed);
     }
 
-    pub(crate) fn set_panicked(&self) {
+    /// Backend-facing: the capture loop panicked (filters already reset).
+    pub fn set_panicked(&self) {
         self.0.panicked.store(true, Ordering::Relaxed);
     }
 }

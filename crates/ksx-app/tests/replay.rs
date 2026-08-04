@@ -90,6 +90,49 @@ fn cabinet_slots() -> Vec<ResolvedSlot> {
         .collect()
 }
 
+/// FNV-1a over the exact XInput wire fields of the whole transition sequence.
+///
+/// Hand-rolled on purpose: `DefaultHasher` is explicitly not stable across Rust
+/// releases, so it cannot back a golden value that has to survive toolchain
+/// upgrades.
+fn digest(transitions: &[(u8, PadState)]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |byte: u8| {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for (slot, s) in transitions {
+        eat(*slot);
+        s.buttons
+            .bits()
+            .to_le_bytes()
+            .iter()
+            .copied()
+            .for_each(&mut eat);
+        eat(s.lt);
+        eat(s.rt);
+        for axis in [s.lx, s.ly, s.rx, s.ry] {
+            axis.to_le_bytes().iter().copied().for_each(&mut eat);
+        }
+    }
+    h
+}
+
+/// The golden: what the cabinet actually felt during the recorded session.
+///
+/// This is the "byte-identical pad-state sequences forever after" half of the
+/// oracle promised in `docs/PLAYBOOK.md`. The structural assertions below
+/// (fan-out, diffing, balanced end) all survive a change that swaps two button
+/// bits or retargets a key — verified by mutation: swapping `XButton::A` and
+/// `XButton::B` in `XButton::flag()` left the entire workspace test suite green.
+/// This constant is what actually notices.
+///
+/// It pins *current* behaviour, so it is a drift detector, not a proof of
+/// correctness-vs-legacy. If a deliberate mapping change lands, re-derive it and
+/// say why in the commit message — never "just update the number".
+const SESSION_DIGEST: u64 = 16_837_667_763_229_975_859;
+const SESSION_TRANSITIONS: usize = 311;
+
 #[test]
 fn recorded_cabinet_session_replays_deterministically() {
     let events = load_corpus();
@@ -99,6 +142,7 @@ fn recorded_cabinet_session_replays_deterministically() {
     let mut transitions = 0usize;
     let mut per_slot = [0usize; 5];
     let mut last = BTreeMap::<u8, PadState>::new();
+    let mut sequence: Vec<(u8, PadState)> = Vec::new();
 
     for (i, e) in events.iter().enumerate() {
         for delta in engine.handle(&KeyEvent {
@@ -107,6 +151,7 @@ fn recorded_cabinet_session_replays_deterministically() {
             down: e.down,
             t: i as u64,
         }) {
+            sequence.push((delta.slot, delta.state));
             // Diffing contract: the engine never emits an unchanged state.
             assert_ne!(
                 last.get(&delta.slot),
@@ -131,6 +176,17 @@ fn recorded_cabinet_session_replays_deterministically() {
     assert!(
         transitions > 100,
         "expected a busy session, got {transitions}"
+    );
+
+    // The oracle proper: the exact wire-level sequence the cabinet produced.
+    assert_eq!(
+        (transitions, digest(&sequence)),
+        (SESSION_TRANSITIONS, SESSION_DIGEST),
+        "the recorded session no longer replays to the same pad states. Something \
+         changed what the cabinet would feel: a key mapping, a button bit, the \
+         all-keys-up release rule, the opposite-axis snap, or the importer. If the \
+         change was deliberate, re-derive the constants and justify it in the commit \
+         message."
     );
 
     // The session ended with every key released, so every pad must be neutral.

@@ -26,8 +26,11 @@
 //!
 //! `run` owns the only thread that ever touches the context after start. The
 //! hot loop does exactly: wait (with timeout so ctl is honored), receive,
-//! decide from an `arc-swap` snapshot, re-send non-captured strokes verbatim,
-//! `try_send` the event (never block). No locks, no allocation after startup
+//! evaluate emergency escapes (`crate::escape` — before any pass/suppress
+//! decision, so `LeftCtrl ×5` frees the keyboards from *this* thread with no
+//! channel in the way), decide from an `arc-swap` snapshot, re-send
+//! non-captured strokes verbatim, `try_send` the event (never block). No locks,
+//! no allocation after startup
 //! except (a) the one-time `SlotEntry` build when a *new* device appears
 //! (hotplug — rare by definition) and (b) the `DeviceId` clone each reported
 //! `KeyEvent` requires by ksx-core contract (small, amortized; noted in the M3
@@ -54,14 +57,23 @@ use ksx_core::{DeviceId, KeyEvent};
 use crate::backend::{
     CaptureBackend, CaptureCtl, CaptureError, DeviceInfo, DeviceKind, ExitReason,
 };
-use crate::decision::process_keyboard_stroke;
+use crate::decision::{key_event, should_resend};
+use crate::escape::{EscapeHandle, EscapeWatch};
 use crate::exhaustion::{Exhaustion, ExhaustionDetector};
 use crate::friendly;
 use crate::health::HealthHandle;
+use crate::presence::PresenceHandle;
 use crate::watchdog::Watchdog;
 
 /// Wait timeout: bounds both ctl-message latency and shutdown latency.
 const WAIT_TIMEOUT_MS: u32 = 50;
+/// How often the slot table is re-read for hotplug (arrivals *and* removals).
+///
+/// Runs only on the idle path — after `interception_wait_with_timeout` reports
+/// the driver has nothing pending — so it can never sit between a keystroke and
+/// its re-send. Arrivals are also caught instantly by the unknown-slot path
+/// below; this exists for removals, which produce no stroke to react to.
+const PRESENCE_RESCAN_MS: u64 = 2_000;
 /// Strokes drained per receive call (driver queues at most a handful).
 const RECEIVE_BATCH: usize = 32;
 /// Legacy `Interception.HardwareIdSize` (chars).
@@ -173,6 +185,8 @@ impl SlotDecision {
 pub struct InterceptionBackend {
     ctx: Ctx,
     health: HealthHandle,
+    presence: PresenceHandle,
+    escapes: EscapeHandle,
 }
 
 impl InterceptionBackend {
@@ -199,6 +213,8 @@ impl InterceptionBackend {
         Ok(Self {
             ctx: Ctx(ctx),
             health: HealthHandle::new(),
+            presence: PresenceHandle::new(),
+            escapes: EscapeHandle::new(),
         })
     }
 }
@@ -237,12 +253,25 @@ impl CaptureBackend for InterceptionBackend {
         self.health.clone()
     }
 
+    fn escapes(&self) -> EscapeHandle {
+        self.escapes.clone()
+    }
+
+    fn presence(&self) -> PresenceHandle {
+        self.presence.clone()
+    }
+
     fn run(
         self: Box<Self>,
         tx: Sender<KeyEvent>,
         ctl: Receiver<CaptureCtl>,
     ) -> std::io::Result<std::thread::JoinHandle<ExitReason>> {
-        let InterceptionBackend { ctx, health } = *self;
+        let InterceptionBackend {
+            ctx,
+            health,
+            presence,
+            escapes,
+        } = *self;
         std::thread::Builder::new()
             .name("ksx-capture-interception".into())
             .spawn(move || {
@@ -252,15 +281,15 @@ impl CaptureBackend for InterceptionBackend {
                 // catch_unwind below only exists to flag health and convert
                 // the panic into a clean ExitReason.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    capture_loop(&ctx, &health, &tx, &ctl)
+                    capture_loop(&ctx, &health, &presence, &escapes, &tx, &ctl)
                 }));
                 match result {
                     Ok(reason) => reason,
                     Err(_) => {
+                        // Flag, don't log: `ctx` has not dropped yet, so the
+                        // filter is still armed. A blocking console write here
+                        // would delay the reset that frees the keyboards.
                         health.set_panicked();
-                        tracing::error!(
-                            "capture loop panicked — drop guard resets the filter; keyboards keep working"
-                        );
                         ExitReason::Panicked
                     }
                 }
@@ -272,6 +301,8 @@ impl CaptureBackend for InterceptionBackend {
 fn capture_loop(
     ctx: &Ctx,
     health: &HealthHandle,
+    presence: &PresenceHandle,
+    escape_handle: &EscapeHandle,
     tx: &Sender<KeyEvent>,
     ctl: &Receiver<CaptureCtl>,
 ) -> ExitReason {
@@ -282,9 +313,23 @@ fn capture_loop(
     let mut captured_ids: Vec<DeviceId> = Vec::new();
     let decision: ArcSwap<SlotDecision> = ArcSwap::from_pointee(SlotDecision::passthrough_all());
     let unknown_device = DeviceId::from("<unknown-interception-device>");
+    let mut last_rescan_ms: u64 = 0;
+    let mut escapes = EscapeWatch::new(escape_handle.clone());
+    // The three independent sources of passthrough, kept apart so none of them
+    // can silently clear another: what the supervisor asked for, what the stall
+    // watchdog forced, and what an emergency escape latched.
+    let mut ctl_passthrough = true;
+    let mut watchdog_passthrough = false;
 
     // Seed slot identities + the exhaustion baseline BEFORE opening the tap.
-    rescan(ctx, &mut slots, &mut exhaustion, health);
+    rescan(
+        ctx,
+        &mut slots,
+        &mut exhaustion,
+        health,
+        presence,
+        &mut escapes,
+    );
 
     // Open the keyboard tap. The mouse filter is NEVER set in M3 — we must not
     // touch mouse.sys behavior at all.
@@ -303,6 +348,8 @@ fn capture_loop(
             match ctl.try_recv() {
                 Ok(CaptureCtl::SetCaptured(ids)) => {
                     captured_ids = ids;
+                    ctl_passthrough = false;
+                    watchdog_passthrough = false;
                     // Re-arm a tripped watchdog: the supervisor re-enabling
                     // capture is a recovery decision, but if the consumer is
                     // still stalled the protection must be able to fire again
@@ -311,9 +358,14 @@ fn capture_loop(
                     if wd.tripped() {
                         wd = Watchdog::default();
                     }
-                    publish(&decision, &slots, &captured_ids, false);
+                    // NOTE: an escape latch is deliberately NOT cleared here. A
+                    // supervisor mirroring its own stale state must never be
+                    // able to re-capture keyboards a `LeftCtrl ×5` just freed;
+                    // only a second gesture does that.
+                    publish(&decision, &slots, &captured_ids, escapes.passthrough());
                 }
                 Ok(CaptureCtl::SetPassthrough) => {
+                    ctl_passthrough = true;
                     publish(&decision, &slots, &captured_ids, true);
                 }
                 Ok(CaptureCtl::Shutdown) => return ExitReason::Shutdown,
@@ -326,8 +378,28 @@ fn capture_loop(
 
         // SAFETY: valid context; returns 0 on timeout.
         let dev = unsafe { raw::interception_wait_with_timeout(ctx.0, WAIT_TIMEOUT_MS) };
+        if dev == 0 {
+            // Driver idle: the one moment where a full slot re-read costs
+            // nothing. Removals produce no stroke, so this is how the
+            // supervisor ever learns a bound board was unplugged.
+            let now_ms = start.elapsed().as_millis() as u64;
+            if now_ms.saturating_sub(last_rescan_ms) >= PRESENCE_RESCAN_MS {
+                last_rescan_ms = now_ms;
+                rescan(
+                    ctx,
+                    &mut slots,
+                    &mut exhaustion,
+                    health,
+                    presence,
+                    &mut escapes,
+                );
+                let passthrough = ctl_passthrough || watchdog_passthrough || escapes.passthrough();
+                publish(&decision, &slots, &captured_ids, passthrough);
+            }
+            continue;
+        }
         // SAFETY: predicate accepts any value.
-        if dev == 0 || unsafe { raw::interception_is_invalid(dev) } != 0 {
+        if unsafe { raw::interception_is_invalid(dev) } != 0 {
             continue;
         }
 
@@ -368,11 +440,14 @@ fn capture_loop(
             // Cold path: a device appeared on a slot we hadn't seen (hotplug,
             // or an id climbing after replug — the exhaustion signal).
             if let Some(hwid) = hardware_id(ctx, dev) {
-                note_exhaustion(exhaustion.observe_keyboard(dev, &hwid), health);
+                // A single device arriving outside a rescan: never compared
+                // against its own siblings, so two identical boards can no
+                // longer read as one board climbing (see `exhaustion`).
+                note_exhaustion(exhaustion.observe_hotplug(dev, &hwid), health);
                 slots[slot] = Some(SlotEntry {
                     id: DeviceId::from(hwid),
                 });
-                let passthrough = decision.load().passthrough;
+                let passthrough = ctl_passthrough || watchdog_passthrough || escapes.passthrough();
                 publish(&decision, &slots, &captured_ids, passthrough);
             }
         }
@@ -386,16 +461,32 @@ fn capture_loop(
                 None => (&unknown_device, false),
             };
 
-            let out = process_keyboard_stroke(
-                snap.passthrough,
-                is_captured,
-                device,
-                stroke.code,
-                stroke.state,
-                qpc_now(),
-            );
+            let event = key_event(device, stroke.code, stroke.state, qpc_now());
 
-            if out.resend {
+            // Emergency escapes are evaluated HERE: before the pass/suppress
+            // decision, on this thread, with no channel between the gesture and
+            // the release. Nothing downstream — a wedged engine, a wedged ViGEm
+            // IOCTL, a full event channel — can starve it (risk review §3 item 2,
+            // legacy `InputManager.CheckForEmergencyHit`).
+            let action = escapes.observe(&event);
+            if action.changed_passthrough() {
+                // No logging on this thread, by rule: a console write can block
+                // indefinitely (QuickEdit selection, a pipe whose reader died),
+                // and stalling here means the filter stays armed with nothing
+                // pumping it — every keyboard dead. The supervisor polls
+                // `EscapeHandle` and does the announcing.
+                publish(
+                    &decision,
+                    &slots,
+                    &captured_ids,
+                    ctl_passthrough || watchdog_passthrough || escapes.passthrough(),
+                );
+                // The rest of this batch — and this very stroke — obey the new
+                // state immediately.
+                snap = decision.load();
+            }
+
+            if should_resend(snap.passthrough, is_captured) {
                 // Re-send FIRST (latency to the OS), byte-for-byte: `stroke`
                 // is untouched since receive — code, state and information all
                 // preserved. A corrupted re-send breaks every keyboard.
@@ -410,17 +501,17 @@ fn capture_loop(
                 }
             }
 
-            match tx.try_send(out.event) {
+            match tx.try_send(event) {
                 Ok(()) => wd.on_send_ok(),
                 Err(TrySendError::Full(_)) => {
                     health.add_dropped(1);
                     let now_ms = start.elapsed().as_millis() as u64;
                     if wd.on_send_failed(now_ms) {
-                        tracing::error!(
-                            threshold_ms = Watchdog::DEFAULT_THRESHOLD_MS,
-                            "event consumer stalled — forcing passthrough so keystrokes reach the OS"
-                        );
+                        // Flag only — see the escape branch above for why this
+                        // thread never writes to a console. `ksx run` surfaces
+                        // `watchdog_tripped` from health.
                         health.set_watchdog_tripped();
+                        watchdog_passthrough = true;
                         publish(&decision, &slots, &captured_ids, true);
                         snap = decision.load(); // rest of the batch passes through
                     }
@@ -450,40 +541,67 @@ fn publish(
     }));
 }
 
-/// Populate the slot table and the exhaustion baseline (cold path, pre-filter).
+/// Re-read the whole slot table and republish presence (cold path).
+///
+/// Runs once before the filter opens (seeding identities + the exhaustion
+/// baseline) and thereafter only on the idle path. Slots whose device is gone
+/// are **cleared**, which is what makes removal observable: the published id
+/// list is the supervisor's hotplug signal.
+///
+/// Clearing fails safe. A transient `hardware_id` failure drops the slot's
+/// identity, so its next stroke is attributed to `<unknown-interception-device>`
+/// and therefore *passes through* to the OS (never suppressed) — and the hot
+/// loop's unknown-slot path immediately re-learns the id. The error direction is
+/// "a keystroke reaches Windows", never "a keystroke disappears".
 fn rescan(
     ctx: &Ctx,
     slots: &mut Slots,
     exhaustion: &mut ExhaustionDetector,
     health: &HealthHandle,
+    presence: &PresenceHandle,
+    escapes: &mut EscapeWatch,
 ) {
+    let before: Vec<DeviceId> = slots.iter().flatten().map(|e| e.id.clone()).collect();
+    let mut ids = Vec::with_capacity(MAX_DEVICE);
+    // One pass: an id seen twice in THIS walk is two identical boards, not a
+    // climb. Only the comparison against the previous pass can report one.
+    exhaustion.begin_pass();
     for slot in 1..=MAX_DEVICE as i32 {
         // SAFETY: predicates accept any device number.
-        if unsafe { raw::interception_is_invalid(slot) } != 0 {
-            continue;
-        }
-        if let Some(hwid) = hardware_id(ctx, slot) {
-            // SAFETY: as above.
-            if unsafe { raw::interception_is_keyboard(slot) } != 0 {
-                note_exhaustion(exhaustion.observe_keyboard(slot, &hwid), health);
+        let gone = unsafe { raw::interception_is_invalid(slot) } != 0;
+        let hwid = if gone { None } else { hardware_id(ctx, slot) };
+        match hwid {
+            Some(hwid) => {
+                // SAFETY: as above.
+                if unsafe { raw::interception_is_keyboard(slot) } != 0 {
+                    note_exhaustion(exhaustion.observe_keyboard(slot, &hwid), health);
+                }
+                let id = DeviceId::from(hwid);
+                ids.push(id.clone());
+                slots[slot as usize] = Some(SlotEntry { id });
             }
-            slots[slot as usize] = Some(SlotEntry {
-                id: DeviceId::from(hwid),
-            });
+            None => slots[slot as usize] = None,
         }
     }
+    note_exhaustion(exhaustion.end_pass(), health);
+    ids.sort_unstable();
+    ids.dedup();
+    // A device that left must not keep a Ctrl+Alt+Del combo half-armed.
+    for old in before {
+        if !ids.contains(&old) {
+            escapes.forget_device(&old);
+        }
+    }
+    presence.publish(ids);
 }
 
+/// Loud by design (risk review R2 mitigation 4) — but the shouting happens in
+/// the supervisor, not here: this runs on the capture thread, where a blocking
+/// console write would stop the pump with the filter armed. `ksx run` and
+/// `ksx devices` both render `reboot_required` from health.
 fn note_exhaustion(event: Option<Exhaustion>, health: &HealthHandle) {
-    if let Some(event) = event {
+    if event.is_some() {
         health.set_reboot_required();
-        // Loud by design: the legacy app's silent version of this failure was
-        // one of its worst traits (risk review R2 mitigation 4).
-        tracing::error!(
-            ?event,
-            "Interception keyboard slot exhaustion — REBOOT REQUIRED; \
-             affected keyboards are invisible to the driver until then"
-        );
     }
 }
 

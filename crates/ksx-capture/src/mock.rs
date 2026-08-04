@@ -13,8 +13,10 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use ksx_core::{DeviceId, KeyEvent};
 
 use crate::backend::{CaptureBackend, CaptureCtl, DeviceInfo, ExitReason};
-use crate::decision::{process_keyboard_stroke, CaptureSet};
+use crate::decision::{key_event, should_resend, CaptureSet};
+use crate::escape::{EscapeHandle, EscapeWatch};
 use crate::health::HealthHandle;
+use crate::presence::PresenceHandle;
 use crate::watchdog::Watchdog;
 
 /// One scripted keyboard stroke: raw (code, state) exactly as the driver would
@@ -37,13 +39,21 @@ pub struct ResentStroke {
     pub state: u16,
 }
 
+/// Observer invoked when the mock *applies* a control message — the hook the
+/// supervisor's teardown-ordering test needs to interleave "keyboards were
+/// released" with the pad log in one timeline.
+pub type CtlObserver = Box<dyn Fn(&CaptureCtl) + Send>;
+
 /// Scripted [`CaptureBackend`].
 pub struct MockCaptureBackend {
     devices: Vec<DeviceInfo>,
     script: Vec<MockStroke>,
     pace: Option<Duration>,
     health: HealthHandle,
+    presence: PresenceHandle,
+    escapes: EscapeHandle,
     resent: Arc<Mutex<Vec<ResentStroke>>>,
+    ctl_observer: Option<CtlObserver>,
 }
 
 impl MockCaptureBackend {
@@ -58,12 +68,17 @@ impl MockCaptureBackend {
                 devices.len()
             );
         }
+        let presence = PresenceHandle::new();
+        presence.publish(devices.iter().map(|d| d.id.clone()).collect());
         Self {
             devices,
             script,
             pace: None,
             health: HealthHandle::new(),
+            presence,
+            escapes: EscapeHandle::new(),
             resent: Arc::new(Mutex::new(Vec::new())),
+            ctl_observer: None,
         }
     }
 
@@ -71,6 +86,12 @@ impl MockCaptureBackend {
     /// messages deterministically enough).
     pub fn with_pace(mut self, pace: Duration) -> Self {
         self.pace = Some(pace);
+        self
+    }
+
+    /// Call `observer` whenever the capture thread applies a [`CaptureCtl`].
+    pub fn with_ctl_observer(mut self, observer: CtlObserver) -> Self {
+        self.ctl_observer = Some(observer);
         self
     }
 
@@ -89,6 +110,16 @@ impl CaptureBackend for MockCaptureBackend {
         self.health.clone()
     }
 
+    fn escapes(&self) -> EscapeHandle {
+        self.escapes.clone()
+    }
+
+    /// Seeded with the configured device list; tests script hotplug by
+    /// `publish`ing a different list on a clone of this handle.
+    fn presence(&self) -> PresenceHandle {
+        self.presence.clone()
+    }
+
     fn run(
         self: Box<Self>,
         tx: Sender<KeyEvent>,
@@ -99,7 +130,10 @@ impl CaptureBackend for MockCaptureBackend {
             script,
             pace,
             health,
+            presence: _,
+            escapes,
             resent,
+            ctl_observer,
         } = *self;
 
         std::thread::Builder::new()
@@ -108,6 +142,13 @@ impl CaptureBackend for MockCaptureBackend {
                 let start = std::time::Instant::now();
                 let mut set = CaptureSet::passthrough();
                 let mut wd = Watchdog::default();
+                let mut watchdog_passthrough = false;
+                let mut escapes = EscapeWatch::new(escapes);
+                let observe_ctl = |message: &CaptureCtl| {
+                    if let Some(observer) = &ctl_observer {
+                        observer(message);
+                    }
+                };
 
                 for (t, stroke) in script.iter().enumerate() {
                     if let Some(p) = pace {
@@ -117,10 +158,12 @@ impl CaptureBackend for MockCaptureBackend {
                     // Apply pending control right before each stroke (after the
                     // pacing sleep, so a paced test can interleave ctl messages
                     // deterministically).
-                    loop {
-                        match ctl.try_recv() {
-                            Ok(CaptureCtl::SetCaptured(ids)) => {
+                    while let Ok(message) = ctl.try_recv() {
+                        observe_ctl(&message);
+                        match message {
+                            CaptureCtl::SetCaptured(ids) => {
                                 set = CaptureSet::capturing(ids);
+                                watchdog_passthrough = false;
                                 // Mirror the real backend: re-enabling capture
                                 // re-arms a tripped watchdog so the stall
                                 // protection can fire again (health flag stays
@@ -129,23 +172,23 @@ impl CaptureBackend for MockCaptureBackend {
                                     wd = Watchdog::default();
                                 }
                             }
-                            Ok(CaptureCtl::SetPassthrough) => set.passthrough = true,
-                            Ok(CaptureCtl::Shutdown) => return ExitReason::Shutdown,
-                            Err(_) => break,
+                            CaptureCtl::SetPassthrough => set.passthrough = true,
+                            CaptureCtl::Shutdown => return ExitReason::Shutdown,
                         }
                     }
 
                     let device = &devices[stroke.device].id;
-                    let out = process_keyboard_stroke(
-                        set.passthrough,
-                        set.is_captured(device),
-                        device,
-                        stroke.code,
-                        stroke.state,
-                        t as u64,
-                    );
+                    let event = key_event(device, stroke.code, stroke.state, t as u64);
 
-                    if out.resend {
+                    // Escapes FIRST, exactly like the real backend: the gesture
+                    // is evaluated before the pass/suppress decision and acts on
+                    // this thread's own latch — no channel is involved, so a
+                    // stalled consumer cannot starve it.
+                    escapes.observe(&event);
+
+                    let passthrough =
+                        set.passthrough || watchdog_passthrough || escapes.passthrough();
+                    if should_resend(passthrough, set.contains(device)) {
                         resent
                             .lock()
                             .expect("resent log poisoned")
@@ -156,7 +199,7 @@ impl CaptureBackend for MockCaptureBackend {
                             });
                     }
 
-                    match tx.try_send(out.event) {
+                    match tx.try_send(event) {
                         Ok(()) => wd.on_send_ok(),
                         Err(TrySendError::Full(_)) => {
                             health.add_dropped(1);
@@ -166,7 +209,7 @@ impl CaptureBackend for MockCaptureBackend {
                                     "mock capture: consumer stalled — forcing passthrough"
                                 );
                                 health.set_watchdog_tripped();
-                                set.passthrough = true;
+                                watchdog_passthrough = true;
                             }
                         }
                         Err(TrySendError::Disconnected(_)) => return ExitReason::ChannelClosed,
@@ -177,8 +220,12 @@ impl CaptureBackend for MockCaptureBackend {
                 // real backend that idles when no keys are pressed).
                 loop {
                     match ctl.recv() {
-                        Ok(CaptureCtl::Shutdown) => return ExitReason::Shutdown,
-                        Ok(_) => {}
+                        Ok(message) => {
+                            observe_ctl(&message);
+                            if matches!(message, CaptureCtl::Shutdown) {
+                                return ExitReason::Shutdown;
+                            }
+                        }
                         Err(_) => return ExitReason::ScriptExhausted,
                     }
                 }
@@ -364,6 +411,214 @@ mod tests {
         assert!(snap.dropped_events > 0, "drops must be counted");
         assert!(snap.watchdog_tripped, "stalled consumer must trip watchdog");
         drop(rx);
+    }
+
+    /// Five LeftCtrl press+release cycles on `device`.
+    fn left_ctrl_x5(device: usize) -> Vec<MockStroke> {
+        (0..5)
+            .flat_map(|_| {
+                [
+                    MockStroke {
+                        device,
+                        code: 29,
+                        state: KEY_DOWN,
+                    },
+                    MockStroke {
+                        device,
+                        code: 29,
+                        state: KEY_UP,
+                    },
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn escape_fires_while_the_device_is_being_suppressed() {
+        // The gesture's own strokes never reach Windows — that is the point of
+        // the escape hatch — and it still frees the keyboard.
+        let backend = MockCaptureBackend::new(two_keyboards(), left_ctrl_x5(0));
+        let escapes = backend.escapes();
+        let resent = backend.resent_log();
+        let (tx, rx) = crossbeam_channel::bounded(64);
+        let (ctl_tx, ctl_rx) = crossbeam_channel::unbounded();
+        ctl_tx
+            .send(CaptureCtl::SetCaptured(vec![DeviceId::from(IPAC)]))
+            .unwrap();
+
+        let handle = Box::new(backend).run(tx, ctl_rx).unwrap();
+        let _events: Vec<KeyEvent> = rx.iter().take(10).collect();
+        ctl_tx.send(CaptureCtl::Shutdown).unwrap();
+        assert_eq!(handle.join().unwrap(), ExitReason::Shutdown);
+
+        let snap = escapes.snapshot();
+        assert_eq!(snap.toggles, 1, "LeftCtrl x5 must fire while suppressed");
+        assert!(
+            snap.passthrough,
+            "the capture thread must free itself immediately, without the supervisor"
+        );
+        // Nine of the ten strokes were swallowed; the tenth is the one that
+        // completed the gesture, and escapes are evaluated BEFORE the
+        // pass/suppress decision, so it flows to Windows like everything after.
+        let log = resent.lock().unwrap();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].state, KEY_UP);
+    }
+
+    /// The regression test for the whole M4 escape finding: with the event
+    /// channel FULL and nobody draining it, every downstream consumer is
+    /// effectively wedged. Escape detection lives on this thread, upstream of
+    /// the channel, so the gesture still works.
+    #[test]
+    fn escape_fires_when_the_event_channel_is_full() {
+        let backend = MockCaptureBackend::new(two_keyboards(), left_ctrl_x5(0));
+        let escapes = backend.escapes();
+        let health = backend.health();
+        let resent = backend.resent_log();
+        // Capacity 1, never drained: the first stroke fits, every later
+        // try_send fails.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = crossbeam_channel::unbounded();
+        ctl_tx
+            .send(CaptureCtl::SetCaptured(vec![DeviceId::from(IPAC)]))
+            .unwrap();
+
+        let handle = Box::new(backend).run(tx, ctl_rx).unwrap();
+        // Nothing drains `rx`, so the only observable progress is the escape
+        // handle itself — which is exactly the claim under test.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while escapes.snapshot().toggles == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ctl_tx.send(CaptureCtl::Shutdown).unwrap();
+        assert_eq!(handle.join().unwrap(), ExitReason::Shutdown);
+
+        assert!(
+            health.snapshot().dropped_events > 0,
+            "the stall must be real: events were dropped"
+        );
+        let snap = escapes.snapshot();
+        assert_eq!(
+            snap.toggles, 1,
+            "a full event channel must not be able to starve the escape hatch"
+        );
+        assert!(snap.passthrough, "keyboards must be free again");
+        assert_eq!(
+            resent.lock().unwrap().len(),
+            1,
+            "the gesture-completing stroke passes through once the latch flips"
+        );
+        drop(rx);
+    }
+
+    /// The whole lockout scenario in one test, and the only question a person
+    /// standing at a wedged cabinet actually asks: *does my keyboard work
+    /// again?*
+    ///
+    /// The device is captured, the event channel is full and nobody is draining
+    /// it (every downstream consumer — engine, output thread, a ViGEm call —
+    /// is effectively dead), and **no `CaptureCtl` is ever sent**: the
+    /// supervisor might as well not exist. The user mashes LeftCtrl ×5, and
+    /// from then on ordinary typing from that same still-bound device must
+    /// reach Windows. `escape_fires_when_the_event_channel_is_full` proves the
+    /// gesture is *registered*; this proves it is *effective*.
+    #[test]
+    fn typing_reaches_windows_again_after_an_escape_with_everything_wedged() {
+        const AFTER: usize = 6; // press+release pairs typed after the gesture
+        let mut script = left_ctrl_x5(0);
+        script.extend((0..AFTER).flat_map(|_| {
+            [
+                MockStroke {
+                    device: 0,
+                    code: 30,
+                    state: KEY_DOWN,
+                },
+                MockStroke {
+                    device: 0,
+                    code: 30,
+                    state: KEY_UP,
+                },
+            ]
+        }));
+        let expected = AFTER * 2 + 1; // + the gesture-completing stroke
+
+        let backend = MockCaptureBackend::new(two_keyboards(), script);
+        let escapes = backend.escapes();
+        let health = backend.health();
+        let resent = backend.resent_log();
+        // Capacity 1, never drained: the pipeline is wedged for good.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = crossbeam_channel::unbounded();
+        ctl_tx
+            .send(CaptureCtl::SetCaptured(vec![DeviceId::from(IPAC)]))
+            .unwrap();
+
+        let handle = Box::new(backend).run(tx, ctl_rx).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while resent.lock().expect("resent log").len() < expected
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Only now — after the keyboard had to be working again on its own.
+        ctl_tx.send(CaptureCtl::Shutdown).unwrap();
+        assert_eq!(handle.join().unwrap(), ExitReason::Shutdown);
+
+        assert!(
+            health.snapshot().dropped_events > 0,
+            "the wedge must be real: events were dropped"
+        );
+        assert_eq!(escapes.snapshot().toggles, 1);
+        let log = resent.lock().expect("resent log");
+        assert_eq!(
+            log.len(),
+            expected,
+            "everything typed after the escape must reach Windows, with no \
+             SetPassthrough from anyone: {log:?}"
+        );
+        assert!(
+            log[1..].iter().all(|r| r.code == 30),
+            "the post-escape strokes are the typing, not the gesture: {log:?}"
+        );
+        drop(rx);
+    }
+
+    #[test]
+    fn ctrl_alt_del_forces_passthrough_and_reports_a_stop() {
+        let script = vec![
+            MockStroke {
+                device: 0,
+                code: 29, // LeftControl
+                state: KEY_DOWN,
+            },
+            MockStroke {
+                device: 0,
+                code: 56, // LeftAlt
+                state: KEY_DOWN,
+            },
+            MockStroke {
+                device: 0,
+                code: 83, // E0 Delete
+                state: KEY_E0 | KEY_DOWN,
+            },
+        ];
+        let backend = MockCaptureBackend::new(two_keyboards(), script);
+        let escapes = backend.escapes();
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let (ctl_tx, ctl_rx) = crossbeam_channel::unbounded();
+        ctl_tx
+            .send(CaptureCtl::SetCaptured(vec![DeviceId::from(IPAC)]))
+            .unwrap();
+
+        let handle = Box::new(backend).run(tx, ctl_rx).unwrap();
+        let events: Vec<KeyEvent> = rx.iter().take(3).collect();
+        ctl_tx.send(CaptureCtl::Shutdown).unwrap();
+        assert_eq!(handle.join().unwrap(), ExitReason::Shutdown);
+
+        assert_eq!(events[2].key, Key::Delete);
+        let snap = escapes.snapshot();
+        assert_eq!(snap.stops, 1);
+        assert!(snap.passthrough, "the emergency stop frees keyboards first");
     }
 
     #[test]

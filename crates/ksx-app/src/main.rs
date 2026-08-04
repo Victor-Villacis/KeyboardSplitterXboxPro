@@ -6,6 +6,7 @@ mod devices;
 mod doctor;
 mod monitor;
 mod pads;
+mod run;
 
 use clap::{Parser, Subcommand};
 
@@ -18,11 +19,43 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start emulation (foreground; later also tray-daemon mode)
+    /// Start emulation: plug the pads, capture the assigned keyboards, translate
+    ///
+    /// Resolves `[[slot]]` entries (or a `--game` profile) into virtual Xbox 360
+    /// pads, then blocks input ONLY for the keyboards those slots are bound to —
+    /// every other keyboard keeps typing. Emergency escapes are printed as a
+    /// banner before any blocking starts and are evaluated inside the capture
+    /// thread, so they work even if the rest of ksx wedges: LeftCtrl x5 toggles
+    /// keyboard capture, RightCtrl x5 is reserved for mice (logged only),
+    /// Ctrl+Alt+Del stops emulation.
+    ///
+    /// Getting out: with every keyboard captured, use LeftCtrl x5 or
+    /// Ctrl+Alt+Del. Ctrl+C canNOT work from a captured keyboard — Interception
+    /// suppresses the keystrokes below win32k, so Windows never raises a console
+    /// break event; it works only from an uncaptured keyboard or before blocking
+    /// is enabled. `taskkill /f /im ksx.exe` works too, but needs a keyboard or
+    /// mouse you can still act from (M4 never captures the mouse). A thread
+    /// panic or process death also returns every keyboard — blocking needs no
+    /// cleanup to be undone.
+    ///
+    /// Exit codes: 0 = clean stop (Ctrl+Alt+Del, Ctrl+C where it can be
+    /// delivered, --dry-run), 1 = error, 2 = refused to start (invalid config,
+    /// unknown --game, missing driver, two keyboards sharing one hardware id;
+    /// nothing was plugged and no filter was set), 3 = started then torn down by
+    /// a runtime failure (keyboards were released first).
     Run {
-        /// Launch a configured game/profile and stop emulation when it exits
-        #[arg(long)]
+        /// Take the slot layout and block flags from this games.toml profile
+        #[arg(long, value_name = "TITLE")]
         game: Option<String>,
+        /// Resolve and print the plan, then exit without touching any driver
+        #[arg(long)]
+        dry_run: bool,
+        /// Print a rolling capture-to-submit latency summary every 5 s
+        #[arg(long)]
+        latency: bool,
+        /// JSON on stdout: the plan with --dry-run, otherwise the final summary
+        #[arg(long)]
+        json: bool,
     },
     /// List keyboards as the Interception driver sees them
     ///
@@ -42,8 +75,8 @@ enum Command {
     ///
     /// Streams one `<alias> <Key> down|up` line per keystroke on every
     /// keyboard. Every stroke is re-sent to the OS: this command has no way
-    /// to suppress input (blocking lands in M4 via `ksx run`). Runs until
-    /// Ctrl+C unless --for-secs is given.
+    /// to suppress input (blocking lives in `ksx run`). Runs until Ctrl+C
+    /// unless --for-secs is given.
     ///
     /// Exit codes: 0 = clean stop, 1 = error, 2 = Interception driver
     /// unavailable (run `ksx doctor`).
@@ -101,7 +134,7 @@ enum Command {
     /// Exit codes: 0 = healthy or warnings only, 1 = error, 2 = at least one
     /// critical problem (something will not work).
     Doctor {
-        /// Capture-to-submit latency histogram (lands in M4)
+        /// Explain the capture-to-submit latency histogram (measured by `ksx run`)
         #[arg(long)]
         latency: bool,
         /// One JSON object {report, advice} on stdout
@@ -117,10 +150,58 @@ enum Command {
     },
 }
 
+/// Default log level when `RUST_LOG` says nothing.
+const DEFAULT_LOG: &str = "info";
+
+/// Build the log filter: `RUST_LOG` if it parses, `info` otherwise.
+///
+/// Pure so the policy is testable without touching the process environment or
+/// the global subscriber.
+fn tracing_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    match rust_log {
+        Some(spec) if !spec.trim().is_empty() => {
+            EnvFilter::try_new(spec).unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG))
+        }
+        _ => EnvFilter::new(DEFAULT_LOG),
+    }
+}
+
+/// Install the process-wide tracing subscriber.
+///
+/// Without one, every `tracing::warn!`/`error!` in the workspace is a silent
+/// no-op — including "REBOOT REQUIRED" (Interception slot exhaustion), "event
+/// consumer stalled — forcing passthrough" (the watchdog), and the Interception
+/// end-of-life / CI-policy warning. Those are the three messages a user most
+/// needs to see, so this is not optional plumbing.
+///
+/// Output goes to **stderr, always**: `--json` promises exactly one object on
+/// stdout, and a log line landing there would corrupt it for every automated
+/// caller.
+///
+/// TODO(M5): add a rotating file sink alongside stderr (tracing-appender), per
+/// `docs/research/design-architecture.md` §4.1 — a cabinet running headless at
+/// boot has no console to read. Deliberately out of scope for this pass.
+fn init_tracing() {
+    use tracing_subscriber::fmt;
+    // `try_init` (not `init`): a second call — e.g. from a test binary that
+    // already installed one — must not abort the program.
+    let _ = fmt()
+        .with_env_filter(tracing_filter(std::env::var("RUST_LOG").ok().as_deref()))
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 fn main() -> anyhow::Result<()> {
+    init_tracing();
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { .. } => not_yet("run", "M4"),
+        Command::Run {
+            game,
+            dry_run,
+            latency,
+            json,
+        } => run::run(game, dry_run, latency, json),
         Command::Devices { json } => devices::run(json),
         Command::Monitor {
             for_secs,
@@ -139,7 +220,7 @@ fn main() -> anyhow::Result<()> {
         } => import_legacy(from, dry_run, json),
         Command::Doctor { latency, json } => {
             if latency {
-                not_yet("doctor --latency", "M4")
+                doctor::run_latency(json)
             } else {
                 doctor::run(json)
             }
@@ -386,6 +467,152 @@ mod tests {
         assert!(help.contains("passthrough-only"), "{help}");
         assert!(help.contains("re-sent to the OS"), "{help}");
         assert!(help.contains("2 = Interception driver"), "{help}");
+    }
+
+    #[test]
+    fn run_defaults_to_the_config_layout_and_no_flags() {
+        let cli = Cli::try_parse_from(["ksx", "run"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                game: None,
+                dry_run: false,
+                latency: false,
+                json: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn run_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "ksx",
+            "run",
+            "--game",
+            "Street Fighter",
+            "--dry-run",
+            "--latency",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Run {
+                game,
+                dry_run,
+                latency,
+                json,
+            } => {
+                assert_eq!(game.as_deref(), Some("Street Fighter"));
+                assert!(dry_run);
+                assert!(latency);
+                assert!(json);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+    }
+
+    /// The escape hotkeys and the exit-code contract are documented where a
+    /// user (or an agent) will actually look: `ksx run --help`.
+    #[test]
+    fn run_help_documents_escapes_and_exit_codes() {
+        let mut cmd = Cli::command();
+        let run = cmd.find_subcommand_mut("run").unwrap();
+        let help = run.render_long_help().to_string();
+        for needle in [
+            "LeftCtrl x5",
+            "RightCtrl x5",
+            "Ctrl+Alt+Del",
+            "taskkill",
+            "0 = clean stop",
+            "2 = refused to start",
+            "3 = started then torn down",
+        ] {
+            assert!(help.contains(needle), "missing '{needle}' in:\n{help}");
+        }
+    }
+
+    /// `--help` must not promise an escape hatch that cannot exist: with every
+    /// keyboard captured, Interception suppresses the keystrokes below win32k,
+    /// so no CTRL_C_EVENT is ever generated and the console handler never runs.
+    #[test]
+    fn run_help_is_honest_about_ctrl_c() {
+        let mut cmd = Cli::command();
+        let run = cmd.find_subcommand_mut("run").unwrap();
+        let help = run.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("Ctrl+C canNOT work from a captured keyboard"),
+            "the Ctrl+C limitation must be stated plainly:\n{help}"
+        );
+        assert!(
+            flat.contains("uncaptured keyboard or before blocking is enabled"),
+            "the help must say when Ctrl+C DOES work:\n{help}"
+        );
+        assert!(
+            flat.contains("needs a keyboard or mouse you can still act from"),
+            "taskkill needs an input device you can still use:\n{help}"
+        );
+        assert!(
+            !flat.contains("Ctrl+C, a thread panic, or `taskkill /f` all return every keyboard"),
+            "the old claim that Ctrl+C always works must be gone:\n{help}"
+        );
+    }
+
+    /// A subscriber must actually be installed: without one every
+    /// `tracing::warn!`/`error!` in the workspace is a no-op, including
+    /// "REBOOT REQUIRED" and the consumer-stall watchdog.
+    #[test]
+    fn tracing_subscriber_is_installed_at_info() {
+        use tracing::level_filters::LevelFilter;
+        // Read the ambient RUST_LOG *before* installing: a developer or CI job
+        // running the gate with `RUST_LOG=warn` set legitimately gets a lower
+        // level, and that must not read as "no subscriber".
+        let configured = std::env::var("RUST_LOG").ok();
+        init_tracing();
+        assert_ne!(
+            LevelFilter::current(),
+            LevelFilter::OFF,
+            "no tracing subscriber is active, so every warn!/error! is silently dropped"
+        );
+        if configured.is_none() {
+            assert!(
+                LevelFilter::current() >= LevelFilter::INFO,
+                "with no RUST_LOG the default must be info, got {}",
+                LevelFilter::current()
+            );
+        }
+    }
+
+    #[test]
+    fn tracing_filter_defaults_to_info_and_honors_rust_log() {
+        assert_eq!(tracing_filter(None).to_string(), "info");
+        assert_eq!(tracing_filter(Some("")).to_string(), "info");
+        assert_eq!(tracing_filter(Some("  ")).to_string(), "info");
+        assert_eq!(
+            tracing_filter(Some("ksx_capture=trace")).to_string(),
+            "ksx_capture=trace"
+        );
+        // A malformed RUST_LOG must not silence the app.
+        assert_eq!(tracing_filter(Some("=========")).to_string(), "info");
+    }
+
+    #[test]
+    fn doctor_latency_is_no_longer_a_stub() {
+        let cli = Cli::try_parse_from(["ksx", "doctor", "--latency"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Doctor {
+                latency: true,
+                json: false,
+            }
+        ));
+        let text = doctor::render_latency();
+        assert!(text.contains("ksx run --latency"), "{text}");
+        assert!(text.contains("p99"), "{text}");
+        assert!(
+            !text.contains("M4"),
+            "the not-yet stub must be gone: {text}"
+        );
     }
 
     /// M1 regression: the exact invocation the milestone gate smoke-runs.

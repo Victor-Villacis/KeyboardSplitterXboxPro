@@ -37,7 +37,15 @@ impl CaptureSet {
 
     /// Is this device's input suppressed from the OS right now?
     pub fn is_captured(&self, id: &DeviceId) -> bool {
-        !self.passthrough && self.captured.iter().any(|c| c == id)
+        !self.passthrough && self.contains(id)
+    }
+
+    /// Set membership only — "is this device bound to a slot", regardless of
+    /// whether passthrough is currently overriding suppression. Backends keep
+    /// membership and passthrough separate because passthrough has three
+    /// independent sources (ctl, the stall watchdog, and an emergency escape).
+    pub fn contains(&self, id: &DeviceId) -> bool {
+        self.captured.iter().any(|c| c == id)
     }
 }
 
@@ -51,6 +59,28 @@ pub struct StrokeOutcome {
     /// the engine sees *all* devices (emergency escapes fire on any keyboard,
     /// risk review §3 item 2; `ksx monitor` wants unassigned traffic too).
     pub event: KeyEvent,
+}
+
+/// Translate one raw stroke into the [`KeyEvent`] the rest of ksx speaks.
+///
+/// Split out from [`process_keyboard_stroke`] because escapes are evaluated
+/// **before** the pass/suppress decision (`crate::escape`): a backend builds the
+/// event, feeds it to its [`crate::EscapeWatch`], and only then asks
+/// [`should_resend`] — so the very stroke that completes `LeftCtrl ×5` is
+/// already flowing to Windows again.
+pub fn key_event(device: &DeviceId, code: u16, state: u16, t: u64) -> KeyEvent {
+    KeyEvent {
+        device: device.clone(),
+        key: corrected_key(code, state),
+        down: is_down(state),
+        t,
+    }
+}
+
+/// The pass/suppress rule, in one place: suppress only a captured device, and
+/// only while nothing has forced passthrough (ctl, watchdog, or escape).
+pub const fn should_resend(passthrough: bool, is_captured: bool) -> bool {
+    passthrough || !is_captured
 }
 
 /// Decide one keyboard stroke. Pure: no clock, no OS, no channel.
@@ -67,13 +97,8 @@ pub fn process_keyboard_stroke(
     t: u64,
 ) -> StrokeOutcome {
     StrokeOutcome {
-        resend: passthrough || !is_captured,
-        event: KeyEvent {
-            device: device.clone(),
-            key: corrected_key(code, state),
-            down: is_down(state),
-            t,
-        },
+        resend: should_resend(passthrough, is_captured),
+        event: key_event(device, code, state, t),
     }
 }
 
@@ -148,5 +173,21 @@ mod tests {
         let set = CaptureSet::capturing(vec![a.clone()]);
         assert!(set.is_captured(&a));
         assert!(!set.is_captured(&b));
+    }
+
+    #[test]
+    fn contains_survives_passthrough_but_is_captured_does_not() {
+        // Membership and suppression are different questions: an escape flips
+        // passthrough on without forgetting which devices are bound, so a later
+        // re-arm captures exactly the same set.
+        let a = dev("A");
+        let mut set = CaptureSet::capturing(vec![a.clone()]);
+        set.passthrough = true;
+        assert!(set.contains(&a));
+        assert!(!set.is_captured(&a));
+        assert!(should_resend(true, set.contains(&a)));
+        set.passthrough = false;
+        assert!(set.is_captured(&a));
+        assert!(!should_resend(false, set.contains(&a)));
     }
 }

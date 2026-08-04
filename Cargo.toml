@@ -59,7 +59,8 @@ windows-sys = "0.60"
 proptest = "1"
 insta = "1"
 rusty-xinput = "1"
-hdrhistogram = "7"
+# No serialization/sync features: ksx only needs the in-process recorder.
+hdrhistogram = { version = "7", default-features = false }
 
 [profile.release]
 lto = "thin"

@@ -5,6 +5,7 @@ expression: "serde_json::to_string_pretty(&devices_json(&report)).unwrap()"
 {
   "backend": "interception",
   "health": {
+    "duplicate_hardware_ids": [],
     "highest_keyboard_slot": 2,
     "keyboard_slots_used": 2,
     "reboot_required": false,

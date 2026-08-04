@@ -10,11 +10,18 @@
 //! - `rawinput` (M3): identify-only device picker; NEVER a blocking backend
 //!   (the RawInput+LLHOOK correlation hack is rejected by design).
 //!
-//! Hot-path rule: the capture thread only receives, decides pass/suppress from
-//! an arc-swap snapshot, re-sends what must pass (byte-for-byte), and pushes
-//! into a bounded channel with `try_send` (drops counted, never blocks). Zero
-//! locks; zero allocation after startup except the per-event `DeviceId` clone
-//! the ksx-core `KeyEvent` contract requires and cold-path hotplug bookkeeping.
+//! Hot-path rule: the capture thread only receives, evaluates emergency escapes
+//! ([`escape`]), decides pass/suppress from an arc-swap snapshot, re-sends what
+//! must pass (byte-for-byte), and pushes into a bounded channel with `try_send`
+//! (drops counted, never blocks). Zero locks; zero allocation after startup
+//! except the per-event `DeviceId` clone the ksx-core `KeyEvent` contract
+//! requires and cold-path hotplug bookkeeping.
+//!
+//! Escapes are evaluated **here**, before the pass/suppress decision, and act on
+//! this thread's own passthrough latch — never through a channel. That is the
+//! one property that makes them unstarvable: a wedged consumer downstream
+//! (engine, output, driver IOCTL) cannot stop `LeftCtrl ×5` from freeing the
+//! keyboards.
 //!
 //! Safety posture (this machine's keyboards are production hardware):
 //! - Backends start in **passthrough** (observe-only); nothing is suppressed
@@ -28,11 +35,13 @@
 
 pub mod backend;
 pub mod decision;
+pub mod escape;
 pub mod exhaustion;
 pub mod guard;
 pub mod health;
 pub mod keymap;
 pub mod mock;
+pub mod presence;
 pub mod watchdog;
 
 #[cfg(windows)]
@@ -43,10 +52,12 @@ pub mod interception;
 pub mod rawinput;
 
 pub use backend::{CaptureBackend, CaptureCtl, CaptureError, DeviceInfo, DeviceKind, ExitReason};
-pub use decision::{process_keyboard_stroke, CaptureSet, StrokeOutcome};
+pub use decision::{key_event, process_keyboard_stroke, should_resend, CaptureSet, StrokeOutcome};
+pub use escape::{EscapeAction, EscapeHandle, EscapeStatus, EscapeWatch};
 pub use exhaustion::{Exhaustion, ExhaustionDetector, MAX_KEYBOARD_SLOT};
 pub use health::{CaptureHealth, HealthHandle};
 pub use mock::{MockCaptureBackend, MockStroke, ResentStroke};
+pub use presence::PresenceHandle;
 pub use watchdog::Watchdog;
 
 #[cfg(windows)]

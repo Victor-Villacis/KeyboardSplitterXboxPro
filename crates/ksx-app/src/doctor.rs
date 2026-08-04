@@ -59,6 +59,57 @@ pub fn run(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `ksx doctor --latency`.
+///
+/// Latency is a property of a *running* pipeline, so there is nothing for a
+/// one-shot diagnostic to sample: this explains where the number actually comes
+/// from instead of pretending to measure it. Always exit 0 — it is help text,
+/// not a verdict.
+pub fn run_latency(json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&latency_json())?);
+    } else {
+        print!("{}", render_latency());
+    }
+    Ok(())
+}
+
+/// The single `--latency --json` object.
+pub fn latency_json() -> serde_json::Value {
+    serde_json::json!({
+        "latency": {
+            "measured_by": "ksx run",
+            "live_flag": "ksx run --latency",
+            "window": "capture QueryPerformanceCounter stamp -> ViGEm submit",
+            "instrument": "hdrhistogram, 3 significant figures",
+            "budget_p99_us": crate::run::latency::BUDGET_P99_US,
+            "reported": ["p50_us", "p99_us", "max_us", "updates"],
+        }
+    })
+}
+
+/// Pure: same text on any platform.
+pub fn render_latency() -> String {
+    let mut doc = Doc(String::new());
+    doc.line("ksx doctor — capture-to-submit latency");
+    doc.blank();
+    doc.line("  Latency is measured live, not by this command. Every `ksx run` session");
+    doc.line("  times each keystroke from the capture thread's QueryPerformanceCounter");
+    doc.line("  stamp to the ViGEm submit on the output thread, into an HDR histogram:");
+    doc.blank();
+    doc.line("    ksx run             prints p50 / p99 / max once, at shutdown");
+    doc.line("    ksx run --latency   also prints a rolling summary every 5 s");
+    doc.line("    ksx run --json      puts the same numbers in the final summary object");
+    doc.blank();
+    doc.line(format!(
+        "  Budget: p99 < {} us (docs/ARCHITECTURE.md rule 5). Over budget means the",
+        crate::run::latency::BUDGET_P99_US
+    ));
+    doc.line("  engine or output thread is being starved — check the dropped-event count");
+    doc.line("  in the same summary, and `ksx doctor` for driver problems.");
+    doc.0
+}
+
 /// Line-oriented string builder so the render code reads as the output does.
 struct Doc(String);
 

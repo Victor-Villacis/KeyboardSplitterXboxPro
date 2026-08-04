@@ -20,6 +20,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use ksx_capture::{DeviceInfo, DeviceKind, MAX_KEYBOARD_SLOT};
+use ksx_core::DeviceId;
 
 /// Exit code when the Interception driver is unavailable (documented in
 /// `--help`). Same value as `ksx pads`' missing-ViGEmBus code: 2 always means
@@ -34,6 +35,30 @@ const IPAC_VID_TAG: &str = "VID_D209";
 /// program exists for?
 pub fn is_ipac(hwid: &str) -> bool {
     hwid.to_ascii_uppercase().contains(IPAC_VID_TAG)
+}
+
+/// Hardware ids reported by more than one connected **keyboard**, sorted and
+/// deduplicated.
+///
+/// Two boards of the same model share one Interception hardware id (risk review
+/// R2): the driver offers nothing else to tell them apart. Anything that binds
+/// such an id to a slot is ambiguous by construction — "capture this device"
+/// captures both boards, and either one drives every slot bound to the id — so
+/// `ksx run` refuses to start and `ksx devices` calls it out.
+pub fn duplicate_hardware_ids(devices: &[DeviceInfo]) -> Vec<DeviceId> {
+    let mut ids: Vec<&DeviceId> = devices
+        .iter()
+        .filter(|d| d.kind == DeviceKind::Keyboard)
+        .map(|d| &d.id)
+        .collect();
+    ids.sort_unstable();
+    let mut out: Vec<DeviceId> = Vec::new();
+    for pair in ids.windows(2) {
+        if pair[0] == pair[1] && out.last() != Some(pair[0]) {
+            out.push(pair[0].clone());
+        }
+    }
+    out
 }
 
 /// Pure, fixture-testable view over one enumeration pass.
@@ -70,6 +95,17 @@ impl DevicesReport {
             .max()
     }
 
+    /// Hardware ids shared by two or more connected keyboards. Binding one of
+    /// these to a slot makes `ksx run` refuse to start.
+    pub fn duplicates(&self) -> Vec<DeviceId> {
+        duplicate_hardware_ids(&self.keyboards)
+    }
+
+    /// How many keyboards report `id`.
+    pub fn count_of(&self, id: &DeviceId) -> usize {
+        self.keyboards.iter().filter(|d| &d.id == id).count()
+    }
+
     /// A keyboard outside the 1..=10 budget means the driver's slot table is
     /// exhausted/corrupt for that device — reboot required (risk review R2).
     pub fn reboot_required(&self) -> bool {
@@ -95,6 +131,16 @@ pub fn devices_json(report: &DevicesReport) -> serde_json::Value {
             })
         })
         .collect();
+    let duplicates: Vec<serde_json::Value> = report
+        .duplicates()
+        .iter()
+        .map(|id| {
+            serde_json::json!({
+                "id": id.as_str(),
+                "count": report.count_of(id),
+            })
+        })
+        .collect();
     serde_json::json!({
         "backend": "interception",
         "keyboards": keyboards,
@@ -104,6 +150,9 @@ pub fn devices_json(report: &DevicesReport) -> serde_json::Value {
             "highest_keyboard_slot": report.highest_slot(),
             "slot_budget": MAX_KEYBOARD_SLOT,
             "reboot_required": report.reboot_required(),
+            // Ids shared by several boards: unusable as a slot binding, because
+            // Interception cannot tell those boards apart.
+            "duplicate_hardware_ids": duplicates,
         },
     })
 }
@@ -139,6 +188,15 @@ pub fn render_human(report: &DevicesReport) -> String {
             out,
             "mice: {} visible (unused — ksx never sets the mouse filter in M3)",
             report.mice_visible
+        );
+    }
+    for id in report.duplicates() {
+        let _ = writeln!(
+            out,
+            "[WARN] {} keyboards report the hardware id {id} — the Interception driver cannot \
+             tell them apart. `ksx run` refuses to start while a slot is bound to it; use \
+             different models/ports (or the WinUSB backend in M6).",
+            report.count_of(&id)
         );
     }
     if report.reboot_required() {
@@ -264,6 +322,58 @@ mod tests {
         assert_eq!(
             v.pointer("/health/reboot_required"),
             Some(&serde_json::json!(true))
+        );
+    }
+
+    /// Two identical I-PACs: same hardware id, different slots. The driver
+    /// cannot distinguish them, so this has to be visible before someone binds
+    /// that id to a slot and gets both boards captured (risk review R2 / §3.3).
+    #[test]
+    fn two_identical_boards_are_reported_as_a_duplicate_id() {
+        let report = DevicesReport::new(vec![
+            keyboard(IPAC, 1, Some("I-PAC Arcade Control Interface")),
+            keyboard(IPAC, 2, Some("I-PAC Arcade Control Interface")),
+            keyboard(LOGI, 3, None),
+        ]);
+        assert_eq!(report.duplicates(), vec![DeviceId::from(IPAC)]);
+        assert_eq!(report.count_of(&DeviceId::from(IPAC)), 2);
+        assert_eq!(report.count_of(&DeviceId::from(LOGI)), 1);
+
+        let text = render_human(&report);
+        assert!(
+            text.contains("2 keyboards report the hardware id") && text.contains(IPAC),
+            "{text}"
+        );
+        let v = devices_json(&report);
+        assert_eq!(
+            v.pointer("/health/duplicate_hardware_ids/0/id"),
+            Some(&serde_json::json!(IPAC))
+        );
+        assert_eq!(
+            v.pointer("/health/duplicate_hardware_ids/0/count"),
+            Some(&serde_json::json!(2))
+        );
+    }
+
+    #[test]
+    fn distinct_boards_and_mice_are_never_duplicates() {
+        // A mouse sharing an id with a keyboard is not an ambiguity for us: M4
+        // never captures mice, so only keyboards are compared.
+        let report = DevicesReport::new(vec![
+            keyboard(IPAC, 1, None),
+            keyboard(LOGI, 2, None),
+            DeviceInfo {
+                id: DeviceId::from(IPAC),
+                interception_slot: Some(11),
+                friendly: None,
+                kind: DeviceKind::Mouse,
+            },
+        ]);
+        assert!(report.duplicates().is_empty());
+        assert!(!render_human(&report).contains("cannot tell them apart"));
+        assert_eq!(
+            devices_json(&report).pointer("/health/duplicate_hardware_ids"),
+            Some(&serde_json::json!([]))
         );
     }
 

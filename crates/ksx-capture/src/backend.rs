@@ -9,7 +9,9 @@
 use crossbeam_channel::{Receiver, Sender};
 use ksx_core::{DeviceId, KeyEvent};
 
+use crate::escape::EscapeHandle;
 use crate::health::HealthHandle;
+use crate::presence::PresenceHandle;
 
 /// What class of input device a capture slot holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -87,6 +89,27 @@ pub trait CaptureBackend: Send {
     /// watchdog trips, drop counters). Grab it before `run` — it stays valid
     /// and live afterwards.
     fn health(&self) -> HealthHandle;
+
+    /// Cloneable handle to the emergency escapes this backend detects. Grab it
+    /// before `run`, like [`Self::health`].
+    ///
+    /// Deliberately **not** defaulted: escape detection is the lockout escape
+    /// hatch, so a new backend has to state what it does about it rather than
+    /// silently inheriting "never fires". A backend that genuinely cannot see
+    /// strokes may return a fresh [`EscapeHandle`] — but it must not set any
+    /// class filter either.
+    fn escapes(&self) -> EscapeHandle;
+
+    /// Cloneable handle to the devices this backend can currently see, kept
+    /// live by the running capture thread (cold path — republished only while
+    /// the driver is idle). Grab it before `run`, like [`Self::health`].
+    ///
+    /// The default is [`PresenceHandle::unsupported`]: a backend with no
+    /// hotplug visibility reports `None` forever and supervisors degrade to
+    /// never invalidating a slot, which is strictly safer than guessing.
+    fn presence(&self) -> PresenceHandle {
+        PresenceHandle::unsupported()
+    }
 
     /// Consume the backend and start its capture thread. Events flow out `tx`
     /// (bounded; the thread never blocks on it — overflow is counted, never
