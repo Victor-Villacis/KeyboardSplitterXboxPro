@@ -1,0 +1,15 @@
+---
+source: crates/ksx-legacy-import/tests/golden.rs
+expression: "toml::to_string(preset).unwrap()"
+---
+name = "v1 preset"
+
+[bindings]
+A = ["S", "Enter"]
+"dpad.down" = "K"
+"dpad.up" = "I"
+lb = "Z"
+lt = "Q"
+"lx.min" = "Left"
+rt = "E"
+"ry.max" = "Numpad8"

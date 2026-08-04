@@ -1,0 +1,11 @@
+---
+source: crates/ksx-legacy-import/tests/golden.rs
+expression: "warned.join(\"\\n\")"
+---
+bad.xml: preset 'mixed': button id="99" -> 'Q': unknown button id 99 -- entry skipped
+bad.xml: preset 'mixed': button id="8192" -> 'NoSuchKey': unknown key name 'NoSuchKey' (exact legacy spelling required) -- entry skipped
+bad.xml: preset 'mixed': trigger id="3" -> 'H': unknown trigger id 3 -- entry skipped
+bad.xml: preset 'mixed': axis id="1" value="notanumber" -> 'M': axis value 'notanumber' is not a valid number -- entry skipped
+bad.xml: preset 'mixed': dpad direction="0" -> 'K': unknown dpad direction 0 (0/Off is not bindable) -- entry skipped
+bad.xml: preset 'mixed': custom function="524288" -> 'L': unknown custom function id 0x80000 -- entry skipped
+bad.xml: preset 'mixed': telemetry: unknown element -- skipped

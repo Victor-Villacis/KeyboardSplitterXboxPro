@@ -1,0 +1,11 @@
+---
+source: crates/ksx-config/tests/emission.rs
+expression: "toml::to_string(&ConfigFile::default()).unwrap()"
+---
+schema_version = 1
+
+[settings]
+block_keyboards = true
+block_mice = false
+mouse_move_deadzone = 5
+starting_user_index = 1

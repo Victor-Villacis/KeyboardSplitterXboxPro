@@ -1,0 +1,16 @@
+---
+source: crates/ksx-config/tests/emission.rs
+expression: "toml::to_string(&games).unwrap()"
+---
+[[game]]
+title = "Steam"
+notes = "Steam"
+path = 'C:\Program Files (x86)\Steam\steam.exe'
+block_keyboards = true
+block_mice = false
+
+[[game.slot]]
+number = 1
+user_index = 1
+keyboard = 'HID\VID_D209&PID_0430&REV_0056&MI_00'
+preset = "IPAC P1"

@@ -1,0 +1,93 @@
+---
+source: crates/ksx-legacy-import/tests/golden.rs
+expression: out
+---
+═══ Phase Shift (Guitar) ═══
+name = "Phase Shift (Guitar)"
+
+[bindings]
+A = "LeftShift"
+B = "Z"
+X = "C"
+Y = "X"
+back = "Space"
+"dpad.down" = "Down"
+"dpad.left" = "Left"
+"dpad.right" = "Right"
+"dpad.up" = "Up"
+rb = "V"
+start = "Tab"
+
+═══ Pro Evolution Soccer ═══
+name = "Pro Evolution Soccer"
+
+[bindings]
+A = "X"
+B = "D"
+X = "A"
+Y = "W"
+back = "Backspace"
+"dpad.down" = "K"
+"dpad.left" = "J"
+"dpad.right" = "L"
+"dpad.up" = "I"
+lb = "Q"
+lt = "Z"
+lthumb = "LeftShift"
+"lx.max" = "Right"
+"lx.min" = "Left"
+"ly.max" = "Up"
+"ly.min" = "Down"
+rb = "E"
+rt = "C"
+rthumb = "RightShift"
+"rx.max" = "Numpad6"
+"rx.min" = "Numpad4"
+"ry.max" = "Numpad8"
+"ry.min" = "Numpad2"
+start = "Escape"
+
+═══ FIFA ═══
+name = "FIFA"
+
+[bindings]
+A = "S"
+B = "D"
+X = "A"
+Y = "W"
+back = "Backspace"
+"dpad.down" = "K"
+"dpad.left" = "J"
+"dpad.right" = "L"
+"dpad.up" = "I"
+lb = "Q"
+lt = "Z"
+lthumb = "LeftShift"
+"lx.max" = "Right"
+"lx.min" = "Left"
+"ly.max" = "Up"
+"ly.min" = "Down"
+rb = "C"
+rt = "E"
+rthumb = "RightShift"
+"rx.max" = "Numpad6"
+"rx.min" = "Numpad4"
+"ry.max" = "Numpad8"
+"ry.min" = "Numpad2"
+start = "Escape"
+
+═══ Phase Shift (Autostrum) ═══
+name = "Phase Shift (Autostrum)"
+
+[bindings]
+A = "LeftShift"
+B = "Z"
+X = "C"
+Y = "X"
+back = "Space"
+"dpad.down" = ["Down", "LeftShift", "Z", "X", "C", "V"]
+"dpad.left" = "Left"
+"dpad.right" = "Right"
+"dpad.up" = "Up"
+rb = "V"
+start = "Tab"

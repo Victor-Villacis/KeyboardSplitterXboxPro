@@ -1,0 +1,32 @@
+---
+source: crates/ksx-config/tests/emission.rs
+expression: "toml::to_string(&file).unwrap()"
+---
+name = "empty"
+
+[bindings]
+A = "None"
+B = "None"
+X = "None"
+Y = "None"
+back = "None"
+"dpad.down" = "None"
+"dpad.left" = "None"
+"dpad.right" = "None"
+"dpad.up" = "None"
+guide = "None"
+lb = "None"
+lt = "None"
+lthumb = "None"
+"lx.max" = "None"
+"lx.min" = "None"
+"ly.max" = "None"
+"ly.min" = "None"
+rb = "None"
+rt = "None"
+rthumb = "None"
+"rx.max" = "None"
+"rx.min" = "None"
+"ry.max" = "None"
+"ry.min" = "None"
+start = "None"

@@ -11,4 +11,29 @@
 //! - opposite-axis snap (to the opposite *binding's* value — deliberate fix)
 //! - state-diff before submit (only genuine transitions leave the engine)
 //!
-//! Implemented in M1.
+//! Module map:
+//! - [`key`] — the single key vocabulary (legacy `InterceptionKey`, exact names/values)
+//! - [`pad`] — XInput wire-shape [`PadState`] + legacy `VirtualXbox` ID tables
+//! - [`device`] — [`DeviceId`] (instance-path identity) and [`KeyEvent`]
+//! - [`preset`] — [`Binding`], [`Preset`], and the `default`/`empty` built-ins
+//! - [`slot`] — [`SlotSpec`] and the 13-variant [`InvalidationReason`] taxonomy
+//! - [`engine`] — the [`Engine`]: precompiled dispatch, per-device key state, diffing
+//! - [`escape`] — [`EscapeDetector`], emergency-escape detection (policy lives upstream)
+
+pub mod device;
+pub mod engine;
+pub mod escape;
+pub mod key;
+pub mod pad;
+pub mod preset;
+pub mod slot;
+
+pub use device::{DeviceId, KeyEvent};
+pub use engine::{Deltas, Engine, PadDelta, ResolvedSlot};
+pub use escape::{Escape, EscapeDetector};
+pub use key::Key;
+pub use pad::{
+    Axis, DpadDirection, PadState, Trigger, XButton, XButtons, AXIS_CENTER, AXIS_MAX, AXIS_MIN,
+};
+pub use preset::{Binding, Preset};
+pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS};

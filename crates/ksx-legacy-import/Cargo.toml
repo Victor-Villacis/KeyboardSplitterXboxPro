@@ -13,6 +13,7 @@ ksx-config.workspace = true
 quick-xml.workspace = true
 encoding_rs.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

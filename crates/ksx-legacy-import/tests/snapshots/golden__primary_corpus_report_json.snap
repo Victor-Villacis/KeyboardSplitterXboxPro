@@ -1,0 +1,5 @@
+---
+source: crates/ksx-legacy-import/tests/golden.rs
+expression: import.report.to_json()
+---
+{"presets":4,"games":1,"skipped":[],"warnings":[]}

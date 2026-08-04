@@ -1,0 +1,175 @@
+//! Games file schema: `%APPDATA%\ksx\games.toml` — same content as legacy
+//! `splitter_games.xml` (title, path, args, block flags, per-slot
+//! device-by-id + preset-by-name).
+
+use ksx_core::{DeviceId, SlotSpec};
+use serde::{Deserialize, Serialize};
+
+use crate::error::ConfigError;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GamesFile {
+    #[serde(default, rename = "game", skip_serializing_if = "Vec::is_empty")]
+    pub games: Vec<GameEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameEntry {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub arguments: String,
+    /// Legacy `BlockKeyboards` (default true).
+    #[serde(default = "default_true")]
+    pub block_keyboards: bool,
+    /// Legacy `BlockMice` (default false).
+    #[serde(default)]
+    pub block_mice: bool,
+    #[serde(default, rename = "slot", skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<GameSlotEntry>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameSlotEntry {
+    pub number: u8,
+    /// Legacy `GamepadUserIndex` (1..=4). Advisory only: the actual XInput
+    /// user index comes from ViGEm's notification callback at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_index: Option<u8>,
+    /// Device instance path — games persist ids directly, not aliases
+    /// (legacy already persisted hardware-id strings here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouse: Option<String>,
+    pub preset: String,
+}
+
+impl GameSlotEntry {
+    pub fn to_spec(&self) -> Result<SlotSpec, ConfigError> {
+        SlotSpec::new(
+            self.number,
+            self.keyboard.as_deref().map(DeviceId::new),
+            self.mouse.as_deref().map(DeviceId::new),
+            self.preset.clone(),
+        )
+        .map_err(Into::into)
+    }
+
+    /// `user_index` is runtime-discovered and comes back as `None`.
+    pub fn from_spec(spec: &SlotSpec) -> Self {
+        Self {
+            number: spec.number,
+            user_index: None,
+            keyboard: spec.keyboard.as_ref().map(|d| d.as_str().to_owned()),
+            mouse: spec.mouse.as_ref().map(|d| d.as_str().to_owned()),
+            preset: spec.preset.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Mirrors the cab's real splitter_games.xml fixture (first two slots).
+    const EXAMPLE: &str = r#"
+[[game]]
+title = "Steam"
+notes = "Steam"
+path = 'C:\Program Files (x86)\Steam\steam.exe'
+block_keyboards = true
+block_mice = false
+
+[[game.slot]]
+number = 1
+user_index = 1
+keyboard = 'HID\VID_D209&PID_0430&REV_0056&MI_00'
+preset = "IPAC P1"
+
+[[game.slot]]
+number = 2
+user_index = 2
+keyboard = 'HID\VID_D209&PID_0430&REV_0056&MI_00'
+preset = "IPAC P2"
+"#;
+
+    #[test]
+    fn example_parses() {
+        let games: GamesFile = toml::from_str(EXAMPLE).unwrap();
+        assert_eq!(games.games.len(), 1);
+        let game = &games.games[0];
+        assert_eq!(game.title, "Steam");
+        assert_eq!(game.path, r"C:\Program Files (x86)\Steam\steam.exe");
+        assert_eq!(game.arguments, "");
+        assert!(game.block_keyboards);
+        assert!(!game.block_mice);
+        assert_eq!(game.slots.len(), 2);
+        assert_eq!(game.slots[1].number, 2);
+        assert_eq!(game.slots[1].user_index, Some(2));
+        assert_eq!(game.slots[1].preset, "IPAC P2");
+    }
+
+    #[test]
+    fn defaults_match_legacy() {
+        let game: GameEntry = toml::from_str("title = \"t\"\npath = \"C:\\\\g.exe\"\n").unwrap();
+        assert!(game.block_keyboards);
+        assert!(!game.block_mice);
+        assert!(game.slots.is_empty());
+        assert_eq!(game.notes, "");
+        assert_eq!(game.arguments, "");
+    }
+
+    #[test]
+    fn round_trips_through_toml() {
+        let games: GamesFile = toml::from_str(EXAMPLE).unwrap();
+        let serialized = toml::to_string(&games).unwrap();
+        let reparsed: GamesFile = toml::from_str(&serialized).unwrap();
+        assert_eq!(games, reparsed);
+    }
+
+    #[test]
+    fn slot_converts_to_and_from_core() {
+        let games: GamesFile = toml::from_str(EXAMPLE).unwrap();
+        let entry = &games.games[0].slots[0];
+        let spec = entry.to_spec().unwrap();
+        assert_eq!(spec.number, 1);
+        assert_eq!(
+            spec.keyboard,
+            Some(ksx_core::DeviceId::new(
+                r"HID\VID_D209&PID_0430&REV_0056&MI_00"
+            ))
+        );
+        assert_eq!(spec.mouse, None);
+        assert_eq!(spec.preset, "IPAC P1");
+
+        let back = GameSlotEntry::from_spec(&spec);
+        assert_eq!(back.number, entry.number);
+        assert_eq!(back.keyboard, entry.keyboard);
+        assert_eq!(back.mouse, entry.mouse);
+        assert_eq!(back.preset, entry.preset);
+        // user_index is runtime-discovered; it does not survive.
+        assert_eq!(back.user_index, None);
+    }
+
+    #[test]
+    fn bad_slot_number_is_an_error() {
+        let entry = GameSlotEntry {
+            number: 0,
+            user_index: None,
+            keyboard: None,
+            mouse: None,
+            preset: "p".into(),
+        };
+        assert!(matches!(
+            entry.to_spec(),
+            Err(ConfigError::InvalidSlotNumber(_))
+        ));
+    }
+}

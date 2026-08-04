@@ -1,0 +1,21 @@
+---
+source: crates/ksx-config/tests/emission.rs
+expression: "toml::to_string(&cfg).unwrap()"
+---
+schema_version = 1
+
+[settings]
+block_keyboards = true
+block_mice = false
+mouse_move_deadzone = 5
+starting_user_index = 1
+
+[[device]]
+id = 'HID\VID_D209&PID_0430&MI_00\8&2A0D0500&0&0000'
+alias = "P1 I-PAC"
+backend = "interception"
+
+[[slot]]
+number = 1
+keyboard = "P1 I-PAC"
+preset = "street-fighter-p1"

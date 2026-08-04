@@ -1,0 +1,117 @@
+---
+source: crates/ksx-legacy-import/tests/golden.rs
+expression: bundle(&import)
+---
+═══ config.toml ═══
+schema_version = 1
+
+[settings]
+block_keyboards = true
+block_mice = false
+mouse_move_deadzone = 1
+starting_user_index = 1
+
+═══ games.toml ═══
+[[game]]
+title = "Steam"
+notes = "Steam"
+path = 'C:\Program Files (x86)\Steam\steam.exe'
+block_keyboards = true
+block_mice = false
+
+[[game.slot]]
+number = 1
+user_index = 1
+keyboard = 'HID\VID_D209&PID_0430&REV_0056&MI_00'
+preset = "IPAC P1"
+
+[[game.slot]]
+number = 2
+user_index = 2
+keyboard = 'HID\VID_D209&PID_0430&REV_0056&MI_00'
+preset = "IPAC P2"
+
+[[game.slot]]
+number = 3
+user_index = 3
+keyboard = 'HID\VID_D209&PID_0430&REV_0056&MI_00'
+preset = "IPAC P3"
+
+[[game.slot]]
+number = 4
+user_index = 4
+keyboard = 'HID\VID_D209&PID_0430&REV_0056&MI_00'
+preset = "IPAC P4"
+
+═══ presets/IPAC P1.toml ═══
+name = "IPAC P1"
+
+[bindings]
+A = "G"
+B = "F"
+X = "J"
+Y = "I"
+back = "A"
+guide = "Q"
+lb = "D"
+lt = "H"
+"lx.max" = "N"
+"lx.min" = "M"
+"ly.max" = "L"
+"ly.min" = "K"
+rb = "C"
+rt = "E"
+start = "B"
+
+═══ presets/IPAC P2.toml ═══
+name = "IPAC P2"
+
+[bindings]
+A = "Eight"
+B = "Seven"
+X = "Enter"
+Y = "Zero"
+back = "Two"
+lb = "Five"
+lt = "Nine"
+"lx.max" = "Space"
+"lx.min" = "Tab"
+"ly.max" = "Backspace"
+"ly.min" = "Escape"
+rb = "Four"
+rt = "Six"
+start = "Three"
+
+═══ presets/IPAC P3.toml ═══
+name = "IPAC P3"
+
+[bindings]
+A = "T"
+B = "S"
+X = "W"
+Y = "V"
+back = "O"
+lt = "U"
+"lx.max" = "One"
+"lx.min" = "Z"
+"ly.max" = "Y"
+"ly.min" = "X"
+rt = "R"
+start = "P"
+
+═══ presets/IPAC P4.toml ═══
+name = "IPAC P4"
+
+[bindings]
+A = "BackslashPipe"
+B = "CloseBracketBrace"
+X = "Tilde"
+Y = "SingleDoubleQuote"
+back = "DashUnderscore"
+lt = "SemicolonColon"
+"lx.max" = "CapsLock"
+"lx.min" = "ForwardSlashQuestionMark"
+"ly.max" = "PeriodRightArrow"
+"ly.min" = "CommaLeftArrow"
+rt = "OpenBracketBrace"
+start = "PlusEquals"
