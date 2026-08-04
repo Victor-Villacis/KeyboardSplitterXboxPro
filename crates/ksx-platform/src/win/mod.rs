@@ -5,7 +5,7 @@
 mod filever;
 mod registry;
 mod services;
-mod signature;
+pub(crate) mod signature;
 
 use std::path::{Path, PathBuf};
 

@@ -14,8 +14,12 @@
 //! Task Scheduler autostart, thread-priority helpers.
 
 pub mod advice;
+pub mod autostart;
+pub mod installer;
 pub mod parse;
+pub mod process;
 pub mod report;
+pub mod sha256;
 
 #[cfg(windows)]
 mod win;

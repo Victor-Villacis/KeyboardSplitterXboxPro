@@ -79,6 +79,74 @@ This one is not an enhancement — it's now a design rule for every milestone:
 - Future idea (post-M5): a tiny MCP server wrapping the CLI so Claude can configure
   ksx conversationally on the cab. The CLI-first design makes this a thin shim.
 
+## E7 — Forma: native-first, web as supplement (decided 2026-08-04)
+
+[Forma](https://github.com/orgs/getforma-dev/repositories) is our own stack (Rust SSR
+server + FMIR binary IR + FormaJS signals/islands). **We dogfood it deliberately**:
+ksx becomes the flagship app that proves Forma in production. Its low star count is not
+a reason to avoid it — shipping something impressive on it is how it gets adopted.
+
+**The constraint that governs everything else: ksx is a native Windows app first.**
+Tray, drivers, virtual bus, native config UI. Forma *enhances*; it never costs
+performance and it is never required for the product to work.
+
+### Verified before deciding (fetched from the repos)
+- **`forma-server` 0.1.4 is a library, not a server** — no listener, no `main`, **no
+  tokio dependency**. `render_page(&PageConfig) -> PageOutput` is a *synchronous pure
+  function*. Our daemon keeps its own runtime and listener. MIT, crates.io, MSRV 1.70.
+- **`rust-embed`-only asset serving** — one `.exe` shipping its own UI is Forma's
+  default path, not a workaround. No Node at runtime (Node ≥18 at build time only).
+- **⚠️ No server push anywhere in the Rust half** — no SSE, no WebSocket. The live
+  monitor is ours to build in plain axum 0.8 (kmd proves the pattern but shares no code).
+- **⚠️ Hardcoded CSP** (`connect-src 'self'`, no extension API) — collides with LAN
+  access and cross-origin WS.
+- **⚠️ FMIR version skew**: `@getforma/core` 1.5.0 (Jul) vs Rust crates 0.1.4 (Mar).
+  `check_ir_compatibility()` exists because drift was anticipated — verify current
+  compiler output still parses **before** building anything.
+- **⚠️ Windows untested upstream** (forma CI is `ubuntu-latest` only).
+
+### Three surfaces, one engine
+1. **Native primary (non-negotiable)** — CLI + tray daemon (M5) + native config UI (M9).
+   Zero HTTP, zero web deps in the default build. The cabinet works perfectly with no
+   browser in existence.
+2. **`ksx-api` (M10a)** — one typed surface for Studio *and* the MCP server (E5). The
+   native UI does **not** go through it: in-process calls straight to the supervisor, so
+   the primary path pays no serialization tax.
+3. **ksx Studio (M10b, Forma)** — optional companion UI: embedded axum + `forma-server`
+   SSR + our own SSE/WS. Configure the cabinet *from your phone while standing at it* —
+   the case where a browser is genuinely the right client, since a cab has no keyboard.
+
+### "Enhance, never compromise" — enforced, not promised
+- **Compile-time optional**: `--features studio`. The default build links no axum, no
+  forma, no HTTP — provable with `cargo tree`.
+- **Never touches pipeline threads.** Studio subscribes to a lossy fan-out sink; a slow
+  browser can never backpressure the engine (same rule as the M4 delta coalescing).
+- **Display-rate coalescing** (~60 Hz) for the monitor. Full fidelity lives in
+  `--record`, not the socket.
+- **Own runtime, normal priority**, isolated from the TIME_CRITICAL capture thread.
+- **Localhost by default**; LAN bind is explicit opt-in with a CSPRNG pairing token
+  (`ring`, not UUIDv4). Do **not** copy the scaffold's dashboard template — it binds
+  `0.0.0.0` with no auth; the minimal template computes a CSP then discards it.
+
+### What ksx gives back (the dogfood loop)
+A systems daemon stresses Forma where no web app would, and each gap becomes a feature
+request with a real consumer: **server push (SSE/WS)**, **CSP extensibility**,
+**embedding ergonomics** (proof it drops into a non-web Rust binary), **Windows build
+validation** (first real Windows consumer), and **FMIR version alignment**.
+
+**The demo that sells both**: open a phone at the cab → four virtual pads rendered live
+→ mash the arcade panel → buttons light up instantly with real latency numbers → remap
+a button from the phone and it works. One demo, two products.
+
+### Sequencing
+M6 WinUSB → M6.5 DS4 spike → M7 GA → M8 HIDMaestro → **M9 native UI** → **M10 Studio**.
+**Nothing web-related precedes M6** — the driver deadline outranks the showcase.
+
+### Using kmd today
+`npx @getforma/kmd` in this repo browses `docs/` (6 design docs + 9 research reports)
+as a local dashboard. Ships a prebuilt Windows x64 binary; no product coupling.
+⚠️ kmd has no LICENSE file — fine for us, but it blocks anyone else adopting it.
+
 ## E6 — Reuse of existing open source (standing policy)
 
 Already practiced; the survey (`research/prior-art-rust-architecture.md`) found no
