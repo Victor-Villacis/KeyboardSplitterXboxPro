@@ -40,7 +40,9 @@ translates. Everything else on the machine keeps typing.
 
 ```sh
 ksx run                      # slot layout from config.toml
-ksx run --game "Street Fighter"   # layout + block flags from a games.toml profile
+ksx run --game "Street Fighter"   # layout + block flags from a games.toml profile,
+                                  # and start the profile's program
+ksx run --game "X" --no-launch    # apply the profile, launch nothing
 ksx run --dry-run            # resolve and print the plan; touches no driver
 ksx run --latency            # rolling capture→submit p50/p99/max every 5 s
 ksx run --json               # one summary object on stdout (human text on stderr)
@@ -48,7 +50,34 @@ ksx run --json               # one summary object on stdout (human text on stder
 
 Startup order is deliberate: pads first (a missing ViGEmBus is found while every
 keyboard is still normal), then capture in passthrough, then blocking — for the
-bound keyboards only.
+bound keyboards only — and only **then** the game. A game started before the
+pads exist enumerates zero controllers and never asks again.
+
+### Launching a game (`--game`)
+
+When the profile has a `path`, `ksx run --game` starts it after the pads are up
+and stops emulation when it exits (exit 0). Two behaviours ported from the
+legacy app and extended:
+
+- **A process that exits within 3 seconds was a launcher, not the game.**
+  `steam.exe`, a `.bat`, a 32→64-bit trampoline: they hand off and return.
+- **After a hand-off, ksx hunts for the profile's `process_name` for 60 s** and
+  then follows *that* process to its exit. Legacy stopped at the 3-second rule
+  and simply ran forever.
+
+```toml
+[[game]]
+title = "Portal 2"
+path  = "steam://rungameid/620"
+process_name = "portal2.exe"   # required for URLs: the shell returns instantly
+```
+
+A `steam://` profile with no `process_name` gets a loud warning naming the exact
+file and the line to add — and runs anyway. The pads work, the game works, and
+the emergency escapes still end the session.
+
+**ksx never kills a game it started.** Stopping emulation leaves the game
+running; your keyboard simply starts typing into it again.
 
 ### Emergency escapes
 
@@ -83,10 +112,101 @@ always a way out.
 
 | code | meaning |
 |---|---|
-| 0 | clean stop — the `Ctrl+Alt+Del` escape, `--dry-run`, or `Ctrl+C` where it can be delivered |
+| 0 | clean stop — the `Ctrl+Alt+Del` escape, **the `--game` game exiting**, `--dry-run`, or `Ctrl+C` where it can be delivered |
 | 1 | unexpected error |
-| 2 | refused to start: invalid config, unknown `--game`, a missing driver, two keyboards sharing one hardware id, or any pad-plug failure. Nothing was plugged and no filter was set |
-| 3 | started, then a runtime failure tore it down (thread death, capture panic, stall watchdog). Keyboards were released first |
+| 2 | refused to start: invalid config, unknown `--game`, **a `--game` profile whose exe does not exist**, a missing driver, two keyboards sharing one hardware id, or any pad-plug failure. Nothing was plugged and no filter was set |
+| 3 | started, then a runtime failure tore it down (thread death, capture panic, stall watchdog, **a game that failed to launch**). Keyboards were released first |
+
+The 2/3 line is exactly "was a keyboard filter ever armed". A 2 means the
+machine is untouched.
+
+## The other commands
+
+```sh
+ksx devices                       # keyboards as the driver sees them (read-only)
+ksx monitor --for-secs 10         # live per-device key stream, never blocks
+ksx pads --count 4                # plug 4 test pads, LED order, kill-recovery
+ksx doctor                        # driver health, CI-policy state, verdicts
+ksx import-legacy --dry-run       # legacy XML -> TOML
+```
+
+### `ksx daemon` — stay resident with a tray icon
+
+```sh
+ksx daemon --game "MAME 4P"       # tray icon; emulation on demand
+ksx daemon --headless             # same commands on stdin
+ksx daemon --start                # begin a session immediately
+```
+
+Menu (and headless commands): **start**, **stop**, **reload** config, open
+**config** folder, **quit**. The tooltip shows the current state and any capture
+health problem from the last session (reboot required, watchdog tripped, dropped
+events).
+
+The tray runs on its own thread with its own message pump and has **no** path to
+the capture, engine or output threads — it can only enqueue a command. A wedged
+tray costs you a menu, never your keyboards. (The legacy app dispatched every
+keystroke onto its WPF UI thread; a stalled UI froze every keyboard on the
+machine until reboot.)
+
+Exit codes: 0 clean, 1 error, 2 the configuration does not resolve.
+
+### `ksx autostart` — cold boot into a playable cabinet
+
+```sh
+ksx autostart --enable --game "MAME 4P"
+ksx autostart --status
+ksx autostart --disable
+ksx autostart --enable --dry-run     # exact XML + schtasks line, registers nothing
+```
+
+A **per-user** logon task — `InteractiveToken`, `LeastPrivilege`, never elevated
+— running `ksx run [--game <TITLE>]` 10 seconds after logon. Idempotent.
+
+`--enable` validates before it registers: the config must pass the same checks
+`ksx run` applies, the profile must exist, and its executable must be on disk.
+Otherwise it refuses with exit 2 — a typo caught here is one line of output, the
+same typo registered is a cabinet that cold-boots to nothing on a console nobody
+sees.
+
+`--status` also reports a **stale** registration (ksx moved, the task did not)
+and exits 2 when it finds one.
+
+Exit codes: 0 done, 1 error, 2 refused / stale.
+
+### `ksx install-drivers` — the bundled ViGEmBus, verified
+
+```sh
+ksx install-drivers                 # report + verify; runs nothing
+ksx install-drivers --dry-run
+ksx install-drivers --yes           # execute (needs an elevated terminal)
+ksx install-drivers --repair --yes  # run setup again over an existing install
+```
+
+Two independent pins must both hold before anything runs: the installer's
+**SHA-256** and its **Authenticode signer**, both recorded in
+[`docs/DRIVERS.md`](docs/DRIVERS.md). The file is opened **once** with writers
+and deleters locked out, hashed and signature-checked through that handle, and
+the handle stays open across execution — so the bytes that were checked are the
+bytes that run. When elevated, ksx also refuses to search any directory a
+standard user could write to.
+
+A file that fails verification is refused, and ksx will not print a command line
+for it either. ksx never downloads anything and never self-elevates.
+Interception is reported but never installed (non-commercial licence).
+
+> **Known blocker (2026-08-04):** the bundled ViGEmBus 1.22.0 asset hashes
+> correctly and is signed by Nefarius, but its signing certificate has expired,
+> so ksx reports `ValidExpiredCert` and refuses it. See `docs/DRIVERS.md`.
+
+Exit codes: 0 nothing to do / installed, 1 error, 2 refused (verification
+failed, installer missing, elevation needed), 3 the installer ran and failed.
+
+### Frontend integration
+
+LaunchBox and RetroBat wiring, plus a wrapper that always stops ksx:
+[`docs/INTEGRATION.md`](docs/INTEGRATION.md) and
+[`examples/ksx-wrap.ps1`](examples/ksx-wrap.ps1).
 
 ## Status
 
@@ -103,7 +223,7 @@ fallback until `ksx` passes the full cabinet test matrix.
 | M2 | ViGEm output layer | ✅ |
 | M3 | Interception capture layer | ✅ |
 | M4 | End-to-end parity (`ksx run`) | ⏳ code complete, cabinet gate pending |
-| M5 | Profiles, autostart, tray daemon, installer | – |
+| M5 | Profiles, autostart, tray daemon, installer | ⏳ code complete, cabinet gate pending |
 | M6 | WinUSB capture backend (post-2026 survival path) | – |
 | M7 | UI | – |
 
@@ -116,11 +236,12 @@ crates/ksx-legacy-import  legacy UTF-16 XML → TOML importer
 crates/ksx-capture        CaptureBackend: interception / winusb / rawinput-identify
 crates/ksx-output         VirtualPadBackend: ViGEmBus
 crates/ksx-platform       hotplug, driver health, install, autostart
-crates/ksx-games          game/profile registry + launch
+crates/ksx-games          game launch + exit detection (launcher hand-off)
 crates/ksx-app            the `ksx` binary
 crates/vigem-client       vendored CasualX/vigem-client (MIT)
 legacy/                   original C# solution (frozen, reference only)
-docs/                     architecture, driver story, recovery runbook, research
+examples/                 frontend wrapper scripts
+docs/                     architecture, integration, driver story, recovery, research
 ```
 
 ## License

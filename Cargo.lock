@@ -453,6 +453,7 @@ version = "0.1.0"
 dependencies = [
  "ksx-config",
  "ksx-core",
+ "ksx-platform",
  "thiserror",
  "tracing",
 ]

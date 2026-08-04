@@ -19,6 +19,7 @@ pub mod installer;
 pub mod parse;
 pub mod process;
 pub mod report;
+pub mod sealed;
 pub mod sha256;
 
 #[cfg(windows)]

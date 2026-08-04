@@ -441,7 +441,7 @@ fn run_session_with(
         pads: Box::new(pads(log.clone())),
     };
     let mut out: Vec<u8> = Vec::new();
-    let outcome = supervise(plan, wiring, &options, &mut out).expect("supervisor ran");
+    let outcome = supervise(plan, wiring, &mut options, &mut out).expect("supervisor ran");
 
     let steps = trace.lock().expect("trace poisoned").clone();
     let resent = resent.lock().expect("resent log poisoned").clone();
@@ -830,7 +830,7 @@ fn a_wedged_output_thread_cannot_prevent_un_capturing() {
     let trace: Trace = Arc::new(Mutex::new(Vec::new()));
     // Backstop so a regression fails instead of hanging forever.
     let hard_deadline = Instant::now() + Duration::from_secs(15);
-    let options = RunOptions {
+    let mut options = RunOptions {
         clock: Clock::monotonic_nanos(),
         trace: Some(trace.clone()),
         plug_deadline: Duration::from_secs(10),
@@ -848,7 +848,7 @@ fn a_wedged_output_thread_cannot_prevent_un_capturing() {
                 log: log.clone(),
             }),
         },
-        &options,
+        &mut options,
         &mut out,
     )
     .expect("supervisor ran");
@@ -935,8 +935,13 @@ fn a_wedged_output_thread_does_not_stall_the_engine() {
         })
     });
     // The only other way out: a blocking engine must FAIL here, not hang CI.
-    let hard_deadline = Instant::now() + Duration::from_secs(10);
-    let options = RunOptions {
+    // Generous on purpose — this deadline exists to convert a hang into a
+    // failure, not to measure throughput. At 10 s it flaked on a machine
+    // running concurrent cargo builds (the engine simply had not been
+    // scheduled enough to push LIMIT events past a 2 ms-per-step wedge), which
+    // is a false red on exactly the property this test does not assert.
+    let hard_deadline = Instant::now() + Duration::from_secs(120);
+    let mut options = RunOptions {
         clock: Clock::monotonic_nanos(),
         plug_deadline: Duration::from_secs(10),
         max_events: Some(LIMIT),
@@ -953,7 +958,7 @@ fn a_wedged_output_thread_does_not_stall_the_engine() {
                 released: Arc::clone(&released),
             }),
         },
-        &options,
+        &mut options,
         &mut out,
     )
     .expect("supervisor ran");
@@ -1193,7 +1198,7 @@ fn two_keyboards_sharing_a_hardware_id_refuse_to_start() {
     // Backstop: if the refusal ever regresses, this session would otherwise run
     // forever (nothing else stops it). Fail, never hang.
     let hard_deadline = Instant::now() + Duration::from_secs(5);
-    let options = RunOptions {
+    let mut options = RunOptions {
         clock: Clock::monotonic_nanos(),
         trace: Some(trace.clone()),
         plug_deadline: Duration::from_secs(5),
@@ -1207,7 +1212,7 @@ fn two_keyboards_sharing_a_hardware_id_refuse_to_start() {
             capture: Box::new(capture),
             pads: Box::new(RecordingBackend::new(log.clone())),
         },
-        &options,
+        &mut options,
         &mut out,
     )
     .expect("supervisor ran");
@@ -1269,7 +1274,7 @@ fn hotplug_does_not_re_arm_capture_after_the_watchdog_tripped() {
     health.set_watchdog_tripped();
     presence.publish(vec![DeviceId::from(IPAC)]);
 
-    let options = RunOptions {
+    let mut options = RunOptions {
         clock: Clock::monotonic_nanos(),
         trace: Some(trace.clone()),
         plug_deadline: Duration::from_secs(5),
@@ -1282,7 +1287,7 @@ fn hotplug_does_not_re_arm_capture_after_the_watchdog_tripped() {
             capture: Box::new(capture),
             pads: Box::new(RecordingBackend::new(log.clone())),
         },
-        &options,
+        &mut options,
         &mut out,
     )
     .expect("supervisor ran");
@@ -1346,7 +1351,7 @@ fn a_bus_with_no_pads_refuses_to_start_and_never_captures() {
 
     let trace: Trace = Arc::new(Mutex::new(Vec::new()));
     let capture = MockCaptureBackend::new(vec![keyboard(IPAC, 1)], Vec::new());
-    let options = RunOptions {
+    let mut options = RunOptions {
         clock: Clock::monotonic_nanos(),
         trace: Some(trace.clone()),
         plug_deadline: Duration::from_secs(5),
@@ -1359,7 +1364,7 @@ fn a_bus_with_no_pads_refuses_to_start_and_never_captures() {
             capture: Box::new(capture),
             pads: Box::new(DeadBus),
         },
-        &options,
+        &mut options,
         &mut out,
     )
     .expect("supervisor ran");
@@ -1439,7 +1444,7 @@ fn every_pre_capture_plug_failure_refuses_with_exit_2() {
                 let log = log.clone();
                 Box::new(move |message| log.push(TraceEvent::Ctl(CtlKind::of(message))))
             });
-        let options = RunOptions {
+        let mut options = RunOptions {
             clock: Clock::monotonic_nanos(),
             trace: Some(trace.clone()),
             plug_deadline: Duration::from_millis(200),
@@ -1452,7 +1457,7 @@ fn every_pre_capture_plug_failure_refuses_with_exit_2() {
                 capture: Box::new(capture),
                 pads,
             },
-            &options,
+            &mut options,
             &mut out,
         )
         .expect("supervisor ran");
@@ -1537,4 +1542,251 @@ fn scancode_table_round_trips_every_key_the_corpus_uses() {
     // Spot-check the two shapes: a plain letter and an E0-extended arrow.
     assert_eq!(table[&Key::A], (30, KEY_DOWN));
     assert_eq!(table[&Key::Left], (75, KEY_E0));
+}
+
+// ---------------------------------------------------------------------------
+// M5: game launching through the SessionHook
+// ---------------------------------------------------------------------------
+
+/// A [`GameHost`] the test thread can steer, and whose clock advances a fixed
+/// amount per observation so the tracker's 3-second rule is crossed
+/// deterministically rather than by sleeping.
+#[derive(Clone)]
+struct ScriptedGame(Arc<Mutex<GameScript>>);
+
+#[derive(Default)]
+struct GameScript {
+    now_ms: u64,
+    /// Virtual milliseconds added per `now_ms()` call.
+    tick_ms: u64,
+    alive: bool,
+    spawn_ok: bool,
+    /// The trace as it stood the moment the game was launched — this is how the
+    /// ordering guarantee is asserted.
+    trace_at_launch: Option<Vec<Step>>,
+    launched: Vec<String>,
+    trace: Option<Trace>,
+}
+
+impl ScriptedGame {
+    fn new(script: GameScript) -> Self {
+        Self(Arc::new(Mutex::new(script)))
+    }
+
+    fn get(&self) -> std::sync::MutexGuard<'_, GameScript> {
+        self.0.lock().expect("game script poisoned")
+    }
+}
+
+impl ksx_games::GameHost for ScriptedGame {
+    fn now_ms(&mut self) -> u64 {
+        let mut script = self.get();
+        script.now_ms += script.tick_ms;
+        script.now_ms
+    }
+
+    fn spawn(
+        &mut self,
+        exe: &std::path::Path,
+        _args: &[String],
+        _wd: Option<&std::path::Path>,
+    ) -> Result<u32, String> {
+        let mut script = self.get();
+        script.launched.push(exe.display().to_string());
+        script.trace_at_launch = script
+            .trace
+            .as_ref()
+            .map(|t| t.lock().expect("trace poisoned").clone());
+        if script.spawn_ok {
+            Ok(4242)
+        } else {
+            Err("The system cannot find the file specified. (os error 2)".to_owned())
+        }
+    }
+
+    fn activate(&mut self, url: &str) -> Result<(), String> {
+        self.get().launched.push(url.to_owned());
+        Ok(())
+    }
+
+    fn launched_alive(&mut self) -> Option<bool> {
+        Some(self.get().alive)
+    }
+
+    fn processes(&mut self) -> Vec<ksx_platform::process::ProcessEntry> {
+        Vec::new()
+    }
+}
+
+fn game_spec() -> ksx_games::LaunchSpec {
+    ksx_games::LaunchSpec::from_entry(&ksx_config::GameEntry {
+        title: "Street Fighter".into(),
+        notes: String::new(),
+        path: r"C:\games\sf.exe".into(),
+        arguments: String::new(),
+        process_name: None,
+        block_keyboards: true,
+        block_mice: false,
+        slots: Vec::new(),
+    })
+}
+
+/// **The ordering contract.** A game started before the pads exist enumerates
+/// zero controllers and never asks again, so the launch must happen strictly
+/// after `PadsPlugged`, `CaptureStarted` and `BlockingEnabled` — asserted
+/// against the trace as it stood at the instant `spawn` was called, not against
+/// a note written afterwards.
+#[test]
+fn the_game_launches_only_after_the_pads_are_up_and_capture_is_armed() {
+    let script = ScriptedGame::new(GameScript {
+        tick_ms: 5_000,
+        alive: false,
+        spawn_ok: true,
+        ..GameScript::default()
+    });
+    let session = run_session(
+        &escape_plan(),
+        vec![keyboard(IPAC, 1)],
+        Vec::new(),
+        None,
+        |options, _| {
+            script.get().trace = options.trace.clone();
+            options.hook = Box::new(super::game::GameHook::new(
+                game_spec(),
+                script.clone(),
+                PathBuf::from("games.toml"),
+            ));
+        },
+    );
+
+    let at_launch = script
+        .get()
+        .trace_at_launch
+        .clone()
+        .expect("the game was launched");
+    assert_eq!(
+        at_launch,
+        vec![
+            Step::PadsPlugged,
+            Step::CaptureStarted,
+            Step::BlockingEnabled
+        ],
+        "the game must not start until the pads are plugged AND blocking is armed"
+    );
+    assert_eq!(script.get().launched, vec![r"C:\games\sf.exe"]);
+
+    // ...and the game exiting is a clean end of session.
+    assert_eq!(session.outcome.stop, StopReason::GameExited);
+    assert_eq!(session.outcome.exit_code(), 0);
+    assert!(
+        session.output.contains("exited — stopping emulation"),
+        "{}",
+        session.output
+    );
+
+    // Teardown order is unchanged: uncapture, then unplug.
+    assert!(
+        index_of(&session.trace, Step::BlockingDisabled)
+            < index_of(&session.trace, Step::PadsUnplugged),
+        "{:?}",
+        session.trace
+    );
+}
+
+/// A launch that fails happens after the pads are up, so it is a runtime
+/// failure (exit 3) — and the keyboards must still be freed before the pads go.
+#[test]
+fn a_failed_game_launch_tears_down_in_order_and_exits_3() {
+    let script = ScriptedGame::new(GameScript {
+        tick_ms: 1_000,
+        alive: true,
+        spawn_ok: false,
+        ..GameScript::default()
+    });
+    let session = run_session(
+        &escape_plan(),
+        vec![keyboard(IPAC, 1)],
+        Vec::new(),
+        None,
+        |options, _| {
+            options.hook = Box::new(super::game::GameHook::new(
+                game_spec(),
+                script.clone(),
+                PathBuf::from("games.toml"),
+            ));
+        },
+    );
+
+    assert!(
+        matches!(session.outcome.stop, StopReason::GameLaunchFailed(_)),
+        "{:?}",
+        session.outcome.stop
+    );
+    assert_eq!(session.outcome.exit_code(), super::EXIT_RUNTIME_FAILURE);
+    assert!(
+        !session.outcome.stop.is_clean(),
+        "a game that never started is not a clean session"
+    );
+    assert!(
+        index_of(&session.trace, Step::BlockingDisabled)
+            < index_of(&session.trace, Step::PadsUnplugged),
+        "even a launch failure frees the keyboards before it unplugs: {:?}",
+        session.trace
+    );
+    // The pads really were unplugged — a failed launch must not leave four
+    // ghost controllers in joy.cpl.
+    assert!(
+        session
+            .pads
+            .iter()
+            .any(|e| matches!(e, PadEvent::Unplug(_))),
+        "{:?}",
+        session.pads
+    );
+    assert!(
+        session
+            .outcome
+            .stop
+            .message()
+            .contains("cannot find the file"),
+        "{}",
+        session.outcome.stop.message()
+    );
+}
+
+/// Stopping for any other reason (here: the Ctrl+C latch) must not end the
+/// game — ksx has no kill primitive — and must say so, because the user's
+/// keyboard is about to start typing into whatever is still on screen.
+#[test]
+fn stopping_emulation_leaves_the_game_running_and_says_so() {
+    let script = ScriptedGame::new(GameScript {
+        tick_ms: 10,
+        alive: true,
+        spawn_ok: true,
+        ..GameScript::default()
+    });
+    let deadline = Instant::now() + Duration::from_millis(400);
+    let session = run_session(
+        &escape_plan(),
+        vec![keyboard(IPAC, 1)],
+        Vec::new(),
+        None,
+        |options, _| {
+            options.stop = Box::new(move || Instant::now() > deadline);
+            options.hook = Box::new(super::game::GameHook::new(
+                game_spec(),
+                script.clone(),
+                PathBuf::from("games.toml"),
+            ));
+        },
+    );
+
+    assert_eq!(session.outcome.stop, StopReason::CtrlC);
+    assert_eq!(session.outcome.exit_code(), 0);
+    assert!(
+        session.output.contains("never kills a game"),
+        "{}",
+        session.output
+    );
+    assert!(script.get().alive, "the game was never touched");
 }

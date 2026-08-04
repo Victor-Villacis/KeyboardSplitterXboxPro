@@ -21,6 +21,15 @@ pub struct GameEntry {
     pub path: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub arguments: String,
+    /// Image name (`mame.exe`) to track once the launched process is gone.
+    ///
+    /// No legacy equivalent — the legacy app simply kept emulation running
+    /// forever when a launcher handed off. Required in practice for `steam://`
+    /// and other protocol profiles, where the shell returns immediately and
+    /// there is no process handle to wait on; optional for a plain `.exe`,
+    /// where it only matters if that exe is a shim that exits early.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
     /// Legacy `BlockKeyboards` (default true).
     #[serde(default = "default_true")]
     pub block_keyboards: bool,
@@ -124,6 +133,23 @@ preset = "IPAC P2"
         assert!(game.slots.is_empty());
         assert_eq!(game.notes, "");
         assert_eq!(game.arguments, "");
+        assert_eq!(game.process_name, None);
+    }
+
+    /// M5 addition: the launcher-handoff hint. Optional, and absent from every
+    /// imported legacy file — so it must never be required to parse.
+    #[test]
+    fn process_name_is_optional_and_round_trips() {
+        let game: GameEntry = toml::from_str(
+            "title = \"t\"\npath = \"steam://rungameid/620\"\nprocess_name = \"portal2.exe\"\n",
+        )
+        .unwrap();
+        assert_eq!(game.process_name.as_deref(), Some("portal2.exe"));
+        let back: GameEntry = toml::from_str(&toml::to_string(&game).unwrap()).unwrap();
+        assert_eq!(back, game);
+        // ...and it is not emitted when unset, so imported files stay clean.
+        let plain: GameEntry = toml::from_str("title = \"t\"\npath = \"C:\\\\g.exe\"\n").unwrap();
+        assert!(!toml::to_string(&plain).unwrap().contains("process_name"));
     }
 
     #[test]

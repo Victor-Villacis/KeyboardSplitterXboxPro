@@ -49,7 +49,7 @@ Rules that keep us honest (each maps to a legacy defect — see risk review §1/
 | M2 | ✅ done | ViGEm output | 4 pads in joy.cpl, LED order right, kill → pads vanish |
 | M3 | ✅ done | Interception capture | attribution + blocking verified; taskkill recovery <1 s ×5; LCtrl×5 in fullscreen |
 | M4 | 🔨 code done, cabinet gate pending | End-to-end parity (`ksx run`) | 4-player real-game session via `ksx run`; p99 < 1 ms |
-| M5 | – | Profiles/autostart/tray/installer | cold boot → daemon → frontend → game → clean exit |
+| M5 | 🔨 code done, cabinet gate pending | Game launching, autostart, tray daemon, install-drivers, frontend integration | cold boot → daemon → frontend → game → clean exit |
 | M6 | – | WinUSB backend | same session with Interception **uninstalled**; 2-week soak |
 | M7 | – | UI (decision deferred; egui/eframe leading) | preset edit without hand-editing TOML |
 
@@ -72,6 +72,75 @@ device set from its idle path; a bound device that disappears releases its keys
 (`Engine::release_device`), invalidates its slots with the ported
 `InvalidationReason`, and the session keeps running. Config hot-reload is **not**
 in M4.
+
+### M5 (`crates/ksx-games`, `crates/ksx-app/src/{daemon,autostart,install}.rs`)
+
+Everything M5 adds hangs off the M4 pipeline without changing it. The pipeline's
+two contractual orderings are unchanged and still asserted the same way.
+
+**Game launching** is a `SessionHook` on the supervisor with a no-op default
+(`NoHook`), called at one specific point in startup: after `PadsPlugged`,
+`CaptureStarted` and `BlockingEnabled`. That ordering is contractual and asserted
+in CI against the trace *as it stood when the game was spawned*, not against a
+note written afterwards — a game started before the pads exist enumerates zero
+controllers and caches that answer for the session.
+
+Exit detection is a pure state machine (`ksx-games::tracker`) with the clock and
+the process list injected, so the 3-second launcher rule and the 60-second
+hand-off grace are exercised in microseconds by fakes:
+
+```text
+                 launched (handle held)
+                          |
+     alive ---------------+--------------- exited
+       |                                     |
+   [Running] <-------------------------  lifetime > 3s ? --yes--> [Exited] -> stop, exit 0
+                                             |no  (it was a launcher)
+                                             v
+                                  process_name configured ? --no--> [Unresolvable]
+                                             |yes                     warn once,
+                                             v                        keep running
+                                   [LauncherHandoff]  --60s--------------^
+                                             | found it
+                                             v
+                                       [Tracking pid]  --3 misses--> [Exited]
+```
+
+A `steam://` target starts at `LauncherHandoff` directly (the shell returns
+immediately; there was never a handle). Three consecutive misses, not one, end a
+tracked session — `snapshot()` returns an empty vector on failure, and one failed
+enumeration must never read as "the player quit". **ksx never kills the game**:
+there is no kill primitive in `ksx-platform::process` and a source-level test
+keeps it that way.
+
+**Exit-code mapping.** A `--game` profile's missing exe is caught with the config,
+before a pad is plugged → 2. A launch that fails at launch time is necessarily
+after the pads are up → 3. The game exiting → 0. The 2/3 line is still exactly
+"was a keyboard filter ever armed".
+
+**The daemon** splits into a control loop (pure, CI-tested with a fake session
+factory) and a Win32 tray thread that can only enqueue a `DaemonCommand`. The
+tray owns no channel to the capture, engine or output threads and calls into none
+of those crates — structurally, not by convention. `--headless` exposes the
+identical command set on stdin, and the tray falls back to it if the icon cannot
+be created. "Reload config" is a clean stop and a clean start from disk, never a
+hot-patch of a live pipeline.
+
+**Autostart** validates before it registers — same resolution `ksx run` performs,
+plus the profile's exe — because the failure it prevents (a cold boot to an
+instant exit 2, on a console nobody sees) has no other detection path.
+`--status` reports a stale registration and exits 2 on one.
+
+**install-drivers** is the only elevated command, so it carries the only two
+privilege-boundary defences in the codebase: an elevated search restricted to
+non-user-writable directories, and a check-and-use with no gap (`SealedFile`:
+one `FILE_SHARE_READ` handle, hashed and Authenticode-checked through it, held
+open across `CreateProcess`). Both are documented in `docs/DRIVERS.md`.
+
+**Frontend integration**: `docs/INTEGRATION.md` + `examples/ksx-wrap.ps1`, whose
+contract is that ksx is stopped on every exit path — and whose safety net is that
+killing ksx is always safe, because blocking is released on process death with no
+cleanup.
 
 ## Interim operational caution (M0–M5)
 

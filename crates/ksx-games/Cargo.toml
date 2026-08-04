@@ -10,5 +10,6 @@ rust-version.workspace = true
 [dependencies]
 ksx-core.workspace = true
 ksx-config.workspace = true
+ksx-platform.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

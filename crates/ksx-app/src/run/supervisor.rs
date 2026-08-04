@@ -104,6 +104,73 @@ pub struct Wiring {
     pub pads: Box<dyn VirtualPadBackend>,
 }
 
+// ---------------------------------------------------------------------------
+// Session hooks (M5: game launching)
+// ---------------------------------------------------------------------------
+
+/// Why a hook wants the session to end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HookStop {
+    /// The launched game exited. A clean, expected end: exit 0.
+    GameExited,
+    /// The game could not be started. Emulation is already up by then, so this
+    /// is a runtime failure: exit 3.
+    LaunchFailed(String),
+}
+
+/// One conversion point, so a hook's vocabulary and the session's stay in sync.
+impl From<HookStop> for StopReason {
+    fn from(stop: HookStop) -> Self {
+        match stop {
+            HookStop::GameExited => StopReason::GameExited,
+            HookStop::LaunchFailed(message) => StopReason::GameLaunchFailed(message),
+        }
+    }
+}
+
+/// Work that hangs off the session's lifecycle without being part of the input
+/// path.
+///
+/// This exists for exactly one ordering problem. A game started **before** the
+/// pads are plugged enumerates zero controllers, caches that answer, and spends
+/// the rest of the session insisting no gamepad is connected — with four
+/// perfectly good virtual pads sitting right behind it. So launching cannot be
+/// something `ksx run` does around the supervisor; it has to be something the
+/// supervisor does at a specific point *inside* startup, after
+/// [`Step::BlockingEnabled`].
+///
+/// Every method has a no-op default, and [`RunOptions::default`] installs
+/// [`NoHook`], so the M4 pipeline is untouched: a run with no `--game` behaves
+/// exactly as it did before this trait existed, down to the step trace.
+pub trait SessionHook: Send {
+    /// Called once, after the pads are plugged, capture is running and blocking
+    /// has been applied. `Err` ends the session with [`HookStop::LaunchFailed`].
+    fn started(&mut self, _out: &mut dyn Write) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Called on every supervisor poll (~50 ms). `Some` ends the session.
+    fn poll(&mut self, _out: &mut dyn Write) -> Option<HookStop> {
+        None
+    }
+
+    /// Called exactly once during teardown, on **every** path out — clean stop,
+    /// escape, panic, thread death. Never kills anything; see
+    /// `ksx_platform::process`' no-kill policy.
+    fn finished(&mut self, _out: &mut dyn Write) {}
+
+    /// One line for `--json` and the tray tooltip. `None` when there is nothing
+    /// to say (the default hook).
+    fn status_line(&self) -> Option<String> {
+        None
+    }
+}
+
+/// The default: a session with nothing hanging off it.
+pub struct NoHook;
+
+impl SessionHook for NoHook {}
+
 /// Everything about a run that is not the plan.
 pub struct RunOptions {
     /// `--latency`: print a rolling summary every 5 s.
@@ -121,6 +188,9 @@ pub struct RunOptions {
     /// Test-only: panic inside the engine thread after this many events, to
     /// prove teardown still frees the keyboards.
     pub panic_after_events: Option<u64>,
+    /// Lifecycle hook — `--game` launching in M5. Defaults to [`NoHook`], so
+    /// every pre-M5 caller and test is unaffected.
+    pub hook: Box<dyn SessionHook>,
 }
 
 impl Default for RunOptions {
@@ -134,6 +204,7 @@ impl Default for RunOptions {
             plug_deadline: DEFAULT_PLUG_DEADLINE,
             max_events: None,
             panic_after_events: None,
+            hook: Box::new(NoHook),
         }
     }
 }
@@ -158,6 +229,12 @@ pub enum StopReason {
     EmergencyStop,
     /// Test-only `max_events` limit.
     EventLimit,
+    /// The `--game` profile's game exited. The cabinet's normal end-of-session:
+    /// the player quit, so emulation goes away and the frontend comes back.
+    GameExited,
+    /// The `--game` profile could not be started. This happens *after* the pads
+    /// are up (see [`SessionHook`]), so it is a runtime failure, not a refusal.
+    GameLaunchFailed(String),
     /// Pads could not be plugged; nothing was ever captured.
     PlugFailed {
         message: String,
@@ -185,7 +262,10 @@ impl StopReason {
     pub fn is_clean(&self) -> bool {
         matches!(
             self,
-            StopReason::CtrlC | StopReason::EmergencyStop | StopReason::EventLimit
+            StopReason::CtrlC
+                | StopReason::EmergencyStop
+                | StopReason::EventLimit
+                | StopReason::GameExited
         )
     }
 
@@ -194,6 +274,8 @@ impl StopReason {
             StopReason::CtrlC => "ctrl-c",
             StopReason::EmergencyStop => "emergency-stop",
             StopReason::EventLimit => "event-limit",
+            StopReason::GameExited => "game-exited",
+            StopReason::GameLaunchFailed(_) => "game-launch-failed",
             StopReason::PlugFailed { .. } => "plug-failed",
             StopReason::AmbiguousDevices { .. } => "ambiguous-devices",
             StopReason::CaptureEnded(_) => "capture-ended",
@@ -210,6 +292,13 @@ impl StopReason {
             StopReason::CtrlC => "stopped by Ctrl+C".to_owned(),
             StopReason::EmergencyStop => "stopped by the Ctrl+Alt+Del emergency escape".to_owned(),
             StopReason::EventLimit => "stopped at the configured event limit".to_owned(),
+            StopReason::GameExited => {
+                "the game exited; emulation stopped and the pads were unplugged".to_owned()
+            }
+            StopReason::GameLaunchFailed(err) => format!(
+                "the game could not be started: {err}. Emulation was torn down, so the \
+                 keyboards are back to normal"
+            ),
             StopReason::PlugFailed { message, .. } => {
                 format!("could not plug the virtual pads: {message}")
             }
@@ -525,7 +614,7 @@ impl Drop for CaptureGuard {
 pub fn supervise(
     plan: &RunPlan,
     wiring: Wiring,
-    opts: &RunOptions,
+    opts: &mut RunOptions,
     out: &mut dyn Write,
 ) -> anyhow::Result<Outcome> {
     let Wiring {
@@ -711,6 +800,45 @@ pub fn supervise(
     };
     let _ = out.flush();
 
+    // Startup order, step 4: the session hook. This is where `--game` launches
+    // the game, and the ONLY place it may: the pads exist, they have their
+    // XInput slots, capture is live and blocking is applied. A game started any
+    // earlier sees zero controllers.
+    //
+    // A launch failure from here is exit 3, not 2 — emulation is up, so this
+    // run has to be torn down, not merely refused.
+    if let Err(message) = opts.hook.started(out) {
+        tracing::error!(%message, "session hook failed to start; tearing down");
+        let _ = writeln!(out, "[FAIL] {message}");
+        let _ = out.flush();
+        opts.hook.finished(out);
+        guard.release();
+        let _ = ctl_tx.send(CaptureCtl::Shutdown);
+        let capture_exit = match capture_handle.join() {
+            Ok(reason) => exit_reason_str(reason),
+            Err(_) => "join-panic",
+        };
+        let _ = ectl_tx.send(EngineCtl::Stop);
+        let engine = engine_handle.join().unwrap_or_default();
+        let _ = octl_tx.send(OutputCtl::Stop);
+        let output = output_handle.join().unwrap_or_default();
+        record(&opts.trace, Step::PadsUnplugged);
+        return Ok(Outcome {
+            stop: HookStop::LaunchFailed(message).into(),
+            pads: pad_infos,
+            latency: output.latency,
+            health: health.snapshot(),
+            events: engine.events,
+            updates: output.updates,
+            capture_exit,
+            toggles: 0,
+            invalidated: Vec::new(),
+            deltas_coalesced: engine.coalesced,
+            deltas_dropped: engine.dropped,
+            plan_notes: plan.notes.clone(),
+        });
+    }
+
     // ---- supervisor loop ---------------------------------------------------
     let mut stop: Option<StopReason> = None;
     let mut toggles = 0u32;
@@ -800,6 +928,15 @@ pub fn supervise(
             }
         }
 
+        // The session hook: has the game exited? Polled after the health and
+        // escape checks so a driver problem always outranks a game problem, and
+        // before the worker checks so a clean game exit is reported as such
+        // even if a worker is finishing in the same 50 ms window.
+        if let Some(hook_stop) = opts.hook.poll(out) {
+            stop = Some(hook_stop.into());
+            break;
+        }
+
         // A dead worker is always fatal: nothing else can guarantee the
         // keyboards get released.
         if capture_handle.is_finished() {
@@ -840,6 +977,13 @@ pub fn supervise(
         None,
         out,
     );
+
+    // The hook is told the session is over before anything is torn down, on
+    // every path out — clean stop, emergency escape, watchdog, thread death.
+    // It never kills the game; it only stops tracking it (see
+    // `ksx_platform::process`' no-kill policy). A game the player is still in
+    // keeps running, with a keyboard that types again.
+    opts.hook.finished(out);
 
     // ---- teardown: uncapture, THEN unplug ----------------------------------
     //

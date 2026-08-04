@@ -1,29 +1,51 @@
 //! `ksx install-drivers` — verify the bundled ViGEmBus installer, then plan.
 //!
 //! The rule this module exists to enforce: **nothing is executed before its
-//! identity is proven.** The bundled installer is a kernel-driver setup running
-//! elevated; if it were swapped, everything downstream is moot. So the order is
-//! always
+//! identity is proven, and nothing can change between the proof and the use.**
+//! The bundled installer is a kernel-driver setup running elevated; if it were
+//! swapped, everything downstream is moot. So the order is always
 //!
-//! 1. locate the bundled file,
-//! 2. SHA-256 it against the value recorded in `docs/DRIVERS.md`,
-//! 3. check its Authenticode chain *and* that the signer really is Nefarius,
-//! 4. only then offer to run it — and only when explicitly asked to.
+//! 1. locate the bundled file — in a directory a standard user cannot write,
+//! 2. open it **once**, denying writers and deleters ([`crate::sealed`]),
+//! 3. SHA-256 it *through that handle* against the value in `docs/DRIVERS.md`,
+//! 4. check its Authenticode chain *through that same handle*, and that the
+//!    signer really is Nefarius,
+//! 5. only then offer to run it — still holding the handle, and targeting the
+//!    path the handle itself resolves to.
 //!
-//! Both checks are required. A hash alone cannot notice that we recorded the
-//! hash of a *tampered* file; a signature alone cannot notice that someone
-//! swapped ViGEmBus 1.22.0 for a differently-signed Nefarius binary. Two
-//! independent pins is the point.
+//! Both pins are required. A hash alone cannot notice that we recorded the hash
+//! of a *tampered* file; a signature alone cannot notice that someone swapped
+//! ViGEmBus 1.22.0 for a differently-signed Nefarius binary. Two independent
+//! pins is the point.
 //!
-//! Everything except [`verify`]'s Authenticode call and the execution step is
-//! pure, so the plan, the verdicts and the rendering are unit-tested on any
-//! platform with fixtures.
+//! # Threat model (why steps 1 and 2 exist at all)
+//!
+//! `ksx install-drivers` is the one ksx command that runs with an administrator
+//! token. Everything it executes is therefore a privilege boundary, and the two
+//! classic ways across it are:
+//!
+//! - **A user-writable search path.** If the search included, say, a `drivers\`
+//!   folder next to a development build under `C:\Users\…`, any standard user
+//!   (or any code running as them) could drop a file there and have an admin
+//!   run it. [`locate`] refuses candidate directories a standard user can write
+//!   **whenever this process is elevated** — which is the only case where the
+//!   refusal matters, because a non-elevated process can never reach
+//!   [`Action::Ready`] anyway. Net effect: execution is only ever possible from
+//!   a protected directory.
+//! - **Time-of-check to time-of-use.** Verifying by path and then executing by
+//!   path means two `open()`s with a window in between. Closed by
+//!   [`crate::sealed::SealedFile`]; the exact guarantee is documented there.
+//!
+//! Everything except the Authenticode call and the execution step is pure, so
+//! the plan, the verdicts and the rendering are unit-tested on any platform
+//! with fixtures.
 
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::report::{DriverReport, SignatureInfo, SignatureStatus};
+pub use crate::sealed::SealedFile;
 use crate::sha256;
 
 /// File name of the bundled ViGEmBus setup (the official v1.22.0 release asset).
@@ -49,32 +71,180 @@ pub const DEFAULT_INSTALL_ARGS: &[&str] = &["/quiet", "/norestart"];
 // Locating the bundle
 // ---------------------------------------------------------------------------
 
+/// Directory roots a standard user cannot write to on a default Windows
+/// installation. Used as a *policy*, not as a security oracle: see
+/// [`SearchPolicy::is_protected`].
+const PROTECTED_ROOT_VARS: &[&str] = &[
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "SystemRoot",
+];
+
+/// Which directories this process is willing to run an installer out of.
+#[derive(Clone, Debug)]
+pub struct SearchPolicy {
+    /// `Some(true)` when this process holds an administrator token. The
+    /// restriction only binds when elevated, because that is the only state in
+    /// which a user-writable installer could be run *with more privilege than
+    /// the person who wrote it*. `None` (unknown) is treated as elevated: when
+    /// we cannot tell, assume the dangerous case.
+    pub elevated: Option<bool>,
+    /// Absolute directory prefixes considered non-user-writable.
+    pub protected_roots: Vec<PathBuf>,
+}
+
+impl SearchPolicy {
+    /// Build the policy from the process environment.
+    pub fn from_env(elevated: Option<bool>) -> Self {
+        let protected_roots = PROTECTED_ROOT_VARS
+            .iter()
+            .filter_map(|var| std::env::var(var).ok())
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .collect();
+        Self {
+            elevated,
+            protected_roots,
+        }
+    }
+
+    /// A policy that trusts nothing — used by tests and by any caller that
+    /// wants the strictest reading.
+    pub fn with_roots(elevated: Option<bool>, roots: &[&str]) -> Self {
+        Self {
+            elevated,
+            protected_roots: roots.iter().map(PathBuf::from).collect(),
+        }
+    }
+
+    /// Is the restriction in force? Only when elevated (or unknown).
+    pub fn restricted(&self) -> bool {
+        self.elevated != Some(false)
+    }
+
+    /// Does `dir` sit under a root a standard user cannot write?
+    ///
+    /// This is a **prefix policy over the well-known protected roots**
+    /// (`%ProgramFiles%`, `%ProgramFiles(x86)%`, `%ProgramW6432%`,
+    /// `%SystemRoot%`), not a live ACL evaluation. Deliberately:
+    ///
+    /// - An `AuthzAccessCheck` on the *directory* answers the wrong question
+    ///   anyway (what matters is whether anyone can create/replace the file at
+    ///   that exact name, including via an inherited ACE on a parent), and a
+    ///   half-right ACL check reads as authority it does not have.
+    /// - The prefix policy fails *closed*: an administrator who has loosened
+    ///   the ACL on `C:\Program Files\ksx` gets no warning from us, but the
+    ///   normal case — a build tree under `C:\Users\…`, a download folder, a
+    ///   USB stick, `C:\drivers\` — is refused, and that is the case the
+    ///   escalation chain actually needs.
+    /// - `%ProgramData%` is deliberately **not** protected: its default ACL
+    ///   grants `Users` create-file rights, so it is user-writable in exactly
+    ///   the way that matters here.
+    ///
+    /// Documented in `docs/DRIVERS.md` so the guarantee is not folklore.
+    pub fn is_protected(&self, dir: &Path) -> bool {
+        // `C:\Program Files\..\Users\v\evil` starts with `C:\Program Files`
+        // component-wise and is *not* protected. Today's callers pass paths
+        // from `current_exe`/`current_dir`, which Windows has already
+        // normalised, so this is a latent hole rather than a live one — but
+        // this function is `pub`, the prefix test is the whole guarantee, and
+        // "fails closed" has to mean it. Anything unnormalised is refused
+        // outright instead of being reasoned about.
+        if dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return false;
+        }
+        self.protected_roots
+            .iter()
+            .any(|root| starts_with_ci(dir, root))
+    }
+}
+
+/// Case-insensitive, component-wise path prefix test (Windows paths are
+/// case-insensitive; `C:\Program Files\x` must match `C:\PROGRAM FILES`).
+fn starts_with_ci(path: &Path, prefix: &Path) -> bool {
+    let mut p = path.components();
+    for want in prefix.components() {
+        match p.next() {
+            Some(got)
+                if got
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&want.as_os_str().to_string_lossy()) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// A candidate the search would have tried but refused.
+#[derive(Clone, Debug, Serialize)]
+pub struct RejectedCandidate {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
 /// Where the installer was looked for, and whether it turned up.
 #[derive(Clone, Debug, Serialize)]
 pub struct Location {
     pub found: Option<PathBuf>,
-    /// Every candidate tried, in order — printed when nothing was found so the
-    /// user can see exactly where to drop the file.
+    /// Every candidate actually tried, in order — printed when nothing was
+    /// found so the user can see exactly where to drop the file.
     pub searched: Vec<PathBuf>,
+    /// Candidates the policy refused to even look at, with the reason. Printed
+    /// too: "it is right there and ksx ignored it" must never be a mystery.
+    pub rejected: Vec<RejectedCandidate>,
+    /// Whether the user-writable-directory restriction was in force.
+    pub restricted: bool,
 }
 
-/// Search for the bundled installer next to the running `ksx`, then in the
-/// development tree, then in the working directory.
+/// Search for the bundled installer, honouring the process's own elevation.
 ///
 /// `exe_dir` is the directory holding `ksx.exe`; a release lays the file out as
 /// `ksx.exe` + `drivers\<INSTALLER_FILE_NAME>`. During development `ksx.exe`
 /// lives in `target\debug\`, so the repo-root `drivers\` directory is reached
-/// by walking up.
+/// by walking up — but those development locations are under a user-writable
+/// tree, so they are only searched when this process is **not** elevated (where
+/// the plan can never reach [`Action::Ready`] anyway).
 pub fn locate(exe_dir: Option<&Path>, cwd: Option<&Path>) -> Location {
-    let mut searched = Vec::new();
-    let mut push = |dir: PathBuf| {
+    locate_with(
+        &SearchPolicy::from_env(crate::process::is_elevated()),
+        exe_dir,
+        cwd,
+    )
+}
+
+/// [`locate`] with the policy injected, so the refusal table is unit-testable
+/// without an administrator token or a particular machine layout.
+pub fn locate_with(policy: &SearchPolicy, exe_dir: Option<&Path>, cwd: Option<&Path>) -> Location {
+    let mut searched: Vec<PathBuf> = Vec::new();
+    let mut rejected: Vec<RejectedCandidate> = Vec::new();
+
+    let mut consider = |dir: PathBuf, what: &str| {
         let candidate = dir.join("drivers").join(INSTALLER_FILE_NAME);
-        if !searched.contains(&candidate) {
-            searched.push(candidate);
+        if searched.contains(&candidate) || rejected.iter().any(|r| r.path == candidate) {
+            return;
         }
+        if policy.restricted() && !policy.is_protected(&dir) {
+            rejected.push(RejectedCandidate {
+                path: candidate,
+                reason: format!(
+                    "{what} ({}) is not under a directory a standard user is unable to write, \
+                     and this process is elevated: running an installer from there would let \
+                     anyone who can write that folder execute code as administrator",
+                    dir.display()
+                ),
+            });
+            return;
+        }
+        searched.push(candidate);
     };
+
     if let Some(dir) = exe_dir {
-        push(dir.to_path_buf());
+        consider(dir.to_path_buf(), "the ksx.exe directory");
         // target\debug\ksx.exe → repo root is three levels up in a workspace
         // build (target\debug, target, root) and two in a plain build.
         for ups in 1..=3 {
@@ -87,15 +257,21 @@ pub fn locate(exe_dir: Option<&Path>, cwd: Option<&Path>) -> Location {
                 }
             }
             if ok {
-                push(up);
+                consider(up, "a parent of the ksx.exe directory");
             }
         }
     }
     if let Some(dir) = cwd {
-        push(dir.to_path_buf());
+        consider(dir.to_path_buf(), "the working directory");
     }
+
     let found = searched.iter().find(|p| p.is_file()).cloned();
-    Location { found, searched }
+    Location {
+        found,
+        searched,
+        rejected,
+        restricted: policy.restricted(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +319,23 @@ impl Verification {
         if !self.signature_ok {
             out.push(match &self.signature {
                 Some(sig) => match &sig.signer {
+                    // Called out by name because it is the *expected* state of
+                    // any correctly timestamped binary once its signing
+                    // certificate ages out, and because it is the same word
+                    // `ksx doctor` uses for the cross-signed kernel driver this
+                    // whole rewrite exists to escape. Telling the two apart is
+                    // the user's first question, so answer it here.
+                    Some(signer) if sig.status == SignatureStatus::ValidExpiredCert => format!(
+                        "Authenticode chains correctly and the signer is '{signer}', but the \
+                         signing certificate expired{}. ksx requires a currently-valid \
+                         certificate for anything it runs elevated, so this bundle is refused. \
+                         This is NOT tampering — see docs/DRIVERS.md ('expired signing \
+                         certificate') for what to ship instead.",
+                        match &sig.not_after_utc {
+                            Some(when) => format!(" on {when}"),
+                            None => String::new(),
+                        }
+                    ),
                     Some(signer) if sig.status != SignatureStatus::Valid => format!(
                         "Authenticode is {:?} (signer '{signer}'); a driver installer must \
                          verify as Valid",
@@ -199,8 +392,31 @@ pub fn verify_with(
     }
 }
 
-/// Live verification against the real file (Windows does the Authenticode part).
-pub fn verify(path: &Path) -> Verification {
+/// Verify a **sealed** file: both pins are read through the one open handle
+/// that is holding writers out, and that handle stays alive in the caller's
+/// hands afterwards. This is the only verification path `install-drivers` uses.
+pub fn verify_sealed(sealed: &mut SealedFile) -> Verification {
+    let digest = sealed.digest().map_err(|e| e.to_string());
+    let signature = sealed.signature();
+    verify_with(sealed.path(), signature, digest)
+}
+
+/// Seal and verify in one step. `Err` means the file could not even be opened
+/// with writers locked out — including "somebody else has it open for writing",
+/// which is itself a refusal, not a retry.
+pub fn seal_and_verify(path: &Path) -> Result<(SealedFile, Verification), std::io::Error> {
+    let mut sealed = SealedFile::open(path)?;
+    let verification = verify_sealed(&mut sealed);
+    Ok((sealed, verification))
+}
+
+/// Verification by path, used only where no execution can follow (diagnostics).
+///
+/// Kept deliberately separate from [`verify_sealed`] and **never** wired into
+/// the execute path: hashing by path is what created the TOCTOU hole in the
+/// first place, so the two live under different names and only one of them can
+/// authorise running anything.
+pub fn verify_for_report(path: &Path) -> Verification {
     let digest = sha256::hash_file(path).map_err(|e| e.to_string());
     #[cfg(windows)]
     let signature = Some(crate::win::signature::verify(&path.display().to_string()));
@@ -319,11 +535,21 @@ pub fn plan(
         (Some(_), Some(_)) => Action::Ready,
     };
 
-    let command = location.found.as_ref().map(|path| {
-        let mut argv = vec![path.display().to_string()];
-        argv.extend(args.iter().cloned());
-        argv
-    });
+    // The argv is shown ONLY for a file that passed both pins.
+    //
+    // A `Refuse` verdict used to print a fully-quoted, pasteable command line
+    // for the tampered binary — one copy-paste away from "ksx wouldn't run it,
+    // so I ran it myself", from an elevated prompt, which is the exact outcome
+    // the refusal exists to prevent. Refusing and then handing over the
+    // instructions is not refusing.
+    let command = match (&location.found, &verification) {
+        (Some(path), Some(v)) if v.is_trusted() => {
+            let mut argv = vec![path.display().to_string()];
+            argv.extend(args.iter().cloned());
+            Some(argv)
+        }
+        _ => None,
+    };
 
     InstallPlan {
         location,
@@ -380,6 +606,13 @@ impl InstallPlan {
                 for candidate in &self.location.searched {
                     let _ = writeln!(out, "           {}", candidate.display());
                 }
+                if self.location.searched.is_empty() {
+                    let _ = writeln!(out, "           (nothing — every candidate was refused)");
+                }
+                for refused in &self.location.rejected {
+                    let _ = writeln!(out, "  [SKIP] {}", refused.path.display());
+                    let _ = writeln!(out, "           {}", refused.reason);
+                }
             }
             (Some(path), Some(v)) => {
                 let _ = writeln!(out, "  {}", path.display());
@@ -431,8 +664,11 @@ impl InstallPlan {
             ),
             Action::Refuse { reasons } => format!(
                 "REFUSING to run the installer — it is not the file ksx ships:\n  - {}\n\
-                 Delete it and restore the official ViGEmBus 1.22.0 release asset. ksx never \
-                 downloads at runtime, so this file is the only thing it can trust.",
+                 Delete it and restore the official ViGEmBus 1.22.0 release asset from \
+                 https://github.com/nefarius/ViGEmBus/releases (sha256 {EXPECTED_SHA256}). ksx \
+                 never downloads at runtime, so this file is the only thing it can trust — and \
+                 it will not tell you how to run it anyway: a file that fails both-pin \
+                 verification is not one to execute by hand from an elevated prompt.",
                 reasons.join("\n  - ")
             ),
             Action::AlreadyInstalled { version } => format!(
@@ -459,6 +695,11 @@ impl InstallPlan {
                 "path": self.location.found.as_ref().map(|p| p.display().to_string()),
                 "searched": self.location.searched.iter()
                     .map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "rejected": self.location.rejected.iter().map(|r| serde_json::json!({
+                    "path": r.path.display().to_string(),
+                    "reason": r.reason,
+                })).collect::<Vec<_>>(),
+                "search_restricted": self.location.restricted,
                 "expected_sha256": EXPECTED_SHA256,
                 "expected_signer": EXPECTED_SIGNER,
                 "sha256": self.verification.as_ref().and_then(|v| v.sha256.clone()),
@@ -499,24 +740,46 @@ pub fn quote_argv(argv: &[String]) -> String {
         .join(" ")
 }
 
-/// Execute the verified installer and wait for it.
+/// Execute the verified installer and wait for it — **from the sealed handle**.
 ///
-/// Callable **only** with a plan whose action [`Action::is_executable`] (or an
-/// explicit repair of an already-installed bus): the type system cannot express
-/// that, so the check is re-asserted here rather than trusted from the caller.
-/// Nothing in the test suite ever reaches this function.
-pub fn execute(plan: &InstallPlan) -> Result<std::process::ExitStatus, InstallError> {
-    let Some(verification) = &plan.verification else {
-        return Err(InstallError::NotVerified);
-    };
-    if !verification.is_trusted() {
+/// The caller must still be holding the [`SealedFile`] the plan was built from.
+/// That is the whole contract: while it lives, nobody can rewrite or delete
+/// those bytes, so what was hashed is what runs.
+///
+/// Three things are re-asserted here rather than trusted from the caller,
+/// because a caller bug must not be able to run an unverified kernel-driver
+/// installer with an administrator token:
+///
+/// 1. the plan's action is executable,
+/// 2. the sealed file **re-hashes and re-verifies** to the pinned identity,
+///    right now, through the same handle,
+/// 3. the process is spawned against [`SealedFile::exec_path`] — the path the
+///    open handle resolves to — not the path string the search produced, so a
+///    junction swapped under the search path cannot redirect the launch.
+///
+/// Nothing in the test suite ever reaches the spawn.
+pub fn execute(
+    plan: &InstallPlan,
+    sealed: &mut SealedFile,
+    args: &[String],
+) -> Result<std::process::ExitStatus, InstallError> {
+    if !plan.action.is_executable() {
+        return Err(InstallError::NotExecutable(plan.action.code()));
+    }
+    // Re-verification, not a cached verdict. The plan's `verification` is a
+    // report; this is the decision.
+    let now = verify_sealed(sealed);
+    if !now.is_trusted() {
         return Err(InstallError::NotVerified);
     }
-    let Some(argv) = &plan.command else {
-        return Err(InstallError::NotVerified);
-    };
-    let (exe, args) = argv.split_first().ok_or(InstallError::NotVerified)?;
-    std::process::Command::new(exe)
+    // ...and it must be the same file the plan was built from.
+    match (&plan.location.found, &plan.verification) {
+        (Some(planned), Some(before))
+            if planned == sealed.path() && before.sha256 == now.sha256 => {}
+        _ => return Err(InstallError::NotVerified),
+    }
+
+    std::process::Command::new(sealed.exec_path())
         .args(args)
         .status()
         .map_err(|err| InstallError::Spawn(err.to_string()))
@@ -526,6 +789,10 @@ pub fn execute(plan: &InstallPlan) -> Result<std::process::ExitStatus, InstallEr
 pub enum InstallError {
     #[error("refusing to execute an installer that did not pass hash + signature verification")]
     NotVerified,
+    #[error("refusing to execute: the plan's verdict is '{0}', not 'ready'")]
+    NotExecutable(&'static str),
+    #[error("the bundled installer could not be opened with writers locked out: {0}")]
+    NotSealed(String),
     #[error("could not start the installer: {0}")]
     Spawn(String),
 }
@@ -569,7 +836,16 @@ mod tests {
         Location {
             found: Some(PathBuf::from("drivers/x.exe")),
             searched: vec![PathBuf::from("drivers/x.exe")],
+            rejected: Vec::new(),
+            restricted: true,
         }
+    }
+
+    /// The policy used by the search tests: only `C:\Program Files` and
+    /// `C:\Windows` count as protected, so the refusal table is deterministic
+    /// on any machine (and on a Linux CI runner).
+    fn policy(elevated: Option<bool>) -> SearchPolicy {
+        SearchPolicy::with_roots(elevated, &[r"C:\Program Files", r"C:\Windows"])
     }
 
     fn args() -> Vec<String> {
@@ -619,6 +895,30 @@ mod tests {
                 .any(|f| f.contains("Totally Legit")),
             "{:?}",
             impostor.failures()
+        );
+    }
+
+    /// The refusal a real user hits first must say what it actually means.
+    /// `ValidExpiredCert` on a correctly timestamped binary is not tampering,
+    /// and a message that implies otherwise sends people looking for an
+    /// attacker instead of a newer release.
+    #[test]
+    fn an_expired_signing_certificate_is_explained_not_just_refused() {
+        let mut signature = sig(
+            SignatureStatus::ValidExpiredCert,
+            "Nefarius Software Solutions e.U.",
+        );
+        signature.cert_expired = Some(true);
+        signature.not_after_utc = Some("2025-04-13T23:59:59Z".into());
+        let v = verify_with(Path::new("x"), Some(signature), Ok(good_digest()));
+        assert!(!v.is_trusted());
+        let failure = v.failures().join(" ");
+        assert!(failure.contains("2025-04-13"), "{failure}");
+        assert!(failure.contains("NOT tampering"), "{failure}");
+        assert!(failure.contains("docs/DRIVERS.md"), "{failure}");
+        assert!(
+            !failure.contains("SHA-256"),
+            "the hash pinned fine; do not muddy the message: {failure}"
         );
     }
 
@@ -772,6 +1072,8 @@ mod tests {
                 PathBuf::from("a/drivers/x.exe"),
                 PathBuf::from("b/drivers/x.exe"),
             ],
+            rejected: Vec::new(),
+            restricted: true,
         };
         let p = plan(
             location,
@@ -789,11 +1091,19 @@ mod tests {
     }
 
     /// `execute` re-checks verification itself: a caller bug must not be able
-    /// to run an unverified kernel-driver installer.
+    /// to run an unverified kernel-driver installer. Nothing here spawns —
+    /// every case is refused before `Command` is built.
     #[test]
     fn execute_refuses_an_unverified_plan_without_spawning_anything() {
-        let bad = verify_with(Path::new("x"), None, Ok([0u8; 32]));
-        let p = plan(
+        let scratch = std::env::temp_dir().join(format!("ksx-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let file = scratch.join("not-the-installer.exe");
+        std::fs::write(&file, b"definitely not ViGEmBus").unwrap();
+        let mut sealed = SealedFile::open(&file).unwrap();
+
+        // A plan whose *own* verdict is Refuse.
+        let bad = verify_with(&file, None, Ok([0u8; 32]));
+        let refused = plan(
             located(),
             Some(bad),
             InstalledState::default(),
@@ -801,25 +1111,41 @@ mod tests {
             &args(),
             false,
         );
-        assert!(matches!(execute(&p), Err(InstallError::NotVerified)));
+        assert!(matches!(
+            execute(&refused, &mut sealed, &args()),
+            Err(InstallError::NotExecutable("verification-failed"))
+        ));
 
-        let missing = plan(
-            Location {
-                found: None,
-                searched: vec![],
-            },
-            None,
-            InstalledState::default(),
-            Some(true),
-            &args(),
-            false,
-        );
-        assert!(matches!(execute(&missing), Err(InstallError::NotVerified)));
+        // ...and a plan that *claims* Ready over a file that is not the pinned
+        // one: re-verification through the handle is what stops it, not the
+        // cached verdict.
+        let lying = InstallPlan {
+            action: Action::Ready,
+            ..plan(
+                located(),
+                Some(trusted()),
+                InstalledState::default(),
+                Some(true),
+                &args(),
+                false,
+            )
+        };
+        assert!(matches!(
+            execute(&lying, &mut sealed, &args()),
+            Err(InstallError::NotVerified)
+        ));
+
+        drop(sealed);
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]
     fn locate_prefers_the_directory_next_to_the_exe() {
-        let loc = locate(Some(Path::new("C:/app")), Some(Path::new("C:/elsewhere")));
+        let loc = locate_with(
+            &policy(Some(false)),
+            Some(Path::new("C:/app")),
+            Some(Path::new("C:/elsewhere")),
+        );
         assert_eq!(
             loc.searched.first().unwrap(),
             &PathBuf::from("C:/app")
@@ -830,10 +1156,15 @@ mod tests {
     }
 
     /// Development layout: `target\debug\ksx.exe` must still find the repo's
-    /// `drivers\` directory, or `--dry-run` is untestable from a cargo build.
+    /// `drivers\` directory, or `--dry-run` is untestable from a cargo build —
+    /// but only when the process is NOT elevated.
     #[test]
-    fn locate_walks_up_out_of_the_cargo_target_directory() {
-        let loc = locate(Some(Path::new("C:/repo/target/debug")), None);
+    fn locate_walks_up_out_of_the_cargo_target_directory_when_unelevated() {
+        let loc = locate_with(
+            &policy(Some(false)),
+            Some(Path::new("C:/repo/target/debug")),
+            None,
+        );
         assert!(
             loc.searched.contains(
                 &PathBuf::from("C:/repo")
@@ -843,6 +1174,164 @@ mod tests {
             "{:?}",
             loc.searched
         );
+        assert!(loc.rejected.is_empty(), "{:?}", loc.rejected);
+        assert!(!loc.restricted);
+    }
+
+    /// **The privilege-escalation fix.** Elevated, a user-writable directory is
+    /// not a place an installer may come from: anyone who can write there would
+    /// get their bytes executed with an administrator token.
+    #[test]
+    fn an_elevated_process_refuses_user_writable_search_directories() {
+        for elevated in [Some(true), None] {
+            let loc = locate_with(
+                &policy(elevated),
+                Some(Path::new(r"C:\Users\victor\ksx\target\debug")),
+                Some(Path::new(r"C:\drivers")),
+            );
+            assert!(
+                loc.searched.is_empty(),
+                "elevated={elevated:?} searched user-writable paths: {:?}",
+                loc.searched
+            );
+            assert!(loc.found.is_none());
+            assert!(
+                loc.rejected.iter().any(|r| r.reason.contains("elevated")),
+                "the refusal must say why: {:?}",
+                loc.rejected
+            );
+            // C:\drivers is the archetype: writable by anyone, next to nothing.
+            assert!(
+                loc.rejected
+                    .iter()
+                    .any(|r| r.path.starts_with(r"C:\drivers")),
+                "{:?}",
+                loc.rejected
+            );
+        }
+    }
+
+    /// The installed layout still works elevated — that is the whole point of
+    /// restricting rather than forbidding.
+    #[test]
+    fn an_elevated_process_still_searches_program_files() {
+        let loc = locate_with(
+            &policy(Some(true)),
+            Some(Path::new(r"C:\Program Files\ksx")),
+            Some(Path::new(r"C:\Users\victor")),
+        );
+        assert_eq!(
+            loc.searched.first(),
+            Some(
+                &PathBuf::from(r"C:\Program Files\ksx")
+                    .join("drivers")
+                    .join(INSTALLER_FILE_NAME)
+            ),
+            "the exe's own directory is searched first: {loc:?}"
+        );
+        assert!(
+            loc.searched.iter().all(
+                |p| policy(Some(true)).is_protected(p.parent().and_then(Path::parent).unwrap())
+            ),
+            "every searched candidate must sit under a protected root: {:?}",
+            loc.searched
+        );
+        // `C:\` (a parent of the exe dir) and the user's home (the cwd) are both
+        // user-writable, so both are refused.
+        assert!(
+            loc.rejected.iter().any(|r| r.path
+                == PathBuf::from(r"C:\")
+                    .join("drivers")
+                    .join(INSTALLER_FILE_NAME)),
+            "{:?}",
+            loc.rejected
+        );
+        assert!(
+            loc.rejected
+                .iter()
+                .any(|r| r.path.starts_with(r"C:\Users\victor")),
+            "{:?}",
+            loc.rejected
+        );
+    }
+
+    #[test]
+    fn protected_root_matching_is_case_insensitive_and_component_wise() {
+        let p = policy(Some(true));
+        assert!(p.is_protected(Path::new(r"C:\PROGRAM FILES\ksx")));
+        assert!(p.is_protected(Path::new(r"c:\program files\ksx\drivers")));
+        assert!(!p.is_protected(Path::new(r"C:\Program Files Evil\ksx")));
+        assert!(!p.is_protected(Path::new(r"C:\Users\victor\Program Files")));
+        assert!(!p.is_protected(Path::new(r"C:\ProgramData\ksx")));
+    }
+
+    /// A component-wise prefix test says `C:\Program Files\..\Users\v\evil`
+    /// starts with `C:\Program Files`. It does, and it is still a folder the
+    /// user owns — so an unnormalised path must be refused, not matched.
+    #[test]
+    fn a_parent_dir_traversal_out_of_a_protected_root_is_not_protected() {
+        let p = policy(Some(true));
+        assert!(
+            !p.is_protected(Path::new(r"C:\Program Files\..\Users\victor\evil")),
+            "traversal out of a protected root must not count as protected"
+        );
+        assert!(!p.is_protected(Path::new(r"C:\Program Files\ksx\..\..\Users\victor")));
+        // The same walk without traversal is still fine.
+        assert!(p.is_protected(Path::new(r"C:\Program Files\ksx\drivers")));
+    }
+
+    /// A `Refuse` verdict must not hand the user a ready-to-paste command line
+    /// for the tampered binary. Refusing and then printing the instructions is
+    /// not refusing.
+    #[test]
+    fn a_refused_plan_never_prints_a_runnable_command() {
+        let bad = verify_with(Path::new("drivers/x.exe"), None, Ok([0u8; 32]));
+        let p = plan(
+            located(),
+            Some(bad),
+            InstalledState::default(),
+            Some(true),
+            &args(),
+            false,
+        );
+        assert!(matches!(p.action, Action::Refuse { .. }));
+        assert_eq!(
+            p.command, None,
+            "no argv may be offered for a tampered file"
+        );
+        let text = p.render_human(false);
+        assert!(!text.contains("command:"), "{text}");
+        assert!(!text.contains("/quiet"), "{text}");
+        assert!(text.contains("REFUSING"), "{text}");
+        assert_eq!(
+            p.to_json().pointer("/command"),
+            Some(&serde_json::Value::Null),
+            "--json must not carry it either"
+        );
+    }
+
+    /// End-to-end over a real file: seal it, verify it, and prove the bytes
+    /// cannot move under us while the seal is held.
+    #[test]
+    fn sealing_a_real_file_reports_the_mismatch_and_locks_it() {
+        let scratch = std::env::temp_dir().join(format!("ksx-seal-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let file = scratch.join("bundle.exe");
+        std::fs::write(&file, b"not ViGEmBus").unwrap();
+
+        let (sealed, verification) = seal_and_verify(&file).unwrap();
+        assert!(!verification.is_trusted());
+        assert!(verification
+            .failures()
+            .iter()
+            .any(|f| f.contains("SHA-256")));
+        #[cfg(windows)]
+        assert!(
+            std::fs::write(&file, b"swapped!").is_err(),
+            "the seal must outlive verification — that is the TOCTOU fix"
+        );
+        drop(sealed);
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

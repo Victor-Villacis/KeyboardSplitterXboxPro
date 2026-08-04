@@ -1,9 +1,12 @@
 //! ksx — split keyboards (I-PAC arcade encoders) into virtual Xbox 360 controllers.
 
+mod autostart;
 #[cfg(windows)]
 mod ctrl_c;
+mod daemon;
 mod devices;
 mod doctor;
+mod install;
 mod monitor;
 mod pads;
 mod run;
@@ -38,15 +41,27 @@ enum Command {
     /// panic or process death also returns every keyboard — blocking needs no
     /// cleanup to be undone.
     ///
-    /// Exit codes: 0 = clean stop (Ctrl+Alt+Del, Ctrl+C where it can be
-    /// delivered, --dry-run), 1 = error, 2 = refused to start (invalid config,
-    /// unknown --game, missing driver, two keyboards sharing one hardware id;
-    /// nothing was plugged and no filter was set), 3 = started then torn down by
-    /// a runtime failure (keyboards were released first).
+    /// With --game, the profile's program is started AFTER the pads are plugged
+    /// and capture is armed (a game started earlier sees zero controllers), and
+    /// emulation stops when it exits. A process that exits within 3 s is
+    /// treated as a launcher, not the game: ksx then watches for the profile's
+    /// `process_name` for 60 s and follows that instead. ksx never kills a game
+    /// it started — stopping emulation leaves the game running.
+    ///
+    /// Exit codes: 0 = clean stop (Ctrl+Alt+Del, the game exiting, Ctrl+C where
+    /// it can be delivered, --dry-run), 1 = error, 2 = refused to start
+    /// (invalid config, unknown --game, a --game profile whose exe is missing,
+    /// missing driver, two keyboards sharing one hardware id; nothing was
+    /// plugged and no filter was set), 3 = started then torn down by a runtime
+    /// failure, including a game that failed to launch (keyboards were released
+    /// first).
     Run {
         /// Take the slot layout and block flags from this games.toml profile
         #[arg(long, value_name = "TITLE")]
         game: Option<String>,
+        /// Apply the --game profile's slots and flags without starting the game
+        #[arg(long, requires = "game")]
+        no_launch: bool,
         /// Resolve and print the plan, then exit without touching any driver
         #[arg(long)]
         dry_run: bool,
@@ -141,12 +156,106 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Install/verify bundled drivers (admin)
-    InstallDrivers,
-    /// Configure start-at-boot via Task Scheduler
-    Autostart {
+    /// Stay resident with a tray icon; start/stop emulation on demand
+    ///
+    /// The tray runs on its own thread with its own message pump and has NO
+    /// path to the capture, engine or output threads — it can only enqueue a
+    /// command. A wedged tray therefore costs you a menu, not your keyboards
+    /// (which is exactly what went wrong in the legacy app's WPF UI thread).
+    ///
+    /// Menu: Start emulation, Stop emulation, Reload config, Open config
+    /// folder, Quit. The tooltip shows the current state plus any capture
+    /// health problem (reboot required, watchdog tripped, dropped events).
+    ///
+    /// --headless offers the identical commands on stdin: start | stop |
+    /// reload | config | status | quit.
+    ///
+    /// Exit codes: 0 = clean exit, 1 = error, 2 = the configuration does not
+    /// resolve (nothing was started).
+    Daemon {
+        /// Use this games.toml profile for each session
+        #[arg(long, value_name = "TITLE")]
+        game: Option<String>,
+        /// With --game, apply the profile but never start its program
+        #[arg(long, requires = "game")]
+        no_launch: bool,
+        /// No tray icon; take the same commands on stdin
         #[arg(long)]
+        headless: bool,
+        /// Start emulation immediately instead of waiting for a command
+        #[arg(long)]
+        start: bool,
+    },
+    /// Install/verify the bundled ViGEmBus driver (needs administrator)
+    ///
+    /// Reports what is installed, then verifies the bundled installer against
+    /// two independent pins — its SHA-256 and its Authenticode signer — before
+    /// offering to run it. The file is opened ONCE with writers locked out and
+    /// stays open across execution, so the bytes that were checked are the
+    /// bytes that run. A file that fails either pin is refused, and ksx will
+    /// not print a command line for it either.
+    ///
+    /// ksx never downloads anything and never self-elevates: if an admin token
+    /// is needed it says so and stops. Interception is reported but never
+    /// installed (non-commercial licence — see docs/DRIVERS.md).
+    ///
+    /// Exit codes: 0 = nothing to do or the install succeeded, 1 = error,
+    /// 2 = refused (verification failed, installer missing, elevation needed),
+    /// 3 = the installer ran and returned a failure.
+    InstallDrivers {
+        /// Report and verify without executing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Actually run the verified installer (otherwise this is a report)
+        #[arg(long)]
+        yes: bool,
+        /// Run setup again even when ViGEmBus is already installed
+        #[arg(long)]
+        repair: bool,
+        /// One JSON object {action, verdict, installer, installed, ...} on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start ksx at logon via a per-user Task Scheduler task
+    ///
+    /// Registers `ksx run` (or `ksx run --game <TITLE>`) as a logon-triggered
+    /// task for the current user only: InteractiveToken, LeastPrivilege, never
+    /// elevated. Idempotent — enabling twice replaces the task.
+    ///
+    /// --enable validates first: the config must pass the same checks `ksx run`
+    /// applies, the --game profile must exist, and its executable must be
+    /// present. A typo caught here is a one-line error; the same typo
+    /// registered is a cabinet that cold-boots to nothing.
+    ///
+    /// --status also reports a STALE registration (ksx moved, task did not).
+    ///
+    /// Exit codes: 0 = done, 1 = error, 2 = refused (validation failed) or a
+    /// stale registration was found by --status.
+    Autostart {
+        /// Register the logon task (validates the configuration first)
+        #[arg(long, conflicts_with_all = ["disable", "status"])]
+        enable: bool,
+        /// Remove the logon task (safe to run when nothing is registered)
+        #[arg(long, conflicts_with = "status")]
         disable: bool,
+        /// Report what is registered (the default when no verb is given)
+        #[arg(long)]
+        status: bool,
+        /// Register `ksx run --game <TITLE>` instead of plain `ksx run`
+        #[arg(long, value_name = "TITLE")]
+        game: Option<String>,
+        /// Seconds to wait after logon before starting
+        #[arg(long, default_value_t = 10)]
+        delay_secs: u32,
+        /// Override the scheduled-task name (default: ksx\autostart)
+        #[arg(long, value_name = "NAME")]
+        task_name: Option<String>,
+        /// Print the exact XML and schtasks invocation; register nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// JSON on stdout
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -198,10 +307,11 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Run {
             game,
+            no_launch,
             dry_run,
             latency,
             json,
-        } => run::run(game, dry_run, latency, json),
+        } => run::run(game, no_launch, dry_run, latency, json),
         Command::Devices { json } => devices::run(json),
         Command::Monitor {
             for_secs,
@@ -225,13 +335,49 @@ fn main() -> anyhow::Result<()> {
                 doctor::run(json)
             }
         }
-        Command::InstallDrivers => not_yet("install-drivers", "M5"),
-        Command::Autostart { .. } => not_yet("autostart", "M5"),
+        Command::Daemon {
+            game,
+            no_launch,
+            headless,
+            start,
+        } => daemon::run(game, no_launch, headless, start),
+        Command::InstallDrivers {
+            dry_run,
+            yes,
+            repair,
+            json,
+        } => install::run(install::Options {
+            dry_run,
+            json,
+            yes,
+            repair,
+        }),
+        Command::Autostart {
+            enable,
+            disable,
+            status: _,
+            game,
+            delay_secs,
+            task_name,
+            dry_run,
+            json,
+        } => autostart::run(autostart::Options {
+            // No verb means `--status`: the read-only answer is the only safe
+            // default for a command that can rewrite what a machine does at
+            // every logon.
+            action: match (enable, disable) {
+                (true, _) => autostart::Action::Enable,
+                (_, true) => autostart::Action::Disable,
+                _ => autostart::Action::Status,
+            },
+            game,
+            delay_secs,
+            task_name,
+            extra_args: Vec::new(),
+            dry_run,
+            json,
+        }),
     }
-}
-
-fn not_yet(cmd: &str, milestone: &str) -> anyhow::Result<()> {
-    anyhow::bail!("`ksx {cmd}` lands in milestone {milestone} — scaffold only for now")
 }
 
 /// Exit code 3 = import completed but produced warnings (0 = clean, 1 = error).
@@ -476,6 +622,7 @@ mod tests {
             cli.command,
             Command::Run {
                 game: None,
+                no_launch: false,
                 dry_run: false,
                 latency: false,
                 json: false,
@@ -498,10 +645,12 @@ mod tests {
         match cli.command {
             Command::Run {
                 game,
+                no_launch,
                 dry_run,
                 latency,
                 json,
             } => {
+                assert!(!no_launch);
                 assert_eq!(game.as_deref(), Some("Street Fighter"));
                 assert!(dry_run);
                 assert!(latency);

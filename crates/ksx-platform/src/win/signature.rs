@@ -21,11 +21,27 @@ use crate::parse::{filetime_to_rfc3339, now_as_filetime_ticks};
 use crate::report::{SignatureInfo, SignatureStatus};
 
 pub fn verify(path: &str) -> SignatureInfo {
+    verify_impl(path, HANDLE::default())
+}
+
+/// Same check, but against an **already-open handle**.
+///
+/// `WINTRUST_FILE_INFO.hFile` is documented as taking precedence over the path
+/// when it is set, so the Authenticode chain is read from the same file object
+/// `SealedFile` is holding writers out of — no second `open()`, no window in
+/// which the signed bytes could be swapped for other bytes. The path is still
+/// passed because the trust provider uses it for catalog lookup and for the
+/// text it puts in errors.
+pub fn verify_handle(path: &str, raw_handle: isize) -> SignatureInfo {
+    verify_impl(path, HANDLE(raw_handle as *mut core::ffi::c_void))
+}
+
+fn verify_impl(path: &str, file: HANDLE) -> SignatureInfo {
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     let mut file_info = WINTRUST_FILE_INFO {
         cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
         pcwszFilePath: windows::core::PCWSTR(wide.as_ptr()),
-        hFile: HANDLE::default(),
+        hFile: file,
         pgKnownSubject: std::ptr::null_mut(),
     };
     let mut data = WINTRUST_DATA {

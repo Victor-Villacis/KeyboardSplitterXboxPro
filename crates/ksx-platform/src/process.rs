@@ -16,11 +16,31 @@
 //! Everything here is off the input hot path by construction — it is polled at
 //! a few hertz from the supervisor thread.
 //!
+//! - [`launch`] — start an executable and keep a **process handle**, so
+//!   liveness is answered without ever consulting a pid (pids are reused;
+//!   handles are not).
+//!
 //! Off Windows every function degrades to a documented no-op/`Unsupported`
 //! rather than failing to compile, so `ksx-games`' policy layer keeps its
 //! cross-platform unit tests.
+//!
+//! # No-kill policy (deliberate, and enforced by a test)
+//!
+//! There is no `kill`, `terminate` or `stop` primitive in this module and there
+//! will not be one. ksx starts the user's game as a convenience; it does not
+//! own it. `TerminateProcess` gives a game no chance to flush a save, and the
+//! one thing worse than a cabinet that will not stop cleanly is a cabinet that
+//! eats a two-hour campaign because emulation wanted to shut down. When ksx
+//! stops first, the game keeps running with a plain keyboard — which is exactly
+//! what the legacy app did, and what a player expects.
+//!
+//! [`GameProcess`] therefore exposes only `is_alive` and `wait_timeout`.
+//! `std::process::Child::kill` is reachable through the inner handle by
+//! construction; `into_inner` does not exist, the field is private, and
+//! `tests::no_kill_primitive_exists` reads this file to keep it that way.
 
 use std::path::Path;
+use std::time::Duration;
 
 /// One live process, as the OS snapshot reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +109,152 @@ pub fn snapshot() -> Vec<ProcessEntry> {
 #[cfg(not(windows))]
 pub fn snapshot() -> Vec<ProcessEntry> {
     Vec::new()
+}
+
+// ---------------------------------------------------------------------------
+// Launching, with a handle
+// ---------------------------------------------------------------------------
+
+/// A process ksx started and still holds a handle to.
+///
+/// The handle — not the pid — is the identity. A pid can be recycled the
+/// instant the process dies, so "is pid 4242 still there?" is a question that
+/// can be answered `yes` about a completely different program; a handle stays
+/// valid and signalled for as long as this value lives.
+///
+/// See the module docs for why there is no way to kill it.
+pub struct GameProcess {
+    child: std::process::Child,
+    pid: u32,
+    /// Cached once the process has been reaped, so repeated polls after exit
+    /// stay cheap and consistent.
+    exit_code: Option<i32>,
+}
+
+impl std::fmt::Debug for GameProcess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GameProcess")
+            .field("pid", &self.pid)
+            .field("exit_code", &self.exit_code)
+            .finish()
+    }
+}
+
+/// Why a process could not be started.
+#[derive(Debug, thiserror::Error)]
+pub enum LaunchError {
+    #[error("the executable does not exist: {0}")]
+    NotFound(String),
+    #[error("could not start '{path}': {source}")]
+    Spawn {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Start `exe` with `args`, in `working_dir` (defaulting to the exe's own
+/// directory, as the legacy app did via `ProcessStartInfo.WorkingDirectory`).
+///
+/// The existence check up front is not redundant with the spawn error: it lets
+/// the caller distinguish "this profile is misconfigured" (checkable before
+/// anything is plugged, exit 2) from "the OS refused to start it" (exit 3).
+pub fn launch(
+    exe: &Path,
+    args: &[String],
+    working_dir: Option<&Path>,
+) -> Result<GameProcess, LaunchError> {
+    if !exe.is_file() {
+        return Err(LaunchError::NotFound(exe.display().to_string()));
+    }
+    let mut command = std::process::Command::new(exe);
+    command.args(args);
+    match working_dir.or_else(|| exe.parent()) {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            command.current_dir(dir);
+        }
+        _ => {}
+    }
+    let child = command.spawn().map_err(|source| LaunchError::Spawn {
+        path: exe.display().to_string(),
+        source,
+    })?;
+    let pid = child.id();
+    Ok(GameProcess {
+        child,
+        pid,
+        exit_code: None,
+    })
+}
+
+impl GameProcess {
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Exit code, once known. `None` while the process is still running.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+
+    /// Is the process still running? Non-blocking, and it reaps on the way past
+    /// so no zombie is left behind.
+    ///
+    /// A failure to ask (the handle is gone, the OS said no) is reported as
+    /// **not alive**: an unanswerable question about a process we started can
+    /// only be resolved by giving up on it, and the alternative — treating it
+    /// as alive forever — would hang the session on a cabinet nobody is
+    /// watching.
+    pub fn is_alive(&mut self) -> bool {
+        if self.exit_code.is_some() {
+            return false;
+        }
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(status)) => {
+                self.exit_code = Some(status.code().unwrap_or(-1));
+                false
+            }
+            Err(err) => {
+                tracing::warn!(pid = self.pid, %err, "cannot poll the launched game; treating it as exited");
+                self.exit_code = Some(-1);
+                false
+            }
+        }
+    }
+
+    /// Block for at most `timeout`, then report whether the process exited.
+    ///
+    /// On Windows this is a real `WaitForSingleObject` on the process handle —
+    /// no polling loop, so a game that exits 3 ms into a 60 s wait is noticed in
+    /// 3 ms. Elsewhere it degrades to a bounded poll.
+    pub fn wait_timeout(&mut self, timeout: Duration) -> bool {
+        if self.exit_code.is_some() {
+            return true;
+        }
+        self.wait_for_signal(timeout);
+        !self.is_alive()
+    }
+
+    #[cfg(windows)]
+    fn wait_for_signal(&self, timeout: Duration) {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        let handle = self.child.as_raw_handle() as HANDLE;
+        // SAFETY: `handle` is the live process handle owned by `self.child`,
+        // which outlives this call; WaitForSingleObject only reads it.
+        unsafe { WaitForSingleObject(handle, ms) };
+    }
+
+    #[cfg(not(windows))]
+    fn wait_for_signal(&self, timeout: Duration) {
+        // No handle-wait primitive in std; the policy layer polls anyway and
+        // this path exists only so the tests build off Windows.
+        std::thread::sleep(timeout.min(Duration::from_millis(50)));
+    }
 }
 
 /// Why a shell activation could not be performed.
@@ -264,5 +430,93 @@ mod tests {
             shell_open("steam://rungameid/1"),
             Err(ShellError::Unsupported(_))
         ));
+    }
+
+    /// A missing exe is diagnosable *before* the spawn, which is what lets
+    /// `ksx run --game` exit 2 without ever plugging a pad.
+    #[test]
+    fn launching_a_missing_executable_is_not_found_not_a_spawn_error() {
+        let missing = std::env::temp_dir().join("ksx-no-such-game-9c1f.exe");
+        assert!(matches!(
+            launch(&missing, &[], None),
+            Err(LaunchError::NotFound(_))
+        ));
+    }
+
+    /// The handle really is a handle: a process that exits is observed to exit,
+    /// with its code, and repeated polls stay consistent.
+    #[cfg(windows)]
+    #[test]
+    fn a_launched_process_is_tracked_to_exit_with_its_code() {
+        let cmd = std::path::PathBuf::from(std::env::var("ComSpec").unwrap_or_else(|_| {
+            format!(
+                "{}\\System32\\cmd.exe",
+                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())
+            )
+        }));
+        let mut proc = launch(&cmd, &["/c".into(), "exit 7".into()], None).expect("cmd.exe /c");
+        assert!(proc.pid() != 0);
+        assert!(
+            proc.wait_timeout(Duration::from_secs(10)),
+            "cmd /c exit must finish well inside the timeout"
+        );
+        assert!(!proc.is_alive());
+        assert_eq!(proc.exit_code(), Some(7));
+        // Idempotent: asking again after exit must not change the answer.
+        assert!(proc.wait_timeout(Duration::from_millis(1)));
+        assert_eq!(proc.exit_code(), Some(7));
+    }
+
+    /// A long-running process is reported alive, and `wait_timeout` honours its
+    /// timeout instead of blocking to completion.
+    #[cfg(windows)]
+    #[test]
+    fn a_running_process_is_alive_and_the_timeout_is_respected() {
+        let cmd = std::path::PathBuf::from(std::env::var("ComSpec").unwrap_or_else(|_| {
+            format!(
+                "{}\\System32\\cmd.exe",
+                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())
+            )
+        }));
+        // `timeout /t` needs a console; `ping -n` is the portable sleep.
+        let mut proc = launch(
+            &cmd,
+            &["/c".into(), "ping -n 6 127.0.0.1 >NUL".into()],
+            None,
+        )
+        .expect("cmd.exe /c ping");
+        assert!(proc.is_alive());
+        let started = std::time::Instant::now();
+        assert!(
+            !proc.wait_timeout(Duration::from_millis(150)),
+            "a 5-second sleep must not have finished in 150 ms"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "wait_timeout blocked past its timeout: {:?}",
+            started.elapsed()
+        );
+        // Let it go; ksx never kills a game, and neither does this test — the
+        // child is reaped when cmd finishes on its own.
+        assert!(proc.wait_timeout(Duration::from_secs(20)));
+    }
+
+    /// The no-kill policy is a property of the source, not of good intentions:
+    /// nothing in this module may terminate a process the user is playing.
+    #[test]
+    fn no_kill_primitive_exists() {
+        let source = include_str!("process.rs");
+        // Skip the doc comment and this test, which necessarily name the APIs.
+        let body = source
+            .split("// ---------------------------------------------------------------------------\n// Launching, with a handle")
+            .nth(1)
+            .expect("the launching section exists");
+        let body = body.split("#[cfg(test)]").next().unwrap();
+        for forbidden in ["TerminateProcess", ".kill(", "fn kill", "ExitProcess"] {
+            assert!(
+                !body.contains(forbidden),
+                "ksx never kills the user's game, but '{forbidden}' appears in process.rs"
+            );
+        }
     }
 }

@@ -545,6 +545,7 @@ mod tests {
                 notes: String::new(),
                 path: r"C:\Program Files (x86)\Steam\steam.exe".into(),
                 arguments: "-silent".into(),
+                process_name: Some("portal2.exe".into()),
                 block_keyboards: true,
                 block_mice: false,
                 slots: vec![GameSlotEntry {

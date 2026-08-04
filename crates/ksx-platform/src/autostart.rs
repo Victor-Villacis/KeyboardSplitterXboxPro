@@ -384,6 +384,103 @@ impl Status {
     }
 }
 
+/// Does the registered task still point at a working ksx?
+///
+/// The failure this exists to catch is silent and slow: someone moves or
+/// reinstalls ksx, the scheduled task keeps the old path, and the next cold
+/// boot runs nothing at all. Nobody is watching the cabinet's console at logon,
+/// so without an explicit check the first symptom is "the arcade machine came
+/// up to a desktop" — weeks later, with no clue why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Staleness {
+    /// The task points at an executable that exists and is this one.
+    Current,
+    /// The registered path does not exist any more. The task is dead.
+    MissingExe { registered: String },
+    /// The registered path exists but is a *different* ksx than the one being
+    /// asked. Not necessarily wrong (two installs, a portable copy), so it is
+    /// reported rather than treated as broken.
+    DifferentExe { registered: String, current: String },
+    /// No `<Command>` in the task at all — something else edited it.
+    NoCommand,
+}
+
+impl Staleness {
+    pub fn is_broken(&self) -> bool {
+        matches!(self, Staleness::MissingExe { .. } | Staleness::NoCommand)
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Staleness::Current => "current",
+            Staleness::MissingExe { .. } => "missing-exe",
+            Staleness::DifferentExe { .. } => "different-exe",
+            Staleness::NoCommand => "no-command",
+        }
+    }
+
+    pub fn message(&self) -> Option<String> {
+        match self {
+            Staleness::Current => None,
+            Staleness::MissingExe { registered } => Some(format!(
+                "STALE: the registered task runs '{registered}', which no longer exists. This \
+                 cabinet will boot to nothing. Re-run `ksx autostart --enable` from the ksx you \
+                 want to keep."
+            )),
+            Staleness::DifferentExe {
+                registered,
+                current,
+            } => Some(format!(
+                "the registered task runs '{registered}', but this is '{current}'. If you meant \
+                 to replace it, re-run `ksx autostart --enable` from here."
+            )),
+            Staleness::NoCommand => Some(
+                "the registered task has no Exec action — it was edited outside ksx. \
+                 Re-run `ksx autostart --enable` to rewrite it."
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
+/// Pure staleness check. `exists` is injected so this is tested without
+/// touching a filesystem or a scheduler.
+pub fn check_staleness(
+    task: &RegisteredTask,
+    current_exe: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> Staleness {
+    let Some(registered) = task
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    else {
+        return Staleness::NoCommand;
+    };
+    let registered_path = Path::new(registered);
+    if !exists(registered_path) {
+        return Staleness::MissingExe {
+            registered: registered.to_owned(),
+        };
+    }
+    // Windows paths are case-insensitive, and `/` vs `\` is not a difference.
+    let normalize = |p: &Path| {
+        p.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    if normalize(registered_path) == normalize(current_exe) {
+        Staleness::Current
+    } else {
+        Staleness::DifferentExe {
+            registered: registered.to_owned(),
+            current: current_exe.display().to_string(),
+        }
+    }
+}
+
 /// Pull the fields we care about out of a task XML document.
 ///
 /// A deliberately small hand-rolled reader rather than a new XML dependency:
@@ -422,12 +519,32 @@ pub struct EnablePlan {
 }
 
 /// Build the plan without touching the filesystem or Task Scheduler.
+/// A per-invocation suffix for the temp XML name, so the path an attacker
+/// would have to pre-create is not one they can predict. Not a secret and not
+/// a substitute for `create_new` in [`apply`] — the two together are what make
+/// the drop box safe. Address of a heap allocation + the clock + the pid, which
+/// is plenty for "unguessable before the process starts".
+fn unpredictable_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+        .unwrap_or(0);
+    let boxed = Box::new(0u8);
+    let addr = (&*boxed as *const u8) as usize as u64;
+    format!(
+        "{:016x}",
+        nanos.rotate_left(17) ^ addr ^ (std::process::id() as u64)
+    )
+}
+
 pub fn enable_plan(spec: TaskSpec) -> Result<EnablePlan, AutostartError> {
     validate(&spec)?;
     let xml = render_xml(&spec);
     let xml_path = std::env::temp_dir().join(format!(
-        "ksx-autostart-{}.xml",
-        spec.task_name.replace(['\\', '/', ':'], "-")
+        "ksx-autostart-{}-{}.xml",
+        spec.task_name.replace(['\\', '/', ':'], "-"),
+        unpredictable_suffix()
     ));
     let argv = create_argv(&spec.task_name, &xml_path);
     Ok(EnablePlan {
@@ -487,10 +604,25 @@ impl EnablePlan {
 // Live operations (Windows)
 // ---------------------------------------------------------------------------
 
+/// Absolute path to the system `schtasks.exe`.
+///
+/// Never a bare `"schtasks.exe"`: `CreateProcess` resolves a bare name against
+/// the current directory and `%PATH%` before `System32`, so `cd`-ing into a
+/// folder holding a hostile `schtasks.exe` would hijack the call. That is only
+/// a same-privilege trick when `ksx autostart` runs unelevated — but people run
+/// whole sessions from an admin terminal, and then it is a straight escalation.
+/// `%SystemRoot%` is not user-writable (it is one of the installer's protected
+/// roots), so an absolute path removes the question entirely.
+#[cfg(windows)]
+pub fn schtasks_exe() -> PathBuf {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+    Path::new(&root).join("System32").join("schtasks.exe")
+}
+
 /// Run `schtasks` with `argv`, returning its decoded stdout.
 #[cfg(windows)]
 fn schtasks(argv: &[String]) -> Result<String, AutostartError> {
-    let out = std::process::Command::new("schtasks.exe")
+    let out = std::process::Command::new(schtasks_exe())
         .args(argv)
         .output()
         .map_err(|e| AutostartError::SchtasksUnavailable(e.to_string()))?;
@@ -519,8 +651,34 @@ fn schtasks(_argv: &[String]) -> Result<String, AutostartError> {
 /// Register (or replace) the task. Idempotent thanks to `/F`.
 #[cfg(windows)]
 pub fn apply(plan: &EnablePlan) -> Result<(), AutostartError> {
-    std::fs::write(&plan.xml_path, to_utf16le_bom(&plan.xml))
+    // `%TEMP%` is user-writable, and `schtasks` re-opens this file by path
+    // after we close it — the same check-then-use shape `crate::sealed` exists
+    // to kill. It matters because people run `ksx autostart --enable` from an
+    // admin terminal even though the task itself needs no elevation: anything
+    // that can win the race there gets an arbitrary task definition registered
+    // by an elevated `schtasks`, and a plain `fs::write` onto a pre-planted
+    // symlink is an arbitrary-file-overwrite as administrator on top of that.
+    //
+    // `create_new(true)` is the fix: it fails rather than following or
+    // truncating anything that already exists, and the name it wants is
+    // unpredictable (see `unpredictable_suffix`). A collision means someone got
+    // there first, which is a refusal, not something to retry through.
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&plan.xml_path)
+        .map_err(|e| {
+            AutostartError::SchtasksUnavailable(format!(
+                "could not create {} exclusively: {e}. Refusing to write the task definition \
+                 through a file this process did not create.",
+                plan.xml_path.display()
+            ))
+        })?;
+    file.write_all(&to_utf16le_bom(&plan.xml))
+        .and_then(|()| file.flush())
         .map_err(|e| AutostartError::SchtasksUnavailable(e.to_string()))?;
+    drop(file);
     let result = schtasks(&plan.argv);
     // The temp XML carries a user name and a path; do not leave it lying around
     // whether or not registration worked.
@@ -638,6 +796,28 @@ mod tests {
             user_id: "CAB\\victor".to_owned(),
             delay_secs: 10,
         }
+    }
+
+    /// A bare program name is resolved against the current directory before
+    /// `System32`, so `ksx autostart` run from an admin terminal sitting in a
+    /// writable folder would execute that folder's `schtasks.exe` as
+    /// administrator. The absolute path is the whole defence; assert it.
+    #[cfg(windows)]
+    #[test]
+    fn schtasks_is_invoked_by_absolute_system32_path_not_by_bare_name() {
+        let exe = schtasks_exe();
+        assert!(
+            exe.is_absolute(),
+            "a relative schtasks path is a current-directory hijack: {}",
+            exe.display()
+        );
+        let text = exe.display().to_string().to_ascii_lowercase();
+        assert!(text.ends_with(r"\system32\schtasks.exe"), "{text}");
+        assert!(
+            exe.is_file(),
+            "the resolved path must actually exist on a real Windows box: {}",
+            exe.display()
+        );
     }
 
     #[test]
@@ -798,6 +978,68 @@ mod tests {
         assert_eq!(plain.game(), None);
     }
 
+    /// The silent killer: ksx moved, the task did not, and the cabinet boots to
+    /// a desktop with no error anyone will ever see.
+    #[test]
+    fn a_registered_task_pointing_at_a_moved_exe_is_reported_as_stale() {
+        let task = RegisteredTask {
+            command: Some(r"C:\old\ksx.exe".into()),
+            ..RegisteredTask::default()
+        };
+        let stale = check_staleness(&task, Path::new(r"C:\new\ksx.exe"), |_| false);
+        assert_eq!(
+            stale,
+            Staleness::MissingExe {
+                registered: r"C:\old\ksx.exe".to_owned()
+            }
+        );
+        assert!(stale.is_broken());
+        let message = stale.message().unwrap();
+        assert!(message.contains("STALE"), "{message}");
+        assert!(message.contains("boot to nothing"), "{message}");
+        assert!(message.contains("--enable"), "{message}");
+    }
+
+    #[test]
+    fn a_task_pointing_at_a_different_but_present_ksx_is_reported_not_condemned() {
+        let task = RegisteredTask {
+            command: Some(r"C:\other\ksx.exe".into()),
+            ..RegisteredTask::default()
+        };
+        let stale = check_staleness(&task, Path::new(r"C:\here\ksx.exe"), |_| true);
+        assert!(matches!(stale, Staleness::DifferentExe { .. }));
+        assert!(
+            !stale.is_broken(),
+            "two installs is a legitimate setup, not a fault"
+        );
+    }
+
+    #[test]
+    fn the_same_exe_in_different_spelling_is_not_stale() {
+        for registered in [
+            r"C:\Program Files\ksx\ksx.exe",
+            r"c:\program files\ksx\ksx.exe",
+            "C:/Program Files/ksx/ksx.exe",
+        ] {
+            let task = RegisteredTask {
+                command: Some(registered.into()),
+                ..RegisteredTask::default()
+            };
+            assert_eq!(
+                check_staleness(&task, Path::new(r"C:\Program Files\ksx\ksx.exe"), |_| true),
+                Staleness::Current,
+                "{registered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_task_with_no_exec_action_is_broken() {
+        let stale = check_staleness(&RegisteredTask::default(), Path::new("x"), |_| true);
+        assert_eq!(stale, Staleness::NoCommand);
+        assert!(stale.is_broken());
+    }
+
     #[test]
     fn not_registered_status_tells_you_how_to_enable_it() {
         let text = render_status(DEFAULT_TASK_NAME, &Status::NotRegistered);
@@ -865,6 +1107,39 @@ mod tests {
     fn the_temp_xml_path_never_contains_a_path_separator_from_the_task_name() {
         let plan = enable_plan(spec(None)).unwrap();
         let name = plan.xml_path.file_name().unwrap().to_string_lossy();
-        assert_eq!(name, "ksx-autostart-ksx-autostart.xml", "{name}");
+        assert!(
+            name.starts_with("ksx-autostart-ksx-autostart-") && name.ends_with(".xml"),
+            "{name}"
+        );
+        assert!(!name.contains('\\') && !name.contains('/'), "{name}");
+    }
+
+    /// The temp XML lands in a user-writable `%TEMP%` and is then re-opened by
+    /// `schtasks`, possibly elevated. Two invocations must not agree on the
+    /// name, or an attacker can pre-create it and win the race every time.
+    #[test]
+    fn two_plans_never_pick_the_same_temp_xml_name() {
+        let a = enable_plan(spec(None)).unwrap().xml_path;
+        let b = enable_plan(spec(None)).unwrap().xml_path;
+        assert_ne!(a, b, "a predictable drop-box name is the whole attack");
+    }
+
+    /// ...and if someone gets there anyway, `apply` refuses instead of writing
+    /// through whatever is sitting at that name (a symlink to a file we would
+    /// then truncate with an administrator token, in the worst case).
+    #[cfg(windows)]
+    #[test]
+    fn apply_refuses_a_pre_planted_temp_file_instead_of_overwriting_it() {
+        let plan = enable_plan(spec(None)).unwrap();
+        std::fs::write(&plan.xml_path, b"planted").unwrap();
+
+        let err = apply(&plan).expect_err("a pre-existing drop box must be refused");
+        assert!(
+            matches!(err, AutostartError::SchtasksUnavailable(ref m) if m.contains("exclusively")),
+            "{err}"
+        );
+        // The planted bytes are untouched: nothing was written through it.
+        assert_eq!(std::fs::read(&plan.xml_path).unwrap(), b"planted");
+        let _ = std::fs::remove_file(&plan.xml_path);
     }
 }

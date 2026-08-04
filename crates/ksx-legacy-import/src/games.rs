@@ -177,6 +177,11 @@ fn parse_game(
         arguments: xml::attr(&attrs, "Arguments")
             .unwrap_or_default()
             .to_owned(),
+        // No legacy equivalent: the C# app had no launcher-handoff tracking at
+        // all (a short-lived launch simply meant "never report an exit"). An
+        // imported profile therefore starts without one, and `ksx run --game`
+        // tells the user which line to add if it turns out to need it.
+        process_name: None,
         block_keyboards,
         block_mice,
         slots: Vec::new(),

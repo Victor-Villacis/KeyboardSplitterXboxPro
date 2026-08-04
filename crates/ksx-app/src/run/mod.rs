@@ -9,12 +9,16 @@
 //! |---|---|
 //! | 0 | clean stop — the Ctrl+Alt+Del escape, `--dry-run`, or Ctrl+C where it can be delivered |
 //! | 1 | unexpected error |
-//! | 2 | refused to start: invalid config, unknown `--game`, a missing driver, two keyboards sharing one hardware id, or any pad-plug failure (bus missing, no free slot, plug timeout, output thread died before the pads were ready). Nothing was plugged and no keyboard filter was ever set |
-//! | 3 | started, then a runtime failure tore it down. Keyboards were released first |
+//! | 0 | …and, with `--game`, the game exiting: that is what "the session ended as asked" means on a cabinet |
+//! | 2 | refused to start: invalid config, unknown `--game`, a `--game` profile whose exe does not exist, a missing driver, two keyboards sharing one hardware id, or any pad-plug failure (bus missing, no free slot, plug timeout, output thread died before the pads were ready). Nothing was plugged and no keyboard filter was ever set |
+//! | 3 | started, then a runtime failure tore it down — including a `--game` launch that failed after the pads were up. Keyboards were released first |
 //!
 //! The 2/3 boundary is exactly "was a keyboard filter ever armed", not "which
 //! component failed" — every pad-plug failure happens before capture is told to
-//! capture anything, so it is always a 2.
+//! capture anything, so it is always a 2. A `--game` profile's missing exe is
+//! checked in the same breath as the config, before a single pad is plugged, so
+//! it is a 2; a launch that fails *at* launch time necessarily happens after
+//! the pads are up (see [`supervisor::SessionHook`]), so it is a 3.
 //!
 //! # Getting out (read this before the first cabinet session)
 //!
@@ -38,6 +42,7 @@
 //! path — clean, Ctrl+C, panic, thread death — uncaptures before it unplugs,
 //! and process death needs no cleanup at all.
 
+pub mod game;
 pub mod latency;
 pub mod plan;
 pub mod supervisor;
@@ -61,6 +66,7 @@ pub const EXIT_RUNTIME_FAILURE: i32 = 3;
 /// CLI entry point for `ksx run`.
 pub fn run(
     game: Option<String>,
+    no_launch: bool,
     dry_run: bool,
     live_latency: bool,
     json: bool,
@@ -81,21 +87,106 @@ pub fn run(
         }
     };
 
+    // Resolve the launch *before* any driver is touched. A profile with a
+    // typo'd path must refuse here, with every keyboard still normal and no pad
+    // plugged, rather than tearing a live session down two seconds in.
+    let launch = match game.as_deref() {
+        Some(title) if !no_launch => match resolve_launch(&root, title) {
+            Ok(spec) => Some(spec),
+            Err(err) => {
+                if json {
+                    println!(
+                        "{}",
+                        crate::pads::error_json("game-not-launchable", &err.to_string())
+                    );
+                } else {
+                    eprintln!("error: {err}");
+                }
+                std::process::exit(EXIT_CANNOT_START);
+            }
+        },
+        _ => None,
+    };
+
     if dry_run {
         if json {
-            println!("{}", serde_json::to_string_pretty(&plan::plan_json(&plan))?);
+            let mut value = plan::plan_json(&plan);
+            value["launch"] = launch_json(launch.as_ref(), no_launch);
+            println!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             print!("{}", plan::render_human(&plan));
-            println!("dry run: nothing was plugged, no keyboard filter was set");
+            print!(
+                "{}",
+                render_launch(launch.as_ref(), no_launch, game.as_deref())
+            );
+            println!("dry run: nothing was plugged, no keyboard filter was set, nothing launched");
         }
         return Ok(());
     }
 
-    run_live(plan, live_latency, json)
+    run_live(plan, launch, root.games_path(), live_latency, json)
+}
+
+/// Find the profile again and turn it into a launch spec, refusing anything
+/// that cannot possibly work.
+fn resolve_launch(
+    root: &ksx_config::ConfigRoot,
+    title: &str,
+) -> anyhow::Result<ksx_games::LaunchSpec> {
+    let games = ksx_config::Store::new(root.clone()).load_games()?;
+    let Some(entry) = games.value.games.iter().find(|g| g.title == title) else {
+        // `plan::resolve` already refused this case with a better message; if
+        // we get here the two disagree, which is worth saying out loud.
+        anyhow::bail!("no game profile titled '{title}' in games.toml");
+    };
+    let spec = ksx_games::LaunchSpec::from_entry(entry);
+    ksx_games::preflight(&spec)?;
+    Ok(spec)
+}
+
+fn render_launch(
+    launch: Option<&ksx_games::LaunchSpec>,
+    no_launch: bool,
+    game: Option<&str>,
+) -> String {
+    match (launch, no_launch, game) {
+        (Some(spec), _, _) => {
+            let tracking = match &spec.process_name {
+                Some(name) => format!("track process '{name}' after a launcher hand-off"),
+                None => "no process_name: a launcher hand-off cannot be followed".to_owned(),
+            };
+            format!(
+                "  launch: {}\n          {tracking}\n",
+                spec.target.describe()
+            )
+        }
+        (None, true, Some(title)) => {
+            format!("  launch: skipped (--no-launch); '{title}' profile applied only\n")
+        }
+        _ => String::new(),
+    }
+}
+
+fn launch_json(launch: Option<&ksx_games::LaunchSpec>, no_launch: bool) -> serde_json::Value {
+    match launch {
+        Some(spec) => serde_json::json!({
+            "will_launch": true,
+            "target": spec.target.describe(),
+            "protocol": spec.target.is_protocol(),
+            "process_name": spec.process_name,
+        }),
+        None => serde_json::json!({ "will_launch": false, "no_launch": no_launch }),
+    }
 }
 
 #[cfg(windows)]
-fn run_live(plan: RunPlan, live_latency: bool, json: bool) -> anyhow::Result<()> {
+fn run_live(
+    plan: RunPlan,
+    launch: Option<ksx_games::LaunchSpec>,
+    games_toml: std::path::PathBuf,
+    live_latency: bool,
+    json: bool,
+) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use ksx_capture::{CaptureError, InterceptionBackend};
     use ksx_output::VigemBackend;
@@ -134,10 +225,19 @@ fn run_live(plan: RunPlan, live_latency: bool, json: bool) -> anyhow::Result<()>
         tracing::warn!("SetConsoleCtrlHandler failed; Ctrl+C will abort without a clean teardown");
     }
 
-    let options = RunOptions {
+    let hook: Box<dyn supervisor::SessionHook> = match launch {
+        Some(spec) => Box::new(game::GameHook::new(
+            spec,
+            ksx_games::RealHost::new(),
+            games_toml,
+        )),
+        None => Box::new(supervisor::NoHook),
+    };
+    let mut options = RunOptions {
         live_latency,
         beep: true,
         stop: Box::new(crate::ctrl_c::requested),
+        hook,
         ..RunOptions::default()
     };
     let wiring = Wiring {
@@ -161,16 +261,21 @@ fn run_live(plan: RunPlan, live_latency: bool, json: bool) -> anyhow::Result<()>
     // session) and cannot deadlock.
     let outcome = if json {
         let mut err = std::io::stderr();
-        supervisor::supervise(&plan, wiring, &options, &mut err)?
+        supervisor::supervise(&plan, wiring, &mut options, &mut err)?
     } else {
         let mut out = std::io::stdout();
         for note in &plan.notes {
             writeln!(out, "{note}")?;
         }
-        supervisor::supervise(&plan, wiring, &options, &mut out)?
+        supervisor::supervise(&plan, wiring, &mut options, &mut out)?
     };
 
-    report(&outcome, json)?;
+    // The hook outlives the session, so its final word is available here — and
+    // "which state did game tracking end in" is exactly what you want when a
+    // profile behaved oddly (`launcher handed off, looking for the game` is a
+    // very different bug report from `exited`). It is merged INTO the summary,
+    // never printed alongside it: `--json` promises exactly one object.
+    report(&outcome, options.hook.status_line(), json)?;
     let code = outcome.exit_code();
     if code != 0 {
         std::process::exit(code);
@@ -179,7 +284,13 @@ fn run_live(plan: RunPlan, live_latency: bool, json: bool) -> anyhow::Result<()>
 }
 
 #[cfg(not(windows))]
-fn run_live(_plan: RunPlan, _live_latency: bool, _json: bool) -> anyhow::Result<()> {
+fn run_live(
+    _plan: RunPlan,
+    _launch: Option<ksx_games::LaunchSpec>,
+    _games_toml: std::path::PathBuf,
+    _live_latency: bool,
+    _json: bool,
+) -> anyhow::Result<()> {
     anyhow::bail!(
         "`ksx run` is Windows-only (it drives the Interception and ViGEmBus kernel drivers); \
          `ksx run --dry-run` works everywhere"
@@ -196,12 +307,20 @@ fn refuse(json: bool, code: &str, message: &str) -> ! {
     std::process::exit(EXIT_CANNOT_START);
 }
 
-fn report(outcome: &Outcome, json: bool) -> anyhow::Result<()> {
+fn report(outcome: &Outcome, game_status: Option<String>, json: bool) -> anyhow::Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(&outcome.to_json())?);
+        let mut value = outcome.to_json();
+        value["game"] = match &game_status {
+            Some(status) => serde_json::json!(status),
+            None => serde_json::Value::Null,
+        };
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
     println!("{}", outcome.stop.message());
+    if let Some(status) = &game_status {
+        println!("game: {status}");
+    }
     println!(
         "session: {} event(s) in, {} pad update(s) out, capture exit '{}', {} escape toggle(s)",
         outcome.events, outcome.updates, outcome.capture_exit, outcome.toggles
