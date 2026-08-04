@@ -15,6 +15,19 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# Interception FFI. We deliberately use its `raw` (interception-sys) layer for the
+# stroke hot path — the safe wrapper's KeyState bitflags define E1 = 3 (the driver
+# header says 0x04), so its receive() silently drops every E1/Pause stroke, and it
+# allocates a Vec per receive/send. See src/interception.rs for the full rationale.
 kanata-interception.workspace = true
-nusb.workspace = true
-windows-sys.workspace = true
+# nusb intentionally NOT a dependency yet: the WinUSB backend lands in M6. Re-add there.
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi", # WNDCLASSEXW/RegisterClassExW are gated on it (HBRUSH)
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Input",
+    "Win32_UI_WindowsAndMessaging",
+] }

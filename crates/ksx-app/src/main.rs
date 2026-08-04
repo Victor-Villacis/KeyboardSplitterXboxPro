@@ -1,6 +1,10 @@
 //! ksx — split keyboards (I-PAC arcade encoders) into virtual Xbox 360 controllers.
 
+#[cfg(windows)]
+mod ctrl_c;
+mod devices;
 mod doctor;
+mod monitor;
 mod pads;
 
 use clap::{Parser, Subcommand};
@@ -20,10 +24,40 @@ enum Command {
         #[arg(long)]
         game: Option<String>,
     },
-    /// List input devices with stable instance-path identities
-    Devices,
-    /// Live per-device key monitor
-    Monitor,
+    /// List keyboards as the Interception driver sees them
+    ///
+    /// Read-only: enumerates keyboards (hardware id, Interception slot,
+    /// friendly name), tags the known I-PAC encoder, and reports slot-budget
+    /// health. Never sets a keyboard filter — cannot affect this machine's
+    /// keyboards.
+    ///
+    /// Exit codes: 0 = listed, 1 = error, 2 = Interception driver unavailable
+    /// (run `ksx doctor`).
+    Devices {
+        /// One JSON object {backend, keyboards, mice_visible, health} on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Live per-device key monitor (passthrough-only — never blocks)
+    ///
+    /// Streams one `<alias> <Key> down|up` line per keystroke on every
+    /// keyboard. Every stroke is re-sent to the OS: this command has no way
+    /// to suppress input (blocking lands in M4 via `ksx run`). Runs until
+    /// Ctrl+C unless --for-secs is given.
+    ///
+    /// Exit codes: 0 = clean stop, 1 = error, 2 = Interception driver
+    /// unavailable (run `ksx doctor`).
+    Monitor {
+        /// Hard-stop after N seconds (default: run until Ctrl+C)
+        #[arg(long, value_name = "N")]
+        for_secs: Option<u64>,
+        /// Write JSONL {t_ms, device, key, down} per event (replay-oracle corpus)
+        #[arg(long, value_name = "FILE")]
+        record: Option<std::path::PathBuf>,
+        /// JSONL on stdout: warning lines, event lines, one final {"summary":...}
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage / test virtual pads (plug N pads, LED order, kill-recovery)
     ///
     /// Plugs N virtual Xbox 360 pads through ViGEmBus, prints each pad's
@@ -87,8 +121,12 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Run { .. } => not_yet("run", "M4"),
-        Command::Devices => not_yet("devices", "M3"),
-        Command::Monitor => not_yet("monitor", "M3"),
+        Command::Devices { json } => devices::run(json),
+        Command::Monitor {
+            for_secs,
+            record,
+            json,
+        } => monitor::run(for_secs, record, json),
         Command::Pads {
             count,
             hold_secs,
@@ -266,6 +304,88 @@ mod tests {
         let help = doctor.render_long_help().to_string();
         assert!(help.contains("0 = healthy or warnings only"), "{help}");
         assert!(help.contains("2 = at least one"), "{help}");
+    }
+
+    #[test]
+    fn devices_parses_with_and_without_json() {
+        let cli = Cli::try_parse_from(["ksx", "devices"]).unwrap();
+        assert!(matches!(cli.command, Command::Devices { json: false }));
+        let cli = Cli::try_parse_from(["ksx", "devices", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Devices { json: true }));
+    }
+
+    #[test]
+    fn devices_help_documents_exit_codes() {
+        let mut cmd = Cli::command();
+        let devices = cmd.find_subcommand_mut("devices").unwrap();
+        let help = devices.render_long_help().to_string();
+        assert!(
+            help.contains("2 = Interception driver unavailable"),
+            "{help}"
+        );
+        assert!(help.contains("ksx doctor"), "{help}");
+    }
+
+    #[test]
+    fn monitor_defaults_run_until_ctrl_c() {
+        let cli = Cli::try_parse_from(["ksx", "monitor"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Monitor {
+                for_secs: None,
+                record: None,
+                json: false,
+            }
+        ));
+    }
+
+    /// The exact bounded live-smoke invocation the M3 gate runs.
+    #[test]
+    fn monitor_flags_parse() {
+        let cli = Cli::try_parse_from(["ksx", "monitor", "--for-secs", "5"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Monitor {
+                for_secs: Some(5),
+                record: None,
+                json: false,
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "ksx",
+            "monitor",
+            "--for-secs",
+            "10",
+            "--record",
+            "corpus.jsonl",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Monitor {
+                for_secs,
+                record,
+                json,
+            } => {
+                assert_eq!(for_secs, Some(10));
+                assert_eq!(
+                    record.as_deref(),
+                    Some(std::path::Path::new("corpus.jsonl"))
+                );
+                assert!(json);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn monitor_help_promises_passthrough_only() {
+        let mut cmd = Cli::command();
+        let monitor = cmd.find_subcommand_mut("monitor").unwrap();
+        let help = monitor.render_long_help().to_string();
+        assert!(help.contains("passthrough-only"), "{help}");
+        assert!(help.contains("re-sent to the OS"), "{help}");
+        assert!(help.contains("2 = Interception driver"), "{help}");
     }
 
     /// M1 regression: the exact invocation the milestone gate smoke-runs.

@@ -3,10 +3,10 @@
 //!
 //! Exit code [`EXIT_DRIVER_MISSING`] (2) = ViGEmBus is not installed: the
 //! human-readable install hint goes to stderr; `--json` puts
-//! `{"error":{code,message}}` on stdout instead. Ctrl+C is handled with
-//! `SetConsoleCtrlHandler` + an `AtomicBool` the pattern loop polls — no ctrlc
-//! crate. A `taskkill /f` mid-pattern runs no destructors; that case is covered
-//! by driver-side client-handle cleanup (see `VigemBackend` docs).
+//! `{"error":{code,message}}` on stdout instead. Ctrl+C is handled by the
+//! shared [`crate::ctrl_c`] latch the pattern loop polls — no ctrlc crate. A
+//! `taskkill /f` mid-pattern runs no destructors; that case is covered by
+//! driver-side client-handle cleanup (see `VigemBackend` docs).
 //!
 //! The pattern math is pure and cross-platform (tested everywhere); only
 //! [`run`]'s driver plumbing is Windows-only.
@@ -202,12 +202,12 @@ fn animate(
 ) {
     use ksx_output::VirtualPadBackend as _;
 
-    if !ctrl_c::install() {
+    if !crate::ctrl_c::install() {
         tracing::warn!("SetConsoleCtrlHandler failed; the pattern runs the full hold time");
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(hold_secs);
     let mut tick: u64 = 0;
-    while std::time::Instant::now() < deadline && !ctrl_c::requested() {
+    while std::time::Instant::now() < deadline && !crate::ctrl_c::requested() {
         let state = pattern_state(tick);
         for &handle in handles {
             if let Err(err) = backend.update(handle, &state) {
@@ -220,36 +220,6 @@ fn animate(
     // Release everything before the unplug so nothing is left "pressed".
     for &handle in handles {
         let _ = backend.update(handle, &PadState::default());
-    }
-}
-
-#[cfg(windows)]
-mod ctrl_c {
-    //! Ctrl+C via `SetConsoleCtrlHandler` + one `AtomicBool` — deliberately no
-    //! ctrlc crate. Returning TRUE from the handler claims the event, so the
-    //! process survives long enough for the explicit unplug + drop path.
-
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use windows_sys::Win32::Foundation::TRUE;
-    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-
-    static REQUESTED: AtomicBool = AtomicBool::new(false);
-
-    unsafe extern "system" fn handler(_ctrl_type: u32) -> windows_sys::core::BOOL {
-        REQUESTED.store(true, Ordering::SeqCst);
-        TRUE
-    }
-
-    /// Installs the handler; `false` means Ctrl+C keeps its default behavior.
-    pub fn install() -> bool {
-        // SAFETY: `handler` is a valid PHANDLER_ROUTINE for the process's
-        // lifetime (a fn item), and only touches an atomic.
-        unsafe { SetConsoleCtrlHandler(Some(handler), TRUE) != 0 }
-    }
-
-    pub fn requested() -> bool {
-        REQUESTED.load(Ordering::SeqCst)
     }
 }
 

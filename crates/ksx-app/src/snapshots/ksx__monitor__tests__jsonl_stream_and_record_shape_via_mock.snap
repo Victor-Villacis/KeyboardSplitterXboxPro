@@ -1,0 +1,8 @@
+---
+source: crates/ksx-app/src/monitor.rs
+expression: stdout
+---
+{"device":"HID\\VID_D209&PID_0430&REV_0056&MI_00","down":true,"key":"A","t_ms":10}
+{"device":"HID\\VID_046D&PID_C31C&REV_6402&MI_00","down":true,"key":"Left","t_ms":20}
+{"device":"HID\\VID_D209&PID_0430&REV_0056&MI_00","down":false,"key":"A","t_ms":30}
+{"summary":{"dropped":0,"events":3,"exit_reason":"shutdown","panicked":false,"per_device":{"HID\\VID_046D&PID_C31C&REV_6402&MI_00":1,"HID\\VID_D209&PID_0430&REV_0056&MI_00":2},"reboot_required":false,"watchdog_tripped":false}}

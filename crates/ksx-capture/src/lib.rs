@@ -1,13 +1,55 @@
 //! ksx-capture — per-device keyboard capture + OS-input blocking.
 //!
 //! Three backends behind one trait (see `docs/research/keyboard-capture-2026.md`):
-//! - `interception` (M3, day-1 default): via `kanata-interception`; ships with a
-//!   loud EOL warning (2012 cross-signed cert + the 2026 CI-policy cliff) and a
-//!   10-slot ID-drift exhaustion detector.
+//! - `interception` (M3, day-1 default): via `kanata-interception`'s raw FFI
+//!   layer (the safe wrapper mis-defines E1 and allocates on the hot path —
+//!   see `src/interception.rs`); ships with a 10-slot ID-drift exhaustion
+//!   detector surfacing "reboot required" loudly.
 //! - `winusb` (M6, strategic primary): claims the I-PAC's `MI_00` interface via
 //!   in-box winusb.sys + `nusb` — blocking and identity become structural.
-//! - `rawinput_identify` (M3): identify-only device picker; NEVER a blocking
-//!   backend (the RawInput+LLHOOK correlation hack is rejected by design).
+//! - `rawinput` (M3): identify-only device picker; NEVER a blocking backend
+//!   (the RawInput+LLHOOK correlation hack is rejected by design).
 //!
-//! Hot-path rule: the capture thread only receives, decides pass/suppress from an
-//! arc-swap snapshot, and pushes into a bounded channel. Zero alloc, zero locks.
+//! Hot-path rule: the capture thread only receives, decides pass/suppress from
+//! an arc-swap snapshot, re-sends what must pass (byte-for-byte), and pushes
+//! into a bounded channel with `try_send` (drops counted, never blocks). Zero
+//! locks; zero allocation after startup except the per-event `DeviceId` clone
+//! the ksx-core `KeyEvent` contract requires and cold-path hotplug bookkeeping.
+//!
+//! Safety posture (this machine's keyboards are production hardware):
+//! - Backends start in **passthrough** (observe-only); nothing is suppressed
+//!   until `CaptureCtl::SetCaptured` arrives.
+//! - Crash-only: process death needs no cleanup (driver releases filters with
+//!   the context handle); a panicking thread in a living process is covered by
+//!   a Drop guard that sets filters to NONE before destroying the context.
+//! - A watchdog force-flips to passthrough if the event consumer stalls
+//!   > 500 ms, so keystrokes reach the OS instead of a black hole.
+//! - The mouse filter is never set in M3 — mouse.sys is never touched.
+
+pub mod backend;
+pub mod decision;
+pub mod exhaustion;
+pub mod guard;
+pub mod health;
+pub mod keymap;
+pub mod mock;
+pub mod watchdog;
+
+#[cfg(windows)]
+mod friendly;
+#[cfg(windows)]
+pub mod interception;
+#[cfg(windows)]
+pub mod rawinput;
+
+pub use backend::{CaptureBackend, CaptureCtl, CaptureError, DeviceInfo, DeviceKind, ExitReason};
+pub use decision::{process_keyboard_stroke, CaptureSet, StrokeOutcome};
+pub use exhaustion::{Exhaustion, ExhaustionDetector, MAX_KEYBOARD_SLOT};
+pub use health::{CaptureHealth, HealthHandle};
+pub use mock::{MockCaptureBackend, MockStroke, ResentStroke};
+pub use watchdog::Watchdog;
+
+#[cfg(windows)]
+pub use interception::InterceptionBackend;
+#[cfg(windows)]
+pub use rawinput::{wait_for_keypress, IdentifiedPress};
