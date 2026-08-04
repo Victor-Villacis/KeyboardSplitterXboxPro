@@ -26,6 +26,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ksx_core::PadState;
+use rusty_xinput::XInputHandle;
 use vigem_client::{Client, TargetId, XGamepad, Xbox360Wired};
 
 use crate::backend::{Feedback, PadHandle, VirtualPadBackend};
@@ -33,9 +34,11 @@ use crate::error::OutputError;
 
 /// Ample for plug+wait_ready; PNP device arrival is normally < 1 s.
 const DEFAULT_PLUG_TIMEOUT: Duration = Duration::from_secs(5);
-/// XInput slot binding can lag device readiness by a beat.
-const USER_INDEX_WAIT: Duration = Duration::from_millis(1000);
-const USER_INDEX_POLL: Duration = Duration::from_millis(20);
+/// Below XINPUT_GAMEPAD_TRIGGER_THRESHOLD (30) — invisible to games, exact in
+/// the raw XInputGetState read-back.
+const CORRELATE_PULSE: u8 = 1;
+const CORRELATE_TIMEOUT: Duration = Duration::from_millis(600);
+const CORRELATE_POLL: Duration = Duration::from_millis(15);
 /// Feedback is low-rate (rumble deltas + LED changes); overflow drops newest.
 const FEEDBACK_QUEUE_CAP: usize = 64;
 
@@ -80,6 +83,9 @@ pub struct VigemBackend {
     pads: BTreeMap<u32, PadEntry>,
     next_id: u32,
     plug_timeout: Duration,
+    /// `None` when the XInput DLL failed to load — pads still work, but slot
+    /// correlation (and therefore `user_index`) is unavailable.
+    xinput: Option<XInputHandle>,
 }
 
 impl VigemBackend {
@@ -93,11 +99,19 @@ impl VigemBackend {
             other => OutputError::TargetError(other),
         })?;
         tracing::info!("connected to ViGEmBus");
+        let xinput = match XInputHandle::load_default() {
+            Ok(xi) => Some(xi),
+            Err(err) => {
+                tracing::warn!(?err, "XInput unavailable — slot correlation disabled");
+                None
+            }
+        };
         Ok(Self {
             client: Arc::new(client),
             pads: BTreeMap::new(),
             next_id: 0,
             plug_timeout: DEFAULT_PLUG_TIMEOUT,
+            xinput,
         })
     }
 
@@ -147,24 +161,48 @@ impl VigemBackend {
         }
     }
 
-    fn read_user_index(target: &mut Xbox360Wired<Arc<Client>>) -> Option<u8> {
-        let deadline = Instant::now() + USER_INDEX_WAIT;
-        loop {
-            match target.get_user_index() {
-                Ok(i) => return u8::try_from(i).ok(),
-                // Not (yet) bound to an XInput slot: retry until the deadline —
-                // pads 5+ legitimately never get one.
-                Err(vigem_client::Error::UserIndexOutOfRange) => {}
-                Err(err) => {
-                    tracing::warn!(%err, "get_user_index failed");
-                    return None;
+    /// Resolves which XInput slot this pad occupies by pulsing LT and watching
+    /// for the echo in `XInputGetState`. Measured on ViGEmBus 1.21.442.0:
+    /// `get_user_index()` returns wrong/duplicate indices and LED notifications
+    /// are mostly absent (docs/research/m2-xinput-findings.md) — the read-back
+    /// echo is the only slot source that matches physical reality. `None` means
+    /// no echo appeared (typically: all 4 slots already occupied, or pad 5+).
+    fn correlate_user_index(
+        xi: &XInputHandle,
+        target: &mut Xbox360Wired<Arc<Client>>,
+    ) -> Option<u8> {
+        let baseline: Vec<Option<u8>> = (0..4u32)
+            .map(|s| xi.get_state(s).ok().map(|st| st.raw.Gamepad.bLeftTrigger))
+            .collect();
+        let pulse = XGamepad {
+            left_trigger: CORRELATE_PULSE,
+            ..XGamepad::default()
+        };
+        if let Err(err) = target.update(&pulse) {
+            tracing::warn!(%err, "correlation pulse failed");
+            return None;
+        }
+        let deadline = Instant::now() + CORRELATE_TIMEOUT;
+        let mut found = None;
+        'scan: while Instant::now() < deadline {
+            for slot in 0..4u32 {
+                let Ok(st) = xi.get_state(slot) else { continue };
+                if st.raw.Gamepad.bLeftTrigger == CORRELATE_PULSE
+                    && baseline[slot as usize] != Some(CORRELATE_PULSE)
+                {
+                    found = Some(slot as u8);
+                    break 'scan;
                 }
             }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            std::thread::sleep(USER_INDEX_POLL);
+            std::thread::sleep(CORRELATE_POLL);
         }
+        if let Err(err) = target.update(&XGamepad::default()) {
+            tracing::warn!(%err, "correlation clear failed");
+        }
+        if found.is_none() {
+            tracing::warn!("no XInput echo for pad — all 4 slots occupied, or pad 5+");
+        }
+        found
     }
 
     fn teardown(mut entry: PadEntry) -> Result<(), OutputError> {
@@ -182,7 +220,10 @@ impl VigemBackend {
 impl VirtualPadBackend for VigemBackend {
     fn plug(&mut self) -> Result<PadHandle, OutputError> {
         let mut target = self.plug_with_timeout()?;
-        let user_index = Self::read_user_index(&mut target);
+        let user_index = self
+            .xinput
+            .as_ref()
+            .and_then(|xi| Self::correlate_user_index(xi, &mut target));
 
         let notification = target.request_notification().map_err(map_target_err)?;
         let (tx, feedback_rx) = mpsc::sync_channel::<Feedback>(FEEDBACK_QUEUE_CAP);

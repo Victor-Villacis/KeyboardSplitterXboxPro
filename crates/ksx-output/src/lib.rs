@@ -1,9 +1,13 @@
 //! ksx-output — virtual Xbox 360 pads.
 //!
 //! Primary (only, for now) backend: ViGEmBus 1.22.0 through the vendored
-//! `vigem-client` (pure-Rust IOCTL, no C DLL). `request_notification` is used from
-//! day one: the LED/player-index callback is the authoritative XInput slot mapping
-//! and replaces the legacy 30 Hz XInput poller + slot-guessing heuristics.
+//! `vigem-client` (pure-Rust IOCTL, no C DLL). Slot identity comes from **active
+//! correlation** — pulse LT below the game-visible threshold and watch which
+//! XInput slot echoes it. Measured on real hardware, both `get_user_index()` and
+//! the LED notification channel report wrong or missing slots
+//! (docs/research/m2-xinput-findings.md); the echo is the only ground truth.
+//! Notifications still feed rumble/LED *feedback* — they're just not trusted
+//! for slot identity.
 //!
 //! `PadState` stays in XInput wire shape so plan-B backends (HIDMaestro,
 //! libvirtualhid — see `docs/research/virtual-gamepad-2026.md`) need no translation
