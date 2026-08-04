@@ -271,7 +271,8 @@ impl DeviceNode {
 }
 
 /// Parse the hex value after `marker` in a device key (`VID_D209` → `0xD209`).
-fn hex_after(key: &str, marker: &str) -> Option<u32> {
+/// Crate-visible: `virtual_pads` classifies bus children with the same parse.
+pub(crate) fn hex_after(key: &str, marker: &str) -> Option<u32> {
     let upper = key.to_uppercase();
     let at = upper.find(marker)? + marker.len();
     let digits: String = upper[at..]

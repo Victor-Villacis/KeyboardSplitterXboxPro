@@ -172,3 +172,45 @@ project that solves the whole problem, but every load-bearing piece is reused:
 `windows-rs`; HIDMaestro's MIT internals are plan B; PadForge/kanata/AutoHotInterception
 are the reference implementations we crib patterns from. New wheels are invented only
 where the survey proved none exist (per-device capture + fan-out engine).
+
+## E8 — Cabinet lighting from pad feedback (Victor, 2026-08-04)
+
+**The idea.** Games and emulators (RetroArch, any XInput-era title) send rumble
+and LED-slot feedback to Xbox 360 pads. Our virtual X360 pads **already receive
+it**: the XUSB notification callback delivers
+`Feedback { large_motor, small_motor, led_number }` per pad into a lossy
+64-deep queue (`FEEDBACK_QUEUE_CAP`, `try_send`, per-pad `dropped_feedback`
+counter for `ksx doctor`), drained non-blocking by
+`VirtualPadBackend::poll_feedback` — see `ksx-output/src/{backend,vigem}.rs`.
+Today that data is discarded: nothing consumes the queue. The enhancement is to
+bridge it to cabinet hardware. Ultimarc **PacLED64** and **I-PAC Ultimate I/O**
+are USB LED controllers with documented protocols; a feedback consumer maps pad
+feedback onto their outputs.
+
+**Mapping ideas.**
+- Rumble burst → that player's button-cluster flash.
+- `led_number` → lighted start button per player (the LED slot *is* the player
+  assignment the bus announces).
+- Idle → attract pattern across the panel.
+
+**Honest constraints.**
+1. **The PlayStation persona can NEVER feed this.** ViGEmBus has no DS4
+   feedback/notification IOCTL — `Persona::has_feedback` is `false` for
+   PlayStation, and `ksx-core/src/persona.rs` states it plainly: no lightbar or
+   rumble will ever arrive on one of those pads. This is Xbox slots (1–4) only;
+   players 5+ light nothing from game feedback.
+2. **MAME drives cabinet LEDs itself** through its outputs system, straight to
+   the same Ultimarc boards. The bridge must **yield to MAME** (off for MAME
+   profiles) — it exists for XInput-era games, which only know how to rumble a
+   pad and have no other way to reach a cabinet.
+3. **Hardware required**: LED-wired buttons plus a controller board. **OPEN
+   QUESTION whether Victor's cabinet has them** — answer this before writing
+   any code; it blocks everything.
+4. **Feedback is the ONLY upstream channel ViGEm exposes.** There is no other
+   game→ksx data path to mine — this is not the first of a series of
+   integrations, it is the whole catalogue.
+
+**Verdict: real, and cheap on the ksx side** — a feedback consumer thread
+draining `poll_feedback` and speaking the Ultimarc protocol, touching no
+pipeline thread (the same "lossy consumer off to the side" shape as E7's
+monitor). **Post-M7 priority, blocked on the hardware question.**

@@ -7,6 +7,7 @@ mod filever;
 mod registry;
 mod services;
 pub(crate) mod signature;
+mod vigem_pads;
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,7 @@ use crate::report::{
     BusDriverReport, CiPolicyReport, ClassFilterReport, CodeIntegrityReport, DriverFileReport,
     DriverReport, InterceptionReport, ServiceInfo, StartType, WhqlEvaluationReport,
 };
+use crate::virtual_pads::{owner_candidates, VirtualPadReport};
 
 const SERVICES: &str = "SYSTEM\\CurrentControlSet\\Services";
 const KEYBOARD_CLASS: &str =
@@ -26,15 +28,44 @@ const WHQL_EVAL: &str = "SYSTEM\\CurrentControlSet\\Control\\CI\\WhqlOnlyEvaluat
 /// ("Microsoft Windows Cross Certificates for Code Integrity Exceptions Audit Policy").
 const CROSS_CERT_POLICY_GUID: &str = "784C4414-79F4-4C32-A6A5-F0FB42A51D0D";
 
+/// The bus service name — the single key both the service-health check and the
+/// ghost-pad devnode lookup go through.
+const VIGEMBUS_SERVICE: &str = "ViGEmBus";
+
 /// Collect the full driver-health report from the live machine.
 pub fn collect() -> DriverReport {
     let windir = windir();
     DriverReport {
-        vigembus: bus_driver("ViGEmBus", &windir),
+        vigembus: bus_driver(VIGEMBUS_SERVICE, &windir),
         scpvbus: bus_driver("ScpVBus", &windir),
         interception: interception(&windir),
         code_integrity: code_integrity(&windir),
+        virtual_pads: virtual_pads(),
     }
+}
+
+/// The bus's current child pads. The devnode is found by *service name* (the
+/// same identity [`bus_driver`] reports on), never by pad VID/PIDs — a real
+/// controller on a physical port hangs off a hub, not off ViGEmBus, and must
+/// never be counted.
+fn virtual_pads() -> VirtualPadReport {
+    // The service filter lists devnodes *registered* to ViGEmBus, present or
+    // not — an uninstalled or stopped bus leaves a registered id behind. Only
+    // a devnode that locates as present (`child_instance_ids` → `Some`) may be
+    // reported or named in the restart advice; a stale id would put a
+    // non-restartable devnode in the `pnputil` command.
+    let mut present_bus: Option<String> = None;
+    let mut children: Vec<String> = Vec::new();
+    for bus in vigem_pads::bus_instance_ids(VIGEMBUS_SERVICE) {
+        if let Some(kids) = vigem_pads::child_instance_ids(&bus) {
+            children.extend(kids);
+            // A machine has one bus devnode; if several ever exist the
+            // children are aggregated and the advice names the first present.
+            present_bus.get_or_insert(bus);
+        }
+    }
+    let owners = owner_candidates(&crate::process::snapshot(), std::process::id());
+    VirtualPadReport::from_bus_children(present_bus, children, owners)
 }
 
 fn windir() -> String {

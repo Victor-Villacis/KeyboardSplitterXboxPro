@@ -26,6 +26,7 @@ pub fn summarize(report: &DriverReport) -> Vec<Advice> {
     let mut out = Vec::new();
 
     summarize_vigembus(&report.vigembus, &mut out);
+    summarize_virtual_pads(report, &mut out);
     summarize_scpvbus(&report.scpvbus, &mut out);
     summarize_interception(report, &mut out);
     summarize_code_integrity(report, &mut out);
@@ -71,6 +72,49 @@ fn summarize_vigembus(v: &BusDriverReport, out: &mut Vec<Advice>) {
             message: "ViGEmBus is installed but its service state could not be queried.".into(),
         }),
     }
+}
+
+fn summarize_virtual_pads(report: &DriverReport, out: &mut Vec<Advice>) {
+    let pads = &report.virtual_pads;
+    if pads.count == 0 {
+        return;
+    }
+    if let Some(owner) = pads.owners.first() {
+        // Not a fault: a running splitter's pads are the product working. Info
+        // keeps the count visible for scripts without flagging anything.
+        out.push(Advice {
+            severity: Severity::Info,
+            code: "virtual-pads-in-use",
+            message: format!(
+                "{} virtual pad(s) are on the bus and a splitter process is running \
+                 ({} pid {}). Expected while it runs; the pads unplug when it exits.",
+                pads.count, owner.name, owner.pid
+            ),
+        });
+        return;
+    }
+    // The fix needs the bus devnode id; pads can only be counted via that
+    // devnode, so it is present whenever count > 0 — the fallback is for
+    // hand-built reports only.
+    let bus = pads
+        .bus_instance_id
+        .as_deref()
+        .unwrap_or("<ViGEmBus instance id>");
+    out.push(Advice {
+        severity: Severity::Warning,
+        code: "ghost-pads",
+        message: format!(
+            "{} virtual pad(s) are on the bus but no known splitter process ({}) is \
+             running. Unless another ViGEm client (DS4Windows and similar feeders \
+             use the same bus) created them, these are ghosts left by a killed or \
+             wedged session: they sit in joy.cpl, can hold XInput slots and confuse \
+             games. Close whatever created them if it is still alive; otherwise \
+             restart the bus device from an elevated prompt: \
+             pnputil /restart-device \"{bus}\" — or reboot.",
+            pads.count,
+            crate::virtual_pads::SPLITTER_PROCESS_NAMES.join(", "),
+        ),
+    });
 }
 
 fn summarize_scpvbus(s: &BusDriverReport, out: &mut Vec<Advice>) {
@@ -260,7 +304,19 @@ mod tests {
                     system_uptime_secs: Some(889_951),
                 }),
             },
+            virtual_pads: crate::virtual_pads::VirtualPadReport::empty(),
         }
+    }
+
+    fn ghost_pads(owners: Vec<crate::virtual_pads::OwnerProcess>) -> crate::VirtualPadReport {
+        crate::VirtualPadReport::from_bus_children(
+            Some("ROOT\\SYSTEM\\0002".into()),
+            [
+                "USB\\VID_045E&PID_028E\\2&2B7A94F5&0&01",
+                "USB\\VID_045E&PID_028E\\2&2B7A94F5&0&02",
+            ],
+            owners,
+        )
     }
 
     fn codes(advice: &[Advice]) -> Vec<&'static str> {
@@ -283,6 +339,54 @@ mod tests {
         assert!(bt.message.contains("784C4414"));
         assert!(bt.message.contains("10.29611.0.0"));
         assert!(bt.message.contains("feature updates"));
+    }
+
+    #[test]
+    fn unowned_pads_are_ghosts_with_the_restart_fix() {
+        let mut r = cabinet_report();
+        r.virtual_pads = ghost_pads(Vec::new());
+        let advice = summarize(&r);
+        let ghost = advice.iter().find(|a| a.code == "ghost-pads").unwrap();
+        assert_eq!(ghost.severity, Severity::Warning);
+        assert!(ghost.message.contains("2 virtual pad(s)"));
+        assert!(ghost.message.contains("ghosts"));
+        // The verdict must hedge: the owner check only knows the splitter
+        // process names, so it may claim "no known splitter", never "no owner
+        // exists" — a third-party ViGEm feeder (DS4Windows) is invisible to it.
+        assert!(ghost.message.contains("no known splitter process"));
+        assert!(ghost.message.contains("ksx.exe, KeyboardSplitter.exe"));
+        assert!(ghost.message.contains("ViGEm client"));
+        // The fix, verbatim enough to paste: restart the named bus devnode.
+        assert!(ghost
+            .message
+            .contains("pnputil /restart-device \"ROOT\\SYSTEM\\0002\""));
+        assert!(ghost.message.contains("reboot"));
+    }
+
+    #[test]
+    fn pads_with_a_live_splitter_are_info_not_ghosts() {
+        let mut r = cabinet_report();
+        r.virtual_pads = ghost_pads(vec![crate::OwnerProcess {
+            pid: 4242,
+            name: "ksx.exe".into(),
+        }]);
+        let advice = summarize(&r);
+        let codes = codes(&advice);
+        assert!(!codes.contains(&"ghost-pads"));
+        let in_use = advice
+            .iter()
+            .find(|a| a.code == "virtual-pads-in-use")
+            .unwrap();
+        assert_eq!(in_use.severity, Severity::Info);
+        assert!(in_use.message.contains("ksx.exe pid 4242"));
+    }
+
+    #[test]
+    fn zero_pads_say_nothing() {
+        let advice = summarize(&cabinet_report());
+        let codes = codes(&advice);
+        assert!(!codes.contains(&"ghost-pads"));
+        assert!(!codes.contains(&"virtual-pads-in-use"));
     }
 
     #[test]
@@ -375,6 +479,7 @@ mod tests {
                 active_policy_count: Some(6),
                 whql_evaluation: None,
             },
+            virtual_pads: crate::VirtualPadReport::empty(),
         };
         let advice = summarize(&r);
         assert_eq!(codes(&advice), vec!["interception-missing"]);

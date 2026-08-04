@@ -13,7 +13,7 @@
 
 use ksx_platform::{
     Advice, BusDriverReport, CiPolicyMode, ClassFilterReport, DriverFileReport, DriverReport,
-    ServiceState, Severity, SignatureStatus,
+    ServiceState, Severity, SignatureStatus, VirtualPadReport,
 };
 
 /// Exit code when any advice is `Critical` (documented in `--help`).
@@ -146,6 +146,10 @@ pub fn render_human(report: &DriverReport, advice: &[Advice]) -> String {
     render_vigembus(&mut doc, &report.vigembus);
     doc.blank();
 
+    doc.line("Virtual pads (what the bus is exposing right now)");
+    render_virtual_pads(&mut doc, &report.virtual_pads);
+    doc.blank();
+
     doc.line("ScpVBus (legacy bus — used by the old C# splitter, never by ksx)");
     render_scpvbus(&mut doc, &report.scpvbus);
     doc.blank();
@@ -194,6 +198,60 @@ fn render_vigembus(doc: &mut Doc, bus: &BusDriverReport) {
     match &bus.driver_file {
         Some(file) => render_driver_file(doc, file),
         None => doc.line("  [WARN] ViGEmBus.sys missing from System32\\drivers"),
+    }
+}
+
+fn render_virtual_pads(doc: &mut Doc, pads: &VirtualPadReport) {
+    if pads.count == 0 {
+        doc.line("  [OK]   none — the bus has no child pads");
+        return;
+    }
+    // Owned pads are the product working; unowned pads outlived their creator.
+    let marker = if pads.is_ghost_suspect() {
+        "[WARN]"
+    } else {
+        "[INFO]"
+    };
+    doc.line(format!(
+        "  {marker} {} virtual pad(s) on the bus",
+        pads.count
+    ));
+    for pad in &pads.pads {
+        let label = pad.persona_guess.label();
+        // Unknown personas print the id the guess was made from, so a new pad
+        // type is evidence rather than a mystery.
+        if pad.persona_guess == ksx_platform::PersonaGuess::Unknown {
+            doc.line(format!(
+                "  {marker}   {label} — {} (hardware id {})",
+                pad.instance_id, pad.hardware_id
+            ));
+        } else {
+            doc.line(format!("  {marker}   {label} — {}", pad.instance_id));
+        }
+    }
+    match pads.owners.first() {
+        Some(owner) => doc.line(format!(
+            "  [INFO] a splitter is running ({} pid {}) — pads unplug when it exits",
+            owner.name, owner.pid
+        )),
+        None => {
+            doc.line(format!(
+                "  [WARN] no known splitter process is running (checked {})",
+                ksx_platform::virtual_pads::SPLITTER_PROCESS_NAMES.join(", ")
+            ));
+            doc.line(
+                "  [WARN] unless another ViGEm client (e.g. DS4Windows) created them, \
+                 these are ghosts (pads that survived their creator)",
+            );
+            let bus = pads
+                .bus_instance_id
+                .as_deref()
+                .unwrap_or("<ViGEmBus instance id>");
+            doc.line(format!(
+                "  [WARN] fix: close whatever created them if it is still alive; else, \
+                 as admin: pnputil /restart-device \"{bus}\" — or reboot"
+            ));
+        }
     }
 }
 
@@ -405,7 +463,22 @@ mod tests {
                     system_uptime_secs: Some(889_951),
                 }),
             },
+            virtual_pads: VirtualPadReport::empty(),
         }
+    }
+
+    /// Two X360 ghosts and one id no persona matches, no owner process — the
+    /// state a `taskkill /f` mid-session leaves behind.
+    fn ghost_pads() -> VirtualPadReport {
+        VirtualPadReport::from_bus_children(
+            Some("ROOT\\SYSTEM\\0002".into()),
+            [
+                "USB\\VID_045E&PID_028E\\2&2B7A94F5&0&01",
+                "USB\\VID_045E&PID_028E\\2&2B7A94F5&0&02",
+                "USB\\VID_054C&PID_0CE6\\2&2B7A94F5&0&03",
+            ],
+            Vec::new(),
+        )
     }
 
     #[test]
@@ -427,6 +500,48 @@ mod tests {
     }
 
     #[test]
+    fn render_human_ghost_pads_name_the_fix() {
+        let mut report = cabinet_report();
+        report.virtual_pads = ghost_pads();
+        let advice = summarize(&report);
+        let text = render_human(&report, &advice);
+        assert!(text.contains("3 virtual pad(s) on the bus"), "{text}");
+        assert!(text.contains("Xbox 360 pad"), "{text}");
+        // The unknown row shows the id the guess was made from.
+        assert!(
+            text.contains("unknown pad") && text.contains("USB\\VID_054C&PID_0CE6"),
+            "{text}"
+        );
+        assert!(text.contains("ghosts"), "{text}");
+        // Hedged, not absolute: only the known splitter names were checked, so
+        // the render must not claim no owner exists (third-party ViGEm feeders
+        // are invisible to the heuristic).
+        assert!(text.contains("no known splitter process"), "{text}");
+        assert!(
+            text.contains("pnputil /restart-device \"ROOT\\SYSTEM\\0002\""),
+            "{text}"
+        );
+        // Ghosts warn; they must not flip the exit code.
+        assert_eq!(exit_code(&advice), 0);
+    }
+
+    #[test]
+    fn render_human_owned_pads_are_not_ghosts() {
+        let mut report = cabinet_report();
+        report.virtual_pads = ghost_pads();
+        report.virtual_pads.owners = vec![ksx_platform::OwnerProcess {
+            pid: 4242,
+            name: "ksx.exe".into(),
+        }];
+        let text = render_human(&report, &summarize(&report));
+        assert!(!text.contains("ghosts"), "{text}");
+        assert!(
+            text.contains("a splitter is running (ksx.exe pid 4242)"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn render_human_no_advice_is_ok() {
         let report = cabinet_report();
         let text = render_human(&report, &[]);
@@ -435,9 +550,39 @@ mod tests {
 
     #[test]
     fn doctor_json_shape() {
-        let report = cabinet_report();
+        let mut report = cabinet_report();
+        report.virtual_pads = ghost_pads();
         let advice = summarize(&report);
         let v = doctor_json(&report, &advice);
+        // The additive virtual-pads key: {count, pads:[{instance_id, persona_guess}]}.
+        assert_eq!(
+            v.pointer("/report/virtual_pads/count"),
+            Some(&serde_json::json!(3))
+        );
+        assert_eq!(
+            v.pointer("/report/virtual_pads/pads/0/persona_guess"),
+            Some(&serde_json::json!("xbox360"))
+        );
+        assert_eq!(
+            v.pointer("/report/virtual_pads/pads/0/instance_id"),
+            Some(&serde_json::json!(
+                "USB\\VID_045E&PID_028E\\2&2B7A94F5&0&01"
+            ))
+        );
+        assert_eq!(
+            v.pointer("/report/virtual_pads/pads/2/persona_guess"),
+            Some(&serde_json::json!("unknown"))
+        );
+        assert_eq!(
+            v.pointer("/report/virtual_pads/bus_instance_id"),
+            Some(&serde_json::json!("ROOT\\SYSTEM\\0002"))
+        );
+        assert!(v
+            .pointer("/advice")
+            .and_then(|a| a.as_array())
+            .unwrap()
+            .iter()
+            .any(|a| a.pointer("/code") == Some(&serde_json::json!("ghost-pads"))));
         assert_eq!(
             v.pointer("/report/vigembus/installed"),
             Some(&serde_json::json!(true))

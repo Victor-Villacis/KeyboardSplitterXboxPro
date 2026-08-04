@@ -4,6 +4,8 @@
 
 use serde::Serialize;
 
+use crate::virtual_pads::VirtualPadReport;
+
 /// Everything `ksx doctor` knows about the driver stack. All fields are
 /// best-effort: a query failure yields `None` / `Unknown`, never an error —
 /// the report must come back even (especially) on a broken machine.
@@ -17,6 +19,9 @@ pub struct DriverReport {
     pub interception: InterceptionReport,
     /// Code-integrity policy state relevant to the 2026 cross-signed-trust removal.
     pub code_integrity: CodeIntegrityReport,
+    /// Pads ViGEmBus is exposing right now — children of the bus devnode, never
+    /// a system-wide VID/PID match (see [`crate::virtual_pads`]).
+    pub virtual_pads: VirtualPadReport,
 }
 
 /// A kernel bus driver registered as a service.

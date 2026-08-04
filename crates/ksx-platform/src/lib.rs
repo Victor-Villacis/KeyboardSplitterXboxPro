@@ -30,6 +30,7 @@ pub mod process;
 pub mod report;
 pub mod sealed;
 pub mod sha256;
+pub mod virtual_pads;
 pub mod winusb;
 
 #[cfg(windows)]
@@ -44,3 +45,4 @@ pub use report::{
     DriverFileReport, DriverReport, InterceptionReport, ServiceInfo, ServiceState, SignatureInfo,
     SignatureStatus, StartType, WhqlEvaluationReport,
 };
+pub use virtual_pads::{OwnerProcess, PersonaGuess, VirtualPadInfo, VirtualPadReport};

@@ -11,8 +11,14 @@ fn collect_runs_and_serializes() {
     let report = collect();
     let json = serde_json::to_value(&report).expect("report serializes");
 
-    // Shape: the four sections are always present.
-    for section in ["vigembus", "scpvbus", "interception", "code_integrity"] {
+    // Shape: the five sections are always present.
+    for section in [
+        "vigembus",
+        "scpvbus",
+        "interception",
+        "code_integrity",
+        "virtual_pads",
+    ] {
         assert!(json.get(section).is_some(), "missing section {section}");
     }
 
@@ -33,6 +39,17 @@ fn collect_runs_and_serializes() {
         report.interception.installed,
         kbd.filter_active && kbd.driver_file.is_some()
     );
+
+    // The ghost-pad section: count mirrors the rows, and a pad without a bus
+    // devnode to hang off is impossible by construction.
+    let pads = &report.virtual_pads;
+    assert_eq!(pads.count, pads.pads.len());
+    if pads.count > 0 {
+        assert!(
+            pads.bus_instance_id.is_some(),
+            "children can only be enumerated via the bus devnode"
+        );
+    }
 
     // Verdicts derive without panicking and serialize.
     let advice = summarize(&report);

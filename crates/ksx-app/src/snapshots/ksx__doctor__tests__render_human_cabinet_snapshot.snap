@@ -9,6 +9,9 @@ ViGEmBus (virtual pad bus)
   [OK]   C:\Windows\System32\drivers\test.sys — 1.21.442.0
   [OK]   signature valid — Nefarius Software Solutions e.U.
 
+Virtual pads (what the bus is exposing right now)
+  [OK]   none — the bus has no child pads
+
 ScpVBus (legacy bus — used by the old C# splitter, never by ksx)
   [INFO] installed (running, 1.21.442.0) — harmless alongside ViGEmBus
 
