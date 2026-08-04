@@ -35,7 +35,9 @@ XOutput and friends is in [`docs/research/`](docs/research/).
 ## Status
 
 Backend-first rewrite in progress — milestone plan in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The legacy app remains the working
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), post-parity ideas (more pad types,
+8-player, key remapping, AI-drivable CLI) in
+[`docs/ENHANCEMENTS.md`](docs/ENHANCEMENTS.md). The legacy app remains the working
 fallback until `ksx` passes the full cabinet test matrix.
 
 | Milestone | Scope | Status |
