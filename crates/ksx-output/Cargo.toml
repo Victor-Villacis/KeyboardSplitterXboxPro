@@ -15,7 +15,9 @@ tracing.workspace = true
 [target.'cfg(windows)'.dependencies]
 vigem-client.workspace = true
 
-[dev-dependencies]
+# rusty-xinput only builds on Windows; the loopback test that uses it is
+# additionally gated behind `cab-tests`.
+[target.'cfg(windows)'.dev-dependencies]
 rusty-xinput.workspace = true
 
 [features]

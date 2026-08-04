@@ -1,0 +1,30 @@
+---
+source: crates/ksx-app/src/doctor.rs
+expression: "render_human(&report, &advice)"
+---
+ksx doctor — driver health
+
+ViGEmBus (virtual pad bus)
+  [OK]   service running (start: demand)
+  [OK]   C:\Windows\System32\drivers\test.sys — 1.21.442.0
+  [OK]   signature valid — Nefarius Software Solutions e.U.
+
+ScpVBus (legacy bus — used by the old C# splitter, never by ksx)
+  [INFO] installed (running, 1.21.442.0) — harmless alongside ViGEmBus
+
+Interception (keyboard/mouse class filters — M3 capture backend)
+  [OK]   keyboard-class upper filter active
+  [OK]   C:\Windows\System32\drivers\test.sys — 1.21.442.0
+  [WARN] signature valid via timestamp — Francisco Lopes da Silva; signing cert expired 2012-10-21T15:38:52Z
+  [OK]   mouse-class upper filter active
+  [OK]   C:\Windows\System32\drivers\test.sys — 1.21.442.0
+  [WARN] signature valid via timestamp — Francisco Lopes da Silva; signing cert expired 2012-10-21T15:38:52Z
+
+Code integrity (2026 cross-signed-trust removal)
+  [WARN] Microsoft Windows Cross Certificates for Code Integrity Exceptions Audit Policy ({784C4414-79F4-4C32-A6A5-F0FB42A51D0D}) — audit mode
+  [INFO] 8 active CI policies
+  [INFO] WHQL-only evaluation counters present (58 boot sessions, 889951s uptime) — enforcement not flipped yet
+
+Advice
+  [WARN] interception-borrowed-time: Interception is on borrowed time: its driver is cross-signed with a certificate that expired 2012-10-21, and the 'Microsoft Windows Cross Certificates for Code Integrity Exceptions Audit Policy' CI policy ({784C4414-79F4-4C32-A6A5-F0FB42A51D0D}, id 10.29611.0.0) is active on this machine in Audit mode. When Windows flips it to enforcement the driver is blocked from loading. Do NOT take Windows feature updates on the cabinet; the M6 WinUSB backend removes this dependency.
+  [INFO] scpvbus-present: Legacy ScpVBus (1.21.442.0) is still installed. Harmless alongside ViGEmBus (the legacy KeyboardSplitter keeps working); uninstall only after full migration to ksx.

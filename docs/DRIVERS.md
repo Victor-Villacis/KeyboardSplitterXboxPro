@@ -11,9 +11,11 @@ Deep dives: [`research/virtual-gamepad-2026.md`](research/virtual-gamepad-2026.m
   ecosystem default (Sunshine bundles it, DS4Windows/XOutput/JSM ship it).
 - Client: vendored [`crates/vigem-client`](../crates/vigem-client) (CasualX, MIT,
   pure-Rust `DeviceIoControl`, includes `get_user_index()` + X360 notification API).
-- Installer: bundle the 1.22.0 setup EXE in releases; **verify the Authenticode
-  publisher is `Nefarius Software Solutions e.U.` before executing**. Never download
-  at runtime (the old endpoints are rotting).
+- Installer: bundled at `drivers/ViGEmBus_1.22.0_x64_x86_arm64.exe` (fetched from the
+  official GitHub release v1.22.0; Authenticode **Valid**, signer
+  `CN=Nefarius Software Solutions e.U., L=Wels, C=AT`; SHA-256
+  `89220A7865076B342892F98865F3499FB7C4CFD673159E89D352C360FD014C6A` — re-verify both
+  before every install). Never download at runtime (the old endpoints are rotting).
 - Plan B: HIDMaestro (MIT, user-mode UMDF2; would mean a hand-written Rust client for
   its documented shared-memory protocol — verify its WGI double-input bug first).
   Plan C: libvirtualhid (LizardByte; revisit when Sunshine's PR merges and XInput slot

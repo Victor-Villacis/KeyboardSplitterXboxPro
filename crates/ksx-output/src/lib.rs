@@ -7,4 +7,26 @@
 //!
 //! `PadState` stays in XInput wire shape so plan-B backends (HIDMaestro,
 //! libvirtualhid — see `docs/research/virtual-gamepad-2026.md`) need no translation
-//! layer. Implemented in M2.
+//! layer.
+//!
+//! Layout:
+//! - [`VirtualPadBackend`] — the object-safe trait (design §3.2), the plan-B
+//!   insurance policy.
+//! - [`VigemBackend`] (Windows) — ViGEmBus implementation. Fails fast with
+//!   [`OutputError::BusNotFound`] when the driver is absent; dropping it unplugs
+//!   every pad (crash safety — a clean process exit never leaves ghost pads).
+//! - [`MockBackend`] — driverless implementation for engine-to-output tests.
+//! - `tests/loopback.rs` — cabinet-only XInput round-trip behind the `cab-tests`
+//!   feature; never runs in CI or on machines without ViGEmBus.
+
+mod backend;
+mod error;
+pub mod mock;
+#[cfg(windows)]
+mod vigem;
+
+pub use backend::{Feedback, PadHandle, VirtualPadBackend};
+pub use error::OutputError;
+pub use mock::MockBackend;
+#[cfg(windows)]
+pub use vigem::VigemBackend;

@@ -8,9 +8,27 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows.workspace = true
-windows-sys.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_Storage_FileSystem",
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+] }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[features]
+# Tests that assert THIS cabinet's known driver state (ScpVBus present,
+# Interception live, expired cross-signed cert, {784C4414-…} CI audit policy).
+# Only ever run on the cabinet, never CI.
+cab-tests = []
