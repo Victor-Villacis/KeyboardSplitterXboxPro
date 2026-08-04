@@ -188,3 +188,44 @@ by hand with Zadig:
 
 System Restore point / disk image taken at M0 (do make one). The legacy app +
 drivers currently work; an image of that state is the ultimate fallback.
+
+## Known environment hazard: Windows Terminal dies when virtual pads send input
+
+**Symptom**: you run `ksx pads` (or press panel buttons during `ksx run`) and
+"it crashes" — the whole Windows Terminal window vanishes, taking every tab
+with it (including a Claude Code CLI tab, if one is open). ksx itself is the
+*victim*: when its console host dies, Windows kills it too, teardown never
+runs, and the bus auto-unplugs the pads (Steam then toasts "controller
+disconnected"). The ksx log shows plugs and then silence — no unplug lines, no
+panic.
+
+**Root cause (upstream, not ksx)**: WinUI 2 TabView's gamepad focus-navigation
+path fail-fasts XAML Islands hosts — gamepad input drives Up/Down focus moves
+between tabs, `TabView::OnListViewGettingFocus` calls
+`DispatcherQueue.TryEnqueue`, it fails `E_INVALIDARG`, XAML fail-fasts the
+process (`0xc000027b`, `Windows.UI.Xaml.dll+0x8f9773`). Gamepad input reaches
+Terminal **even as a background window**, so it can die while a game or test
+pattern is in the foreground. Confirmed by Terminal maintainers:
+microsoft/terminal#19671, #20089; WinUI issue microsoft-ui-xaml#11155.
+
+**Fix status**: patched in microsoft/terminal PR #20234 (merged 2026-06-23) —
+in Canary builds now, expected in **Terminal 1.26**. Stable 1.24 and preview
+1.25 both still crash (verified on this machine 2026-08-04: six identical
+crashes across two 1.24 builds).
+
+**Until then**:
+- Drive pads from a console *not* hosted by Windows Terminal: `Win+R` →
+  `conhost.exe`, run ksx there. (Or temporarily set Settings → System →
+  For developers → Terminal → *Windows Console Host*.)
+- Don't run pad tests from a Terminal that also hosts anything you care
+  about — every tab dies together (one process hosts all windows).
+- The cabinet path is immune: the tray daemon and the LaunchBox/RetroBat
+  wrapper never attach to Windows Terminal.
+
+Diagnosed 2026-08-04 from: Application Event Log 1000 (6× identical signature,
+incl. one at 4 AM with ksx idle), LocalDumps minidumps (stowed-exception
+stream, XAML UI thread, zero gaming-input modules loaded), Steam
+controller.txt (pads vanish with `hid_read failure` at the crash instant in
+every episode; a detached 30 s run survived untouched), and the upstream
+issues above. This also retroactively explains the terminal crashes seen
+during M3–M5 testing ("something opened and crashed").
