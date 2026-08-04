@@ -59,6 +59,13 @@ Legacy KeyboardSplitter shipped zero tests; the oracle is built, not inherited:
 - **Driver safety**: no Windows feature updates on the cabinet until M6 removes
   the Interception dependency (audit→enforcement CI-policy cliff);
   `docs/RECOVERY.md` before any capture-layer experiment.
+- **Driver bindings are supervised, never incidental.** Nothing in ksx or in an
+  agent session rebinds a device, runs `pnputil`, or installs an INF as a side
+  effect of something else. `ksx winusb claim`/`release` are dry runs by default
+  and need an explicit `--yes` plus an admin token; a rebind on the cabinet is a
+  deliberate act performed with `docs/RECOVERY.md` §2 open and a second keyboard
+  plugged in. The one refusal that is not negotiable: never claim a machine's
+  last keyboard.
 
 ## Conventions
 

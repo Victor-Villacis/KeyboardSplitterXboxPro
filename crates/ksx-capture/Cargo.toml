@@ -9,6 +9,12 @@ rust-version.workspace = true
 
 [dependencies]
 ksx-core.workspace = true
+# For `ksx_platform::inject`: on a WinUSB-claimed interface, passthrough is
+# keystroke *synthesis*, not a re-send, and `inject::stroke_for` is the exact
+# inverse of this crate's `keymap::corrected_key`. Two tables would be two
+# sources of truth; the capture layer consumes that one rather than growing a
+# second SendInput of its own.
+ksx-platform.workspace = true
 crossbeam-channel.workspace = true
 arc-swap.workspace = true
 thiserror.workspace = true
@@ -20,7 +26,11 @@ tracing.workspace = true
 # header says 0x04), so its receive() silently drops every E1/Pause stroke, and it
 # allocates a Vec per receive/send. See src/interception.rs for the full rationale.
 kanata-interception.workspace = true
-# nusb intentionally NOT a dependency yet: the WinUSB backend lands in M6. Re-add there.
+# M6: the WinUSB backend claims the I-PAC's MI_00 interface through Microsoft's
+# in-box winusb.sys and reads HID interrupt reports directly — pure Rust, no C
+# dependency, and no third-party kernel driver to be revoked by the 2026
+# cross-signing cliff (docs/research/keyboard-capture-2026.md §4, §7).
+nusb.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi", # WNDCLASSEXW/RegisterClassExW are gated on it (HBRUSH)

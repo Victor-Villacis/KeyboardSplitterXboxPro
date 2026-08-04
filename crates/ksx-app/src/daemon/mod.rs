@@ -31,10 +31,38 @@
 //! loop, same commands, same state — the tray is a front end for it, not a
 //! parallel implementation. That is what makes the tray droppable if it ever
 //! misbehaves, and what makes the control loop testable in CI.
+//!
+//! # M6: the daemon owns the panel
+//!
+//! With the Interception backend the daemon is a convenience — between sessions
+//! every keyboard is an ordinary keyboard whether ksx runs or not. With a
+//! WinUSB-claimed panel that is no longer true: the claimed interface is not in
+//! the keyboard stack, so **something has to put its keystrokes back**, and the
+//! only thing that can is ksx. [`typethrough::TypethroughService`] does it, and
+//! this control loop decides when: [`PanelKeyboard::set_emulating`] is called
+//! `true` before a session starts and `false` after it is reaped. That ordering
+//! is contractual and asserted in CI — see
+//! [`tests::the_panel_stops_typing_before_a_session_starts_and_resumes_after_it_ends`].
+//!
+//! The claim itself is made **once**, by [`run`], before this loop starts, and
+//! lives in a [`panel::Panel`] for the whole life of the process. Sessions
+//! borrow it through `Panel::session_backend` (`crate::capture::build_session`);
+//! `supervise()` starts and stops that borrowed view per session while the claim
+//! underneath never moves. Interception-backed devices are unchanged: their
+//! backend is still created and destroyed per session, because between sessions
+//! the OS owns them and ksx has nothing to do.
+//!
+//! End to end, that path is asserted in [`panel_tests`]: two real sessions over
+//! one mock-backed claim, with the panel typing in between.
 
 pub mod live;
+pub mod panel;
 #[cfg(windows)]
 pub mod tray;
+pub mod typethrough;
+
+#[cfg(test)]
+mod panel_tests;
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -210,14 +238,80 @@ pub trait SessionFactory: Send {
     fn game(&self) -> Option<String>;
 }
 
+/// The keystroke behaviour of a WinUSB-claimed panel between sessions.
+///
+/// Implemented for real by [`typethrough::TypethroughService`]; [`NoPanel`] is
+/// the correct implementation for every backend whose devices are still
+/// keyboards in their own right (Interception, RawInput), where the OS is
+/// already doing this and ksx doing it too would double every keystroke.
+pub trait PanelKeyboard: Send {
+    /// `true` = emulation owns the panel, inject nothing. `false` = the panel
+    /// is a keyboard again.
+    ///
+    /// Implementations must have applied the change by the time this returns
+    /// (see [`typethrough::TypethroughService::set_emulating`]): a queued mode
+    /// change races the keystroke stream.
+    fn set_emulating(&mut self, emulating: bool);
+
+    /// Clear the escape passthrough latch, leaving the counters alone.
+    ///
+    /// Called in the same breath as muting: the instant the panel goes dead is
+    /// the instant a fresh `LeftCtrl x5` must be able to revive it. Arming any
+    /// later — once the supervisor is up, after pads have finished plugging —
+    /// silently erases a gesture made during those seconds, which is exactly
+    /// when a user staring at a dead panel reaches for one.
+    fn arm_escapes(&mut self) {}
+}
+
+/// The panel needs no help — its devices are still keyboards to Windows.
+pub struct NoPanel;
+
+impl PanelKeyboard for NoPanel {
+    fn set_emulating(&mut self, _emulating: bool) {}
+}
+
+/// Choose the daemon's [`PanelKeyboard`].
+///
+/// Given the claim the daemon made at startup, the panel types between sessions
+/// through its [`typethrough::TypethroughService`]. Given `None`, every bound
+/// device is still a keyboard in its own right (the Interception backend, or a
+/// machine with nothing claimed) and ksx injecting as well would double every
+/// keystroke, so the panel is left alone.
+///
+/// This is the one seam where the WinUSB backend plugs into the daemon: the
+/// **daemon** owns the claim for its whole lifetime and hands each session a
+/// borrowed view of it, instead of the M4/M5 arrangement where `supervise()`
+/// created and destroyed the capture backend per session. That inversion is
+/// required, not stylistic — releasing a WinUSB claim between sessions would not
+/// give the panel back to Windows, only stop anything reading it. See
+/// `docs/ARCHITECTURE.md` §M6.
+pub fn panel_for(panel: Option<Arc<panel::Panel>>) -> Box<dyn PanelKeyboard> {
+    match panel {
+        Some(panel) => Box::new(panel::PanelKeyboardHandle(panel)),
+        None => Box::new(NoPanel),
+    }
+}
+
 /// The control loop. Returns when [`DaemonCommand::Quit`] is handled or the
 /// command channel closes.
 ///
 /// Blocking here is free: nothing in the input path waits on this thread.
-pub fn control_loop(
+///
+/// The two calls into `panel` are the whole M6 daemon contract:
+///
+/// - **before** a session is spawned, `set_emulating(true)` — otherwise the
+///   first frames of a game are both translated into pad state *and* typed onto
+///   the desktop behind it;
+/// - **after** a session is reaped, `set_emulating(false)` — otherwise the
+///   frontend the player just returned to has a dead panel, which is the exact
+///   failure mode a WinUSB claim introduces.
+///
+/// Both orderings are asserted in CI against a recording panel.
+pub fn control_loop_with(
     commands: Receiver<DaemonCommand>,
     state: SharedState,
     factory: &mut dyn SessionFactory,
+    panel: &mut dyn PanelKeyboard,
     out: &mut dyn Write,
 ) {
     let mut session: Option<LiveSession> = None;
@@ -230,6 +324,7 @@ pub fn control_loop(
             if live.handle.as_ref().is_some_and(|h| h.is_finished()) {
                 let finished = session.take().expect("checked");
                 reap(finished, &state, out);
+                panel.set_emulating(false);
             }
         }
 
@@ -239,13 +334,27 @@ pub fn control_loop(
                     let _ = writeln!(out, "already running");
                     continue;
                 }
+                // Mute the panel BEFORE the pipeline exists, not after — and
+                // re-arm the escape latch in the same breath. Muting and
+                // arming are one event: the moment the panel goes dead is the
+                // moment a fresh LeftCtrl x5 must be able to bring it back.
+                // Arming later (in the supervisor, after pads plug) would
+                // silently erase a gesture made during those seconds.
+                panel.arm_escapes();
+                panel.set_emulating(true);
                 session = start(factory, &state, out);
+                if session.is_none() {
+                    // Nothing started, so nothing owns the panel: give it back
+                    // rather than leaving a dead panel behind a failed start.
+                    panel.set_emulating(false);
+                }
             }
             Ok(DaemonCommand::Stop) => match session.take() {
                 Some(live) => {
                     let _ = writeln!(out, "stopping…");
                     live.stop.store(true, Ordering::SeqCst);
                     reap(live, &state, out);
+                    panel.set_emulating(false);
                 }
                 None => {
                     let _ = writeln!(out, "not running");
@@ -258,7 +367,11 @@ pub fn control_loop(
                 }
                 let _ = writeln!(out, "reloading configuration…");
                 set_game(&state, factory.game());
+                panel.set_emulating(true);
                 session = start(factory, &state, out);
+                if session.is_none() {
+                    panel.set_emulating(false);
+                }
             }
             Ok(DaemonCommand::OpenConfigFolder) => {
                 let dir = factory.config_dir();
@@ -277,6 +390,11 @@ pub fn control_loop(
                     live.stop.store(true, Ordering::SeqCst);
                     reap(live, &state, out);
                 }
+                // The daemon is going away and the claim goes with it. Handing
+                // the panel back on the way out is what makes a `quit` while a
+                // key is held not leave that key latched down on the desktop —
+                // the typethrough's own Drop is the second line of defence.
+                panel.set_emulating(false);
                 set_run(&state, RunState::Quitting);
                 let _ = writeln!(out, "bye");
                 let _ = out.flush();
@@ -291,6 +409,7 @@ pub fn control_loop(
                     live.stop.store(true, Ordering::SeqCst);
                     reap(live, &state, out);
                 }
+                panel.set_emulating(false);
                 set_run(&state, RunState::Quitting);
                 let _ = out.flush();
                 return;
@@ -435,14 +554,38 @@ pub fn run(
     let root = ksx_config::ConfigRoot::discover()?;
     // Fail fast on a broken configuration rather than showing a tray icon that
     // can only ever report errors.
-    if let Err(err) = crate::run::plan::resolve(&root, game.as_deref()) {
-        eprintln!("refusing to start the daemon:\n{err}");
-        std::process::exit(crate::run::EXIT_CANNOT_START);
-    }
+    let plan = match crate::run::plan::resolve(&root, game.as_deref()) {
+        Ok(plan) => plan,
+        Err(err) => {
+            eprintln!("refusing to start the daemon:\n{err}");
+            std::process::exit(crate::run::EXIT_CANNOT_START);
+        }
+    };
+
+    // M6: the claim is made HERE, once, and released when this function
+    // returns (or when the process dies, which needs no cleanup — the binding
+    // outlives us either way). Everything after this point borrows it. A claim
+    // failure is a refusal to start: a daemon that could not take the panel it
+    // was configured for would silently be a daemon with a dead panel.
+    #[cfg(windows)]
+    let claimed = match crate::capture::claim_panel(&plan) {
+        Ok(panel) => panel,
+        Err(err) => {
+            eprintln!("refusing to start the daemon: {err}");
+            std::process::exit(crate::run::EXIT_CANNOT_START);
+        }
+    };
+    #[cfg(not(windows))]
+    let claimed: Option<Arc<panel::Panel>> = {
+        let _ = &plan;
+        None
+    };
+
     let mut factory = live::LiveFactory {
         root,
         game,
         no_launch,
+        panel: claimed.clone(),
     };
 
     let (tx, rx) = crossbeam_channel::unbounded::<DaemonCommand>();
@@ -450,6 +593,14 @@ pub fn run(
     if autostart {
         let _ = tx.send(DaemonCommand::Start);
     }
+
+    // M6 seam. Taken FROM THE FACTORY on purpose: the panel the control loop
+    // mutes and the panel the sessions borrow have to be the same object, and
+    // for the whole of M6 they were not — the loop got `panel_for(None)` while
+    // each session claimed its own. Asking the factory makes that class of bug
+    // unspellable. `None` inside means no claim, which is every configuration
+    // whose devices are still keyboards to Windows.
+    let mut panel = factory.panel_keyboard();
 
     #[cfg(windows)]
     if !headless {
@@ -460,7 +611,7 @@ pub fn run(
                 .name("ksx-daemon".into())
                 .spawn(move || {
                     let mut out = std::io::stdout();
-                    control_loop(rx, state, &mut factory, &mut out);
+                    control_loop_with(rx, state, &mut factory, panel.as_mut(), &mut out);
                 })?
         };
         if tray::run(tx.clone(), state.clone()) {
@@ -469,6 +620,7 @@ pub fn run(
             let _ = tx.send(DaemonCommand::Quit);
             drop(tx);
             let _ = worker.join();
+            release_claim(claimed.as_ref());
             return Ok(());
         }
         // The tray could not be created (Session 0, a locked-down desktop, no
@@ -483,6 +635,7 @@ pub fn run(
         });
         drop(tx);
         let _ = worker.join();
+        release_claim(claimed.as_ref());
         return Ok(());
     }
 
@@ -494,8 +647,20 @@ pub fn run(
     });
     drop(tx);
     let mut out = std::io::stdout();
-    control_loop(rx, state, &mut factory, &mut out);
+    control_loop_with(rx, state, &mut factory, panel.as_mut(), &mut out);
+    release_claim(claimed.as_ref());
     Ok(())
+}
+
+/// Release the daemon's claim on the way out.
+///
+/// [`panel::Panel`]'s `Drop` does this anyway — that is what covers a panicking
+/// control thread — but the ordinary exit says so explicitly rather than relying
+/// on the order in which three `Arc`s happen to drop.
+fn release_claim(panel: Option<&Arc<panel::Panel>>) {
+    if let Some(panel) = panel {
+        panel.shutdown();
+    }
 }
 
 /// Read commands from stdin and forward them. Runs on its own thread so the
@@ -534,6 +699,34 @@ mod tests {
     use super::*;
     use crossbeam_channel::unbounded;
 
+    /// Shared ordered log, so panel transitions and session lifecycle events
+    /// can be interleaved and asserted against each other.
+    type Trace = Arc<Mutex<Vec<&'static str>>>;
+
+    fn note(trace: &Trace, what: &'static str) {
+        if let Ok(mut log) = trace.lock() {
+            log.push(what);
+        }
+    }
+
+    /// A [`PanelKeyboard`] that records the transitions it is told to make.
+    struct RecordingPanel {
+        trace: Trace,
+    }
+
+    impl PanelKeyboard for RecordingPanel {
+        fn set_emulating(&mut self, emulating: bool) {
+            note(
+                &self.trace,
+                if emulating {
+                    "panel:muted"
+                } else {
+                    "panel:typing"
+                },
+            );
+        }
+    }
+
     /// A runner that blocks until told to stop, and reports whatever we script.
     struct FakeRunner {
         summary: SessionSummary,
@@ -542,6 +735,7 @@ mod tests {
         ran: Arc<AtomicBool>,
         /// End on its own after this long, ignoring `stop`.
         self_ends_after: Option<Duration>,
+        trace: Option<Trace>,
     }
 
     impl SessionRunner for FakeRunner {
@@ -550,6 +744,9 @@ mod tests {
             stop: Arc<AtomicBool>,
             _out: &mut dyn Write,
         ) -> anyhow::Result<SessionSummary> {
+            if let Some(trace) = &self.trace {
+                note(trace, "session:started");
+            }
             self.ran.store(true, Ordering::SeqCst);
             let deadline = self.self_ends_after.map(|d| Instant::now() + d);
             loop {
@@ -560,6 +757,9 @@ mod tests {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
+            }
+            if let Some(trace) = &self.trace {
+                note(trace, "session:ended");
             }
             Ok(self.summary.clone())
         }
@@ -576,6 +776,7 @@ mod tests {
         self_ends_after: Option<Duration>,
         fail_with: Option<String>,
         makes: Arc<Mutex<u32>>,
+        trace: Option<Trace>,
     }
 
     impl Default for FakeFactory {
@@ -591,6 +792,7 @@ mod tests {
                 self_ends_after: None,
                 fail_with: None,
                 makes: Arc::new(Mutex::new(0)),
+                trace: None,
             }
         }
     }
@@ -606,6 +808,7 @@ mod tests {
                 slots: self.slots,
                 ran: self.ran.clone(),
                 self_ends_after: self.self_ends_after,
+                trace: self.trace.clone(),
             }))
         }
 
@@ -626,7 +829,7 @@ mod tests {
         drop(tx);
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
         let mut out: Vec<u8> = Vec::new();
-        control_loop(rx, state.clone(), factory, &mut out);
+        control_loop_with(rx, state.clone(), factory, &mut NoPanel, &mut out);
         let final_state = state.lock().unwrap().clone();
         (final_state, String::from_utf8(out).unwrap())
     }
@@ -724,7 +927,7 @@ mod tests {
             let _ = tx.send(DaemonCommand::Quit);
         });
         let mut out: Vec<u8> = Vec::new();
-        control_loop(rx, state.clone(), &mut factory, &mut out);
+        control_loop_with(rx, state.clone(), &mut factory, &mut NoPanel, &mut out);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("game-exited"), "{text}");
         let last = watcher.lock().unwrap().last.clone().expect("recorded");
@@ -758,7 +961,7 @@ mod tests {
         drop(tx);
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
         let mut out: Vec<u8> = Vec::new();
-        control_loop(rx, state.clone(), &mut factory, &mut out);
+        control_loop_with(rx, state.clone(), &mut factory, &mut NoPanel, &mut out);
         assert_eq!(state.lock().unwrap().run, RunState::Quitting);
     }
 
@@ -804,6 +1007,157 @@ mod tests {
         assert!(running[1].2, "stop must be available while running");
         // The other three are always available.
         assert!(running[2..].iter().all(|(_, _, enabled)| *enabled));
+    }
+
+    // -----------------------------------------------------------------
+    // M6: the claimed-panel contract
+    // -----------------------------------------------------------------
+
+    fn drive_with_panel(script: &[DaemonCommand]) -> Vec<&'static str> {
+        let trace: Trace = Arc::new(Mutex::new(Vec::new()));
+        let mut factory = FakeFactory {
+            trace: Some(trace.clone()),
+            ..FakeFactory::default()
+        };
+        let mut panel = RecordingPanel {
+            trace: trace.clone(),
+        };
+        let (tx, rx) = unbounded();
+        for command in script {
+            tx.send(*command).unwrap();
+        }
+        drop(tx);
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        let mut out: Vec<u8> = Vec::new();
+        control_loop_with(rx, state, &mut factory, &mut panel, &mut out);
+        let log = trace.lock().unwrap().clone();
+        log
+    }
+
+    /// **The M6 daemon contract.** The panel must stop typing *before* the
+    /// session exists and start again *after* it is gone.
+    ///
+    /// Get the first one wrong and a player's inputs are translated to pad
+    /// state and typed onto the desktop behind the game at the same time. Get
+    /// the second one wrong and they come back to a frontend they cannot
+    /// navigate — which is the whole failure a WinUSB claim introduces and the
+    /// whole reason this mechanism exists.
+    #[test]
+    fn the_panel_stops_typing_before_a_session_starts_and_resumes_after_it_ends() {
+        let log = drive_with_panel(&[
+            DaemonCommand::Start,
+            DaemonCommand::Stop,
+            DaemonCommand::Quit,
+        ]);
+        let mute = log.iter().position(|s| *s == "panel:muted").expect("muted");
+        let started = log
+            .iter()
+            .position(|s| *s == "session:started")
+            .expect("started");
+        let ended = log
+            .iter()
+            .position(|s| *s == "session:ended")
+            .expect("ended");
+        let typing = log
+            .iter()
+            .position(|s| *s == "panel:typing")
+            .expect("resumed");
+        assert!(
+            mute < started,
+            "the panel must be muted before the session exists: {log:?}"
+        );
+        assert!(
+            ended < typing,
+            "the panel must resume only after the session is gone: {log:?}"
+        );
+    }
+
+    /// A session that ends by itself (the game exited) hands the panel back
+    /// too — otherwise quitting a game leaves a dead frontend.
+    #[test]
+    fn a_self_ending_session_hands_the_panel_back() {
+        let trace: Trace = Arc::new(Mutex::new(Vec::new()));
+        let mut factory = FakeFactory {
+            self_ends_after: Some(Duration::from_millis(20)),
+            trace: Some(trace.clone()),
+            ..FakeFactory::default()
+        };
+        let mut panel = RecordingPanel {
+            trace: trace.clone(),
+        };
+        let (tx, rx) = unbounded();
+        tx.send(DaemonCommand::Start).unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = tx.send(DaemonCommand::Quit);
+        });
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        let mut out: Vec<u8> = Vec::new();
+        control_loop_with(rx, state, &mut factory, &mut panel, &mut out);
+
+        let log = trace.lock().unwrap().clone();
+        let ended = log
+            .iter()
+            .position(|s| *s == "session:ended")
+            .unwrap_or_else(|| panic!("the fake session must have ended: {log:?}"));
+        assert!(
+            log[ended + 1..].contains(&"panel:typing"),
+            "the panel must be handed back after a game exits on its own: {log:?}"
+        );
+        // ...and it was muted first, or it was never ksx's to hand back.
+        assert!(log[..ended].contains(&"panel:muted"), "{log:?}");
+    }
+
+    /// A start that never starts must not leave the panel muted: nothing owns
+    /// it, so it has to keep typing.
+    #[test]
+    fn a_failed_start_gives_the_panel_straight_back() {
+        let trace: Trace = Arc::new(Mutex::new(Vec::new()));
+        let mut factory = FakeFactory {
+            fail_with: Some("refusing to start".into()),
+            trace: Some(trace.clone()),
+            ..FakeFactory::default()
+        };
+        let mut panel = RecordingPanel {
+            trace: trace.clone(),
+        };
+        let (tx, rx) = unbounded();
+        tx.send(DaemonCommand::Start).unwrap();
+        drop(tx);
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        let mut out: Vec<u8> = Vec::new();
+        control_loop_with(rx, state, &mut factory, &mut panel, &mut out);
+
+        let log = trace.lock().unwrap().clone();
+        assert_eq!(log.first(), Some(&"panel:muted"), "{log:?}");
+        assert_eq!(
+            log.get(1),
+            Some(&"panel:typing"),
+            "a failed start must hand the panel straight back: {log:?}"
+        );
+        assert!(!log.contains(&"session:started"), "{log:?}");
+    }
+
+    /// Losing the command channel is a teardown path too.
+    #[test]
+    fn a_disconnected_channel_hands_the_panel_back_before_returning() {
+        let log = drive_with_panel(&[DaemonCommand::Start]);
+        assert_eq!(
+            log.last(),
+            Some(&"panel:typing"),
+            "the last thing a dying daemon does is give the panel back: {log:?}"
+        );
+    }
+
+    /// The default is `NoPanel`: with a backend whose devices are still
+    /// keyboards, ksx injecting as well would double every keystroke.
+    #[test]
+    fn the_default_panel_does_nothing() {
+        let mut panel = NoPanel;
+        panel.set_emulating(true);
+        panel.set_emulating(false);
+        // Compiles, does nothing, and `control_loop` uses it — which is the
+        // assertion: existing behaviour is unchanged.
     }
 
     #[test]

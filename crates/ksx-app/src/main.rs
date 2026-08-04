@@ -2,6 +2,8 @@
 
 mod autostart;
 #[cfg(windows)]
+mod capture;
+#[cfg(windows)]
 mod ctrl_c;
 mod daemon;
 mod devices;
@@ -10,6 +12,7 @@ mod install;
 mod monitor;
 mod pads;
 mod run;
+mod winusb;
 
 use clap::{Parser, Subcommand};
 
@@ -72,15 +75,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List keyboards as the Interception driver sees them
+    /// List every keyboard ksx could capture, on either backend
     ///
-    /// Read-only: enumerates keyboards (hardware id, Interception slot,
-    /// friendly name), tags the known I-PAC encoder, and reports slot-budget
-    /// health. Never sets a keyboard filter — cannot affect this machine's
-    /// keyboards.
+    /// Read-only on both halves: keyboards as the Interception driver sees them
+    /// (hardware id, slot, friendly name, slot-budget health), and USB
+    /// interfaces as WinUSB candidates (instance path, VID/PID, interface, and
+    /// whether the winusb.sys rebind is present). Each device is shown with the
+    /// backend its `[[device]]` entry selects. Nothing is opened, claimed or
+    /// rebound, and no keyboard filter is ever set — this cannot affect the
+    /// machine's keyboards.
     ///
-    /// Exit codes: 0 = listed, 1 = error, 2 = Interception driver unavailable
-    /// (run `ksx doctor`).
+    /// A missing Interception driver is reported, not fatal: after the M6
+    /// rebind, running with it uninstalled is the target state.
+    ///
+    /// Exit codes: 0 = listed, 1 = error, 2 = nothing could be enumerated at
+    /// all (run `ksx doctor`).
     Devices {
         /// One JSON object {backend, keyboards, mice_visible, health} on stdout
         #[arg(long)]
@@ -257,6 +266,87 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Manage the WinUSB claim: which interfaces ksx can take, and how to give them back
+    ///
+    /// Claiming an interface rebinds it from the keyboard stack to Microsoft's
+    /// in-box winusb.sys. Blocking then costs nothing and cannot be bypassed —
+    /// the interface is not in the keyboard stack at all — and there is no
+    /// third-party kernel driver left to expire. That is what M6 is for: the
+    /// Interception driver this project shipped on is cross-signed with a
+    /// certificate that expired in 2012.
+    ///
+    /// THE TRADE, stated plainly: a claimed panel is no longer a keyboard.
+    /// It types only while ksx is running — the daemon re-injects its keys
+    /// with SendInput whenever emulation is stopped, so frontend menus keep
+    /// working. If ksx is not running, a claimed panel does nothing. Injected
+    /// keys also cannot reach the lock screen, a UAC prompt or Ctrl+Alt+Del.
+    /// Keep one ordinary keyboard on another port; `claim` refuses to take the
+    /// last one.
+    ///
+    /// `status` is read-only. `claim` and `release` are dry runs by default:
+    /// they print the exact INF and the exact pnputil command line and change
+    /// nothing until you add --yes (which also needs an administrator token).
+    ///
+    /// Exit codes: 0 = reported or done, 1 = error, 2 = refused (unknown or
+    /// ambiguous device, not a keyboard interface, already claimed, elevation
+    /// needed, or it is the only keyboard on the machine), 3 = pnputil ran and
+    /// failed.
+    Winusb {
+        #[command(subcommand)]
+        command: WinusbCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum WinusbCommand {
+    /// List USB interfaces, their current driver, and whether ksx could claim them
+    ///
+    /// Read-only: reads the PnP device tree and the registry. Opens nothing,
+    /// claims nothing, changes nothing.
+    Status {
+        /// One JSON object {keyboard_count, keyboards, candidates} on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rebind an interface to winusb.sys (DRY RUN unless --yes)
+    ///
+    /// DEVICE is an instance path from `ksx winusb status`, or any unique
+    /// substring of one. An ambiguous match is refused, never guessed — two
+    /// identical I-PACs differ only in their instance path.
+    Claim {
+        /// Instance path (or a unique substring) from `ksx winusb status`
+        device: String,
+        /// Print the INF and the commands; change nothing (the default)
+        #[arg(long)]
+        dry_run: bool,
+        /// Actually write the INF and run pnputil (needs administrator)
+        #[arg(long)]
+        yes: bool,
+        /// JSON on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Give an interface back to the keyboard driver (DRY RUN unless --yes)
+    ///
+    /// The rollback: pnputil /remove-device, delete the ksx INF from the driver
+    /// store (without which a rescan re-binds WinUSB straight back), then
+    /// /scan-devices.
+    Release {
+        /// Instance path (or a unique substring) from `ksx winusb status`
+        device: String,
+        /// Print the commands; change nothing (the default)
+        #[arg(long)]
+        dry_run: bool,
+        /// Actually run pnputil (needs administrator)
+        #[arg(long)]
+        yes: bool,
+        /// Release a device that is not currently WinUSB-bound (recovery)
+        #[arg(long)]
+        force: bool,
+        /// JSON on stdout
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Default log level when `RUST_LOG` says nothing.
@@ -377,6 +467,37 @@ fn main() -> anyhow::Result<()> {
             dry_run,
             json,
         }),
+        Command::Winusb { command } => match command {
+            WinusbCommand::Status { json } => winusb::run(winusb::Options {
+                action: winusb::Action::Status,
+                dry_run: true,
+                yes: false,
+                json,
+            }),
+            WinusbCommand::Claim {
+                device,
+                dry_run,
+                yes,
+                json,
+            } => winusb::run(winusb::Options {
+                action: winusb::Action::Claim { device },
+                dry_run,
+                yes,
+                json,
+            }),
+            WinusbCommand::Release {
+                device,
+                dry_run,
+                yes,
+                force,
+                json,
+            } => winusb::run(winusb::Options {
+                action: winusb::Action::Release { device, force },
+                dry_run,
+                yes,
+                json,
+            }),
+        },
     }
 }
 
@@ -547,10 +668,21 @@ mod tests {
         let devices = cmd.find_subcommand_mut("devices").unwrap();
         let help = devices.render_long_help().to_string();
         assert!(
-            help.contains("2 = Interception driver unavailable"),
+            help.contains("2 = nothing could be enumerated at all"),
             "{help}"
         );
         assert!(help.contains("ksx doctor"), "{help}");
+        // M6 changed what a missing Interception driver means here: it is the
+        // expected end state, not a failure, and the help has to say so or
+        // someone will read exit 0 with an empty keyboard list as a bug.
+        assert!(
+            help.contains("A missing Interception driver is reported, not fatal"),
+            "{help}"
+        );
+        assert!(
+            help.contains("Nothing is opened, claimed or rebound"),
+            "{help}"
+        );
     }
 
     #[test]
@@ -762,6 +894,89 @@ mod tests {
             !text.contains("M4"),
             "the not-yet stub must be gone: {text}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // M6: ksx winusb
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn winusb_status_parses_and_is_the_read_only_verb() {
+        let cli = Cli::try_parse_from(["ksx", "winusb", "status", "--json"]).unwrap();
+        match cli.command {
+            Command::Winusb {
+                command: WinusbCommand::Status { json },
+            } => assert!(json),
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+        // `status` takes no --yes: there is nothing for it to consent to.
+        assert!(Cli::try_parse_from(["ksx", "winusb", "status", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn winusb_claim_and_release_take_a_device_and_default_to_not_acting() {
+        let cli = Cli::try_parse_from(["ksx", "winusb", "claim", "MI_00"]).unwrap();
+        match cli.command {
+            Command::Winusb {
+                command:
+                    WinusbCommand::Claim {
+                        device,
+                        dry_run,
+                        yes,
+                        json,
+                    },
+            } => {
+                assert_eq!(device, "MI_00");
+                // `yes` unset is what makes this a report; the command layer
+                // requires `yes && !dry_run` before it touches pnputil.
+                assert!(!yes, "claim must never act without an explicit --yes");
+                assert!(!dry_run);
+                assert!(!json);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+        let cli =
+            Cli::try_parse_from(["ksx", "winusb", "release", "MI_00", "--force", "--yes"]).unwrap();
+        match cli.command {
+            Command::Winusb {
+                command:
+                    WinusbCommand::Release {
+                        device, force, yes, ..
+                    },
+            } => {
+                assert_eq!(device, "MI_00");
+                assert!(force);
+                assert!(yes);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+        // A device argument is not optional: `ksx winusb claim` with no target
+        // must not be able to mean "whatever you think is best".
+        assert!(Cli::try_parse_from(["ksx", "winusb", "claim"]).is_err());
+        assert!(Cli::try_parse_from(["ksx", "winusb", "release"]).is_err());
+    }
+
+    /// The trade-off — a claimed panel types only while ksx runs — is the one
+    /// thing a user must know before running this, so it lives in `--help`,
+    /// not only in a doc they have not opened.
+    #[test]
+    fn winusb_help_states_the_trade_and_the_exit_codes() {
+        let mut cmd = Cli::command();
+        let winusb = cmd.find_subcommand_mut("winusb").unwrap();
+        let help = winusb.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "no longer a keyboard",
+            "types only while ksx is running",
+            "If ksx is not running, a claimed panel does nothing",
+            "cannot reach the lock screen",
+            "refuses to take the last one",
+            "dry runs by default",
+            "2 = refused",
+            "3 = pnputil ran and failed",
+        ] {
+            assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
+        }
     }
 
     /// M1 regression: the exact invocation the milestone gate smoke-runs.

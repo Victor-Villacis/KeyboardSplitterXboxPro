@@ -188,7 +188,6 @@ fn run_live(
     json: bool,
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
-    use ksx_capture::{CaptureError, InterceptionBackend};
     use ksx_output::VigemBackend;
 
     // Pads first, even for the availability check: a missing bus must be found
@@ -200,25 +199,33 @@ fn run_live(
         }
         Err(err) => return Err(err).context("connecting to ViGEmBus"),
     };
-    // Safe: creating the context sets no filter (see InterceptionBackend::new).
-    let capture = match InterceptionBackend::new() {
+    // Backend selection is per device (`[[device]] backend = ...`). This claims
+    // any WinUSB interfaces the plan names, and only creates an Interception
+    // context if something still needs one — see `crate::capture`. Every
+    // failure here is a refusal: no pad is plugged and no filter is armed.
+    let capture = match crate::capture::build(&plan) {
         Ok(backend) => backend,
-        Err(err @ CaptureError::DriverUnavailable) => {
-            refuse(
-                json,
-                "interception-unavailable",
-                &format!("{err}; run `ksx doctor` for driver diagnostics"),
-            );
+        Err(err) => {
+            let hint = match &err {
+                crate::capture::SetupError::Interception(_) => {
+                    "; run `ksx doctor` for driver diagnostics"
+                }
+                _ => "",
+            };
+            refuse(json, err.code(), &format!("{err}{hint}"));
         }
-        Err(err) => return Err(err).context("creating the Interception context"),
     };
 
-    // The doctor's borrowed-time warning at startup, same code + message.
-    for advice in ksx_platform::summarize(&ksx_platform::collect())
-        .iter()
-        .filter(|a| a.code == "interception-borrowed-time")
-    {
-        eprintln!("[WARN] {}: {}", advice.code, advice.message);
+    // The doctor's borrowed-time warning at startup, same code + message — but
+    // only when this session actually loads the end-of-life driver. A fully
+    // migrated cabinet has earned its silence.
+    if plan.needs_interception() {
+        for advice in ksx_platform::summarize(&ksx_platform::collect())
+            .iter()
+            .filter(|a| a.code == "interception-borrowed-time")
+        {
+            eprintln!("[WARN] {}: {}", advice.code, advice.message);
+        }
     }
 
     if !crate::ctrl_c::install() {
@@ -241,7 +248,7 @@ fn run_live(
         ..RunOptions::default()
     };
     let wiring = Wiring {
-        capture: Box::new(capture),
+        capture,
         pads: Box::new(pads),
     };
 

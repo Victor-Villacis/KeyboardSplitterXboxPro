@@ -34,11 +34,13 @@
 //! - The mouse filter is never set in M3 — mouse.sys is never touched.
 
 pub mod backend;
+pub mod composite;
 pub mod decision;
 pub mod escape;
 pub mod exhaustion;
 pub mod guard;
 pub mod health;
+pub mod hid;
 pub mod keymap;
 pub mod mock;
 pub mod presence;
@@ -50,12 +52,19 @@ mod friendly;
 pub mod interception;
 #[cfg(windows)]
 pub mod rawinput;
+#[cfg(windows)]
+mod regkey;
+#[cfg(windows)]
+pub mod winusb;
 
-pub use backend::{CaptureBackend, CaptureCtl, CaptureError, DeviceInfo, DeviceKind, ExitReason};
+pub use backend::{
+    CaptureBackend, CaptureCtl, CaptureError, DeviceInfo, DeviceKind, ExitReason, Handles,
+};
+pub use composite::CompositeBackend;
 pub use decision::{key_event, process_keyboard_stroke, should_resend, CaptureSet, StrokeOutcome};
 pub use escape::{EscapeAction, EscapeHandle, EscapeStatus, EscapeWatch};
 pub use exhaustion::{Exhaustion, ExhaustionDetector, MAX_KEYBOARD_SLOT};
-pub use health::{CaptureHealth, HealthHandle};
+pub use health::{CaptureHealth, HealthHandle, HealthView};
 pub use mock::{MockCaptureBackend, MockStroke, ResentStroke};
 pub use presence::PresenceHandle;
 pub use watchdog::Watchdog;
@@ -64,3 +73,5 @@ pub use watchdog::Watchdog;
 pub use interception::InterceptionBackend;
 #[cfg(windows)]
 pub use rawinput::{wait_for_keypress, IdentifiedPress};
+#[cfg(windows)]
+pub use winusb::{enumerate::candidates as usb_candidates, Binding, UsbCandidate, WinUsbBackend};

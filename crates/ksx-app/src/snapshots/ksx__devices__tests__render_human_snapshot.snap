@@ -5,5 +5,6 @@ expression: render_human(&report)
 keyboards (interception backend):
   slot 1  HID\VID_D209&PID_0430&REV_0056&MI_00  "I-PAC Arcade Control Interface"  [I-PAC]
   slot 2  HID\VID_046D&PID_C31C&REV_6402&MI_00  "n/a"
-mice: 1 visible (unused — ksx never sets the mouse filter in M3)
+mice: 1 visible (unused — ksx never sets the mouse filter)
+usb enumeration unavailable
 health: [OK]   2/10 keyboard slots in use (highest slot 2); no exhaustion detected

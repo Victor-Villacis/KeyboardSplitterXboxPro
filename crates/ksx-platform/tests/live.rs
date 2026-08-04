@@ -39,11 +39,118 @@ fn collect_runs_and_serializes() {
     serde_json::to_value(&advice).expect("advice serializes");
 }
 
+/// The WinUSB survey against the live device tree.
+///
+/// Read-only by construction: `CM_Get_Device_ID_List` plus registry reads.
+/// Nothing here opens a device handle, and a claim is never planned — this test
+/// exists to prove the *enumerator* works on a real machine, which no synthetic
+/// tree can.
+#[test]
+fn winusb_survey_runs_and_is_internally_consistent() {
+    use ksx_platform::winusb::{self, ClaimState};
+
+    let survey = winusb::survey();
+
+    // Every candidate's state must agree with the evidence it was derived from.
+    for c in &survey.candidates {
+        match c.state {
+            ClaimState::Claimed => {
+                assert!(
+                    c.interface.service_is(winusb::WINUSB_SERVICE),
+                    "{} reported claimed but its service is {:?}",
+                    c.interface.instance_id,
+                    c.interface.service
+                );
+            }
+            ClaimState::Claimable => {
+                assert!(
+                    c.keyboard.is_some(),
+                    "{} is claimable with no keyboard child",
+                    c.interface.instance_id
+                );
+                assert!(c.keyboard.as_ref().unwrap().is_keyboard_class());
+            }
+            ClaimState::NotAKeyboard | ClaimState::ForeignDriver => {
+                assert!(c.keyboard.is_none(), "{}", c.interface.instance_id);
+            }
+        }
+        assert!(c.interface.enumerator.eq_ignore_ascii_case("USB"));
+        assert!(!c.ksx_device_id().is_empty());
+    }
+
+    // Every keyboard a candidate claims must be in the machine's keyboard list.
+    for c in &survey.candidates {
+        if let Some(kb) = &c.keyboard {
+            assert!(survey.keyboards.iter().any(|k| &k.node == kb));
+        }
+    }
+    // A keyboard cannot be attributed to two interfaces.
+    let mut attributed: Vec<&str> = survey
+        .candidates
+        .iter()
+        .filter_map(|c| c.keyboard.as_ref().map(|k| k.instance_id.as_str()))
+        .collect();
+    let before = attributed.len();
+    attributed.sort_unstable();
+    attributed.dedup();
+    assert_eq!(before, attributed.len(), "a keyboard was double-attributed");
+
+    // JSON shape, for `ksx winusb status --json` consumers.
+    let json = survey.to_json();
+    assert!(json["candidates"].is_array());
+    // The count is usable BOARDS, not rows: a claimed, disabled or
+    // paired-but-disconnected keyboard is present and cannot type, and two
+    // collections of one board are one keyboard (see `Survey::keyboard_count`).
+    assert_eq!(
+        json["keyboard_count"].as_u64().unwrap() as usize,
+        survey.keyboard_count()
+    );
+    assert!(
+        survey.keyboard_count() <= survey.keyboards.len(),
+        "the refusal must never count more keyboards than the machine has rows for"
+    );
+}
+
 /// Ground truth on the cabinet, verified by hand 2026-08-03 (see
 /// docs/research/keyboard-capture-2026.md §0). Never run in CI.
 #[cfg(feature = "cab-tests")]
 mod cab {
     use ksx_platform::{collect, summarize, CiPolicyMode, ServiceState, SignatureStatus};
+
+    /// The I-PAC4 as this machine enumerates it, read-only. Pins the exact
+    /// instance paths docs/RECOVERY.md quotes — if a board moves ports those
+    /// paths change, and the runbook must be re-derived rather than trusted.
+    #[test]
+    fn the_ipac_keyboard_interface_is_visible_and_claimable() {
+        use ksx_platform::winusb::{self, ClaimState};
+
+        let survey = winusb::survey();
+        let ipac = survey
+            .resolve(r"USB\VID_D209&PID_0430&MI_00\7&25eea38c&0&0000")
+            .expect("the I-PAC keyboard interface is present");
+        assert_eq!(ipac.state, ClaimState::Claimable);
+        assert!(ipac.is_ultimarc());
+        assert_eq!(ipac.interface.interface_number(), Some(0));
+        assert_eq!(
+            ipac.ksx_device_id(),
+            r"HID\VID_D209&PID_0430&MI_00\8&2a0d0500&0&0000"
+        );
+
+        // MI_01 (system/consumer/mouse) and MI_02 (vendor) must never be
+        // claimable: claiming MI_01 would take the trackball's mouse collection
+        // with it.
+        for iface in ["&MI_01\\", "&MI_02\\"] {
+            let c = survey.resolve(iface).expect(iface);
+            assert_eq!(c.state, ClaimState::NotAKeyboard, "{iface}");
+        }
+
+        // The refusal only holds if there really is another keyboard.
+        assert!(
+            survey.keyboard_count() >= 2,
+            "the cabinet must keep a spare keyboard plugged in; found {}",
+            survey.keyboard_count()
+        );
+    }
 
     #[test]
     fn cabinet_ground_truth() {

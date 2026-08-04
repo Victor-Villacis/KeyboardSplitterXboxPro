@@ -97,6 +97,11 @@ fn reason_str(reason: ExitReason) -> &'static str {
         ExitReason::ChannelClosed => "channel-closed",
         ExitReason::ScriptExhausted => "script-exhausted",
         ExitReason::Panicked => "panicked",
+        // M6: a claimed board was unplugged. Deliberately its own string and
+        // not folded into "shutdown" — the session ended because hardware
+        // left, which is a different thing to explain to a user than "you
+        // asked me to stop".
+        ExitReason::DeviceLost => "device-lost",
     }
 }
 

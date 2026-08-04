@@ -14,7 +14,7 @@ non-negotiables are listed at the bottom.
 | T1 | One multi-player encoder (I-PAC2/4) → 2–4 pads by key subsets | arcade cabinets (**the primary case**) | ✅ proven on hardware (M4) |
 | T2 | N distinct keyboards → one pad each | couch co-op, two people one PC — *the legacy app's headline case* | ⚠️ supported by design, **never tested**; needs a second physical keyboard bound to a slot |
 | T3 | Mixed: encoder + regular keyboard(s) | cabinet with a control station | ⚠️ same as T2 |
-| T4 | **Two identical devices** (2× I-PAC2, or two of the same cheap USB keyboard) | very common for 4-player builds and co-op | ❌ **blocked** — ksx refuses to start (see below) |
+| T4 | **Two identical devices** (2× I-PAC2, or two of the same cheap USB keyboard) | very common for 4-player builds and co-op | ❌ **blocked on Interception** — ksx refuses to start (see below); ✅ **structurally solved by the M6 WinUSB claim**, whose identity is the per-port USB instance path |
 | T5 | One keyboard → one pad | single-player remapper, accessibility | ✅ works (degenerate case of T1) |
 | T6 | More than 4 pads | 6-player cabinets | ❌ XInput caps at 4; needs HID personas (ENHANCEMENTS E4) |
 | T7 | Laptop internal keyboard as a player | portable setups | ⚠️ untested; Interception filters the class stack so it should work |
@@ -38,7 +38,9 @@ Three ways out, cheapest first:
    rather than silently mis-routing. **Highest value per unit of work.**
 2. **WinUSB claim (M6).** Identity becomes the USB device path — structurally
    unique per port, no collisions, no drift. Solves T4 as a side effect of the
-   work already planned for the 2026 driver deadline.
+   work already planned for the 2026 driver deadline. `ksx winusb status` already
+   reports each interface's instance path and refuses an ambiguous target rather
+   than guessing between two identical boards.
 3. **RawInput correlation for identity only.** `crates/ksx-capture/src/rawinput.rs`
    already reports the per-device instance path; use it during setup to map
    physical panel → device, never for blocking (the blocking variant of this hack
@@ -96,6 +98,14 @@ Fold into the roadmap after M5, without delaying the M6 deadline work:
   Design question raised by generality: with the encoder claimed by WinUSB it is
   no longer a keyboard, so **frontend navigation needs ksx to inject keystrokes**
   when not emulating. Design that in, or the cabinet loses menu control.
+  → **Answered and implemented** (`docs/ARCHITECTURE.md` §M6): the daemon owns
+  the claim for its whole lifetime, not per-session, and re-injects the panel's
+  keystrokes with `SendInput` (`ksx_platform::inject::Typethrough`) whenever
+  emulation is stopped. Muting/unmuting is ordered against session start/stop and
+  asserted in CI. The honest residual: **if ksx is not running, a claimed panel
+  does nothing**, and injected keys never reach the secure desktop — mitigated by
+  autostart, a mandatory second keyboard (`ksx winusb claim` refuses the last
+  one), and `ksx winusb release`.
 - **M8 "general availability"** (new): `ksx setup` wizard, preset templates,
   Interception in `install-drivers`, quickstart docs, `ksx map` verbs, and a
   tested T2/T4 path. This is what turns "Victor's cabinet software" into

@@ -70,6 +70,41 @@ impl EscapeHandle {
         Self::default()
     }
 
+    /// The passthrough latch itself, lock-free.
+    ///
+    /// Public because the latch is *shared state between capture threads*: with
+    /// the M6 backend split (one WinUSB thread per claimed board, plus an
+    /// Interception thread for everything else), `LeftCtrl x5` on any one board
+    /// has to free them **all**. Handing every [`EscapeWatch`] the same
+    /// [`EscapeHandle`] is what makes that true, and this is where they meet.
+    pub fn passthrough(&self) -> bool {
+        self.0.passthrough.load(Ordering::Relaxed)
+    }
+
+    /// Clear the passthrough latch — **session start only**.
+    ///
+    /// The latch is one-way *within* a session on purpose: nothing a supervisor
+    /// does may re-capture keyboards behind an escape's back. Between sessions
+    /// it is a different question, and M6 is what raised it. The handle now
+    /// lives as long as the daemon's claim, so a `LeftCtrl ×5` used to escape a
+    /// wedged game would still be latched when the next game starts — and
+    /// "freed" means the panel types onto the desktop while the pads are being
+    /// driven, i.e. double input on every press, with no gesture to explain it.
+    ///
+    /// Starting a session is the one moment where re-arming is the user's own
+    /// instruction: they asked for emulation, now, after whatever they did
+    /// before. So the *latch* is reset here and the *counters* deliberately are
+    /// not — they stay monotonic, which is what lets a poller take a baseline
+    /// and treat only its own increments as its own gestures
+    /// ([`EscapeStatus`]).
+    ///
+    /// Idempotent, and safe to call while capture threads are running: they
+    /// read the latch per stroke and compute the next toggle from it, so an
+    /// armed latch simply means the next gesture frees rather than re-captures.
+    pub fn arm(&self) {
+        self.0.passthrough.store(false, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> EscapeStatus {
         EscapeStatus {
             toggles: self.0.toggles.load(Ordering::Relaxed),
@@ -105,12 +140,19 @@ impl EscapeAction {
 }
 
 /// The capture thread's escape state machine: [`EscapeDetector`] plus the
-/// self-passthrough latch. Owned by one thread; never shared.
+/// self-passthrough latch.
+///
+/// The *detector* is owned by one thread and never shared — gesture progress is
+/// per-thread state. The *latch* deliberately is not: it lives in the shared
+/// [`EscapeHandle`], so several capture threads handed the same handle behave
+/// as one escape hatch. With a single backend that is indistinguishable from a
+/// local `bool`; with M6's split (a WinUSB thread per claimed board alongside
+/// the Interception thread) it is the difference between `LeftCtrl x5` freeing
+/// every keyboard and freeing only the one you happened to press it on.
 #[derive(Debug)]
 pub struct EscapeWatch {
     detector: EscapeDetector,
     handle: EscapeHandle,
-    passthrough: bool,
 }
 
 impl EscapeWatch {
@@ -118,14 +160,13 @@ impl EscapeWatch {
         Self {
             detector: EscapeDetector::default(),
             handle,
-            passthrough: false,
         }
     }
 
     /// The self-passthrough latch. `true` ⇒ suppress nothing, whatever the
     /// supervisor last asked for.
     pub fn passthrough(&self) -> bool {
-        self.passthrough
+        self.handle.passthrough()
     }
 
     /// Feed one stroke. Hot path: a few counters plus (only the first time a
@@ -135,15 +176,10 @@ impl EscapeWatch {
         match self.detector.observe(event) {
             None => EscapeAction::None,
             Some(Escape::LeftSequence) => {
-                self.passthrough = !self.passthrough;
-                self.handle
-                    .0
-                    .passthrough
-                    .store(self.passthrough, Ordering::Relaxed);
+                let next = !self.handle.passthrough();
+                self.handle.0.passthrough.store(next, Ordering::Relaxed);
                 self.handle.0.toggles.fetch_add(1, Ordering::Relaxed);
-                EscapeAction::ToggledCapture {
-                    passthrough: self.passthrough,
-                }
+                EscapeAction::ToggledCapture { passthrough: next }
             }
             Some(Escape::RightSequence) => {
                 self.handle.0.mouse_escapes.fetch_add(1, Ordering::Relaxed);
@@ -151,7 +187,6 @@ impl EscapeWatch {
             }
             Some(Escape::CtrlAltDel) => {
                 // Never a toggle: the emergency stop only ever frees keyboards.
-                self.passthrough = true;
                 self.handle.0.passthrough.store(true, Ordering::Relaxed);
                 self.handle.0.stops.fetch_add(1, Ordering::Relaxed);
                 EscapeAction::Stop
@@ -256,6 +291,102 @@ mod tests {
         assert!(!action.changed_passthrough());
         assert!(!w.passthrough(), "the mouse escape never frees keyboards");
         assert_eq!(handle.snapshot().mouse_escapes, 1);
+    }
+
+    /// M6: several capture threads, one escape hatch.
+    ///
+    /// With the WinUSB backend a session can be running three capture threads
+    /// at once (two claimed I-PACs and an Interception thread for the desk
+    /// keyboard). Freeing "the keyboards" must mean all of them — a player who
+    /// mashes LeftCtrl x5 on player 1's panel and gets only player 1's board
+    /// back is still locked out.
+    #[test]
+    fn one_handle_makes_several_watches_a_single_escape_hatch() {
+        let handle = EscapeHandle::new();
+        let mut winusb_p1 = EscapeWatch::new(handle.clone());
+        let winusb_p2 = EscapeWatch::new(handle.clone());
+        let mut interception = EscapeWatch::new(handle.clone());
+
+        assert!(!winusb_p2.passthrough());
+        let action = cycles(&mut winusb_p1, Key::LeftControl, 5);
+        assert_eq!(action, EscapeAction::ToggledCapture { passthrough: true });
+
+        assert!(winusb_p1.passthrough());
+        assert!(winusb_p2.passthrough(), "the other board is freed too");
+        assert!(interception.passthrough(), "and so is every other keyboard");
+
+        // Re-arming is equally global, and the toggle is computed from the
+        // shared latch — not from a stale per-thread bool.
+        let action = cycles(&mut interception, Key::LeftControl, 5);
+        assert_eq!(action, EscapeAction::ToggledCapture { passthrough: false });
+        assert!(!winusb_p1.passthrough());
+        assert!(!winusb_p2.passthrough());
+        assert_eq!(handle.snapshot().toggles, 2);
+    }
+
+    /// A stop on any thread frees every thread and can never be toggled back.
+    #[test]
+    fn a_stop_on_one_thread_frees_them_all() {
+        let handle = EscapeHandle::new();
+        let mut a = EscapeWatch::new(handle.clone());
+        let b = EscapeWatch::new(handle.clone());
+        a.observe(&ev(Key::LeftControl, true));
+        a.observe(&ev(Key::LeftAlt, true));
+        assert_eq!(a.observe(&ev(Key::Delete, true)), EscapeAction::Stop);
+        assert!(b.passthrough());
+    }
+
+    /// R2, at the level it is caused. A gesture that freed the panel in one
+    /// session must not still be freeing it in the next one — but the counters
+    /// it moved must survive, because that is what a baseline reader needs.
+    #[test]
+    fn arming_clears_the_latch_without_rewriting_the_counters() {
+        let handle = EscapeHandle::new();
+        let mut w = EscapeWatch::new(handle.clone());
+        cycles(&mut w, Key::LeftControl, 5);
+        assert!(handle.passthrough());
+
+        handle.arm();
+        assert!(!handle.passthrough(), "a new session starts armed");
+        let snap = handle.snapshot();
+        assert_eq!(snap.toggles, 1, "history is not rewritten, only re-armed");
+        assert!(!snap.passthrough);
+
+        // The next gesture frees, rather than re-capturing something that was
+        // never captured: the watch computes from the shared latch, not from a
+        // stale local bool.
+        let action = cycles(&mut w, Key::LeftControl, 5);
+        assert_eq!(action, EscapeAction::ToggledCapture { passthrough: true });
+        assert!(handle.passthrough());
+        assert_eq!(handle.snapshot().toggles, 2);
+
+        // Idempotent, and it also undoes an emergency stop's forced latch —
+        // the stop ended that session, this is the next one.
+        handle.arm();
+        handle.arm();
+        assert!(!handle.passthrough());
+    }
+
+    /// The baseline-delta pattern a session poller uses, spelled out: what it
+    /// must NOT see is every gesture that ever happened.
+    #[test]
+    fn a_baseline_reader_sees_only_the_gestures_after_it() {
+        let handle = EscapeHandle::new();
+        let mut w = EscapeWatch::new(handle.clone());
+        cycles(&mut w, Key::LeftControl, 5);
+        cycles(&mut w, Key::RightControl, 5);
+
+        let baseline = handle.snapshot();
+        assert_eq!(baseline.toggles, 1);
+        assert_eq!(handle.snapshot().toggles - baseline.toggles, 0);
+
+        cycles(&mut w, Key::LeftControl, 5);
+        assert_eq!(
+            handle.snapshot().toggles - baseline.toggles,
+            1,
+            "one gesture since the baseline, not two"
+        );
+        assert_eq!(handle.snapshot().mouse_escapes - baseline.mouse_escapes, 0);
     }
 
     #[test]

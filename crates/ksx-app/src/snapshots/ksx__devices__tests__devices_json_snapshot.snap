@@ -3,27 +3,41 @@ source: crates/ksx-app/src/devices.rs
 expression: "serde_json::to_string_pretty(&devices_json(&report)).unwrap()"
 ---
 {
-  "backend": "interception",
+  "backends": {
+    "interception": {
+      "available": true
+    },
+    "winusb": {
+      "available": false
+    }
+  },
   "health": {
     "duplicate_hardware_ids": [],
     "highest_keyboard_slot": 2,
     "keyboard_slots_used": 2,
+    "pending_rebinds": [],
     "reboot_required": false,
-    "slot_budget": 10
+    "slot_budget": 10,
+    "unmatched_winusb_config": []
   },
   "keyboards": [
     {
+      "alias": null,
+      "backend": "interception",
       "friendly": "I-PAC Arcade Control Interface",
       "id": "HID\\VID_D209&PID_0430&REV_0056&MI_00",
       "ipac": true,
       "slot": 1
     },
     {
+      "alias": null,
+      "backend": "interception",
       "friendly": null,
       "id": "HID\\VID_046D&PID_C31C&REV_6402&MI_00",
       "ipac": false,
       "slot": 2
     }
   ],
-  "mice_visible": 1
+  "mice_visible": 1,
+  "usb_candidates": []
 }

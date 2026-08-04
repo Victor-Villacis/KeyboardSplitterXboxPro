@@ -194,6 +194,17 @@ impl InterceptionBackend {
     /// [`CaptureBackend::run`], so constructing (e.g. for `devices()`
     /// enumeration) cannot affect the machine's keyboards.
     pub fn new() -> Result<Self, CaptureError> {
+        Self::new_with(crate::backend::Handles::new())
+    }
+
+    /// [`Self::new`] publishing into pre-existing handles.
+    ///
+    /// Since M6 a session can run this backend alongside one
+    /// [`crate::WinUsbBackend`] per rebound board. They must share a health
+    /// state and — the part that matters at 2 a.m. — a single escape latch, so
+    /// `LeftCtrl x5` on the WinUSB-claimed I-PAC also drops this backend's
+    /// keyboard filter. See [`crate::CompositeBackend`].
+    pub fn new_with(handles: crate::backend::Handles) -> Result<Self, CaptureError> {
         // SAFETY: plain FFI constructor; null-checked below.
         let ctx = unsafe { raw::interception_create_context() };
         if ctx.is_null() {
@@ -212,9 +223,9 @@ impl InterceptionBackend {
         );
         Ok(Self {
             ctx: Ctx(ctx),
-            health: HealthHandle::new(),
+            health: handles.health,
             presence: PresenceHandle::new(),
-            escapes: EscapeHandle::new(),
+            escapes: handles.escapes,
         })
     }
 }

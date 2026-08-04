@@ -74,6 +74,36 @@ pub enum ExitReason {
     /// The loop body panicked. The panic was caught, health flagged, and the
     /// drop guard has already reset the driver filter — keyboards keep working.
     Panicked,
+    /// The captured device physically went away (M6 WinUSB: the endpoint
+    /// reported a disconnect). Distinct from `Shutdown` because nobody asked
+    /// for it and the session cannot continue on that board — and distinct
+    /// from `Panicked` because nothing is wrong with ksx. The backend has
+    /// already released every key it was holding.
+    DeviceLost,
+}
+
+/// The observation handles a backend publishes into.
+///
+/// Normally a backend makes its own (`Handles::new()`), and nothing else needs
+/// this type. It exists so several backends can be handed the **same** handles
+/// and add up to one session: since M6 a run can be driving a WinUSB thread per
+/// claimed board alongside an Interception thread, and the supervisor must see
+/// one health state and — critically — one escape latch, not three
+/// (`crate::composite`, `crate::escape::EscapeWatch`).
+///
+/// Presence is deliberately *not* here: health and escapes merge by OR-ing and
+/// summing, but two backends publishing device lists into one slot would
+/// clobber each other. [`crate::CompositeBackend`] merges those separately.
+#[derive(Clone, Debug, Default)]
+pub struct Handles {
+    pub health: HealthHandle,
+    pub escapes: EscapeHandle,
+}
+
+impl Handles {
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 /// A source of per-device key events that can also suppress them from the OS.
@@ -133,6 +163,29 @@ pub enum CaptureError {
     DriverUnavailable,
     #[error("{context} failed (win32 error {code})")]
     Os { context: &'static str, code: u32 },
+    /// The WinUSB rebind has not been performed for this interface, so there
+    /// is no `winusb.sys` to claim through. Never auto-fixed: rebinding is a
+    /// supervised manual step (`docs/RECOVERY.md` §2).
+    #[error(
+        "{id} is bound to {bound}, not winusb.sys — the WinUSB rebind has not been performed          for this interface (see docs/WINUSB.md; ksx never rebinds a device itself)"
+    )]
+    NotRebound { id: String, bound: String },
+    /// Enumeration found nothing matching the configured device id.
+    #[error("no USB interface with instance path {id} is connected")]
+    NoSuchDevice { id: String },
+    /// The interface was claimed but does not describe a keyboard.
+    #[error("{id} delivered a HID report descriptor with no keyboard fields — wrong interface?")]
+    NotAKeyboard { id: String },
+    /// No interrupt-IN endpoint: nothing to read reports from.
+    #[error("{id} has no interrupt IN endpoint")]
+    NoInterruptEndpoint { id: String },
+    /// `nusb` failed to open/claim/transfer.
+    #[error("{context}: {source}")]
+    Usb {
+        context: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 // Compile-time proof the trait stays object-safe (the whole point of it).

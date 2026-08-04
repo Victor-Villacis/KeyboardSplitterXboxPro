@@ -9,18 +9,28 @@
 //! - [`summarize`]: pure report → [`Advice`] verdicts with stable codes for
 //!   scripting (`--json`).
 //!
-//! Still to come (M3–M6): hotplug via `CM_Register_Notification`, driver
-//! install orchestration (bundled signature-verified installers, pnputil),
-//! Task Scheduler autostart, thread-priority helpers.
+//! - [`installer`] / [`autostart`] (M5): bundled signature-verified driver
+//!   install orchestration and per-user Task Scheduler registration.
+//! - [`inject`] (M6): `SendInput` keystroke synthesis, so a WinUSB-claimed
+//!   arcade panel still types when ksx is not emulating.
+//! - [`winusb`] (M6): the WinUSB rebind lifecycle — a read-only survey of the
+//!   device tree, INF generation, and the exact `pnputil` command lines for
+//!   claim and release. **Nothing in this module mutates a driver binding**;
+//!   `apply` shells out to `pnputil`, and only the caller decides to run it.
+//!
+//! Still to come: hotplug via `CM_Register_Notification`, thread-priority
+//! helpers.
 
 pub mod advice;
 pub mod autostart;
+pub mod inject;
 pub mod installer;
 pub mod parse;
 pub mod process;
 pub mod report;
 pub mod sealed;
 pub mod sha256;
+pub mod winusb;
 
 #[cfg(windows)]
 mod win;

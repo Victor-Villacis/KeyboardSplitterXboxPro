@@ -13,10 +13,32 @@ use super::{SessionFactory, SessionRunner, SessionSummary};
 /// Re-reads configuration on every `make()`. That is what "Reload config"
 /// means: a clean stop and a clean start from whatever is on disk now, never a
 /// hot-patch of a live pipeline.
+///
+/// The **claim** is the one thing that is not re-made per session: `panel` is
+/// the daemon's, made once at startup and handed to every session that follows
+/// (see [`super::panel`]). Re-reading the config can therefore change slots,
+/// presets and games freely, but not which board is claimed — for that the
+/// daemon has to be restarted, and `crate::capture::build_session` says so
+/// rather than claiming something new mid-flight.
 pub struct LiveFactory {
     pub root: ksx_config::ConfigRoot,
     pub game: Option<String>,
     pub no_launch: bool,
+    pub panel: Option<Arc<super::panel::Panel>>,
+}
+
+impl LiveFactory {
+    /// The [`super::PanelKeyboard`] the control loop must drive, derived from
+    /// **this factory's** claim.
+    ///
+    /// It is a method rather than something `daemon::run` assembles separately
+    /// so the two cannot disagree: for the whole of M6 the daemon passed
+    /// `panel_for(None)` to the control loop while its sessions each made their
+    /// own claim, which type-checked perfectly and meant a claimed panel was
+    /// dead between sessions. One source of truth, one claim.
+    pub fn panel_keyboard(&self) -> Box<dyn super::PanelKeyboard> {
+        super::panel_for(self.panel.clone())
+    }
 }
 
 impl SessionFactory for LiveFactory {
@@ -42,6 +64,7 @@ impl SessionFactory for LiveFactory {
             plan,
             launch,
             games_toml: self.root.games_path(),
+            panel: self.panel.clone(),
         }))
     }
 
@@ -62,6 +85,10 @@ struct LiveRunner {
     launch: Option<ksx_games::LaunchSpec>,
     games_toml: PathBuf,
     slots: usize,
+    /// The daemon's claim, borrowed for this session. `None` means there is
+    /// nothing claimed and the session builds its own backends, exactly as
+    /// `ksx run` does.
+    panel: Option<Arc<super::panel::Panel>>,
 }
 
 impl SessionRunner for LiveRunner {
@@ -76,11 +103,15 @@ impl SessionRunner for LiveRunner {
         out: &mut dyn Write,
     ) -> anyhow::Result<SessionSummary> {
         use crate::run::supervisor::{self, RunOptions, SessionHook, Wiring};
-        use ksx_capture::InterceptionBackend;
         use ksx_output::VigemBackend;
 
         let pads = VigemBackend::connect()?;
-        let capture = InterceptionBackend::new()?;
+        // Same per-device backend selection as `ksx run`, from the same place:
+        // a daemon that chose backends differently would be a second, untested
+        // capture path (see `crate::capture`). The one difference is the claim:
+        // this session *borrows* the daemon's, and returns it untouched when it
+        // ends, so the panel is a keyboard again the moment the game is gone.
+        let capture = crate::capture::build_session(&self.plan, self.panel.as_ref())?;
 
         let hook: Box<dyn SessionHook> = match self.launch.clone() {
             Some(spec) => Box::new(crate::run::game::GameHook::new(
@@ -92,17 +123,21 @@ impl SessionRunner for LiveRunner {
         };
         let mut options = RunOptions {
             beep: true,
-            // Two independent stop sources: the daemon's own latch (tray Stop,
-            // Quit, Reload) and the console handler, so Ctrl+C in a headless
-            // daemon still ends the session cleanly.
-            stop: Box::new(move || stop.load(Ordering::SeqCst) || crate::ctrl_c::requested()),
+            // The daemon's own latch (tray Stop, Quit, Reload) is the only stop
+            // source. `ctrl_c::requested()` deliberately is NOT consulted: it is
+            // a process-lifetime latch ("stays true once tripped" — see
+            // ctrl_c.rs) and a daemon runs many sessions, so honouring it would
+            // make the first Ctrl+C end every future session ~50 ms after start,
+            // forever. `daemon::run` never installs the handler either, so
+            // Ctrl+C takes the default action and ends the process.
+            stop: Box::new(move || stop.load(Ordering::SeqCst)),
             hook,
             ..RunOptions::default()
         };
         let outcome = supervisor::supervise(
             &self.plan,
             Wiring {
-                capture: Box::new(capture),
+                capture,
                 pads: Box::new(pads),
             },
             &mut options,

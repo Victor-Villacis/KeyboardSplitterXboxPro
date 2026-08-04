@@ -1,13 +1,18 @@
-//! `ksx devices` — keyboards as the Interception driver currently sees them.
+//! `ksx devices` — every keyboard ksx could capture, on either backend, and
+//! what stands between it and being captured.
 //!
-//! Read-only and safe on a production keyboard stack: constructing an
-//! `InterceptionBackend` never sets a class filter (see its `new` docs), so
-//! enumeration cannot affect the machine's keyboards in any way.
+//! Read-only and safe on a production keyboard stack, on both halves:
+//! constructing an `InterceptionBackend` never sets a class filter (see its
+//! `new` docs), and the WinUSB half only enumerates — `ksx_capture::winusb::
+//! enumerate` opens nothing and claims nothing (see its module docs). Running
+//! this command mid-session cannot disturb a keystroke.
 //!
 //! Exit codes (documented in `--help`): 0 = listed, 1 = error,
-//! [`EXIT_DRIVER_MISSING`] (2) = the Interception driver is unavailable —
-//! the hint points at `ksx doctor`; `--json` puts `{"error":{code,message}}`
-//! on stdout instead (same convention as `ksx pads`).
+//! [`EXIT_DRIVER_MISSING`] (2) = **nothing** could be enumerated — neither the
+//! Interception driver nor the USB tree. A missing Interception driver on its
+//! own is no longer fatal here: after the M6 rebind the whole point is that
+//! ksx runs with Interception uninstalled, and a command that refused to list
+//! anything in that state would be useless exactly when it is needed most.
 //!
 //! The health line is the *static* slot-exhaustion check: budget usage plus
 //! any keyboard sitting outside the 1..=10 slot range. Id-climb detection
@@ -20,11 +25,12 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use ksx_capture::{DeviceInfo, DeviceKind, MAX_KEYBOARD_SLOT};
+use ksx_config::Backend;
 use ksx_core::DeviceId;
 
-/// Exit code when the Interception driver is unavailable (documented in
-/// `--help`). Same value as `ksx pads`' missing-ViGEmBus code: 2 always means
-/// "a required driver is not there".
+/// Exit code when no enumeration path worked at all (documented in `--help`).
+/// Same value as `ksx pads`' missing-ViGEmBus code: 2 always means "a required
+/// driver is not there".
 pub const EXIT_DRIVER_MISSING: i32 = 2;
 
 /// Ultimarc's USB vendor id — every I-PAC board enumerates with it. The exact
@@ -45,6 +51,10 @@ pub fn is_ipac(hwid: &str) -> bool {
 /// such an id to a slot is ambiguous by construction — "capture this device"
 /// captures both boards, and either one drives every slot bound to the id — so
 /// `ksx run` refuses to start and `ksx devices` calls it out.
+///
+/// The WinUSB backend has no equivalent problem: its ids are per-interface
+/// device instance paths, so two identical boards on different ports are two
+/// different ids (`docs/USE-CASES.md` T4, `docs/MIGRATION-WINUSB.md`).
 pub fn duplicate_hardware_ids(devices: &[DeviceInfo]) -> Vec<DeviceId> {
     let mut ids: Vec<&DeviceId> = devices
         .iter()
@@ -61,17 +71,113 @@ pub fn duplicate_hardware_ids(devices: &[DeviceInfo]) -> Vec<DeviceId> {
     out
 }
 
+/// What `config.toml` says about one device, if anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConfiguredDevices {
+    /// `(id, alias, backend)` from every `[[device]]` entry.
+    pub entries: Vec<(DeviceId, String, Backend)>,
+}
+
+impl ConfiguredDevices {
+    pub fn from_config(config: &ksx_config::ConfigFile) -> Self {
+        Self {
+            entries: config
+                .devices
+                .iter()
+                .map(|d| (DeviceId::new(d.id.clone()), d.alias.clone(), d.backend))
+                .collect(),
+        }
+    }
+
+    fn find(&self, id: &DeviceId) -> Option<&(DeviceId, String, Backend)> {
+        self.entries.iter().find(|(entry, _, _)| entry == id)
+    }
+
+    /// Which backend would drive this device: what config says, or the default
+    /// for an unconfigured one.
+    pub fn backend_for(&self, id: &DeviceId) -> Backend {
+        self.find(id).map(|(_, _, b)| *b).unwrap_or_default()
+    }
+
+    pub fn alias_for(&self, id: &DeviceId) -> Option<&str> {
+        self.find(id).map(|(_, alias, _)| alias.as_str())
+    }
+
+    /// Entries that ask for the WinUSB backend.
+    pub fn winusb_ids(&self) -> Vec<&DeviceId> {
+        self.entries
+            .iter()
+            .filter(|(_, _, b)| *b == Backend::Winusb)
+            .map(|(id, _, _)| id)
+            .collect()
+    }
+}
+
+/// One WinUSB-side row: a USB interface plus what config wants from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsbRow {
+    pub candidate: ksx_capture::UsbCandidate,
+    /// The `[[device]]` alias bound to this id, if any.
+    pub alias: Option<String>,
+    /// `true` when a `[[device]]` entry selects `backend = "winusb"` for it.
+    pub selected: bool,
+}
+
+impl UsbRow {
+    /// Is this row ready to be captured — configured for WinUSB *and* rebound?
+    pub fn ready(&self) -> bool {
+        self.selected && self.candidate.binding.is_winusb()
+    }
+
+    /// Configured for WinUSB but still on the keyboard stack: `ksx run` will
+    /// refuse. This is the single most useful line this command prints.
+    pub fn needs_rebind(&self) -> bool {
+        self.selected && !self.candidate.binding.is_winusb()
+    }
+}
+
 /// Pure, fixture-testable view over one enumeration pass.
 pub struct DevicesReport {
-    /// Keyboards only, sorted by Interception slot.
+    /// Keyboards the Interception driver sees, sorted by slot. Empty when the
+    /// driver is not installed — which is the *expected* end state of M6.
     pub keyboards: Vec<DeviceInfo>,
-    /// Mice visible to the driver — listed as a count only; M3 never touches
+    /// Was the Interception driver available at all?
+    pub interception_available: bool,
+    /// Mice visible to the driver — listed as a count only; ksx never touches
     /// the mouse filter.
     pub mice_visible: usize,
+    /// HID-class USB interfaces, claimable or not.
+    pub usb: Vec<UsbRow>,
+    /// Was USB enumeration possible?
+    pub usb_available: bool,
+    /// `[[device]]` entries, for the backend column.
+    pub configured: ConfiguredDevices,
 }
 
 impl DevicesReport {
-    pub fn new(mut devices: Vec<DeviceInfo>) -> Self {
+    /// Interception-only report (the shape M3–M5 produced).
+    ///
+    /// Test-only since M6: the real command always has both halves, and a
+    /// constructor that silently claims "no USB" would be a way to build a
+    /// report that cannot happen.
+    #[cfg(test)]
+    pub fn new(devices: Vec<DeviceInfo>) -> Self {
+        Self::build(
+            devices,
+            true,
+            Vec::new(),
+            false,
+            ConfiguredDevices::default(),
+        )
+    }
+
+    pub fn build(
+        mut devices: Vec<DeviceInfo>,
+        interception_available: bool,
+        usb: Vec<UsbRow>,
+        usb_available: bool,
+        configured: ConfiguredDevices,
+    ) -> Self {
         let mice_visible = devices
             .iter()
             .filter(|d| d.kind == DeviceKind::Mouse)
@@ -80,7 +186,11 @@ impl DevicesReport {
         devices.sort_by_key(|d| d.interception_slot);
         Self {
             keyboards: devices,
+            interception_available,
             mice_visible,
+            usb,
+            usb_available,
+            configured,
         }
     }
 
@@ -114,10 +224,34 @@ impl DevicesReport {
                 .is_some_and(|s| !(1..=MAX_KEYBOARD_SLOT as u8).contains(&s))
         })
     }
+
+    /// HID interfaces only — the ones that could ever carry keyboard reports.
+    pub fn hid_rows(&self) -> impl Iterator<Item = &UsbRow> {
+        self.usb
+            .iter()
+            .filter(|r| r.candidate.is_keyboard_candidate())
+    }
+
+    /// Rows a run would refuse on: configured for WinUSB, not rebound.
+    pub fn pending_rebinds(&self) -> Vec<&UsbRow> {
+        self.usb.iter().filter(|r| r.needs_rebind()).collect()
+    }
+
+    /// `[[device]] backend = "winusb"` entries with no matching USB interface —
+    /// a config pointing at a board that is not plugged in, or (much more
+    /// likely, and the reason this exists) a config still holding an
+    /// **Interception hardware id** after being switched to `winusb`.
+    /// See `docs/MIGRATION-WINUSB.md`.
+    pub fn unmatched_winusb_config(&self) -> Vec<&DeviceId> {
+        self.configured
+            .winusb_ids()
+            .into_iter()
+            .filter(|id| !self.usb.iter().any(|r| &r.candidate.id == *id))
+            .collect()
+    }
 }
 
-/// The single `--json` success object:
-/// `{backend, keyboards: [{id, slot, friendly, ipac}], mice_visible, health}`.
+/// The single `--json` success object.
 pub fn devices_json(report: &DevicesReport) -> serde_json::Value {
     let keyboards: Vec<serde_json::Value> = report
         .keyboards
@@ -128,6 +262,8 @@ pub fn devices_json(report: &DevicesReport) -> serde_json::Value {
                 "slot": d.interception_slot,
                 "friendly": d.friendly,
                 "ipac": is_ipac(d.id.as_str()),
+                "alias": report.configured.alias_for(&d.id),
+                "backend": backend_name(report.configured.backend_for(&d.id)),
             })
         })
         .collect();
@@ -141,10 +277,35 @@ pub fn devices_json(report: &DevicesReport) -> serde_json::Value {
             })
         })
         .collect();
+    let usb: Vec<serde_json::Value> = report
+        .hid_rows()
+        .map(|row| {
+            let c = &row.candidate;
+            serde_json::json!({
+                "id": c.id.as_str(),
+                "vendor_id": format!("{:04X}", c.vendor_id),
+                "product_id": format!("{:04X}", c.product_id),
+                "interface": c.interface_number,
+                "boot_keyboard": c.is_boot_keyboard(),
+                "friendly": c.friendly(),
+                "ipac": c.is_ultimarc(),
+                "bound_to": c.binding.label(),
+                "winusb_rebind_present": c.binding.is_winusb(),
+                "alias": row.alias,
+                "selected_backend": if row.selected { "winusb" } else { "interception" },
+                "ready": row.ready(),
+                "needs_rebind": row.needs_rebind(),
+            })
+        })
+        .collect();
     serde_json::json!({
-        "backend": "interception",
+        "backends": {
+            "interception": { "available": report.interception_available },
+            "winusb": { "available": report.usb_available },
+        },
         "keyboards": keyboards,
         "mice_visible": report.mice_visible,
+        "usb_candidates": usb,
         "health": {
             "keyboard_slots_used": report.slots_used(),
             "highest_keyboard_slot": report.highest_slot(),
@@ -153,8 +314,25 @@ pub fn devices_json(report: &DevicesReport) -> serde_json::Value {
             // Ids shared by several boards: unusable as a slot binding, because
             // Interception cannot tell those boards apart.
             "duplicate_hardware_ids": duplicates,
+            "pending_rebinds": report
+                .pending_rebinds()
+                .iter()
+                .map(|r| r.candidate.id.as_str())
+                .collect::<Vec<_>>(),
+            "unmatched_winusb_config": report
+                .unmatched_winusb_config()
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>(),
         },
     })
+}
+
+fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Interception => "interception",
+        Backend::Winusb => "winusb",
+    }
 }
 
 /// Grouped human report. Pure: same report, same text, any platform.
@@ -162,7 +340,15 @@ pub fn render_human(report: &DevicesReport) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
-    if report.keyboards.is_empty() {
+
+    // -- Interception half ------------------------------------------------
+    if !report.interception_available {
+        let _ = writeln!(
+            out,
+            "interception backend: driver not installed (expected once every \
+             board is on WinUSB)"
+        );
+    } else if report.keyboards.is_empty() {
         let _ = writeln!(out, "no keyboards visible to the Interception driver");
     } else {
         let _ = writeln!(out, "keyboards (interception backend):");
@@ -176,9 +362,15 @@ pub fn render_human(report: &DevicesReport) -> String {
             } else {
                 ""
             };
+            // A device configured for winusb still shows up here until the
+            // rebind happens — saying so is the whole point of the column.
+            let note = match report.configured.backend_for(&d.id) {
+                Backend::Winusb => "  -> configured backend: winusb (not rebound yet)",
+                Backend::Interception => "",
+            };
             let _ = writeln!(
                 out,
-                "  slot {slot:<2} {}  \"{friendly}\"{tag}",
+                "  slot {slot:<2} {}  \"{friendly}\"{tag}{note}",
                 d.id.as_str()
             );
         }
@@ -186,17 +378,75 @@ pub fn render_human(report: &DevicesReport) -> String {
     if report.mice_visible > 0 {
         let _ = writeln!(
             out,
-            "mice: {} visible (unused — ksx never sets the mouse filter in M3)",
+            "mice: {} visible (unused — ksx never sets the mouse filter)",
             report.mice_visible
         );
     }
+
+    // -- WinUSB half ------------------------------------------------------
+    if !report.usb_available {
+        let _ = writeln!(out, "usb enumeration unavailable");
+    } else {
+        let rows: Vec<&UsbRow> = report.hid_rows().collect();
+        if rows.is_empty() {
+            let _ = writeln!(out, "no HID USB interfaces found");
+        } else {
+            let _ = writeln!(out, "usb interfaces (winusb backend candidates):");
+            for row in rows {
+                let c = &row.candidate;
+                let friendly = c.friendly().unwrap_or("n/a");
+                let tag = if c.is_ultimarc() { "  [I-PAC]" } else { "" };
+                let state = if row.ready() {
+                    "  [READY]"
+                } else if row.needs_rebind() {
+                    "  [NEEDS REBIND]"
+                } else {
+                    ""
+                };
+                let _ = writeln!(
+                    out,
+                    "  {}  \"{friendly}\"{tag}\n      bound to {} | interface MI_{:02X} | \
+                     backend {}{state}",
+                    c.id.as_str(),
+                    c.binding.label(),
+                    c.interface_number,
+                    if row.selected {
+                        "winusb"
+                    } else {
+                        "interception"
+                    },
+                );
+            }
+        }
+    }
+
+    // -- Findings ---------------------------------------------------------
     for id in report.duplicates() {
         let _ = writeln!(
             out,
             "[WARN] {} keyboards report the hardware id {id} — the Interception driver cannot \
-             tell them apart. `ksx run` refuses to start while a slot is bound to it; use \
-             different models/ports (or the WinUSB backend in M6).",
+             tell them apart. `ksx run` refuses to start while a slot is bound to it; move one \
+             board to the WinUSB backend, whose ids are per-port instance paths (docs/MIGRATION-WINUSB.md).",
             report.count_of(&id)
+        );
+    }
+    for row in report.pending_rebinds() {
+        let _ = writeln!(
+            out,
+            "[WARN] {} is configured for the winusb backend but is bound to {}. ksx never \
+             rebinds a device itself — perform the supervised rebind (docs/MIGRATION-WINUSB.md) with a \
+             spare keyboard plugged in, or set backend = \"interception\" for now.",
+            row.candidate.id.as_str(),
+            row.candidate.binding.label()
+        );
+    }
+    for id in report.unmatched_winusb_config() {
+        let _ = writeln!(
+            out,
+            "[WARN] config selects backend = \"winusb\" for {id}, but no USB interface has that \
+             instance path. If that looks like an Interception hardware id (it starts with \
+             HID\\ and has no instance suffix), it is: replace it with the USB\\ id listed \
+             above — the alias keeps every [[slot]] working (docs/MIGRATION-WINUSB.md)."
         );
     }
     if report.reboot_required() {
@@ -206,7 +456,7 @@ pub fn render_human(report: &DevicesReport) -> String {
              budget (Interception slot exhaustion)",
             MAX_KEYBOARD_SLOT
         );
-    } else {
+    } else if report.interception_available {
         let highest = report
             .highest_slot()
             .map_or_else(|| "-".to_string(), |s| s.to_string());
@@ -223,28 +473,63 @@ pub fn render_human(report: &DevicesReport) -> String {
 
 #[cfg(windows)]
 pub fn run(json: bool) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    use ksx_capture::{CaptureBackend as _, CaptureError, InterceptionBackend};
+    use ksx_capture::{CaptureBackend as _, InterceptionBackend};
 
-    // Safe: creating the context sets no filter; keyboards are untouched.
-    let mut backend = match InterceptionBackend::new() {
-        Ok(backend) => backend,
-        Err(err @ CaptureError::DriverUnavailable) => {
-            let message = format!("{err}; run `ksx doctor` for driver diagnostics");
-            if json {
-                println!(
-                    "{}",
-                    crate::pads::error_json("interception-unavailable", &message)
-                );
-            } else {
-                eprintln!("error: {message}");
-            }
-            std::process::exit(EXIT_DRIVER_MISSING);
-        }
-        Err(err) => return Err(err).context("creating the Interception context"),
+    // Config is advisory here: a machine with no config still lists hardware.
+    let configured = ksx_config::ConfigRoot::discover()
+        .ok()
+        .and_then(|root| ksx_config::Store::new(root).load_config().ok())
+        .map(|loaded| ConfiguredDevices::from_config(&loaded.value))
+        .unwrap_or_default();
+
+    // Interception half. A missing driver is a *fact to report*, not a failure:
+    // after M6 that is the target state. Creating the context sets no filter.
+    let (keyboards, interception_available) = match InterceptionBackend::new() {
+        Ok(mut backend) => (backend.devices(), true),
+        Err(_) => (Vec::new(), false),
     };
 
-    let report = DevicesReport::new(backend.devices());
+    // WinUSB half. Enumeration only — nothing is opened or claimed.
+    let (usb, usb_available) = match ksx_capture::usb_candidates() {
+        Ok(found) => {
+            let rows = found
+                .into_iter()
+                .map(|candidate| UsbRow {
+                    alias: configured.alias_for(&candidate.id).map(str::to_owned),
+                    selected: configured.backend_for(&candidate.id) == Backend::Winusb,
+                    candidate,
+                })
+                .collect();
+            (rows, true)
+        }
+        Err(err) => {
+            tracing::warn!("USB enumeration failed: {err}");
+            (Vec::new(), false)
+        }
+    };
+
+    if !interception_available && !usb_available {
+        let message = "neither the Interception driver nor USB enumeration is available; \
+                       run `ksx doctor` for driver diagnostics"
+            .to_owned();
+        if json {
+            println!(
+                "{}",
+                crate::pads::error_json("no-capture-backend", &message)
+            );
+        } else {
+            eprintln!("error: {message}");
+        }
+        std::process::exit(EXIT_DRIVER_MISSING);
+    }
+
+    let report = DevicesReport::build(
+        keyboards,
+        interception_available,
+        usb,
+        usb_available,
+        configured,
+    );
     if json {
         println!("{}", serde_json::to_string_pretty(&devices_json(&report))?);
     } else {
@@ -255,11 +540,12 @@ pub fn run(json: bool) -> anyhow::Result<()> {
 
 #[cfg(not(windows))]
 pub fn run(_json: bool) -> anyhow::Result<()> {
-    anyhow::bail!("`ksx devices` is Windows-only (it enumerates via the Interception driver)")
+    anyhow::bail!("`ksx devices` is Windows-only (it enumerates USB and the Interception driver)")
 }
 
 #[cfg(test)]
 mod tests {
+    use ksx_capture::winusb::Binding;
     use ksx_core::DeviceId;
 
     use super::*;
@@ -267,6 +553,8 @@ mod tests {
     const IPAC: &str = "HID\\VID_D209&PID_0430&REV_0056&MI_00";
     const LOGI: &str = "HID\\VID_046D&PID_C31C&REV_6402&MI_00";
     const MOUSE: &str = "HID\\VID_046D&PID_C077&REV_7200";
+    const IPAC_USB: &str = "USB\\VID_D209&PID_0430&MI_00\\7&1A2B3C4D&0&0000";
+    const IPAC_USB_B: &str = "USB\\VID_D209&PID_0430&MI_00\\7&5E6F7A8B&0&0000";
 
     fn keyboard(id: &str, slot: u8, friendly: Option<&str>) -> DeviceInfo {
         DeviceInfo {
@@ -290,6 +578,43 @@ mod tests {
                 kind: DeviceKind::Mouse,
             },
         ]
+    }
+
+    fn usb(id: &str, binding: Binding) -> ksx_capture::UsbCandidate {
+        ksx_capture::UsbCandidate {
+            id: DeviceId::from(id),
+            parent_id: "USB\\VID_D209&PID_0430\\4".into(),
+            vendor_id: 0xD209,
+            product_id: 0x0430,
+            interface_number: 0,
+            interface_class: 0x03,
+            interface_subclass: 1,
+            interface_protocol: 1,
+            interface_string: None,
+            product: Some("I-PAC Ultimate I/O".into()),
+            device_desc: Some("HID Keyboard Device".into()),
+            port_chain: vec![1, 4],
+            bus_id: "1".into(),
+            binding,
+        }
+    }
+
+    fn config(entries: &[(&str, &str, Backend)]) -> ConfiguredDevices {
+        ConfiguredDevices {
+            entries: entries
+                .iter()
+                .map(|(id, alias, b)| (DeviceId::from(*id), (*alias).to_owned(), *b))
+                .collect(),
+        }
+    }
+
+    fn row(id: &str, binding: Binding, configured: &ConfiguredDevices) -> UsbRow {
+        let candidate = usb(id, binding);
+        UsbRow {
+            alias: configured.alias_for(&candidate.id).map(str::to_owned),
+            selected: configured.backend_for(&candidate.id) == Backend::Winusb,
+            candidate,
+        }
     }
 
     #[test]
@@ -355,9 +680,37 @@ mod tests {
         );
     }
 
+    /// T4, structurally fixed: the same two boards on the WinUSB side are two
+    /// distinct ids, so both can be bound and neither is ambiguous.
+    #[test]
+    fn two_identical_boards_are_distinct_on_the_winusb_side() {
+        let cfg = config(&[
+            (IPAC_USB, "P1 I-PAC", Backend::Winusb),
+            (IPAC_USB_B, "P2 I-PAC", Backend::Winusb),
+        ]);
+        let report = DevicesReport::build(
+            Vec::new(),
+            false,
+            vec![
+                row(IPAC_USB, Binding::WinUsb, &cfg),
+                row(IPAC_USB_B, Binding::WinUsb, &cfg),
+            ],
+            true,
+            cfg,
+        );
+        assert!(report.duplicates().is_empty());
+        assert!(report.pending_rebinds().is_empty());
+        assert!(report.unmatched_winusb_config().is_empty());
+        assert_eq!(report.hid_rows().filter(|r| r.ready()).count(), 2);
+
+        let text = render_human(&report);
+        assert_eq!(text.matches("[READY]").count(), 2, "{text}");
+        assert!(!text.contains("cannot tell them apart"));
+    }
+
     #[test]
     fn distinct_boards_and_mice_are_never_duplicates() {
-        // A mouse sharing an id with a keyboard is not an ambiguity for us: M4
+        // A mouse sharing an id with a keyboard is not an ambiguity for us: ksx
         // never captures mice, so only keyboards are compared.
         let report = DevicesReport::new(vec![
             keyboard(IPAC, 1, None),
@@ -377,6 +730,122 @@ mod tests {
         );
     }
 
+    /// The state a user is in for the whole middle of the migration: config
+    /// says winusb, the board is still a keyboard. `ksx run` would refuse, so
+    /// this must be impossible to miss.
+    #[test]
+    fn a_selected_but_unrebound_board_is_called_out() {
+        let cfg = config(&[(IPAC_USB, "P1 I-PAC", Backend::Winusb)]);
+        let report = DevicesReport::build(
+            vec![keyboard(IPAC, 1, Some("I-PAC"))],
+            true,
+            vec![row(IPAC_USB, Binding::HidUsb, &cfg)],
+            true,
+            cfg,
+        );
+        assert_eq!(report.pending_rebinds().len(), 1);
+        let text = render_human(&report);
+        assert!(text.contains("[NEEDS REBIND]"), "{text}");
+        assert!(text.contains("ksx never rebinds a device itself"), "{text}");
+        let v = devices_json(&report);
+        assert_eq!(
+            v.pointer("/health/pending_rebinds/0"),
+            Some(&serde_json::json!(IPAC_USB))
+        );
+        assert_eq!(
+            v.pointer("/usb_candidates/0/winusb_rebind_present"),
+            Some(&serde_json::json!(false))
+        );
+    }
+
+    /// The migration mistake worth catching by name: `backend` flipped to
+    /// winusb while `id` is still the Interception hardware id.
+    #[test]
+    fn an_interception_id_left_on_a_winusb_entry_is_diagnosed() {
+        let cfg = config(&[(IPAC, "P1 I-PAC", Backend::Winusb)]);
+        let report = DevicesReport::build(
+            Vec::new(),
+            false,
+            vec![row(IPAC_USB, Binding::WinUsb, &cfg)],
+            true,
+            cfg,
+        );
+        assert_eq!(
+            report.unmatched_winusb_config(),
+            vec![&DeviceId::from(IPAC)]
+        );
+        let text = render_human(&report);
+        assert!(
+            text.contains("no USB interface has that instance path"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the alias keeps every [[slot]] working"),
+            "{text}"
+        );
+    }
+
+    /// The M6 exit state: Interception uninstalled, everything on WinUSB. The
+    /// command must still work — it is how you check the machine survived.
+    #[test]
+    fn listing_works_with_the_interception_driver_gone() {
+        let cfg = config(&[(IPAC_USB, "P1 I-PAC", Backend::Winusb)]);
+        let report = DevicesReport::build(
+            Vec::new(),
+            false,
+            vec![row(IPAC_USB, Binding::WinUsb, &cfg)],
+            true,
+            cfg,
+        );
+        let text = render_human(&report);
+        assert!(text.contains("driver not installed"), "{text}");
+        assert!(text.contains("[READY]"), "{text}");
+        assert!(
+            !text.contains("health:"),
+            "no slot-budget line without a driver to budget: {text}"
+        );
+        let v = devices_json(&report);
+        assert_eq!(
+            v.pointer("/backends/interception/available"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            v.pointer("/backends/winusb/available"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[test]
+    fn non_hid_interfaces_are_not_listed_as_candidates() {
+        let cfg = ConfiguredDevices::default();
+        let mut vendor = row(IPAC_USB, Binding::None, &cfg);
+        vendor.candidate.interface_class = 0xFF;
+        let report = DevicesReport::build(Vec::new(), false, vec![vendor], true, cfg);
+        assert_eq!(report.hid_rows().count(), 0);
+        assert!(render_human(&report).contains("no HID USB interfaces"));
+    }
+
+    #[test]
+    fn configured_devices_answers_backend_alias_and_selection() {
+        let cfg = config(&[
+            (IPAC_USB, "P1 I-PAC", Backend::Winusb),
+            (LOGI, "Desk", Backend::Interception),
+        ]);
+        assert_eq!(cfg.backend_for(&DeviceId::from(IPAC_USB)), Backend::Winusb);
+        assert_eq!(
+            cfg.backend_for(&DeviceId::from(LOGI)),
+            Backend::Interception
+        );
+        // An unconfigured device gets the schema default.
+        assert_eq!(
+            cfg.backend_for(&DeviceId::from("USB\\NOPE")),
+            Backend::Interception
+        );
+        assert_eq!(cfg.alias_for(&DeviceId::from(IPAC_USB)), Some("P1 I-PAC"));
+        assert_eq!(cfg.alias_for(&DeviceId::from("USB\\NOPE")), None);
+        assert_eq!(cfg.winusb_ids(), vec![&DeviceId::from(IPAC_USB)]);
+    }
+
     #[test]
     fn devices_json_snapshot() {
         let report = DevicesReport::new(fixture());
@@ -386,6 +855,28 @@ mod tests {
     #[test]
     fn render_human_snapshot() {
         let report = DevicesReport::new(fixture());
+        insta::assert_snapshot!(render_human(&report));
+    }
+
+    #[test]
+    fn mixed_backend_snapshot() {
+        // The realistic mid-migration cabinet: one board rebound and ready, one
+        // still on the keyboard stack, plus the desk keyboard on Interception.
+        let cfg = config(&[
+            (IPAC_USB, "P1 I-PAC", Backend::Winusb),
+            (IPAC_USB_B, "P2 I-PAC", Backend::Winusb),
+            (LOGI, "Desk", Backend::Interception),
+        ]);
+        let report = DevicesReport::build(
+            vec![keyboard(LOGI, 1, Some("Logitech Keyboard"))],
+            true,
+            vec![
+                row(IPAC_USB, Binding::WinUsb, &cfg),
+                row(IPAC_USB_B, Binding::HidUsb, &cfg),
+            ],
+            true,
+            cfg,
+        );
         insta::assert_snapshot!(render_human(&report));
     }
 

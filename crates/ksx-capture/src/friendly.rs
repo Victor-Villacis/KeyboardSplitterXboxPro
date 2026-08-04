@@ -4,13 +4,10 @@
 //! subkeys for one whose `Class` matches, and take the `DeviceDesc` text after
 //! the `;` separator. Any failure yields `None` (legacy showed "n/a").
 
-use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
-    RRF_RT_REG_SZ,
-};
+use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 
 use crate::backend::DeviceKind;
+use crate::regkey::RegKey;
 
 /// Legacy revision-strip: `HID\VID_D209&PID_0430&REV_0056&MI_00` →
 /// `HID\VID_D209&PID_0430&MI_00`. If there is no `&` after `REV`, the id is
@@ -71,100 +68,6 @@ fn search(key: &RegKey, class: &str, depth: u8) -> Option<String> {
         }
     }
     None
-}
-
-fn to_wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// Minimal owning registry-key handle (read-only).
-struct RegKey(HKEY);
-
-impl RegKey {
-    fn open(parent: HKEY, path: &str) -> Option<Self> {
-        let wide = to_wide(path);
-        let mut h: HKEY = std::ptr::null_mut();
-        // SAFETY: valid NUL-terminated wide string, out-pointer to HKEY.
-        let status = unsafe { RegOpenKeyExW(parent, wide.as_ptr(), 0, KEY_READ, &mut h) };
-        (status == ERROR_SUCCESS && !h.is_null()).then(|| Self(h))
-    }
-
-    fn subkey_names(&self) -> Vec<String> {
-        let mut names = Vec::new();
-        let mut index = 0u32;
-        loop {
-            let mut buf = [0u16; 256];
-            let mut len = buf.len() as u32;
-            // SAFETY: buffer/length pair as documented; other outputs unused.
-            let status = unsafe {
-                RegEnumKeyExW(
-                    self.0,
-                    index,
-                    buf.as_mut_ptr(),
-                    &mut len,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            };
-            if status != ERROR_SUCCESS {
-                break; // ERROR_NO_MORE_ITEMS or genuine failure — done either way
-            }
-            names.push(String::from_utf16_lossy(&buf[..len as usize]));
-            index += 1;
-        }
-        names
-    }
-
-    fn string_value(&self, name: &str) -> Option<String> {
-        let wide = to_wide(name);
-        let mut size = 0u32;
-        // SAFETY: size query (null data pointer) per RegGetValueW contract.
-        let status = unsafe {
-            RegGetValueW(
-                self.0,
-                std::ptr::null(),
-                wide.as_ptr(),
-                RRF_RT_REG_SZ,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut size,
-            )
-        };
-        if status != ERROR_SUCCESS || size == 0 {
-            return None;
-        }
-        let mut buf = vec![0u16; (size as usize).div_ceil(2)];
-        // SAFETY: buffer sized from the query above; size is in bytes.
-        let status = unsafe {
-            RegGetValueW(
-                self.0,
-                std::ptr::null(),
-                wide.as_ptr(),
-                RRF_RT_REG_SZ,
-                std::ptr::null_mut(),
-                buf.as_mut_ptr().cast(),
-                &mut size,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return None;
-        }
-        let chars = (size as usize) / 2;
-        let end = buf[..chars.min(buf.len())]
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(chars.min(buf.len()));
-        Some(String::from_utf16_lossy(&buf[..end]))
-    }
-}
-
-impl Drop for RegKey {
-    fn drop(&mut self) {
-        // SAFETY: handle owned by us, closed exactly once.
-        unsafe { RegCloseKey(self.0) };
-    }
 }
 
 #[cfg(test)]

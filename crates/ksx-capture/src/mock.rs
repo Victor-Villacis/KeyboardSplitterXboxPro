@@ -44,6 +44,18 @@ pub struct ResentStroke {
 /// released" with the pad log in one timeline.
 pub type CtlObserver = Box<dyn Fn(&CaptureCtl) + Send>;
 
+/// Hook run **synchronously inside [`CaptureBackend::run`]**, before the capture
+/// thread is spawned and therefore before the supervisor's first loop
+/// iteration.
+///
+/// It exists for one thing a test otherwise cannot express: a backend whose
+/// health went bad *during this session* rather than before it. Simply setting
+/// a flag on the handle before calling `supervise()` no longer says that — a
+/// session baselines its health at start, so a pre-set flag is somebody else's
+/// history by definition ([`crate::HealthView`]). Setting it from the spawned
+/// thread instead would be a race with the very first poll.
+pub type StartHook = Box<dyn FnOnce(&HealthHandle) + Send>;
+
 /// Scripted [`CaptureBackend`].
 pub struct MockCaptureBackend {
     devices: Vec<DeviceInfo>,
@@ -54,6 +66,7 @@ pub struct MockCaptureBackend {
     escapes: EscapeHandle,
     resent: Arc<Mutex<Vec<ResentStroke>>>,
     ctl_observer: Option<CtlObserver>,
+    start_hook: Option<StartHook>,
 }
 
 impl MockCaptureBackend {
@@ -79,6 +92,7 @@ impl MockCaptureBackend {
             escapes: EscapeHandle::new(),
             resent: Arc::new(Mutex::new(Vec::new())),
             ctl_observer: None,
+            start_hook: None,
         }
     }
 
@@ -92,6 +106,24 @@ impl MockCaptureBackend {
     /// Call `observer` whenever the capture thread applies a [`CaptureCtl`].
     pub fn with_ctl_observer(mut self, observer: CtlObserver) -> Self {
         self.ctl_observer = Some(observer);
+        self
+    }
+
+    /// Publish into pre-existing handles instead of fresh ones — how several
+    /// mocks become one session under [`crate::CompositeBackend`] (shared
+    /// health counters, one escape latch). Presence stays this mock's own, by
+    /// the merge-not-share rule in [`crate::presence`].
+    pub fn with_handles(mut self, handles: crate::backend::Handles) -> Self {
+        self.health = handles.health;
+        self.escapes = handles.escapes;
+        self
+    }
+
+    /// Publish health from inside `run`, before the capture thread exists —
+    /// the only way to script "this session's backend went bad" rather than
+    /// "the previous one did". See [`StartHook`].
+    pub fn with_start_hook(mut self, hook: StartHook) -> Self {
+        self.start_hook = Some(hook);
         self
     }
 
@@ -134,7 +166,14 @@ impl CaptureBackend for MockCaptureBackend {
             escapes,
             resent,
             ctl_observer,
+            start_hook,
         } = *self;
+
+        // Synchronously, on the caller's thread: whatever this publishes is
+        // unambiguously inside the session that is starting.
+        if let Some(hook) = start_hook {
+            hook(&health);
+        }
 
         std::thread::Builder::new()
             .name("ksx-capture-mock".into())

@@ -41,6 +41,32 @@
 //! (`ksx_capture::escape`); this thread only *polls* the resulting counters to
 //! mirror its own bookkeeping, print, and beep. If this thread stopped running
 //! entirely, `LeftCtrl ×5` would still free the keyboards.
+//!
+//! # One session's worth of state, on state that outlives the session
+//!
+//! Everything below was written when the capture backend was born and died with
+//! the session: health flags and escape counters started at zero because the
+//! object holding them was new. Since M6 that is no longer true for a claimed
+//! panel — the daemon claims once and keeps the claim (and its `Handles`) for
+//! its whole lifetime, so a second session borrows state a first session already
+//! wrote into. Latched flags would then be read as *this* session's, which turns
+//! one watchdog trip into "every game after it refuses to start".
+//!
+//! So a session takes a **baseline** at [`supervise`]'s startup and reads
+//! deltas: [`ksx_capture::HealthView`] for health, `seen_escapes` seeded from
+//! the live counters for escapes. Two consequences worth stating plainly:
+//!
+//! - `ksx run` is bit-for-bit unaffected. It builds its own backend per run, so
+//!   the baseline is all-zero and every delta is the value itself.
+//! - The one piece of health that is *not* session-scoped is
+//!   `reboot_required`: Interception slot exhaustion is a property of the
+//!   machine until it restarts, not of a session (`ksx_capture::CaptureHealth::since`).
+//!
+//! The escape **latch** cannot be handled by a reader, because the capture
+//! thread and the panel's typethrough act on it live. It is re-armed once, at
+//! session start, by `EscapeHandle::arm` — starting a session is the user
+//! asking for emulation *now*, and a gesture from a game they already quit must
+//! not silently keep the panel typing onto the desktop behind the new one.
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -52,7 +78,7 @@ use crossbeam_channel::{
     bounded, never, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError,
 };
 use ksx_capture::{
-    CaptureBackend, CaptureCtl, CaptureHealth, DeviceInfo, EscapeStatus, ExitReason,
+    CaptureBackend, CaptureCtl, CaptureHealth, DeviceInfo, EscapeStatus, ExitReason, HealthView,
 };
 use ksx_core::{DeviceId, Engine, InvalidationReason, KeyEvent, PadState, ResolvedSlot};
 use ksx_output::{PadHandle, VirtualPadBackend};
@@ -357,6 +383,12 @@ pub struct Outcome {
     pub stop: StopReason,
     pub pads: Vec<PadInfo>,
     pub latency: LatencySummary,
+    /// Health **as this session earned it** — a delta over the baseline taken
+    /// at startup, so a daemon that has run five games does not report the
+    /// first one's stall five times. The single exception is
+    /// `reboot_required`, which describes the machine rather than the session
+    /// and is carried forward on purpose
+    /// (`ksx_capture::CaptureHealth::since`).
     pub health: CaptureHealth,
     pub events: u64,
     pub updates: u64,
@@ -621,6 +653,20 @@ pub fn supervise(
         mut capture, pads, ..
     } = wiring;
 
+    // The escape baseline is taken HERE, first statement, before pads are
+    // plugged — not next to the health baseline further down.
+    //
+    // Why: under `ksx daemon` the panel is muted at the control loop
+    // (`daemon::mod`'s Start arm) and pad plugging can take seconds. A player
+    // staring at a suddenly-dead panel mashes P1 Button 1 — which on an I-PAC
+    // *is* LeftCtrl. The claim's capture thread is daemon-lifetime and already
+    // running, so it latches passthrough correctly and the panel starts typing.
+    // Taking the baseline after that point would absorb the gesture: the panel
+    // would go dead again with no `[ESC]` line and no trace, and a Ctrl+Alt+Del
+    // in the same window would be discarded instead of stopping the session.
+    // Escapes must never be undone by the machine (escape.rs module docs).
+    let escape_baseline = capture.escapes().snapshot();
+
     // Startup order, step 0: what does the capture backend see right now? This
     // is both the hotplug baseline and the "you configured a device that isn't
     // plugged in" warning.
@@ -750,9 +796,20 @@ pub fn supervise(
     let _ = out.flush();
 
     // Startup order, step 2: capture starts — in passthrough, always.
-    let health = capture.health();
+    //
+    // The handles are grabbed here, and this is where the session's *health*
+    // view begins (see the module docs) — taken BEFORE `capture.run` so nothing
+    // this session's own capture thread publishes can be mistaken for history.
+    //
+    // The escape baseline is deliberately NOT taken here: it was captured as
+    // the first statement of this function, before the pad phase, so a gesture
+    // made while the panel was already muted and the pads were still plugging
+    // still counts as this session's. Arming likewise belongs to whoever mutes
+    // the panel — `ksx daemon` arms as it sets emulating, and `ksx run` builds a
+    // fresh backend whose latch starts clear.
     let presence = capture.presence();
     let escapes = capture.escapes();
+    let health = HealthView::new(capture.health());
     let (ev_tx, ev_rx) = bounded::<KeyEvent>(EVENT_CHANNEL_CAPACITY);
     let (ctl_tx, ctl_rx) = unbounded::<CaptureCtl>();
     let capture_handle = match capture.run(ev_tx, ctl_rx) {
@@ -843,7 +900,12 @@ pub fn supervise(
     let mut stop: Option<StopReason> = None;
     let mut toggles = 0u32;
     let mut invalidated: Vec<(u8, InvalidationReason)> = Vec::new();
-    let mut seen_escapes = EscapeStatus::default();
+    // Seeded from the baseline, NOT from zero. `mirror_escapes` replays every
+    // gesture between `seen` and the live counter, and on a daemon-lifetime
+    // handle "zero" means "every gesture since the daemon started" — an old
+    // `LeftCtrl ×5` would toggle this session's blocking straight back off and
+    // print an `[ESC]` line for something that happened two games ago.
+    let mut seen_escapes = escape_baseline;
 
     while stop.is_none() {
         if (opts.stop)() {
@@ -1137,6 +1199,11 @@ fn exit_reason_str(reason: ExitReason) -> &'static str {
         ExitReason::ChannelClosed => "channel-closed",
         ExitReason::ScriptExhausted => "script-exhausted",
         ExitReason::Panicked => "panicked",
+        // M6: a claimed board was unplugged. Deliberately its own string and
+        // not folded into "shutdown" — the session ended because hardware
+        // left, which is a different thing to explain to a user than "you
+        // asked me to stop".
+        ExitReason::DeviceLost => "device-lost",
     }
 }
 

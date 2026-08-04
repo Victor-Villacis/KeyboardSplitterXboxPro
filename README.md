@@ -128,6 +128,7 @@ ksx monitor --for-secs 10         # live per-device key stream, never blocks
 ksx pads --count 4                # plug 4 test pads, LED order, kill-recovery
 ksx doctor                        # driver health, CI-policy state, verdicts
 ksx import-legacy --dry-run       # legacy XML -> TOML
+ksx winusb status                 # WinUSB claim state per USB interface (read-only)
 ```
 
 ### `ksx daemon` — stay resident with a tray icon
@@ -202,6 +203,49 @@ Interception is reported but never installed (non-commercial licence).
 Exit codes: 0 nothing to do / installed, 1 error, 2 refused (verification
 failed, installer missing, elevation needed), 3 the installer ran and failed.
 
+### `ksx winusb` — escape the 2026 driver cliff
+
+```sh
+ksx winusb status                       # read-only: which interfaces, which driver, claimable?
+ksx winusb status --json
+ksx winusb claim "USB\VID_D209&PID_0430&MI_00\7&25eea38c&0&0000"        # DRY RUN
+ksx winusb claim "USB\VID_D209&PID_0430&MI_00\7&25eea38c&0&0000" --yes  # elevated
+ksx winusb release "USB\VID_D209&PID_0430&MI_00\7&25eea38c&0&0000" --yes
+```
+
+Rebinds **one** USB interface from the keyboard stack to Microsoft's in-box
+`winusb.sys`, after which ksx reads its HID interrupt endpoint directly. Blocking
+and identity stop being enforced and start being structural: the interface is not
+in the keyboard stack, so nothing else on the machine can see a keystroke from it,
+and two identical I-PACs stop being indistinguishable ([`USE-CASES.md`](docs/USE-CASES.md) T4).
+No third-party kernel driver, so nothing to expire in 2026.
+
+**The trade, and you should decide about it before you run anything:** a claimed
+panel is no longer a keyboard. It types only while `ksx daemon` is running — the
+daemon holds the claim for its whole lifetime and re-injects the panel's
+keystrokes with `SendInput` whenever emulation is stopped, including between two
+games, so frontend menus keep working — and **if ksx is not running it does
+nothing at all.** Injected keys also never reach the lock screen, a UAC prompt or
+`Ctrl+Alt+Del`. Mitigations: `ksx autostart --enable`, one ordinary keyboard on
+another port, and the one-command rollback. `claim` **refuses** to take the
+machine's last keyboard (exit 2) — counting only keyboards that can type right
+now, one per physical board, so a claimed, disabled or paired-but-disconnected
+keyboard cannot be mistaken for your spare.
+
+Both mutating verbs are **dry runs by default**: they print the exact INF and the
+exact `pnputil` command line and change nothing until `--yes`. The INF must be
+signed before `pnputil` will take it (`winusb.sys` is signed; a third-party INF
+pointing at it is not) — the dry run prints the `signtool` recipe and the Zadig
+alternative, and explicitly tells you not to enable test-signing.
+
+Migration walkthrough: [`docs/MIGRATION-WINUSB.md`](docs/MIGRATION-WINUSB.md).
+Rollback: [`docs/RECOVERY.md`](docs/RECOVERY.md) §2 — including the Device
+Manager route that needs only a mouse.
+
+Exit codes: 0 reported/done, 1 error, 2 refused (unknown or ambiguous device,
+not a keyboard interface, already claimed, elevation needed, **or it is the only
+keyboard**), 3 pnputil ran and failed.
+
 ### Frontend integration
 
 LaunchBox and RetroBat wiring, plus a wrapper that always stops ksx:
@@ -224,7 +268,7 @@ fallback until `ksx` passes the full cabinet test matrix.
 | M3 | Interception capture layer | ✅ |
 | M4 | End-to-end parity (`ksx run`) | ⏳ code complete, cabinet gate pending |
 | M5 | Profiles, autostart, tray daemon, installer | ⏳ code complete, cabinet gate pending |
-| M6 | WinUSB capture backend (post-2026 survival path) | – |
+| M6 | WinUSB claim: rebind tooling, recovery, keystroke re-injection | ⏳ tooling + injection done, backend + cabinet gate pending |
 | M7 | UI | – |
 
 ## Workspace
@@ -235,13 +279,13 @@ crates/ksx-config         TOML config + presets
 crates/ksx-legacy-import  legacy UTF-16 XML → TOML importer
 crates/ksx-capture        CaptureBackend: interception / winusb / rawinput-identify
 crates/ksx-output         VirtualPadBackend: ViGEmBus
-crates/ksx-platform       hotplug, driver health, install, autostart
+crates/ksx-platform       driver health, install, autostart, WinUSB rebind, SendInput
 crates/ksx-games          game launch + exit detection (launcher hand-off)
 crates/ksx-app            the `ksx` binary
 crates/vigem-client       vendored CasualX/vigem-client (MIT)
 legacy/                   original C# solution (frozen, reference only)
 examples/                 frontend wrapper scripts
-docs/                     architecture, integration, driver story, recovery, research
+docs/                     architecture, integration, driver story, recovery, migration, research
 ```
 
 ## License

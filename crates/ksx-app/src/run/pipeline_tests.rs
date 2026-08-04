@@ -230,6 +230,9 @@ fn escape_plan() -> RunPlan {
         block_keyboards: true,
         block_mice: false,
         captureable: vec![DeviceId::from(IPAC)],
+        // These plans drive mock backends; no board is WinUSB-claimed, so the
+        // pipeline runs entirely through the Interception path.
+        winusb: Vec::new(),
         notes: Vec::new(),
     }
 }
@@ -269,6 +272,9 @@ fn cabinet_plan() -> RunPlan {
         block_keyboards: true,
         block_mice: false,
         captureable: vec![DeviceId::from(IPAC)],
+        // These plans drive mock backends; no board is WinUSB-claimed, so the
+        // pipeline runs entirely through the Interception path.
+        winusb: Vec::new(),
         notes: Vec::new(),
     }
 }
@@ -537,10 +543,43 @@ fn recorded_cabinet_session_drives_all_four_pads_through_the_real_pipeline() {
     // The output thread also writes one neutral state per pad at teardown, so
     // compare the session's transitions as a prefix.
     let observed: Vec<(u32, PadState)> = actual.by_ref().take(expected.len()).collect();
-    assert_eq!(
-        observed, expected,
-        "the live pipeline diverged from the pure engine"
-    );
+    if session.outcome.deltas_coalesced == 0 {
+        assert_eq!(
+            observed, expected,
+            "the live pipeline diverged from the pure engine"
+        );
+    } else {
+        // Coalescing is level-triggered and therefore ALLOWED to drop
+        // intermediate states — that is the M4 fix that stops a stalled output
+        // thread from blocking the engine. Under parallel CI load it does fire
+        // here (observed 305 of 311 once, agreeing for the first 301 and then
+        // simply shorter), so demanding exact equality makes this test a
+        // load-sensitive flake rather than a correctness check.
+        //
+        // What must still hold is the property coalescing actually promises:
+        // every state that survived is one the pure engine produced, in order,
+        // and each pad ends where an un-squashed run would have left it. The
+        // stronger equality above still runs whenever nothing was coalesced,
+        // which is the ordinary case.
+        let mut it = expected.iter();
+        assert!(
+            observed.iter().all(|o| it.any(|e| e == o)),
+            "coalescing dropped intermediate states, but what survived is not an \
+             in-order subsequence of what the pure engine produced"
+        );
+        let final_of = |seq: &[(u32, PadState)]| -> BTreeMap<u32, PadState> {
+            let mut last = BTreeMap::new();
+            for (handle, state) in seq {
+                last.insert(*handle, *state);
+            }
+            last
+        };
+        assert_eq!(
+            final_of(&observed),
+            final_of(&expected),
+            "a coalesced burst left a pad in a different state than an un-squashed one"
+        );
+    }
     assert!(expected.len() > 100, "expected a busy session");
 
     // Every player panel drove its own pad: the one-keyboard→many-slots fan-out
@@ -1045,9 +1084,22 @@ fn teardown_uncaptures_before_it_unplugs() {
 #[test]
 fn an_engine_thread_panic_still_frees_the_keyboards() {
     let devices = vec![keyboard(IPAC, 1)];
-    let script: Vec<MockStroke> = (0..50)
-        .flat_map(|_| [key_stroke(0, Key::A, true), key_stroke(0, Key::A, false)])
-        .collect();
+    // EXACTLY one stroke, and that is load-bearing rather than minimal.
+    //
+    // The engine panics on the event this stroke produces, which drops the
+    // capture→engine receiver. A mock that is still feeding that channel then
+    // sees `Disconnected` and exits `ChannelClosed` — and the supervisor checks
+    // the capture thread *before* the engine thread, so it would report
+    // `CaptureEnded` instead of `EngineThreadDied` depending on which thread the
+    // scheduler ran first. That is what made this test fail about one run in
+    // five under a loaded `cargo test` (and never in isolation).
+    //
+    // With one stroke the mock has provably finished sending before the panic
+    // it causes can happen: it is parked in its idle `ctl.recv()` loop, never
+    // touches the channel again, and the only thread that can die is the engine.
+    // The recovery path under test — real panic, real teardown, real ordering —
+    // is unchanged.
+    let script = vec![key_stroke(0, Key::A, true)];
 
     // The panic message is printed by the default hook; that noise is the price
     // of proving the recovery path with a real panic instead of a simulated one.
@@ -1262,16 +1314,23 @@ fn hotplug_does_not_re_arm_capture_after_the_watchdog_tripped() {
     // republishes the I-PAC as "back" — with the watchdog already tripped. Both
     // conditions are true on the supervisor's very first loop iteration, so the
     // ordering of the two checks is what decides the outcome.
+    //
+    // The trip is published from `with_start_hook`, i.e. synchronously inside
+    // `run()`, and that is load-bearing: a session baselines its health at
+    // startup, so a flag set before `supervise()` is by definition a PREVIOUS
+    // session's stall and this one is right to ignore it (R1). Setting it from
+    // the capture thread instead would race the first poll and make this test
+    // flaky rather than meaningful.
     let log = PadLog::default();
-    let capture = MockCaptureBackend::new(Vec::new(), Vec::new()).with_ctl_observer({
-        let log = log.clone();
-        Box::new(move |message| log.push(TraceEvent::Ctl(CtlKind::of(message))))
-    });
-    let health = capture.health();
+    let capture = MockCaptureBackend::new(Vec::new(), Vec::new())
+        .with_ctl_observer({
+            let log = log.clone();
+            Box::new(move |message| log.push(TraceEvent::Ctl(CtlKind::of(message))))
+        })
+        .with_start_hook(Box::new(ksx_capture::HealthHandle::set_watchdog_tripped));
     let presence = capture.presence();
     let trace: Trace = Arc::new(Mutex::new(Vec::new()));
 
-    health.set_watchdog_tripped();
     presence.publish(vec![DeviceId::from(IPAC)]);
 
     let mut options = RunOptions {

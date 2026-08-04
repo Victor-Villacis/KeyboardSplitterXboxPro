@@ -54,12 +54,30 @@ pub struct RunPlan {
     pub block_mice: bool,
     /// Distinct keyboards bound to slots — exactly the `SetCaptured` set.
     pub captureable: Vec<DeviceId>,
+    /// The subset of [`Self::captureable`] whose `[[device]]` entry selects
+    /// `backend = "winusb"` (M6).
+    ///
+    /// Backend choice is *per device*, so a run can need one claimed WinUSB
+    /// interface per rebound board **and** an Interception context for whatever
+    /// is still on the keyboard stack. Resolving it here, in the pure planner,
+    /// is what lets `--dry-run` tell you which backends a session would touch
+    /// before it touches one.
+    pub winusb: Vec<DeviceId>,
     /// Non-fatal findings worth printing (dropped slots, ignored flags,
     /// lenient-load warnings).
     pub notes: Vec<String>,
 }
 
 impl RunPlan {
+    /// Does this plan need an Interception context at all?
+    ///
+    /// `false` is the M6 exit state: every bound board is claimed through
+    /// WinUSB, so the run never loads the end-of-life driver — which is the
+    /// whole point of the milestone, and the thing the cabinet gate checks.
+    pub fn needs_interception(&self) -> bool {
+        self.captureable.iter().any(|id| !self.winusb.contains(id))
+    }
+
     /// Slot numbers driven by `device`, in slot order.
     pub fn slots_using(&self, device: &DeviceId) -> Vec<u8> {
         self.slots
@@ -266,6 +284,19 @@ pub fn build_plan(
         .filter(|id| seen.insert(id.clone()))
         .collect();
 
+    // Backend selection is a property of the *device*, not of the slot layout,
+    // so it comes from `[[device]]` in both the config and the `--game` path.
+    let winusb: Vec<DeviceId> = captureable
+        .iter()
+        .filter(|id| {
+            config
+                .devices
+                .iter()
+                .any(|d| d.id == id.as_str() && d.backend == ksx_config::Backend::Winusb)
+        })
+        .cloned()
+        .collect();
+
     Ok(RunPlan {
         source,
         config_path: PathBuf::new(),
@@ -273,6 +304,7 @@ pub fn build_plan(
         block_keyboards,
         block_mice,
         captureable,
+        winusb,
         notes,
     })
 }
@@ -320,6 +352,22 @@ pub fn render_human(plan: &RunPlan) -> String {
         "  block keyboards: {}    block mice: {} (never applied in M4)",
         yes_no(plan.block_keyboards),
         yes_no(plan.block_mice)
+    );
+    // Which capture drivers this session would touch. Worth a line of its own:
+    // "does this run still load the end-of-life Interception driver" is the
+    // question M6 exists to answer, and --dry-run is where you ask it.
+    let _ = writeln!(
+        out,
+        "  backends: {}",
+        match (plan.needs_interception(), plan.winusb.is_empty()) {
+            (true, true) => "interception".to_owned(),
+            (false, false) => format!("winusb ({} claimed board(s))", plan.winusb.len()),
+            (true, false) => format!(
+                "mixed - winusb ({} board(s)) + interception for the rest",
+                plan.winusb.len()
+            ),
+            (false, true) => "none (no keyboard bound to a slot)".to_owned(),
+        }
     );
     for slot in &plan.slots {
         let keyboard = slot
@@ -379,6 +427,8 @@ pub fn plan_json(plan: &RunPlan) -> serde_json::Value {
         "block_mice": plan.block_mice,
         "slots": slots,
         "captureable": plan.captureable.iter().map(|d| d.as_str()).collect::<Vec<_>>(),
+        "winusb": plan.winusb.iter().map(|d| d.as_str()).collect::<Vec<_>>(),
+        "needs_interception": plan.needs_interception(),
         "notes": plan.notes,
     })
 }

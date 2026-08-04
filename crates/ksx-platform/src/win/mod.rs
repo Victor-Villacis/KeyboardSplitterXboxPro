@@ -2,6 +2,7 @@
 //! file metadata, WinVerifyTrust. Never elevates, never errors — a machine with
 //! no drivers at all still yields a complete `DriverReport`.
 
+pub(crate) mod devices;
 mod filever;
 mod registry;
 mod services;

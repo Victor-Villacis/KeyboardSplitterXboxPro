@@ -105,8 +105,40 @@ reports for it. The bytes that were checked are the bytes that run.
   own `nusb::Device`. No third-party kernel driver, no signing cliff, no 10-device limit.
 - Leave `MI_01`/`MI_02` (mouse/consumer/vendor collections) bound normally — the
   trackball/spinner keeps working natively in MAME.
-- Recovery: `pnputil /remove-device <instance-id>` + rescan restores the standard
-  keyboard driver; keep one non-claimed keyboard on a spare port during setup.
+- Recovery: `ksx winusb release <instance-id> --yes`, or by hand
+  `pnputil /remove-device` → `pnputil /delete-driver oemNN.inf /uninstall /force`
+  → `pnputil /scan-devices`. **The middle step is not optional**: the ksx INF
+  matches on hardware id and outranks the in-box `input.inf` (compatible id
+  only), so a rescan with the INF still in the driver store re-binds WinUSB.
+  Keep one non-claimed keyboard on a spare port — `ksx winusb claim` refuses to
+  take the machine's last one, counting only keyboards that can type *right now*
+  (not claimed, not disabled, not paired-but-disconnected) and one per physical
+  board. Full runbook: `RECOVERY.md` §2.
+- Ownership: the **daemon** claims once at startup and holds it for its whole
+  lifetime, handing each session a borrowed view (`ARCHITECTURE.md` §M6). That is
+  what keeps a claimed panel typing between games; a per-session claim would give
+  the panel back to nobody.
+
+#### The INF is the only signing cost
+
+`winusb.sys` needs nothing: it is in-box and WHQL-signed, so it is unaffected by
+the cross-signed-trust removal. But **the INF that points at it is third-party**,
+and x64 Windows will not add an unsigned INF to the driver store. ksx generates
+the INF deterministically (`ksx winusb claim --dry-run` prints it verbatim) and
+prints the signing recipe; it does not and cannot sign it for you.
+
+| Option | Cost | Verdict |
+|---|---|---|
+| Self-signed catalog (`inf2cat` + `signtool`, cert into Root + TrustedPublisher) | free, WDK needed | **the cabinet answer** — this is what Zadig/libwdi automate |
+| [Zadig](https://zadig.akeo.ie/) by hand | free, one GUI click | equivalent; ksx does not care how the interface got bound |
+| Attestation signing via Partner Center | EV cert (~$215–499/yr, or Trusted Signing ~$10/mo) + account | the answer if ksx is ever redistributed |
+| `bcdedit /set testsigning on` | — | **rejected.** Disables a Secure Boot guarantee machine-wide to install one INF |
+
+The generated INF carries `PnpLockdown = 1`, `Class = USBDevice`, and one
+`DeviceInterfaceGUIDs` entry (`{B8B2D1F8-6E0E-4C7F-9E5A-3A9C1D6F2E10}`, ksx's own
+device interface class) so `nusb` can find claimed interfaces. It matches **one**
+interface's hardware id — never the composite parent, which would claim MI_01 and
+MI_02 along with it and take the trackball down.
 
 ### Hardware escape hatch (documented, not built)
 
@@ -122,6 +154,8 @@ software. Costs per-key remapping and caps at 2 pads/board — escape hatch, not
 | ViGEmBus driver + installer | bundled in releases | BSD-3-Clause (redistribution OK) |
 | Interception `interception.dll` + drivers | user-installed / bundled installer | LGPL, **non-commercial**, API-boundary only |
 | kanata-interception | crates.io dep | LGPL-3.0 (dynamic driver API binding) |
+| `winusb.sys` (M6 capture) | in-box, `%SystemRoot%\System32\drivers` | Microsoft, ships with Windows — nothing to redistribute, nothing to license |
+| ksx-generated WinUSB INF | written to `%APPDATA%\ksx\winusb` on claim | MIT OR Apache-2.0 (it is ksx output); the catalog signing it is the user's |
 | Legacy C# app | `legacy/` | upstream repo shipped no license; kept as reference, not distributed |
 
 Nothing from `legacy/` (embedded `devcon.exe`, ScpVBus, prebuilt DLLs) is ever carried

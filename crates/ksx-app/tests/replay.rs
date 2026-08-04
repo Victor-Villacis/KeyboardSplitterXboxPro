@@ -204,3 +204,38 @@ fn recorded_cabinet_session_replays_deterministically() {
         );
     }
 }
+
+/// M6: the recorded corpus must stay replayable on the **WinUSB** backend too.
+///
+/// The oracle above proves the engine still feels the same given `KeyEvent`s.
+/// It says nothing about whether the WinUSB capture path can still *produce*
+/// those events — that path reaches `Key` by a completely different route
+/// (HID usage → set-1 scancode → `corrected_key`) than Interception does.
+///
+/// A key that this cabinet really pressed but that no HID usage maps to would
+/// be silently unreachable after the rebind: the button would go dead, the
+/// preset bound to it would never fire, and nothing in CI would notice —
+/// exactly the "presets break on one backend only" failure the usage table was
+/// written to prevent. So: every key in the recorded session must be the image
+/// of some keyboard-page usage.
+#[test]
+fn every_key_the_cabinet_really_pressed_is_reachable_from_a_hid_usage() {
+    use ksx_capture::hid::usage_to_scancode;
+    use ksx_capture::keymap::{corrected_key, KEY_DOWN};
+
+    // Every `Key` the WinUSB backend can ever report.
+    let reachable: std::collections::BTreeSet<Key> = (0u8..=0xFF)
+        .filter_map(usage_to_scancode)
+        .map(|(code, prefix)| corrected_key(code, prefix | KEY_DOWN))
+        .collect();
+
+    let recorded: std::collections::BTreeSet<Key> = load_corpus().iter().map(|e| e.key).collect();
+    assert!(!recorded.is_empty(), "corpus loaded");
+
+    let unreachable: Vec<&Key> = recorded.difference(&reachable).collect();
+    assert!(
+        unreachable.is_empty(),
+        "these keys were pressed on the real cabinet but no HID usage maps to \
+         them, so they would go dead on the WinUSB backend: {unreachable:?}"
+    );
+}
