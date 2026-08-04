@@ -1,4 +1,5 @@
-//! `ksx autostart` — cold boot straight into a playable cabinet.
+//! `ksx autostart` — cold boot to a live tray (or, with `--mode run`, straight
+//! into a session).
 //!
 //! The XML, the `schtasks` argv, the status parsing and the staleness rules all
 //! live in `ksx_platform::autostart` (pure, tested off-Windows). This file is
@@ -6,13 +7,18 @@
 //! layer deliberately cannot do — decide whether the thing being registered
 //! would actually *work*.
 //!
+//! The default registration is `ksx daemon`, not `ksx run` — see
+//! [`ksx_platform::autostart::TaskMode`] for the rationale (a `run` at logon
+//! captures the keyboards unconditionally on a machine that is also a desktop
+//! PC; the daemon sits in the tray until asked).
+//!
 //! # Why `--enable` validates first
 //!
 //! A scheduled task is a promise made to a machine nobody is watching. Register
-//! `ksx run --game Steem` (typo for `Steam`) and the failure surfaces at 07:00
-//! on a cold boot, as an instant exit-2 on a console that is not attached to a
-//! screen, in a cabinet whose frontend never appears. There is no error message
-//! anywhere a human will look.
+//! `ksx daemon --game Steem` (typo for `Steam`) and the failure surfaces at
+//! 07:00 on a cold boot, as an instant exit-2 on a console that is not attached
+//! to a screen, in a cabinet whose tray icon never appears. There is no error
+//! message anywhere a human will look.
 //!
 //! So `--enable` refuses (exit 2) unless, right now:
 //!
@@ -30,7 +36,7 @@
 //! nothing.
 
 use ksx_platform::autostart::{
-    self, check_staleness, AutostartError, EnablePlan, Staleness, Status, TaskSpec,
+    self, check_staleness, AutostartError, EnablePlan, Staleness, Status, TaskMode, TaskSpec,
 };
 
 /// Refused: nothing was registered or removed.
@@ -47,6 +53,7 @@ pub enum Action {
 /// Everything the CLI passes in.
 pub struct Options {
     pub action: Action,
+    pub mode: TaskMode,
     pub game: Option<String>,
     pub delay_secs: u32,
     pub task_name: Option<String>,
@@ -146,13 +153,14 @@ fn enable(opts: &Options) -> anyhow::Result<()> {
 
 /// Validate everything, then build the plan. `Err` is a user-facing refusal.
 fn build_plan(opts: &Options) -> Result<EnablePlan, String> {
-    validate_target(opts.game.as_deref())?;
+    validate_target(opts.mode, opts.game.as_deref())?;
     let spec = spec(opts).map_err(|err| err.to_string())?;
     autostart::enable_plan(spec).map_err(|err| err.to_string())
 }
 
 fn spec(opts: &Options) -> Result<TaskSpec, AutostartError> {
     autostart::spec_for_current_exe(
+        opts.mode,
         opts.game.clone(),
         opts.extra_args.clone(),
         opts.delay_secs,
@@ -161,8 +169,12 @@ fn spec(opts: &Options) -> Result<TaskSpec, AutostartError> {
 }
 
 /// The check that makes a scheduled task worth trusting: would
-/// `ksx run [--game X]` start *right now*?
-fn validate_target(game: Option<&str>) -> Result<(), String> {
+/// `ksx daemon`/`ksx run` (with the given `--game`) start *right now*?
+///
+/// The same gate applies to both modes: the daemon refuses to start (exit 2)
+/// on a configuration `ksx run` would refuse, so anything registered here has
+/// to resolve today or the logon task dies silently either way.
+fn validate_target(mode: TaskMode, game: Option<&str>) -> Result<(), String> {
     let root = ksx_config::ConfigRoot::discover().map_err(|err| {
         format!("  [FAIL] {err}\n  Fix the configuration before registering an autostart task.")
     })?;
@@ -172,7 +184,8 @@ fn validate_target(game: Option<&str>) -> Result<(), String> {
     // must refuse here, where somebody is looking at the screen.
     crate::run::plan::resolve(&root, game).map_err(|err| {
         format!(
-            "  [FAIL] {err}\n  `ksx run{}` would exit 2 at logon, on a console nobody sees.",
+            "  [FAIL] {err}\n  `ksx {}{}` would exit 2 at logon, on a console nobody sees.",
+            mode.verb(),
             match game {
                 Some(title) => format!(" --game \"{title}\""),
                 None => String::new(),
@@ -273,18 +286,23 @@ mod tests {
         assert_eq!(EXIT_REFUSED, crate::run::EXIT_CANNOT_START);
     }
 
-    /// `--dry-run` must produce the whole document, and register nothing.
-    #[test]
-    fn dry_run_renders_the_exact_xml_and_command() {
-        let spec = TaskSpec {
+    fn spec_for(mode: TaskMode, game: Option<&str>) -> TaskSpec {
+        TaskSpec {
             task_name: "ksx\\autostart".into(),
             exe: PathBuf::from(r"C:\Program Files\ksx\ksx.exe"),
-            game: Some("Street Fighter".into()),
+            mode,
+            game: game.map(str::to_owned),
             extra_args: Vec::new(),
             user_id: "CAB\\victor".into(),
             delay_secs: 10,
-        };
-        let plan = autostart::enable_plan(spec).unwrap();
+        }
+    }
+
+    /// `--dry-run` must produce the whole document, and register nothing.
+    /// `--mode run` here: the kiosk shape is still a first-class registration.
+    #[test]
+    fn dry_run_renders_the_exact_xml_and_command() {
+        let plan = autostart::enable_plan(spec_for(TaskMode::Run, Some("Street Fighter"))).unwrap();
         let text = plan.render_human(true);
         assert!(text.contains("schtasks /Create"), "{text}");
         assert!(text.contains("<LogonTrigger>"), "{text}");
@@ -309,5 +327,27 @@ mod tests {
             text.contains("LeastPrivilege"),
             "the task must never be elevated: {text}"
         );
+    }
+
+    /// Every mode×game combination produces the command line it promises, and
+    /// the registered XML reads back with the same mode and game.
+    #[test]
+    fn every_mode_and_game_combination_round_trips_through_plan_and_inspection() {
+        for (mode, game, want_args) in [
+            (TaskMode::Daemon, None, "daemon"),
+            (TaskMode::Daemon, Some("Steam"), "daemon --game Steam"),
+            (TaskMode::Run, None, "run"),
+            (TaskMode::Run, Some("Steam"), "run --game Steam"),
+        ] {
+            let plan = autostart::enable_plan(spec_for(mode, game)).unwrap();
+            assert_eq!(plan.spec.arguments(), want_args);
+            assert_eq!(
+                plan.spec.command_line(),
+                format!(r#""C:\Program Files\ksx\ksx.exe" {want_args}"#)
+            );
+            let registered = autostart::parse_registered(&plan.xml);
+            assert_eq!(registered.mode(), Some(mode), "{want_args}");
+            assert_eq!(registered.game().as_deref(), game, "{want_args}");
+        }
     }
 }

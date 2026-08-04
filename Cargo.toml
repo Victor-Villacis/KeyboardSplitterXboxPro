@@ -12,6 +12,7 @@ default-members = [
     "crates/ksx-platform",
     "crates/ksx-games",
     "crates/ksx-app",
+    "crates/ksx-fuzz",
 ]
 
 [workspace.package]

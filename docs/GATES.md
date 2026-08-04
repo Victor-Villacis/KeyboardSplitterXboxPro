@@ -84,19 +84,20 @@ within a second — then `ksx doctor`.
 
 ## Phase B — autostart at boot
 
-**Honest note first:** `ksx autostart` registers **`ksx run --game <TITLE>`** as
-the logon task — a session, not the tray daemon. There is no tray icon at boot
-today; what a cold boot proves is that the scheduled task fires, the session
-comes up on a console nobody sees, and the log shows it. (If a tray-at-boot is
-wanted, that is a small M5-rest work item — the task would need to run
-`ksx daemon --start`, which `ksx autostart` cannot register yet.)
+`ksx autostart` registers **`ksx daemon --game <TITLE>`** as the logon task:
+the tray icon comes up at every logon and captures nothing until a session is
+started from the tray (or a wrapper). That default is deliberate — a
+registered `ksx run` would grab the keyboards at every logon, desktop use
+included. The kiosk shape (logon straight into the game) still exists as
+`--mode run`; it is not part of this gate.
 
 ```powershell
 ksx autostart --enable --game "Steam" --dry-run
 ```
 
-**Expect:** the full plan — `task name: ksx\autostart`, `runs: "…\ksx.exe" run
---game Steam`, `elevation: none (LeastPrivilege, per-user task)`, the exact
+**Expect:** the full plan — `task name: ksx\autostart`, `mode: daemon (tray
+icon at logon; sessions start on demand)`, `runs: "…\ksx.exe" daemon --game
+Steam`, `elevation: none (LeastPrivilege, per-user task)`, the exact
 `schtasks /Create` line, the full XML, and `dry run: nothing was registered.`
 Read the XML: `LogonTrigger` with `PT10S` delay, `RunLevel LeastPrivilege`,
 `MultipleInstancesPolicy IgnoreNew`.
@@ -107,25 +108,31 @@ ksx autostart --status
 ```
 
 **Expect:** `registered. Verify with `ksx autostart --status`…`, then a status
-block: `autostart: registered as 'ksx\autostart'`, `game: Steam`,
-`enabled: yes`, exit 0. Exit 2 with a `STALE` warning means the task points at
-a different or missing exe — fix before booting.
+block: `autostart: registered as 'ksx\autostart'`, `mode: daemon`,
+`game: Steam`, `enabled: yes`, exit 0. Exit 2 with a `STALE` warning means the
+task points at a different or missing exe — fix before booting.
 
 **Cold boot:** full shutdown (not restart), power on, log in, wait ~15 s.
 
 **Expect after logon:**
+- the **tray icon appears** (the task waits out its 10 s delay first) — hover
+  it: idle state, nothing running;
 - `tasklist | findstr /i ksx` shows `ksx.exe`;
-- Steam launches (the profile's program), pads present in `joy.cpl`;
-- today's log shows the session start with no `ERROR`.
+- nothing is captured yet: the panel still types, `joy.cpl` lists no pads;
+- today's log shows the daemon start with no `ERROR`.
 
-End the session cleanly: quit the game/Steam (emulation stops when the followed
-process exits) — or `Ctrl+Alt+Del` to stop emulation. Then the clean checklist.
+Then prove boot-to-playable: tray → **Start emulation** → Steam launches (the
+profile's program), pads present in `joy.cpl`, panel drives them. End the
+session cleanly: quit the game/Steam (emulation stops when the followed
+process exits) — or `Ctrl+Alt+Del` to stop emulation. Tray → **Quit**, then
+the clean checklist.
 
-**ABORT Phase B if:** nothing started at logon (check Task Scheduler history
+**ABORT Phase B if:** no tray icon after logon (check Task Scheduler history
 for `ksx\autostart` and the log — a missing log entry means the task never
 fired; a log entry ending in exit 2 means validation drifted between enable and
-boot); or a second logon starts a second session (must be impossible:
-`IgnoreNew`).
+boot); pads appear at logon without anyone touching the tray (the task was
+registered `--mode run` — not this runbook's registration); or a second logon
+starts a second daemon (must be impossible: `IgnoreNew`).
 
 ## Phase C — frontend wrapper into a real emulator
 
@@ -173,9 +180,10 @@ boot: nothing starts, `tasklist` has no ksx.
 
 ## GATE 1 PASS criteria
 
-All of: Phase A tray lifecycle clean; Phase B cold boot into a live session
-with log evidence and a clean stop; Phase C frontend → emulator → 4 pads →
-clean exit with no ghost pads; Phase D removal verified by a boot. `ksx doctor`
+All of: Phase A tray lifecycle clean; Phase B cold boot to the tray icon, a
+live session started from it, log evidence and a clean stop; Phase C
+frontend → emulator → 4 pads → clean exit with no ghost pads; Phase D removal
+verified by a boot. `ksx doctor`
 exits 0 at the end, and the day's log has no unexplained `ERROR`.
 
 ## GATE 1 rollback

@@ -150,6 +150,15 @@ const INPUT_VARIABLE: u32 = 1 << 1;
 /// The long-item prefix (HID 1.11 §6.2.2.3). Skipped by declared length.
 const LONG_ITEM_PREFIX: u8 = 0xFE;
 
+/// Largest report payload `parse` will honor, in bytes.
+///
+/// One USB interrupt-IN transfer carries at most 1024 bytes (the high-speed
+/// endpoint ceiling; full speed is 64), and HID input reports arrive in one
+/// transfer — so no keyboard can deliver a longer report no matter what its
+/// descriptor claims. Real keyboard payloads are ≤ 32 bytes; the headroom is
+/// for exotic NKRO layouts, not for trusting the descriptor.
+const MAX_PAYLOAD_LEN: usize = 1024;
+
 /// Global item state, saved/restored by Push/Pop.
 #[derive(Clone, Copy, Debug, Default)]
 struct GlobalState {
@@ -250,7 +259,11 @@ pub fn parse(descriptor: &[u8]) -> KeyboardFormat {
                         (global.report_size as usize).saturating_mul(global.report_count as usize);
                     let cursor = cursor_for(&mut cursors, global.report_id);
                     let bit_offset = *cursor;
-                    *cursor += bits;
+                    // Saturating like the multiply above: a hostile descriptor
+                    // can declare ~2^64 bits per Input item, and a wrapping
+                    // cursor is a debug-build panic / release-build phantom
+                    // field offset (found by ksx-fuzz).
+                    *cursor = bit_offset.saturating_add(bits);
 
                     if global.usage_page == PAGE_KEYBOARD
                         && data & INPUT_CONSTANT == 0
@@ -298,7 +311,15 @@ pub fn parse(descriptor: &[u8]) -> KeyboardFormat {
 
     // Drop reports that ended up with no keyboard field (e.g. a mouse report ID
     // in the same descriptor) but keep their length knowledge out of the way.
-    formats.retain(|f| f.is_keyboard());
+    // Also drop any report declared longer than one USB interrupt transfer:
+    // no real keyboard can send it (an interrupt-IN transfer caps at 1024
+    // bytes even at high speed), and honoring it is a device-supplied DoS —
+    // `max_report_len` sizes the claim-time buffer and `feed` walks the
+    // declared bits, so a 13-byte descriptor declaring a 2^32-bit bitmap costs
+    // a ~512 MiB allocation plus seconds *per report* (found by ksx-fuzz).
+    // Dropping the report (not clamping it) keeps the "malformed → refuse to
+    // claim" contract: a device that lies about its reports is not captured.
+    formats.retain(|f| f.is_keyboard() && f.payload_len <= MAX_PAYLOAD_LEN);
     // A descriptor that declares report IDs prefixes every report with the ID.
     KeyboardFormat {
         reports: formats,
@@ -493,6 +514,21 @@ mod tests {
     #[test]
     fn pop_without_push_is_survivable() {
         assert!(parse(&[0xB4, 0xB4, 0xB4]).is_empty());
+    }
+
+    #[test]
+    fn cursor_overflow_from_giant_declared_fields_is_saturated_not_a_panic() {
+        // Two Input items, each declaring Report Size × Report Count =
+        // (2^32-1)^2 bits. The second cursor advance used to overflow usize —
+        // a debug-build panic (silent wrap in release) on a device-supplied
+        // descriptor. Found by ksx-fuzz (tests/hid_report.rs).
+        let desc = [
+            0x77, 0xFF, 0xFF, 0xFF, 0xFF, // Report Size (0xFFFFFFFF)
+            0x97, 0xFF, 0xFF, 0xFF, 0xFF, // Report Count (0xFFFFFFFF)
+            0x81, 0x01, // Input (Const) — cursor += ~2^64 bits
+            0x81, 0x01, // Input (Const) — the second advance overflowed
+        ];
+        assert!(parse(&desc).is_empty());
     }
 
     #[test]

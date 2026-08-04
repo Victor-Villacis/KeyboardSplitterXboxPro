@@ -254,9 +254,19 @@ enum Command {
     },
     /// Start ksx at logon via a per-user Task Scheduler task
     ///
-    /// Registers `ksx run` (or `ksx run --game <TITLE>`) as a logon-triggered
-    /// task for the current user only: InteractiveToken, LeastPrivilege, never
-    /// elevated. Idempotent — enabling twice replaces the task.
+    /// Registers `ksx daemon` (add --game <TITLE> to give every session a
+    /// profile) as a logon-triggered task for the current user only:
+    /// InteractiveToken, LeastPrivilege, never elevated. Idempotent — enabling
+    /// twice replaces the task.
+    ///
+    /// The default is the tray daemon, not a session, and that is deliberate:
+    /// a registered `ksx run` captures the assigned keyboards unconditionally
+    /// at every logon — a hostile default on a machine that is also a desktop
+    /// PC — while the daemon sits in the tray until a session is asked for.
+    /// `--mode run` keeps the kiosk shape (logon straight into the game) for
+    /// cabinets that want exactly that. Changing the default was safe: no
+    /// cabinet has ever run the M5 gate, so no deployed registration relied on
+    /// `run` (and --status still reports both shapes correctly).
     ///
     /// --enable validates first: the config must pass the same checks `ksx run`
     /// applies, the --game profile must exist, and its executable must be
@@ -277,7 +287,11 @@ enum Command {
         /// Report what is registered (the default when no verb is given)
         #[arg(long)]
         status: bool,
-        /// Register `ksx run --game <TITLE>` instead of plain `ksx run`
+        /// What the task starts: the tray daemon (default) or a full session
+        #[arg(long, value_enum, default_value = "daemon")]
+        mode: AutostartMode,
+        /// Give the registered command a games.toml profile: the daemon uses
+        /// it for every session; `--mode run` starts it at logon
         #[arg(long, value_name = "TITLE")]
         game: Option<String>,
         /// Seconds to wait after logon before starting
@@ -382,6 +396,26 @@ fn parse_persona(s: &str) -> Result<ksx_core::Persona, ksx_core::UnknownPersona>
     s.parse()
 }
 
+/// What `ksx autostart` registers as the logon task. The clap-facing twin of
+/// [`ksx_platform::autostart::TaskMode`] (the platform crate stays clap-free);
+/// the rationale for `daemon` being the default lives on that type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum AutostartMode {
+    /// Tray icon at logon; sessions are started from the tray or a wrapper
+    Daemon,
+    /// Capture keyboards and start a session immediately at logon (kiosk)
+    Run,
+}
+
+impl From<AutostartMode> for ksx_platform::autostart::TaskMode {
+    fn from(mode: AutostartMode) -> Self {
+        match mode {
+            AutostartMode::Daemon => Self::Daemon,
+            AutostartMode::Run => Self::Run,
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // Logging first, and for **every** command — not just the daemon. A
     // `ksx run` started by the cabinet's logon task has no console either, and
@@ -449,6 +483,7 @@ fn main() -> anyhow::Result<()> {
             enable,
             disable,
             status: _,
+            mode,
             game,
             delay_secs,
             task_name,
@@ -463,6 +498,7 @@ fn main() -> anyhow::Result<()> {
                 (_, true) => autostart::Action::Disable,
                 _ => autostart::Action::Status,
             },
+            mode: mode.into(),
             game,
             delay_secs,
             task_name,
@@ -882,6 +918,77 @@ mod tests {
             !text.contains("M4"),
             "the not-yet stub must be gone: {text}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // M5 rest: ksx autostart --mode
+    // -----------------------------------------------------------------
+
+    /// The default registration is the tray daemon. A bare `--enable` on a
+    /// machine that is also a desktop PC must NOT produce a task that captures
+    /// the keyboards at every logon.
+    #[test]
+    fn autostart_defaults_to_the_daemon_mode() {
+        let cli = Cli::try_parse_from(["ksx", "autostart", "--enable"]).unwrap();
+        let Command::Autostart { mode, game, .. } = cli.command else {
+            panic!("parsed to the wrong subcommand");
+        };
+        assert_eq!(mode, AutostartMode::Daemon);
+        assert_eq!(game, None);
+        assert_eq!(
+            ksx_platform::autostart::TaskMode::from(mode),
+            ksx_platform::autostart::TaskMode::Daemon
+        );
+    }
+
+    #[test]
+    fn autostart_mode_parses_both_values_composes_with_game_and_rejects_unknowns() {
+        for (arg, want) in [
+            ("daemon", AutostartMode::Daemon),
+            ("run", AutostartMode::Run),
+        ] {
+            let cli = Cli::try_parse_from([
+                "ksx",
+                "autostart",
+                "--enable",
+                "--mode",
+                arg,
+                "--game",
+                "Street Fighter",
+            ])
+            .unwrap();
+            let Command::Autostart { mode, game, .. } = cli.command else {
+                panic!("parsed to the wrong subcommand");
+            };
+            assert_eq!(mode, want, "{arg}");
+            assert_eq!(game.as_deref(), Some("Street Fighter"), "{arg}");
+        }
+        let err = Cli::try_parse_from(["ksx", "autostart", "--enable", "--mode", "kiosk"])
+            .err()
+            .expect("an unknown mode must be a parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("daemon") && msg.contains("run"),
+            "must name the valid modes: {msg}"
+        );
+    }
+
+    /// The why lives in `--help`, where the person about to register a logon
+    /// task is actually looking.
+    #[test]
+    fn autostart_help_says_why_the_daemon_is_the_default() {
+        let mut cmd = Cli::command();
+        let autostart = cmd.find_subcommand_mut("autostart").unwrap();
+        let help = autostart.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "captures the assigned keyboards unconditionally",
+            "also a desktop PC",
+            "sits in the tray until a session is asked for",
+            "--mode run",
+        ] {
+            assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
+        }
     }
 
     // -----------------------------------------------------------------

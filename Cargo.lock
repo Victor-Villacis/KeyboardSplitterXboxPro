@@ -525,6 +525,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ksx-fuzz"
+version = "0.1.0"
+dependencies = [
+ "ksx-capture",
+ "ksx-config",
+ "ksx-legacy-import",
+ "proptest",
+ "toml",
+]
+
+[[package]]
 name = "ksx-games"
 version = "0.1.0"
 dependencies = [

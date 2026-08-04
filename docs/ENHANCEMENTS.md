@@ -162,7 +162,8 @@ M6 WinUSB → M6.5 DS4 spike → M7 GA → M8 HIDMaestro → **M9 native UI** �
 ### Using kmd today
 `npx @getforma/kmd` in this repo browses `docs/` (6 design docs + 9 research reports)
 as a local dashboard. Ships a prebuilt Windows x64 binary; no product coupling.
-⚠️ kmd has no LICENSE file — fine for us, but it blocks anyone else adopting it.
+kmd is MIT-licensed (Copyright (c) 2026 Victor Villacis) — nothing blocks anyone
+else adopting it.
 
 ## E6 — Reuse of existing open source (standing policy)
 

@@ -23,8 +23,8 @@
 //! The task is registered for the *invoking* user with `LogonType`
 //! `InteractiveToken` and `RunLevel` `LeastPrivilege`. Registering a task for
 //! yourself needs no elevation; asking for `HighestAvailable`, another user, or
-//! a system account does — so this module never does. `ksx run` does not need
-//! admin either (Interception and ViGEmBus are already installed by then), and
+//! a system account does — so this module never does. Neither `ksx daemon` nor
+//! `ksx run` needs admin (Interception and ViGEmBus are already installed), and
 //! a cabinet that silently runs elevated at logon is a much worse thing to own
 //! than one that does not.
 //!
@@ -39,13 +39,68 @@ use serde::Serialize;
 /// Library root, where it would be lost among vendor updaters.
 pub const DEFAULT_TASK_NAME: &str = "ksx\\autostart";
 
+/// Which ksx entry point the logon task starts.
+///
+/// `Daemon` is the default, deliberately. A registered `ksx run` captures the
+/// assigned keyboards unconditionally at every logon — a hostile default on a
+/// machine that is also a desktop PC: log in to pay a bill and the panel's
+/// keyboard is a gamepad. `ksx daemon` puts an icon in the tray and captures
+/// nothing until a session is started from the tray or the frontend wrapper.
+/// `Run` stays available (`--mode run`) for the kiosk shape where
+/// logon-straight-into-the-game is the point.
+///
+/// Changing the default from `run` to `daemon` breaks nobody: no cabinet has
+/// ever run the M5 gate, so there are no deployed registrations to preserve
+/// (the gate runbook is what found this gap — docs/GATES.md, GATE 1 Phase B).
+/// Inspection still parses both shapes, so a task registered as `run …`
+/// before this change is reported correctly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskMode {
+    /// `ksx daemon` — tray icon at logon; sessions start on demand.
+    #[default]
+    Daemon,
+    /// `ksx run` — capture keyboards and start a session at logon (kiosk).
+    Run,
+}
+
+impl TaskMode {
+    /// The ksx subcommand this mode registers.
+    pub fn verb(self) -> &'static str {
+        match self {
+            TaskMode::Daemon => "daemon",
+            TaskMode::Run => "run",
+        }
+    }
+
+    /// Inverse of [`TaskMode::verb`], for reading a registration back.
+    pub fn from_verb(verb: &str) -> Option<Self> {
+        match verb {
+            "daemon" => Some(TaskMode::Daemon),
+            "run" => Some(TaskMode::Run),
+            _ => None,
+        }
+    }
+
+    /// One-line human description for status output.
+    pub fn describe(self) -> &'static str {
+        match self {
+            TaskMode::Daemon => "daemon (tray icon at logon; sessions start on demand)",
+            TaskMode::Run => "run (captures keyboards and starts a session at logon)",
+        }
+    }
+}
+
 /// What the registered task should run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskSpec {
     pub task_name: String,
     /// Absolute path to `ksx.exe`.
     pub exe: PathBuf,
-    /// `ksx run --game <TITLE>` when set, plain `ksx run` otherwise.
+    /// Which subcommand runs at logon — see [`TaskMode`].
+    pub mode: TaskMode,
+    /// Appends `--game <TITLE>` after the mode's verb: the daemon uses the
+    /// profile for every session it starts; `run` starts it immediately.
     pub game: Option<String>,
     /// Extra flags appended verbatim (e.g. `--latency`).
     pub extra_args: Vec<String>,
@@ -59,12 +114,13 @@ pub struct TaskSpec {
 impl TaskSpec {
     /// The `Arguments` element — everything after `ksx.exe`.
     ///
-    /// A title with spaces is quoted; a title containing a quote is refused
-    /// upstream (see [`validate`]) rather than escaped, because Task Scheduler
-    /// hands this string to `CommandLineToArgvW` and a half-escaped title is a
+    /// A title with spaces is quoted; a title containing a quote, or a
+    /// to-be-quoted title ending in a backslash, is refused upstream (see
+    /// [`validate`]) rather than escaped, because Task Scheduler hands this
+    /// string to `CommandLineToArgvW` and a half-escaped title is a
     /// silently-wrong autostart nobody would notice until a cold boot.
     pub fn arguments(&self) -> String {
-        let mut parts = vec!["run".to_owned()];
+        let mut parts = vec![self.mode.verb().to_owned()];
         if let Some(game) = &self.game {
             parts.push("--game".to_owned());
             parts.push(if game.contains(' ') {
@@ -100,6 +156,12 @@ pub enum AutostartError {
          command line. Rename the profile in games.toml"
     )]
     UnquotableTitle(String),
+    #[error(
+        "the game title {0:?} needs quoting (it contains a space) but ends with a backslash; \
+         CommandLineToArgvW reads backslashes before a closing quote as escapes and would \
+         mis-split the command line. Rename the profile in games.toml"
+    )]
+    TrailingBackslashTitle(String),
     #[error("cannot determine the current user (USERNAME is not set)")]
     NoUser,
     #[error("schtasks.exe could not be run: {0}")]
@@ -115,6 +177,15 @@ pub fn validate(spec: &TaskSpec) -> Result<(), AutostartError> {
     if let Some(game) = &spec.game {
         if game.contains('"') {
             return Err(AutostartError::UnquotableTitle(game.clone()));
+        }
+        // A quoted title ending in a backslash is the other CommandLineToArgvW
+        // trap: `--game "Foo Bar\"` reads `\"` as an escaped quote, so the
+        // quoted region never closes (odd run) or the backslashes are halved
+        // (even run) — either way a silently-wrong argv at logon. A title that
+        // needs no quoting keeps its trailing backslash verbatim, so only the
+        // quoted shape is refused.
+        if game.contains(' ') && game.ends_with('\\') {
+            return Err(AutostartError::TrailingBackslashTitle(game.clone()));
         }
     }
     if spec.exe.as_os_str().is_empty() {
@@ -141,6 +212,7 @@ pub fn current_user_id() -> Result<String, AutostartError> {
 
 /// Build the default spec for this installation.
 pub fn spec_for_current_exe(
+    mode: TaskMode,
     game: Option<String>,
     extra_args: Vec<String>,
     delay_secs: u32,
@@ -150,6 +222,7 @@ pub fn spec_for_current_exe(
     let spec = TaskSpec {
         task_name: task_name.unwrap_or_else(|| DEFAULT_TASK_NAME.to_owned()),
         exe,
+        mode,
         game,
         extra_args,
         user_id: current_user_id()?,
@@ -359,6 +432,14 @@ impl RegisteredTask {
         }
     }
 
+    /// Which entry point the registered task starts, read back from its
+    /// arguments. Both shapes must parse — tasks registered before the daemon
+    /// became the default say `run …` and must still be reported correctly.
+    /// `None` means the arguments were not written by `ksx autostart` at all.
+    pub fn mode(&self) -> Option<TaskMode> {
+        TaskMode::from_verb(self.arguments.as_deref()?.split_whitespace().next()?)
+    }
+
     /// Which `--game` profile the registered task points at, if any.
     pub fn game(&self) -> Option<String> {
         let args = self.arguments.as_deref()?;
@@ -562,6 +643,7 @@ impl EnablePlan {
         let _ = writeln!(out, "task name:    {}", self.spec.task_name);
         let _ = writeln!(out, "runs at:      logon of {}", self.spec.user_id);
         let _ = writeln!(out, "after:        {} s delay", self.spec.delay_secs);
+        let _ = writeln!(out, "mode:         {}", self.spec.mode.describe());
         let _ = writeln!(out, "runs:         {}", self.spec.command_line());
         let _ = writeln!(out, "working dir:  {}", self.spec.working_dir().display());
         let _ = writeln!(out, "elevation:    none (LeastPrivilege, per-user task)");
@@ -589,6 +671,7 @@ impl EnablePlan {
             "user_id": self.spec.user_id,
             "delay_secs": self.spec.delay_secs,
             "exe": self.spec.exe.display().to_string(),
+            "mode": self.spec.mode,
             "arguments": self.spec.arguments(),
             "command_line": self.spec.command_line(),
             "working_directory": self.spec.working_dir().display().to_string(),
@@ -729,16 +812,25 @@ pub fn render_status(task_name: &str, status: &Status) -> String {
     match status {
         Status::NotRegistered => format!(
             "autostart: NOT registered (no scheduled task '{task_name}')\n\
-             enable it with `ksx autostart --enable` (add --game \"Title\" to start a profile)"
+             enable it with `ksx autostart --enable` (add --game \"Title\" to give sessions a \
+             profile; --mode run to start one at logon)"
         ),
         Status::Registered(task) => {
             use std::fmt::Write as _;
             let mut out = format!("autostart: registered as '{task_name}'\n");
             let _ = writeln!(out, "  runs:        {}", task.command_line());
+            let _ = writeln!(
+                out,
+                "  mode:        {}",
+                match task.mode() {
+                    Some(mode) => mode.describe(),
+                    None => "unknown (the arguments were not written by ksx)",
+                }
+            );
             if let Some(game) = task.game() {
                 let _ = writeln!(out, "  game:        {game}");
             } else {
-                let _ = writeln!(out, "  game:        (none — plain `ksx run`)");
+                let _ = writeln!(out, "  game:        (none)");
             }
             if let Some(user) = &task.user_id {
                 let _ = writeln!(out, "  as user:     {user}");
@@ -775,6 +867,7 @@ pub fn status_json(task_name: &str, status: &Status) -> serde_json::Value {
             "command": task.command,
             "arguments": task.arguments,
             "command_line": task.command_line(),
+            "mode": task.mode(),
             "game": task.game(),
             "user_id": task.user_id,
             "working_directory": task.working_directory,
@@ -787,16 +880,19 @@ pub fn status_json(task_name: &str, status: &Status) -> serde_json::Value {
 mod tests {
     use super::*;
 
-    fn spec(game: Option<&str>) -> TaskSpec {
+    fn spec(mode: TaskMode, game: Option<&str>) -> TaskSpec {
         TaskSpec {
             task_name: DEFAULT_TASK_NAME.to_owned(),
             exe: PathBuf::from(r"C:\Program Files\ksx\ksx.exe"),
+            mode,
             game: game.map(str::to_owned),
             extra_args: Vec::new(),
             user_id: "CAB\\victor".to_owned(),
             delay_secs: 10,
         }
     }
+
+    const BOTH_MODES: [TaskMode; 2] = [TaskMode::Daemon, TaskMode::Run];
 
     /// A bare program name is resolved against the current directory before
     /// `System32`, so `ksx autostart` run from an admin terminal sitting in a
@@ -820,38 +916,105 @@ mod tests {
         );
     }
 
+    /// All four mode×game combinations, and the quoting rule is identical in
+    /// both modes — the mode only ever changes the leading verb.
     #[test]
-    fn arguments_quote_a_title_with_spaces_and_omit_game_when_absent() {
-        assert_eq!(spec(None).arguments(), "run");
-        assert_eq!(spec(Some("Steam")).arguments(), "run --game Steam");
+    fn arguments_compose_the_mode_verb_with_the_game_for_all_four_combinations() {
+        assert_eq!(spec(TaskMode::Daemon, None).arguments(), "daemon");
         assert_eq!(
-            spec(Some("Street Fighter")).arguments(),
+            spec(TaskMode::Daemon, Some("Steam")).arguments(),
+            "daemon --game Steam"
+        );
+        assert_eq!(spec(TaskMode::Run, None).arguments(), "run");
+        assert_eq!(
+            spec(TaskMode::Run, Some("Steam")).arguments(),
+            "run --game Steam"
+        );
+        // A title with spaces is quoted the same way in both modes.
+        assert_eq!(
+            spec(TaskMode::Daemon, Some("Street Fighter")).arguments(),
+            "daemon --game \"Street Fighter\""
+        );
+        assert_eq!(
+            spec(TaskMode::Run, Some("Street Fighter")).arguments(),
             "run --game \"Street Fighter\""
         );
     }
 
+    #[test]
+    fn command_line_is_the_quoted_exe_plus_arguments_in_every_combination() {
+        for (mode, game, want) in [
+            (TaskMode::Daemon, None, "daemon"),
+            (TaskMode::Daemon, Some("Steam"), "daemon --game Steam"),
+            (TaskMode::Run, None, "run"),
+            (TaskMode::Run, Some("Steam"), "run --game Steam"),
+        ] {
+            assert_eq!(
+                spec(mode, game).command_line(),
+                format!(r#""C:\Program Files\ksx\ksx.exe" {want}"#)
+            );
+        }
+    }
+
+    /// The daemon is the default mode: a registered `ksx run` captures the
+    /// keyboards unconditionally at every logon, which is hostile on a machine
+    /// that is also a desktop PC. Nothing deployed depended on the old default
+    /// (no cabinet has run the M5 gate), so the default could change safely.
+    #[test]
+    fn the_default_mode_is_the_daemon_not_a_session() {
+        assert_eq!(TaskMode::default(), TaskMode::Daemon);
+    }
+
     /// A title with a quote in it cannot be represented safely; refuse loudly
     /// rather than register an autostart that silently starts the wrong thing.
+    /// The refusal is mode-independent.
     #[test]
-    fn a_title_containing_a_quote_is_refused() {
-        let bad = spec(Some(r#"Rock"n Roll"#));
-        assert_eq!(
-            validate(&bad),
-            Err(AutostartError::UnquotableTitle(r#"Rock"n Roll"#.to_owned()))
-        );
-        assert!(enable_plan(bad).is_err());
+    fn a_title_containing_a_quote_is_refused_in_both_modes() {
+        for mode in BOTH_MODES {
+            let bad = spec(mode, Some(r#"Rock"n Roll"#));
+            assert_eq!(
+                validate(&bad),
+                Err(AutostartError::UnquotableTitle(r#"Rock"n Roll"#.to_owned())),
+                "{mode:?}"
+            );
+            assert!(enable_plan(bad).is_err(), "{mode:?}");
+        }
+    }
+
+    /// The other `CommandLineToArgvW` trap: backslashes immediately before a
+    /// closing quote are escapes, so `--game "Foo Bar\"` never closes its
+    /// quoted region (odd run) or halves the backslashes (even run). A quoted
+    /// title ending in a backslash must be refused, in both modes; an unquoted
+    /// one is representable and stays allowed.
+    #[test]
+    fn a_quoted_title_ending_in_a_backslash_is_refused_in_both_modes() {
+        for mode in BOTH_MODES {
+            for title in [r"Street Fighter\", r"Street Fighter\\"] {
+                let bad = spec(mode, Some(title));
+                assert_eq!(
+                    validate(&bad),
+                    Err(AutostartError::TrailingBackslashTitle(title.to_owned())),
+                    "{mode:?} {title}"
+                );
+                assert!(enable_plan(bad).is_err(), "{mode:?} {title}");
+            }
+        }
+        // No space → never quoted → the trailing backslash survives verbatim.
+        let unquoted = spec(TaskMode::Daemon, Some(r"Foo\"));
+        assert_eq!(validate(&unquoted), Ok(()));
+        assert_eq!(unquoted.arguments(), r"daemon --game Foo\");
     }
 
     #[test]
     fn extra_args_are_appended_after_the_game() {
-        let mut s = spec(Some("Steam"));
+        let mut s = spec(TaskMode::Daemon, Some("Steam"));
         s.extra_args = vec!["--latency".into()];
-        assert_eq!(s.arguments(), "run --game Steam --latency");
+        assert_eq!(s.arguments(), "daemon --game Steam --latency");
     }
 
     #[test]
     fn xml_is_a_per_user_least_privilege_logon_task() {
-        let xml = render_xml(&spec(Some("Steam")));
+        let xml = render_xml(&spec(TaskMode::Daemon, Some("Steam")));
         assert!(xml.contains("<LogonTrigger>"), "{xml}");
         assert!(xml.contains("<UserId>CAB\\victor</UserId>"), "{xml}");
         assert!(
@@ -884,7 +1047,7 @@ mod tests {
             "{xml}"
         );
         assert!(
-            xml.contains("<Arguments>run --game Steam</Arguments>"),
+            xml.contains("<Arguments>daemon --game Steam</Arguments>"),
             "{xml}"
         );
         assert!(
@@ -895,7 +1058,7 @@ mod tests {
 
     #[test]
     fn xml_escapes_titles_that_would_break_the_document() {
-        let mut s = spec(Some("Tom & Jerry <2>"));
+        let mut s = spec(TaskMode::Daemon, Some("Tom & Jerry <2>"));
         s.user_id = "CAB\\a&b".into();
         let xml = render_xml(&s);
         assert!(xml.contains("Tom &amp; Jerry &lt;2&gt;"), "{xml}");
@@ -904,8 +1067,54 @@ mod tests {
         let parsed = parse_registered(&xml);
         assert_eq!(
             parsed.arguments.as_deref(),
-            Some("run --game \"Tom & Jerry <2>\"")
+            Some("daemon --game \"Tom & Jerry <2>\"")
         );
+    }
+
+    /// The inspection round trip, all four combinations: what `render_xml`
+    /// writes, `parse_registered` reads back with the right mode and game.
+    #[test]
+    fn registered_mode_and_game_round_trip_through_the_xml_in_both_modes() {
+        for mode in BOTH_MODES {
+            for game in [None, Some("Street Fighter")] {
+                let task = parse_registered(&render_xml(&spec(mode, game)));
+                assert_eq!(task.mode(), Some(mode), "{mode:?} {game:?}");
+                assert_eq!(task.game().as_deref(), game, "{mode:?} {game:?}");
+            }
+        }
+    }
+
+    /// Registrations that predate the daemon default say `run …`; they must
+    /// still be inspected correctly, not misread or reported as unknown.
+    #[test]
+    fn a_pre_daemon_registration_of_run_is_still_reported_as_run() {
+        let task = RegisteredTask {
+            arguments: Some("run --game \"Street Fighter\"".into()),
+            ..RegisteredTask::default()
+        };
+        assert_eq!(task.mode(), Some(TaskMode::Run));
+        assert_eq!(task.game().as_deref(), Some("Street Fighter"));
+    }
+
+    /// Arguments ksx never wrote parse to no mode, and the status output says
+    /// so instead of guessing.
+    #[test]
+    fn arguments_not_written_by_ksx_have_no_mode() {
+        for arguments in [Some("frobnicate --game X"), Some(""), None] {
+            let task = RegisteredTask {
+                arguments: arguments.map(str::to_owned),
+                ..RegisteredTask::default()
+            };
+            assert_eq!(task.mode(), None, "{arguments:?}");
+        }
+        let text = render_status(
+            DEFAULT_TASK_NAME,
+            &Status::Registered(RegisteredTask {
+                arguments: Some("frobnicate".into()),
+                ..RegisteredTask::default()
+            }),
+        );
+        assert!(text.contains("unknown"), "{text}");
     }
 
     #[test]
@@ -955,27 +1164,49 @@ mod tests {
             task.command.as_deref(),
             Some(r"C:\Program Files\ksx\ksx.exe")
         );
+        assert_eq!(task.mode(), Some(TaskMode::Run));
         assert_eq!(task.game().as_deref(), Some("Street Fighter"));
         assert_eq!(task.user_id.as_deref(), Some("CAB\\victor"));
         assert_eq!(task.enabled, Some(true));
+
+        // The mode is surfaced in both the human text and the JSON.
+        let json = status_json(DEFAULT_TASK_NAME, &Status::Registered(task.clone()));
+        assert_eq!(json.pointer("/mode"), Some(&serde_json::json!("run")));
         let text = render_status(DEFAULT_TASK_NAME, &Status::Registered(task));
         assert!(text.contains("Street Fighter"), "{text}");
+        assert!(
+            text.contains("run (captures keyboards"),
+            "the mode must be in the human status: {text}"
+        );
         assert!(text.contains("--disable"), "{text}");
     }
 
     #[test]
-    fn an_unquoted_game_title_is_still_read_back() {
-        let task = RegisteredTask {
-            arguments: Some("run --game Steam --latency".into()),
-            ..RegisteredTask::default()
-        };
-        assert_eq!(task.game().as_deref(), Some("Steam"));
+    fn a_daemon_registration_is_surfaced_in_status_and_json() {
+        let task = parse_registered(&render_xml(&spec(TaskMode::Daemon, Some("Steam"))));
+        let json = status_json(DEFAULT_TASK_NAME, &Status::Registered(task.clone()));
+        assert_eq!(json.pointer("/mode"), Some(&serde_json::json!("daemon")));
+        assert_eq!(json.pointer("/game"), Some(&serde_json::json!("Steam")));
+        let text = render_status(DEFAULT_TASK_NAME, &Status::Registered(task));
+        assert!(text.contains("daemon (tray icon at logon"), "{text}");
+        assert!(text.contains("Steam"), "{text}");
+    }
 
-        let plain = RegisteredTask {
-            arguments: Some("run".into()),
-            ..RegisteredTask::default()
-        };
-        assert_eq!(plain.game(), None);
+    #[test]
+    fn an_unquoted_game_title_is_still_read_back_in_both_modes() {
+        for verb in ["run", "daemon"] {
+            let task = RegisteredTask {
+                arguments: Some(format!("{verb} --game Steam --latency")),
+                ..RegisteredTask::default()
+            };
+            assert_eq!(task.game().as_deref(), Some("Steam"), "{verb}");
+
+            let plain = RegisteredTask {
+                arguments: Some(verb.to_owned()),
+                ..RegisteredTask::default()
+            };
+            assert_eq!(plain.game(), None, "{verb}");
+        }
     }
 
     /// The silent killer: ksx moved, the task did not, and the cabinet boots to
@@ -1081,19 +1312,24 @@ mod tests {
 
     #[test]
     fn dry_run_prints_the_exact_xml_and_command() {
-        let plan = enable_plan(spec(Some("Steam"))).unwrap();
+        let plan = enable_plan(spec(TaskMode::Daemon, Some("Steam"))).unwrap();
         let text = plan.render_human(true);
         assert!(text.contains("schtasks /Create"), "{text}");
         assert!(text.contains("<LogonTrigger>"), "{text}");
         assert!(text.contains("nothing was registered"), "{text}");
         assert!(text.contains("LeastPrivilege"), "{text}");
+        assert!(
+            text.contains("mode:         daemon (tray icon at logon"),
+            "{text}"
+        );
 
         let v = plan.to_json(true);
         assert_eq!(v.pointer("/action"), Some(&serde_json::json!("dry-run")));
         assert_eq!(v.pointer("/elevated"), Some(&serde_json::json!(false)));
+        assert_eq!(v.pointer("/mode"), Some(&serde_json::json!("daemon")));
         assert_eq!(
             v.pointer("/arguments"),
-            Some(&serde_json::json!("run --game Steam"))
+            Some(&serde_json::json!("daemon --game Steam"))
         );
         assert!(v
             .pointer("/xml")
@@ -1105,7 +1341,7 @@ mod tests {
 
     #[test]
     fn the_temp_xml_path_never_contains_a_path_separator_from_the_task_name() {
-        let plan = enable_plan(spec(None)).unwrap();
+        let plan = enable_plan(spec(TaskMode::Daemon, None)).unwrap();
         let name = plan.xml_path.file_name().unwrap().to_string_lossy();
         assert!(
             name.starts_with("ksx-autostart-ksx-autostart-") && name.ends_with(".xml"),
@@ -1119,8 +1355,8 @@ mod tests {
     /// name, or an attacker can pre-create it and win the race every time.
     #[test]
     fn two_plans_never_pick_the_same_temp_xml_name() {
-        let a = enable_plan(spec(None)).unwrap().xml_path;
-        let b = enable_plan(spec(None)).unwrap().xml_path;
+        let a = enable_plan(spec(TaskMode::Daemon, None)).unwrap().xml_path;
+        let b = enable_plan(spec(TaskMode::Daemon, None)).unwrap().xml_path;
         assert_ne!(a, b, "a predictable drop-box name is the whole attack");
     }
 
@@ -1130,7 +1366,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn apply_refuses_a_pre_planted_temp_file_instead_of_overwriting_it() {
-        let plan = enable_plan(spec(None)).unwrap();
+        let plan = enable_plan(spec(TaskMode::Daemon, None)).unwrap();
         std::fs::write(&plan.xml_path, b"planted").unwrap();
 
         let err = apply(&plan).expect_err("a pre-existing drop box must be refused");

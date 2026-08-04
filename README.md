@@ -158,7 +158,7 @@ machine until reboot.)
 
 Exit codes: 0 clean, 1 error, 2 the configuration does not resolve.
 
-### `ksx autostart` — cold boot into a playable cabinet
+### `ksx autostart` — cold boot to a live tray
 
 ```sh
 ksx autostart --enable --game "MAME 4P"
@@ -168,7 +168,12 @@ ksx autostart --enable --dry-run     # exact XML + schtasks line, registers noth
 ```
 
 A **per-user** logon task — `InteractiveToken`, `LeastPrivilege`, never elevated
-— running `ksx run [--game <TITLE>]` 10 seconds after logon. Idempotent.
+— running `ksx daemon [--game <TITLE>]` 10 seconds after logon: the tray icon
+comes up and **nothing is captured** until a session is started from the tray or
+a wrapper. That default is deliberate — a registered `ksx run` would grab the
+assigned keyboards at every logon, desktop use included. `--mode run` registers
+exactly that instead, for kiosk cabinets where logon-straight-into-the-game is
+the point. Idempotent.
 
 `--enable` validates before it registers: the config must pass the same checks
 `ksx run` applies, the profile must exist, and its executable must be on disk.
