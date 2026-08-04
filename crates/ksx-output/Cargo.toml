@@ -1,0 +1,23 @@
+[package]
+name = "ksx-output"
+description = "VirtualPadBackend trait + ViGEmBus implementation over the vendored vigem-client."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ksx-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+vigem-client.workspace = true
+
+[dev-dependencies]
+rusty-xinput.workspace = true
+
+[features]
+# XInput loopback + driver-touching tests; only ever run on the cabinet, never CI.
+cab-tests = []

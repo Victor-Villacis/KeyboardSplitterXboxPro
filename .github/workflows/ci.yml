@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        # vendored vigem-client keeps upstream formatting; check only our crates
+        run: cargo fmt --check -p ksx-core -p ksx-config -p ksx-legacy-import -p ksx-capture -p ksx-output -p ksx-platform -p ksx-games -p ksx-app
+      - name: Clippy
+        run: cargo clippy --workspace --exclude vigem-client --all-targets -- -D warnings
+      - name: Test
+        # Driver-touching tests are behind the `cab-tests` feature and never run here.
+        # The vendored vigem-client's integration tests need the ViGEmBus driver: compile-check only.
+        run: cargo test --workspace --exclude vigem-client
+      - name: Check vendored vigem-client compiles
+        run: cargo check -p vigem-client --all-features

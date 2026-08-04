@@ -1,0 +1,18 @@
+[package]
+name = "ksx-legacy-import"
+description = "One-shot importer: legacy UTF-16 splitter_presets.xml / splitter_games.xml → ksx TOML."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ksx-core.workspace = true
+ksx-config.workspace = true
+quick-xml.workspace = true
+encoding_rs.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

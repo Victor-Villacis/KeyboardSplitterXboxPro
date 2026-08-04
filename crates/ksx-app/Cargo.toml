@@ -1,0 +1,25 @@
+[package]
+name = "ksx-app"
+description = "ksx — split keyboards (I-PAC arcade encoders) into virtual Xbox 360 controllers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ksx"
+path = "src/main.rs"
+
+[dependencies]
+ksx-core.workspace = true
+ksx-config.workspace = true
+ksx-legacy-import.workspace = true
+ksx-capture.workspace = true
+ksx-output.workspace = true
+ksx-platform.workspace = true
+ksx-games.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

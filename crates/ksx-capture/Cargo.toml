@@ -1,0 +1,20 @@
+[package]
+name = "ksx-capture"
+description = "CaptureBackend trait + backends: Interception (day 1), WinUSB/nusb (target), Raw Input identify."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ksx-core.workspace = true
+crossbeam-channel.workspace = true
+arc-swap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+kanata-interception.workspace = true
+nusb.workspace = true
+windows-sys.workspace = true

@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# vigem-client is vendored; its integration tests require the ViGEmBus driver,
+# so it is excluded from default build/test target selection (CI never runs it).
+default-members = [
+    "crates/ksx-core",
+    "crates/ksx-config",
+    "crates/ksx-legacy-import",
+    "crates/ksx-capture",
+    "crates/ksx-output",
+    "crates/ksx-platform",
+    "crates/ksx-games",
+    "crates/ksx-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Victor-Villacis/KeyboardSplitterXboxPro"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# internal
+ksx-core = { path = "crates/ksx-core" }
+ksx-config = { path = "crates/ksx-config" }
+ksx-legacy-import = { path = "crates/ksx-legacy-import" }
+ksx-capture = { path = "crates/ksx-capture" }
+ksx-output = { path = "crates/ksx-output" }
+ksx-platform = { path = "crates/ksx-platform" }
+ksx-games = { path = "crates/ksx-games" }
+vigem-client = { path = "crates/vigem-client", features = ["unstable_xtarget_notification"] }
+# shared
+bitflags = "2"
+thiserror = "2"
+anyhow = "1"
+smallvec = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+quick-xml = "0.37"
+encoding_rs = "0.8"
+directories = "6"
+crossbeam-channel = "0.5"
+arc-swap = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+notify = "8"
+# capture / output / platform (Windows)
+kanata-interception = "0.3"
+nusb = "0.2"
+windows = "0.62"
+windows-sys = "0.60"
+# dev / diagnostics
+proptest = "1"
+insta = "1"
+rusty-xinput = "1"
+hdrhistogram = "7"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

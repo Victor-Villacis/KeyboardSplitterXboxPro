@@ -1,0 +1,16 @@
+[package]
+name = "ksx-core"
+description = "Pure mapping engine: key events in, virtual-pad state deltas out. No I/O, no OS deps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bitflags.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

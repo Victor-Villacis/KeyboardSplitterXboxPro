@@ -1,0 +1,18 @@
+[package]
+name = "ksx-config"
+description = "TOML configuration: config.toml, presets/*.toml, games.toml — load/save/versioning/paths."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ksx-core.workspace = true
+serde.workspace = true
+toml.workspace = true
+directories.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
