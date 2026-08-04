@@ -315,6 +315,43 @@ fn refuse(json: bool, code: &str, message: &str) -> ! {
 }
 
 fn report(outcome: &Outcome, game_status: Option<String>, json: bool) -> anyhow::Result<()> {
+    // Mirror the verdict into `tracing` before rendering it for a human.
+    //
+    // `ksx autostart` registers `ksx run`, not the daemon, so on a cabinet this
+    // process has no console at logon: everything below is `println!` to a
+    // stdout nobody reads. Without this the log file gets a startup banner and
+    // then silence — no stop reason, no REBOOT REQUIRED, no dropped-event
+    // count — which is exactly the 3am failure the log exists for. stdout stays
+    // the human surface; the file gets the same facts.
+    if outcome.health.reboot_required {
+        tracing::error!(
+            stop = outcome.stop.code(),
+            "Interception keyboard-slot exhaustion — REBOOT REQUIRED before the affected board works again"
+        );
+    }
+    if outcome.health.watchdog_tripped {
+        tracing::warn!(
+            stop = outcome.stop.code(),
+            "the capture watchdog tripped: the event consumer stalled and keystrokes were passed through"
+        );
+    }
+    if outcome.health.dropped_events > 0 {
+        tracing::warn!(
+            dropped = outcome.health.dropped_events,
+            "events were dropped: the engine could not keep up with capture"
+        );
+    }
+    tracing::info!(
+        stop = outcome.stop.code(),
+        events = outcome.events,
+        updates = outcome.updates,
+        capture_exit = %outcome.capture_exit,
+        toggles = outcome.toggles,
+        exit_code = outcome.exit_code(),
+        "session ended: {}",
+        outcome.stop.message()
+    );
+
     if json {
         let mut value = outcome.to_json();
         value["game"] = match &game_status {

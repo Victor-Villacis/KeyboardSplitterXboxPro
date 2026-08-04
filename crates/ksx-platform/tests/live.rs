@@ -111,6 +111,73 @@ fn winusb_survey_runs_and_is_internally_consistent() {
     );
 }
 
+/// The bundled ViGEmBus installer, verified the way `ksx install-drivers` does
+/// it: sealed handle, both pins, real `WinVerifyTrust`.
+///
+/// This is the accepted-with-timestamp case in the flesh. Its certificate
+/// expired 2025-02-16 and it is still installable, because a countersignature
+/// dates the signature to 2023 — inside the window. Nothing here executes
+/// anything; `verify_sealed` only reads.
+///
+/// The last assertion is the load-bearing one. Anyone can write a test that
+/// says "the bundle passes"; it would keep passing if the timestamp check were
+/// deleted and expired certificates were waved through wholesale. So the same
+/// signature is re-judged with the countersignature removed, and must flip to
+/// refused. That is what proves the acceptance came from the timestamp.
+#[test]
+fn the_bundled_installer_is_accepted_because_of_its_timestamp() {
+    use ksx_platform::installer::{self, SignatureVerdict};
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../drivers")
+        .join(installer::INSTALLER_FILE_NAME);
+    if !path.is_file() {
+        // A source checkout without the release asset. `install-drivers`
+        // reports `installer-missing` for this, which is its own tested state.
+        return;
+    }
+
+    let (_sealed, verification) = installer::seal_and_verify(&path).expect("the bundle seals");
+    assert!(
+        verification.is_trusted(),
+        "the committed bundle must be installable: {:?}",
+        verification.failures()
+    );
+    assert_eq!(
+        verification.signature_verdict.code(),
+        "expired-timestamp-verified",
+        "{:?}",
+        verification.signature_verdict
+    );
+
+    let signature = verification.signature.clone().expect("Authenticode ran");
+    assert_eq!(signature.cert_expired, Some(true));
+    let timestamp = signature.timestamp.clone().expect("a countersignature");
+    assert!(timestamp.is_verified(), "{timestamp:?}");
+
+    // Re-derive the window comparison from the reported instants rather than
+    // trusting the boolean that was computed from them. RFC 3339 UTC at fixed
+    // width sorts lexicographically, so string ordering is date ordering.
+    let signed_at = timestamp.signed_at_utc.as_deref().expect("a signing time");
+    let not_before = signature.not_before_utc.as_deref().expect("NotBefore");
+    let not_after = signature.not_after_utc.as_deref().expect("NotAfter");
+    assert!(
+        not_before <= signed_at && signed_at <= not_after,
+        "signed {signed_at} outside [{not_before}, {not_after}]"
+    );
+
+    // And the proof that the timestamp is what carried it: take it away, and
+    // the very same signature is refused.
+    let mut undated = signature;
+    undated.timestamp = None;
+    let verdict = installer::judge_signature(Some(&undated));
+    assert!(!verdict.accepted(), "{verdict:?}");
+    assert!(
+        matches!(verdict, SignatureVerdict::ExpiredNoValidTimestamp { .. }),
+        "{verdict:?}"
+    );
+}
+
 /// Ground truth on the cabinet, verified by hand 2026-08-03 (see
 /// docs/research/keyboard-capture-2026.md §0). Never run in CI.
 #[cfg(feature = "cab-tests")]

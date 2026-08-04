@@ -10,6 +10,7 @@ mod daemon;
 mod devices;
 mod doctor;
 mod install;
+mod logging;
 mod monitor;
 mod pads;
 mod run;
@@ -179,7 +180,10 @@ enum Command {
     ///
     /// Menu: Start emulation, Stop emulation, Reload config, Open config
     /// folder, Quit. The tooltip shows the current state plus any capture
-    /// health problem (reboot required, watchdog tripped, dropped events).
+    /// health problem (reboot required, watchdog tripped, dropped events) —
+    /// polled from the RUNNING session, so a mid-session problem appears while
+    /// it is happening, and the last finished session's verdict is shown only
+    /// once nothing is running.
     ///
     /// --headless offers the identical commands on stdin: start | stop |
     /// reload | config | status | quit.
@@ -187,11 +191,11 @@ enum Command {
     /// THE CONSOLE: once the tray icon is on screen, ksx releases the console
     /// window it was started from, so the tray is the whole interface and there
     /// is no terminal to close by accident (closing it would kill the daemon)
-    /// and none on a cabinet's game screen at logon. The cost is that log
-    /// output stops at that moment — tracing writes to stderr, and there is no
-    /// stderr afterwards; capture health is still reported in the tooltip. Use
-    /// --console to keep it for debugging. --headless always keeps it: stdin is
-    /// its control surface.
+    /// and none on a cabinet's game screen at logon. Logging survives that:
+    /// every line, a panic included, also goes to the daily rotating log file
+    /// under the config root (its path is printed at startup and again just
+    /// before the console is released). Use --console to keep it and watch a
+    /// session live. --headless always keeps it: stdin is its control surface.
     ///
     /// Exit codes: 0 = clean exit, 1 = error, 2 = the configuration does not
     /// resolve (nothing was started).
@@ -205,7 +209,7 @@ enum Command {
         /// No tray icon; take the same commands on stdin (keeps the console)
         #[arg(long)]
         headless: bool,
-        /// Keep the console window attached (debugging; logs keep working)
+        /// Keep the console window attached (debugging; watch a session live)
         #[arg(long)]
         console: bool,
         /// Start emulation immediately instead of waiting for a command
@@ -366,50 +370,18 @@ enum WinusbCommand {
     },
 }
 
-/// Default log level when `RUST_LOG` says nothing.
-const DEFAULT_LOG: &str = "info";
-
-/// Build the log filter: `RUST_LOG` if it parses, `info` otherwise.
-///
-/// Pure so the policy is testable without touching the process environment or
-/// the global subscriber.
-fn tracing_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
-    use tracing_subscriber::EnvFilter;
-    match rust_log {
-        Some(spec) if !spec.trim().is_empty() => {
-            EnvFilter::try_new(spec).unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG))
-        }
-        _ => EnvFilter::new(DEFAULT_LOG),
-    }
-}
-
-/// Install the process-wide tracing subscriber.
-///
-/// Without one, every `tracing::warn!`/`error!` in the workspace is a silent
-/// no-op — including "REBOOT REQUIRED" (Interception slot exhaustion), "event
-/// consumer stalled — forcing passthrough" (the watchdog), and the Interception
-/// end-of-life / CI-policy warning. Those are the three messages a user most
-/// needs to see, so this is not optional plumbing.
-///
-/// Output goes to **stderr, always**: `--json` promises exactly one object on
-/// stdout, and a log line landing there would corrupt it for every automated
-/// caller.
-///
-/// TODO(M5): add a rotating file sink alongside stderr (tracing-appender), per
-/// `docs/research/design-architecture.md` §4.1 — a cabinet running headless at
-/// boot has no console to read. Deliberately out of scope for this pass.
-fn init_tracing() {
-    use tracing_subscriber::fmt;
-    // `try_init` (not `init`): a second call — e.g. from a test binary that
-    // already installed one — must not abort the program.
-    let _ = fmt()
-        .with_env_filter(tracing_filter(std::env::var("RUST_LOG").ok().as_deref()))
-        .with_writer(std::io::stderr)
-        .try_init();
-}
-
 fn main() -> anyhow::Result<()> {
-    init_tracing();
+    // Logging first, and for **every** command — not just the daemon. A
+    // `ksx run` started by the cabinet's logon task has no console either, and
+    // the whole point of the file sink is that something is left behind when a
+    // session ends badly. A config root that cannot be discovered degrades to
+    // stderr rather than failing the command: `ksx --version` must still work.
+    //
+    // The returned `LogSink` is *not* a guard — `crate::logging` keeps the
+    // writer's `WorkerGuard` in a `static` precisely so that no future edit to
+    // this function can drop it and silently stop logging.
+    let sink = logging::init(ksx_config::ConfigRoot::discover().ok().as_ref());
+    logging::announce(&sink);
     let cli = Cli::parse();
     match cli.command {
         Command::Run {
@@ -857,44 +829,6 @@ mod tests {
         );
     }
 
-    /// A subscriber must actually be installed: without one every
-    /// `tracing::warn!`/`error!` in the workspace is a no-op, including
-    /// "REBOOT REQUIRED" and the consumer-stall watchdog.
-    #[test]
-    fn tracing_subscriber_is_installed_at_info() {
-        use tracing::level_filters::LevelFilter;
-        // Read the ambient RUST_LOG *before* installing: a developer or CI job
-        // running the gate with `RUST_LOG=warn` set legitimately gets a lower
-        // level, and that must not read as "no subscriber".
-        let configured = std::env::var("RUST_LOG").ok();
-        init_tracing();
-        assert_ne!(
-            LevelFilter::current(),
-            LevelFilter::OFF,
-            "no tracing subscriber is active, so every warn!/error! is silently dropped"
-        );
-        if configured.is_none() {
-            assert!(
-                LevelFilter::current() >= LevelFilter::INFO,
-                "with no RUST_LOG the default must be info, got {}",
-                LevelFilter::current()
-            );
-        }
-    }
-
-    #[test]
-    fn tracing_filter_defaults_to_info_and_honors_rust_log() {
-        assert_eq!(tracing_filter(None).to_string(), "info");
-        assert_eq!(tracing_filter(Some("")).to_string(), "info");
-        assert_eq!(tracing_filter(Some("  ")).to_string(), "info");
-        assert_eq!(
-            tracing_filter(Some("ksx_capture=trace")).to_string(),
-            "ksx_capture=trace"
-        );
-        // A malformed RUST_LOG must not silence the app.
-        assert_eq!(tracing_filter(Some("=========")).to_string(), "info");
-    }
-
     #[test]
     fn doctor_latency_is_no_longer_a_stub() {
         let cli = Cli::try_parse_from(["ksx", "doctor", "--latency"]).unwrap();
@@ -1041,7 +975,7 @@ mod tests {
     }
 
     /// The trade has to be in `--help`, because it is the only place somebody
-    /// looks after their daemon stopped logging.
+    /// looks after their daemon vanished.
     #[test]
     fn daemon_help_states_what_happens_to_the_console() {
         let mut cmd = Cli::command();
@@ -1050,12 +984,30 @@ mod tests {
         let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
         for needle in [
             "releases the console window",
-            "log output stops at that moment",
+            // The file log is the answer to "where did my daemon go", so the
+            // help has to name it — and must no longer claim the opposite.
+            "daily rotating log file",
+            "a panic included",
             "--console to keep it",
             "--headless always keeps it",
         ] {
             assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
         }
+        assert!(
+            !flat.contains("log output stops at that moment"),
+            "the pre-file-log claim must be gone:\n{help}"
+        );
+    }
+
+    /// The tooltip's promise, in `--help`: health is live, not post-mortem.
+    #[test]
+    fn daemon_help_promises_live_health_in_the_tooltip() {
+        let mut cmd = Cli::command();
+        let daemon = cmd.find_subcommand_mut("daemon").unwrap();
+        let help = daemon.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("polled from the RUNNING session"), "{help}");
+        assert!(flat.contains("while it is happening"), "{help}");
     }
 
     /// M1 regression: the exact invocation the milestone gate smoke-runs.

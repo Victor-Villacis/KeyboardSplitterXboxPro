@@ -194,44 +194,52 @@ mod tests {
         assert_eq!(EXIT_INSTALLER_FAILED, 3);
     }
 
-    /// The cross-signed state this whole rewrite exists to escape must never
-    /// authorise a *new* install — asserted here as well as in the platform
-    /// crate, because this is the layer that decides whether to run anything.
-    #[test]
-    fn a_valid_but_expired_cert_never_reaches_an_executable_verdict() {
-        use ksx_platform::installer::{plan, InstalledState, Location, Verification};
-        use ksx_platform::{SignatureInfo, SignatureStatus};
-
-        let signature = SignatureInfo {
-            status: SignatureStatus::ValidExpiredCert,
-            signer: Some("Nefarius Software Solutions e.U.".into()),
-            issuer: None,
-            not_after_utc: None,
-            cert_expired: Some(true),
-        };
+    fn pinned_digest() -> [u8; 32] {
         let mut digest = [0u8; 32];
         for (i, byte) in digest.iter_mut().enumerate() {
             let hex = &installer::EXPECTED_SHA256[i * 2..i * 2 + 2];
             *byte = u8::from_str_radix(hex, 16).unwrap();
         }
-        let verification: Verification = ksx_platform::installer::verify_with(
-            std::path::Path::new("x"),
-            Some(signature),
-            Ok(digest),
-        );
-        let p = plan(
+        digest
+    }
+
+    fn plan_for(signature: ksx_platform::SignatureInfo) -> ksx_platform::installer::InstallPlan {
+        use ksx_platform::installer::{plan, InstalledState, Location};
+        plan(
             Location {
                 found: Some("x".into()),
                 searched: vec!["x".into()],
                 rejected: Vec::new(),
                 restricted: true,
             },
-            Some(verification),
+            Some(ksx_platform::installer::verify_with(
+                std::path::Path::new("x"),
+                Some(signature),
+                Ok(pinned_digest()),
+            )),
             InstalledState::default(),
             Some(true),
             &["/quiet".to_owned()],
             false,
-        );
+        )
+    }
+
+    /// An expired certificate with **nothing to date the signature** must never
+    /// authorise a new install — asserted here as well as in the platform
+    /// crate, because this is the layer that decides whether to run anything.
+    #[test]
+    fn an_undated_expired_cert_never_reaches_an_executable_verdict() {
+        use ksx_platform::{SignatureInfo, SignatureStatus};
+
+        let p = plan_for(SignatureInfo {
+            status: SignatureStatus::ValidExpiredCert,
+            signer: Some("Nefarius Software Solutions e.U.".into()),
+            not_after_utc: Some("2025-02-17T00:59:59Z".into()),
+            cert_expired: Some(true),
+            // No countersignature: nothing shows when this was signed.
+            timestamp: None,
+            ..SignatureInfo::unknown()
+        });
         assert!(matches!(p.action, Action::Refuse { .. }), "{:?}", p.action);
         assert!(!p.action.is_executable());
         assert_eq!(p.command, None);
@@ -240,6 +248,49 @@ mod tests {
             "{}",
             p.verdict_line()
         );
+        assert_eq!(
+            p.to_json().pointer("/installer/signature_code"),
+            Some(&serde_json::json!("expired-no-valid-timestamp"))
+        );
+    }
+
+    /// ...and the same certificate **with** a verified timestamp does reach an
+    /// executable verdict, because the timestamp proves the file was signed
+    /// while the certificate was live. Both halves are asserted at this layer:
+    /// the whole point of the policy is that these two cases diverge here.
+    #[test]
+    fn a_verified_timestamp_makes_the_same_expired_cert_installable() {
+        use ksx_platform::report::TimestampInfo;
+        use ksx_platform::{SignatureInfo, SignatureStatus};
+
+        let p = plan_for(SignatureInfo {
+            status: SignatureStatus::ValidExpiredCert,
+            signer: Some("Nefarius Software Solutions e.U.".into()),
+            not_before_utc: Some("2023-03-13T00:00:00Z".into()),
+            not_after_utc: Some("2025-02-17T00:59:59Z".into()),
+            cert_expired: Some(true),
+            timestamp: Some(TimestampInfo {
+                signed_at_utc: Some("2023-11-02T15:12:03Z".into()),
+                signed_at_ticks: 133_434_163_230_000_000,
+                authority: Some("DigiCert Timestamp 2023".into()),
+                is_timestamp_signer: true,
+                chain_ok: true,
+                within_signing_cert_validity: true,
+                within_timestamp_cert_validity: true,
+            }),
+            ..SignatureInfo::unknown()
+        });
+        assert_eq!(p.action, Action::Ready);
+        assert!(p.action.is_executable());
+        assert_eq!(
+            p.to_json().pointer("/installer/signature_code"),
+            Some(&serde_json::json!("expired-timestamp-verified"))
+        );
+        // Accepted, but never silently: the report says which expired
+        // certificate was accepted and what dated it.
+        let text = p.render_human(true);
+        assert!(text.contains("2023-11-02T15:12:03Z"), "{text}");
+        assert!(text.contains("(EXPIRED)"), "{text}");
     }
 
     /// WiX Burn's real unattended switches — getting these wrong means an

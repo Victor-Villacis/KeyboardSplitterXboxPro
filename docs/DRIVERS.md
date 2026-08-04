@@ -16,45 +16,112 @@ Deep dives: [`research/virtual-gamepad-2026.md`](research/virtual-gamepad-2026.m
   `CN=Nefarius Software Solutions e.U., L=Wels, C=AT`; SHA-256
   `89220A7865076B342892F98865F3499FB7C4CFD673159E89D352C360FD014C6A`). Never download
   at runtime (the old endpoints are rotting).
-
-### ⚠ Expired signing certificate — `ksx install-drivers` currently refuses this bundle
-
-Measured on the dev machine 2026-08-04 with `ksx install-drivers --dry-run --json`:
-
-```
-sha256        [OK]   89220A78…014C6A
-authenticode  [FAIL] ValidExpiredCert, signer Nefarius Software Solutions e.U.
-```
-
-The chain verifies and the signer is right; the **signing certificate's validity
-period has passed**. For a correctly timestamped Authenticode signature that is
-normal and Windows still accepts it — it is *not* evidence of tampering, and it is
-a different thing from the cross-signed kernel-driver problem below (that one is
-about `keyboard.sys`'s 2012 cross-cert and the 2026 CI policy; this one is about a
-user-mode WiX bootstrapper's leaf cert).
-
-M5 nonetheless refuses it, by explicit design decision: `install-drivers` is the
-only ksx command that runs elevated, and "currently-valid certificate" is the bar
-for anything that crosses that boundary. The consequence is that **the bundle as
-committed cannot be installed by ksx today**. Three ways out, to decide before the
-M5 cabinet gate:
-
-1. **Ship a ViGEmBus release whose signature is still in validity** and re-pin both
-   the hash and the signer. Cleanest; depends on an archived project publishing one.
-2. **Accept `ValidExpiredCert` when a valid RFC-3161 timestamp countersignature
-   covers the signing time** — which is what Windows itself does. This is the
-   technically correct relaxation; it needs the timestamp to be *verified*, not
-   assumed, or the rule means nothing.
-3. **Install ViGEmBus by hand** and use `ksx install-drivers` purely as a reporter
-   (`ksx doctor` already tells you whether the bus is healthy).
-
-Until one of those lands, the cabinet path is (3). The refusal message names the
-expiry date and points here.
 - Plan B: HIDMaestro (MIT, user-mode UMDF2; would mean a hand-written Rust client for
   its documented shared-memory protocol — verify its WGI double-input bug first).
   Plan C: libvirtualhid (LizardByte; revisit when Sunshine's PR merges and XInput slot
   behavior is verified). Not options: Nefarius VirtualPad (closed/commercial), vJoy
   (DirectInput-only).
+
+### Expired signing certificate — accepted, because a verified timestamp covers it
+
+The bundle's signing certificate **expired 2025-02-16**. The chain verifies and
+the signer is right; the certificate simply aged out, as code-signing certificates
+do — they are issued for a year or two and the binaries they sign outlive them.
+
+M5 originally refused on that alone ("currently-valid certificate" as the bar for
+anything running elevated), which made **the committed bundle un-installable by
+ksx at all**. That rule is now gone. Since 2026-08-04 the policy is Windows':
+
+> An expired certificate is accepted **if, and only if, a timestamp
+> countersignature proves the file was signed while the certificate was still
+> valid.** No timestamp, no acceptance.
+
+Measured on the dev machine with `ksx install-drivers --dry-run`:
+
+```
+sha256        [OK]   89220A7865076B342892F98865F3499FB7C4CFD673159E89D352C360FD014C6A
+authenticode  [OK]   expired-timestamp-verified, signer Nefarius Software Solutions e.U.
+certificate          valid 2023-03-13T00:00:00Z .. 2025-02-16T23:59:59Z  (EXPIRED)
+timestamp     [OK]   signed 2023-11-02T16:32:03Z, countersigned by DigiCert Timestamp 2023
+```
+
+#### Why this, and not one of the other options
+
+The three candidates were: re-pin a newer ViGEmBus release, relax the rule, or
+tell people to install by hand.
+
+- **A newer release** would be cleanest and does not exist. ViGEmBus was archived
+  in Nov 2023; nobody is going to re-sign 1.22.0.
+- **Refusing outright** sounds like the safe default and is not. `ksx doctor` says
+  "run `ksx install-drivers`", `install-drivers` refuses its own bundle, and the
+  only way forward left is double-clicking the same `.exe` from an admin prompt —
+  with **no** hash check, **no** signer check, and no sealed handle. The refusal
+  did not prevent that install; it just removed every check from it. A policy that
+  routes users around itself is worse than the thing it was guarding against.
+- **Verifying the timestamp** keeps both pins live on the path people actually
+  take, and matches what the operating system concludes about the same file. The
+  cost is one honest relaxation instead of a rule nobody can comply with.
+
+Expiry is also *not* the same problem as the cross-signed kernel driver below:
+that one is `keyboard.sys`'s 2012 cross-cert versus the 2026 CI policy, a
+kernel-mode trust anchor being withdrawn. This is a user-mode WiX bootstrapper's
+leaf cert reaching its ordinary end of life. `ksx doctor` still warns about the
+former, loudly.
+
+#### What "verified" means here — four checks, not a shrug
+
+A countersignature is a *claim* ("this file was signed at T"). Trusting it
+unexamined would be theatre, so `ksx install-drivers` accepts an expired
+certificate only when all four of these hold
+(`crates/ksx-platform/src/report.rs`, `TimestampInfo::problem`):
+
+1. the countersigner is a **timestamp** countersigner (`SGNR_TYPE_TIMESTAMP`) and
+   not some other unauthenticated attribute;
+2. its **own certificate chain verified** — the timestamping authority is one
+   Windows trusts (`dwError == 0`);
+3. the authority's certificate was **itself valid at the instant it claims to have
+   stamped** — a TSA vouching for a moment outside its own life vouches for
+   nothing;
+4. the stamped instant falls **inside the signing certificate's `NotBefore` ..
+   `NotAfter` window** — the actual question being asked.
+
+Any one of them failing is a refusal, and the message names which one. A
+certificate whose validity window could not be read at all fails closed: unknown
+is not the same as valid.
+
+All of it is read from a **single `WinVerifyTrust` call against the sealed
+handle** (`WINTRUST_FILE_INFO.hFile`), through
+`CRYPT_PROVIDER_SGNR::pasCounterSigners`. `CryptQueryObject` is deliberately not
+used: it accepts only a path or a blob, so reaching for it would mean a second
+`open()` and would re-open the time-of-check/time-of-use gap the sealed handle
+exists to close. One open, one check, no gap.
+
+#### The states, and their codes
+
+`--json` reports `installer.signature_code`; the same string appears on the
+`authenticode` line. The first three are the certificate states, and they stay
+three distinct states rather than collapsing into one boolean:
+
+| code | meaning | installable |
+|---|---|---|
+| `valid` | chain verifies, certificate still inside its window | yes |
+| `expired-timestamp-verified` | certificate expired; a timestamp passing all four checks dates the signature inside the window | yes — **this is the committed bundle** |
+| `expired-no-valid-timestamp` | certificate expired and no countersignature survives checking (or there is none) | **no** |
+| `wrong-signer` | chain verifies, but it is not Nefarius | no |
+| `chain-not-trusted` | the chain itself does not verify | no |
+| `unsigned` | no Authenticode signature at all | no |
+
+`installer.signature` carries the raw evidence — chain status, both ends of the
+certificate window, the timestamp instant, the authority, and each of the four
+checks individually — so a script can re-derive the verdict instead of trusting
+it. An accepted-but-expired bundle is announced in the human output as a `note:`,
+never waved through silently.
+
+Nothing else was relaxed. A bad hash, the wrong signer, an untrusted chain or an
+unsigned file are refused exactly as before, and `WinVerifyTrust` returning
+`CERT_E_EXPIRED` — Windows' own "no acceptable timestamp" answer — is refused too,
+so ksx can never be *more* permissive than the platform whose behaviour it
+matches.
 
 ### Where `install-drivers` will look for the bundle
 

@@ -202,9 +202,15 @@ A file that fails verification is refused, and ksx will not print a command line
 for it either. ksx never downloads anything and never self-elevates.
 Interception is reported but never installed (non-commercial licence).
 
-> **Known blocker (2026-08-04):** the bundled ViGEmBus 1.22.0 asset hashes
-> correctly and is signed by Nefarius, but its signing certificate has expired,
-> so ksx reports `ValidExpiredCert` and refuses it. See `docs/DRIVERS.md`.
+The signer pin is not "the certificate is valid today" — code-signing
+certificates outlive by design the binaries they sign. ksx does what Windows
+does: an **expired** certificate is accepted only when a timestamp
+countersignature, *verified* rather than assumed, places the signing time inside
+the certificate's validity window. The bundled ViGEmBus 1.22.0 asset is exactly
+that case (certificate expired 2025-02-16, signature timestamped 2023-11-02), and
+`install-drivers` reports it as `expired-timestamp-verified` with the date shown.
+An expired certificate with no timestamp that survives checking is still refused.
+See [`docs/DRIVERS.md`](docs/DRIVERS.md) for the four checks and the state codes.
 
 Exit codes: 0 nothing to do / installed, 1 error, 2 refused (verification
 failed, installer missing, elevation needed), 3 the installer ran and failed.

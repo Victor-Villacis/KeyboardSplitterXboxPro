@@ -323,9 +323,9 @@ mod tests {
             signature: Some(SignatureInfo {
                 status,
                 signer: Some(signer.into()),
-                issuer: None,
                 not_after_utc: not_after.map(Into::into),
                 cert_expired: Some(matches!(status, SignatureStatus::ValidExpiredCert)),
+                ..SignatureInfo::unknown()
             }),
         }
     }

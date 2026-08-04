@@ -16,16 +16,21 @@
 //!   registers `ksx run`, not the daemon, so this applies to a hand-registered
 //!   daemon task — see the autostart module.)
 //!
-//! # The fix, and its one honest cost
+//! # The fix, and what used to be its cost
 //!
 //! `ksx daemon` (tray mode) calls `FreeConsole` once the icon is on screen:
-//! after that there is no window to close and nothing to see. The cost is that
-//! **the console is where tracing goes**, so from the moment of detaching, every
-//! `tracing::warn!`/`error!` in the process — REBOOT REQUIRED, the capture
-//! watchdog, the Interception end-of-life notice — is written to nothing. That
-//! is a real regression until the rotating file log lands (`docs/research/
-//! design-architecture.md` §4.1), so [`DETACH_NOTICE`] says so out loud, on the
-//! console, *before* the console goes away.
+//! after that there is no window to close and nothing to see.
+//!
+//! That used to cost the logs. The console is where tracing went, so from the
+//! moment of detaching every `tracing::warn!`/`error!` in the process — REBOOT
+//! REQUIRED, the capture watchdog, the Interception end-of-life notice, and a
+//! panic message — was written to nothing, and a daemon that died left no trace
+//! anywhere. [`crate::logging`] closed that: the same lines also go to a daily
+//! rotating file under the config root (`docs/research/design-architecture.md`
+//! §4.1), and a panic hook puts a dying daemon's last words there too. So
+//! [`detach_notice`] now *names the file* instead of apologising — and still
+//! says the old thing, loudly, in the one case where it is true again: no log
+//! file could be opened.
 //!
 //! Two escape hatches, both keeping the console:
 //!
@@ -63,24 +68,47 @@ pub fn mode(headless: bool, console: bool) -> ConsoleMode {
     }
 }
 
-/// Printed to the console immediately before it is taken away.
+/// The fixed part of what is printed to the console immediately before it is
+/// taken away. Use [`detach_notice`] to print it — the one fact this constant
+/// cannot hold is the runtime path of the log file.
 ///
-/// Says the two things somebody staring at a vanishing window needs: how to get
-/// it back, and that logging stops here. Written before the flush + detach so it
+/// Says the things somebody staring at a vanishing window needs: how to get it
+/// back, and where their logs are now. Written before the flush + detach so it
 /// is guaranteed to be on screen.
 pub const DETACH_NOTICE: &str = "\
 ksx daemon: releasing this console. The tray icon is now the whole interface.
   * closing this window can no longer stop ksx (that is the point);
-  * log output stops here: tracing writes to stderr, and after this line there
-    is no stderr. That includes a panic message, so a daemon that dies after
-    this point leaves no trace until the rotating log file lands;
-  * the tray tooltip reports health only AFTER a session ends, so a mid-session
-    REBOOT REQUIRED or watchdog trip is currently visible nowhere. Run with
-    `--console` if you need to watch one;
-  * redirect instead to keep everything: `ksx daemon >> ksx.log 2>&1` is not
-    detached from its file and keeps logging;
-  * to keep this console, start it as `ksx daemon --console`;
+  * log output does NOT stop here: every line keeps going to the rotating log
+    file below, and a panic hook puts a dying daemon's last words in it too;
+  * the tray tooltip reports the RUNNING session's health, so a mid-session
+    REBOOT REQUIRED or watchdog trip shows up while it is happening, not only
+    after the session ends;
+  * to watch a session live, start it as `ksx daemon --console`;
   * to drive it from a script instead, use `ksx daemon --headless`.";
+
+/// The notice as it is actually printed: [`DETACH_NOTICE`] plus the one fact a
+/// constant cannot carry — which file the logs are in.
+///
+/// `log` is `None` when [`crate::logging`] could not open one (a read-only
+/// config root, no `%APPDATA%`). That is the *only* case where the pre-file-log
+/// warning is still true, and then it is printed in full: a user about to lose
+/// their console has to know when they are losing everything with it.
+pub fn detach_notice(log: Option<&std::path::Path>) -> String {
+    match log {
+        Some(path) => format!(
+            "{DETACH_NOTICE}\n  * this daemon's log: {} (daily rotation, {} days kept).",
+            path.display(),
+            crate::logging::KEEP_DAYS
+        ),
+        None => format!(
+            // ASCII only, like the constant: the console this is printed to may
+            // be a legacy code page, and a mojibake warning is a lost warning.
+            "{DETACH_NOTICE}\n  * [!] NO LOG FILE could be opened, so log output really does stop \
+             here, a panic message included. Start it as `ksx daemon --console`, or redirect: \
+             `ksx daemon >> ksx.log 2>&1` is not detached from its file and keeps logging."
+        ),
+    }
+}
 
 /// Flush stdout/stderr, then detach from the console.
 ///
@@ -150,6 +178,8 @@ pub fn detach() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     /// The whole policy table, including the combination that matters most:
@@ -177,14 +207,11 @@ mod tests {
         }
     }
 
-    /// The notice is the only warning a user gets that logging has stopped, and
-    /// the only place the way back is written down. Both are load-bearing.
+    /// The notice is the only place the way back is written down, and the only
+    /// warning a user gets about what happens to their output. Both are
+    /// load-bearing.
     #[test]
-    fn the_notice_states_the_cost_and_both_ways_to_keep_the_console() {
-        assert!(
-            DETACH_NOTICE.contains("log output stops here"),
-            "{DETACH_NOTICE}"
-        );
+    fn the_notice_states_both_ways_to_keep_the_console() {
         assert!(
             DETACH_NOTICE.contains("ksx daemon --console"),
             "{DETACH_NOTICE}"
@@ -199,6 +226,58 @@ mod tests {
         assert!(
             DETACH_NOTICE.is_ascii(),
             "the console may be a legacy code page"
+        );
+        assert!(detach_notice(None).is_ascii(), "{}", detach_notice(None));
+    }
+
+    /// **The notice must not promise the opposite of what ksx now does.** For
+    /// the whole of M5–M6 it said logging stopped at the detach and that health
+    /// was visible only after a session ended; both are now false, and a notice
+    /// that tells a user their logs are gone is a user who never looks for the
+    /// file that has the answer in it.
+    #[test]
+    fn the_notice_points_at_the_log_file_and_the_live_tooltip() {
+        let notice = detach_notice(Some(Path::new(r"C:\cfg\ksx\logs\ksx.2026-08-04.log")));
+        assert!(notice.contains("log output does NOT stop here"), "{notice}");
+        assert!(
+            notice.contains(r"C:\cfg\ksx\logs\ksx.2026-08-04.log"),
+            "the user must be told where to look: {notice}"
+        );
+        assert!(
+            notice.contains("14 days kept"),
+            "the retention bound is stated, not implied: {notice}"
+        );
+        assert!(
+            notice.contains("panic"),
+            "the panic hook is the reason the file is worth mentioning: {notice}"
+        );
+        assert!(
+            notice.contains("RUNNING session's health"),
+            "the mid-session gap is closed, so the notice must stop claiming it: {notice}"
+        );
+        for gone in [
+            "log output stops here",
+            "leaves no trace",
+            "visible nowhere",
+            "only AFTER a session ends",
+        ] {
+            assert!(
+                !notice.contains(gone),
+                "the pre-M6.5 claim '{gone}' must be gone:\n{notice}"
+            );
+        }
+    }
+
+    /// ...and when there really is no log file, the old warning is the truth
+    /// again and has to be printed in full.
+    #[test]
+    fn with_no_log_file_the_notice_says_output_really_does_stop() {
+        let notice = detach_notice(None);
+        assert!(notice.contains("NO LOG FILE"), "{notice}");
+        assert!(notice.contains("really does stop"), "{notice}");
+        assert!(
+            notice.contains("ksx daemon >> ksx.log 2>&1"),
+            "the redirect escape hatch matters most when there is no file: {notice}"
         );
     }
 }

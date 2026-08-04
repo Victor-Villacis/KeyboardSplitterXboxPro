@@ -18,6 +18,28 @@
 //! ViGEmBus 1.22.0 for a differently-signed Nefarius binary. Two independent
 //! pins is the point.
 //!
+//! # The signature policy, and why an expired certificate can still pass
+//!
+//! Step 4 is not "the certificate is valid today". Code-signing certificates
+//! are issued for a year or two; the binaries they sign outlive them by design,
+//! and that is what the timestamp countersignature is *for*. Windows itself
+//! resolves this by asking whether the file was signed **while** the
+//! certificate was live, and accepts it forever after if so. ksx does the same
+//! — see [`SignatureVerdict`] — with one addition: the timestamp is verified
+//! rather than assumed. A countersignature nobody checked is decoration.
+//!
+//! So there are three distinct outcomes for a correctly-signed Nefarius binary,
+//! and they are reported as three states with three codes, never as one bool:
+//!
+//! | state | code | run it? |
+//! |---|---|---|
+//! | certificate still inside its window | `valid` | yes |
+//! | certificate expired, verified timestamp covers the signing time | `expired-timestamp-verified` | yes |
+//! | certificate expired, no timestamp survives checking | `expired-no-valid-timestamp` | **no** |
+//!
+//! Everything else — wrong signer, untrusted chain, unsigned, bad hash — is
+//! refused exactly as before.
+//!
 //! # Threat model (why steps 1 and 2 exist at all)
 //!
 //! `ksx install-drivers` is the one ksx command that runs with an administrator
@@ -278,6 +300,207 @@ pub fn locate_with(policy: &SearchPolicy, exe_dir: Option<&Path>, cwd: Option<&P
 // Verification
 // ---------------------------------------------------------------------------
 
+/// The Authenticode pin's outcome — one variant per state that can actually
+/// occur, each with a stable `code` for `--json`.
+///
+/// This exists instead of a boolean because the three interesting outcomes are
+/// genuinely different things to tell a user: "signed and current", "signed
+/// years ago and the paperwork proves it", and "signed by someone whose
+/// certificate ran out with nothing to show when". Collapsing the middle one
+/// into either neighbour is a lie — into `valid` it hides that the certificate
+/// is dead, into `refused` it strands a legitimately-signed bundle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "code", rename_all = "kebab-case")]
+pub enum SignatureVerdict {
+    /// Chain verifies, signer matches, certificate still inside its window.
+    Valid,
+    /// Chain verifies, signer matches, certificate has **expired** — and a
+    /// timestamp countersignature that passed every check in
+    /// [`crate::report::TimestampInfo`] places the signing time inside the
+    /// certificate's validity window. Accepted: this is what Windows does, and
+    /// it is the entire purpose of timestamping.
+    ExpiredTimestampVerified {
+        signed_at_utc: String,
+        not_after_utc: Option<String>,
+        authority: Option<String>,
+    },
+    /// Chain verifies, signer matches, certificate has expired, and no
+    /// countersignature proves it was signed in time. Refused.
+    ExpiredNoValidTimestamp {
+        not_after_utc: Option<String>,
+        /// Which requirement the countersignature failed, or that there was
+        /// none at all.
+        problem: String,
+    },
+    /// The chain verifies, but this is somebody else's binary.
+    WrongSigner { signer: Option<String> },
+    /// The chain itself does not verify (revoked, tampered, self-signed, …).
+    ChainNotTrusted { status: SignatureStatus },
+    /// No Authenticode signature at all.
+    Unsigned,
+    /// Off Windows: there is no Authenticode to ask about, so nothing is ever
+    /// trusted here.
+    NotChecked,
+}
+
+impl SignatureVerdict {
+    /// Stable identifier for `--json` consumers and provisioning scripts.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::ExpiredTimestampVerified { .. } => "expired-timestamp-verified",
+            Self::ExpiredNoValidTimestamp { .. } => "expired-no-valid-timestamp",
+            Self::WrongSigner { .. } => "wrong-signer",
+            Self::ChainNotTrusted { .. } => "chain-not-trusted",
+            Self::Unsigned => "unsigned",
+            Self::NotChecked => "not-checked",
+        }
+    }
+
+    /// The only two states that may authorise running a kernel-driver installer
+    /// with an administrator token.
+    pub fn accepted(&self) -> bool {
+        matches!(self, Self::Valid | Self::ExpiredTimestampVerified { .. })
+    }
+
+    /// One sentence a human can act on — for accepted states too, because
+    /// "accepted an expired certificate" is a thing the user is entitled to
+    /// read rather than have quietly waved through.
+    pub fn explain(&self) -> String {
+        match self {
+            Self::Valid => {
+                "Authenticode verifies and the signing certificate is current".to_owned()
+            }
+            Self::ExpiredTimestampVerified {
+                signed_at_utc,
+                not_after_utc,
+                authority,
+            } => format!(
+                "the signing certificate expired{}, but a verified timestamp countersignature{} \
+                 places the signing time at {signed_at_utc}, inside the certificate's validity \
+                 window. Windows accepts a signature on those terms and so does ksx — that is \
+                 what timestamping is for. The certificate being expired *now* is not evidence \
+                 of anything.",
+                match not_after_utc {
+                    Some(when) => format!(" on {when}"),
+                    None => String::new(),
+                },
+                match authority {
+                    Some(who) => format!(" from '{who}'"),
+                    None => String::new(),
+                }
+            ),
+            Self::ExpiredNoValidTimestamp {
+                not_after_utc,
+                problem,
+            } => format!(
+                "Authenticode chains correctly and the signer is right, but the signing \
+                 certificate expired{} and {problem}. Without a timestamp there is nothing to \
+                 show the file was signed while the certificate was live, so ksx refuses to run \
+                 it elevated. See docs/DRIVERS.md ('expired signing certificate').",
+                match not_after_utc {
+                    Some(when) => format!(" on {when}"),
+                    None => String::new(),
+                }
+            ),
+            Self::WrongSigner { signer: Some(got) } => {
+                format!("Authenticode is valid but the signer is '{got}', not '{EXPECTED_SIGNER}'")
+            }
+            Self::WrongSigner { signer: None } => {
+                "Authenticode verified but no signer name could be read from the certificate, \
+                 so the signer pin cannot be checked"
+                    .to_owned()
+            }
+            Self::ChainNotTrusted { status } => format!(
+                "Authenticode is {status:?}; a driver installer must present a chain that verifies"
+            ),
+            Self::Unsigned => "the file carries no Authenticode signature at all".to_owned(),
+            Self::NotChecked => "Authenticode could not be checked on this platform".to_owned(),
+        }
+    }
+}
+
+/// Apply the signature policy to what `WinVerifyTrust` reported. Pure, so every
+/// state below is exercised by fixtures on any platform.
+///
+/// Order matters. The signer pin is checked *before* anything about validity
+/// windows: "expired certificate" is only an interesting question once the
+/// certificate is the one we expect, and a stranger's currently-valid
+/// certificate must never read as a milder problem than Nefarius's expired one.
+pub fn judge_signature(signature: Option<&SignatureInfo>) -> SignatureVerdict {
+    let Some(sig) = signature else {
+        return SignatureVerdict::NotChecked;
+    };
+    match sig.status {
+        SignatureStatus::Unsigned => return SignatureVerdict::Unsigned,
+        // `Expired` is WinVerifyTrust's own CERT_E_EXPIRED: Windows looked for a
+        // timestamp covering the signing time and did not find an acceptable
+        // one. Reported as the expiry state it is, not as a generic untrusted
+        // chain — but never accepted, so ksx can never be more permissive than
+        // the platform whose behaviour it is matching.
+        SignatureStatus::Valid | SignatureStatus::ValidExpiredCert | SignatureStatus::Expired => {}
+        status => return SignatureVerdict::ChainNotTrusted { status },
+    }
+
+    // Anchored, not a substring search. `contains` on a security boundary
+    // accepts "Evil Nefarius Software Solutions Ltd" — the SHA-256 pin makes
+    // that unexploitable here, but a signer check that can be satisfied by a
+    // name someone else chose is not a check. The trailing tail is allowed
+    // because `CertGetNameStringW` returns the CN ("Nefarius Software
+    // Solutions e.U.") while the full DN carries `L=Wels, C=AT`.
+    let signer_ok = sig.signer.as_deref().is_some_and(|s| {
+        let s = s.trim();
+        s == EXPECTED_SIGNER
+            || s.strip_prefix(EXPECTED_SIGNER)
+                .is_some_and(|tail| tail.starts_with([' ', ',']))
+    });
+    if !signer_ok {
+        return SignatureVerdict::WrongSigner {
+            signer: sig.signer.clone(),
+        };
+    }
+
+    if sig.status == SignatureStatus::Valid && sig.cert_expired == Some(false) {
+        return SignatureVerdict::Valid;
+    }
+
+    // Expired — or a certificate whose window could not be read, which is not
+    // the same as a valid one and is treated as the dangerous case. The
+    // timestamp is now the only thing that can carry it.
+    let not_after_utc = sig.not_after_utc.clone();
+    if sig.status == SignatureStatus::Expired {
+        return SignatureVerdict::ExpiredNoValidTimestamp {
+            not_after_utc,
+            problem: "Windows itself rejected the chain with CERT_E_EXPIRED, meaning no \
+                      timestamp countersignature it would accept covers the signing time"
+                .to_owned(),
+        };
+    }
+    match sig.timestamp.as_ref() {
+        Some(ts) if ts.is_verified() => SignatureVerdict::ExpiredTimestampVerified {
+            // `is_verified()` guarantees this is `Some`; the fallback keeps the
+            // guarantee from being a `.unwrap()` in an elevated code path.
+            signed_at_utc: ts
+                .signed_at_utc
+                .clone()
+                .unwrap_or_else(|| ts.signed_at_ticks.to_string()),
+            not_after_utc,
+            authority: ts.authority.clone(),
+        },
+        Some(ts) => SignatureVerdict::ExpiredNoValidTimestamp {
+            not_after_utc,
+            problem: ts
+                .problem()
+                .unwrap_or("the timestamp countersignature did not verify")
+                .to_owned(),
+        },
+        None => SignatureVerdict::ExpiredNoValidTimestamp {
+            not_after_utc,
+            problem: "the signature carries no timestamp countersignature at all".to_owned(),
+        },
+    }
+}
+
 /// Result of pinning the installer's identity. Both checks always run so the
 /// report can say *which* pin failed.
 #[derive(Clone, Debug, Serialize)]
@@ -290,6 +513,10 @@ pub struct Verification {
     /// `None` off Windows, where there is no Authenticode to check.
     pub signature: Option<SignatureInfo>,
     pub expected_signer: &'static str,
+    /// The policy's reading of `signature` — the thing that actually decides.
+    pub signature_verdict: SignatureVerdict,
+    /// `signature_verdict.accepted()`, kept as a field so serialised plans stay
+    /// readable at a glance. Never computed independently of the verdict.
     pub signature_ok: bool,
     /// Set when the file could not even be read.
     pub read_error: Option<String>,
@@ -317,43 +544,20 @@ impl Verification {
             });
         }
         if !self.signature_ok {
-            out.push(match &self.signature {
-                Some(sig) => match &sig.signer {
-                    // Called out by name because it is the *expected* state of
-                    // any correctly timestamped binary once its signing
-                    // certificate ages out, and because it is the same word
-                    // `ksx doctor` uses for the cross-signed kernel driver this
-                    // whole rewrite exists to escape. Telling the two apart is
-                    // the user's first question, so answer it here.
-                    Some(signer) if sig.status == SignatureStatus::ValidExpiredCert => format!(
-                        "Authenticode chains correctly and the signer is '{signer}', but the \
-                         signing certificate expired{}. ksx requires a currently-valid \
-                         certificate for anything it runs elevated, so this bundle is refused. \
-                         This is NOT tampering — see docs/DRIVERS.md ('expired signing \
-                         certificate') for what to ship instead.",
-                        match &sig.not_after_utc {
-                            Some(when) => format!(" on {when}"),
-                            None => String::new(),
-                        }
-                    ),
-                    Some(signer) if sig.status != SignatureStatus::Valid => format!(
-                        "Authenticode is {:?} (signer '{signer}'); a driver installer must \
-                         verify as Valid",
-                        sig.status
-                    ),
-                    Some(signer) => format!(
-                        "Authenticode is valid but the signer is '{signer}', not '{}'",
-                        self.expected_signer
-                    ),
-                    None => format!(
-                        "Authenticode is {:?} and no signer could be read",
-                        sig.status
-                    ),
-                },
-                None => "Authenticode could not be checked on this platform".to_owned(),
-            });
+            out.push(self.signature_verdict.explain());
         }
         out
+    }
+
+    /// The one-line signature note shown even when the file is accepted — so
+    /// "ksx ran an installer whose certificate expired last year" is something
+    /// the user was told, not something they find out later.
+    pub fn signature_note(&self) -> Option<String> {
+        matches!(
+            self.signature_verdict,
+            SignatureVerdict::ExpiredTimestampVerified { .. }
+        )
+        .then(|| self.signature_verdict.explain())
     }
 }
 
@@ -373,13 +577,7 @@ pub fn verify_with(
     let sha256_ok = sha
         .as_deref()
         .is_some_and(|got| got.eq_ignore_ascii_case(EXPECTED_SHA256));
-    let signature_ok = signature.as_ref().is_some_and(|sig| {
-        sig.status == SignatureStatus::Valid
-            && sig
-                .signer
-                .as_deref()
-                .is_some_and(|s| s.contains(EXPECTED_SIGNER))
-    });
+    let signature_verdict = judge_signature(signature.as_ref());
     Verification {
         path: path.to_path_buf(),
         sha256: sha,
@@ -387,7 +585,8 @@ pub fn verify_with(
         sha256_ok,
         signature,
         expected_signer: EXPECTED_SIGNER,
-        signature_ok,
+        signature_ok: signature_verdict.accepted(),
+        signature_verdict,
         read_error,
     }
 }
@@ -624,17 +823,61 @@ impl InstallPlan {
                 );
                 let _ = writeln!(
                     out,
-                    "  authenticode  {} {}",
+                    "  authenticode  {} {}, signer {}",
                     if v.signature_ok { "[OK]  " } else { "[FAIL]" },
-                    match &v.signature {
-                        Some(sig) => format!(
-                            "{:?}, signer {}",
-                            sig.status,
-                            sig.signer.as_deref().unwrap_or("<unknown>")
-                        ),
-                        None => "not checked (non-Windows)".to_owned(),
-                    }
+                    v.signature_verdict.code(),
+                    v.signature
+                        .as_ref()
+                        .and_then(|s| s.signer.as_deref())
+                        .unwrap_or("<unknown>")
                 );
+                // The certificate window and the timestamp are printed for every
+                // signed file, passing or failing. They are the evidence behind
+                // the verdict on the line above, and a verdict whose evidence is
+                // hidden is a verdict the user has to take on faith.
+                if let Some(sig) = &v.signature {
+                    if sig.not_after_utc.is_some() {
+                        // No `[OK]`/`[FAIL]` marker: a validity window is
+                        // evidence, not a verdict. It is indented past the
+                        // marker column so its text still lines up with the
+                        // lines above and below it.
+                        let _ = writeln!(
+                            out,
+                            "  certificate          valid {} .. {}{}",
+                            sig.not_before_utc.as_deref().unwrap_or("?"),
+                            sig.not_after_utc.as_deref().unwrap_or("?"),
+                            match sig.cert_expired {
+                                Some(true) => "  (EXPIRED)",
+                                Some(false) => "  (current)",
+                                None => "",
+                            }
+                        );
+                    }
+                    match &sig.timestamp {
+                        Some(ts) => {
+                            let _ = writeln!(
+                                out,
+                                "  timestamp     {} signed {}{}",
+                                if ts.is_verified() { "[OK]  " } else { "[FAIL]" },
+                                ts.signed_at_utc.as_deref().unwrap_or("<unreadable>"),
+                                match &ts.authority {
+                                    Some(who) => format!(", countersigned by {who}"),
+                                    None => String::new(),
+                                }
+                            );
+                            if let Some(problem) = ts.problem() {
+                                let _ = writeln!(out, "                       {problem}");
+                            }
+                        }
+                        None if sig.cert_expired == Some(true) => {
+                            let _ = writeln!(out, "  timestamp     [FAIL] none present");
+                        }
+                        None => {}
+                    }
+                }
+                if let Some(note) = v.signature_note() {
+                    let _ = writeln!(out, "\n  note: {note}");
+                }
             }
         }
 
@@ -705,6 +948,22 @@ impl InstallPlan {
                 "sha256": self.verification.as_ref().and_then(|v| v.sha256.clone()),
                 "sha256_ok": self.verification.as_ref().is_some_and(|v| v.sha256_ok),
                 "signature_ok": self.verification.as_ref().is_some_and(|v| v.signature_ok),
+                // The signature policy's own state, with a stable code:
+                // "valid" | "expired-timestamp-verified" |
+                // "expired-no-valid-timestamp" | "wrong-signer" |
+                // "chain-not-trusted" | "unsigned" | "not-checked".
+                "signature_code": self.verification.as_ref()
+                    .map(|v| v.signature_verdict.code()),
+                "signature_verdict": self.verification.as_ref()
+                    .map(|v| serde_json::json!({
+                        "accepted": v.signature_verdict.accepted(),
+                        "explanation": v.signature_verdict.explain(),
+                        "detail": v.signature_verdict,
+                    })),
+                // The raw evidence, so a script can re-derive the verdict rather
+                // than trust it: chain status, certificate window, timestamp and
+                // every individual check that was run on it.
+                "signature": self.verification.as_ref().and_then(|v| v.signature.clone()),
                 "signer": self.verification.as_ref()
                     .and_then(|v| v.signature.as_ref())
                     .and_then(|s| s.signer.clone()),
@@ -801,13 +1060,45 @@ pub enum InstallError {
 mod tests {
     use super::*;
 
+    use crate::report::TimestampInfo;
+
+    const NEFARIUS: &str = "Nefarius Software Solutions e.U.";
+
     fn sig(status: SignatureStatus, signer: &str) -> SignatureInfo {
         SignatureInfo {
             status,
             signer: Some(signer.to_owned()),
-            issuer: None,
-            not_after_utc: None,
             cert_expired: Some(false),
+            ..SignatureInfo::unknown()
+        }
+    }
+
+    /// The live bundle's shape: chain verifies, signer is Nefarius, certificate
+    /// ran out in Feb 2025, RFC-3161 countersignature from Nov 2023.
+    /// Ticks/dates mirror what wintrust reports for
+    /// `ViGEmBus_1.22.0_x64_x86_arm64.exe` on this machine.
+    fn expired_cert_sig(timestamp: Option<TimestampInfo>) -> SignatureInfo {
+        SignatureInfo {
+            status: SignatureStatus::ValidExpiredCert,
+            signer: Some(NEFARIUS.to_owned()),
+            issuer: Some("DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1".to_owned()),
+            not_before_utc: Some("2023-03-13T00:00:00Z".into()),
+            not_after_utc: Some("2025-02-17T00:59:59Z".into()),
+            cert_expired: Some(true),
+            timestamp,
+        }
+    }
+
+    /// A countersignature that passes every check.
+    fn good_timestamp() -> TimestampInfo {
+        TimestampInfo {
+            signed_at_utc: Some("2023-11-02T15:12:03Z".into()),
+            signed_at_ticks: 133_434_163_230_000_000,
+            authority: Some("DigiCert Timestamp 2023".into()),
+            is_timestamp_signer: true,
+            chain_ok: true,
+            within_signing_cert_validity: true,
+            within_timestamp_cert_validity: true,
         }
     }
 
@@ -898,23 +1189,61 @@ mod tests {
         );
     }
 
-    /// The refusal a real user hits first must say what it actually means.
-    /// `ValidExpiredCert` on a correctly timestamped binary is not tampering,
-    /// and a message that implies otherwise sends people looking for an
-    /// attacker instead of a newer release.
+    // -----------------------------------------------------------------------
+    // The signature policy: three accepted/refused states, one code each.
+    // -----------------------------------------------------------------------
+
+    /// **The decision this policy exists for.** An expired certificate plus a
+    /// timestamp that survives every check is accepted, because the timestamp
+    /// proves the file was signed while the certificate was live — which is
+    /// exactly what Windows concludes and the entire purpose of timestamping.
     #[test]
-    fn an_expired_signing_certificate_is_explained_not_just_refused() {
-        let mut signature = sig(
-            SignatureStatus::ValidExpiredCert,
-            "Nefarius Software Solutions e.U.",
+    fn an_expired_certificate_with_a_verified_timestamp_is_accepted() {
+        let v = verify_with(
+            Path::new("x"),
+            Some(expired_cert_sig(Some(good_timestamp()))),
+            Ok(good_digest()),
         );
-        signature.cert_expired = Some(true);
-        signature.not_after_utc = Some("2025-04-13T23:59:59Z".into());
-        let v = verify_with(Path::new("x"), Some(signature), Ok(good_digest()));
+        assert!(v.is_trusted(), "{:?}", v.signature_verdict);
+        assert_eq!(v.signature_verdict.code(), "expired-timestamp-verified");
+        assert!(v.failures().is_empty(), "{:?}", v.failures());
+
+        // ...and it says so out loud rather than quietly waving it through.
+        let note = v.signature_note().expect("an accepted expiry is announced");
+        assert!(note.contains("2023-11-02T15:12:03Z"), "{note}");
+        assert!(note.contains("2025-02-17T00:59:59Z"), "{note}");
+        assert!(note.contains("DigiCert Timestamp 2023"), "{note}");
+
+        let p = plan(
+            located(),
+            Some(v),
+            InstalledState::default(),
+            Some(true),
+            &args(),
+            false,
+        );
+        assert_eq!(p.action, Action::Ready);
+    }
+
+    /// The other half of the same decision: **absent** a timestamp, an expired
+    /// certificate is still refused. The relaxation is "a proof was presented
+    /// and checked", never "expiry is fine".
+    #[test]
+    fn an_expired_certificate_without_a_timestamp_is_refused() {
+        let v = verify_with(
+            Path::new("x"),
+            Some(expired_cert_sig(None)),
+            Ok(good_digest()),
+        );
         assert!(!v.is_trusted());
+        assert_eq!(v.signature_verdict.code(), "expired-no-valid-timestamp");
+        assert!(v.signature_note().is_none());
         let failure = v.failures().join(" ");
-        assert!(failure.contains("2025-04-13"), "{failure}");
-        assert!(failure.contains("NOT tampering"), "{failure}");
+        assert!(
+            failure.contains("no timestamp countersignature"),
+            "{failure}"
+        );
+        assert!(failure.contains("2025-02-17"), "{failure}");
         assert!(failure.contains("docs/DRIVERS.md"), "{failure}");
         assert!(
             !failure.contains("SHA-256"),
@@ -922,24 +1251,276 @@ mod tests {
         );
     }
 
-    /// A cross-signed-style "valid chain, expired cert" is exactly the state
-    /// this project exists to escape — it must not pass for a *new* install.
+    /// **The check is a check, not a courtesy.** Each way a countersignature
+    /// can fail to prove what it claims is refused on its own, and the refusal
+    /// names that specific failure — otherwise "we verify the timestamp" is a
+    /// sentence in a doc rather than a property of the code.
     #[test]
-    fn expired_or_untrusted_signatures_are_refused() {
+    fn every_broken_timestamp_is_refused_and_named() {
+        let cases: [(TimestampInfo, &str); 5] = [
+            (
+                // Some other unauthenticated countersignature wearing the hat.
+                TimestampInfo {
+                    is_timestamp_signer: false,
+                    ..good_timestamp()
+                },
+                "not a timestamp countersignature",
+            ),
+            (
+                // A timestamping authority Windows does not trust.
+                TimestampInfo {
+                    chain_ok: false,
+                    ..good_timestamp()
+                },
+                "own certificate chain did not verify",
+            ),
+            (
+                // Present, well-formed, and says nothing.
+                TimestampInfo {
+                    signed_at_utc: None,
+                    signed_at_ticks: 0,
+                    ..good_timestamp()
+                },
+                "no readable signing time",
+            ),
+            (
+                // A TSA vouching for an instant outside its own certificate's
+                // life is vouching for nothing.
+                TimestampInfo {
+                    within_timestamp_cert_validity: false,
+                    ..good_timestamp()
+                },
+                "was not valid at the instant",
+            ),
+            (
+                // The one that matters most: a real, trusted timestamp whose
+                // instant is simply not inside the signing certificate's
+                // window. Trusting this would be trusting an unchecked claim.
+                TimestampInfo {
+                    within_signing_cert_validity: false,
+                    ..good_timestamp()
+                },
+                "outside the signing certificate's validity window",
+            ),
+        ];
+        for (timestamp, expected) in cases {
+            let v = verify_with(
+                Path::new("x"),
+                Some(expired_cert_sig(Some(timestamp.clone()))),
+                Ok(good_digest()),
+            );
+            assert!(!v.is_trusted(), "{timestamp:?} must not be trusted");
+            assert_eq!(
+                v.signature_verdict.code(),
+                "expired-no-valid-timestamp",
+                "{timestamp:?}"
+            );
+            let failure = v.failures().join(" ");
+            assert!(failure.contains(expected), "{failure}");
+        }
+    }
+
+    /// A timestamp cannot rescue a signature Windows itself refused. If
+    /// `WinVerifyTrust` returned `CERT_E_EXPIRED` it already looked for an
+    /// acceptable countersignature and did not find one; accepting on our own
+    /// evidence there would make ksx *more* permissive than the platform whose
+    /// behaviour it is matching.
+    #[test]
+    fn a_timestamp_cannot_override_win_verify_trusts_own_expiry_refusal() {
+        let mut signature = expired_cert_sig(Some(good_timestamp()));
+        signature.status = SignatureStatus::Expired;
+        let v = verify_with(Path::new("x"), Some(signature), Ok(good_digest()));
+        assert!(!v.is_trusted());
+        assert_eq!(v.signature_verdict.code(), "expired-no-valid-timestamp");
+        assert!(v.failures().join(" ").contains("CERT_E_EXPIRED"));
+    }
+
+    /// Everything the relaxation does **not** touch. A broken chain, a stranger,
+    /// or no signature at all is refused whatever timestamp it carries.
+    #[test]
+    fn a_verified_timestamp_never_rescues_anything_else() {
         for status in [
-            SignatureStatus::ValidExpiredCert,
-            SignatureStatus::Expired,
             SignatureStatus::Untrusted,
             SignatureStatus::Unsigned,
             SignatureStatus::Unknown,
         ] {
-            let v = verify_with(
-                Path::new("x"),
-                Some(sig(status, "Nefarius Software Solutions e.U.")),
-                Ok(good_digest()),
-            );
+            let mut signature = expired_cert_sig(Some(good_timestamp()));
+            signature.status = status;
+            let v = verify_with(Path::new("x"), Some(signature), Ok(good_digest()));
             assert!(!v.is_trusted(), "{status:?} must not be trusted");
+            assert!(
+                matches!(
+                    v.signature_verdict,
+                    SignatureVerdict::ChainNotTrusted { .. } | SignatureVerdict::Unsigned
+                ),
+                "{status:?} → {:?}",
+                v.signature_verdict
+            );
         }
+
+        // A stranger's binary, perfectly timestamped, right bytes claimed.
+        let mut impostor = expired_cert_sig(Some(good_timestamp()));
+        impostor.signer = Some("Totally Legit Drivers Ltd".into());
+        let v = verify_with(Path::new("x"), Some(impostor), Ok(good_digest()));
+        assert!(!v.is_trusted());
+        assert_eq!(v.signature_verdict.code(), "wrong-signer");
+
+        // ...and the timestamp never touches the hash pin.
+        let v = verify_with(
+            Path::new("x"),
+            Some(expired_cert_sig(Some(good_timestamp()))),
+            Ok([0u8; 32]),
+        );
+        assert!(v.signature_ok, "the signature really is fine here");
+        assert!(!v.is_trusted(), "but the bytes are not the bytes we ship");
+        assert!(v.failures().iter().any(|f| f.contains("SHA-256")));
+    }
+
+    /// A certificate whose window could not be read is not a valid one. The
+    /// unknown case falls to the timestamp path and is refused there, rather
+    /// than being optimistically treated as current.
+    #[test]
+    fn an_unreadable_certificate_window_fails_closed() {
+        let signature = SignatureInfo {
+            status: SignatureStatus::Valid,
+            signer: Some(NEFARIUS.to_owned()),
+            cert_expired: None,
+            ..SignatureInfo::unknown()
+        };
+        let v = verify_with(Path::new("x"), Some(signature), Ok(good_digest()));
+        assert!(!v.is_trusted());
+        assert_eq!(v.signature_verdict.code(), "expired-no-valid-timestamp");
+    }
+
+    /// The three states a user can hit with a genuine Nefarius bundle must be
+    /// three distinguishable codes in `--json`, never one boolean.
+    #[test]
+    fn the_three_certificate_states_have_distinct_json_codes() {
+        let states = [
+            (
+                verify_with(
+                    Path::new("x"),
+                    Some(sig(SignatureStatus::Valid, NEFARIUS)),
+                    Ok(good_digest()),
+                ),
+                "valid",
+                true,
+            ),
+            (
+                verify_with(
+                    Path::new("x"),
+                    Some(expired_cert_sig(Some(good_timestamp()))),
+                    Ok(good_digest()),
+                ),
+                "expired-timestamp-verified",
+                true,
+            ),
+            (
+                verify_with(
+                    Path::new("x"),
+                    Some(expired_cert_sig(None)),
+                    Ok(good_digest()),
+                ),
+                "expired-no-valid-timestamp",
+                false,
+            ),
+        ];
+        let mut seen: Vec<&str> = Vec::new();
+        for (verification, code, accepted) in states {
+            assert_eq!(verification.signature_ok, accepted, "{code}");
+            let p = plan(
+                located(),
+                Some(verification),
+                InstalledState::default(),
+                Some(true),
+                &args(),
+                false,
+            );
+            let json = p.to_json();
+            assert_eq!(
+                json.pointer("/installer/signature_code"),
+                Some(&serde_json::json!(code))
+            );
+            assert_eq!(
+                json.pointer("/installer/signature_verdict/accepted"),
+                Some(&serde_json::json!(accepted)),
+                "{code}"
+            );
+            assert_eq!(
+                json.pointer("/installer/signature_verdict/detail/code"),
+                Some(&serde_json::json!(code)),
+                "the tagged detail must agree with the flat code"
+            );
+            assert_eq!(
+                json.pointer("/action").unwrap().as_str().unwrap() == "ready",
+                accepted
+            );
+            seen.push(code);
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            3,
+            "the three states must not collapse: {seen:?}"
+        );
+    }
+
+    /// The accepted-with-timestamp case prints its evidence: a user must be
+    /// able to see *which* expired certificate was accepted and *what* dated it.
+    #[test]
+    fn the_human_report_shows_the_certificate_window_and_the_timestamp() {
+        let p = plan(
+            located(),
+            Some(verify_with(
+                Path::new("drivers/x.exe"),
+                Some(expired_cert_sig(Some(good_timestamp()))),
+                Ok(good_digest()),
+            )),
+            InstalledState::default(),
+            Some(true),
+            &args(),
+            false,
+        );
+        let text = p.render_human(true);
+        assert!(text.contains("authenticode  [OK]"), "{text}");
+        assert!(text.contains("expired-timestamp-verified"), "{text}");
+        assert!(text.contains("(EXPIRED)"), "{text}");
+        assert!(text.contains("2023-03-13T00:00:00Z"), "{text}");
+        assert!(text.contains("timestamp     [OK]"), "{text}");
+        assert!(text.contains("2023-11-02T15:12:03Z"), "{text}");
+        assert!(text.contains("DigiCert Timestamp 2023"), "{text}");
+        assert!(text.contains("note:"), "{text}");
+
+        // Four evidence lines, one text column. Hand-padded label widths drift
+        // the moment somebody adds a fifth, and a misaligned report is the
+        // first thing a reader stops trusting.
+        let column = |needle: &str| {
+            text.find(needle)
+                .map(|at| at - text[..at].rfind('\n').unwrap())
+        };
+        assert_eq!(column("89220A"), column("expired-timestamp-verified"));
+        assert_eq!(column("89220A"), column("valid 2023-03-13T00:00:00Z"));
+        assert_eq!(column("89220A"), column("signed 2023-11-02T15:12:03Z"));
+
+        // ...and the refusing case shows the missing evidence just as plainly.
+        let refused = plan(
+            located(),
+            Some(verify_with(
+                Path::new("drivers/x.exe"),
+                Some(expired_cert_sig(None)),
+                Ok(good_digest()),
+            )),
+            InstalledState::default(),
+            Some(true),
+            &args(),
+            false,
+        );
+        let text = refused.render_human(true);
+        assert!(text.contains("authenticode  [FAIL]"), "{text}");
+        assert!(text.contains("expired-no-valid-timestamp"), "{text}");
+        assert!(text.contains("timestamp     [FAIL] none present"), "{text}");
+        assert!(!text.contains("note:"), "{text}");
     }
 
     #[test]

@@ -98,9 +98,14 @@ pub struct SignatureInfo {
     pub status: SignatureStatus,
     pub signer: Option<String>,
     pub issuer: Option<String>,
+    /// Signing certificate `NotBefore`, RFC 3339 UTC.
+    pub not_before_utc: Option<String>,
     /// Signing certificate `NotAfter`, RFC 3339 UTC.
     pub not_after_utc: Option<String>,
     pub cert_expired: Option<bool>,
+    /// The countersignature that says *when* this file was signed, and whether
+    /// that claim survives checking. `None` when the signature carries none.
+    pub timestamp: Option<TimestampInfo>,
 }
 
 impl SignatureInfo {
@@ -109,9 +114,104 @@ impl SignatureInfo {
             status: SignatureStatus::Unknown,
             signer: None,
             issuer: None,
+            not_before_utc: None,
             not_after_utc: None,
             cert_expired: None,
+            timestamp: None,
         }
+    }
+}
+
+/// A timestamp countersignature, **and the result of checking it**.
+///
+/// A countersignature is a claim ("this file was signed at T"), not a fact. It
+/// is worth something only once four separate things have been confirmed, and
+/// each one is a field here rather than an assumption:
+///
+/// 1. it really is a *timestamp* countersignature — `SGNR_TYPE_TIMESTAMP`, the
+///    class wintrust puts both RFC 3161 and legacy PKCS#9 countersigners in —
+///    and not some other unauthenticated attribute ([`is_timestamp_signer`]);
+/// 2. its own certificate chain verified, i.e. the timestamping authority is
+///    someone Windows trusts ([`chain_ok`]);
+/// 3. the authority's certificate was itself valid at the instant it claims to
+///    have stamped ([`within_timestamp_cert_validity`]) — a TSA vouching for a
+///    moment outside its own life is vouching for nothing;
+/// 4. and the stamped instant falls inside the *signing* certificate's validity
+///    window ([`within_signing_cert_validity`]) — the actual question.
+///
+/// [`TimestampInfo::problem`] is the single place those are turned into a
+/// verdict, so "verified" can never drift from "checked".
+///
+/// [`is_timestamp_signer`]: Self::is_timestamp_signer
+/// [`chain_ok`]: Self::chain_ok
+/// [`within_timestamp_cert_validity`]: Self::within_timestamp_cert_validity
+/// [`within_signing_cert_validity`]: Self::within_signing_cert_validity
+#[derive(Debug, Clone, Serialize)]
+pub struct TimestampInfo {
+    /// The signing time the countersignature asserts, RFC 3339 UTC.
+    pub signed_at_utc: Option<String>,
+    /// The same instant in FILETIME ticks — 0 when it could not be read.
+    pub signed_at_ticks: u64,
+    /// Timestamping authority: the leaf CN of the countersignature's own chain.
+    pub authority: Option<String>,
+    /// wintrust classified this countersigner as `SGNR_TYPE_TIMESTAMP`.
+    pub is_timestamp_signer: bool,
+    /// The countersignature verified on its own terms (`dwError == 0`) and came
+    /// with a certificate chain.
+    pub chain_ok: bool,
+    /// `signed_at` lies inside the **signing** certificate's validity window.
+    pub within_signing_cert_validity: bool,
+    /// `signed_at` lies inside the **timestamping** certificate's own window.
+    pub within_timestamp_cert_validity: bool,
+}
+
+impl TimestampInfo {
+    /// The first requirement this timestamp fails, or `None` if it proves what
+    /// it claims. Ordered cheapest-and-most-fundamental first so the message a
+    /// user sees names the real problem rather than a downstream symptom.
+    ///
+    /// Note what is deliberately *not* checked: "the signing time is not in the
+    /// future". A timestamp is only ever consulted for a certificate that has
+    /// already expired, so `signed_at <= NotAfter < now` follows from
+    /// [`within_signing_cert_validity`](Self::within_signing_cert_validity) —
+    /// adding a second, clock-sensitive comparison would buy nothing and could
+    /// fail on a machine with a skewed RTC.
+    pub fn problem(&self) -> Option<&'static str> {
+        if !self.is_timestamp_signer {
+            return Some(
+                "the countersignature is not a timestamp countersignature \
+                 (wintrust did not classify it as SGNR_TYPE_TIMESTAMP)",
+            );
+        }
+        if !self.chain_ok {
+            return Some(
+                "the timestamp countersignature's own certificate chain did not verify, \
+                 so the timestamping authority is not one Windows trusts",
+            );
+        }
+        if self.signed_at_ticks == 0 || self.signed_at_utc.is_none() {
+            return Some("the timestamp carries no readable signing time");
+        }
+        if !self.within_timestamp_cert_validity {
+            return Some(
+                "the timestamping authority's own certificate was not valid at the instant \
+                 it claims to have countersigned",
+            );
+        }
+        if !self.within_signing_cert_validity {
+            return Some(
+                "the timestamp's signing time falls outside the signing certificate's \
+                 validity window, so it does not show the file was signed while the \
+                 certificate was live",
+            );
+        }
+        None
+    }
+
+    /// All four checks passed: this timestamp really does prove the file was
+    /// signed while its certificate was valid.
+    pub fn is_verified(&self) -> bool {
+        self.problem().is_none()
     }
 }
 

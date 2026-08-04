@@ -199,9 +199,8 @@ mod tests {
             signature: Some(SignatureInfo {
                 status: sig_status,
                 signer: Some("Test Signer".into()),
-                issuer: None,
-                not_after_utc: None,
                 cert_expired: Some(cert_expired),
+                ..SignatureInfo::unknown()
             }),
         }
     }

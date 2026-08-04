@@ -138,18 +138,118 @@ pub struct LastSession {
     pub exit_code: i32,
 }
 
+impl LastSession {
+    /// The one health line to show for a session that is **over**.
+    fn note(&self) -> Option<String> {
+        if self.reboot_required {
+            Some(REBOOT_NOTE.to_owned())
+        } else if self.watchdog_tripped {
+            Some("[!] capture watchdog tripped last session".to_owned())
+        } else if self.dropped_events > 0 {
+            Some(format!(
+                "[!] {} event(s) dropped last session",
+                self.dropped_events
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// Slot exhaustion phrased identically whether it is happening now or happened
+/// then: it is a fact about the machine either way, and it is the message a user
+/// is most likely to be searching for.
+const REBOOT_NOTE: &str = "[!] REBOOT REQUIRED (Interception slot exhaustion)";
+
+/// Capture health of the session running **right now**.
+///
+/// [`LastSession`] is written by [`reap`], which by definition runs after the
+/// session is over. That left the worst failures invisible for exactly as long
+/// as they mattered: a REBOOT REQUIRED or a watchdog trip halfway through a
+/// two-hour game showed up nowhere until the player quit. This is the same
+/// three facts, sampled *while* the session runs.
+///
+/// Plain data, deliberately: [`DaemonState::tooltip`] stays a pure function of
+/// state, and the tray keeps reading one `Mutex` for the length of a `clone()`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveHealth {
+    pub reboot_required: bool,
+    pub watchdog_tripped: bool,
+    pub dropped_events: u64,
+}
+
+impl LiveHealth {
+    /// The single worst thing to say about the running session, worst first.
+    /// `None` means there is nothing wrong, which is the common case and must
+    /// stay silent — a tooltip that always has a `[!]` in it trains people to
+    /// ignore the `[!]`.
+    fn note(&self) -> Option<String> {
+        if self.reboot_required {
+            Some(REBOOT_NOTE.to_owned())
+        } else if self.watchdog_tripped {
+            Some("[!] capture watchdog TRIPPED — passthrough forced".to_owned())
+        } else if self.dropped_events > 0 {
+            Some(format!("[!] {} event(s) dropped", self.dropped_events))
+        } else {
+            None
+        }
+    }
+}
+
+/// Where a running session publishes the health the control loop polls.
+///
+/// One `Mutex<Option<HealthView>>`, written **once** per session by the session
+/// thread the moment its capture backend exists, and read by the control loop
+/// on the idle tick it already wakes on. The capture thread is not involved and
+/// gains nothing: it goes on setting the lock-free atomics inside the
+/// [`ksx_capture::HealthHandle`] this view reads, exactly as it did before. The
+/// tray is one further step removed — it never touches this at all, only the
+/// `DaemonState` snapshot the control loop refreshes from it.
+///
+/// A [`ksx_capture::HealthView`] rather than the handle, because the daemon's
+/// WinUSB claim keeps one handle alive across every session: only a view with a
+/// baseline taken at session start can answer "is *this* session in trouble"
+/// (see that type's docs).
+#[derive(Clone, Debug, Default)]
+pub struct HealthSlot(Arc<Mutex<Option<ksx_capture::HealthView>>>);
+
+impl HealthSlot {
+    /// Publish this session's view. Called by the session thread once its
+    /// capture backend is up.
+    pub fn publish(&self, view: ksx_capture::HealthView) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(view);
+        }
+    }
+
+    /// Sample it. `None` until the session's backend exists — during which time
+    /// there is genuinely nothing to report, not "nothing wrong".
+    pub fn poll(&self) -> Option<LiveHealth> {
+        let slot = self.0.lock().ok()?;
+        let snapshot = slot.as_ref()?.snapshot();
+        Some(LiveHealth {
+            reboot_required: snapshot.reboot_required,
+            watchdog_tripped: snapshot.watchdog_tripped,
+            dropped_events: snapshot.dropped_events,
+        })
+    }
+}
+
 /// The state the tray polls. Small, cloneable, no borrows of anything live.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DaemonState {
     pub run: RunState,
     pub game: Option<String>,
     pub last: Option<LastSession>,
+    /// Refreshed by the control loop while a session runs; cleared when it is
+    /// reaped, at which point [`Self::last`] is the truth again.
+    pub live: Option<LiveHealth>,
 }
 
 impl DaemonState {
     /// The tray tooltip. Windows truncates it at 128 UTF-16 units, so the most
-    /// important thing goes first and the health notes are appended only if
-    /// there is something to say.
+    /// important thing goes first and the health note is appended only if there
+    /// is something to say.
     pub fn tooltip(&self) -> String {
         let mut text = match &self.run {
             RunState::Stopped => "ksx — stopped".to_owned(),
@@ -161,16 +261,27 @@ impl DaemonState {
         if let Some(game) = &self.game {
             text.push_str(&format!("\ngame: {game}"));
         }
-        if let Some(last) = &self.last {
-            if last.reboot_required {
-                text.push_str("\n[!] REBOOT REQUIRED (Interception slot exhaustion)");
-            } else if last.watchdog_tripped {
-                text.push_str("\n[!] capture watchdog tripped last session");
-            } else if last.dropped_events > 0 {
-                text.push_str(&format!("\n[!] {} event(s) dropped", last.dropped_events));
-            }
+        if let Some(note) = self.health_note() {
+            text.push('\n');
+            text.push_str(&note);
         }
         truncate_utf16(&text, 127)
+    }
+
+    /// The one health line the tooltip carries.
+    ///
+    /// **The running session wins.** What is wrong now outranks what was wrong
+    /// then, and a tooltip is 128 UTF-16 units — there is room for one line, so
+    /// it has to be the actionable one. A healthy running session falls through
+    /// to the last finished one rather than hiding it: `reboot_required` in
+    /// particular describes the *machine* and stays true until Windows
+    /// restarts, so forgetting it because a fresh session looks fine would be
+    /// the same lie in the other direction.
+    fn health_note(&self) -> Option<String> {
+        self.live
+            .as_ref()
+            .and_then(LiveHealth::note)
+            .or_else(|| self.last.as_ref().and_then(LastSession::note))
     }
 
     /// Menu item labels + whether each is enabled right now.
@@ -227,6 +338,19 @@ pub trait SessionRunner: Send {
     /// Pads the plan will ask for — reported while starting, before any driver
     /// call, so the tooltip is useful during the slow part.
     fn slots(&self) -> usize;
+
+    /// Where this session will publish its capture health.
+    ///
+    /// Taken by [`start`] **before** the runner is moved onto its own thread,
+    /// so the control loop holds the slot for the whole session and the runner
+    /// fills it in as soon as its backend exists.
+    ///
+    /// Defaulted to a slot nothing ever fills: a runner with no capture backend
+    /// has no health to report, and the tooltip should then say nothing rather
+    /// than invent a clean bill of it.
+    fn health_slot(&self) -> HealthSlot {
+        HealthSlot::default()
+    }
 }
 
 /// Makes a fresh runner per session, re-reading configuration each time. That
@@ -328,6 +452,16 @@ pub fn control_loop_with(
             }
         }
 
+        // Live capture health, sampled on the tick this loop already wakes on.
+        // Nothing is added to the hot path: the capture thread publishes into
+        // lock-free atomics exactly as before, and this reads them. Without it
+        // a REBOOT REQUIRED or a watchdog trip *during* a two-hour game is
+        // visible nowhere until the player quits — which is the moment it stops
+        // being useful.
+        if let Some(live) = &mut session {
+            live.refresh_health(&state);
+        }
+
         match commands.recv_timeout(Duration::from_millis(200)) {
             Ok(DaemonCommand::Start) => {
                 if session.is_some() {
@@ -423,6 +557,37 @@ struct LiveSession {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<anyhow::Result<SessionSummary>>>,
     started: Instant,
+    /// Filled in by the session thread once its capture backend exists.
+    health: HealthSlot,
+    /// The last sample pushed into [`DaemonState::live`], so an unchanged
+    /// reading costs no lock and a *newly* appeared problem is logged once
+    /// rather than four times a second.
+    reported: Option<LiveHealth>,
+}
+
+impl LiveSession {
+    /// Sample the session's health into the shared state.
+    fn refresh_health(&mut self, state: &SharedState) {
+        let Some(fresh) = self.health.poll() else {
+            return;
+        };
+        if self.reported == Some(fresh) {
+            return;
+        }
+        // A problem that has just appeared also goes to the log — the tooltip
+        // is 128 characters that somebody has to be looking at, and this is
+        // precisely the event a cabinet's log file exists to have caught.
+        let note = fresh.note();
+        if let Some(note) = &note {
+            if self.reported.and_then(|h| h.note()).as_ref() != Some(note) {
+                tracing::warn!("capture health: {note}");
+            }
+        }
+        self.reported = Some(fresh);
+        if let Ok(mut s) = state.lock() {
+            s.live = Some(fresh);
+        }
+    }
 }
 
 /// Last-resort teardown: if the control thread unwinds, this local is dropped
@@ -457,6 +622,9 @@ fn start(
         }
     };
     let slots = runner.slots();
+    // Grabbed before the runner moves onto its own thread; the runner publishes
+    // into it as soon as its capture backend is up.
+    let health = runner.health_slot();
     let stop = Arc::new(AtomicBool::new(false));
     let handle = std::thread::Builder::new()
         .name("ksx-session".into())
@@ -477,6 +645,8 @@ fn start(
         stop,
         handle: Some(handle),
         started: Instant::now(),
+        health,
+        reported: None,
     })
 }
 
@@ -524,6 +694,12 @@ fn reap(mut live: LiveSession, state: &SharedState, out: &mut dyn Write) {
             let _ = writeln!(out, "[FAIL] {message}");
             set_run(state, RunState::Failed { message });
         }
+    }
+    // Nothing is running any more, so there is no live health: the verdict this
+    // reap just recorded in `last` is the truth from here on. Leaving a stale
+    // live reading would pin the tooltip to a session that no longer exists.
+    if let Ok(mut s) = state.lock() {
+        s.live = None;
     }
 }
 
@@ -623,7 +799,13 @@ pub fn run(
         let tray = tray::create(tx.clone(), state.clone());
         let mode = crate::console::mode(headless, console);
         if tray.is_some() && mode.detaches() {
-            println!("{}", crate::console::DETACH_NOTICE);
+            // The notice names the log file, which is the whole answer to
+            // "where did my daemon go" — and says so *here*, on the last
+            // console output this process will ever produce.
+            println!(
+                "{}",
+                crate::console::detach_notice(crate::logging::active_path())
+            );
             crate::console::detach();
         }
 
@@ -765,9 +947,17 @@ mod tests {
         /// End on its own after this long, ignoring `stop`.
         self_ends_after: Option<Duration>,
         trace: Option<Trace>,
+        /// Stands in for the capture backend's health, so a test can trip a
+        /// flag from outside while the session runs.
+        health: Option<ksx_capture::HealthHandle>,
+        slot: HealthSlot,
     }
 
     impl SessionRunner for FakeRunner {
+        fn health_slot(&self) -> HealthSlot {
+            self.slot.clone()
+        }
+
         fn run(
             &mut self,
             stop: Arc<AtomicBool>,
@@ -775,6 +965,11 @@ mod tests {
         ) -> anyhow::Result<SessionSummary> {
             if let Some(trace) = &self.trace {
                 note(trace, "session:started");
+            }
+            // Same moment the real runner publishes: once the backend exists.
+            if let Some(health) = &self.health {
+                self.slot
+                    .publish(ksx_capture::HealthView::new(health.clone()));
             }
             self.ran.store(true, Ordering::SeqCst);
             let deadline = self.self_ends_after.map(|d| Instant::now() + d);
@@ -806,6 +1001,7 @@ mod tests {
         fail_with: Option<String>,
         makes: Arc<Mutex<u32>>,
         trace: Option<Trace>,
+        health: Option<ksx_capture::HealthHandle>,
     }
 
     impl Default for FakeFactory {
@@ -822,6 +1018,7 @@ mod tests {
                 fail_with: None,
                 makes: Arc::new(Mutex::new(0)),
                 trace: None,
+                health: None,
             }
         }
     }
@@ -838,6 +1035,8 @@ mod tests {
                 ran: self.ran.clone(),
                 self_ends_after: self.self_ends_after,
                 trace: self.trace.clone(),
+                health: self.health.clone(),
+                slot: HealthSlot::default(),
             }))
         }
 
@@ -1003,6 +1202,7 @@ mod tests {
                 reboot_required: true,
                 ..LastSession::default()
             }),
+            live: None,
         };
         let tip = state.tooltip();
         assert!(tip.contains("running, 4 pad(s)"), "{tip}");
@@ -1016,9 +1216,204 @@ mod tests {
             },
             game: Some("y".repeat(200)),
             last: None,
+            live: None,
         };
         assert!(long.tooltip().encode_utf16().count() <= 127);
         assert!(long.tooltip().ends_with('…'));
+    }
+
+    // -----------------------------------------------------------------
+    // Live health: what is wrong NOW, not what was wrong then
+    // -----------------------------------------------------------------
+
+    /// **The mid-session case, which is the whole point.** `last` is written by
+    /// `reap()`, which by definition runs after a session is over — so a
+    /// REBOOT REQUIRED that happens forty minutes into a two-hour game used to
+    /// be visible nowhere at all until the player quit. Here nothing has ever
+    /// been reaped (`last: None`) and the tooltip must still say it.
+    #[test]
+    fn the_tooltip_reports_the_running_sessions_health_with_nothing_reaped_yet() {
+        let state = DaemonState {
+            run: RunState::Running { slots: 4 },
+            game: Some("Street Fighter".into()),
+            last: None,
+            live: Some(LiveHealth {
+                reboot_required: true,
+                ..LiveHealth::default()
+            }),
+        };
+        let tip = state.tooltip();
+        assert!(tip.contains("running, 4 pad(s)"), "{tip}");
+        assert!(
+            tip.contains("REBOOT REQUIRED"),
+            "a mid-session problem must be in the tooltip while the session runs: {tip}"
+        );
+        assert!(tip.encode_utf16().count() <= 127, "{tip}");
+
+        // ...and the same for the other two, each phrased in the present tense.
+        let watchdog = DaemonState {
+            run: RunState::Running { slots: 2 },
+            live: Some(LiveHealth {
+                watchdog_tripped: true,
+                ..LiveHealth::default()
+            }),
+            ..DaemonState::default()
+        };
+        let tip = watchdog.tooltip();
+        assert!(tip.contains("watchdog TRIPPED"), "{tip}");
+        assert!(
+            !tip.contains("last session"),
+            "this session is not over: {tip}"
+        );
+
+        let dropped = DaemonState {
+            run: RunState::Running { slots: 2 },
+            live: Some(LiveHealth {
+                dropped_events: 12,
+                ..LiveHealth::default()
+            }),
+            ..DaemonState::default()
+        };
+        assert!(dropped.tooltip().contains("12 event(s) dropped"));
+    }
+
+    /// A healthy running session must not erase the previous session's verdict
+    /// — `reboot_required` in particular describes the *machine* and stays true
+    /// until Windows restarts, so "the current session looks fine" is not a
+    /// reason to stop saying it.
+    #[test]
+    fn a_healthy_live_session_falls_back_to_the_last_sessions_verdict() {
+        let state = DaemonState {
+            run: RunState::Running { slots: 4 },
+            game: None,
+            last: Some(LastSession {
+                reboot_required: true,
+                ..LastSession::default()
+            }),
+            live: Some(LiveHealth::default()),
+        };
+        assert!(state.tooltip().contains("REBOOT REQUIRED"), "{state:?}");
+    }
+
+    /// ...but a live problem outranks a stale one: a 128-unit tooltip has room
+    /// for exactly one line, and it has to be the actionable one.
+    #[test]
+    fn a_live_problem_outranks_the_last_sessions_note() {
+        let state = DaemonState {
+            run: RunState::Running { slots: 4 },
+            game: None,
+            last: Some(LastSession {
+                dropped_events: 3,
+                ..LastSession::default()
+            }),
+            live: Some(LiveHealth {
+                watchdog_tripped: true,
+                ..LiveHealth::default()
+            }),
+        };
+        let tip = state.tooltip();
+        assert!(tip.contains("watchdog TRIPPED"), "{tip}");
+        assert!(!tip.contains("dropped"), "one line, the live one: {tip}");
+    }
+
+    /// Nothing wrong must say nothing at all. A tooltip that always carries a
+    /// `[!]` teaches people to ignore the `[!]`.
+    #[test]
+    fn a_healthy_daemon_has_no_health_line() {
+        let state = DaemonState {
+            run: RunState::Running { slots: 4 },
+            live: Some(LiveHealth::default()),
+            last: Some(LastSession {
+                stop_code: "ctrl-c".into(),
+                message: "stopped by Ctrl+C".into(),
+                ..LastSession::default()
+            }),
+            game: None,
+        };
+        assert!(!state.tooltip().contains("[!]"), "{}", state.tooltip());
+    }
+
+    /// End to end through the real control loop: a watchdog trip published by a
+    /// running session reaches `DaemonState` **while it is still running**, with
+    /// nothing reaped. This is gap B at the level it is caused — the tooltip
+    /// test above proves the rendering, this proves the plumbing.
+    #[test]
+    fn a_mid_session_trip_reaches_the_state_before_anything_is_reaped() {
+        let health = ksx_capture::HealthHandle::new();
+        let mut factory = FakeFactory {
+            health: Some(health.clone()),
+            ..FakeFactory::default()
+        };
+        let (tx, rx) = unbounded();
+        tx.send(DaemonCommand::Start).unwrap();
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+
+        // What the tray would have seen at the moment the trip became visible.
+        let seen: Arc<Mutex<Option<DaemonState>>> = Arc::new(Mutex::new(None));
+        std::thread::spawn({
+            let watcher = state.clone();
+            let seen = seen.clone();
+            move || {
+                // Let the session come up and publish its view.
+                std::thread::sleep(Duration::from_millis(100));
+                health.set_watchdog_tripped();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let snapshot = watcher.lock().unwrap().clone();
+                    if snapshot.live.is_some_and(|h| h.watchdog_tripped) {
+                        *seen.lock().unwrap() = Some(snapshot);
+                        break;
+                    }
+                    if Instant::now() > deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let _ = tx.send(DaemonCommand::Quit);
+            }
+        });
+
+        let mut out: Vec<u8> = Vec::new();
+        control_loop_with(rx, state.clone(), &mut factory, &mut NoPanel, &mut out);
+
+        let seen = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the trip never reached DaemonState — the tray would show nothing");
+        assert!(
+            matches!(seen.run, RunState::Running { .. }),
+            "the session must still have been running when the tray could see it: {seen:?}"
+        );
+        assert!(
+            seen.last.is_none(),
+            "nothing has been reaped: this is exactly the window that used to be blind"
+        );
+        assert!(seen.tooltip().contains("watchdog TRIPPED"), "{seen:?}");
+
+        // Once the session IS reaped, the live reading is dropped rather than
+        // left pinned to a session that no longer exists.
+        let after = state.lock().unwrap().clone();
+        assert_eq!(after.live, None, "{after:?}");
+    }
+
+    /// A runner with no capture backend publishes nothing, and "nothing to
+    /// report" must not be rendered as "nothing wrong".
+    #[test]
+    fn an_unpublished_slot_reports_nothing_at_all() {
+        let slot = HealthSlot::default();
+        assert_eq!(slot.poll(), None);
+        let handle = ksx_capture::HealthHandle::new();
+        handle.set_reboot_required();
+        slot.publish(ksx_capture::HealthView::new(handle));
+        assert_eq!(
+            slot.poll(),
+            Some(LiveHealth {
+                reboot_required: true,
+                watchdog_tripped: false,
+                dropped_events: 0,
+            })
+        );
     }
 
     #[test]

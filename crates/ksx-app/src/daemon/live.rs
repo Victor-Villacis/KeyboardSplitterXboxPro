@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use super::{SessionFactory, SessionRunner, SessionSummary};
+use super::{HealthSlot, SessionFactory, SessionRunner, SessionSummary};
 
 /// Re-reads configuration on every `make()`. That is what "Reload config"
 /// means: a clean stop and a clean start from whatever is on disk now, never a
@@ -69,6 +69,7 @@ impl SessionFactory for LiveFactory {
             launch,
             games_toml: self.root.games_path(),
             panel: self.panel.clone(),
+            health: HealthSlot::default(),
         }))
     }
 
@@ -93,11 +94,18 @@ struct LiveRunner {
     /// nothing claimed and the session builds its own backends, exactly as
     /// `ksx run` does.
     panel: Option<Arc<super::panel::Panel>>,
+    /// Handed to the control loop before this runner moves onto its own thread,
+    /// and filled in below the moment the capture backend exists.
+    health: HealthSlot,
 }
 
 impl SessionRunner for LiveRunner {
     fn slots(&self) -> usize {
         self.slots
+    }
+
+    fn health_slot(&self) -> HealthSlot {
+        self.health.clone()
     }
 
     #[cfg(windows)]
@@ -116,6 +124,16 @@ impl SessionRunner for LiveRunner {
         // this session *borrows* the daemon's, and returns it untouched when it
         // ends, so the panel is a keyboard again the moment the game is gone.
         let capture = crate::capture::build_session(&self.plan, self.panel.as_ref())?;
+
+        // Publish this session's health before `supervise` takes the backend,
+        // so the tray can report a mid-session REBOOT REQUIRED or watchdog trip
+        // while it is happening. A *view*, not the handle: the daemon's WinUSB
+        // claim keeps one handle alive across every session, and only a
+        // baseline taken here means "this session" (see `ksx_capture::
+        // HealthView`). Nothing is added to the capture thread by this — the
+        // view reads the same lock-free atomics it always published into.
+        self.health
+            .publish(ksx_capture::HealthView::new(capture.health()));
 
         let hook: Box<dyn SessionHook> = match self.launch.clone() {
             Some(spec) => Box::new(crate::run::game::GameHook::new(

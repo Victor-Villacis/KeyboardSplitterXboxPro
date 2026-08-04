@@ -136,7 +136,41 @@ keystroke onto its WPF UI thread, and a stalled UI froze every keyboard on the
 machine until reboot.
 
 The tooltip shows the current state and surfaces capture-health problems
-(reboot required, watchdog tripped, dropped events) from the last session.
+(reboot required, watchdog tripped, dropped events) **from the running
+session**, polled off the hot path while it runs — so a mid-session REBOOT
+REQUIRED or watchdog trip appears while it is happening, not only once the
+player quits. When nothing is running, the last finished session's verdict is
+shown instead.
+
+Plain `ksx daemon` releases its console window once the tray icon is on screen
+(a stray terminal beside a tray icon is one click away from killing emulation,
+and a scheduled task would put one on the cabinet's game screen at every
+logon). Logging is unaffected — see below — and `--console` keeps the window if
+you want to watch a session live.
+
+---
+
+## Logs
+
+Every command writes to a daily-rolling file as well as stderr:
+
+```
+%APPDATA%\ksx\logs\ksx.<YYYY-MM-DD>.log     # installed
+<exe dir>\logs\ksx.<YYYY-MM-DD>.log         # portable (a ksx.toml next to ksx.exe)
+```
+
+- **14 days are kept.** Older files are pruned when ksx starts and at each
+  rollover, so the directory cannot grow without bound on a cabinet's system
+  drive.
+- **A panic goes to the file too**, via a panic hook that logs before the
+  unwind. A daemon that dies at 3am leaves the reason on disk — which is the
+  whole point, since after the console is released there is no stderr to catch
+  it.
+- **`--json` is unaffected.** Nothing is ever logged to stdout, so
+  `ksx devices --json | ConvertFrom-Json` stays exactly one object.
+- The path is printed at startup and again in the notice `ksx daemon` prints
+  just before it releases the console.
+- `RUST_LOG` controls the level for both sinks (`RUST_LOG=ksx_capture=trace`).
 
 ---
 
