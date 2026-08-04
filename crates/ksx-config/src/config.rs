@@ -1,7 +1,7 @@
 //! Main config file schema: `%APPDATA%\ksx\config.toml`
 //! (`docs/research/design-architecture.md` §4.1).
 
-use ksx_core::{DeviceId, SlotSpec};
+use ksx_core::{DeviceId, Persona, SlotSpec};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
@@ -82,6 +82,15 @@ pub struct SlotEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<String>,
     pub preset: String,
+    /// Which controller this slot presents itself as. Absent means
+    /// [`Persona::Xbox360`], which is why every pre-persona config still loads
+    /// and still round-trips byte-identically.
+    #[serde(
+        default,
+        with = "crate::persona_serde",
+        skip_serializing_if = "crate::persona_serde::is_default"
+    )]
+    pub persona: Persona,
 }
 
 impl ConfigFile {
@@ -109,7 +118,9 @@ impl ConfigFile {
             .as_deref()
             .map(|m| self.resolve_device(m))
             .transpose()?;
-        SlotSpec::new(slot.number, keyboard, mouse, slot.preset.clone()).map_err(Into::into)
+        SlotSpec::new(slot.number, keyboard, mouse, slot.preset.clone())
+            .map(|spec| spec.with_persona(slot.persona))
+            .map_err(Into::into)
     }
 
     /// Reverse of [`ConfigFile::slot_spec`]: an instance path folds back to
@@ -127,6 +138,7 @@ impl ConfigFile {
             keyboard: spec.keyboard.as_ref().map(display),
             mouse: spec.mouse.as_ref().map(display),
             preset: spec.preset.clone(),
+            persona: spec.persona,
         }
     }
 }
@@ -241,10 +253,11 @@ preset = "street-fighter-p1"
     fn bad_slot_number_is_an_error() {
         let cfg = ConfigFile::default();
         let slot = SlotEntry {
-            number: 5,
+            number: ksx_core::MAX_SLOTS + 1,
             keyboard: None,
             mouse: None,
             preset: "p".into(),
+            persona: Persona::default(),
         };
         assert!(matches!(
             cfg.slot_spec(&slot),

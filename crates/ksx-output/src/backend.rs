@@ -1,6 +1,6 @@
 //! The `VirtualPadBackend` trait — design §3.2, the plan-B insurance policy.
 
-use ksx_core::PadState;
+use ksx_core::{PadState, Persona};
 
 use crate::error::OutputError;
 
@@ -33,7 +33,7 @@ pub struct Feedback {
     pub led_number: u8,
 }
 
-/// A backend that materializes virtual Xbox 360 pads.
+/// A backend that materializes virtual game pads.
 ///
 /// Object-safe by design: the engine holds `Box<dyn VirtualPadBackend>` so a
 /// plan-B backend (HIDMaestro, libvirtualhid) is a drop-in.
@@ -45,7 +45,30 @@ pub struct Feedback {
 /// - `poll_feedback` never blocks; it drains one queued [`Feedback`] per call.
 pub trait VirtualPadBackend: Send {
     /// Plugs a new virtual pad and waits until it accepts updates.
+    ///
+    /// Equivalent to [`plug_persona`](Self::plug_persona) with
+    /// [`Persona::Xbox360`] — the persona every caller wanted before personas
+    /// existed.
     fn plug(&mut self) -> Result<PadHandle, OutputError>;
+
+    /// Plugs a new virtual pad presenting itself as `persona`.
+    ///
+    /// The default implementation supports **only** [`Persona::Xbox360`] and
+    /// rejects everything else with [`OutputError::PersonaUnsupported`]. That is
+    /// deliberate: a backend that silently downgraded an unimplemented persona
+    /// to an Xbox pad would hand the user a working controller showing the wrong
+    /// button prompts — the exact failure a persona exists to prevent, and one
+    /// that looks like success. Backends override this to declare what they can
+    /// really emulate.
+    fn plug_persona(&mut self, persona: Persona) -> Result<PadHandle, OutputError> {
+        match persona {
+            Persona::Xbox360 => self.plug(),
+            other => Err(OutputError::PersonaUnsupported(other)),
+        }
+    }
+
+    /// The persona a plugged pad was created with, or `None` for a dead handle.
+    fn persona(&self, handle: PadHandle) -> Option<Persona>;
 
     /// XInput `dwUserIndex` (0..=3) of the pad, if it got an XInput slot.
     ///
@@ -53,10 +76,16 @@ pub trait VirtualPadBackend: Send {
     /// DirectInput) or before the slot is known.
     fn user_index(&self, handle: PadHandle) -> Option<u8>;
 
-    /// Submits a new pad state (XInput wire shape, trivially copied).
+    /// Submits a new pad state.
+    ///
+    /// [`PadState`] is in XInput wire shape, so an Xbox pad copies it and any
+    /// other persona translates (see `ds4.rs`).
     fn update(&mut self, handle: PadHandle, state: &PadState) -> Result<(), OutputError>;
 
     /// Non-blocking: next queued rumble/LED feedback for this pad, if any.
+    ///
+    /// Always `None` for personas where [`Persona::has_feedback`] is false —
+    /// ViGEmBus exposes no notification channel for those targets at all.
     fn poll_feedback(&mut self, handle: PadHandle) -> Option<Feedback>;
 
     /// Unplugs the pad. The handle is dead afterwards.

@@ -80,7 +80,7 @@ use crossbeam_channel::{
 use ksx_capture::{
     CaptureBackend, CaptureCtl, CaptureHealth, DeviceInfo, EscapeStatus, ExitReason, HealthView,
 };
-use ksx_core::{DeviceId, Engine, InvalidationReason, KeyEvent, PadState, ResolvedSlot};
+use ksx_core::{DeviceId, Engine, InvalidationReason, KeyEvent, PadState, Persona, ResolvedSlot};
 use ksx_output::{PadHandle, VirtualPadBackend};
 
 use super::latency::{Clock, LatencyRecorder, LatencySummary};
@@ -238,11 +238,14 @@ impl Default for RunOptions {
 /// One plugged pad as the supervisor reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PadInfo {
-    /// Slot *number* (1..=4) — never an XInput user index.
+    /// Slot *number* (1..=MAX_SLOTS) — never an XInput user index.
     pub slot: u8,
     pub handle: u32,
+    /// Which controller the pad presents itself as.
+    pub persona: Persona,
     /// XInput `dwUserIndex`, discovered by the backend. `None` when all four
-    /// XInput slots were already taken (e.g. by a real pad).
+    /// XInput slots were already taken (e.g. by a real pad) — or, always, for
+    /// a non-XInput persona, which never has one.
     pub user_index: Option<u8>,
 }
 
@@ -435,6 +438,7 @@ impl Outcome {
             "pads": self.pads.iter().map(|p| serde_json::json!({
                 "slot": p.slot,
                 "handle": p.handle,
+                "persona": p.persona.as_str(),
                 "user_index": p.user_index,
             })).collect::<Vec<_>>(),
             "events": self.events,
@@ -730,7 +734,11 @@ pub fn supervise(
 
     // Startup order, step 1: pads first. If the bus is missing or full we find
     // out while every keyboard is still perfectly normal.
-    let slot_numbers: Vec<u8> = plan.slots.iter().map(|s| s.spec.number).collect();
+    let slot_plugs: Vec<(u8, Persona)> = plan
+        .slots
+        .iter()
+        .map(|s| (s.spec.number, s.spec.persona))
+        .collect();
     let recorder = LatencyRecorder::new(opts.clock);
     let live = opts.live_latency.then_some(LIVE_LATENCY_INTERVAL);
     let output_msg = msg_tx.clone();
@@ -738,13 +746,7 @@ pub fn supervise(
         .name("ksx-output".into())
         .spawn(move || {
             output_thread(
-                pads,
-                slot_numbers,
-                delta_rx,
-                octl_rx,
-                output_msg,
-                recorder,
-                live,
+                pads, slot_plugs, delta_rx, octl_rx, output_msg, recorder, live,
             )
         })?;
 
@@ -778,14 +780,23 @@ pub fn supervise(
         "pads plugged (slot number is NOT the XInput user index):"
     );
     for pad in &pad_infos {
-        let _ = match pad.user_index {
-            Some(index) => writeln!(
+        let _ = match (pad.user_index, pad.persona.is_xinput()) {
+            (Some(index), _) => writeln!(
                 out,
                 "  slot {} -> XInput user index {index} (player {})",
                 pad.slot,
                 index + 1
             ),
-            None => writeln!(
+            // Correct behavior, not a failure: this persona never gets an
+            // XInput index. Printing the bus-full explanation here would send
+            // someone debugging a working PlayStation pad.
+            (None, false) => writeln!(
+                out,
+                "  slot {} -> {} (HID/DirectInput, no XInput index)",
+                pad.slot,
+                pad.persona.label()
+            ),
+            (None, true) => writeln!(
                 out,
                 "  slot {} -> no XInput slot ({})",
                 pad.slot,
@@ -1352,7 +1363,7 @@ struct OutputOutcome {
 /// thing: nothing is captured yet and nobody else knows about those handles.)
 fn output_thread(
     mut pads: Box<dyn VirtualPadBackend>,
-    slots: Vec<u8>,
+    slots: Vec<(u8, Persona)>,
     deltas: Receiver<OutMsg>,
     ctl: Receiver<OutputCtl>,
     msg: Sender<Msg>,
@@ -1360,11 +1371,11 @@ fn output_thread(
     live: Option<Duration>,
 ) -> OutputOutcome {
     let mut handles: Vec<(u8, PadHandle)> = Vec::with_capacity(slots.len());
-    for &slot in &slots {
-        match pads.plug() {
+    for &(slot, persona) in &slots {
+        match pads.plug_persona(persona) {
             Ok(handle) => handles.push((slot, handle)),
             Err(err) => {
-                tracing::error!(%err, slot, "plugging a virtual pad failed");
+                tracing::error!(%err, slot, %persona, "plugging a virtual pad failed");
                 for (_, handle) in handles.drain(..) {
                     let _ = pads.unplug(handle);
                 }
@@ -1382,6 +1393,7 @@ fn output_thread(
         .map(|&(slot, handle)| PadInfo {
             slot,
             handle: handle.raw(),
+            persona: pads.persona(handle).unwrap_or_default(),
             user_index: pads.user_index(handle),
         })
         .collect();

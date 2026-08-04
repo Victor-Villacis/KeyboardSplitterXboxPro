@@ -1,4 +1,4 @@
-//! ksx-output — virtual Xbox 360 pads.
+//! ksx-output — virtual game pads.
 //!
 //! Primary (only, for now) backend: ViGEmBus 1.22.0 through the vendored
 //! `vigem-client` (pure-Rust IOCTL, no C DLL). Slot identity comes from **active
@@ -20,10 +20,15 @@
 //!   [`OutputError::BusNotFound`] when the driver is absent; dropping it unplugs
 //!   every pad (crash safety — a clean process exit never leaves ghost pads).
 //! - [`MockBackend`] — driverless implementation for engine-to-output tests.
+//! - `ds4` (Windows) — `PadState` → DualShock 4 report for the PlayStation
+//!   persona. Not a field copy like the Xbox path: Y axes invert, the D-pad
+//!   collapses to a 4-bit hat, and triggers are analog *and* digital.
 //! - `tests/loopback.rs` — cabinet-only XInput round-trip behind the `cab-tests`
 //!   feature; never runs in CI or on machines without ViGEmBus.
 
 mod backend;
+#[cfg(windows)]
+mod ds4;
 mod error;
 pub mod mock;
 #[cfg(windows)]

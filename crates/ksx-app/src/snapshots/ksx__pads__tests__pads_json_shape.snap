@@ -1,5 +1,6 @@
 ---
 source: crates/ksx-app/src/pads.rs
+assertion_line: 388
 expression: "serde_json::to_string_pretty(&v).unwrap()"
 ---
 {
@@ -24,12 +25,14 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
     {
       "handle": 0,
       "led_number": 2,
+      "persona": "xbox360",
       "slot": 1,
       "user_index": 0
     },
     {
       "handle": 1,
       "led_number": null,
+      "persona": "playstation",
       "slot": 2,
       "user_index": null
     }

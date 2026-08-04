@@ -2,7 +2,7 @@
 //! `splitter_games.xml` (title, path, args, block flags, per-slot
 //! device-by-id + preset-by-name).
 
-use ksx_core::{DeviceId, SlotSpec};
+use ksx_core::{DeviceId, Persona, SlotSpec};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
@@ -79,6 +79,15 @@ pub struct GameSlotEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<String>,
     pub preset: String,
+    /// See [`crate::config::SlotEntry::persona`]. A per-game override: the same
+    /// panel can be four Xbox pads for a Steam title and four PlayStation pads
+    /// for a PS2 emulator without touching the presets.
+    #[serde(
+        default,
+        with = "crate::persona_serde",
+        skip_serializing_if = "crate::persona_serde::is_default"
+    )]
+    pub persona: Persona,
 }
 
 impl GameSlotEntry {
@@ -89,6 +98,7 @@ impl GameSlotEntry {
             self.mouse.as_deref().map(DeviceId::new),
             self.preset.clone(),
         )
+        .map(|spec| spec.with_persona(self.persona))
         .map_err(Into::into)
     }
 
@@ -97,6 +107,7 @@ impl GameSlotEntry {
         Self {
             number: spec.number,
             user_index: None,
+            persona: spec.persona,
             keyboard: spec.keyboard.as_ref().map(|d| d.as_str().to_owned()),
             mouse: spec.mouse.as_ref().map(|d| d.as_str().to_owned()),
             preset: spec.preset.clone(),
@@ -232,6 +243,7 @@ preset = "IPAC P2"
             keyboard: None,
             mouse: None,
             preset: "p".into(),
+            persona: Persona::default(),
         };
         assert!(matches!(
             entry.to_spec(),

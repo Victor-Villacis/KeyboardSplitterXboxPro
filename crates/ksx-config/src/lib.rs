@@ -21,6 +21,7 @@ pub mod error;
 pub mod function;
 pub mod games;
 pub mod paths;
+pub mod persona_serde;
 pub mod preset;
 pub mod store;
 pub mod validate;

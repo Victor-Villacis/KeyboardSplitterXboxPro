@@ -95,8 +95,8 @@ target.wait_ready().unwrap();
 
 // Configure the gamepad pressing nothing but A and X buttons
 let gamepad = vigem_client::XGamepad {
-	buttons: vigem_client::XButtons!(A | X),
-	..Default::default()
+    buttons: vigem_client::XButtons!(A | X),
+    ..Default::default()
 };
 
 // Update the target
@@ -107,29 +107,35 @@ The DualShock4Wired target is under development.
 */
 
 mod bus;
-mod event;
-mod error;
 mod client;
-mod x360;
 mod ds4;
+mod error;
+mod event;
+mod x360;
 
-use self::event::*;
-pub use self::error::Error;
 pub use self::client::*;
-pub use self::x360::*;
 pub use self::ds4::*;
+pub use self::error::Error;
+use self::event::*;
+pub use self::x360::*;
 
 /// Vendor and product ids.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
 #[repr(C)]
 pub struct TargetId {
-	pub vendor: u16,
-	pub product: u16,
+    pub vendor: u16,
+    pub product: u16,
 }
 impl TargetId {
-	/// Default vender and product ids for a wired Xbox360 target.
-	pub const XBOX360_WIRED: TargetId = TargetId { vendor: 0x045E, product: 0x028E };
-	/// Default vender and product ids for a wired DualShock4 target.
-	#[cfg(feature = "unstable_ds4")]
-	pub const DUALSHOCK4_WIRED: TargetId = TargetId { vendor: 0x054C, product: 0x05C4 };
+    /// Default vender and product ids for a wired Xbox360 target.
+    pub const XBOX360_WIRED: TargetId = TargetId {
+        vendor: 0x045E,
+        product: 0x028E,
+    };
+    /// Default vender and product ids for a wired DualShock4 target.
+    #[cfg(feature = "unstable_ds4")]
+    pub const DUALSHOCK4_WIRED: TargetId = TargetId {
+        vendor: 0x054C,
+        product: 0x05C4,
+    };
 }

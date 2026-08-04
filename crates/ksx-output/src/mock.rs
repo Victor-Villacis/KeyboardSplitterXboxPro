@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use ksx_core::PadState;
+use ksx_core::{PadState, Persona};
 
 use crate::backend::{Feedback, PadHandle, VirtualPadBackend};
 use crate::error::OutputError;
@@ -15,6 +15,7 @@ const XINPUT_SLOTS: u8 = 4;
 
 #[derive(Debug, Default)]
 struct MockPad {
+    persona: Persona,
     user_index: Option<u8>,
     feedback: VecDeque<Feedback>,
     last_state: Option<PadState>,
@@ -22,6 +23,12 @@ struct MockPad {
 
 /// In-memory backend: records every `update`, serves scripted feedback, and
 /// mimics XInput's lowest-free-slot assignment (indices 0..=3, `None` beyond).
+///
+/// Personas are modeled the way the real driver behaves, because callers reason
+/// about slot exhaustion against this mock: only XInput personas take a user
+/// index, so a PlayStation pad never consumes one of the four
+/// (`docs/research/m6.5-ds4-findings.md`). It emulates every persona — a mock
+/// that refused one could not test the paths that use it.
 #[derive(Debug, Default)]
 pub struct MockBackend {
     next_id: u32,
@@ -81,20 +88,32 @@ impl MockBackend {
 
 impl VirtualPadBackend for MockBackend {
     fn plug(&mut self) -> Result<PadHandle, OutputError> {
+        self.plug_persona(Persona::default())
+    }
+
+    fn plug_persona(&mut self, persona: Persona) -> Result<PadHandle, OutputError> {
         if self.bus_missing {
             return Err(OutputError::BusNotFound);
         }
-        let user_index = self.lowest_free_user_index();
+        let user_index = persona
+            .is_xinput()
+            .then(|| self.lowest_free_user_index())
+            .flatten();
         let id = self.next_id;
         self.next_id += 1;
         self.pads.insert(
             id,
             MockPad {
+                persona,
                 user_index,
                 ..MockPad::default()
             },
         );
         Ok(PadHandle(id))
+    }
+
+    fn persona(&self, handle: PadHandle) -> Option<Persona> {
+        self.pads.get(&handle.0).map(|p| p.persona)
     }
 
     fn user_index(&self, handle: PadHandle) -> Option<u8> {

@@ -25,11 +25,12 @@ use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ksx_core::PadState;
+use ksx_core::{PadState, Persona};
 use rusty_xinput::XInputHandle;
-use vigem_client::{Client, TargetId, XGamepad, Xbox360Wired};
+use vigem_client::{Client, DualShock4Wired, TargetId, XGamepad, Xbox360Wired};
 
 use crate::backend::{Feedback, PadHandle, VirtualPadBackend};
+use crate::ds4::to_ds4report;
 use crate::error::OutputError;
 
 /// Ample for plug+wait_ready; PNP device arrival is normally < 1 s.
@@ -64,8 +65,43 @@ fn map_target_err(err: vigem_client::Error) -> OutputError {
     OutputError::TargetError(err)
 }
 
+/// The plugged target, one variant per [`Persona`] ViGEmBus can emulate.
+///
+/// These are separate types in the vendored client with no shared trait (their
+/// IOCTLs, report structs, and capabilities genuinely differ), so the enum is
+/// where the difference is absorbed.
+enum Target {
+    X360(Xbox360Wired<Arc<Client>>),
+    /// No notification IOCTL exists for a DS4 target, so this variant never has
+    /// a feedback thread — [`Persona::has_feedback`] is the contract.
+    Ds4(DualShock4Wired<Arc<Client>>),
+}
+
+impl Target {
+    fn persona(&self) -> Persona {
+        match self {
+            Target::X360(_) => Persona::Xbox360,
+            Target::Ds4(_) => Persona::PlayStation,
+        }
+    }
+
+    fn update(&mut self, state: &PadState) -> Result<(), vigem_client::Error> {
+        match self {
+            Target::X360(t) => t.update(&to_xgamepad(state)),
+            Target::Ds4(t) => t.update(&to_ds4report(state)),
+        }
+    }
+
+    fn unplug(&mut self) -> Result<(), vigem_client::Error> {
+        match self {
+            Target::X360(t) => t.unplug(),
+            Target::Ds4(t) => t.unplug(),
+        }
+    }
+}
+
 struct PadEntry {
-    target: Xbox360Wired<Arc<Client>>,
+    target: Target,
     user_index: Option<u8>,
     feedback_rx: mpsc::Receiver<Feedback>,
     notif_thread: Option<JoinHandle<()>>,
@@ -137,14 +173,28 @@ impl VigemBackend {
 
     /// `plugin() + wait_ready()` under a deadline (see module docs for why this
     /// needs a helper thread).
-    fn plug_with_timeout(&self) -> Result<Xbox360Wired<Arc<Client>>, OutputError> {
-        let mut target = Xbox360Wired::new(self.client.clone(), TargetId::XBOX360_WIRED);
+    fn plug_with_timeout(&self, persona: Persona) -> Result<Target, OutputError> {
+        let client = self.client.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = target
-                .plugin()
-                .and_then(|()| target.wait_ready())
-                .map(|()| target);
+            // Both arms are the same three calls; they differ only in type, and
+            // the vendored client gives them no common trait to unify over.
+            let result = match persona {
+                Persona::Xbox360 => {
+                    let mut target = Xbox360Wired::new(client, TargetId::XBOX360_WIRED);
+                    target
+                        .plugin()
+                        .and_then(|()| target.wait_ready())
+                        .map(|()| Target::X360(target))
+                }
+                Persona::PlayStation => {
+                    let mut target = DualShock4Wired::new(client, TargetId::DUALSHOCK4_WIRED);
+                    target
+                        .plugin()
+                        .and_then(|()| target.wait_ready())
+                        .map(|()| Target::Ds4(target))
+                }
+            };
             let _ = tx.send(result);
         });
         match rx.recv_timeout(self.plug_timeout) {
@@ -205,6 +255,63 @@ impl VigemBackend {
         found
     }
 
+    /// Plugs one pad and registers it. Shared by every persona; the
+    /// persona-specific parts are the target itself, whether XInput correlation
+    /// is worth running, and whether a feedback channel exists at all.
+    fn plug_inner(&mut self, persona: Persona) -> Result<PadHandle, OutputError> {
+        let mut target = self.plug_with_timeout(persona)?;
+
+        // Correlation costs up to CORRELATE_TIMEOUT and can only ever fail for a
+        // pad that is not an XInput device — skipping it for HID personas saves
+        // 600 ms per pad and, more importantly, suppresses a "no XInput echo"
+        // warning that would be describing correct behavior.
+        let user_index = match (persona.is_xinput(), &mut target) {
+            (true, Target::X360(t)) => self
+                .xinput
+                .as_ref()
+                .and_then(|xi| Self::correlate_user_index(xi, t)),
+            _ => None,
+        };
+
+        let (tx, feedback_rx) = mpsc::sync_channel::<Feedback>(FEEDBACK_QUEUE_CAP);
+        let dropped_feedback = Arc::new(AtomicUsize::new(0));
+        let notif_thread = match &mut target {
+            Target::X360(t) => {
+                let notification = t.request_notification().map_err(map_target_err)?;
+                let dropped = dropped_feedback.clone();
+                Some(notification.spawn_thread(move |_reqn, n| {
+                    let feedback = Feedback {
+                        large_motor: n.large_motor,
+                        small_motor: n.small_motor,
+                        led_number: n.led_number,
+                    };
+                    if tx.try_send(feedback).is_err() {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }))
+            }
+            // Nothing to subscribe to: ViGEmBus has no DS4 notification IOCTL.
+            // `tx` drops here, so `feedback_rx` is a permanently empty channel
+            // and `poll_feedback` returns None without a special case.
+            Target::Ds4(_) => None,
+        };
+
+        let id = self.next_id;
+        self.next_id += 1;
+        self.pads.insert(
+            id,
+            PadEntry {
+                target,
+                user_index,
+                feedback_rx,
+                notif_thread,
+                dropped_feedback,
+            },
+        );
+        tracing::info!(handle = id, %persona, ?user_index, "virtual pad plugged");
+        Ok(PadHandle(id))
+    }
+
     fn teardown(mut entry: PadEntry) -> Result<(), OutputError> {
         let result = entry.target.unplug().map_err(map_target_err);
         // Drop before joining: if the explicit unplug failed, Drop retries it —
@@ -219,41 +326,16 @@ impl VigemBackend {
 
 impl VirtualPadBackend for VigemBackend {
     fn plug(&mut self) -> Result<PadHandle, OutputError> {
-        let mut target = self.plug_with_timeout()?;
-        let user_index = self
-            .xinput
-            .as_ref()
-            .and_then(|xi| Self::correlate_user_index(xi, &mut target));
+        self.plug_inner(Persona::Xbox360)
+    }
 
-        let notification = target.request_notification().map_err(map_target_err)?;
-        let (tx, feedback_rx) = mpsc::sync_channel::<Feedback>(FEEDBACK_QUEUE_CAP);
-        let dropped_feedback = Arc::new(AtomicUsize::new(0));
-        let dropped = dropped_feedback.clone();
-        let notif_thread = notification.spawn_thread(move |_reqn, n| {
-            let feedback = Feedback {
-                large_motor: n.large_motor,
-                small_motor: n.small_motor,
-                led_number: n.led_number,
-            };
-            if tx.try_send(feedback).is_err() {
-                dropped.fetch_add(1, Ordering::Relaxed);
-            }
-        });
+    fn plug_persona(&mut self, persona: Persona) -> Result<PadHandle, OutputError> {
+        // ViGEmBus emulates both personas natively, so nothing is refused here.
+        self.plug_inner(persona)
+    }
 
-        let id = self.next_id;
-        self.next_id += 1;
-        self.pads.insert(
-            id,
-            PadEntry {
-                target,
-                user_index,
-                feedback_rx,
-                notif_thread: Some(notif_thread),
-                dropped_feedback,
-            },
-        );
-        tracing::info!(handle = id, ?user_index, "virtual pad plugged");
-        Ok(PadHandle(id))
+    fn persona(&self, handle: PadHandle) -> Option<Persona> {
+        self.pads.get(&handle.0).map(|p| p.target.persona())
     }
 
     fn user_index(&self, handle: PadHandle) -> Option<u8> {
@@ -261,10 +343,9 @@ impl VirtualPadBackend for VigemBackend {
     }
 
     fn update(&mut self, handle: PadHandle, state: &PadState) -> Result<(), OutputError> {
-        let gamepad = to_xgamepad(state);
         self.entry_mut(handle)?
             .target
-            .update(&gamepad)
+            .update(state)
             .map_err(map_target_err)
     }
 

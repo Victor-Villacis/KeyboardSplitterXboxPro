@@ -504,6 +504,7 @@ mod tests {
                 keyboard: Some("P1 I-PAC".into()),
                 mouse: None,
                 preset: "street-fighter-p1".into(),
+                persona: ksx_core::Persona::default(),
             }],
         }
     }
@@ -555,6 +556,7 @@ mod tests {
                     keyboard: Some(r"HID\VID_D209&PID_0430&REV_0056&MI_00".into()),
                     mouse: None,
                     preset: "IPAC P1".into(),
+                    persona: ksx_core::Persona::default(),
                 }],
             }],
         };

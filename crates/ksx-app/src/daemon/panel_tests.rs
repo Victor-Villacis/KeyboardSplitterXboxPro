@@ -315,6 +315,9 @@ impl VirtualPadBackend for SlowPads {
         std::thread::sleep(self.delay);
         self.inner.plug()
     }
+    fn persona(&self, handle: ksx_output::PadHandle) -> Option<ksx_core::Persona> {
+        self.inner.persona(handle)
+    }
     fn user_index(&self, handle: ksx_output::PadHandle) -> Option<u8> {
         self.inner.user_index(handle)
     }

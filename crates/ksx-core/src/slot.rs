@@ -1,12 +1,34 @@
 //! Slot configuration and the invalidation taxonomy.
 
 use crate::device::DeviceId;
+use crate::persona::Persona;
 
-/// Maximum slots (legacy `EmulationManager` cap; also the XInput ceiling).
-pub const MAX_SLOTS: u8 = 4;
+/// Maximum slots ksx will configure.
+///
+/// Was 4 — the legacy `EmulationManager` cap, which matched the XInput ceiling
+/// exactly because Xbox 360 was the only persona. Since PlayStation personas are
+/// plain HID and do not touch XInput's four slots
+/// (`docs/research/m6.5-ds4-findings.md`), the two limits are now different
+/// things: [`MAX_XINPUT_SLOTS`] is imposed by Windows, this one is ours.
+///
+/// 8 because that is where cabinet hardware stops: an 8-player panel is the
+/// largest anyone builds, and every extra slot costs a real device node.
+pub const MAX_SLOTS: u8 = 8;
+
+/// How many slots may use an XInput persona at once — a Windows limit, not ours.
+///
+/// Windows exposes exactly four XInput slots and no virtual bus can create a
+/// fifth (measured: `docs/research/m2-xinput-findings.md`). A fifth Xbox 360
+/// target still plugs, but no game will ever see it, so configuration refuses it
+/// with an actionable message instead of producing a silently dead pad.
+///
+/// **Physical pads count too.** This is the *configured* ceiling; a real
+/// controller already connected takes a slot from the same four, which surfaces
+/// at runtime as [`InvalidationReason::XinputBusFull`].
+pub const MAX_XINPUT_SLOTS: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("slot number must be 1..=4, got {0}")]
+#[error("slot number must be 1..={MAX_SLOTS}, got {0}")]
 pub struct InvalidSlotNumber(pub u8);
 
 /// Desired configuration of one slot — pure data. The runtime slot (pad
@@ -16,15 +38,23 @@ pub struct InvalidSlotNumber(pub u8);
 /// notification callback after plug-in, never derived from this number.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotSpec {
-    /// 1..=4 (enforced by [`SlotSpec::new`]).
+    /// 1..=[`MAX_SLOTS`] (enforced by [`SlotSpec::new`]).
     pub number: u8,
     pub keyboard: Option<DeviceId>,
     pub mouse: Option<DeviceId>,
     /// Preset referenced by name; resolution happens in the config layer.
     pub preset: String,
+    /// Which controller this slot presents itself as. Defaults to
+    /// [`Persona::Xbox360`]; set with [`SlotSpec::with_persona`].
+    pub persona: Persona,
 }
 
 impl SlotSpec {
+    /// A slot with the default [`Persona::Xbox360`].
+    ///
+    /// Kept non-breaking on purpose: 16-odd construction sites (mostly tests)
+    /// want an Xbox pad and should not have to say so. Chain
+    /// [`SlotSpec::with_persona`] for anything else.
     pub fn new(
         number: u8,
         keyboard: Option<DeviceId>,
@@ -39,7 +69,15 @@ impl SlotSpec {
             keyboard,
             mouse,
             preset: preset.into(),
+            persona: Persona::default(),
         })
+    }
+
+    /// Sets the persona this slot presents itself as.
+    #[must_use]
+    pub fn with_persona(mut self, persona: Persona) -> Self {
+        self.persona = persona;
+        self
     }
 }
 
@@ -140,12 +178,37 @@ mod tests {
     #[test]
     fn slot_numbers_validated() {
         assert_eq!(SlotSpec::new(0, None, None, "p"), Err(InvalidSlotNumber(0)));
-        assert_eq!(SlotSpec::new(5, None, None, "p"), Err(InvalidSlotNumber(5)));
+        assert_eq!(
+            SlotSpec::new(MAX_SLOTS + 1, None, None, "p"),
+            Err(InvalidSlotNumber(MAX_SLOTS + 1))
+        );
         for n in 1..=MAX_SLOTS {
             let spec = SlotSpec::new(n, Some(DeviceId::new("dev")), None, "p").unwrap();
             assert_eq!(spec.number, n);
             assert_eq!(spec.preset, "p");
         }
+    }
+
+    #[test]
+    fn slots_default_to_xbox360_and_opt_into_others() {
+        // The compatibility guarantee: a spec built the old way is an Xbox pad.
+        let spec = SlotSpec::new(1, None, None, "p").unwrap();
+        assert_eq!(spec.persona, Persona::Xbox360);
+        let ps = spec.clone().with_persona(Persona::PlayStation);
+        assert_eq!(ps.persona, Persona::PlayStation);
+        // …and changes nothing else about the slot.
+        assert_eq!((ps.number, ps.preset), (spec.number, spec.preset));
+    }
+
+    #[test]
+    fn the_xinput_ceiling_is_below_the_slot_ceiling() {
+        // If these ever converge again, the "slots 5+ must be HID" rule in
+        // ksx-config becomes unreachable and should be deleted, not left lying.
+        // (Read through black_box: both are constants, and a plain compare here
+        // is a clippy error rather than the tripwire this test intends.)
+        let (xinput, max) = std::hint::black_box((MAX_XINPUT_SLOTS, MAX_SLOTS));
+        assert!(xinput < max);
+        assert_eq!(xinput, 4, "Windows' XInput ceiling is fixed at 4");
     }
 
     #[test]

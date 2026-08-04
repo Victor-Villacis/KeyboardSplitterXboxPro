@@ -17,6 +17,7 @@
 //! - [`device`] — [`DeviceId`] (instance-path identity) and [`KeyEvent`]
 //! - [`preset`] — [`Binding`], [`Preset`], and the `default`/`empty` built-ins
 //! - [`slot`] — [`SlotSpec`] and the 13-variant [`InvalidationReason`] taxonomy
+//! - [`persona`] — [`Persona`]: which controller a slot presents itself as
 //! - [`engine`] — the [`Engine`]: precompiled dispatch, per-device key state, diffing
 //! - [`escape`] — [`EscapeDetector`], emergency-escape detection (policy lives upstream)
 
@@ -25,6 +26,7 @@ pub mod engine;
 pub mod escape;
 pub mod key;
 pub mod pad;
+pub mod persona;
 pub mod preset;
 pub mod slot;
 
@@ -35,5 +37,6 @@ pub use key::Key;
 pub use pad::{
     Axis, DpadDirection, PadState, Trigger, XButton, XButtons, AXIS_CENTER, AXIS_MAX, AXIS_MIN,
 };
+pub use persona::{Persona, UnknownPersona};
 pub use preset::{Binding, Preset};
-pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS};
+pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS, MAX_XINPUT_SLOTS};

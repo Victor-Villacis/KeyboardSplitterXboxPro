@@ -261,6 +261,9 @@ fn parse_slot(
         keyboard: device("Keyboard"),
         mouse: device("Mouse"),
         preset,
+        // Legacy predates personas and only ever emulated Xbox 360 pads, so
+        // every imported slot is exactly what it was.
+        persona: ksx_core::Persona::default(),
     })
 }
 

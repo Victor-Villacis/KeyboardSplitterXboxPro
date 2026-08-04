@@ -142,6 +142,10 @@ impl VirtualPadBackend for RecordingBackend {
         Ok(handle)
     }
 
+    fn persona(&self, handle: PadHandle) -> Option<ksx_core::Persona> {
+        self.inner.persona(handle)
+    }
+
     fn user_index(&self, handle: PadHandle) -> Option<u8> {
         self.inner.user_index(handle)
     }
@@ -815,6 +819,9 @@ fn a_wedged_output_thread_cannot_prevent_un_capturing() {
             self.log.push(TraceEvent::Pad(PadEvent::Plug(handle.raw())));
             Ok(handle)
         }
+        fn persona(&self, handle: PadHandle) -> Option<ksx_core::Persona> {
+            self.inner.persona(handle)
+        }
         fn user_index(&self, handle: PadHandle) -> Option<u8> {
             self.inner.user_index(handle)
         }
@@ -938,6 +945,9 @@ fn a_wedged_output_thread_does_not_stall_the_engine() {
     impl VirtualPadBackend for Wedged {
         fn plug(&mut self) -> Result<PadHandle, OutputError> {
             self.inner.plug()
+        }
+        fn persona(&self, handle: PadHandle) -> Option<ksx_core::Persona> {
+            self.inner.persona(handle)
         }
         fn user_index(&self, handle: PadHandle) -> Option<u8> {
             self.inner.user_index(handle)
@@ -1394,6 +1404,9 @@ fn a_bus_with_no_pads_refuses_to_start_and_never_captures() {
         fn plug(&mut self) -> Result<PadHandle, OutputError> {
             Err(OutputError::BusNotFound)
         }
+        fn persona(&self, _: PadHandle) -> Option<ksx_core::Persona> {
+            Some(ksx_core::Persona::default())
+        }
         fn user_index(&self, _: PadHandle) -> Option<u8> {
             None
         }
@@ -1462,6 +1475,9 @@ fn every_pre_capture_plug_failure_refuses_with_exit_2() {
                 fn plug(&mut self) -> Result<PadHandle, OutputError> {
                     #[allow(clippy::redundant_closure_call)]
                     ($plug)()
+                }
+                fn persona(&self, _: PadHandle) -> Option<ksx_core::Persona> {
+                    Some(ksx_core::Persona::default())
                 }
                 fn user_index(&self, _: PadHandle) -> Option<u8> {
                     None

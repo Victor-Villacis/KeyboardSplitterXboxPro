@@ -14,7 +14,7 @@ use crate::error::ConfigError;
 use crate::function::parse_function;
 use crate::games::GamesFile;
 use crate::preset::{BindingEntry, PresetFile};
-use ksx_core::{Key, Preset, MAX_SLOTS};
+use ksx_core::{Key, Persona, Preset, MAX_SLOTS, MAX_XINPUT_SLOTS};
 
 /// One validation finding. All findings are non-fatal: the caller decides
 /// whether to refuse to start emulation (unknown preset ref) or just warn.
@@ -30,8 +30,15 @@ pub enum Issue {
     DuplicateDeviceAlias { alias: String },
     /// Two `[[slot]]` entries share a number.
     DuplicateSlotNumber { number: u8 },
-    /// `[[slot]]` number outside 1..=4.
+    /// `[[slot]]` number outside 1..=[`MAX_SLOTS`].
     SlotNumberOutOfRange { number: u8 },
+    /// More slots ask for an XInput persona than Windows has XInput slots.
+    ///
+    /// Not a ksx limit and not fixable by any virtual bus: Windows exposes
+    /// exactly four. The extra pads would plug and then be invisible to every
+    /// game, which is a failure that looks like success — so it is reported
+    /// here, where the fix (a HID persona) can be named.
+    TooManyXinputSlots { count: usize },
     /// Slot references a preset that is neither a preset file nor a built-in.
     UnknownPresetRef { slot: u8, preset: String },
     /// Slot keyboard/mouse is neither a `[[device]]` alias nor an instance
@@ -47,8 +54,10 @@ pub enum Issue {
         function: String,
         key: String,
     },
-    /// Game slot number outside 1..=4.
+    /// Game slot number outside 1..=[`MAX_SLOTS`].
     GameSlotNumberOutOfRange { game: String, number: u8 },
+    /// See [`Issue::TooManyXinputSlots`], for one game's slot list.
+    GameTooManyXinputSlots { game: String, count: usize },
     /// Two slots of one game share a number.
     GameDuplicateSlotNumber { game: String, number: u8 },
     /// Game slot references an unknown preset.
@@ -85,6 +94,15 @@ impl fmt::Display for Issue {
             Issue::SlotNumberOutOfRange { number } => {
                 write!(f, "[[slot]] number {number} is outside 1..={MAX_SLOTS}")
             }
+            Issue::TooManyXinputSlots { count } => {
+                write!(
+                    f,
+                    "{count} slots use persona '{}', but Windows has only {MAX_XINPUT_SLOTS} XInput slots; \
+                     give the extra slots persona '{}' (HID/DirectInput — read by MAME, RetroArch, Steam Input)",
+                    Persona::Xbox360,
+                    Persona::PlayStation
+                )
+            }
             Issue::UnknownPresetRef { slot, preset } => {
                 write!(f, "slot {slot} references preset '{preset}', which is neither a preset file nor a built-in")
             }
@@ -114,6 +132,15 @@ impl fmt::Display for Issue {
                 write!(
                     f,
                     "game '{game}': slot number {number} is outside 1..={MAX_SLOTS}"
+                )
+            }
+            Issue::GameTooManyXinputSlots { game, count } => {
+                write!(
+                    f,
+                    "game '{game}': {count} slots use persona '{}', but Windows has only \
+                     {MAX_XINPUT_SLOTS} XInput slots; give the extra slots persona '{}'",
+                    Persona::Xbox360,
+                    Persona::PlayStation
                 )
             }
             Issue::GameDuplicateSlotNumber { game, number } => {
@@ -199,6 +226,17 @@ pub fn validate(config: &ConfigFile, presets: &[PresetFile]) -> Vec<Issue> {
         }
     }
 
+    let xinput_slots = config
+        .slots
+        .iter()
+        .filter(|s| s.persona.is_xinput())
+        .count();
+    if xinput_slots > usize::from(MAX_XINPUT_SLOTS) {
+        issues.push(Issue::TooManyXinputSlots {
+            count: xinput_slots,
+        });
+    }
+
     for preset in presets {
         validate_preset(preset, &mut issues);
     }
@@ -245,6 +283,13 @@ pub fn validate_games(games: &GamesFile, presets: &[PresetFile]) -> Vec<Issue> {
                     });
                 }
             }
+        }
+        let xinput_slots = game.slots.iter().filter(|s| s.persona.is_xinput()).count();
+        if xinput_slots > usize::from(MAX_XINPUT_SLOTS) {
+            issues.push(Issue::GameTooManyXinputSlots {
+                game: game.title.clone(),
+                count: xinput_slots,
+            });
         }
     }
     issues
@@ -364,25 +409,30 @@ preset = "default"
                     keyboard: Some("Ghost Alias".into()),
                     mouse: None,
                     preset: "missing".into(),
+                    persona: Persona::default(),
                 },
                 SlotEntry {
                     number: 1,
                     keyboard: None,
                     mouse: None,
                     preset: "default".into(),
+                    persona: Persona::default(),
                 },
                 SlotEntry {
-                    number: 5,
+                    number: MAX_SLOTS + 1,
                     keyboard: None,
                     mouse: None,
                     preset: "empty".into(),
+                    persona: Persona::default(),
                 },
             ],
             ..ConfigFile::default()
         };
         let issues = validate(&cfg, &[]);
         assert!(issues.contains(&Issue::DuplicateSlotNumber { number: 1 }));
-        assert!(issues.contains(&Issue::SlotNumberOutOfRange { number: 5 }));
+        assert!(issues.contains(&Issue::SlotNumberOutOfRange {
+            number: MAX_SLOTS + 1
+        }));
         assert!(issues.contains(&Issue::UnknownPresetRef {
             slot: 1,
             preset: "missing".into()
@@ -392,6 +442,70 @@ preset = "default"
             reference: "Ghost Alias".into()
         }));
         assert_eq!(issues.len(), 4);
+    }
+
+    #[test]
+    fn a_fifth_xinput_slot_is_reported_with_the_fix_named() {
+        let slot = |number: u8, persona: Persona| SlotEntry {
+            number,
+            keyboard: None,
+            mouse: None,
+            preset: "default".into(),
+            persona,
+        };
+        // 5 Xbox slots: one more than Windows can ever show to a game.
+        let cfg = ConfigFile {
+            slots: (1..=5).map(|n| slot(n, Persona::Xbox360)).collect(),
+            ..ConfigFile::default()
+        };
+        let issues = validate(&cfg, &[]);
+        assert_eq!(issues, vec![Issue::TooManyXinputSlots { count: 5 }]);
+        // The message must point at the actual fix, not just complain.
+        let msg = issues[0].to_string();
+        assert!(msg.contains("playstation"), "{msg}");
+
+        // The supported 8-player shape: 4 Xbox + 4 PlayStation. No issues.
+        let cfg = ConfigFile {
+            slots: (1..=8)
+                .map(|n| {
+                    slot(
+                        n,
+                        if n <= 4 {
+                            Persona::Xbox360
+                        } else {
+                            Persona::PlayStation
+                        },
+                    )
+                })
+                .collect(),
+            ..ConfigFile::default()
+        };
+        assert_eq!(validate(&cfg, &[]), vec![]);
+    }
+
+    #[test]
+    fn a_games_fifth_xinput_slot_is_reported_per_game() {
+        use crate::games::GameSlotEntry;
+        let slot = |number: u8| GameSlotEntry {
+            number,
+            user_index: None,
+            keyboard: None,
+            mouse: None,
+            preset: "default".into(),
+            persona: Persona::Xbox360,
+        };
+        let mut games: GamesFile =
+            toml::from_str("[[game]]\ntitle = \"MAME 8P\"\npath = \"C:\\\\mame\\\\mame.exe\"\n")
+                .unwrap();
+        games.games[0].slots = (1..=6).map(slot).collect();
+        let issues = validate_games(&games, &[]);
+        assert_eq!(
+            issues,
+            vec![Issue::GameTooManyXinputSlots {
+                game: "MAME 8P".into(),
+                count: 6
+            }]
+        );
     }
 
     #[test]

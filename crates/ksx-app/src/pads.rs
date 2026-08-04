@@ -74,7 +74,10 @@ pub struct PadRow {
     pub slot: u8,
     /// Backend handle id ([`ksx_output::PadHandle::raw`]).
     pub handle: u32,
-    /// XInput `dwUserIndex`; `None` beyond the 4 XInput slots.
+    /// Which controller the pad presents itself as.
+    pub persona: ksx_core::Persona,
+    /// XInput `dwUserIndex`; `None` beyond the 4 XInput slots, and always
+    /// `None` for non-XInput personas.
     pub user_index: Option<u8>,
     /// LED number from the bus feedback, if one arrived during the drain.
     pub led_number: Option<u8>,
@@ -88,6 +91,7 @@ pub fn pads_json(driver: &BusDriverReport, pads: &[PadRow]) -> serde_json::Value
             serde_json::json!({
                 "slot": p.slot,
                 "handle": p.handle,
+                "persona": p.persona.as_str(),
                 "user_index": p.user_index,
                 "led_number": p.led_number,
             })
@@ -102,7 +106,12 @@ pub fn error_json(code: &str, message: &str) -> serde_json::Value {
 }
 
 #[cfg(windows)]
-pub fn run(count: u8, hold_secs: u64, json: bool) -> anyhow::Result<()> {
+pub fn run(
+    count: u8,
+    persona: ksx_core::Persona,
+    hold_secs: u64,
+    json: bool,
+) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use ksx_output::{VigemBackend, VirtualPadBackend as _};
 
@@ -123,25 +132,36 @@ pub fn run(count: u8, hold_secs: u64, json: bool) -> anyhow::Result<()> {
     let mut rows = Vec::new();
     for slot in 1..=count {
         let handle = backend
-            .plug()
-            .with_context(|| format!("plugging pad {slot} of {count}"))?;
+            .plug_persona(persona)
+            .with_context(|| format!("plugging {persona} pad {slot} of {count}"))?;
         let user_index = backend.user_index(handle);
-        let led_number = drain_led(&mut backend, handle);
+        // Draining LED feedback on a persona with no feedback channel would
+        // just burn the 600ms drain deadline per pad reporting nothing.
+        let led_number = persona
+            .has_feedback()
+            .then(|| drain_led(&mut backend, handle))
+            .flatten();
         if !json {
-            let ui = match user_index {
-                Some(i) => i.to_string(),
-                None => "none".to_string(),
-            };
-            let led = match led_number {
-                Some(n) => n.to_string(),
-                None => "?".to_string(),
-            };
-            println!("pad {slot}: user index {ui} (led {led})");
+            if persona.is_xinput() {
+                let ui = match user_index {
+                    Some(i) => i.to_string(),
+                    None => "none".to_string(),
+                };
+                let led = match led_number {
+                    Some(n) => n.to_string(),
+                    None => "?".to_string(),
+                };
+                println!("pad {slot}: user index {ui} (led {led})");
+            } else {
+                // No XInput index and no LED — by design, not by failure.
+                println!("pad {slot}: {} (HID/DirectInput)", persona.label());
+            }
         }
         handles.push(handle);
         rows.push(PadRow {
             slot,
             handle: handle.raw(),
+            persona,
             user_index,
             led_number,
         });
@@ -169,7 +189,12 @@ pub fn run(count: u8, hold_secs: u64, json: bool) -> anyhow::Result<()> {
 }
 
 #[cfg(not(windows))]
-pub fn run(_count: u8, _hold_secs: u64, _json: bool) -> anyhow::Result<()> {
+pub fn run(
+    _count: u8,
+    _persona: ksx_core::Persona,
+    _hold_secs: u64,
+    _json: bool,
+) -> anyhow::Result<()> {
     anyhow::bail!("`ksx pads` is Windows-only (it drives the ViGEmBus kernel driver)")
 }
 
@@ -347,12 +372,14 @@ mod tests {
             PadRow {
                 slot: 1,
                 handle: 0,
+                persona: ksx_core::Persona::Xbox360,
                 user_index: Some(0),
                 led_number: Some(2),
             },
             PadRow {
                 slot: 2,
                 handle: 1,
+                persona: ksx_core::Persona::PlayStation,
                 user_index: None,
                 led_number: None,
             },

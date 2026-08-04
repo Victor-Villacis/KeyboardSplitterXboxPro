@@ -27,6 +27,13 @@ pub enum OutputError {
     #[error("unknown or unplugged pad handle {0:?}")]
     UnknownHandle(PadHandle),
 
+    /// This backend cannot emulate the requested controller.
+    ///
+    /// Never downgraded to a working pad of a different kind: see
+    /// [`VirtualPadBackend::plug_persona`](crate::VirtualPadBackend::plug_persona).
+    #[error("this backend cannot emulate a '{0}' controller")]
+    PersonaUnsupported(ksx_core::Persona),
+
     /// The underlying driver client reported an error.
     #[cfg(windows)]
     #[error("ViGEmBus target operation failed")]
@@ -61,7 +68,16 @@ mod tests {
     fn only_bus_not_found_is_bus_missing() {
         assert!(!OutputError::PlugTimeout(Duration::from_secs(5)).is_bus_missing());
         assert!(!OutputError::UnknownHandle(PadHandle(7)).is_bus_missing());
+        assert!(!OutputError::PersonaUnsupported(ksx_core::Persona::PlayStation).is_bus_missing());
         #[cfg(windows)]
         assert!(!OutputError::TargetError(vigem_client::Error::NoFreeSlot).is_bus_missing());
+    }
+
+    #[test]
+    fn unsupported_persona_names_the_persona() {
+        // The message has to say which controller was refused; "unsupported
+        // persona" alone leaves the user guessing which slot to edit.
+        let msg = OutputError::PersonaUnsupported(ksx_core::Persona::PlayStation).to_string();
+        assert!(msg.contains("playstation"), "{msg}");
     }
 }

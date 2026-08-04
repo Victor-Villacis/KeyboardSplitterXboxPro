@@ -123,7 +123,7 @@ enum Command {
     },
     /// Manage / test virtual pads (plug N pads, LED order, kill-recovery)
     ///
-    /// Plugs N virtual Xbox 360 pads through ViGEmBus, prints each pad's
+    /// Plugs N virtual pads through ViGEmBus, prints each pad's
     /// XInput user index + LED number, runs a visible test pattern
     /// (A/B/X/Y cycle, circular stick sweep, trigger pulses) until
     /// --hold-secs elapses or Ctrl+C, then unplugs cleanly.
@@ -131,9 +131,15 @@ enum Command {
     /// Exit codes: 0 = pads plugged and unplugged cleanly, 1 = error,
     /// 2 = ViGEmBus driver is not installed.
     Pads {
-        /// Pads to plug (XInput has 4 slots; pads 5..=8 are DirectInput-only)
+        /// Pads to plug (XInput has 4 slots; pads 5..=8 need --persona playstation)
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=8))]
         count: u8,
+        /// Controller type for every pad: xbox360 (default) or playstation
+        /// (aliases ds4/ps4 accepted). PlayStation pads are HID/DirectInput —
+        /// no XInput user index, no LED, and joy.cpl shows a "Wireless
+        /// Controller".
+        #[arg(long, default_value = "xbox360", value_parser = parse_persona)]
+        persona: ksx_core::Persona,
         /// Seconds to run the test pattern before unplugging
         #[arg(long, default_value_t = 10)]
         hold_secs: u64,
@@ -370,6 +376,12 @@ enum WinusbCommand {
     },
 }
 
+/// Clap adapter for [`ksx_core::Persona`]'s lenient `FromStr` (ksx-core carries
+/// no clap dependency). The error already names the valid values.
+fn parse_persona(s: &str) -> Result<ksx_core::Persona, ksx_core::UnknownPersona> {
+    s.parse()
+}
+
 fn main() -> anyhow::Result<()> {
     // Logging first, and for **every** command — not just the daemon. A
     // `ksx run` started by the cabinet's logon task has no console either, and
@@ -399,9 +411,10 @@ fn main() -> anyhow::Result<()> {
         } => monitor::run(for_secs, record, json),
         Command::Pads {
             count,
+            persona,
             hold_secs,
             json,
-        } => pads::run(count, hold_secs, json),
+        } => pads::run(count, persona, hold_secs, json),
         Command::ImportLegacy {
             from,
             dry_run,
@@ -583,6 +596,7 @@ mod tests {
             cli.command,
             Command::Pads {
                 count: 4,
+                persona: ksx_core::Persona::Xbox360,
                 hold_secs: 10,
                 json: false,
             }
@@ -598,10 +612,32 @@ mod tests {
             cli.command,
             Command::Pads {
                 count: 2,
+                persona: ksx_core::Persona::Xbox360,
                 hold_secs: 2,
                 json: true,
             }
         ));
+    }
+
+    #[test]
+    fn pads_persona_accepts_aliases_and_rejects_unknowns() {
+        for (arg, want) in [
+            ("playstation", ksx_core::Persona::PlayStation),
+            ("ds4", ksx_core::Persona::PlayStation),
+            ("PS4", ksx_core::Persona::PlayStation),
+            ("xbox360", ksx_core::Persona::Xbox360),
+        ] {
+            let cli = Cli::try_parse_from(["ksx", "pads", "--persona", arg]).unwrap();
+            assert!(
+                matches!(cli.command, Command::Pads { persona, .. } if persona == want),
+                "{arg}"
+            );
+        }
+        let err = Cli::try_parse_from(["ksx", "pads", "--persona", "gamecube"])
+            .err()
+            .expect("an unknown persona must be a parse error");
+        let msg = err.to_string();
+        assert!(msg.contains("playstation"), "must name the options: {msg}");
     }
 
     #[test]

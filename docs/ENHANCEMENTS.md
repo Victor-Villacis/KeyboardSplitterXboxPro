@@ -70,12 +70,16 @@ XInput-only game still sees four; that is Windows, not ksx.
 The 4-slot cap itself is unchanged and unfixable: no virtual bus can create
 XInput slot 5. What changed is that we no longer need XInput for players 5+.
 
-**Blocked on one bug**: `IOCTL_DS4_SUBMIT_REPORT` currently fails with
-`ERROR_NO_MORE_ITEMS` on every pad, so ksx can create DS4 pads but not drive
-them. The vendored client's DS4 path has never been exercised by anyone
-(upstream ships no DS4 example or test). Fix that, then the persona plumbing is
-the ~2–4 day job sketched in the plan. `MAX_SLOTS = 4` in `ksx-core/src/slot.rs`
-also has to rise, with its validation sites.
+**Shipped 2026-08-04.** The submit bug (`ERROR_NO_MORE_ITEMS`) was a driver
+startup window, not a marshalling error — `Ds4Pdo.cpp` drops reports until the
+HID stack starts polling, 1–3 ms after `WAIT_DEVICE_READY`; `wait_ready` now
+primes through it and `update` retries transients (fix in the vendored client,
+worth offering upstream). The persona plumbing is live end to end: `Persona` in
+ksx-core (`persona = "playstation"` in TOML, `ds4`/`ps4` accepted as aliases),
+`MAX_SLOTS` raised to 8 with a validation rule that refuses a fifth `xbox360`
+slot by name, the `PadState`→DS4 mapper with a documented D-pad SOCD collapse,
+and `ksx pads --persona playstation` verified on the cabinet: six pads plugged,
+driven, and unplugged with zero XInput slots consumed.
 
 ## E5 — AI-drivable CLI (accepted into CURRENT scope, not deferred)
 
