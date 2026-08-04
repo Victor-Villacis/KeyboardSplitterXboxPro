@@ -7,23 +7,34 @@ use winapi::shared::winerror;
 use crate::*;
 
 /// How long [`DualShock4Wired::wait_ready`] keeps offering a neutral report
-/// before it gives up on the HID stack ever polling this target.
+/// before it stops waiting for the HID stack to start polling this target.
 ///
-/// Measured window on ViGEmBus 1.21.442.0 is 1-3ms; a second is pure headroom.
+/// The measured window on ViGEmBus 1.21.442.0 is 1-3ms, so this is ~80x
+/// headroom. It is deliberately not "generous": priming is best-effort (see
+/// [`DualShock4Wired::wait_ready`]), and a budget large enough to cover a
+/// first-ever DS4 plug -- where Windows still has to build the HID stack --
+/// would stall a multi-pad startup for seconds to buy nothing.
 #[cfg(feature = "unstable_ds4")]
-const READY_BUDGET: time::Duration = time::Duration::from_secs(1);
+const READY_BUDGET: time::Duration = time::Duration::from_millis(250);
+
+/// Gap between priming attempts. Off the input path, so a real sleep is right;
+/// the value is nominal, as Windows rounds any sub-millisecond sleep up to the
+/// current timer resolution (measured here: a 1ms sleep costs ~1.5ms).
+#[cfg(feature = "unstable_ds4")]
+const READY_GAP: time::Duration = time::Duration::from_millis(1);
 
 /// How long [`DualShock4Wired::update`] retries a report the driver currently
 /// has nowhere to put. Short: `wait_ready` already absorbed the startup window,
 /// so this only covers a transient, and it sits in the caller's input path.
+///
+/// Retries here spin on [`thread::yield_now`] rather than sleeping. A sleep
+/// cannot express this budget: `thread::sleep` on Windows rounds up to the
+/// process timer resolution, so a nominal 250us gap measured 512us on the
+/// cabinet and would cost up to 15.6ms on a machine that has not raised the
+/// resolution -- 18x the whole ksx input-latency budget, for a wait that is
+/// normally microseconds (`yield_now` measured 275ns).
 #[cfg(feature = "unstable_ds4")]
 const UPDATE_BUDGET: time::Duration = time::Duration::from_millis(2);
-
-/// Gap between retries. The driver flushes its pending interrupt-IN queue every
-/// 5ms (`DS4_QUEUE_FLUSH_PERIOD`, ViGEmBus sys/Ds4Pdo.hpp), so retrying at a
-/// coarser grain than that would just waste the budget.
-#[cfg(feature = "unstable_ds4")]
-const RETRY_GAP: time::Duration = time::Duration::from_micros(250);
 
 /// DualShock4 HID Input report.
 #[cfg(feature = "unstable_ds4")]
@@ -176,6 +187,10 @@ impl<CL: Borrow<Client>> DualShock4Wired<CL> {
 	/// Waits until the virtual controller is ready.
 	///
 	/// Any updates submitted before the virtual controller is ready may return an error.
+	///
+	/// For a DS4 target this also *primes* the driver: see the comment in the
+	/// body. Priming is best-effort and never turns a successful plug into an
+	/// error -- if it does not land, the first [`update`](Self::update) says so.
 	#[inline(never)]
 	pub fn wait_ready(&mut self) -> Result<(), Error> {
 		if !self.is_attached() {
@@ -191,53 +206,114 @@ impl<CL: Borrow<Client>> DualShock4Wired<CL> {
 		// IOCTL_WAIT_DEVICE_READY only says the bus finished creating the PDO.
 		// A DS4 target needs more than that before it will take a report:
 		// `EmulationTargetDS4::SubmitReportImpl` (ViGEmBus sys/Ds4Pdo.cpp) opens
-		// by dequeuing a pending interrupt-IN request and returns that queue's
-		// status when there is none -- STATUS_NO_MORE_ENTRIES, which surfaces to
-		// user mode as ERROR_NO_MORE_ITEMS (259). Those requests only exist once
-		// the HID stack above the PDO starts polling, which lags this IOCTL by
+		// by dequeuing a pending interrupt-IN request and bails out with that
+		// queue's status if there is none --
+		//
+		//     status = WdfIoQueueRetrieveNextRequest(this->_PendingUsbInRequests, &usbRequest);
+		//     if (!NT_SUCCESS(status)) return status;
+		//
+		// -- STATUS_NO_MORE_ENTRIES, which surfaces to user mode as
+		// ERROR_NO_MORE_ITEMS (259). Requests only land in that queue once the
+		// HID stack above the PDO starts polling it, which lags this IOCTL by
 		// 1-3ms. Absorb that window here so the caller's first real update is
 		// not dropped on the floor.
+		//
+		// Note the queue is fed by hidclass itself, not by an application: with
+		// no reader open at all, 50/50 submits are accepted (measured). The only
+		// window where it is empty is this one, right after plug -- which is
+		// exactly where a plug/wait_ready/update sequence used to land.
 		//
 		// X360 needs none of this: xusb22 keeps the interrupt-IN queue populated
 		// from the moment the device starts, which is why the identically shaped
 		// `Xbox360Wired::update` has never been seen to fail this way.
 		#[cfg(feature = "unstable_ds4")]
-		self.submit(&DS4Report::default(), READY_BUDGET)?;
+		let _ = self.submit(&DS4Report::default(), READY_BUDGET, Some(READY_GAP));
 
 		Ok(())
 	}
 
-	/// Submits one report, retrying while the driver has no pending
-	/// interrupt-IN request to complete (`ERROR_NO_MORE_ITEMS`).
+	/// Submits one report exactly once, with no retry.
 	///
-	/// A refused submit is a *dropped* report: `SubmitReportImpl` returns before
-	/// it copies anything into the PDO's cached report, so the state change is
-	/// simply lost. Upstream ViGEmClient hides this -- `vigem_target_ds4_update`
-	/// ignores every `GetOverlappedResult` failure except `ERROR_ACCESS_DENIED`
-	/// and reports `VIGEM_ERROR_NONE` -- which is harmless for a client that
-	/// streams reports on a timer (DS4Windows) and wrong for one that submits
-	/// only on change. Retrying is what actually gets the report to the driver.
+	/// This is upstream `vigem_target_ds4_update`'s IOCTL without upstream's
+	/// error swallowing, and it is the honest view of what the driver did:
+	///
+	/// * `Ok(())` -- the report was copied into the PDO's cached report and
+	///   handed to a waiting interrupt-IN request.
+	/// * `Err(Error::TargetNotReady)` -- `STATUS_NO_MORE_ENTRIES`: no request
+	///   was pending, so the report was **dropped**. `SubmitReportImpl` returns
+	///   before it copies anything, so the state change is simply lost and the
+	///   next flush of the pending queue (every `DS4_QUEUE_FLUSH_PERIOD` = 5ms,
+	///   `PendingUsbRequestsTimerFunc`) re-sends the *previous* report.
+	///
+	/// Upstream hides that distinction: `vigem_target_ds4_update` ignores every
+	/// `GetOverlappedResult` failure except `ERROR_ACCESS_DENIED` and returns
+	/// `VIGEM_ERROR_NONE` regardless. That is harmless for a client that streams
+	/// reports on a timer (DS4Windows) and wrong for one that submits only on
+	/// change -- the dropped edge never comes back. Prefer
+	/// [`update`](Self::update), which retries; use this to observe the driver.
 	#[cfg(feature = "unstable_ds4")]
-	fn submit(&mut self, report: &DS4Report, budget: time::Duration) -> Result<(), Error> {
+	#[inline(never)]
+	pub fn try_update(&mut self, report: &DS4Report) -> Result<(), Error> {
+		if !self.is_attached() {
+			return Err(Error::NotPluggedIn);
+		}
+
+		self.submit_once(report).map_err(Self::submit_error)
+	}
+
+	/// One `IOCTL_DS4_SUBMIT_REPORT`, raw win32 error preserved so the retry
+	/// loop can tell "nothing is polling *yet*" (retry) from "this serial is
+	/// gone" (do not).
+	#[cfg(feature = "unstable_ds4")]
+	fn submit_once(&mut self, report: &DS4Report) -> Result<(), u32> {
+		unsafe {
+			let mut dsr = bus::DS4SubmitReport::new(self.serial_no, *report);
+			let device = self.client.borrow().device;
+			dsr.ioctl(device, self.event.handle)
+		}
+	}
+
+	#[cfg(feature = "unstable_ds4")]
+	fn submit_error(err: u32) -> Error {
+		match err {
+			// STATUS_NO_MORE_ENTRIES: no interrupt-IN request was pending, so
+			// the report was dropped without being cached.
+			winerror::ERROR_NO_MORE_ITEMS => Error::TargetNotReady,
+			// STATUS_DEVICE_DOES_NOT_EXIST: Bus_Ds4SubmitReportHandler could not
+			// find this serial (sys/Queue.cpp). Matches `Xbox360Wired::update`.
+			winerror::ERROR_DEV_NOT_EXIST => Error::TargetNotReady,
+			err => Error::WinError(err),
+		}
+	}
+
+	/// Submits one report, retrying while the driver has nowhere to put it.
+	///
+	/// `gap` is the pause between attempts: `Some(_)` sleeps (startup paths),
+	/// `None` spins on [`thread::yield_now`] (the caller's input path, where a
+	/// Windows sleep cannot express a sub-millisecond gap -- see
+	/// [`UPDATE_BUDGET`]).
+	#[cfg(feature = "unstable_ds4")]
+	fn submit(
+		&mut self,
+		report: &DS4Report,
+		budget: time::Duration,
+		gap: Option<time::Duration>,
+	) -> Result<(), Error> {
 		let start = time::Instant::now();
 		loop {
-			let result = unsafe {
-				let mut dsr = bus::DS4SubmitReport::new(self.serial_no, *report);
-				let device = self.client.borrow().device;
-				dsr.ioctl(device, self.event.handle)
-			};
-			match result {
+			match self.submit_once(report) {
 				Ok(()) => return Ok(()),
-				// Nothing is polling the target yet (or right now).
+				// Nothing is polling the target yet (or right at this instant).
 				Err(winerror::ERROR_NO_MORE_ITEMS) => {
 					if start.elapsed() >= budget {
 						return Err(Error::TargetNotReady);
 					}
-					thread::sleep(RETRY_GAP);
+					match gap {
+						Some(gap) => thread::sleep(gap),
+						None => thread::yield_now(),
+					}
 				}
-				// Bus_Ds4SubmitReportHandler could not find this serial.
-				Err(winerror::ERROR_DEV_NOT_EXIST) => return Err(Error::TargetNotReady),
-				Err(err) => return Err(Error::WinError(err)),
+				Err(err) => return Err(Self::submit_error(err)),
 			}
 		}
 	}
@@ -253,7 +329,7 @@ impl<CL: Borrow<Client>> DualShock4Wired<CL> {
 			return Err(Error::NotPluggedIn);
 		}
 
-		self.submit(report, UPDATE_BUDGET)
+		self.submit(report, UPDATE_BUDGET, None)
 	}
 
 	// #[inline(never)]

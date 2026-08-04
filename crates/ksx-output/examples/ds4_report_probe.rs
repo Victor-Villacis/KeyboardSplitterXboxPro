@@ -4,8 +4,9 @@
 //! `ds4_slot_probe` proved DS4 targets dodge the XInput 4-slot cap but could not
 //! drive them: every submit failed with `ERROR_NO_MORE_ITEMS` (259). Reading
 //! ViGEmBus' kernel source explains it — `EmulationTargetDS4::SubmitReportImpl`
-//! (sys/Ds4Pdo.cpp) *starts* by dequeuing a pending interrupt-IN request and
-//! bails out with that queue's status if there is none:
+//! (sys/Ds4Pdo.cpp, tag v1.21.442.0 = the driver installed here) *starts* by
+//! dequeuing a pending interrupt-IN request and bails out with that queue's
+//! status if there is none:
 //!
 //! ```text
 //! status = WdfIoQueueRetrieveNextRequest(this->_PendingUsbInRequests, &usbRequest);
@@ -17,25 +18,26 @@
 //! So 259 is not a marshalling bug and not a permissions problem: it is a
 //! **startup race**, and the spike lost it by submitting exactly once.
 //!
-//! Measured here on ViGEmBus 1.21.442.0 (unfixed crate, one pad):
+//! Two corrections to the first version of this probe, both measured below:
 //!
-//! ```text
-//! [plug] plugin 310.9µs, wait_ready returned at 1.7544ms
-//! [0   ] first report ACCEPTED at 4.3417ms (2 refusals with 259 before it)
-//! [A   ] no reader open : 50 ok, 0 x 259   <- steady state never refuses
-//! [C   ] 200 unpaced submits: 0 refused
-//! ```
+//! * The queue is fed by *hidclass*, not by an application. Submits succeed with
+//!   no reader open at all, so "259 means nobody is listening" is wrong — the
+//!   only window where the queue is empty is the one right after plug.
+//! * Phases here submit with [`DualShock4Wired::try_update`] (single shot), not
+//!   `update` (retries). Measuring through the retry would measure the fix, not
+//!   the driver.
 //!
-//! `DualShock4Wired::wait_ready` now absorbs that window, so phase 0 should show
-//! zero refusals. The phases:
-//!   0. time from plug to the first accepted report
-//!   A. submit with no reader open       -> the queue is fed by hidclass anyway
-//!   B/C. paced and unpaced submits with a reader open
-//!   then press/release verified byte-for-byte on the wire
+//! Phases:
+//!   0. **control** — a pad that is plugged and driven with no priming, i.e. the
+//!      spike's sequence. Reproduces 259 and times the window.
+//!   1. **fixed** — a pad taken through `wait_ready`, which primes. One
+//!      single-shot submit must be accepted with no retry.
+//!   2. **A/B/C** — raw acceptance rate with no reader, with a reader, and
+//!      unpaced; then press/release verified byte-for-byte on the wire.
 //!
 //! Run on the cabinet: cargo run -p ksx-output --example ds4_report_probe
 //! Opens one HID handle for reading (what joy.cpl does); claims nothing, binds
-//! nothing, installs nothing. The pad is unplugged on exit.
+//! nothing, installs nothing. Both pads are unplugged on exit.
 #![cfg(windows)]
 
 use std::ptr;
@@ -184,16 +186,18 @@ fn pressed_report() -> DS4Report {
     }
 }
 
-/// Submit `ATTEMPTS` copies of `report`, returning (ok, err259, other).
+/// Submit `ATTEMPTS` copies of `report` *without* retrying, returning
+/// (ok, refused_259, other). Single-shot on purpose: `update` would retry and
+/// this phase is measuring what the driver does, not what the retry hides.
 fn submit_burst(
     pad: &mut DualShock4Wired<Arc<Client>>,
     report: &DS4Report,
 ) -> (usize, usize, Vec<String>) {
     let (mut ok, mut busy, mut other) = (0, 0, Vec::new());
     for _ in 0..ATTEMPTS {
-        match pad.update(report) {
+        match pad.try_update(report) {
             Ok(()) => ok += 1,
-            Err(vigem_client::Error::WinError(259)) => busy += 1,
+            Err(vigem_client::Error::TargetNotReady) => busy += 1,
             Err(e) => other.push(format!("{e:?}")),
         }
         std::thread::sleep(Duration::from_millis(2));
@@ -211,41 +215,69 @@ fn main() {
         before.len()
     );
 
+    // --- Phase 0: the control -------------------------------------------------
+    // A pad driven with no priming at all, which is what the spike did. If the
+    // startup-race story is right this must refuse, then start accepting a few
+    // ms later, all by itself.
+    {
+        let mut ctrl = DualShock4Wired::new(client.clone(), TargetId::DUALSHOCK4_WIRED);
+        let t0 = Instant::now();
+        ctrl.plugin().expect("plugin");
+        let first = ctrl.try_update(&DS4Report::default());
+        println!(
+            "[0   ] unprimed pad, submit at {:?}: {}",
+            t0.elapsed(),
+            match &first {
+                Ok(()) => "ACCEPTED (no window to lose)".to_string(),
+                Err(e) => format!("REFUSED ({e:?}) <- the original bug"),
+            }
+        );
+
+        let mut refused = 0usize;
+        let mut first_ok = None;
+        while t0.elapsed() < Duration::from_secs(10) {
+            match ctrl.try_update(&DS4Report::default()) {
+                Ok(()) => {
+                    first_ok = Some(t0.elapsed());
+                    break;
+                }
+                Err(vigem_client::Error::TargetNotReady) => refused += 1,
+                Err(e) => {
+                    println!("[0   ] unexpected error: {e:?}");
+                    break;
+                }
+            }
+            std::thread::yield_now();
+        }
+        match first_ok {
+            Some(t) => println!(
+                "[0   ] queue starts accepting at {t:?} ({refused} refusals with 259 first)"
+            ),
+            None => println!("[0   ] never accepted within 10s ({refused} refusals)"),
+        }
+        // ctrl unplugs here.
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // --- Phase 1: the fixed path ---------------------------------------------
     let mut pad = DualShock4Wired::new(client.clone(), TargetId::DUALSHOCK4_WIRED);
     let t_plug = Instant::now();
     pad.plugin().expect("plugin");
     let t_plugged = t_plug.elapsed();
     pad.wait_ready().expect("wait_ready");
     let t_ready = t_plug.elapsed();
-    println!("[plug] plugin {t_plugged:?}, wait_ready returned at {t_ready:?}");
+    println!("\n[plug] plugin {t_plugged:?}, wait_ready (primes) returned at {t_ready:?}");
 
-    // --- Phase 0: how long after `wait_ready` before a report is accepted? ----
-    // This is the spike's exact sequence (plugin -> wait_ready -> update), which
-    // failed with 259 on all six pads. Measure the window instead of guessing.
-    // With the fix in place `wait_ready` has already paid for it, so this should
-    // report the first attempt accepted and zero refusals.
-    let mut refused = 0usize;
-    let mut first_ok = None;
-    while t_plug.elapsed() < Duration::from_secs(10) {
-        match pad.update(&DS4Report::default()) {
-            Ok(()) => {
-                first_ok = Some(t_plug.elapsed());
-                break;
-            }
-            Err(vigem_client::Error::WinError(259)) => refused += 1,
-            Err(e) => {
-                println!("[0   ] unexpected error: {e:?}");
-                break;
-            }
+    // One single-shot submit. No retry to hide behind: if wait_ready did its job
+    // this is accepted outright.
+    let primed = pad.try_update(&pressed_report());
+    println!(
+        "[1   ] first single-shot submit after wait_ready: {}",
+        match &primed {
+            Ok(()) => "ACCEPTED".to_string(),
+            Err(e) => format!("REFUSED ({e:?})"),
         }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    match first_ok {
-        Some(t) => println!(
-            "[0   ] first report ACCEPTED at {t:?} ({refused} refusals with 259 before it)"
-        ),
-        None => println!("[0   ] no report accepted within 10s ({refused} refusals)"),
-    }
+    );
 
     // Enumeration is asynchronous; give the HID stack a moment to build the node.
     let mut fresh = Vec::new();
@@ -333,17 +365,37 @@ fn main() {
     }
 
     // --- Phase C: back-to-back submits, no pacing ----------------------------
-    // A daemon can emit two state changes inside one millisecond. If the driver
-    // refuses submits faster than the host polls, `update` must not drop them.
+    // A daemon can emit two state changes inside one millisecond. Single-shot
+    // here too: this measures how often the driver refuses when pushed faster
+    // than the host polls, which is exactly what `update`'s retry has to cover.
     let mut burst_refused = 0usize;
+    let t_burst = Instant::now();
     for i in 0..200u32 {
         let mut r = pressed_report();
         r.thumb_ly = (i % 200) as u8;
-        if let Err(vigem_client::Error::WinError(259)) = pad.update(&r) {
+        if let Err(vigem_client::Error::TargetNotReady) = pad.try_update(&r) {
             burst_refused += 1;
         }
     }
-    println!("[C   ] 200 unpaced submits: {burst_refused} refused with 259");
+    println!(
+        "[C   ] 200 unpaced single-shot submits in {:?}: {burst_refused} refused with 259",
+        t_burst.elapsed()
+    );
+
+    // Same burst through `update`, which retries: nothing should be refused.
+    let mut retry_failed = 0usize;
+    let t_retry = Instant::now();
+    for i in 0..200u32 {
+        let mut r = pressed_report();
+        r.thumb_ly = (i % 200) as u8;
+        if pad.update(&r).is_err() {
+            retry_failed += 1;
+        }
+    }
+    println!(
+        "[C   ] 200 unpaced update() (retrying) in {:?}: {retry_failed} failed",
+        t_retry.elapsed()
+    );
 
     std::thread::sleep(Duration::from_millis(100));
     let _ = pad.update(&pressed_report());
@@ -366,24 +418,25 @@ fn main() {
     let buttons_rel = u16::from_le_bytes([released[5], released[6]]);
 
     println!("\n--- RESULT ---");
-    println!("phase A (no reader) : {ok_a}/{ATTEMPTS} submits accepted");
-    println!("phase B (reader)    : {ok_b}/{ATTEMPTS} submits accepted");
+    println!("phase A (no reader) : {ok_a}/{ATTEMPTS} single-shot submits accepted");
+    println!("phase B (reader)    : {ok_b}/{ATTEMPTS} single-shot submits accepted");
     println!("pressed  on the wire: thumb_lx {lx:#04x} (want 0xff), buttons {buttons:#06x} (want 0x0028)");
     println!("released on the wire: thumb_lx {lx_rel:#04x} (want 0x80), buttons {buttons_rel:#06x} (want 0x0008)");
 
     let delivered = lx == 0xFF && buttons == 0x0028 && lx_rel == 0x80 && buttons_rel == 0x0008;
+    let primed_ok = primed.is_ok();
     println!(
         "\nVERDICT: {}",
-        if delivered && ok_b > 0 && ok_a == 0 {
-            "confirmed — 259 means 'no reader'; with a reader open the report reaches the wire"
-        } else if delivered {
-            "reports reach the wire, but the phase A/B split is not what the kernel source predicts"
-        } else {
-            "reports did NOT reach the wire — inspect the bytes above"
+        match (delivered, primed_ok) {
+            (true, true) =>
+                "fixed — priming in wait_ready closes the post-plug window, and the report reaches the wire byte-for-byte",
+            (true, false) =>
+                "reports reach the wire, but wait_ready's priming did NOT close the window — the first submit was still refused",
+            (false, _) => "reports did NOT reach the wire — inspect the bytes above",
         }
     );
 
     drop(pad); // unplug before the reader's handle closes
     let _ = reader.join();
-    println!("(pad unplugged)");
+    println!("(pads unplugged)");
 }
