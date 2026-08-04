@@ -152,6 +152,7 @@ mod tests {
             path: path.into(),
             arguments: String::new(),
             process_name: process_name.map(str::to_owned),
+            launcher_grace_ms: None,
             block_keyboards: true,
             block_mice: false,
             slots: Vec::new(),
@@ -179,7 +180,8 @@ mod tests {
         assert_eq!(h.status_line().unwrap(), "'Portal 2': running");
 
         h.session_host_mut().alive = Some(false);
-        h.session_host_mut().now_ms = 10_000;
+        // Past the launcher grace: this exit is the game's own, not a hand-off.
+        h.session_host_mut().now_ms = ksx_games::DEFAULT_LAUNCHER_GRACE_MS + 1;
         assert_eq!(h.poll(&mut out), Some(HookStop::GameExited));
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("exited — stopping emulation"), "{text}");
@@ -220,7 +222,7 @@ mod tests {
         let mut h = hook(r"C:\g\portal2.exe", None, FakeHost::running(1));
         h.started(&mut out).unwrap();
         h.session_host_mut().alive = Some(false);
-        h.session_host_mut().now_ms = 10_000;
+        h.session_host_mut().now_ms = ksx_games::DEFAULT_LAUNCHER_GRACE_MS + 1;
         assert_eq!(h.poll(&mut out), Some(HookStop::GameExited));
         out.clear();
         h.finished(&mut out);
@@ -262,7 +264,7 @@ mod tests {
         );
         out.clear();
 
-        // The launcher exits inside the 3 s window -> hand-off.
+        // The launcher exits well inside the launcher grace -> hand-off.
         h.session_host_mut().alive = Some(false);
         h.session_host_mut().now_ms = 800;
         assert_eq!(h.poll(&mut out), None);

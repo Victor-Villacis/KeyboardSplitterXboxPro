@@ -43,8 +43,10 @@ argument, and let ksx run the emulator.
 
 Launchers hand off. `steam.exe` passes the request to the running client and
 returns in under a second; a `.bat`, a 32→64-bit trampoline and most storefronts
-do the same. ksx keeps the legacy rule — **a process that exits within 3 seconds
-was a launcher, not the game** — and then goes looking for the real one:
+do the same. ksx keeps the legacy rule in shape but not in number — **a process
+that exits within 10 seconds was a launcher, not the game** (legacy's 3 s
+mis-classified a 5-second `steam.exe` hand-off as the player quitting; override
+per profile with `launcher_grace_ms`) — and then goes looking for the real one:
 
 ```toml
 [[game]]

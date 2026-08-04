@@ -182,6 +182,10 @@ fn parse_game(
         // imported profile therefore starts without one, and `ksx run --game`
         // tells the user which line to add if it turns out to need it.
         process_name: None,
+        // Same reasoning: legacy had no notion of a launcher grace at all, so an
+        // imported profile takes ksx's default and can be tuned per profile
+        // afterwards if its launcher turns out to be slower still.
+        launcher_grace_ms: None,
         block_keyboards,
         block_mice,
         slots: Vec::new(),

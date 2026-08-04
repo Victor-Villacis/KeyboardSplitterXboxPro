@@ -15,6 +15,42 @@
 //! useless on a cabinet — the whole point of `ksx run --game` is that quitting
 //! the game returns the machine to the frontend.
 //!
+//! # Why 3 seconds was the wrong number (measured, not guessed)
+//!
+//! On the cabinet, `C:\Program Files (x86)\Steam\steam.exe` took **5 seconds**
+//! to hand off to the already-running client and exit. Under the 3 s rule ksx
+//! classified that as the game itself quitting and stopped emulation *while the
+//! game was still loading* — pads gone, panel back to typing, mid-launch. The
+//! threshold is now [`DEFAULT_LAUNCHER_GRACE_MS`] (10 s) and is configurable per
+//! profile (`launcher_grace_ms` in `games.toml`), because the right value is a
+//! property of the launcher, not of ksx.
+//!
+//! **The trade, stated honestly.** This threshold answers one question — "did
+//! that process live long enough to have *been* the game?" — and both wrong
+//! answers cost something:
+//!
+//! - **too low**: a slow launcher's exit is read as the game's, and emulation
+//!   stops during a launch that is still in progress. That is the observed bug,
+//!   and it is the expensive one: the player is left with a dead panel and no
+//!   pads, and only an emergency escape or a restart fixes it.
+//! - **too high**: a genuinely short play session (start, quit after 8 s) is
+//!   read as a hand-off. ksx then hunts for `process_name` — finds nothing,
+//!   because the game really has gone — and waits out the 60 s hand-off grace
+//!   before saying so. Emulation keeps running for up to a minute longer than it
+//!   needed to, which is untidy but harms nothing: the pads work, the escapes
+//!   work, and with a `process_name` set the hunt gives up on its own.
+//!
+//! One failure strands a player mid-game; the other delays a teardown nobody is
+//! waiting on. 10 s buys twice the observed hand-off time against a cost that is
+//! only ever measured in seconds of extra emulation, so the default errs high.
+//! A cabinet with a launcher slower still (a cold Battle.net on a spinning disk)
+//! raises `launcher_grace_ms`; a MAME-only cabinet where every exit is the game
+//! can drop it back to legacy's 3 s.
+//!
+//! The 60 s hand-off hunt ([`DEFAULT_HANDOFF_GRACE_MS`]) is a **separate**
+//! timer answering a different question — "how long do we look for the game the
+//! launcher started?" — and is deliberately untouched by any of this.
+//!
 //! # What this adds: `LauncherHandoff`
 //!
 //! A short-lived launch is not the end of the session, it is a **hand-off**. So
@@ -37,15 +73,32 @@
 
 use ksx_platform::process::ProcessEntry;
 
-/// Legacy's threshold, preserved exactly: a process that lives this long or
-/// less handed off to something else (`Game.cs`, "> 3 seconds").
-pub const LAUNCHER_THRESHOLD_MS: u64 = 3_000;
+/// Legacy's threshold (`Game.cs`, "> 3 seconds"), kept as a named constant
+/// because it is the number every legacy behaviour comparison is against — and
+/// a reasonable value for a profile that launches the game directly.
+///
+/// **Not the default any more**: see [`DEFAULT_LAUNCHER_GRACE_MS`] and the
+/// module docs for the 5-second Steam hand-off that retired it.
+pub const LEGACY_LAUNCHER_THRESHOLD_MS: u64 = 3_000;
+
+/// A process that lives this long or less handed off to something else.
+///
+/// 10 s: twice the 5 s hand-off measured from `steam.exe` on the cabinet, which
+/// is the margin a cold launcher on a loaded machine needs. Overridable per
+/// profile with `launcher_grace_ms` — the full trade-off is in the module docs,
+/// and the short version is that being too low strands a player mid-launch while
+/// being too high only delays a teardown.
+pub const DEFAULT_LAUNCHER_GRACE_MS: u64 = 10_000;
 
 /// How long to hunt for `process_name` after a hand-off before giving up.
 ///
 /// 60 s because a cold Steam start on a spinning disk genuinely takes that
 /// long: the client updates itself, shows a splash, decrypts, and only then
 /// spawns the game. Too short and a legitimate slow start is misread as "gone".
+///
+/// Independent of [`DEFAULT_LAUNCHER_GRACE_MS`] and unchanged by its retuning:
+/// that one asks "was that the game or a launcher?", this one asks "how long do
+/// we look for what the launcher started?".
 pub const DEFAULT_HANDOFF_GRACE_MS: u64 = 60_000;
 
 /// Consecutive misses required before a tracked process is declared gone.
@@ -71,7 +124,7 @@ impl Default for TrackPolicy {
     fn default() -> Self {
         Self {
             process_name: None,
-            launcher_threshold_ms: LAUNCHER_THRESHOLD_MS,
+            launcher_threshold_ms: DEFAULT_LAUNCHER_GRACE_MS,
             handoff_grace_ms: DEFAULT_HANDOFF_GRACE_MS,
             exit_confirmations: EXIT_CONFIRMATIONS,
         }
@@ -82,6 +135,20 @@ impl TrackPolicy {
     pub fn for_process(name: Option<String>) -> Self {
         Self {
             process_name: name,
+            ..Self::default()
+        }
+    }
+
+    /// The policy a `games.toml` profile asks for: its `process_name` and its
+    /// optional `launcher_grace_ms`.
+    ///
+    /// `None` for the grace means the default — a profile that says nothing
+    /// must keep tracking the default as it moves, rather than freezing whatever
+    /// it happened to be when the file was written.
+    pub fn for_profile(name: Option<String>, launcher_grace_ms: Option<u64>) -> Self {
+        Self {
+            process_name: name,
+            launcher_threshold_ms: launcher_grace_ms.unwrap_or(DEFAULT_LAUNCHER_GRACE_MS),
             ..Self::default()
         }
     }
@@ -342,8 +409,8 @@ mod tests {
         GameTracker::new(TrackPolicy::for_process(process_name.map(str::to_owned)))
     }
 
-    /// The legacy rule, verbatim: a process that outlives the threshold *was*
-    /// the game, and its exit ends the session.
+    /// The rule, unchanged in shape: a process that outlives the threshold
+    /// *was* the game, and its exit ends the session. Only the number moved.
     #[test]
     fn a_long_lived_process_exiting_ends_the_session() {
         let mut t = tracker(None);
@@ -353,36 +420,85 @@ mod tests {
             TrackOutcome::Watching
         );
         assert_eq!(
-            t.observe(obs(3_001, Some(false), &[])),
+            t.observe(obs(DEFAULT_LAUNCHER_GRACE_MS + 1, Some(false), &[])),
             TrackOutcome::GameExited
         );
         assert_eq!(t.state(), &TrackState::Exited);
         // ...and it stays exited.
         assert_eq!(
-            t.observe(obs(9_999, Some(false), &[])),
+            t.observe(obs(999_999, Some(false), &[])),
             TrackOutcome::GameExited
         );
     }
 
-    /// Exactly 3000 ms is *not* longer than 3000 ms — legacy used `> 3s`, and
-    /// an off-by-one here silently changes which games work.
+    /// The comparison is `>`, not `>=`: exactly the threshold is still a
+    /// launcher. An off-by-one here silently changes which games work.
     #[test]
-    fn the_threshold_is_strictly_greater_than_three_seconds() {
+    fn the_threshold_is_strictly_greater_than_the_configured_grace() {
         let mut t = tracker(Some("game.exe"));
         t.started_with_handle(0);
         assert_eq!(
-            t.observe(obs(3_000, Some(false), &[])),
+            t.observe(obs(DEFAULT_LAUNCHER_GRACE_MS, Some(false), &[])),
             TrackOutcome::Watching,
-            "a 3000 ms life is a launcher, not the game"
+            "a life of exactly the grace is a launcher, not the game"
         );
         assert!(matches!(t.state(), TrackState::LauncherHandoff { .. }));
 
         let mut t = tracker(Some("game.exe"));
         t.started_with_handle(0);
         assert_eq!(
+            t.observe(obs(DEFAULT_LAUNCHER_GRACE_MS + 1, Some(false), &[])),
+            TrackOutcome::GameExited
+        );
+    }
+
+    /// **The cabinet regression.** `steam.exe` took 5 seconds to hand off to the
+    /// already-running client and exit. Under legacy's 3 s rule that read as
+    /// "the player quit" and emulation stopped mid-launch, with the game still
+    /// loading. It must read as a hand-off, and the hunt must find the game.
+    #[test]
+    fn a_five_second_steam_handoff_is_not_the_game_quitting() {
+        // The test is only meaningful while 5 s sits above legacy's threshold
+        // and below the new default — i.e. exactly in the window the bug lived
+        // in. Checked at compile time so moving either constant into 5 s fails
+        // the build rather than making this test silently vacuous.
+        const _: () = assert!(LEGACY_LAUNCHER_THRESHOLD_MS < 5_000);
+        const _: () = assert!(DEFAULT_LAUNCHER_GRACE_MS > 5_000);
+        let mut t = tracker(Some("portal2.exe"));
+        t.started_with_handle(0);
+        // Still up at 4 s.
+        assert_eq!(
+            t.observe(obs(4_000, Some(true), &[])),
+            TrackOutcome::Watching
+        );
+        // Hands off and exits at 5 s — the measured number.
+        assert_eq!(
+            t.observe(obs(5_000, Some(false), &[])),
+            TrackOutcome::Watching,
+            "a 5 s launcher exit must NOT stop emulation"
+        );
+        assert_eq!(t.state(), &TrackState::LauncherHandoff { since_ms: 5_000 });
+        // ...and the game the launcher started is picked up normally.
+        t.observe(obs(25_000, None, &procs(&[(42, "portal2.exe")])));
+        assert_eq!(t.state(), &TrackState::Tracking { pid: 42 });
+    }
+
+    /// A profile may still ask for legacy's number — a MAME cabinet where every
+    /// launch is the game itself wants the faster stop.
+    #[test]
+    fn a_profile_can_ask_for_the_legacy_three_second_rule_back() {
+        let mut t = GameTracker::new(TrackPolicy::for_profile(
+            Some("mame.exe".into()),
+            Some(LEGACY_LAUNCHER_THRESHOLD_MS),
+        ));
+        t.started_with_handle(0);
+        assert_eq!(
             t.observe(obs(3_001, Some(false), &[])),
             TrackOutcome::GameExited
         );
+        // ...and saying nothing means the default, not a frozen copy of it.
+        let policy = TrackPolicy::for_profile(Some("x.exe".into()), None);
+        assert_eq!(policy.launcher_threshold_ms, DEFAULT_LAUNCHER_GRACE_MS);
     }
 
     /// The whole hand-off arc: launcher returns fast, the game appears a while

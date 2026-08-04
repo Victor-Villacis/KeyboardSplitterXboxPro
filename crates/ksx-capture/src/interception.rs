@@ -46,6 +46,18 @@
 //! Thread priority is set inline with `windows-sys` rather than through
 //! `ksx-platform`: one syscall does not justify an inter-crate dependency from
 //! the capture hot path (deliberate design decision, see M3 notes).
+//!
+//! # Where the DLL comes from
+//!
+//! Every `interception_*` call below goes through [`crate::interception_dll`]'s
+//! `GetProcAddress` table, never through `interception-sys`'s import stubs. That
+//! is not a style choice: a static import makes `interception.dll` a **load-time
+//! requirement of `ksx.exe` itself**, so `ksx --version` on a WinUSB-only
+//! cabinet dies in the Windows loader before `main`. Only `Api` (loaded when
+//! this backend is *constructed*) is allowed to need the DLL. The types are
+//! still `kanata_interception::raw`'s — a `#[repr(C)]` declaration creates no
+//! linkage, and a second hand-written `InterceptionKeyStroke` would be a second
+//! source of truth for the layout the hot path re-sends byte-for-byte.
 
 use std::sync::Arc;
 
@@ -53,6 +65,8 @@ use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use kanata_interception::raw;
 use ksx_core::{DeviceId, KeyEvent};
+
+use crate::interception_dll::Api;
 
 use crate::backend::{
     CaptureBackend, CaptureCtl, CaptureError, DeviceInfo, DeviceKind, ExitReason,
@@ -89,11 +103,18 @@ const FILTER_NONE: u16 = 0;
 /// panic unwind too — a panicking capture thread must never leave a filter
 /// armed with nobody pumping `receive` (that deadens every keyboard until
 /// reboot).
-struct Ctx(raw::InterceptionContext);
+struct Ctx {
+    handle: raw::InterceptionContext,
+    /// The resolved DLL entry points. Held rather than re-fetched so the hot
+    /// loop never touches the `OnceLock` (and so `Drop` cannot fail to find the
+    /// functions it needs to reset the filters with).
+    api: &'static Api,
+}
 
 // SAFETY: the context is created on one thread and moved into the capture
 // thread; it is only ever used from one thread at a time. The Interception API
-// itself is documented to be usable this way (legacy did the same).
+// itself is documented to be usable this way (legacy did the same). `api` is a
+// table of function pointers with 'static lifetime, which is Sync by nature.
 unsafe impl Send for Ctx {}
 
 impl Ctx {
@@ -101,8 +122,8 @@ impl Ctx {
         // SAFETY: valid context; is_keyboard/is_mouse are the canonical
         // predicates exported by the driver library itself.
         unsafe {
-            raw::interception_set_filter(self.0, Some(raw::interception_is_keyboard), FILTER_NONE);
-            raw::interception_set_filter(self.0, Some(raw::interception_is_mouse), FILTER_NONE);
+            (self.api.set_filter)(self.handle, Some(self.api.is_keyboard), FILTER_NONE);
+            (self.api.set_filter)(self.handle, Some(self.api.is_mouse), FILTER_NONE);
         }
     }
 
@@ -115,19 +136,19 @@ impl Ctx {
         let mut stroke = raw::InterceptionKeyStroke::default();
         for _ in 0..64 {
             // SAFETY: valid context; zero timeout returns 0 when idle.
-            let dev = unsafe { raw::interception_wait_with_timeout(self.0, 0) };
+            let dev = unsafe { (self.api.wait_with_timeout)(self.handle, 0) };
             // SAFETY: predicates accept any value.
             if dev == 0
-                || unsafe { raw::interception_is_invalid(dev) } != 0
-                || unsafe { raw::interception_is_keyboard(dev) } == 0
+                || unsafe { (self.api.is_invalid)(dev) } != 0
+                || unsafe { (self.api.is_keyboard)(dev) } == 0
             {
                 break; // idle, or not a keyboard (mouse filter is never set)
             }
             // SAFETY: one-stroke keyboard receive/send, same layout contract
             // as the hot loop; the stroke is re-sent byte-for-byte.
             unsafe {
-                let n = raw::interception_receive(
-                    self.0,
+                let n = (self.api.receive)(
+                    self.handle,
                     dev,
                     (&mut stroke as *mut raw::InterceptionKeyStroke).cast(),
                     1,
@@ -135,8 +156,8 @@ impl Ctx {
                 if n < 1 {
                     break;
                 }
-                raw::interception_send(
-                    self.0,
+                (self.api.send)(
+                    self.handle,
                     dev,
                     (&stroke as *const raw::InterceptionKeyStroke).cast(),
                     1,
@@ -150,9 +171,9 @@ impl Drop for Ctx {
     fn drop(&mut self) {
         self.drain_resend_pending();
         self.reset_filters();
-        // SAFETY: self.0 is a live context; after this call it is never used
-        // again (we are in drop).
-        unsafe { raw::interception_destroy_context(self.0) };
+        // SAFETY: self.handle is a live context; after this call it is never
+        // used again (we are in drop).
+        unsafe { (self.api.destroy_context)(self.handle) };
     }
 }
 
@@ -205,8 +226,14 @@ impl InterceptionBackend {
     /// `LeftCtrl x5` on the WinUSB-claimed I-PAC also drops this backend's
     /// keyboard filter. See [`crate::CompositeBackend`].
     pub fn new_with(handles: crate::backend::Handles) -> Result<Self, CaptureError> {
+        // The DLL is loaded HERE and nowhere earlier: this is the first moment
+        // ksx actually needs Interception, so it is the first moment its absence
+        // may cost anything. Everything upstream — `ksx --version`, `ksx
+        // devices`, `ksx doctor`, a WinUSB-only session — must run on a machine
+        // that has never had the driver (M6's exit criterion).
+        let api = crate::interception_dll::api()?;
         // SAFETY: plain FFI constructor; null-checked below.
-        let ctx = unsafe { raw::interception_create_context() };
+        let ctx = unsafe { (api.create_context)() };
         if ctx.is_null() {
             return Err(CaptureError::DriverUnavailable);
         }
@@ -222,7 +249,7 @@ impl InterceptionBackend {
              docs/RECOVERY.md at hand and plan on the WinUSB backend (M6)."
         );
         Ok(Self {
-            ctx: Ctx(ctx),
+            ctx: Ctx { handle: ctx, api },
             health: handles.health,
             presence: PresenceHandle::new(),
             escapes: handles.escapes,
@@ -233,18 +260,19 @@ impl InterceptionBackend {
 impl CaptureBackend for InterceptionBackend {
     fn devices(&mut self) -> Vec<DeviceInfo> {
         let mut out = Vec::new();
+        let api = self.ctx.api;
         // Full 1..=20. (Legacy `RescanInputDevices` looped `id < 20` and never
         // enumerated slot 20 — confirmed off-by-one, fixed here.)
         for slot in 1..=MAX_DEVICE as i32 {
             // SAFETY: predicates take any device number by design.
-            if unsafe { raw::interception_is_invalid(slot) } != 0 {
+            if unsafe { (api.is_invalid)(slot) } != 0 {
                 continue;
             }
             let Some(hwid) = hardware_id(&self.ctx, slot) else {
                 continue;
             };
             // SAFETY: as above.
-            let kind = if unsafe { raw::interception_is_keyboard(slot) } != 0 {
+            let kind = if unsafe { (api.is_keyboard)(slot) } != 0 {
                 DeviceKind::Keyboard
             } else {
                 DeviceKind::Mouse
@@ -318,6 +346,9 @@ fn capture_loop(
     ctl: &Receiver<CaptureCtl>,
 ) -> ExitReason {
     let start = std::time::Instant::now();
+    // Hoisted out of the hot loop: one field read instead of a `&Ctx` deref per
+    // call. The pointers are immutable for the life of the process.
+    let api = ctx.api;
     let mut wd = Watchdog::default();
     let mut exhaustion = ExhaustionDetector::new();
     let mut slots: Slots = std::array::from_fn(|_| None);
@@ -346,7 +377,7 @@ fn capture_loop(
     // touch mouse.sys behavior at all.
     // SAFETY: valid context, canonical predicate.
     unsafe {
-        raw::interception_set_filter(ctx.0, Some(raw::interception_is_keyboard), FILTER_KEY_ALL);
+        (api.set_filter)(ctx.handle, Some(api.is_keyboard), FILTER_KEY_ALL);
     }
 
     let mut kb_buf = [raw::InterceptionKeyStroke::default(); RECEIVE_BATCH];
@@ -388,7 +419,7 @@ fn capture_loop(
         }
 
         // SAFETY: valid context; returns 0 on timeout.
-        let dev = unsafe { raw::interception_wait_with_timeout(ctx.0, WAIT_TIMEOUT_MS) };
+        let dev = unsafe { (api.wait_with_timeout)(ctx.handle, WAIT_TIMEOUT_MS) };
         if dev == 0 {
             // Driver idle: the one moment where a full slot re-read costs
             // nothing. Removals produce no stroke, so this is how the
@@ -410,12 +441,12 @@ fn capture_loop(
             continue;
         }
         // SAFETY: predicate accepts any value.
-        if unsafe { raw::interception_is_invalid(dev) } != 0 {
+        if unsafe { (api.is_invalid)(dev) } != 0 {
             continue;
         }
 
         // SAFETY: predicate accepts any value.
-        if unsafe { raw::interception_is_mouse(dev) } != 0 {
+        if unsafe { (api.is_mouse)(dev) } != 0 {
             // Mouse filter is NONE, so this should be unreachable; if the
             // driver hands us mouse strokes anyway, re-send them verbatim so
             // nothing is ever lost. Never reported in M3.
@@ -423,8 +454,8 @@ fn capture_loop(
             // treats the pointer as a packed InterceptionMouseStroke array for
             // mouse devices (same layout contract the safe wrapper relies on).
             let n = unsafe {
-                raw::interception_receive(
-                    ctx.0,
+                (api.receive)(
+                    ctx.handle,
                     dev,
                     mouse_buf.as_mut_ptr().cast(),
                     RECEIVE_BATCH as u32,
@@ -432,7 +463,7 @@ fn capture_loop(
             };
             if n > 0 {
                 // SAFETY: sending back the exact strokes just received.
-                unsafe { raw::interception_send(ctx.0, dev, mouse_buf.as_ptr().cast(), n as u32) };
+                unsafe { (api.send)(ctx.handle, dev, mouse_buf.as_ptr().cast(), n as u32) };
             }
             continue;
         }
@@ -440,7 +471,12 @@ fn capture_loop(
         // Keyboard stroke(s).
         // SAFETY: same layout contract as above, for InterceptionKeyStroke.
         let n = unsafe {
-            raw::interception_receive(ctx.0, dev, kb_buf.as_mut_ptr().cast(), RECEIVE_BATCH as u32)
+            (api.receive)(
+                ctx.handle,
+                dev,
+                kb_buf.as_mut_ptr().cast(),
+                RECEIVE_BATCH as u32,
+            )
         };
         if n <= 0 {
             continue;
@@ -503,8 +539,8 @@ fn capture_loop(
                 // preserved. A corrupted re-send breaks every keyboard.
                 // SAFETY: one valid stroke, same layout contract as receive.
                 unsafe {
-                    raw::interception_send(
-                        ctx.0,
+                    (api.send)(
+                        ctx.handle,
                         dev,
                         (stroke as *const raw::InterceptionKeyStroke).cast(),
                         1,
@@ -579,12 +615,12 @@ fn rescan(
     exhaustion.begin_pass();
     for slot in 1..=MAX_DEVICE as i32 {
         // SAFETY: predicates accept any device number.
-        let gone = unsafe { raw::interception_is_invalid(slot) } != 0;
+        let gone = unsafe { (ctx.api.is_invalid)(slot) } != 0;
         let hwid = if gone { None } else { hardware_id(ctx, slot) };
         match hwid {
             Some(hwid) => {
                 // SAFETY: as above.
-                if unsafe { raw::interception_is_keyboard(slot) } != 0 {
+                if unsafe { (ctx.api.is_keyboard)(slot) } != 0 {
                     note_exhaustion(exhaustion.observe_keyboard(slot, &hwid), health);
                 }
                 let id = DeviceId::from(hwid);
@@ -622,8 +658,8 @@ fn hardware_id(ctx: &Ctx, dev: i32) -> Option<String> {
     let mut buf = [0u16; HWID_BUF_CHARS];
     // SAFETY: buffer is HWID_BUF_CHARS u16s = 2x bytes, exactly what we pass.
     let bytes = unsafe {
-        raw::interception_get_hardware_id(
-            ctx.0,
+        (ctx.api.get_hardware_id)(
+            ctx.handle,
             dev,
             buf.as_mut_ptr().cast(),
             (HWID_BUF_CHARS * 2) as u32,

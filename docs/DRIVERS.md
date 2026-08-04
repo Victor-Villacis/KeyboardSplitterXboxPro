@@ -95,6 +95,16 @@ reports for it. The bytes that were checked are the bytes that run.
   API only (we dynamically load `interception.dll`); commercial use requires a paid
   license from an author who is unreachable.** This backend is therefore permanently
   non-commercial. Fine for a personal cabinet.
+- **`ksx.exe` does not require `interception.dll` to start.** It is loaded with
+  `LoadLibrary`/`GetProcAddress` at the moment the Interception backend is
+  constructed, and nowhere else — so `ksx --version`, `ksx devices`, `ksx doctor`,
+  `ksx winusb …` and any session whose devices are all `backend = "winusb"` run on a
+  machine that has never had the driver. If something does ask for the backend
+  without it, the error names the two ways forward instead of the Windows loader
+  putting up a "code execution cannot proceed" dialog before `main`. The installer
+  therefore does **not** have to ship this DLL. CI pins it: the ksx binary's PE
+  import table is asserted to contain no `interception.dll` entry
+  (`crates/ksx-app/tests/no_interception_dll.rs`).
 
 ### WinUSB direct claim (backend: `winusb`, M6 — the survival path)
 

@@ -37,6 +37,10 @@ tracing-subscriber.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    # FreeConsole/SetStdHandle + CreateFileW("NUL"): `ksx daemon` releases its
+    # console once the tray icon exists, and points the standard handles at the
+    # null device so later writes are a silent no-op instead of an I/O error.
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Performance",

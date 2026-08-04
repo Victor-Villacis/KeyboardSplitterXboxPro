@@ -3,6 +3,7 @@
 mod autostart;
 #[cfg(windows)]
 mod capture;
+mod console;
 #[cfg(windows)]
 mod ctrl_c;
 mod daemon;
@@ -46,10 +47,14 @@ enum Command {
     ///
     /// With --game, the profile's program is started AFTER the pads are plugged
     /// and capture is armed (a game started earlier sees zero controllers), and
-    /// emulation stops when it exits. A process that exits within 3 s is
+    /// emulation stops when it exits. A process that exits within 10 s is
     /// treated as a launcher, not the game: ksx then watches for the profile's
-    /// `process_name` for 60 s and follows that instead. ksx never kills a game
-    /// it started — stopping emulation leaves the game running.
+    /// `process_name` for 60 s and follows that instead. (Legacy used 3 s;
+    /// Steam takes 5 s to hand off, and being too tight stops emulation while a
+    /// launch is still in progress. Override per profile with
+    /// `launcher_grace_ms` — lower it to notice a short session sooner, raise
+    /// it for a slower launcher.) ksx never kills a game it started — stopping
+    /// emulation leaves the game running.
     ///
     /// Exit codes: 0 = clean stop (Ctrl+Alt+Del, the game exiting, Ctrl+C where
     /// it can be delivered, --dry-run), 1 = error, 2 = refused to start
@@ -179,6 +184,15 @@ enum Command {
     /// --headless offers the identical commands on stdin: start | stop |
     /// reload | config | status | quit.
     ///
+    /// THE CONSOLE: once the tray icon is on screen, ksx releases the console
+    /// window it was started from, so the tray is the whole interface and there
+    /// is no terminal to close by accident (closing it would kill the daemon)
+    /// and none on a cabinet's game screen at logon. The cost is that log
+    /// output stops at that moment — tracing writes to stderr, and there is no
+    /// stderr afterwards; capture health is still reported in the tooltip. Use
+    /// --console to keep it for debugging. --headless always keeps it: stdin is
+    /// its control surface.
+    ///
     /// Exit codes: 0 = clean exit, 1 = error, 2 = the configuration does not
     /// resolve (nothing was started).
     Daemon {
@@ -188,9 +202,12 @@ enum Command {
         /// With --game, apply the profile but never start its program
         #[arg(long, requires = "game")]
         no_launch: bool,
-        /// No tray icon; take the same commands on stdin
+        /// No tray icon; take the same commands on stdin (keeps the console)
         #[arg(long)]
         headless: bool,
+        /// Keep the console window attached (debugging; logs keep working)
+        #[arg(long)]
+        console: bool,
         /// Start emulation immediately instead of waiting for a command
         #[arg(long)]
         start: bool,
@@ -429,8 +446,9 @@ fn main() -> anyhow::Result<()> {
             game,
             no_launch,
             headless,
+            console,
             start,
-        } => daemon::run(game, no_launch, headless, start),
+        } => daemon::run(game, no_launch, headless, console, start),
         Command::InstallDrivers {
             dry_run,
             yes,
@@ -974,6 +992,67 @@ mod tests {
             "dry runs by default",
             "2 = refused",
             "3 = pnputil ran and failed",
+        ] {
+            assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // The daemon's console
+    // -----------------------------------------------------------------
+
+    /// Plain `ksx daemon` must detach; `--console` and `--headless` must not.
+    /// This is the flag-to-policy wiring — the policy itself is tested in
+    /// `crate::console`.
+    #[test]
+    fn daemon_console_flags_parse_and_select_the_right_policy() {
+        let cli = Cli::try_parse_from(["ksx", "daemon"]).unwrap();
+        let Command::Daemon {
+            headless, console, ..
+        } = cli.command
+        else {
+            panic!("parsed to the wrong subcommand");
+        };
+        assert!(!headless);
+        assert!(!console);
+        assert!(
+            console::mode(headless, console).detaches(),
+            "a bare `ksx daemon` must release its console: a stray terminal window on a \
+             cabinet is one click away from killing emulation"
+        );
+
+        for args in [
+            vec!["ksx", "daemon", "--console"],
+            vec!["ksx", "daemon", "--headless"],
+            vec!["ksx", "daemon", "--headless", "--console"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            let Command::Daemon {
+                headless, console, ..
+            } = cli.command
+            else {
+                panic!("parsed to the wrong subcommand");
+            };
+            assert!(
+                !console::mode(headless, console).detaches(),
+                "{args:?} must keep the console"
+            );
+        }
+    }
+
+    /// The trade has to be in `--help`, because it is the only place somebody
+    /// looks after their daemon stopped logging.
+    #[test]
+    fn daemon_help_states_what_happens_to_the_console() {
+        let mut cmd = Cli::command();
+        let daemon = cmd.find_subcommand_mut("daemon").unwrap();
+        let help = daemon.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "releases the console window",
+            "log output stops at that moment",
+            "--console to keep it",
+            "--headless always keeps it",
         ] {
             assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
         }

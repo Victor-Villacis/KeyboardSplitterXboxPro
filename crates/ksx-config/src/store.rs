@@ -546,6 +546,7 @@ mod tests {
                 path: r"C:\Program Files (x86)\Steam\steam.exe".into(),
                 arguments: "-silent".into(),
                 process_name: Some("portal2.exe".into()),
+                launcher_grace_ms: None,
                 block_keyboards: true,
                 block_mice: false,
                 slots: vec![GameSlotEntry {

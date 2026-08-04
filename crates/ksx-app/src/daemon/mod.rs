@@ -545,16 +545,28 @@ fn set_game(state: &SharedState, game: Option<String>) {
 /// with a window on it) and the control loop moves to a worker; headless is the
 /// other way round. Either way the control loop is the same code with the same
 /// commands.
+///
+/// # The console
+///
+/// In tray mode this function gives up the console window it inherited (see
+/// [`crate::console`]) — but only *after* the icon is on screen, and only after
+/// every refusal path above has had somewhere to print to. Get that order wrong
+/// and a tray that cannot be created leaves a daemon with no icon, no console
+/// and no stdin: reachable only by `taskkill`.
 pub fn run(
     game: Option<String>,
     no_launch: bool,
     headless: bool,
+    console: bool,
     autostart: bool,
 ) -> anyhow::Result<()> {
     let root = ksx_config::ConfigRoot::discover()?;
     // Fail fast on a broken configuration rather than showing a tray icon that
     // can only ever report errors.
-    let plan = match crate::run::plan::resolve(&root, game.as_deref()) {
+    // `resolve_as`, not `resolve`: a "nothing to run" refusal here must suggest
+    // `ksx daemon --game "…"`. Suggesting `ksx run` would hand a daemon user a
+    // foreground session and let them conclude the daemon cannot do profiles.
+    let plan = match crate::run::plan::resolve_as(&root, game.as_deref(), "ksx daemon") {
         Ok(plan) => plan,
         Err(err) => {
             eprintln!("refusing to start the daemon:\n{err}");
@@ -604,7 +616,20 @@ pub fn run(
 
     #[cfg(windows)]
     if !headless {
-        // Control loop on a worker; tray owns this thread.
+        // The icon FIRST, before the control loop and before the console is
+        // released: `tray::create` is the only thing that can tell us whether
+        // this machine can show a tray at all, and the answer decides whether
+        // the console is still the user's last way in.
+        let tray = tray::create(tx.clone(), state.clone());
+        let mode = crate::console::mode(headless, console);
+        if tray.is_some() && mode.detaches() {
+            println!("{}", crate::console::DETACH_NOTICE);
+            crate::console::detach();
+        }
+
+        // Control loop on a worker; the tray (or the stdin fallback) owns this
+        // thread. Spawned after the detach so its first writes already go to
+        // the right place.
         let worker = {
             let state = state.clone();
             std::thread::Builder::new()
@@ -614,7 +639,8 @@ pub fn run(
                     control_loop_with(rx, state, &mut factory, panel.as_mut(), &mut out);
                 })?
         };
-        if tray::run(tx.clone(), state.clone()) {
+        if let Some(tray) = tray {
+            tray.pump();
             // The tray exited (Quit, or the icon was destroyed): make sure the
             // control loop hears about it even if the click never arrived.
             let _ = tx.send(DaemonCommand::Quit);
@@ -626,7 +652,8 @@ pub fn run(
         // The tray could not be created (Session 0, a locked-down desktop, no
         // shell). Fall through to headless rather than leaving a daemon nobody
         // can talk to — the control surface is identical, so nothing is lost
-        // but the icon.
+        // but the icon. The console was deliberately NOT released above: it is
+        // now the only way in.
         eprintln!("[WARN] the tray icon could not be created; running headless.");
         eprintln!("{}", DaemonCommand::help());
         std::thread::spawn({
@@ -639,7 +666,9 @@ pub fn run(
         return Ok(());
     }
 
-    let _ = headless;
+    // Headless keeps its console unconditionally — stdin is the control surface.
+    debug_assert!(!crate::console::mode(headless, console).detaches());
+    let _ = (headless, console);
     println!("ksx daemon (headless). {}", DaemonCommand::help());
     std::thread::spawn({
         let tx = tx.clone();

@@ -76,14 +76,33 @@ struct TrayContext {
 unsafe impl Send for TrayContext {}
 unsafe impl Sync for TrayContext {}
 
-/// Run the tray on this thread until [`DaemonCommand::Quit`] is chosen or the
-/// window is destroyed. Returns `false` if the tray could not be created at all
-/// (no shell, Session 0, a locked-down desktop) — the caller then falls back to
-/// the headless control surface rather than leaving the user with nothing.
-pub fn run(commands: Sender<DaemonCommand>, state: SharedState) -> bool {
+/// A live tray icon: created, on screen, not yet pumping messages.
+///
+/// The split between [`create`] and [`Tray::pump`] exists for one caller and one
+/// reason: `ksx daemon` releases its console window (`crate::console`), and it
+/// may only do that once the icon is definitely on screen. Detaching first and
+/// discovering afterwards that the tray could not be created (Session 0, no
+/// shell, a locked-down desktop) would leave a daemon with no icon, no console
+/// and no stdin — unreachable by any means except `taskkill`.
+pub struct Tray {
+    hwnd: HWND,
+    icon: NOTIFYICONDATAW,
+}
+
+// SAFETY: the tray is created and pumped on the same thread — `create` and
+// `pump` are called back to back by `daemon::run`, which never moves it. The
+// marker exists only so the value can be held across that (non-Send) sequence
+// without the caller needing to prove it; the fields are raw Win32 handles.
+unsafe impl Send for Tray {}
+
+/// Register the class, make the hidden window, and put the icon on screen.
+///
+/// Returns `None` — after logging why — if any of that fails. Nothing is
+/// pumped yet, so no menu works and no tooltip updates until [`Tray::pump`].
+pub fn create(commands: Sender<DaemonCommand>, state: SharedState) -> Option<Tray> {
     if TRAY.set(TrayContext { commands, state }).is_err() {
         tracing::error!("a tray is already running in this process");
-        return false;
+        return None;
     }
 
     let class_name: Vec<u16> = "ksx_tray\0".encode_utf16().collect();
@@ -99,7 +118,7 @@ pub fn run(commands: Sender<DaemonCommand>, state: SharedState) -> bool {
     // SAFETY: `class` is fully initialised above.
     if unsafe { RegisterClassW(&class) } == 0 {
         tracing::error!("RegisterClassW failed; falling back to headless");
-        return false;
+        return None;
     }
 
     // A message-only-ish hidden window: never shown, exists solely to receive
@@ -124,7 +143,7 @@ pub fn run(commands: Sender<DaemonCommand>, state: SharedState) -> bool {
     };
     if hwnd.is_null() {
         tracing::error!("CreateWindowExW failed; falling back to headless");
-        return false;
+        return None;
     }
 
     let mut icon = notify_data(hwnd);
@@ -139,33 +158,44 @@ pub fn run(commands: Sender<DaemonCommand>, state: SharedState) -> bool {
         tracing::error!("Shell_NotifyIconW(NIM_ADD) failed; falling back to headless");
         // SAFETY: `hwnd` is ours and has not been destroyed yet.
         unsafe { DestroyWindow(hwnd) };
-        return false;
+        return None;
     }
 
-    // SAFETY: `hwnd` is a live window we own.
-    unsafe { SetTimer(hwnd, TIMER_ID, TIMER_MS, None) };
+    // The icon is on screen from here on: this is the earliest moment the
+    // caller may safely give up its console.
+    Some(Tray { hwnd, icon })
+}
 
-    // SAFETY: standard message pump; `msg` is zeroed and re-filled per
-    // iteration. GetMessageW returns 0 on WM_QUIT and -1 on error.
-    let mut msg: MSG = unsafe { std::mem::zeroed() };
-    loop {
-        let got = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
-        if got <= 0 {
-            break;
+impl Tray {
+    /// Pump messages until `WM_QUIT`, then remove the icon and the window.
+    ///
+    /// Consumes the tray, because after this returns there is no icon left.
+    pub fn pump(self) {
+        let hwnd = self.hwnd;
+        // SAFETY: `hwnd` is a live window we own.
+        unsafe { SetTimer(hwnd, TIMER_ID, TIMER_MS, None) };
+
+        // SAFETY: standard message pump; `msg` is zeroed and re-filled per
+        // iteration. GetMessageW returns 0 on WM_QUIT and -1 on error.
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        loop {
+            let got = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
+            if got <= 0 {
+                break;
+            }
+            unsafe {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
+
+        // SAFETY: the same icon identity we added, and a window we own.
         unsafe {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            KillTimer(hwnd, TIMER_ID);
+            Shell_NotifyIconW(NIM_DELETE, &self.icon);
+            DestroyWindow(hwnd);
         }
     }
-
-    // SAFETY: the same icon identity we added, and a window we own.
-    unsafe {
-        KillTimer(hwnd, TIMER_ID);
-        Shell_NotifyIconW(NIM_DELETE, &icon);
-        DestroyWindow(hwnd);
-    }
-    true
 }
 
 fn notify_data(hwnd: HWND) -> NOTIFYICONDATAW {

@@ -30,6 +30,27 @@ pub struct GameEntry {
     /// where it only matters if that exe is a shim that exits early.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_name: Option<String>,
+    /// How long a launched program may live and still count as a *launcher*
+    /// rather than the game (milliseconds).
+    ///
+    /// Legacy hard-coded 3 s, and on this cabinet that was wrong: `steam.exe`
+    /// took **5 seconds** to hand off to the already-running client, so ksx read
+    /// its exit as "the player quit" and stopped emulation mid-launch. The
+    /// default is now 10 s (`ksx_games::DEFAULT_LAUNCHER_GRACE_MS`); this key
+    /// exists because the right number is a property of the launcher, not of
+    /// ksx.
+    ///
+    /// The trade runs both ways and neither end is free:
+    /// - **too low** — a slow launcher's exit is mistaken for the game's, and
+    ///   emulation stops while the game is still starting (the observed bug);
+    /// - **too high** — a genuinely short session (start a game, quit after
+    ///   8 seconds) is mistaken for a hand-off, so ksx spends the hand-off grace
+    ///   hunting for a process that has already gone before it notices.
+    ///
+    /// The second failure is the milder one — it delays a stop, it never stops
+    /// a live session — which is why the default errs high.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher_grace_ms: Option<u64>,
     /// Legacy `BlockKeyboards` (default true).
     #[serde(default = "default_true")]
     pub block_keyboards: bool,
@@ -134,6 +155,25 @@ preset = "IPAC P2"
         assert_eq!(game.notes, "");
         assert_eq!(game.arguments, "");
         assert_eq!(game.process_name, None);
+        assert_eq!(game.launcher_grace_ms, None);
+    }
+
+    /// The per-profile launcher grace: optional, absent from every imported
+    /// legacy file, and never emitted when unset.
+    #[test]
+    fn launcher_grace_is_optional_and_round_trips() {
+        let game: GameEntry = toml::from_str(
+            "title = \"t\"\npath = \"C:\\\\steam.exe\"\nlauncher_grace_ms = 20000\n",
+        )
+        .unwrap();
+        assert_eq!(game.launcher_grace_ms, Some(20_000));
+        let back: GameEntry = toml::from_str(&toml::to_string(&game).unwrap()).unwrap();
+        assert_eq!(back, game);
+
+        let plain: GameEntry = toml::from_str("title = \"t\"\npath = \"C:\\\\g.exe\"\n").unwrap();
+        assert!(!toml::to_string(&plain)
+            .unwrap()
+            .contains("launcher_grace_ms"));
     }
 
     /// M5 addition: the launcher-handoff hint. Optional, and absent from every

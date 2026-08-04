@@ -77,7 +77,11 @@ impl<H: GameHost> GameSession<H> {
         Self::with_policy(
             spec.clone(),
             host,
-            TrackPolicy::for_process(spec.process_name.clone()),
+            // Both tunables come from the profile: `process_name` (what to hunt
+            // for) and `launcher_grace_ms` (how long a launch may live and still
+            // be a launcher). The second one is why a 5-second Steam hand-off no
+            // longer reads as the player quitting.
+            TrackPolicy::for_profile(spec.process_name.clone(), spec.launcher_grace_ms),
         )
     }
 
@@ -351,6 +355,7 @@ mod tests {
             path: path.into(),
             arguments: String::new(),
             process_name: process_name.map(str::to_owned),
+            launcher_grace_ms: None,
             block_keyboards: true,
             block_mice: false,
             slots: Vec::new(),
@@ -371,10 +376,63 @@ mod tests {
         assert!(report.warnings.is_empty());
         assert_eq!(session.host.launched, vec![r"C:\g\portal2.exe"]);
 
-        session.host.advance(5_000);
+        // Past the launcher grace, so this exit is the game's own.
+        session
+            .host
+            .advance(crate::tracker::DEFAULT_LAUNCHER_GRACE_MS + 1);
         assert_eq!(session.poll(), TrackOutcome::Watching);
         session.host.alive = Some(false);
         assert_eq!(session.poll(), TrackOutcome::GameExited);
+    }
+
+    /// **The cabinet regression, at the session level.** A profile that points
+    /// straight at `steam.exe`: the program exits after 5 seconds having handed
+    /// off, and that must not be reported as the game ending. Under the old 3 s
+    /// rule this returned `GameExited` and emulation stopped mid-launch.
+    #[test]
+    fn a_five_second_launcher_exit_does_not_end_the_session() {
+        let spec = LaunchSpec::from_entry(&entry(
+            r"C:\Program Files (x86)\Steam\steam.exe",
+            Some("portal2.exe"),
+        ));
+        let mut session = GameSession::new(spec, FakeHost::running(1234));
+        session.start(games_toml()).unwrap();
+
+        session.host.advance(5_000);
+        session.host.alive = Some(false);
+        assert_eq!(
+            session.poll(),
+            TrackOutcome::Watching,
+            "a 5 s hand-off must not stop emulation"
+        );
+        assert!(matches!(
+            session.state(),
+            TrackState::LauncherHandoff { .. }
+        ));
+
+        // The game the launcher started is then followed to its real exit.
+        session.host.set_processes(&[(77, "portal2.exe")]);
+        session.host.advance(20_000);
+        assert_eq!(session.poll(), TrackOutcome::Watching);
+        assert_eq!(session.state(), &TrackState::Tracking { pid: 77 });
+    }
+
+    /// A profile may override the grace, and the override reaches the tracker
+    /// through `GameSession::new` — not only through `with_policy`, which is
+    /// what the production path uses.
+    #[test]
+    fn a_profile_grace_override_reaches_the_tracker() {
+        let mut spec = LaunchSpec::from_entry(&entry(r"C:\g\x.exe", Some("x.exe")));
+        spec.launcher_grace_ms = Some(1_000);
+        let mut session = GameSession::new(spec, FakeHost::running(7));
+        session.start(games_toml()).unwrap();
+        session.host.advance(1_001);
+        session.host.alive = Some(false);
+        assert_eq!(
+            session.poll(),
+            TrackOutcome::GameExited,
+            "with a 1 s grace, a 1001 ms life is the game itself"
+        );
     }
 
     #[test]

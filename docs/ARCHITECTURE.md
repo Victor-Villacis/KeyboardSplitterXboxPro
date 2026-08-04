@@ -86,8 +86,9 @@ note written afterwards — a game started before the pads exist enumerates zero
 controllers and caches that answer for the session.
 
 Exit detection is a pure state machine (`ksx-games::tracker`) with the clock and
-the process list injected, so the 3-second launcher rule and the 60-second
-hand-off grace are exercised in microseconds by fakes:
+the process list injected, so the launcher rule (10 s by default, per-profile
+`launcher_grace_ms`) and the 60-second hand-off grace are exercised in
+microseconds by fakes:
 
 ```text
                  launched (handle held)

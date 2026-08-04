@@ -1684,6 +1684,7 @@ fn game_spec() -> ksx_games::LaunchSpec {
         path: r"C:\games\sf.exe".into(),
         arguments: String::new(),
         process_name: None,
+        launcher_grace_ms: None,
         block_keyboards: true,
         block_mice: false,
         slots: Vec::new(),
@@ -1698,7 +1699,11 @@ fn game_spec() -> ksx_games::LaunchSpec {
 #[test]
 fn the_game_launches_only_after_the_pads_are_up_and_capture_is_armed() {
     let script = ScriptedGame::new(GameScript {
-        tick_ms: 5_000,
+        // One virtual tick must carry the process past the launcher grace, or
+        // its exit is a hand-off (which never ends a session) and this test
+        // waits forever. `game_spec()` has no `process_name`, so a hand-off here
+        // would be terminal-but-running by design.
+        tick_ms: ksx_games::DEFAULT_LAUNCHER_GRACE_MS + 5_000,
         alive: false,
         spawn_ok: true,
         ..GameScript::default()

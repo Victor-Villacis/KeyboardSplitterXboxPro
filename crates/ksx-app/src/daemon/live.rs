@@ -43,7 +43,11 @@ impl LiveFactory {
 
 impl SessionFactory for LiveFactory {
     fn make(&mut self) -> anyhow::Result<Box<dyn SessionRunner>> {
-        let plan = crate::run::plan::resolve(&self.root, self.game.as_deref())
+        // `resolve_as`, not `resolve`, for the same reason `daemon::run` uses it:
+        // this is the path a tray "Reload config" takes, so a "nothing to run"
+        // refusal must suggest `ksx daemon --game "…"`. Suggesting `ksx run`
+        // from inside a running daemon hands the user a foreground session.
+        let plan = crate::run::plan::resolve_as(&self.root, self.game.as_deref(), "ksx daemon")
             .map_err(|err| anyhow::anyhow!("{err}"))?;
         let launch = match (&self.game, self.no_launch) {
             (Some(title), false) => {

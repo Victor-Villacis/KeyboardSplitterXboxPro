@@ -50,6 +50,10 @@ pub mod watchdog;
 mod friendly;
 #[cfg(windows)]
 pub mod interception;
+/// Runtime `interception.dll` loading — what keeps `ksx.exe` free of a static
+/// import on a DLL a migrated cabinet no longer has.
+#[cfg(windows)]
+pub mod interception_dll;
 #[cfg(windows)]
 pub mod rawinput;
 #[cfg(windows)]

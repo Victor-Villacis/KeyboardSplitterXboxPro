@@ -344,7 +344,11 @@ pub fn run(
     // only inside `run_loop`'s capture thread — in passthrough, guarded.
     let backend = match InterceptionBackend::new() {
         Ok(backend) => backend,
-        Err(err @ CaptureError::DriverUnavailable) => {
+        // Both "the driver is not answering" and "the DLL is not on this
+        // machine at all" are the same thing to `ksx monitor`: an Interception-
+        // only command on a machine that cannot do Interception. Exit 2 with the
+        // message, never a loader dialog and never an anyhow backtrace.
+        Err(err @ (CaptureError::DriverUnavailable | CaptureError::DllMissing { .. })) => {
             let message = format!("{err}; run `ksx doctor` for driver diagnostics");
             if json {
                 println!(

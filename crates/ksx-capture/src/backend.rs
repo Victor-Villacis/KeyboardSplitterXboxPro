@@ -161,6 +161,21 @@ pub trait CaptureBackend: Send {
 pub enum CaptureError {
     #[error("Interception driver unavailable (interception_create_context returned null) — driver not installed or not loaded")]
     DriverUnavailable,
+    /// `interception.dll` could not be loaded or is missing an export.
+    ///
+    /// Distinct from [`Self::DriverUnavailable`] on purpose: that one means the
+    /// *kernel driver* is not answering, this one means the **user-mode DLL is
+    /// not on this machine at all** — which since M6 is a perfectly ordinary
+    /// state, not a broken install. The message therefore leads with the WinUSB
+    /// backend rather than with "go install Interception".
+    #[error(
+        "the Interception driver/DLL is not installed on this machine ({detail}). If this \
+         device has been migrated, set backend = \"winusb\" for it in config.toml (see \
+         docs/MIGRATION-WINUSB.md); otherwise install the driver — `ksx install-drivers` \
+         reports what is present. `ksx devices`, `ksx doctor` and every WinUSB-backed \
+         session work without it"
+    )]
+    DllMissing { detail: String },
     #[error("{context} failed (win32 error {code})")]
     Os { context: &'static str, code: u32 },
     /// The WinUSB rebind has not been performed for this interface, so there

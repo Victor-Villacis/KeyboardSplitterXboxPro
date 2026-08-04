@@ -6,9 +6,11 @@
 //! - [`profile`] — a `[[game]]` entry resolved into something launchable
 //!   (an executable ksx can hold a handle to, or a `steam://`-style URL it
 //!   cannot), plus the checks that can be made *before* a pad is plugged.
-//! - [`tracker`] — the pure exit-detection state machine: legacy's >3-second
-//!   launcher rule, plus a `LauncherHandoff` state that follows a launcher to
-//!   the process it started. Clock injected, no I/O, fully CI-testable.
+//! - [`tracker`] — the pure exit-detection state machine: legacy's launcher
+//!   rule (retuned from 3 s to 10 s after a 5-second Steam hand-off on the
+//!   cabinet, and configurable per profile), plus a `LauncherHandoff` state that
+//!   follows a launcher to the process it started. Clock injected, no I/O,
+//!   fully CI-testable.
 //! - [`session`] — the thin layer that feeds the tracker real facts, behind a
 //!   [`session::GameHost`] trait with a scriptable [`session::FakeHost`].
 //!
@@ -30,4 +32,5 @@ pub use profile::{preflight, LaunchSpec, LaunchTarget, PreflightError};
 pub use session::{GameHost, GameSession, LaunchFailure, RealHost, StartReport};
 pub use tracker::{
     GameTracker, TrackOutcome, TrackPolicy, TrackState, Unresolvable, DEFAULT_HANDOFF_GRACE_MS,
+    DEFAULT_LAUNCHER_GRACE_MS, LEGACY_LAUNCHER_THRESHOLD_MS,
 };

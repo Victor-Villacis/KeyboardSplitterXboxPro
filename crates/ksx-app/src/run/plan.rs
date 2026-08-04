@@ -90,6 +90,30 @@ impl RunPlan {
     }
 }
 
+/// One `[[game]]` profile, as the "nothing to run" message needs to describe it.
+///
+/// The slot count is the part that matters: a profile with no `[[game.slot]]`
+/// cannot be suggested as a way out, and recommending it would hand the user a
+/// second identical error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileSummary {
+    pub title: String,
+    pub slots: usize,
+}
+
+impl ProfileSummary {
+    fn of(games: &GamesFile) -> Vec<Self> {
+        games
+            .games
+            .iter()
+            .map(|g| Self {
+                title: g.title.clone(),
+                slots: g.slots.len(),
+            })
+            .collect()
+    }
+}
+
 /// Why a plan could not be built. Everything here is an exit-code-2 refusal:
 /// nothing was plugged and no filter was set.
 #[derive(Debug)]
@@ -99,7 +123,19 @@ pub enum PlanError {
     /// `--game <Title>` matched nothing in `games.toml`.
     UnknownGame { title: String, known: Vec<String> },
     /// The plan resolved to zero usable slots.
-    NoSlots(PlanSource),
+    ///
+    /// Carries what the user needs to get past it, not just what went wrong: on
+    /// this cabinet the slots live in `games.toml` profiles and `config.toml`
+    /// has none of its own, so "config defines no usable slot" was *correct* and
+    /// completely unactionable. `profiles` is every `[[game]]` title in
+    /// `games.toml`, and `invoked_as` is the command to repeat with `--game`.
+    NoSlots {
+        source: PlanSource,
+        profiles: Vec<ProfileSummary>,
+        /// The command the user actually typed (`ksx run` / `ksx daemon`), so
+        /// the suggestion is copy-pasteable rather than approximately right.
+        invoked_as: &'static str,
+    },
     /// A slot names a preset that is neither a file nor a built-in.
     UnknownPreset { slot: u8, preset: String },
     /// A slot's device reference or preset body could not be resolved.
@@ -128,12 +164,11 @@ impl std::fmt::Display for PlanError {
                     write!(f, "; known titles: {}", known.join(", "))
                 }
             }
-            PlanError::NoSlots(source) => write!(
-                f,
-                "{} defines no usable slot (a slot needs a number, a preset, and \
-                 at least one input device)",
-                source.label()
-            ),
+            PlanError::NoSlots {
+                source,
+                profiles,
+                invoked_as,
+            } => render_no_slots(f, source, profiles, invoked_as),
             PlanError::UnknownPreset { slot, preset } => write!(
                 f,
                 "slot {slot} references preset '{preset}', which is neither a preset file \
@@ -146,14 +181,124 @@ impl std::fmt::Display for PlanError {
 
 impl std::error::Error for PlanError {}
 
+/// The "nothing to run" message.
+///
+/// The old text — *"config defines no usable slot (a slot needs a number, a
+/// preset, and at least one input device)"* — was true and useless: the
+/// cabinet's `config.toml` has no `[[slot]]` at all because its slots live in
+/// `games.toml` profiles, so the message described a file the user had never
+/// filled in and said nothing about the file they had. This one names the file
+/// that is empty, lists what *is* configured, and ends with a command to run.
+fn render_no_slots(
+    f: &mut std::fmt::Formatter<'_>,
+    source: &PlanSource,
+    profiles: &[ProfileSummary],
+    invoked_as: &str,
+) -> std::fmt::Result {
+    // A profile the user explicitly asked for is a different problem: they named
+    // the right file, it is just empty. No profile list helps there.
+    if let PlanSource::Game(title) = source {
+        return write!(
+            f,
+            "game profile '{title}' defines no usable slot (a slot needs a number, a preset, \
+             and at least one input device). Add a [[game.slot]] to its entry in games.toml, \
+             or run without --game to use config.toml's own [[slot]] layout"
+        );
+    }
+
+    writeln!(
+        f,
+        "config.toml defines no [[slot]] (a slot needs a number, a preset, and at least one \
+         input device), so there is nothing to run without --game."
+    )?;
+
+    let runnable: Vec<&ProfileSummary> = profiles.iter().filter(|p| p.slots > 0).collect();
+    if profiles.is_empty() {
+        writeln!(
+            f,
+            "games.toml has no [[game]] profiles either, so ksx has no slot layout from any \
+             source."
+        )?;
+        writeln!(
+            f,
+            "  - coming from the legacy KeyboardSplitter? `ksx import-legacy` converts its \
+             splitter_games.xml / splitter_presets.xml into both files;"
+        )?;
+        return write!(
+            f,
+            "  - starting fresh? add a [[slot]] to config.toml. `ksx devices` prints the \
+             keyboard ids to paste into it."
+        );
+    }
+    if runnable.is_empty() {
+        writeln!(
+            f,
+            "games.toml has {} profile(s), but none of them define a [[game.slot]] either:",
+            profiles.len()
+        )?;
+        for p in profiles {
+            writeln!(f, "  - {}", p.title)?;
+        }
+        return write!(
+            f,
+            "Add a [[game.slot]] to one of them, or a [[slot]] to config.toml. \
+             `ksx devices` prints the keyboard ids to paste in."
+        );
+    }
+
+    writeln!(
+        f,
+        "These {} game profile(s) in games.toml do define slots:",
+        runnable.len()
+    )?;
+    for p in &runnable {
+        writeln!(f, "  - {} ({} slot(s))", p.title, p.slots)?;
+    }
+    write!(
+        f,
+        "Run one of them, for example:\n    {invoked_as} --game \"{}\"",
+        runnable[0].title
+    )
+}
+
 impl From<ksx_config::ConfigError> for PlanError {
     fn from(err: ksx_config::ConfigError) -> Self {
         PlanError::Config(err)
     }
 }
 
-/// Load everything under `root` and build the plan.
+/// What [`build_plan`] assumes it was called for. [`resolve_as`] corrects it.
+const DEFAULT_INVOCATION: &str = "ksx run";
+
+impl PlanError {
+    /// Re-label the suggested command for the command that is actually running.
+    ///
+    /// `ksx daemon` must suggest `ksx daemon --game "…"`, not `ksx run --game
+    /// "…"`: a user who pastes the suggestion gets a foreground session that
+    /// ends when they close it, which is not what they asked for, and they will
+    /// reasonably assume the daemon cannot do it.
+    fn invoked_as(mut self, command: &'static str) -> Self {
+        if let PlanError::NoSlots { invoked_as, .. } = &mut self {
+            *invoked_as = command;
+        }
+        self
+    }
+}
+
+/// Load everything under `root` and build the plan, as `ksx run`.
 pub fn resolve(root: &ConfigRoot, game: Option<&str>) -> Result<RunPlan, PlanError> {
+    resolve_as(root, game, DEFAULT_INVOCATION)
+}
+
+/// [`resolve`], for a caller that is not `ksx run`.
+///
+/// `invoked_as` is the command name to print in any suggestion — the only thing
+/// it affects.
+pub fn resolve_as(
+    root: &ConfigRoot,
+    game: Option<&str>,
+    invoked_as: &'static str,
+) -> Result<RunPlan, PlanError> {
     let store = Store::new(root.clone());
     let config = store.load_config()?;
     let presets = store.load_presets()?;
@@ -169,7 +314,8 @@ pub fn resolve(root: &ConfigRoot, game: Option<&str>) -> Result<RunPlan, PlanErr
         notes.push(format!("[WARN] {warning}"));
     }
 
-    let mut plan = build_plan(&config.value, &games.value, &presets.value, game)?;
+    let mut plan = build_plan(&config.value, &games.value, &presets.value, game)
+        .map_err(|err| err.invoked_as(invoked_as))?;
     plan.config_path = root.config_path();
     notes.extend(std::mem::take(&mut plan.notes));
     plan.notes = notes;
@@ -257,7 +403,16 @@ pub fn build_plan(
     slots.sort_by_key(|s| s.spec.number);
 
     if slots.is_empty() {
-        return Err(PlanError::NoSlots(source));
+        return Err(PlanError::NoSlots {
+            source,
+            // The profiles are listed even when the failure is about
+            // config.toml, because on a cabinet imported from legacy that is
+            // where every slot actually lives — and "there is nothing to run"
+            // beside a games.toml full of profiles is the exact unhelpfulness
+            // this replaces.
+            profiles: ProfileSummary::of(games),
+            invoked_as: DEFAULT_INVOCATION,
+        });
     }
 
     if block_mice {
@@ -627,8 +782,134 @@ preset = "IPAC P2"
     fn empty_layout_is_refused_rather_than_starting_with_nothing() {
         let cfg = config("schema_version = 1\n");
         let err = build_plan(&cfg, &GamesFile::default(), &presets(), None).unwrap_err();
-        assert!(matches!(err, PlanError::NoSlots(PlanSource::Config)));
-        assert!(err.to_string().contains("no usable slot"), "{err}");
+        assert!(matches!(
+            err,
+            PlanError::NoSlots {
+                source: PlanSource::Config,
+                ..
+            }
+        ));
+    }
+
+    /// **The cabinet's message.** `config.toml` has no `[[slot]]` because every
+    /// slot lives in a `games.toml` profile — so the old text ("config defines
+    /// no usable slot") was correct and useless. It must name the empty file,
+    /// list what is actually configured, and end with a command that works.
+    #[test]
+    fn no_slots_names_the_file_lists_the_profiles_and_gives_the_command() {
+        let games = games(
+            r#"
+[[game]]
+title = "Steam"
+path = 'C:\Program Files (x86)\Steam\steam.exe'
+[[game.slot]]
+number = 1
+keyboard = 'HID\VID_D209&PID_0430&REV_0056&MI_00'
+preset = "IPAC P1"
+[[game.slot]]
+number = 2
+keyboard = 'HID\VID_D209&PID_0430&REV_0056&MI_00'
+preset = "IPAC P2"
+
+[[game]]
+title = "MAME"
+path = 'C:\mame\mame.exe'
+[[game.slot]]
+number = 1
+keyboard = 'HID\VID_D209&PID_0430&REV_0056&MI_00'
+preset = "IPAC P1"
+"#,
+        );
+        let err =
+            build_plan(&config("schema_version = 1\n"), &games, &presets(), None).unwrap_err();
+        let text = err.to_string();
+
+        assert!(
+            text.contains("config.toml defines no [[slot]]"),
+            "the empty file must be named: {text}"
+        );
+        assert!(text.contains("Steam"), "profiles must be listed: {text}");
+        assert!(text.contains("MAME"), "profiles must be listed: {text}");
+        assert!(
+            text.contains("2 slot(s)"),
+            "say how many slots each profile brings: {text}"
+        );
+        assert!(
+            text.contains("ksx run --game \"Steam\""),
+            "the exact command must be shown: {text}"
+        );
+
+        // ...and `ksx daemon` gets its own command, not `ksx run`.
+        let daemon = err.invoked_as("ksx daemon").to_string();
+        assert!(
+            daemon.contains("ksx daemon --game \"Steam\""),
+            "the daemon must suggest itself: {daemon}"
+        );
+        assert!(!daemon.contains("ksx run --game"), "{daemon}");
+    }
+
+    /// Nothing anywhere: say so, and point at the importer rather than listing
+    /// an empty set.
+    #[test]
+    fn no_slots_and_no_profiles_points_at_import_legacy() {
+        let err = build_plan(
+            &config("schema_version = 1\n"),
+            &GamesFile::default(),
+            &presets(),
+            None,
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("no [[game]] profiles either"), "{text}");
+        assert!(text.contains("ksx import-legacy"), "{text}");
+        assert!(text.contains("ksx devices"), "{text}");
+        assert!(
+            !text.contains("--game \""),
+            "there is no profile to suggest: {text}"
+        );
+    }
+
+    /// Profiles that exist but define no slots must not be suggested — running
+    /// one would produce the same refusal a second time.
+    #[test]
+    fn profiles_without_slots_are_listed_but_never_recommended() {
+        let games = games(
+            r#"
+[[game]]
+title = "Empty"
+path = 'C:\a.exe'
+"#,
+        );
+        let err =
+            build_plan(&config("schema_version = 1\n"), &games, &presets(), None).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("none of them define a [[game.slot]]"),
+            "{text}"
+        );
+        assert!(text.contains("Empty"), "{text}");
+        assert!(
+            !text.contains("--game \"Empty\""),
+            "suggesting it would just fail again: {text}"
+        );
+    }
+
+    /// `--game <Title>` on a profile with no slots is a different problem — the
+    /// user named the right file, it is simply empty — and gets its own text.
+    #[test]
+    fn an_empty_game_profile_is_told_about_game_slot_not_about_other_profiles() {
+        let games = games("[[game]]\ntitle = \"Empty\"\npath = 'C:\\a.exe'\n");
+        let err = build_plan(
+            &config("schema_version = 1\n"),
+            &games,
+            &presets(),
+            Some("Empty"),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("game profile 'Empty'"), "{text}");
+        assert!(text.contains("[[game.slot]]"), "{text}");
+        assert!(!text.contains("config.toml defines no"), "{text}");
     }
 
     #[test]

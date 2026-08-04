@@ -59,11 +59,17 @@ When the profile has a `path`, `ksx run --game` starts it after the pads are up
 and stops emulation when it exits (exit 0). Two behaviours ported from the
 legacy app and extended:
 
-- **A process that exits within 3 seconds was a launcher, not the game.**
+- **A process that exits within 10 seconds was a launcher, not the game.**
   `steam.exe`, a `.bat`, a 32→64-bit trampoline: they hand off and return.
+  Legacy used 3 s and that was measurably too tight — Steam on this cabinet
+  takes 5 s to hand off, and stopping emulation then leaves a player mid-launch
+  with no pads. Tune it per profile with `launcher_grace_ms` (milliseconds):
+  lower it if you want a short session noticed sooner, raise it for a launcher
+  that is slower still.
 - **After a hand-off, ksx hunts for the profile's `process_name` for 60 s** and
-  then follows *that* process to its exit. Legacy stopped at the 3-second rule
-  and simply ran forever.
+  then follows *that* process to its exit. This is a separate timer from the one
+  above and is unchanged. Legacy stopped at the launcher rule and simply ran
+  forever.
 
 ```toml
 [[game]]
