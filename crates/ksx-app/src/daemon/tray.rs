@@ -274,7 +274,7 @@ unsafe extern "system" fn wnd_proc(
                 let items = snapshot().menu();
                 if let Some((command, _, enabled)) = items.get(id - MENU_BASE) {
                     if *enabled {
-                        send(*command);
+                        send(command.clone());
                         if *command == DaemonCommand::Quit {
                             // SAFETY: scalar-only call.
                             unsafe { PostQuitMessage(0) };

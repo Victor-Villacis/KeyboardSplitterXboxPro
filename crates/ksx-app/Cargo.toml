@@ -49,6 +49,13 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Performance",
+    # The daemon's control channel: CreateNamedPipeW/ConnectNamedPipe for the
+    # \\.\pipe\ksx-daemon server (plain threads, no async runtime — E7 rule A).
+    # Security/IO carry the SECURITY_ATTRIBUTES/OVERLAPPED types those
+    # signatures reference; both are passed as null.
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
 ] }
 
 [features]

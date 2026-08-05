@@ -14,6 +14,7 @@ mod logging;
 mod monitor;
 mod pads;
 mod run;
+mod session;
 #[cfg(feature = "studio")]
 mod studio;
 mod winusb;
@@ -309,6 +310,29 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Control a running `ksx daemon`: status, start, stop, reload
+    ///
+    /// Talks to the daemon over its named pipe (\\.\pipe\ksx-daemon) — the
+    /// same control surface as the tray menu, reachable from a script, an
+    /// agent, or ksx Studio. Each verb is one request; the daemon enqueues
+    /// the identical command a tray click would and answers with the result.
+    /// The pipe uses the default same-user ACL: whoever runs the daemon (and
+    /// administrators) can drive it, nobody else.
+    ///
+    /// `start --game TITLE` points this and every later session at that
+    /// games.toml profile; the title is validated by the daemon's normal plan
+    /// resolution, and a title that does not resolve fails the start and
+    /// leaves the previous profile in place. `status --json` prints the full
+    /// pipe response (state, game, profiles, last/live session health).
+    ///
+    /// Exit codes: 0 = done, 1 = error (the daemon refused — e.g. start while
+    /// already running, stop while stopped, unknown profile — or the pipe
+    /// failed mid-conversation), 2 = no daemon control channel (the daemon is
+    /// not running, or it predates `ksx session`).
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// Manage the WinUSB claim: which interfaces ksx can take, and how to give them back
     ///
     /// Claiming an interface rebinds it from the keyboard stack to Microsoft's
@@ -338,19 +362,22 @@ enum Command {
         #[command(subcommand)]
         command: WinusbCommand,
     },
-    /// Serve the ksx Studio status page on 127.0.0.1 (skeleton)
+    /// Serve the ksx Studio page on 127.0.0.1: cabinet status + session control
     ///
-    /// Renders the cabinet status screen — driver health, the virtual pads
-    /// the bus is exposing, autostart registration, the games.toml profiles,
-    /// and whether another ksx process is alive — as a localhost web page
-    /// that auto-refreshes every 2 seconds. Read-only: every request re-runs
-    /// the same collectors `ksx doctor` uses; nothing is opened, claimed or
-    /// changed.
+    /// One auto-refreshing page. The SESSION panel talks to a running `ksx
+    /// daemon` over its control pipe (the same surface as `ksx session` and
+    /// the tray menu): current state, a games.toml profile dropdown, and
+    /// Start / Stop / Reload buttons as plain HTML forms — every button is
+    /// one backend verb, no GUI-only code paths. With no daemon on the pipe
+    /// the controls render disabled and say so; this command never starts a
+    /// daemon or captures anything itself.
     ///
-    /// Snapshots are point-in-time. There is no daemon IPC yet, so this page
-    /// cannot see inside a running session and does not pretend to (the page
-    /// footer says the same). Localhost only — there is no LAN option; that
-    /// arrives with the pairing token.
+    /// Below it, the status sections re-run the same read-only collectors
+    /// `ksx doctor` uses per request: driver health, the virtual pads the
+    /// bus is exposing, autostart registration, the games.toml profiles.
+    /// Status rows are point-in-time snapshots; session state is live from
+    /// the pipe. Localhost only — there is no LAN option; that arrives with
+    /// the pairing token.
     ///
     /// Exit codes: 0 = clean stop, 1 = error (bind failed, embedded UI
     /// rejected).
@@ -359,6 +386,37 @@ enum Command {
         /// TCP port on 127.0.0.1
         #[arg(long, default_value_t = 4460)]
         port: u16,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    /// Daemon state, current session summary, and the games.toml profiles
+    Status {
+        /// Print the raw pipe response (one JSON object) on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start emulation (optionally under a games.toml profile)
+    Start {
+        /// Use this profile for this and every later session
+        #[arg(long, value_name = "TITLE")]
+        game: Option<String>,
+        /// Print the raw pipe response (one JSON object) on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the current session (the game, if any, keeps running)
+    Stop {
+        /// Print the raw pipe response (one JSON object) on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop, re-read the configuration from disk, start again
+    Reload {
+        /// Print the raw pipe response (one JSON object) on stdout
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -532,6 +590,14 @@ fn main() -> anyhow::Result<()> {
         }),
         #[cfg(feature = "studio")]
         Command::Studio { port } => studio::run(port),
+        Command::Session { command } => match command {
+            SessionCommand::Status { json } => session::run(session::Verb::Status, json),
+            SessionCommand::Start { game, json } => {
+                session::run(session::Verb::Start { game }, json)
+            }
+            SessionCommand::Stop { json } => session::run(session::Verb::Stop, json),
+            SessionCommand::Reload { json } => session::run(session::Verb::Reload, json),
+        },
         Command::Winusb { command } => match command {
             WinusbCommand::Status { json } => winusb::run(winusb::Options {
                 action: winusb::Action::Status,
@@ -1192,20 +1258,77 @@ mod tests {
         assert!(matches!(cli.command, Command::Studio { port: 8099 }));
     }
 
-    /// The honest-skeleton promises live in `--help`: read-only, snapshot
-    /// only (no daemon IPC), localhost only.
+    /// The honest promises live in `--help`: controls go through the pipe
+    /// (never a parallel path), degrade visibly, and the bind stays local.
     #[cfg(feature = "studio")]
     #[test]
-    fn studio_help_states_the_snapshot_and_localhost_limits() {
+    fn studio_help_states_the_control_path_and_localhost_limits() {
         let mut cmd = Cli::command();
         let studio = cmd.find_subcommand_mut("studio").unwrap();
         let help = studio.render_long_help().to_string();
         let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
         for needle in [
+            "control pipe",
+            "one backend verb, no GUI-only code paths",
+            "controls render disabled",
             "point-in-time",
-            "no daemon IPC",
             "Localhost only",
             "no LAN option",
+        ] {
+            assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // M10a first slice: ksx session (the pipe client verbs)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn session_verbs_parse_with_json_and_game() {
+        let cli = Cli::try_parse_from(["ksx", "session", "status", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Session {
+                command: SessionCommand::Status { json: true }
+            }
+        ));
+        let cli =
+            Cli::try_parse_from(["ksx", "session", "start", "--game", "Street Fighter"]).unwrap();
+        match cli.command {
+            Command::Session {
+                command: SessionCommand::Start { game, json },
+            } => {
+                assert_eq!(game.as_deref(), Some("Street Fighter"));
+                assert!(!json);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+        for verb in ["stop", "reload"] {
+            assert!(
+                Cli::try_parse_from(["ksx", "session", verb, "--json"]).is_ok(),
+                "{verb}"
+            );
+        }
+        // A bare `ksx session` has no default verb: controlling a daemon is
+        // always an explicit ask.
+        assert!(Cli::try_parse_from(["ksx", "session"]).is_err());
+    }
+
+    /// The exit-code contract is what makes these verbs scriptable; it lives
+    /// in `--help` where the script author looks.
+    #[test]
+    fn session_help_documents_the_pipe_and_exit_codes() {
+        let mut cmd = Cli::command();
+        let session = cmd.find_subcommand_mut("session").unwrap();
+        let help = session.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            r"\\.\pipe\ksx-daemon",
+            "same control surface as the tray menu",
+            "same-user ACL",
+            "0 = done",
+            "2 = no daemon control channel",
+            "predates `ksx session`",
         ] {
             assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
         }

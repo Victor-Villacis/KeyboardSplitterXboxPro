@@ -292,6 +292,8 @@ impl SessionFactory for PanelFactory {
     fn game(&self) -> Option<String> {
         None
     }
+
+    fn set_game(&mut self, _game: Option<String>) {}
 }
 
 struct PanelRunner {
@@ -553,7 +555,7 @@ impl Daemon {
     /// the startup window itself.
     fn start_asynchronously(&self) {
         self.commands
-            .send(DaemonCommand::Start)
+            .send(DaemonCommand::Start { game: None })
             .expect("the loop is alive");
     }
 
@@ -569,7 +571,7 @@ impl Daemon {
 
     fn start_session(&self, n: usize) {
         self.commands
-            .send(DaemonCommand::Start)
+            .send(DaemonCommand::Start { game: None })
             .expect("the loop is alive");
         eventually(&format!("session {n} to report Running"), || {
             matches!(run_state(&self.state), RunState::Running { .. })
@@ -670,7 +672,9 @@ fn one_claim_serves_two_sessions_and_the_panel_types_in_between() {
         move || {
             let mut between = String::new();
             for session in 1..=2 {
-                commands.send(DaemonCommand::Start).expect("loop alive");
+                commands
+                    .send(DaemonCommand::Start { game: None })
+                    .expect("loop alive");
                 eventually("the session to report Running", || {
                     matches!(run_state(&state), RunState::Running { .. })
                 });
@@ -795,7 +799,7 @@ fn a_key_held_into_emulation_is_released_and_not_latched() {
     });
 
     let (commands, rx) = crossbeam_channel::unbounded::<DaemonCommand>();
-    commands.send(DaemonCommand::Start).unwrap();
+    commands.send(DaemonCommand::Start { game: None }).unwrap();
     commands.send(DaemonCommand::Quit).unwrap();
     drop(commands);
 

@@ -1,25 +1,110 @@
-//! `ksx studio` — serve the cabinet status page on localhost (feature
-//! `studio`).
+//! `ksx studio` — the localhost control room (feature `studio`).
 //!
-//! Builds a [`StatusSource`] from the EXISTING collectors — `ksx-platform`'s
-//! driver report (which includes the bus's current children), the autostart
-//! query, the games store, and a tasklist-style process check — and hands it
-//! to `ksx-studio` to serve. Every page load takes a fresh point-in-time
-//! snapshot; there is no daemon IPC yet (docs/CONTROL-SURFACE.md), so this
-//! command cannot see inside a running session and does not pretend to.
+//! Two providers, both thin:
+//!
+//! - [`StatusSource`] from the EXISTING collectors — `ksx-platform`'s driver
+//!   report (which includes the bus's current children), the autostart query,
+//!   the games store, and a tasklist-style process check. Fresh point-in-time
+//!   snapshot per page load.
+//! - [`ksx_studio::ControlSource`] over the daemon's control pipe
+//!   (`crate::daemon::pipe`): the session panel's state and its Start / Stop
+//!   / Reload buttons are each one pipe request, which enqueues the same
+//!   `DaemonCommand` a tray click would (docs/CONTROL-SURFACE.md — no
+//!   GUI-only code paths). No daemon on the pipe → the panel says so and the
+//!   controls render disabled; this process never becomes a daemon itself.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use crate::daemon::pipe::{self, client};
 use ksx_platform::autostart;
 use ksx_platform::{BusDriverReport, InterceptionReport, ServiceState};
-use ksx_studio::{PadRow, ProfileRow, StatusSnapshot, StatusSource};
+use ksx_studio::{PadRow, ProfileRow, SessionView, StatusSnapshot, StatusSource};
 
 pub fn run(port: u16) -> anyhow::Result<()> {
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     println!("ksx Studio: http://{bind}/  (localhost only; Ctrl+C or close the window to stop)");
-    println!("Snapshots are point-in-time, re-read on each request — no live session data yet.");
-    ksx_studio::serve(bind, Box::new(CollectorSource))?;
+    println!("Session controls talk to a running `ksx daemon` over its control pipe.");
+    ksx_studio::serve(bind, Box::new(CollectorSource), Box::new(PipeControlSource))?;
     Ok(())
+}
+
+/// What the panel says when nothing answers the pipe — state and remedy in
+/// one line, because the disabled controls point at it.
+const NO_CHANNEL: &str = "no daemon control channel — start the daemon (tray, or `ksx daemon`)";
+
+/// The real [`ksx_studio::ControlSource`]: one pipe request per method,
+/// nothing cached, nothing owned.
+struct PipeControlSource;
+
+impl ksx_studio::ControlSource for PipeControlSource {
+    fn session(&self) -> SessionView {
+        match client::request(pipe::PIPE_NAME, &serde_json::json!({ "verb": "status" })) {
+            Ok(status) => session_view(&status),
+            Err(client::ClientError::NotRunning) => SessionView::unreachable(NO_CHANNEL),
+            Err(err) => SessionView::unreachable(err.to_string()),
+        }
+    }
+
+    fn start(&self, profile: Option<&str>) -> Result<String, String> {
+        action(match profile {
+            Some(profile) => serde_json::json!({ "verb": "start", "profile": profile }),
+            None => serde_json::json!({ "verb": "start" }),
+        })
+    }
+
+    fn stop(&self) -> Result<String, String> {
+        action(serde_json::json!({ "verb": "stop" }))
+    }
+
+    fn reload(&self) -> Result<String, String> {
+        action(serde_json::json!({ "verb": "reload" }))
+    }
+}
+
+fn action(request: serde_json::Value) -> Result<String, String> {
+    match client::request(pipe::PIPE_NAME, &request) {
+        Ok(response) if response["ok"] == true => {
+            Ok(response["message"].as_str().unwrap_or("done").to_owned())
+        }
+        Ok(response) => Err(response["error"]
+            .as_str()
+            .unwrap_or("the daemon refused")
+            .to_owned()),
+        Err(client::ClientError::NotRunning) => Err(NO_CHANNEL.to_owned()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// One presentation line from the pipe's status response.
+fn session_view(status: &serde_json::Value) -> SessionView {
+    let run = status["run"].as_str().unwrap_or("unknown");
+    let game = status["game"].as_str();
+    let running = matches!(run, "running" | "starting");
+    let line = match run {
+        "running" => {
+            let slots = status["slots"].as_u64().unwrap_or(0);
+            match game {
+                Some(game) => format!("running — {game} — {slots} pad(s)"),
+                None => format!("running — {slots} pad(s)"),
+            }
+        }
+        "starting" => "starting…".to_owned(),
+        "stopped" => match game {
+            Some(game) => format!("idle — profile: {game}"),
+            None => "idle".to_owned(),
+        },
+        "failed" => format!(
+            "stopped: {}",
+            status["message"].as_str().unwrap_or("last session failed")
+        ),
+        "quitting" => "daemon shutting down…".to_owned(),
+        other => format!("daemon state: {other}"),
+    };
+    SessionView {
+        reachable: true,
+        running,
+        line,
+    }
 }
 
 /// The real snapshot provider: nothing cached, nothing owned — each call
@@ -120,8 +205,10 @@ fn interception_line(icpt: &InterceptionReport) -> String {
 }
 
 /// Tasklist-style liveness check: any OTHER `ksx.exe` process. Honest about
-/// its own limits — without daemon IPC it cannot tell a tray daemon from a
-/// `ksx run` session, only that some ksx is alive.
+/// its own limits — a process list cannot tell a tray daemon from a `ksx
+/// run` session; the session panel's control pipe is the authoritative
+/// daemon view, and this row exists to catch a ksx that is alive but NOT
+/// answering the pipe (a foreground session, a pre-pipe daemon).
 fn daemon_check() -> (bool, String) {
     let self_pid = std::process::id();
     let ksx: Vec<_> = ksx_platform::process::snapshot()
@@ -131,8 +218,8 @@ fn daemon_check() -> (bool, String) {
     if ksx.is_empty() {
         (
             false,
-            "no other ksx.exe process (process-list check — this cannot see \
-             inside a session and there is no daemon IPC yet)"
+            "no other ksx.exe process (process-list check; the Session panel's \
+             control pipe is the authoritative daemon view)"
                 .to_owned(),
         )
     } else {
@@ -140,8 +227,9 @@ fn daemon_check() -> (bool, String) {
         (
             true,
             format!(
-                "ksx.exe alive (pid {}) — daemon or session, indistinguishable \
-                 without daemon IPC",
+                "ksx.exe alive (pid {}) — daemon or session; if the Session \
+                 panel shows no control channel, this one predates it or is a \
+                 foreground `ksx run`",
                 pids.join(", ")
             ),
         )
@@ -228,10 +316,32 @@ mod tests {
     }
 
     #[test]
-    fn daemon_check_is_honest_about_the_ipc_gap() {
+    fn daemon_check_is_honest_about_its_mechanism() {
         // Cannot assert liveness (depends on the machine), but the wording
-        // must always disclose the mechanism's limit.
+        // must always disclose the mechanism's limit and point at the pipe.
         let (_, detail) = daemon_check();
-        assert!(detail.contains("daemon IPC"), "{detail}");
+        assert!(detail.contains("Session panel"), "{detail}");
+    }
+
+    #[test]
+    fn session_view_composes_the_state_line_from_the_pipe_status() {
+        let running = session_view(&serde_json::json!({
+            "run": "running", "slots": 4, "game": "Street Fighter"
+        }));
+        assert!(running.reachable && running.running);
+        assert_eq!(running.line, "running — Street Fighter — 4 pad(s)");
+
+        let idle = session_view(&serde_json::json!({ "run": "stopped", "game": null }));
+        assert!(idle.reachable && !idle.running);
+        assert_eq!(idle.line, "idle");
+
+        let failed = session_view(&serde_json::json!({
+            "run": "failed", "message": "refusing to start: bad config"
+        }));
+        assert!(!failed.running);
+        assert!(failed.line.contains("bad config"));
+
+        let starting = session_view(&serde_json::json!({ "run": "starting" }));
+        assert!(starting.running, "starting must offer Stop, not Start");
     }
 }

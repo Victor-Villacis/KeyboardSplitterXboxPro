@@ -1,4 +1,5 @@
-//! The render seam: embedded FMIR + per-request [`StatusSnapshot`] → HTML.
+//! The render seam: embedded FMIR + per-request [`StatusSnapshot`] /
+//! [`SessionView`] → HTML.
 //!
 //! # Data-injection mechanism (and why)
 //!
@@ -7,7 +8,7 @@
 //! is populated by the handler before the IR walk. That is the mechanism used
 //! here — no JSON island, no string templating.
 //!
-//! Two flavours of slot exist on this page:
+//! Three flavours of slot exist on this page:
 //!
 //! - **Scalars** — every `createSignal` in `studio-ui/src/StatusPage.ts`
 //!   becomes a slot named after the signal getter. Unique names, injected via
@@ -16,20 +17,27 @@
 //!   `list:array`. The compiler (0.1.8) gives ALL lists that same name, so
 //!   name-keyed injection cannot address more than one list per page; the
 //!   seam resolves them **positionally** instead (slot-table order == emission
-//!   order == document order). [`LIST_ORDER`] documents the mapping and
-//!   `tests::embedded_ir_slot_layout_matches_the_seam` pins it — reordering
-//!   lists in StatusPage.ts without updating both is a test failure, not a
-//!   silent blank section.
+//!   order == document order). [`LIST_ORDER`] documents the mapping.
+//! - **Shows** — every `createShow` becomes a `show:createShow` Bool slot,
+//!   with exactly the same shared-name problem and the same positional
+//!   solution. [`SHOW_ORDER`] documents that mapping; the shows are what let
+//!   an SSR-only page render the session controls conditionally (enabled /
+//!   running / visibly-disabled) with zero client JS.
+//!
+//! `tests::embedded_ir_slot_layout_matches_the_seam` pins both counts —
+//! reordering lists or shows in StatusPage.ts without updating this file is a
+//! test failure, not a silently blank section.
 //!
 //! Upstream feature request this dogfoods (docs/ENHANCEMENTS.md E7 loop):
-//! per-list slot naming (e.g. `list:<binding>`), so multi-list pages can be
-//! injected by name alone.
+//! per-instance slot naming (e.g. `list:<binding>` / `show:<signal>`), so
+//! multi-list, multi-show pages can be injected by name alone.
 
 use forma_ir::parser::IrModule;
 use forma_ir::slot::{SlotData, SlotValue};
 use forma_server::{render_page, AssetManifest, PageConfig, PageOutput, RenderMode};
 use rust_embed::Embed;
 
+use crate::control::SessionView;
 use crate::error::StudioError;
 use crate::snapshot::StatusSnapshot;
 
@@ -41,10 +49,22 @@ pub(crate) struct Assets;
 
 /// The compiler names every `createList` array slot identically; lists are
 /// therefore resolved by position. Document order in StatusPage.ts:
-/// virtual pads first, then game profiles.
+/// profile dropdown options, then virtual pads, then game profiles.
 const LIST_SLOT_NAME: &str = "list:array";
-const LIST_ORDER: [&str; 2] = ["pads", "profiles"];
+const LIST_ORDER: [&str; 3] = ["profile options", "pads", "profiles"];
 const LIST_COUNT: usize = LIST_ORDER.len();
+
+/// Same story for `createShow` booleans. Document order in StatusPage.ts:
+/// the flash line, the Start form, the Stop/Reload forms, the disabled
+/// controls + explanation shown when no daemon control channel answers.
+const SHOW_SLOT_NAME: &str = "show:createShow";
+const SHOW_ORDER: [&str; 4] = ["flash", "start controls", "stop controls", "daemon down"];
+const SHOW_COUNT: usize = SHOW_ORDER.len();
+
+/// Seconds between full-page refreshes (meta pragma + HTTP `Refresh`). Was
+/// 2 s while the page was read-only; a page with a dropdown must leave the
+/// user time to aim at it before the reload closes it.
+pub(crate) const REFRESH_SECS: u32 = 5;
 
 /// Parsed once at server start; immutable afterwards.
 pub(crate) struct EmbeddedPage {
@@ -81,7 +101,11 @@ impl EmbeddedPage {
 }
 
 /// Scalar slot values, keyed by the signal names in StatusPage.ts.
-fn scalar_slots(snap: &StatusSnapshot) -> serde_json::Value {
+fn scalar_slots(
+    snap: &StatusSnapshot,
+    session: &SessionView,
+    flash: Option<&str>,
+) -> serde_json::Value {
     serde_json::json!({
         "generatedAt": snap.generated_at,
         "vigemLine": snap.vigem,
@@ -92,6 +116,8 @@ fn scalar_slots(snap: &StatusSnapshot) -> serde_json::Value {
         "padsSummary": pads_summary(snap),
         "profilesSummary": profiles_summary(snap),
         "configRoot": snap.config_root,
+        "sessionLine": session.line,
+        "flashLine": flash.unwrap_or(""),
     })
 }
 
@@ -111,8 +137,16 @@ fn profiles_summary(snap: &StatusSnapshot) -> String {
     }
 }
 
-/// The two list arrays, in [`LIST_ORDER`].
+/// The list arrays, in [`LIST_ORDER`].
 fn list_values(snap: &StatusSnapshot) -> [SlotValue; LIST_COUNT] {
+    let options = SlotValue::Array(
+        snap.profiles
+            .iter()
+            .map(|g| {
+                SlotValue::Object(vec![("title".to_owned(), SlotValue::Text(g.title.clone()))])
+            })
+            .collect(),
+    );
     let pads = SlotValue::Array(
         snap.pads
             .iter()
@@ -135,46 +169,72 @@ fn list_values(snap: &StatusSnapshot) -> [SlotValue; LIST_COUNT] {
             })
             .collect(),
     );
-    [pads, profiles]
+    [options, pads, profiles]
 }
 
-/// Slot ids of every `list:array` entry, in slot-table (== document) order.
-fn list_array_slot_ids(module: &IrModule) -> Vec<u16> {
+/// The show booleans, in [`SHOW_ORDER`]. This is the whole conditional-UI
+/// policy: exactly one of "start", "stop" or "daemon down" is true, so the
+/// panel always says something and never offers a dead button as live.
+fn show_values(session: &SessionView, flash: Option<&str>) -> [bool; SHOW_COUNT] {
+    [
+        flash.is_some(),
+        session.reachable && !session.running,
+        session.reachable && session.running,
+        !session.reachable,
+    ]
+}
+
+/// Slot ids of every slot named `name`, in slot-table (== document) order.
+fn named_slot_ids(module: &IrModule, name: &str) -> Vec<u16> {
     module
         .slots
         .entries()
         .iter()
-        .filter(|e| {
-            module
-                .strings
-                .get(e.name_str_idx)
-                .is_ok_and(|name| name == LIST_SLOT_NAME)
-        })
+        .filter(|e| module.strings.get(e.name_str_idx).is_ok_and(|n| n == name))
         .map(|e| e.slot_id)
         .collect()
 }
 
-/// Populate every server-injected slot from the snapshot.
-fn build_slots(module: &IrModule, snap: &StatusSnapshot) -> SlotData {
+/// Populate every server-injected slot.
+fn build_slots(
+    module: &IrModule,
+    snap: &StatusSnapshot,
+    session: &SessionView,
+    flash: Option<&str>,
+) -> SlotData {
     // Scalars by name; starts from IR defaults, so a renamed signal degrades
     // to its authored default ("not collected"), never to garbage.
-    let scalars = scalar_slots(snap).to_string();
+    let scalars = scalar_slots(snap, session, flash).to_string();
     let mut slots = SlotData::from_json(&scalars, module)
         .unwrap_or_else(|_| SlotData::new_from_defaults(&module.slots));
 
-    // Lists by position (see module docs).
-    let ids = list_array_slot_ids(module);
-    for (id, value) in ids.into_iter().zip(list_values(snap)) {
+    // Lists and shows by position (see module docs).
+    for (id, value) in named_slot_ids(module, LIST_SLOT_NAME)
+        .into_iter()
+        .zip(list_values(snap))
+    {
         slots.set(id, value);
+    }
+    for (id, value) in named_slot_ids(module, SHOW_SLOT_NAME)
+        .into_iter()
+        .zip(show_values(session, flash))
+    {
+        slots.set(id, SlotValue::Bool(value));
     }
     slots
 }
 
-/// Render the status page for one snapshot. Falling back to Phase 1 (an empty
-/// `#app` with zero client JS, i.e. a blank page) can only happen if the
-/// embedded IR is broken — which `EmbeddedPage::load` already refused.
-pub(crate) fn render_status(page: &EmbeddedPage, snap: &StatusSnapshot) -> PageOutput {
-    let slots = build_slots(&page.module, snap);
+/// Render the page for one snapshot + session view. Falling back to Phase 1
+/// (an empty `#app` with zero client JS, i.e. a blank page) can only happen
+/// if the embedded IR is broken — which `EmbeddedPage::load` already refused.
+pub(crate) fn render_status(
+    page: &EmbeddedPage,
+    snap: &StatusSnapshot,
+    session: &SessionView,
+    flash: Option<&str>,
+) -> PageOutput {
+    let slots = build_slots(&page.module, snap, session, flash);
+    let refresh = format!(r#"<meta http-equiv="refresh" content="{REFRESH_SECS}">"#);
     render_page(&PageConfig {
         title: "ksx Studio — cabinet status",
         route_pattern: "/",
@@ -182,11 +242,11 @@ pub(crate) fn render_status(page: &EmbeddedPage, snap: &StatusSnapshot) -> PageO
         config_script: None,
         body_class: None,
         personality_css: None,
-        // The 2-second auto-refresh. A meta pragma is processed wherever the
-        // element is inserted (WHATWG "pragma directives"), head or body; the
-        // server also sends an HTTP `Refresh: 2` header (server.rs) as belt
-        // and braces. No JS, nothing for the hardcoded CSP to block.
-        body_prefix: Some(r#"<meta http-equiv="refresh" content="2">"#),
+        // The auto-refresh. A meta pragma is processed wherever the element
+        // is inserted (WHATWG "pragma directives"), head or body; the server
+        // also sends an HTTP `Refresh` header (server.rs) as belt and braces.
+        // No JS, nothing for the hardcoded CSP to block.
+        body_prefix: Some(&refresh),
         render_mode: RenderMode::Phase2SsrReconcile,
         ir_module: Some(&page.module),
         slots: Some(&slots),
@@ -224,6 +284,22 @@ mod tests {
         }
     }
 
+    fn idle_session() -> SessionView {
+        SessionView {
+            reachable: true,
+            running: false,
+            line: "idle — daemon reachable".into(),
+        }
+    }
+
+    fn running_session() -> SessionView {
+        SessionView {
+            reachable: true,
+            running: true,
+            line: "running — Street Fighter — 4 pad(s)".into(),
+        }
+    }
+
     #[test]
     fn embedded_page_loads_and_ir_is_fmir_v2() {
         let page = EmbeddedPage::load().expect("embedded page must load");
@@ -235,8 +311,9 @@ mod tests {
     }
 
     /// Pins the slot-table contract the seam depends on: every scalar signal
-    /// name exists, and there are exactly as many `list:array` slots as
-    /// [`LIST_ORDER`] claims. Fails when StatusPage.ts and this file drift.
+    /// name exists, and there are exactly as many `list:array` / `show:
+    /// createShow` slots as [`LIST_ORDER`] / [`SHOW_ORDER`] claim. Fails when
+    /// StatusPage.ts and this file drift.
     #[test]
     fn embedded_ir_slot_layout_matches_the_seam() {
         let page = EmbeddedPage::load().unwrap();
@@ -248,7 +325,7 @@ mod tests {
             .filter_map(|e| module.strings.get(e.name_str_idx).ok())
             .collect();
 
-        let scalars = scalar_slots(&StatusSnapshot::default());
+        let scalars = scalar_slots(&StatusSnapshot::default(), &SessionView::default(), None);
         for key in scalars.as_object().unwrap().keys() {
             assert!(
                 names.contains(&key.as_str()),
@@ -256,16 +333,21 @@ mod tests {
             );
         }
         assert_eq!(
-            list_array_slot_ids(module).len(),
+            named_slot_ids(module, LIST_SLOT_NAME).len(),
             LIST_ORDER.len(),
             "list count drifted between StatusPage.ts and LIST_ORDER; slots: {names:?}"
+        );
+        assert_eq!(
+            named_slot_ids(module, SHOW_SLOT_NAME).len(),
+            SHOW_ORDER.len(),
+            "show count drifted between StatusPage.ts and SHOW_ORDER; slots: {names:?}"
         );
     }
 
     #[test]
     fn render_injects_real_snapshot_data_into_ssr_html() {
         let page = EmbeddedPage::load().unwrap();
-        let out = render_status(&page, &sample());
+        let out = render_status(&page, &sample(), &idle_session(), None);
         // Phase 2 actually happened — not the Phase-1 empty-mount fallback.
         assert!(out.html.contains("data-forma-ssr"), "{}", out.html);
         // Scalars.
@@ -274,7 +356,7 @@ mod tests {
         assert!(out.html.contains("yes"));
         assert!(out.html.contains("ksx.exe alive (pid 4242)"));
         assert!(out.html.contains("2026-08-04 12:00:00 UTC"));
-        // Lists, both of them.
+        // Lists, all of them.
         assert!(out
             .html
             .contains("USB\\VID_045E&amp;PID_028E\\2&amp;AA&amp;0&amp;01"));
@@ -284,14 +366,109 @@ mod tests {
         // The auto-refresh pragma and the no-client-JS shape.
         assert!(out
             .html
-            .contains(r#"<meta http-equiv="refresh" content="2">"#));
+            .contains(r#"<meta http-equiv="refresh" content="5">"#));
         assert!(!out.html.contains("<script type=\"module\""));
+    }
+
+    /// Idle + reachable: the Start form renders (with the profiles as
+    /// options), Stop does not, and no disabled-controls block appears.
+    #[test]
+    fn an_idle_reachable_daemon_renders_the_start_form_with_profile_options() {
+        let page = EmbeddedPage::load().unwrap();
+        let out = render_status(&page, &sample(), &idle_session(), None);
+        assert!(out.html.contains("idle — daemon reachable"), "{}", out.html);
+        assert!(
+            out.html.contains(r#"action="/session/start""#),
+            "{}",
+            out.html
+        );
+        assert!(out.html.contains("(config default)"));
+        // The reconcile markers sit inside the <option> tags, so assert on
+        // the select's inner text: an option's submitted value IS its text
+        // content (comments excluded), which is what /session/start receives.
+        let select_start = out.html.find(r#"name="profile""#).expect("select");
+        let select = &out.html[select_start..];
+        let select = &select[..select.find("</select>").expect("closed select")];
+        assert!(
+            select.contains("Street Fighter"),
+            "profile options must come from the snapshot's profiles: {select}"
+        );
+        assert!(!out.html.contains(r#"action="/session/stop""#));
+        assert!(!out.html.contains("controls disabled"));
+    }
+
+    /// Running: Stop + Reload render, Start does not.
+    #[test]
+    fn a_running_session_renders_stop_and_reload() {
+        let page = EmbeddedPage::load().unwrap();
+        let out = render_status(&page, &sample(), &running_session(), None);
+        assert!(out.html.contains("running — Street Fighter — 4 pad(s)"));
+        assert!(out.html.contains(r#"action="/session/stop""#));
+        assert!(out.html.contains(r#"action="/config/reload""#));
+        assert!(!out.html.contains(r#"action="/session/start""#));
+    }
+
+    /// No control channel: every control renders DISABLED with the reason —
+    /// visible, inert, honest. No live form may appear.
+    #[test]
+    fn an_unreachable_daemon_renders_disabled_controls_with_the_reason() {
+        let page = EmbeddedPage::load().unwrap();
+        let session = SessionView::unreachable("no daemon control channel");
+        let out = render_status(&page, &sample(), &session, None);
+        assert!(
+            out.html.contains("no daemon control channel"),
+            "{}",
+            out.html
+        );
+        assert!(out.html.contains("controls disabled"), "{}", out.html);
+        assert!(out.html.contains("`ksx daemon`"));
+        assert!(out.html.contains("disabled"));
+        assert!(!out.html.contains(r#"action="/session/start""#));
+        assert!(!out.html.contains(r#"action="/session/stop""#));
+        assert!(!out.html.contains(r#"action="/config/reload""#));
+    }
+
+    #[test]
+    fn a_flash_message_renders_only_when_present() {
+        let page = EmbeddedPage::load().unwrap();
+        let out = render_status(
+            &page,
+            &sample(),
+            &idle_session(),
+            Some("error: already running"),
+        );
+        assert!(out.html.contains("error: already running"), "{}", out.html);
+        let out = render_status(&page, &sample(), &idle_session(), None);
+        assert!(!out.html.contains(r#"class="flash""#), "{}", out.html);
+    }
+
+    /// The flash arrives from a query parameter — attacker-writable — and
+    /// must be escaped like everything else.
+    #[test]
+    fn a_hostile_flash_is_escaped_not_injected() {
+        let page = EmbeddedPage::load().unwrap();
+        let out = render_status(
+            &page,
+            &sample(),
+            &idle_session(),
+            Some("<script>alert(1)</script>"),
+        );
+        assert!(
+            !out.html.contains("<script>alert(1)</script>"),
+            "{}",
+            out.html
+        );
     }
 
     #[test]
     fn render_survives_an_empty_snapshot() {
         let page = EmbeddedPage::load().unwrap();
-        let out = render_status(&page, &StatusSnapshot::default());
+        let out = render_status(
+            &page,
+            &StatusSnapshot::default(),
+            &SessionView::default(),
+            None,
+        );
         assert!(out.html.contains("data-forma-ssr"));
         assert!(out.html.contains("no virtual pads exposed by the bus"));
         assert!(out.html.contains("no profiles in games.toml"));
@@ -302,7 +479,7 @@ mod tests {
         let page = EmbeddedPage::load().unwrap();
         let mut snap = sample();
         snap.vigem = "<script>alert(1)</script>".into();
-        let out = render_status(&page, &snap);
+        let out = render_status(&page, &snap, &idle_session(), None);
         assert!(
             !out.html.contains("<script>alert(1)</script>"),
             "{}",

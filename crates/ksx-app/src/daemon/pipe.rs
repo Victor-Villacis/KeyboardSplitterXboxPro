@@ -1,0 +1,1002 @@
+//! The daemon's external control channel: `\\.\pipe\ksx-daemon`.
+//!
+//! One JSON request line in, one JSON response line out, per connection —
+//! that is the whole protocol. Verbs: `status`, `start` (optional `profile`),
+//! `stop`, `reload`. `ksx session` and Studio are thin clients of this;
+//! docs/CONTROL-SURFACE.md carries the request/response examples.
+//!
+//! # Reach
+//!
+//! The pipe thread has exactly the tray's reach and no more: it enqueues the
+//! same [`DaemonCommand`] values the tray menu produces, reads the same
+//! [`DaemonState`] snapshot the tray polls, and reads games.toml from disk.
+//! It owns no path to the factory, the panel, or any pipeline thread — a
+//! wedged pipe client costs other clients their turn on the pipe, never a
+//! keyboard.
+//!
+//! # Trust model
+//!
+//! The pipe is created with the DEFAULT security descriptor, which grants
+//! access to the creating user (plus SYSTEM and administrators) and nobody
+//! else. Same-user processes can already `taskkill` the daemon, so the pipe
+//! adds no authority they lack; other users get ERROR_ACCESS_DENIED from the
+//! object manager before ksx sees the connection. No token, no auth layer.
+//!
+//! # Concurrency
+//!
+//! One server thread serves connections **sequentially**. The next pipe
+//! instance is created *before* the current connection is served, so a second
+//! client (two Studio processes, a `ksx session` racing a page load) connects
+//! and simply waits its turn instead of seeing ERROR_FILE_NOT_FOUND; the
+//! client side additionally retries briefly on FILE_NOT_FOUND and
+//! ERROR_PIPE_BUSY as belt and braces.
+
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::Sender;
+
+use super::{DaemonCommand, DaemonState, RunState, SharedState};
+
+/// The one well-known name. Tests use throwaway names; everything else uses
+/// this.
+pub const PIPE_NAME: &str = r"\\.\pipe\ksx-daemon";
+
+/// `(title, detail)` rows from games.toml, read on demand so `status` reflects
+/// what is on disk now — the same freshness rule as `Reload`.
+pub type ProfilesFn = Box<dyn Fn() -> Vec<(String, String)> + Send>;
+
+/// games.toml rows for the status response. Unreadable configuration reports
+/// itself as a row rather than vanishing — same honesty rule as Studio.
+pub fn profile_rows(root: &ksx_config::ConfigRoot) -> Vec<(String, String)> {
+    match ksx_config::Store::new(root.clone()).load_games() {
+        Ok(loaded) => loaded
+            .value
+            .games
+            .iter()
+            .map(|g| {
+                let detail = match g.slots.len() {
+                    1 => format!("{} — 1 slot", g.path),
+                    n => format!("{} — {n} slots", g.path),
+                };
+                (g.title.clone(), detail)
+            })
+            .collect(),
+        Err(err) => vec![("(games.toml unreadable)".to_owned(), err.to_string())],
+    }
+}
+
+/// How long an action verb polls the snapshot for the command's outcome
+/// before answering "requested". Long enough for pads to plug; short enough
+/// that a client is never parked behind a wedged start.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+const SETTLE_POLL: Duration = Duration::from_millis(25);
+/// A request line longer than this is an attack or a bug, not a verb.
+const MAX_REQUEST: usize = 64 * 1024;
+
+// ---------------------------------------------------------------------------
+// Verb handling — pure with respect to the transport, so the protocol is
+// testable without a pipe (and without Windows).
+// ---------------------------------------------------------------------------
+
+fn snapshot(state: &SharedState) -> DaemonState {
+    state.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+fn run_word(run: &RunState) -> &'static str {
+    match run {
+        RunState::Stopped => "stopped",
+        RunState::Starting => "starting",
+        RunState::Running { .. } => "running",
+        RunState::Failed { .. } => "failed",
+        RunState::Quitting => "quitting",
+    }
+}
+
+fn status_json(state: &SharedState, profiles: &ProfilesFn) -> serde_json::Value {
+    let snap = snapshot(state);
+    let (slots, message) = match &snap.run {
+        RunState::Running { slots } => (Some(*slots), None),
+        RunState::Failed { message } => (None, Some(message.clone())),
+        _ => (None, None),
+    };
+    let rows: Vec<serde_json::Value> = profiles()
+        .into_iter()
+        .map(|(title, detail)| serde_json::json!({ "title": title, "detail": detail }))
+        .collect();
+    serde_json::json!({
+        "ok": true,
+        "run": run_word(&snap.run),
+        "slots": slots,
+        "message": message,
+        "game": snap.game,
+        "tooltip": snap.tooltip(),
+        "profiles": rows,
+        "last": snap.last.as_ref().map(|l| serde_json::json!({
+            "stop_code": l.stop_code,
+            "message": l.message,
+            "exit_code": l.exit_code,
+            "reboot_required": l.reboot_required,
+            "watchdog_tripped": l.watchdog_tripped,
+            "dropped_events": l.dropped_events,
+        })),
+        "live": snap.live.as_ref().map(|h| serde_json::json!({
+            "reboot_required": h.reboot_required,
+            "watchdog_tripped": h.watchdog_tripped,
+            "dropped_events": h.dropped_events,
+        })),
+    })
+}
+
+fn ok_msg(message: String) -> serde_json::Value {
+    serde_json::json!({ "ok": true, "message": message })
+}
+
+fn err_msg(error: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({ "ok": false, "error": error.into() })
+}
+
+/// Poll the snapshot until a start (or reload) settles. `baseline` is the run
+/// state from before the command was enqueued: a `Failed` identical to the
+/// baseline is old news unless `Starting` was seen in between.
+fn await_start(state: &SharedState, baseline: &RunState, settle: Duration) -> serde_json::Value {
+    let deadline = Instant::now() + settle;
+    let mut saw_starting = false;
+    loop {
+        let snap = snapshot(state);
+        match &snap.run {
+            // A reload's baseline is already Running: the OLD session must
+            // not be reported as the new one, so Running only settles once
+            // the state has visibly moved off the baseline.
+            RunState::Running { slots } if saw_starting || snap.run != *baseline => {
+                return ok_msg(format!("running ({slots} slot(s))"));
+            }
+            RunState::Starting => saw_starting = true,
+            RunState::Failed { message } if saw_starting || snap.run != *baseline => {
+                return err_msg(message.clone());
+            }
+            RunState::Stopped if saw_starting => {
+                return err_msg("the session ended as soon as it started");
+            }
+            RunState::Quitting => return err_msg("the daemon is shutting down"),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return ok_msg(
+                "requested; the daemon has not reported a new state yet — \
+                 check `ksx session status`"
+                    .to_owned(),
+            );
+        }
+        std::thread::sleep(SETTLE_POLL);
+    }
+}
+
+fn await_stop(state: &SharedState, settle: Duration) -> serde_json::Value {
+    let deadline = Instant::now() + settle;
+    loop {
+        let snap = snapshot(state);
+        match &snap.run {
+            RunState::Stopped => return ok_msg("stopped".to_owned()),
+            // The session is over either way; a nonzero summary is its
+            // verdict, not a failure of the stop.
+            RunState::Failed { message } => return ok_msg(format!("stopped ({message})")),
+            RunState::Quitting => return err_msg("the daemon is shutting down"),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return ok_msg(
+                "stop requested; the session has not reported ending yet — \
+                 check `ksx session status`"
+                    .to_owned(),
+            );
+        }
+        std::thread::sleep(SETTLE_POLL);
+    }
+}
+
+/// One request line → one response value. Everything the pipe can do, with
+/// the transport factored out.
+pub fn handle_request(
+    line: &str,
+    tx: &Sender<DaemonCommand>,
+    state: &SharedState,
+    profiles: &ProfilesFn,
+    settle: Duration,
+) -> serde_json::Value {
+    let request: serde_json::Value = match serde_json::from_str(line.trim()) {
+        Ok(value) => value,
+        Err(err) => return err_msg(format!("request is not a JSON object: {err}")),
+    };
+    let Some(verb) = request.get("verb").and_then(|v| v.as_str()) else {
+        return err_msg(r#"request has no "verb" (status | start | stop | reload)"#);
+    };
+    match verb {
+        "status" => status_json(state, profiles),
+        "start" => {
+            let profile = request
+                .get("profile")
+                .and_then(|p| p.as_str())
+                .filter(|p| !p.trim().is_empty())
+                .map(str::to_owned);
+            let baseline = snapshot(state).run;
+            if matches!(baseline, RunState::Running { .. } | RunState::Starting) {
+                return err_msg("already running");
+            }
+            if tx.send(DaemonCommand::Start { game: profile }).is_err() {
+                return err_msg("the daemon is shutting down");
+            }
+            await_start(state, &baseline, settle)
+        }
+        "stop" => {
+            let baseline = snapshot(state).run;
+            if !matches!(baseline, RunState::Running { .. } | RunState::Starting) {
+                return err_msg("not running");
+            }
+            if tx.send(DaemonCommand::Stop).is_err() {
+                return err_msg("the daemon is shutting down");
+            }
+            await_stop(state, settle)
+        }
+        "reload" => {
+            let baseline = snapshot(state).run;
+            if tx.send(DaemonCommand::Reload).is_err() {
+                return err_msg("the daemon is shutting down");
+            }
+            await_start(state, &baseline, settle)
+        }
+        other => err_msg(format!(
+            "unknown verb '{other}' (status | start | stop | reload)"
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client — plain std file I/O. `\\.\pipe\...` opens through CreateFileW under
+// std, so the client needs no FFI and compiles everywhere (a non-Windows open
+// simply fails NotFound, which is the truthful "no daemon here" answer).
+// ---------------------------------------------------------------------------
+
+pub mod client {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::time::{Duration, Instant};
+
+    /// Why a request produced no response.
+    #[derive(Debug)]
+    pub enum ClientError {
+        /// The pipe does not exist: no daemon is running — or the one that is
+        /// predates the control channel. `ksx session` maps this to exit 2.
+        NotRunning,
+        Io(std::io::Error),
+        Protocol(String),
+    }
+
+    impl std::fmt::Display for ClientError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::NotRunning => write!(
+                    f,
+                    "no ksx daemon control channel at the pipe (the daemon is \
+                     not running, or it predates `ksx session`) — start one \
+                     with `ksx daemon`"
+                ),
+                Self::Io(err) => write!(f, "control pipe I/O failed: {err}"),
+                Self::Protocol(what) => write!(f, "control pipe protocol error: {what}"),
+            }
+        }
+    }
+
+    impl std::error::Error for ClientError {}
+
+    /// WinError 231: every instance is mid-conversation. The daemon is alive.
+    const ERROR_PIPE_BUSY: i32 = 231;
+    /// Total budget for open retries (busy server, instance-rotation races).
+    const CONNECT_BUDGET: Duration = Duration::from_secs(2);
+    const RETRY_PAUSE: Duration = Duration::from_millis(50);
+    /// FILE_NOT_FOUND is definitive after this many looks — the retries only
+    /// paper over the daemon's instance rotation, which is sub-millisecond.
+    const NOT_FOUND_TRIES: u32 = 3;
+
+    fn open(pipe_path: &str) -> Result<std::fs::File, ClientError> {
+        let deadline = Instant::now() + CONNECT_BUDGET;
+        let mut not_found = 0;
+        loop {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(pipe_path)
+            {
+                Ok(file) => return Ok(file),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    not_found += 1;
+                    if not_found >= NOT_FOUND_TRIES {
+                        return Err(ClientError::NotRunning);
+                    }
+                }
+                Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    if Instant::now() >= deadline {
+                        return Err(ClientError::Io(err));
+                    }
+                }
+                Err(err) => return Err(ClientError::Io(err)),
+            }
+            std::thread::sleep(RETRY_PAUSE);
+        }
+    }
+
+    /// One request line in, one response line out.
+    pub fn request(
+        pipe_path: &str,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        let mut pipe = open(pipe_path)?;
+        let mut line = request.to_string();
+        line.push('\n');
+        pipe.write_all(line.as_bytes()).map_err(ClientError::Io)?;
+        pipe.flush().map_err(ClientError::Io)?;
+
+        let mut response = String::new();
+        BufReader::new(pipe)
+            .read_line(&mut response)
+            .map_err(ClientError::Io)?;
+        if response.trim().is_empty() {
+            return Err(ClientError::Protocol(
+                "the daemon closed the connection without a response".into(),
+            ));
+        }
+        serde_json::from_str(response.trim())
+            .map_err(|err| ClientError::Protocol(format!("unparsable response: {err}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server — Win32 named pipe, plain threads. No async runtime anywhere: E7
+// rule A (`cargo tree -p ksx-app` shows no tokio) holds by construction.
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+pub mod server {
+    use super::*;
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+    };
+    use windows_sys::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
+
+    /// One pipe instance. Closes on drop; [`Instance::finish`] is the
+    /// graceful path (flush → disconnect) for a served connection.
+    struct Instance(HANDLE);
+
+    // SAFETY: a pipe HANDLE is a kernel object reference, valid on any thread
+    // of the owning process; only the raw-pointer typedef blocks the auto
+    // impl.
+    unsafe impl Send for Instance {}
+
+    impl Drop for Instance {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from CreateNamedPipeW and is closed
+            // exactly once (drop consumes self).
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    impl Instance {
+        /// `first` asserts sole ownership of the pipe name: a second daemon
+        /// must fail here, not silently split the client stream with the
+        /// first.
+        fn create(wide_name: &[u16], first: bool) -> Result<Self, u32> {
+            let mut open_mode = PIPE_ACCESS_DUPLEX;
+            if first {
+                open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+            }
+            // SAFETY: `wide_name` is NUL-terminated and outlives the call; a
+            // null security-attributes pointer selects the default (same-user)
+            // descriptor — the trust model documented on this module.
+            let handle = unsafe {
+                CreateNamedPipeW(
+                    wide_name.as_ptr(),
+                    open_mode,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    PIPE_UNLIMITED_INSTANCES,
+                    64 * 1024,
+                    64 * 1024,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                // SAFETY: immediately after the failed call, same thread.
+                return Err(unsafe { GetLastError() });
+            }
+            Ok(Self(handle))
+        }
+
+        /// Block until a client connects. A client that raced ahead of us
+        /// (ERROR_PIPE_CONNECTED) is already connected — success.
+        fn connect(&self) -> bool {
+            // SAFETY: `self.0` is a live pipe handle; a null OVERLAPPED means
+            // synchronous, which is this server's whole design.
+            let ok = unsafe { ConnectNamedPipe(self.0, std::ptr::null_mut()) };
+            // SAFETY: immediately after the call, same thread.
+            ok != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED
+        }
+
+        /// Read until `\n`, EOF, or the size cap.
+        fn read_line(&self) -> Option<String> {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let mut read: u32 = 0;
+                // SAFETY: `chunk` outlives the call and its length is passed;
+                // `read` receives the byte count.
+                let ok = unsafe {
+                    ReadFile(
+                        self.0,
+                        chunk.as_mut_ptr(),
+                        chunk.len() as u32,
+                        &mut read,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 || read == 0 {
+                    return None;
+                }
+                buf.extend_from_slice(&chunk[..read as usize]);
+                if buf.contains(&b'\n') {
+                    break;
+                }
+                if buf.len() > MAX_REQUEST {
+                    return None;
+                }
+            }
+            String::from_utf8(buf).ok()
+        }
+
+        fn write_all(&self, mut bytes: &[u8]) -> bool {
+            while !bytes.is_empty() {
+                let mut written: u32 = 0;
+                // SAFETY: `bytes` outlives the call and its length is passed;
+                // `written` receives the byte count.
+                let ok = unsafe {
+                    WriteFile(
+                        self.0,
+                        bytes.as_ptr(),
+                        bytes.len() as u32,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 || written == 0 {
+                    return false;
+                }
+                bytes = &bytes[written as usize..];
+            }
+            true
+        }
+
+        /// Flush + disconnect, so the client reads the full response before
+        /// the handle goes away. Drop then closes it.
+        fn finish(self) {
+            // SAFETY: live handle; flush-then-disconnect is the documented
+            // graceful server-side teardown for byte pipes.
+            unsafe {
+                FlushFileBuffers(self.0);
+                DisconnectNamedPipe(self.0);
+            }
+        }
+    }
+
+    /// Serve `name` until the process exits. Returns immediately; the thread
+    /// logs and dies (leaving tray/stdin untouched) if the name cannot be
+    /// owned — e.g. a second daemon is already serving it.
+    pub fn spawn(
+        name: String,
+        tx: Sender<DaemonCommand>,
+        state: SharedState,
+        profiles: ProfilesFn,
+    ) {
+        spawn_with(name, tx, state, profiles, SETTLE_TIMEOUT);
+    }
+
+    /// [`spawn`] with the settle timeout exposed, so tests are not 5 s each.
+    pub fn spawn_with(
+        name: String,
+        tx: Sender<DaemonCommand>,
+        state: SharedState,
+        profiles: ProfilesFn,
+        settle: Duration,
+    ) {
+        let result = std::thread::Builder::new()
+            .name("ksx-daemon-pipe".into())
+            .spawn(move || serve(&name, &tx, &state, &profiles, settle));
+        if let Err(err) = result {
+            tracing::error!("could not spawn the control-pipe thread: {err}");
+        }
+    }
+
+    fn serve(
+        name: &str,
+        tx: &Sender<DaemonCommand>,
+        state: &SharedState,
+        profiles: &ProfilesFn,
+        settle: Duration,
+    ) {
+        let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut instance = match Instance::create(&wide_name, true) {
+            Ok(instance) => instance,
+            Err(code) => {
+                tracing::error!(
+                    "control pipe {name} unavailable (WinError {code}); \
+                     is another ksx daemon already running?"
+                );
+                return;
+            }
+        };
+        tracing::info!("control pipe listening on {name}");
+        loop {
+            if !instance.connect() {
+                // A failed accept on a healthy handle is transient; recreate
+                // rather than spin on it.
+                drop(instance);
+                match Instance::create(&wide_name, false) {
+                    Ok(fresh) => instance = fresh,
+                    Err(code) => {
+                        tracing::error!("control pipe died (WinError {code})");
+                        return;
+                    }
+                }
+                continue;
+            }
+            // The NEXT instance exists before this connection is served:
+            // clients arriving mid-request queue on it instead of finding no
+            // pipe at all.
+            let next = Instance::create(&wide_name, false);
+            if let Some(line) = instance.read_line() {
+                let mut response = handle_request(&line, tx, state, profiles, settle).to_string();
+                response.push('\n');
+                instance.write_all(response.as_bytes());
+            }
+            instance.finish();
+            match next {
+                Ok(fresh) => instance = fresh,
+                Err(code) => {
+                    tracing::error!("control pipe died (WinError {code})");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use crossbeam_channel::unbounded;
+
+    fn shared(run: RunState) -> SharedState {
+        Arc::new(Mutex::new(DaemonState {
+            run,
+            ..DaemonState::default()
+        }))
+    }
+
+    fn no_profiles() -> ProfilesFn {
+        Box::new(Vec::new)
+    }
+
+    fn fixed_profiles() -> ProfilesFn {
+        Box::new(|| {
+            vec![
+                (
+                    "Street Fighter".to_owned(),
+                    r"C:\sf.exe — 2 slots".to_owned(),
+                ),
+                ("Metal Slug".to_owned(), r"C:\ms.exe — 1 slot".to_owned()),
+            ]
+        })
+    }
+
+    const FAST: Duration = Duration::from_millis(50);
+
+    // -- protocol, no transport ---------------------------------------------
+
+    #[test]
+    fn status_reports_state_game_and_profiles() {
+        let state = shared(RunState::Running { slots: 4 });
+        state.lock().unwrap().game = Some("Street Fighter".into());
+        let (tx, _rx) = unbounded();
+        let v = handle_request(r#"{"verb":"status"}"#, &tx, &state, &fixed_profiles(), FAST);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["run"], "running");
+        assert_eq!(v["slots"], 4);
+        assert_eq!(v["game"], "Street Fighter");
+        assert_eq!(v["profiles"][1]["title"], "Metal Slug");
+        assert!(v["tooltip"].as_str().unwrap().contains("running, 4 pad(s)"));
+    }
+
+    #[test]
+    fn start_enqueues_the_same_command_the_tray_produces() {
+        let state = shared(RunState::Stopped);
+        let (tx, rx) = unbounded();
+        let worker = std::thread::spawn({
+            let state = state.clone();
+            move || {
+                let command = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                state.lock().unwrap().run = RunState::Running { slots: 2 };
+                command
+            }
+        });
+        let v = handle_request(
+            r#"{"verb":"start","profile":"Metal Slug"}"#,
+            &tx,
+            &state,
+            &no_profiles(),
+            Duration::from_secs(2),
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert!(v["message"].as_str().unwrap().contains("2 slot(s)"), "{v}");
+        assert_eq!(
+            worker.join().unwrap(),
+            DaemonCommand::Start {
+                game: Some("Metal Slug".into())
+            }
+        );
+    }
+
+    #[test]
+    fn start_with_no_or_blank_profile_keeps_the_daemons_configured_game() {
+        for request in [r#"{"verb":"start"}"#, r#"{"verb":"start","profile":" "}"#] {
+            let state = shared(RunState::Stopped);
+            let (tx, rx) = unbounded();
+            let _ = handle_request(request, &tx, &state, &no_profiles(), FAST);
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                DaemonCommand::Start { game: None },
+                "{request}"
+            );
+        }
+    }
+
+    #[test]
+    fn start_while_running_is_refused_without_enqueuing() {
+        let state = shared(RunState::Running { slots: 4 });
+        let (tx, rx) = unbounded();
+        let v = handle_request(r#"{"verb":"start"}"#, &tx, &state, &no_profiles(), FAST);
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains("already running"));
+        assert!(rx.try_recv().is_err(), "nothing may be enqueued");
+    }
+
+    /// The same validation path as the tray: a bad profile fails in the
+    /// factory's plan resolution, lands in `RunState::Failed`, and the pipe
+    /// reports that message — no parallel validator in the pipe thread.
+    #[test]
+    fn a_start_that_fails_in_the_factory_reports_the_failure_message() {
+        let state = shared(RunState::Stopped);
+        let (tx, rx) = unbounded();
+        std::thread::spawn({
+            let state = state.clone();
+            move || {
+                let _ = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                state.lock().unwrap().run = RunState::Starting;
+                std::thread::sleep(Duration::from_millis(10));
+                state.lock().unwrap().run = RunState::Failed {
+                    message: "unknown game \"Typo Fighter\"".into(),
+                };
+            }
+        });
+        let v = handle_request(
+            r#"{"verb":"start","profile":"Typo Fighter"}"#,
+            &tx,
+            &state,
+            &no_profiles(),
+            Duration::from_secs(2),
+        );
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("Typo Fighter"));
+    }
+
+    /// A make() that fails faster than the poll interval must still be
+    /// reported: the baseline comparison catches a Stopped→Failed jump even
+    /// when Starting was never observed.
+    #[test]
+    fn a_fast_failure_is_not_mistaken_for_stale_state() {
+        let state = shared(RunState::Stopped);
+        let (tx, rx) = unbounded();
+        std::thread::spawn({
+            let state = state.clone();
+            move || {
+                let _ = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                state.lock().unwrap().run = RunState::Failed {
+                    message: "cannot start".into(),
+                };
+            }
+        });
+        let v = handle_request(
+            r#"{"verb":"start"}"#,
+            &tx,
+            &state,
+            &no_profiles(),
+            Duration::from_secs(2),
+        );
+        assert_eq!(v["ok"], false, "{v}");
+    }
+
+    #[test]
+    fn an_unprocessed_command_times_out_into_an_honest_requested_answer() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let v = handle_request(r#"{"verb":"start"}"#, &tx, &state, &no_profiles(), FAST);
+        assert_eq!(v["ok"], true, "{v}");
+        assert!(v["message"].as_str().unwrap().contains("requested"), "{v}");
+    }
+
+    #[test]
+    fn stop_when_nothing_runs_is_refused() {
+        let state = shared(RunState::Stopped);
+        let (tx, rx) = unbounded();
+        let v = handle_request(r#"{"verb":"stop"}"#, &tx, &state, &no_profiles(), FAST);
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains("not running"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stop_waits_for_the_session_to_end() {
+        let state = shared(RunState::Running { slots: 4 });
+        let (tx, rx) = unbounded();
+        std::thread::spawn({
+            let state = state.clone();
+            move || {
+                assert_eq!(
+                    rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                    DaemonCommand::Stop
+                );
+                state.lock().unwrap().run = RunState::Stopped;
+            }
+        });
+        let v = handle_request(
+            r#"{"verb":"stop"}"#,
+            &tx,
+            &state,
+            &no_profiles(),
+            Duration::from_secs(2),
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["message"], "stopped");
+    }
+
+    #[test]
+    fn reload_enqueues_reload_and_reports_the_new_session() {
+        let state = shared(RunState::Running { slots: 4 });
+        let (tx, rx) = unbounded();
+        std::thread::spawn({
+            let state = state.clone();
+            move || {
+                assert_eq!(
+                    rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                    DaemonCommand::Reload
+                );
+                state.lock().unwrap().run = RunState::Starting;
+                std::thread::sleep(Duration::from_millis(10));
+                state.lock().unwrap().run = RunState::Running { slots: 6 };
+            }
+        });
+        let v = handle_request(
+            r#"{"verb":"reload"}"#,
+            &tx,
+            &state,
+            &no_profiles(),
+            Duration::from_secs(2),
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert!(v["message"].as_str().unwrap().contains("6 slot(s)"));
+    }
+
+    #[test]
+    fn junk_and_unknown_verbs_are_answered_not_dropped() {
+        let state = shared(RunState::Stopped);
+        let (tx, rx) = unbounded();
+        for junk in ["not json", "{}", r#"{"verb":"launch nukes"}"#, ""] {
+            let v = handle_request(junk, &tx, &state, &no_profiles(), FAST);
+            assert_eq!(v["ok"], false, "{junk:?} → {v}");
+            assert!(v["error"].is_string(), "{junk:?} → {v}");
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    // -- transport, Windows only --------------------------------------------
+
+    #[cfg(windows)]
+    mod transport {
+        use super::*;
+
+        fn unique_pipe(tag: &str) -> String {
+            format!(r"\\.\pipe\ksx-test-{}-{tag}", std::process::id())
+        }
+
+        #[test]
+        fn one_request_one_response_per_connection_served_sequentially() {
+            let name = unique_pipe("roundtrip");
+            let state = shared(RunState::Running { slots: 4 });
+            let (tx, _rx) = unbounded();
+            server::spawn_with(
+                name.clone(),
+                tx,
+                state,
+                fixed_profiles(),
+                Duration::from_millis(100),
+            );
+
+            // Sequential connections: each opens, asks, gets one line.
+            for _ in 0..3 {
+                let v = client::request(&name, &serde_json::json!({ "verb": "status" }))
+                    .expect("round trip");
+                assert_eq!(v["ok"], true);
+                assert_eq!(v["run"], "running");
+                assert_eq!(v["profiles"][0]["title"], "Street Fighter");
+            }
+        }
+
+        #[test]
+        fn concurrent_clients_all_get_served() {
+            let name = unique_pipe("concurrent");
+            let state = shared(RunState::Stopped);
+            let (tx, _rx) = unbounded();
+            server::spawn_with(
+                name.clone(),
+                tx,
+                state,
+                no_profiles(),
+                Duration::from_millis(10),
+            );
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let name = name.clone();
+                    std::thread::spawn(move || {
+                        client::request(&name, &serde_json::json!({ "verb": "status" }))
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let v = handle.join().unwrap().expect("every client is answered");
+                assert_eq!(v["ok"], true);
+            }
+        }
+
+        #[test]
+        fn no_daemon_means_not_running_not_a_hang() {
+            let err = client::request(
+                &unique_pipe("absent"),
+                &serde_json::json!({ "verb": "status" }),
+            )
+            .unwrap_err();
+            assert!(matches!(err, client::ClientError::NotRunning), "{err}");
+        }
+
+        #[test]
+        fn a_second_server_on_the_same_name_is_refused_but_the_first_keeps_serving() {
+            let name = unique_pipe("dup");
+            let state = shared(RunState::Stopped);
+            let (tx, _rx) = unbounded();
+            server::spawn_with(
+                name.clone(),
+                tx.clone(),
+                state.clone(),
+                no_profiles(),
+                Duration::from_millis(10),
+            );
+            // Let the first server own the name before the pretender tries.
+            let v = client::request(&name, &serde_json::json!({ "verb": "status" })).unwrap();
+            assert_eq!(v["ok"], true);
+            server::spawn_with(
+                name.clone(),
+                tx,
+                state,
+                no_profiles(),
+                Duration::from_millis(10),
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            let v = client::request(&name, &serde_json::json!({ "verb": "status" }))
+                .expect("the first server still answers");
+            assert_eq!(v["ok"], true);
+        }
+
+        /// The full loop: pipe → channel → REAL control loop → factory, with
+        /// the profile override landing in the factory and the response
+        /// reporting the running session.
+        #[test]
+        fn the_pipe_drives_the_real_control_loop_end_to_end() {
+            struct BlockingRunner;
+            impl super::super::super::SessionRunner for BlockingRunner {
+                fn run(
+                    &mut self,
+                    stop: Arc<std::sync::atomic::AtomicBool>,
+                    _out: &mut dyn std::io::Write,
+                ) -> anyhow::Result<super::super::super::SessionSummary> {
+                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(super::super::super::SessionSummary {
+                        stop_code: "daemon-stop".into(),
+                        message: "stopped from the pipe".into(),
+                        ..Default::default()
+                    })
+                }
+                fn slots(&self) -> usize {
+                    3
+                }
+            }
+            struct Factory {
+                game: Arc<Mutex<Option<String>>>,
+            }
+            impl super::super::super::SessionFactory for Factory {
+                fn make(&mut self) -> anyhow::Result<Box<dyn super::super::super::SessionRunner>> {
+                    Ok(Box::new(BlockingRunner))
+                }
+                fn config_dir(&self) -> std::path::PathBuf {
+                    std::path::PathBuf::from(r"C:\cfg\ksx")
+                }
+                fn game(&self) -> Option<String> {
+                    self.game.lock().unwrap().clone()
+                }
+                fn set_game(&mut self, game: Option<String>) {
+                    *self.game.lock().unwrap() = game;
+                }
+            }
+
+            let name = unique_pipe("loop");
+            let (tx, rx) = unbounded();
+            let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+            let game = Arc::new(Mutex::new(None));
+            server::spawn_with(
+                name.clone(),
+                tx.clone(),
+                state.clone(),
+                no_profiles(),
+                Duration::from_secs(2),
+            );
+            let loop_thread = std::thread::spawn({
+                let state = state.clone();
+                let game = game.clone();
+                move || {
+                    let mut factory = Factory { game };
+                    let mut out: Vec<u8> = Vec::new();
+                    super::super::super::control_loop_with(
+                        rx,
+                        state,
+                        &mut factory,
+                        &mut super::super::super::NoPanel,
+                        &mut out,
+                    );
+                }
+            });
+
+            let v = client::request(
+                &name,
+                &serde_json::json!({ "verb": "start", "profile": "Metal Slug" }),
+            )
+            .expect("start round trip");
+            assert_eq!(v["ok"], true, "{v}");
+            assert!(v["message"].as_str().unwrap().contains("3 slot(s)"), "{v}");
+            assert_eq!(game.lock().unwrap().as_deref(), Some("Metal Slug"));
+
+            let v = client::request(&name, &serde_json::json!({ "verb": "status" })).unwrap();
+            assert_eq!(v["run"], "running");
+            assert_eq!(v["game"], "Metal Slug");
+
+            let v = client::request(&name, &serde_json::json!({ "verb": "stop" })).unwrap();
+            assert_eq!(v["ok"], true, "{v}");
+
+            tx.send(DaemonCommand::Quit).unwrap();
+            loop_thread.join().unwrap();
+        }
+    }
+}

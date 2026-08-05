@@ -11,10 +11,10 @@ pub trait StatusSource: Send + Sync {
     fn snapshot(&self) -> StatusSnapshot;
 }
 
-/// Everything the cabinet status page shows. Point-in-time by design — there
-/// is no daemon IPC yet (docs/CONTROL-SURFACE.md, "the honest gaps"), so a
+/// Everything the cabinet status sections show. Point-in-time by design: a
 /// snapshot is re-read on every request and never claims to be live session
-/// data.
+/// data — that is the session panel's job, over [`crate::ControlSource`] and
+/// the daemon pipe.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     /// When the snapshot was taken, already formatted (e.g. RFC-3339-ish UTC).

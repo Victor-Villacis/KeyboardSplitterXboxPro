@@ -32,6 +32,11 @@
 //! parallel implementation. That is what makes the tray droppable if it ever
 //! misbehaves, and what makes the control loop testable in CI.
 //!
+//! A third front end, the [`pipe`] named-pipe server, gives OTHER processes
+//! (`ksx session`, Studio) exactly the tray's reach and no more: enqueue a
+//! [`DaemonCommand`], read the [`DaemonState`] snapshot. See that module for
+//! the protocol and the trust model.
+//!
 //! # M6: the daemon owns the panel
 //!
 //! With the Interception backend the daemon is a convenience — between sessions
@@ -57,6 +62,7 @@
 
 pub mod live;
 pub mod panel;
+pub mod pipe;
 #[cfg(windows)]
 pub mod tray;
 pub mod typethrough;
@@ -71,11 +77,14 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
-/// Everything the tray (or stdin) can ask for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Everything the tray, stdin or the control pipe can ask for.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DaemonCommand {
-    /// Start emulation if it is not already running.
-    Start,
+    /// Start emulation if it is not already running. `game: Some(title)` makes
+    /// this and every later session use that games.toml profile (the pipe's
+    /// `start --game`); `None` keeps whatever the daemon is configured with —
+    /// which is what the tray and stdin always send.
+    Start { game: Option<String> },
     /// Stop the current session. The game, if any, keeps running.
     Stop,
     /// Stop, re-read the configuration, start again.
@@ -93,7 +102,7 @@ impl DaemonCommand {
     /// whitespace; deliberately unforgiving about anything else.
     pub fn parse(line: &str) -> Option<Self> {
         match line.trim().to_ascii_lowercase().as_str() {
-            "start" | "s" => Some(Self::Start),
+            "start" | "s" => Some(Self::Start { game: None }),
             "stop" | "x" => Some(Self::Stop),
             "reload" | "r" => Some(Self::Reload),
             "config" | "c" => Some(Self::OpenConfigFolder),
@@ -288,7 +297,11 @@ impl DaemonState {
     pub fn menu(&self) -> Vec<(DaemonCommand, &'static str, bool)> {
         let running = matches!(self.run, RunState::Running { .. } | RunState::Starting);
         vec![
-            (DaemonCommand::Start, "Start emulation", !running),
+            (
+                DaemonCommand::Start { game: None },
+                "Start emulation",
+                !running,
+            ),
             (DaemonCommand::Stop, "Stop emulation", running),
             (DaemonCommand::Reload, "Reload config", true),
             (DaemonCommand::OpenConfigFolder, "Open config folder", true),
@@ -360,6 +373,11 @@ pub trait SessionFactory: Send {
     fn make(&mut self) -> anyhow::Result<Box<dyn SessionRunner>>;
     fn config_dir(&self) -> std::path::PathBuf;
     fn game(&self) -> Option<String>;
+    /// Repoint every FUTURE session at this games.toml profile (`None` = the
+    /// plain `[[slot]]` config). Validation stays where it always was — in
+    /// [`Self::make`]'s plan resolution — so a pipe `start --game X` fails
+    /// exactly like a tray Start with a broken config, not via a second path.
+    fn set_game(&mut self, game: Option<String>);
 }
 
 /// The keystroke behaviour of a WinUSB-claimed panel between sessions.
@@ -463,10 +481,18 @@ pub fn control_loop_with(
         }
 
         match commands.recv_timeout(Duration::from_millis(200)) {
-            Ok(DaemonCommand::Start) => {
+            Ok(DaemonCommand::Start { game }) => {
                 if session.is_some() {
                     let _ = writeln!(out, "already running");
                     continue;
+                }
+                // A per-start profile override must not outlive a start that
+                // never started: a typo'd `--game` would otherwise repoint
+                // every later tray Start at the broken title.
+                let previous_game = factory.game();
+                if let Some(game) = game {
+                    factory.set_game(Some(game));
+                    set_game(&state, factory.game());
                 }
                 // Mute the panel BEFORE the pipeline exists, not after — and
                 // re-arm the escape latch in the same breath. Muting and
@@ -481,6 +507,8 @@ pub fn control_loop_with(
                     // Nothing started, so nothing owns the panel: give it back
                     // rather than leaving a dead panel behind a failed start.
                     panel.set_emulating(false);
+                    factory.set_game(previous_game);
+                    set_game(&state, factory.game());
                 }
             }
             Ok(DaemonCommand::Stop) => match session.take() {
@@ -779,7 +807,24 @@ pub fn run(
     let (tx, rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
     if autostart {
-        let _ = tx.send(DaemonCommand::Start);
+        let _ = tx.send(DaemonCommand::Start { game: None });
+    }
+
+    // The external control channel (M10a): a named-pipe thread that can only
+    // do what the tray can — enqueue a DaemonCommand, read the DaemonState
+    // snapshot, and read games.toml from disk. It has no path to the factory,
+    // the panel or any pipeline thread. Failure to create the pipe (a second
+    // daemon already owns the name) is logged, not fatal: the tray and stdin
+    // surfaces are untouched.
+    #[cfg(windows)]
+    {
+        let profiles_root = factory.root.clone();
+        pipe::server::spawn(
+            pipe::PIPE_NAME.to_owned(),
+            tx.clone(),
+            state.clone(),
+            Box::new(move || pipe::profile_rows(&profiles_root)),
+        );
     }
 
     // M6 seam. Taken FROM THE FACTORY on purpose: the panel the control loop
@@ -1002,6 +1047,7 @@ mod tests {
         makes: Arc<Mutex<u32>>,
         trace: Option<Trace>,
         health: Option<ksx_capture::HealthHandle>,
+        game: Option<String>,
     }
 
     impl Default for FakeFactory {
@@ -1019,6 +1065,7 @@ mod tests {
                 makes: Arc::new(Mutex::new(0)),
                 trace: None,
                 health: None,
+                game: Some("Street Fighter".into()),
             }
         }
     }
@@ -1045,14 +1092,18 @@ mod tests {
         }
 
         fn game(&self) -> Option<String> {
-            Some("Street Fighter".into())
+            self.game.clone()
+        }
+
+        fn set_game(&mut self, game: Option<String>) {
+            self.game = game;
         }
     }
 
     fn drive(factory: &mut FakeFactory, script: &[DaemonCommand]) -> (DaemonState, String) {
         let (tx, rx) = unbounded();
         for command in script {
-            tx.send(*command).unwrap();
+            tx.send(command.clone()).unwrap();
         }
         drop(tx);
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
@@ -1068,7 +1119,7 @@ mod tests {
         let (state, text) = drive(
             &mut factory,
             &[
-                DaemonCommand::Start,
+                DaemonCommand::Start { game: None },
                 DaemonCommand::Stop,
                 DaemonCommand::Quit,
             ],
@@ -1092,8 +1143,8 @@ mod tests {
         let (_, text) = drive(
             &mut factory,
             &[
-                DaemonCommand::Start,
-                DaemonCommand::Start,
+                DaemonCommand::Start { game: None },
+                DaemonCommand::Start { game: None },
                 DaemonCommand::Quit,
             ],
         );
@@ -1109,7 +1160,7 @@ mod tests {
         let (_, text) = drive(
             &mut factory,
             &[
-                DaemonCommand::Start,
+                DaemonCommand::Start { game: None },
                 DaemonCommand::Reload,
                 DaemonCommand::Quit,
             ],
@@ -1122,11 +1173,56 @@ mod tests {
         assert!(text.contains("reloading configuration"), "{text}");
     }
 
+    /// A pipe `start --game X` repoints this and every later session at that
+    /// profile — the same thing restarting the daemon with `--game X` does.
+    #[test]
+    fn start_with_a_profile_override_repoints_the_factory() {
+        let mut factory = FakeFactory::default();
+        let (state, text) = drive(
+            &mut factory,
+            &[
+                DaemonCommand::Start {
+                    game: Some("Metal Slug".into()),
+                },
+                DaemonCommand::Stop,
+                DaemonCommand::Quit,
+            ],
+        );
+        assert_eq!(factory.game.as_deref(), Some("Metal Slug"), "{text}");
+        assert_eq!(state.game.as_deref(), Some("Metal Slug"));
+        assert!(factory.ran.load(Ordering::SeqCst), "{text}");
+    }
+
+    /// ...but an override whose start never started is rolled back: a typo'd
+    /// title must not repoint every later tray Start at the broken profile.
+    #[test]
+    fn a_failed_override_start_restores_the_previous_profile() {
+        let mut factory = FakeFactory {
+            fail_with: Some("refusing to start: unknown game".into()),
+            ..FakeFactory::default()
+        };
+        let (state, text) = drive(
+            &mut factory,
+            &[
+                DaemonCommand::Start {
+                    game: Some("Typo Fighter".into()),
+                },
+                DaemonCommand::Quit,
+            ],
+        );
+        assert!(text.contains("cannot start"), "{text}");
+        assert_eq!(factory.game.as_deref(), Some("Street Fighter"), "{text}");
+        assert_eq!(state.game.as_deref(), Some("Street Fighter"));
+    }
+
     /// Quit while running must stop the session, not orphan it.
     #[test]
     fn quit_stops_a_running_session_first() {
         let mut factory = FakeFactory::default();
-        let (state, text) = drive(&mut factory, &[DaemonCommand::Start, DaemonCommand::Quit]);
+        let (state, text) = drive(
+            &mut factory,
+            &[DaemonCommand::Start { game: None }, DaemonCommand::Quit],
+        );
         assert!(text.contains("stopping before exit"), "{text}");
         assert!(text.contains("bye"), "{text}");
         assert_eq!(state.run, RunState::Quitting);
@@ -1146,7 +1242,7 @@ mod tests {
             ..FakeFactory::default()
         };
         let (tx, rx) = unbounded();
-        tx.send(DaemonCommand::Start).unwrap();
+        tx.send(DaemonCommand::Start { game: None }).unwrap();
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
         let watcher = state.clone();
         std::thread::spawn(move || {
@@ -1170,7 +1266,10 @@ mod tests {
             fail_with: Some("refusing to start: 2 configuration problem(s)".into()),
             ..FakeFactory::default()
         };
-        let (state, text) = drive(&mut factory, &[DaemonCommand::Start, DaemonCommand::Quit]);
+        let (state, text) = drive(
+            &mut factory,
+            &[DaemonCommand::Start { game: None }, DaemonCommand::Quit],
+        );
         assert!(text.contains("cannot start"), "{text}");
         assert!(
             matches!(state.run, RunState::Quitting),
@@ -1185,7 +1284,7 @@ mod tests {
     fn a_disconnected_command_channel_shuts_the_daemon_down() {
         let mut factory = FakeFactory::default();
         let (tx, rx) = unbounded();
-        tx.send(DaemonCommand::Start).unwrap();
+        tx.send(DaemonCommand::Start { game: None }).unwrap();
         drop(tx);
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
         let mut out: Vec<u8> = Vec::new();
@@ -1345,7 +1444,7 @@ mod tests {
             ..FakeFactory::default()
         };
         let (tx, rx) = unbounded();
-        tx.send(DaemonCommand::Start).unwrap();
+        tx.send(DaemonCommand::Start { game: None }).unwrap();
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
 
         // What the tray would have seen at the moment the trip became visible.
@@ -1419,7 +1518,10 @@ mod tests {
     #[test]
     fn the_menu_disables_what_cannot_be_done_right_now() {
         let stopped = DaemonState::default().menu();
-        assert_eq!(stopped[0], (DaemonCommand::Start, "Start emulation", true));
+        assert_eq!(
+            stopped[0],
+            (DaemonCommand::Start { game: None }, "Start emulation", true)
+        );
         assert_eq!(stopped[1], (DaemonCommand::Stop, "Stop emulation", false));
 
         let running = DaemonState {
@@ -1448,7 +1550,7 @@ mod tests {
         };
         let (tx, rx) = unbounded();
         for command in script {
-            tx.send(*command).unwrap();
+            tx.send(command.clone()).unwrap();
         }
         drop(tx);
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
@@ -1469,7 +1571,7 @@ mod tests {
     #[test]
     fn the_panel_stops_typing_before_a_session_starts_and_resumes_after_it_ends() {
         let log = drive_with_panel(&[
-            DaemonCommand::Start,
+            DaemonCommand::Start { game: None },
             DaemonCommand::Stop,
             DaemonCommand::Quit,
         ]);
@@ -1510,7 +1612,7 @@ mod tests {
             trace: trace.clone(),
         };
         let (tx, rx) = unbounded();
-        tx.send(DaemonCommand::Start).unwrap();
+        tx.send(DaemonCommand::Start { game: None }).unwrap();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
             let _ = tx.send(DaemonCommand::Quit);
@@ -1546,7 +1648,7 @@ mod tests {
             trace: trace.clone(),
         };
         let (tx, rx) = unbounded();
-        tx.send(DaemonCommand::Start).unwrap();
+        tx.send(DaemonCommand::Start { game: None }).unwrap();
         drop(tx);
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
         let mut out: Vec<u8> = Vec::new();
@@ -1565,7 +1667,7 @@ mod tests {
     /// Losing the command channel is a teardown path too.
     #[test]
     fn a_disconnected_channel_hands_the_panel_back_before_returning() {
-        let log = drive_with_panel(&[DaemonCommand::Start]);
+        let log = drive_with_panel(&[DaemonCommand::Start { game: None }]);
         assert_eq!(
             log.last(),
             Some(&"panel:typing"),
@@ -1587,7 +1689,7 @@ mod tests {
     #[test]
     fn headless_commands_parse_the_documented_words() {
         for (line, want) in [
-            ("start", DaemonCommand::Start),
+            ("start", DaemonCommand::Start { game: None }),
             ("  STOP ", DaemonCommand::Stop),
             ("reload", DaemonCommand::Reload),
             ("config", DaemonCommand::OpenConfigFolder),
@@ -1603,7 +1705,7 @@ mod tests {
         for (command, _, _) in DaemonState::default().menu() {
             assert!(
                 [
-                    DaemonCommand::Start,
+                    DaemonCommand::Start { game: None },
                     DaemonCommand::Stop,
                     DaemonCommand::Reload,
                     DaemonCommand::OpenConfigFolder,
@@ -1611,7 +1713,7 @@ mod tests {
                 ]
                 .contains(&command)
                     && DaemonCommand::help().contains(match command {
-                        DaemonCommand::Start => "start",
+                        DaemonCommand::Start { .. } => "start",
                         DaemonCommand::Stop => "stop",
                         DaemonCommand::Reload => "reload",
                         DaemonCommand::OpenConfigFolder => "config",

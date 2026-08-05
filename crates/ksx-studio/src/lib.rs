@@ -1,14 +1,24 @@
-//! ksx-studio — the optional Forma-powered web status page (M10 skeleton).
+//! ksx-studio — the optional Forma-powered web page: cabinet status + session
+//! control (M10).
 //!
-//! One page: the cabinet status screen — driver health (ViGEmBus /
-//! Interception), the pads the bus is exposing, autostart registration, the
-//! games.toml profile list, and whether a ksx daemon process is alive. SSR
-//! only: forma-server 0.1.4 renders the embedded FMIR per request, the page
-//! auto-refreshes every 2 seconds via meta refresh (plus an HTTP `Refresh`
-//! header), and **zero JavaScript ships to the client** — which also
-//! sidesteps forma's hardcoded CSP entirely. Snapshots are point-in-time,
-//! re-read on each request; there is no daemon IPC yet
-//! (docs/CONTROL-SURFACE.md documents that gap) and the page footer says so.
+//! One page, one screen (docs/research/padforge-ui-lessons.md — no tabs, no
+//! nav): a SESSION panel (daemon state, profile dropdown, Start / Stop /
+//! Reload as plain HTML forms) above the cabinet status — driver health
+//! (ViGEmBus / Interception), the pads the bus is exposing, autostart
+//! registration, the games.toml profile list. SSR only: forma-server 0.1.4
+//! renders the embedded FMIR per request, the page auto-refreshes via meta
+//! refresh (plus an HTTP `Refresh` header), and **zero JavaScript ships to
+//! the client** — which also sidesteps forma's hardcoded CSP entirely
+//! (whose `form-action 'self'` already covers the forms).
+//!
+//! Session state and the three POST routes go through [`ControlSource`] —
+//! ksx-app implements it over the daemon's `\\.\pipe\ksx-daemon` control
+//! channel, so every button maps to the same `DaemonCommand` the tray
+//! enqueues (docs/CONTROL-SURFACE.md: no GUI-only code paths). When no
+//! daemon answers the pipe, the controls render visibly disabled with the
+//! reason and the way out ("start the daemon — tray or `ksx daemon`").
+//! Action outcomes — failures included — come back as a `flash` query
+//! parameter after a 303 redirect, rendered escaped; nothing fails silently.
 //!
 //! # Committed UI artifacts — Node is never required to build or run ksx
 //!
@@ -38,14 +48,18 @@
 //! - **Own tokio runtime, normal priority** — created inside [`serve`], never
 //!   shared with (or visible to) anything session- or pipeline-related.
 //! - This crate depends on **no other ksx crate**. Data arrives through the
-//!   [`StatusSource`] trait; ksx-app implements it from the existing
-//!   collectors. Nothing here can touch capture, output, or a live session.
+//!   [`StatusSource`] and [`ControlSource`] traits; ksx-app implements both
+//!   (collectors and pipe client respectively). Nothing here can touch
+//!   capture, output, or a live session — a control implementation is a
+//!   client of the daemon's pipe, never a second control loop.
 
+mod control;
 mod error;
 mod render;
 mod server;
 mod snapshot;
 
+pub use control::{ControlSource, SessionView};
 pub use error::StudioError;
 pub use server::serve;
 pub use snapshot::{PadRow, ProfileRow, StatusSnapshot, StatusSource};

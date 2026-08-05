@@ -1,6 +1,6 @@
-import { h, createSignal, createList } from "@getforma/core";
+import { h, createSignal, createList, createShow } from "@getforma/core";
 
-// The cabinet status page — SSR-only in the M10 skeleton.
+// The cabinet status + session-control page — SSR-only, zero client JS.
 //
 // Server-side data injection contract (see crates/ksx-studio/src/render.rs):
 // - every `createSignal("...")` below becomes a NAMED slot in the compiled
@@ -8,15 +8,28 @@ import { h, createSignal, createList } from "@getforma/core";
 //   the Rust side overwrites it by name per request. The defaults here are
 //   what renders if injection ever misses — keep them honest ("not
 //   collected"), never fake data.
-// - each `createList` becomes a `list:array` slot. The compiler gives EVERY
-//   list the same slot name, so the Rust side resolves them by POSITION in
-//   the slot table, which follows document order. There are exactly two
-//   lists on this page, in this order: virtual pads, then game profiles.
-//   If you add/remove/reorder a list, update `LIST_ORDER` in render.rs —
-//   a ksx-studio unit test pins the count and will fail loudly otherwise.
+// - each `createList` becomes a `list:array` slot and each `createShow` a
+//   `show:createShow` slot. The compiler gives EVERY list (and every show)
+//   the same slot name, so the Rust side resolves both kinds by POSITION in
+//   the slot table, which follows document order.
+//     lists, in order:  profile <option>s, virtual pads, game profiles
+//     shows, in order:  flash, start controls, stop/reload controls,
+//                       daemon-down controls
+//   If you add/remove/reorder either kind, update `LIST_ORDER`/`SHOW_ORDER`
+//   in render.rs — ksx-studio unit tests pin both counts and will fail
+//   loudly otherwise.
+// - the compiler ignores createShow's condition expression entirely (the
+//   server injects the boolean), so the signals referenced there are pure
+//   documentation of intent.
 // - list item bodies may only use direct member reads (`p.persona`) — any
 //   computed expression makes the compiler fall back to a client island,
-//   which this zero-JS skeleton cannot hydrate.
+//   which this zero-JS page cannot hydrate.
+//
+// Control contract (docs/CONTROL-SURFACE.md): every button below is a plain
+// HTML form POSTing to a route that wraps one backend verb over the daemon
+// pipe — /session/start, /session/stop, /config/reload. No JS, no GUI-only
+// code paths, CSP untouched. When the daemon is unreachable the same
+// controls render disabled, with the reason next to them.
 
 export function StatusPage() {
   const [generatedAt] = createSignal("(no snapshot)");
@@ -28,6 +41,14 @@ export function StatusPage() {
   const [padsSummary] = createSignal("not collected");
   const [profilesSummary] = createSignal("not collected");
   const [configRoot] = createSignal("(unknown)");
+  const [sessionLine] = createSignal("not collected");
+  const [flashLine] = createSignal("");
+  // Booleans injected positionally into the show:createShow slots; the
+  // defaults render nothing until the server says otherwise.
+  const [showFlash] = createSignal(false);
+  const [canStart] = createSignal(false);
+  const [canStop] = createSignal(false);
+  const [daemonDown] = createSignal(false);
 
   return h(
     "div",
@@ -36,11 +57,79 @@ export function StatusPage() {
       "header",
       null,
       h("h1", null, "ksx Studio"),
-      h("p", { class: "sub" }, "cabinet status"),
+      h("p", { class: "sub" }, "cabinet status & session control"),
     ),
     h(
       "main",
       null,
+      h(
+        "section",
+        { class: "session" },
+        h("h2", null, "Session"),
+        createShow(
+          () => showFlash(),
+          () => h("p", { class: "flash" }, () => flashLine()),
+        ),
+        h("p", null, () => sessionLine()),
+        createShow(
+          () => canStart(),
+          () =>
+            h(
+              "form",
+              { class: "controls", method: "post", action: "/session/start" },
+              h("label", { for: "profile" }, "profile"),
+              h(
+                "select",
+                { id: "profile", name: "profile" },
+                h("option", { value: "" }, "(config default)"),
+                createList(
+                  () => [],
+                  (o) => o.title,
+                  (o) => h("option", null, o.title),
+                ),
+              ),
+              h("button", { type: "submit" }, "Start"),
+            ),
+        ),
+        createShow(
+          () => canStop(),
+          () =>
+            h(
+              "div",
+              { class: "controls" },
+              h(
+                "form",
+                { method: "post", action: "/session/stop" },
+                h("button", { type: "submit" }, "Stop"),
+              ),
+              h(
+                "form",
+                { method: "post", action: "/config/reload" },
+                h("button", { type: "submit" }, "Reload config"),
+              ),
+            ),
+        ),
+        createShow(
+          () => daemonDown(),
+          () =>
+            h(
+              "div",
+              { class: "controls off" },
+              h(
+                "select",
+                { disabled: "" },
+                h("option", null, "(profiles unavailable)"),
+              ),
+              h("button", { disabled: "" }, "Start"),
+              h(
+                "p",
+                { class: "warn" },
+                "controls disabled — no daemon control channel: ",
+                "start the daemon (tray, or `ksx daemon`)",
+              ),
+            ),
+        ),
+      ),
       h(
         "section",
         null,
@@ -109,8 +198,9 @@ export function StatusPage() {
       h(
         "p",
         null,
-        "Point-in-time snapshot re-read on each request (no daemon IPC yet) — ",
-        "auto-refreshes every 2 s. Generated ",
+        "Status re-read on each request; session state and buttons go over ",
+        "the daemon pipe (\\\\.\\pipe\\ksx-daemon). Auto-refreshes every 5 s. ",
+        "Generated ",
         () => generatedAt(),
         ".",
       ),

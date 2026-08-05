@@ -16,10 +16,10 @@ list.
 
 | Operation | Today's surface | GUI mapping (M9 in-process / M10 ksx-api) | Status |
 |---|---|---|---|
-| Start emulation | `ksx run` (foreground session); daemon: tray "Start emulation" / headless stdin `start` → `DaemonCommand::Start` | M9: enqueue `DaemonCommand::Start` on the control loop the UI hosts in-process. M10: api start verb wrapping the same command | exists |
-| Stop emulation | tray "Stop emulation" / stdin `stop` → `DaemonCommand::Stop`; the emergency escapes (LeftCtrl ×5, Ctrl+Alt+Del) live in the capture thread, not in any control surface | M9: `DaemonCommand::Stop`. M10: api stop. Escapes are deliberately NOT a GUI concern — see invariants | exists |
-| Session status + live health | tray tooltip (`DaemonState::tooltip`: `RunState` + `LiveHealth` while running, `LastSession` after); stdin `status` → `DaemonCommand::Status`; `ksx run --latency` for the rolling latency summary | M9: poll the same `SharedState` snapshot (`DaemonState`) the tray polls — small, cloneable, no borrows of anything live. M10: api serializes `DaemonState` | exists |
-| Reload config | tray "Reload config" / stdin `reload` → `DaemonCommand::Reload` — a clean stop and a clean start from disk, never a hot-patch | M9: `DaemonCommand::Reload`. M10: api reload | exists |
+| Start emulation | `ksx run` (foreground session); daemon: tray "Start emulation" / headless stdin `start` / pipe `start` / `ksx session start [--game TITLE]` — all → `DaemonCommand::Start` | M9: enqueue `DaemonCommand::Start` on the control loop the UI hosts in-process. **M10: Studio's Start button POSTs `/session/start` → pipe `start` → the same command (live)** | exists — pipe + CLI + Studio live |
+| Stop emulation | tray "Stop emulation" / stdin `stop` / pipe `stop` / `ksx session stop` → `DaemonCommand::Stop`; the emergency escapes (LeftCtrl ×5, Ctrl+Alt+Del) live in the capture thread, not in any control surface | M9: `DaemonCommand::Stop`. **M10: Studio's Stop button POSTs `/session/stop` → pipe `stop` (live).** Escapes are deliberately NOT a GUI concern — see invariants | exists — pipe + CLI + Studio live |
+| Session status + live health | tray tooltip (`DaemonState::tooltip`: `RunState` + `LiveHealth` while running, `LastSession` after); stdin `status` → `DaemonCommand::Status`; pipe `status` / `ksx session status [--json]` (state + game + profiles + last/live health); `ksx run --latency` for the rolling latency summary | M9: poll the same `SharedState` snapshot (`DaemonState`) the tray polls — small, cloneable, no borrows of anything live. **M10: Studio's session panel renders the pipe `status` response (live)** | exists — pipe + CLI + Studio live |
+| Reload config | tray "Reload config" / stdin `reload` / pipe `reload` / `ksx session reload` → `DaemonCommand::Reload` — a clean stop and a clean start from disk, never a hot-patch | M9: `DaemonCommand::Reload`. **M10: Studio's Reload button POSTs `/config/reload` → pipe `reload` (live)** | exists — pipe + CLI + Studio live |
 | List / identify devices | `ksx devices [--json]` (both backends, read-only); `ksx winusb status [--json]` for the USB/claim view | M9: same enumeration in-process — strictly read-only, safe mid-session. M10: api devices | exists |
 | Pad test | `ksx pads --count N --persona xbox360\|playstation [--json]` (plug, test pattern, unplug) | M9: same routine in-process, only while emulation is stopped (test pads compete for the four XInput slots). M10: api | exists |
 | Per-slot persona | TOML edit: `persona = "playstation"` on the `[[slot]]` (aliases `ds4`/`ps4` accepted) | M7 wizard / mapping verbs first; then GUI forms write the same TOML and issue `Reload` | gap — TOML-only **by design** until M7 |
@@ -31,20 +31,74 @@ list.
 | Import legacy | `ksx import-legacy [--from DIR] [--dry-run] [--json]` | M9: same verb; the `--json` shape is already a GUI-renderable report | exists |
 | Doctor | `ksx doctor [--latency] [--json]` — stable codes, `{report, advice}` | M9: same verb, render the JSON. M10: api | exists |
 
+## The daemon control channel (M10a first slice — CLOSED the old gap 1)
+
+A running daemon now serves `\\.\pipe\ksx-daemon` (`ksx-app/src/daemon/pipe.rs`).
+Formerly: "a RUNNING daemon has no external control channel" — `DaemonCommand`'s
+only senders were the tray thread and the headless stdin reader. The pipe is the
+third front end with **exactly the tray's reach**: it enqueues the same
+`DaemonCommand` values the tray menu produces onto the same crossbeam channel,
+reads the same `DaemonState` snapshot the tray polls, and reads games.toml from
+disk. It has no path to the factory, the panel, or any pipeline thread, and it
+runs on one plain thread — no async runtime, so E7 rule A (default build links
+no tokio/axum/forma) still holds.
+
+**Protocol** — one JSON request line in, one JSON response line out, per
+connection; then the server disconnects. Kept deliberately dumb.
+
+```
+→ {"verb":"status"}
+← {"ok":true,"run":"running","slots":4,"message":null,"game":"Street Fighter",
+   "tooltip":"ksx — running, 4 pad(s)\ngame: Street Fighter",
+   "profiles":[{"title":"Street Fighter","detail":"C:\\games\\sf.exe — 2 slots"}],
+   "last":null,"live":{"reboot_required":false,"watchdog_tripped":false,"dropped_events":0}}
+
+→ {"verb":"start","profile":"Street Fighter"}     ("profile" optional)
+← {"ok":true,"message":"running (4 slot(s))"}
+← {"ok":false,"error":"already running"}           (refusal example)
+
+→ {"verb":"stop"}
+← {"ok":true,"message":"stopped"}                  (or {"ok":false,"error":"not running"})
+
+→ {"verb":"reload"}
+← {"ok":true,"message":"running (4 slot(s))"}
+```
+
+Action verbs poll the snapshot up to 5 s for the outcome; an unsettled command
+answers `ok:true` with a "requested — check `ksx session status`" message
+rather than guessing. `start`'s profile title is validated by the daemon's
+normal plan resolution (the same path a tray Start takes); an unknown title
+comes back as the resolver's error and the previously configured profile is
+restored. Verbs the pipe does NOT offer, deliberately: `quit` (walk to the
+machine or use the tray — a remote surface should not be able to make the
+panel permanently dead), `config` (meaningless off-machine).
+
+**Trust model**: the pipe is created with the DEFAULT security descriptor —
+the creating user, SYSTEM, and administrators; nobody else connects. Same-user
+processes can already `taskkill` the daemon, so the pipe grants no new
+authority. No token, no auth layer, and localhost-only Studio keeps it off the
+network.
+
+**Concurrency**: one server thread, sequential connections. The next pipe
+instance is created before the current connection is served, so a second
+client (two Studios, a racing `ksx session`) queues instead of failing;
+clients also retry briefly on `ERROR_PIPE_BUSY` / `FILE_NOT_FOUND`. A daemon
+that is not running fails the connect cleanly → `ksx session` exit 2; Studio
+renders the controls disabled with the reason. A daemon **older than the
+pipe** looks identical to "not running" on this surface — the process-list
+row on the Studio page is what catches that case.
+
+**Clients**: `ksx session status|start [--game TITLE]|stop|reload` (`--json`
+prints the raw response; exit 0 = done, 1 = daemon refused / pipe error,
+2 = no control channel) and Studio's session panel (below). The E5 MCP shim
+gets the same channel for free.
+
 ## The honest gaps
 
-1. **A RUNNING daemon has no external control channel.** `DaemonCommand`
-   travels one crossbeam channel whose only senders are the tray thread and the
-   headless stdin reader — no socket, no pipe, no way for a second process to
-   enqueue a command. This blocks nothing before M9: the native UI *hosts* the
-   supervisor in-process (the same relationship the tray already has), so it
-   maps 1:1 onto `DaemonCommand` with no new plumbing. M10a's `ksx-api` is what
-   adds the remote surface — for Studio and the E5 MCP shim alike. **Nothing
-   needs building before M9.**
-2. **No non-interactive mapping verbs yet.** `ksx map` / `ksx slot assign` are
+1. **No non-interactive mapping verbs yet.** `ksx map` / `ksx slot assign` are
    M7 work and already specified in E5. Until they exist, "edit a binding" has
    no verb — and therefore, by the rule above, no GUI mapping either.
-3. **Per-slot persona is a TOML edit today.** Deliberate until the M7 wizard:
+2. **Per-slot persona is a TOML edit today.** Deliberate until the M7 wizard:
    the hand-editable config *is* the interface, and it round-trips.
 
 ## Invariants a GUI must not break
@@ -53,8 +107,8 @@ Each one maps to a legacy defect or a measured constraint
 (`ARCHITECTURE.md` rules 1–5, `ENHANCEMENTS.md` E7 "enhance, never compromise"):
 
 - **Never touch pipeline threads.** The tray can only enqueue a
-  `DaemonCommand`; the M9 native UI and M10 Studio get exactly the same reach
-  and no more. Live data flows out through snapshots (`DaemonState`,
+  `DaemonCommand`; the pipe thread, the M9 native UI and M10 Studio get
+  exactly the same reach and no more. Live data flows out through snapshots (`DaemonState`,
   `HealthSlot`) or a lossy fan-out sink — a slow or wedged UI can cost a
   window, never a keyboard. The legacy WPF app died of the opposite
   arrangement.

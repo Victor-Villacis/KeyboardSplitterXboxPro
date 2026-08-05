@@ -83,6 +83,10 @@ impl SessionFactory for LiveFactory {
     fn game(&self) -> Option<String> {
         self.game.clone()
     }
+
+    fn set_game(&mut self, game: Option<String>) {
+        self.game = game;
+    }
 }
 
 struct LiveRunner {
