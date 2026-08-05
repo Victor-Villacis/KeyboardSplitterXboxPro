@@ -458,3 +458,42 @@ In order of how much still works:
 Plus, always: revert the `config.toml` device lines, and remember the panel
 "not typing" usually just means **`ksx daemon` is not running** — start it
 before assuming the claim is broken (`RECOVERY.md` §2, first table).
+
+---
+
+# GATE 1 RUN LOG — 2026-08-05 (Victor + session)
+
+**Phase A — PASSED.** Tray lifecycle clean: idle tooltip, Start → 4 X360 pads
+(user indexes 0–3 in order), panel drove pads and stopped typing, desktop
+keyboard unaffected, Stop restored typing, Quit exited 0. Post-quit checklist
+clean (no process, no ghost pads, doctor 0).
+
+**Phase B — PASSED.** Registered `daemon --game Steam` (debug-build exe,
+deliberate — the gate-tested binary). Cold boot → task fired at logon +10 s
+(schtasks result 267009 "running"), tray icon up, nothing captured at logon,
+boot-to-playable proven via tray → Start (Steam + 4 pads), clean stop, zero
+ERROR lines. Cosmetic finding: `--status` prints `enabled: unknown` — the
+Enabled field isn't parsed from schtasks output; fix at leisure.
+
+**Phase C — WIRED, NOT VERIFIED.** The 5big/G: array was physically
+disconnected during the run, and everything Phase C needs lives on G: (roms,
+mame.exe, romkit). Built on assumptions, all additive:
+- `games.toml` +"MAME 4P" profile (4 slots, dry-run exit 0; `path` assumed).
+- RetroBat: new `es_systems_ksx4p.cfg` (delete to unwire).
+- LaunchBox: new additive emulator "MAME 4P (ksx wrapper)" (Emulators.xml
+  backed up first; LB was closed).
+**When G: is back, verify:** (1) volume mounts as G: exactly; (2) real
+mame.exe path — fix the three assumed references (games.toml, es_systems_ksx4p,
+LB entry) if it differs; (3) G:\roms\mame exists; (4) assign one 4-player game
+to the LB wrapper emulator; (5) run the Phase C launch test from both
+frontends. Longer term the durable LB integration is romkit-launch.exe calling
+the ksx CLI itself, not a wrapper entry.
+
+**Phase D — COMMANDS PASSED, boot check skipped.** disable → NOT registered →
+second disable idempotent (exit 0) → re-enabled as the desired end state
+(daemon at boot stays armed). The "nothing starts after removal" cold boot was
+deliberately skipped to keep the registration; it is implicitly covered by the
+pre-gate months of boots with no task.
+
+**Verdict: GATE 1 PASSED with Phase C hardware-pending.** The 10-minute
+completion pass when the 5big returns is listed above.
