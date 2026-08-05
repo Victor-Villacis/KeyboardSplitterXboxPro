@@ -18,7 +18,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use crate::daemon::pipe::{self, client};
 use ksx_platform::autostart;
 use ksx_platform::{BusDriverReport, InterceptionReport, ServiceState};
-use ksx_studio::{PadRow, ProfileRow, SessionView, StatusSnapshot, StatusSource};
+use ksx_studio::{
+    BindConflict, BindOutcome, BindRequest, LearnView, MapperSlot, MapperSnapshot, PadRow,
+    ProfileRow, SessionView, StatusSnapshot, StatusSource,
+};
 
 pub fn run(port: u16) -> anyhow::Result<()> {
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -58,6 +61,86 @@ impl ksx_studio::ControlSource for PipeControlSource {
 
     fn reload(&self) -> Result<String, String> {
         action(serde_json::json!({ "verb": "reload" }))
+    }
+
+    // The mapper verbs: each one pipe request. A daemon that is missing, or
+    // that predates the verbs ("unknown verb …"), comes back as the honest
+    // "unavailable" LearnView — which is exactly what flips the mapper page
+    // read-only with the reason on screen.
+
+    fn learn_start(&self) -> LearnView {
+        learn_request(serde_json::json!({ "verb": "learn-key" }))
+    }
+
+    fn learn_poll(&self) -> LearnView {
+        learn_request(serde_json::json!({ "verb": "learn-poll" }))
+    }
+
+    fn learn_cancel(&self) -> LearnView {
+        learn_request(serde_json::json!({ "verb": "learn-cancel" }))
+    }
+
+    fn bind(&self, request: &BindRequest) -> BindOutcome {
+        let mut wire = serde_json::json!({
+            "verb": "map",
+            "preset": request.preset,
+            "function": request.function,
+            "force": request.force,
+            "reload": request.reload,
+        });
+        match &request.key {
+            Some(key) => wire["key"] = serde_json::json!(key),
+            None => wire["clear"] = serde_json::json!(true),
+        }
+        match client::request(pipe::PIPE_NAME, &wire) {
+            Ok(response) => BindOutcome {
+                ok: response["ok"] == true,
+                message: response["message"].as_str().map(str::to_owned),
+                error: response["error"].as_str().map(str::to_owned),
+                code: response["code"].as_str().map(str::to_owned),
+                conflicts: response["conflicts"]
+                    .as_array()
+                    .map(|rows| {
+                        rows.iter()
+                            .map(|row| BindConflict {
+                                scope: row["scope"].as_str().unwrap_or("").to_owned(),
+                                preset: row["preset"].as_str().unwrap_or("").to_owned(),
+                                function: row["function"].as_str().unwrap_or("").to_owned(),
+                                profile: row["profile"].as_str().map(str::to_owned),
+                                slot: row["slot"].as_u64().and_then(|n| u8::try_from(n).ok()),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                reloaded: response["reloaded"] == true,
+            },
+            Err(client::ClientError::NotRunning) => BindOutcome::failed(NO_CHANNEL),
+            Err(err) => BindOutcome::failed(err.to_string()),
+        }
+    }
+}
+
+/// One learn-verb pipe request → [`LearnView`]. An `ok:false` response (the
+/// gate refusal, or an old daemon's "unknown verb") maps to `unavailable`
+/// with the daemon's own words.
+fn learn_request(request: serde_json::Value) -> LearnView {
+    match client::request(pipe::PIPE_NAME, &request) {
+        Ok(response) => {
+            if response["ok"] == true {
+                LearnView {
+                    ok: true,
+                    state: response["state"].as_str().unwrap_or("unknown").to_owned(),
+                    remaining_ms: response["remaining_ms"].as_u64(),
+                    device: response["device"].as_str().map(str::to_owned),
+                    key: response["key"].as_str().map(str::to_owned),
+                    error: response["error"].as_str().map(str::to_owned),
+                }
+            } else {
+                LearnView::unavailable(response["error"].as_str().unwrap_or("the daemon refused"))
+            }
+        }
+        Err(client::ClientError::NotRunning) => LearnView::unavailable(NO_CHANNEL),
+        Err(err) => LearnView::unavailable(err.to_string()),
     }
 }
 
@@ -116,6 +199,125 @@ impl StatusSource for CollectorSource {
     fn snapshot(&self) -> StatusSnapshot {
         collect_snapshot()
     }
+
+    fn mapper(&self) -> MapperSnapshot {
+        collect_mapper()
+    }
+}
+
+/// The mapper's slot list, re-read from disk per call (fresh writes = fresh
+/// zone tags): `config.toml` `[[slot]]` entries when present, otherwise the
+/// first games.toml profile's slots — this cabinet keeps its slots in the
+/// game profiles. Preset bindings come through the same store the `map` verb
+/// writes with.
+fn collect_mapper() -> MapperSnapshot {
+    let root = match ksx_config::ConfigRoot::discover() {
+        Ok(root) => root,
+        Err(err) => return MapperSnapshot::unavailable(&format!("config root not found: {err}")),
+    };
+    let config_root = root.dir().display().to_string();
+    let store = ksx_config::Store::new(root);
+
+    // (number, keyboard, preset, persona, source-line)
+    let (rows, source) = match store.load_config() {
+        Ok(loaded) if !loaded.value.slots.is_empty() => {
+            let rows: Vec<(u8, String, String, ksx_core::Persona)> = loaded
+                .value
+                .slots
+                .iter()
+                .map(|s| {
+                    (
+                        s.number,
+                        s.keyboard.clone().unwrap_or_else(|| "(any)".to_owned()),
+                        s.preset.clone(),
+                        s.persona,
+                    )
+                })
+                .collect();
+            (rows, "config.toml [[slot]] entries".to_owned())
+        }
+        _ => match store.load_games() {
+            Ok(loaded) => match loaded.value.games.first() {
+                Some(game) => {
+                    let rows = game
+                        .slots
+                        .iter()
+                        .map(|s| {
+                            (
+                                s.number,
+                                s.keyboard.clone().unwrap_or_else(|| "(any)".to_owned()),
+                                s.preset.clone(),
+                                s.persona,
+                            )
+                        })
+                        .collect();
+                    (
+                        rows,
+                        format!("slots of profile \"{}\" (games.toml)", game.title),
+                    )
+                }
+                None => {
+                    return MapperSnapshot {
+                        generated_at: now_utc(),
+                        source: "no [[slot]] entries in config.toml and no games.toml profiles"
+                            .to_owned(),
+                        config_root,
+                        slots: Vec::new(),
+                    }
+                }
+            },
+            Err(err) => {
+                return MapperSnapshot::unavailable(&format!("games.toml unreadable: {err}"))
+            }
+        },
+    };
+
+    let slots = rows
+        .into_iter()
+        .map(|(number, keyboard, preset_name, persona)| {
+            let bindings = preset_bindings(&store, &preset_name);
+            MapperSlot {
+                number,
+                persona: persona.as_str().to_owned(),
+                persona_label: persona.label().to_owned(),
+                preset: preset_name,
+                keyboard,
+                bindings,
+            }
+        })
+        .collect();
+
+    MapperSnapshot {
+        generated_at: now_utc(),
+        source,
+        config_root,
+        slots,
+    }
+}
+
+/// Canonical function name → bound key names. Inert `"None"` placeholders
+/// become EMPTY lists (the page's honest "unbound" tag); an unreadable or
+/// missing preset yields no entries at all — its zones all render unbound,
+/// and a `map` attempt will name the real problem.
+fn preset_bindings(
+    store: &ksx_config::Store,
+    preset_name: &str,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut bindings = std::collections::BTreeMap::new();
+    let Ok(Some(loaded)) = store.load_preset(preset_name) else {
+        return bindings;
+    };
+    let Ok(core) = loaded.value.to_core() else {
+        return bindings;
+    };
+    for (key, binding) in &core.entries {
+        let function = ksx_config::function_name(binding);
+        let keys: &mut Vec<String> = bindings.entry(function).or_default();
+        if *key != ksx_core::Key::None {
+            keys.push(key.name().to_owned());
+        }
+    }
+    bindings
 }
 
 fn collect_snapshot() -> StatusSnapshot {

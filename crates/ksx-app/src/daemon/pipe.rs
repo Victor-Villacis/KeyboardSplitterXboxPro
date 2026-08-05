@@ -2,8 +2,12 @@
 //!
 //! One JSON request line in, one JSON response line out, per connection —
 //! that is the whole protocol. Verbs: `status`, `start` (optional `profile`),
-//! `stop`, `reload`. `ksx session` and Studio are thin clients of this;
-//! docs/CONTROL-SURFACE.md carries the request/response examples.
+//! `stop`, `reload`, plus the M7 mapper slice: `map` (edit one preset binding
+//! through the same [`crate::mapping::apply`] the CLI verb uses — no
+//! pipe-private editor), `learn-key` / `learn-poll` / `learn-cancel` (the
+//! asynchronous "press the panel key" recorder, [`super::learn`]). `ksx
+//! session` and Studio are thin clients of this; docs/CONTROL-SURFACE.md
+//! carries the request/response examples.
 //!
 //! # Reach
 //!
@@ -44,6 +48,28 @@ pub const PIPE_NAME: &str = r"\\.\pipe\ksx-daemon";
 /// `(title, detail)` rows from games.toml, read on demand so `status` reflects
 /// what is on disk now — the same freshness rule as `Reload`.
 pub type ProfilesFn = Box<dyn Fn() -> Vec<(String, String)> + Send>;
+
+/// The `map` verb's writer — [`crate::mapping::apply`] over the daemon's
+/// config root, injected so protocol tests need no disk.
+pub type MapFn = Box<
+    dyn Fn(&crate::mapping::MapSpec) -> Result<crate::mapping::AppliedMap, crate::mapping::MapError>
+        + Send,
+>;
+
+/// Everything a pipe request can reach. One struct so the transport, the
+/// tests and future verbs share a single wiring point.
+pub struct PipeDeps {
+    pub tx: Sender<DaemonCommand>,
+    pub state: SharedState,
+    pub profiles: ProfilesFn,
+    pub map: MapFn,
+    pub learn: super::learn::LearnService,
+}
+
+/// The real [`MapFn`]: [`crate::mapping::apply`] against `root`'s store.
+pub fn map_fn(root: ksx_config::ConfigRoot) -> MapFn {
+    Box::new(move |spec| crate::mapping::apply(&ksx_config::Store::new(root.clone()), spec))
+}
 
 /// games.toml rows for the status response. Unreadable configuration reports
 /// itself as a row rather than vanishing — same honesty rule as Studio.
@@ -196,22 +222,20 @@ fn await_stop(state: &SharedState, settle: Duration) -> serde_json::Value {
 
 /// One request line → one response value. Everything the pipe can do, with
 /// the transport factored out.
-pub fn handle_request(
-    line: &str,
-    tx: &Sender<DaemonCommand>,
-    state: &SharedState,
-    profiles: &ProfilesFn,
-    settle: Duration,
-) -> serde_json::Value {
+pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_json::Value {
+    let tx = &deps.tx;
+    let state = &deps.state;
     let request: serde_json::Value = match serde_json::from_str(line.trim()) {
         Ok(value) => value,
         Err(err) => return err_msg(format!("request is not a JSON object: {err}")),
     };
     let Some(verb) = request.get("verb").and_then(|v| v.as_str()) else {
-        return err_msg(r#"request has no "verb" (status | start | stop | reload)"#);
+        return err_msg(
+            r#"request has no "verb" (status | start | stop | reload | map | learn-key | learn-poll | learn-cancel)"#,
+        );
     };
     match verb {
-        "status" => status_json(state, profiles),
+        "status" => status_json(state, &deps.profiles),
         "start" => {
             let profile = request
                 .get("profile")
@@ -244,9 +268,129 @@ pub fn handle_request(
             }
             await_start(state, &baseline, settle)
         }
+        "map" => handle_map(&request, deps, settle),
+        // Learn is only meaningful while nothing runs: a running session's
+        // captured keyboards are suppressed below win32k, where the Raw Input
+        // observer hears nothing — refusing is the honest answer, not a 10 s
+        // silent timeout. (docs/CONTROL-SURFACE.md "learn-key semantics".)
+        "learn-key" => {
+            if matches!(
+                snapshot(state).run,
+                RunState::Running { .. } | RunState::Starting
+            ) {
+                return err_msg(
+                    "learn-key is unavailable while a session is running — captured \
+                     keys never reach the observer; stop the session first \
+                     (`ksx session stop`), or bind directly with `ksx map`",
+                );
+            }
+            deps.learn.start()
+        }
+        "learn-poll" => deps.learn.poll(),
+        "learn-cancel" => deps.learn.cancel(),
         other => err_msg(format!(
-            "unknown verb '{other}' (status | start | stop | reload)"
+            "unknown verb '{other}' (status | start | stop | reload | map | \
+             learn-key | learn-poll | learn-cancel)"
         )),
+    }
+}
+
+/// The pipe `map` verb: same fields as `ksx map`, plus `"reload": true` to
+/// bounce a RUNNING session onto the new binding (a clean `Reload` — stop,
+/// re-read from disk, start — never a hot-patch; the CONTROL-SURFACE
+/// invariant). With nothing running there is nothing to bounce: the next
+/// start reads the file.
+fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) -> serde_json::Value {
+    let field = |name: &str| {
+        request
+            .get(name)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_owned)
+    };
+    let Some(preset) = field("preset") else {
+        return err_msg(r#"map needs a "preset""#);
+    };
+    let Some(function) = field("function") else {
+        return err_msg(r#"map needs a "function""#);
+    };
+    let clear = request
+        .get("clear")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let key = field("key");
+    if key.is_none() && !clear {
+        return err_msg(r#"map needs a "key" (or "clear": true)"#);
+    }
+    if key.is_some() && clear {
+        return err_msg(r#"map takes either "key" or "clear", not both"#);
+    }
+    let spec = crate::mapping::MapSpec {
+        preset,
+        function,
+        key,
+        force: request
+            .get("force")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    };
+    match (deps.map)(&spec) {
+        Ok(applied) => {
+            let mut message = applied.message();
+            let running = matches!(
+                snapshot(&deps.state).run,
+                RunState::Running { .. } | RunState::Starting
+            );
+            let want_reload = request
+                .get("reload")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut reloaded = false;
+            if running && want_reload {
+                let baseline = snapshot(&deps.state).run;
+                if deps.tx.send(DaemonCommand::Reload).is_ok() {
+                    let outcome = await_start(&deps.state, &baseline, settle);
+                    reloaded = outcome["ok"] == true;
+                    match outcome["message"].as_str().or(outcome["error"].as_str()) {
+                        Some(note) => message.push_str(&format!(" — session reloaded: {note}")),
+                        None => message.push_str(" — session reload requested"),
+                    }
+                } else {
+                    message.push_str(" — saved, but the daemon is shutting down (no reload)");
+                }
+            } else if running {
+                message.push_str(" — a session is running; `reload` to apply now");
+            } else {
+                message.push_str(" — the next session start reads it");
+            }
+            serde_json::json!({
+                "ok": true,
+                "message": message,
+                "path": applied.path.display().to_string(),
+                "preset": applied.preset,
+                "function": applied.function,
+                "key": applied.key,
+                "stolen_from": applied.stolen_from,
+                "conflicts": crate::mapping::conflicts_json(&applied.overridden),
+                "reloaded": reloaded,
+            })
+        }
+        Err(crate::mapping::MapError::Conflicts {
+            ref key,
+            ref conflicts,
+        }) => {
+            let err = crate::mapping::MapError::Conflicts {
+                key: key.clone(),
+                conflicts: conflicts.clone(),
+            };
+            serde_json::json!({
+                "ok": false,
+                "code": "conflict",
+                "error": err.to_string(),
+                "conflicts": crate::mapping::conflicts_json(conflicts),
+            })
+        }
+        Err(err) => err_msg(err.to_string()),
     }
 }
 
@@ -494,38 +638,21 @@ pub mod server {
     /// Serve `name` until the process exits. Returns immediately; the thread
     /// logs and dies (leaving tray/stdin untouched) if the name cannot be
     /// owned — e.g. a second daemon is already serving it.
-    pub fn spawn(
-        name: String,
-        tx: Sender<DaemonCommand>,
-        state: SharedState,
-        profiles: ProfilesFn,
-    ) {
-        spawn_with(name, tx, state, profiles, SETTLE_TIMEOUT);
+    pub fn spawn(name: String, deps: PipeDeps) {
+        spawn_with(name, deps, SETTLE_TIMEOUT);
     }
 
     /// [`spawn`] with the settle timeout exposed, so tests are not 5 s each.
-    pub fn spawn_with(
-        name: String,
-        tx: Sender<DaemonCommand>,
-        state: SharedState,
-        profiles: ProfilesFn,
-        settle: Duration,
-    ) {
+    pub fn spawn_with(name: String, deps: PipeDeps, settle: Duration) {
         let result = std::thread::Builder::new()
             .name("ksx-daemon-pipe".into())
-            .spawn(move || serve(&name, &tx, &state, &profiles, settle));
+            .spawn(move || serve(&name, &deps, settle));
         if let Err(err) = result {
             tracing::error!("could not spawn the control-pipe thread: {err}");
         }
     }
 
-    fn serve(
-        name: &str,
-        tx: &Sender<DaemonCommand>,
-        state: &SharedState,
-        profiles: &ProfilesFn,
-        settle: Duration,
-    ) {
+    fn serve(name: &str, deps: &PipeDeps, settle: Duration) {
         let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         let mut instance = match Instance::create(&wide_name, true) {
             Ok(instance) => instance,
@@ -557,7 +684,7 @@ pub mod server {
             // pipe at all.
             let next = Instance::create(&wide_name, false);
             if let Some(line) = instance.read_line() {
-                let mut response = handle_request(&line, tx, state, profiles, settle).to_string();
+                let mut response = handle_request(&line, deps, settle).to_string();
                 response.push('\n');
                 instance.write_all(response.as_bytes());
             }
@@ -603,6 +730,41 @@ mod tests {
         })
     }
 
+    /// A `map` that refuses everything — protocol tests that never map.
+    fn no_map() -> MapFn {
+        Box::new(|spec| {
+            Err(crate::mapping::MapError::UnknownPreset {
+                name: spec.preset.clone(),
+                known: Vec::new(),
+            })
+        })
+    }
+
+    /// A learn service whose observer parks until cancelled (protocol tests
+    /// drive phases through the service API, not a keyboard).
+    fn idle_learn() -> super::super::learn::LearnService {
+        super::super::learn::LearnService::new(Arc::new(|timeout, cancel| {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(None)
+        }))
+    }
+
+    fn deps(tx: Sender<DaemonCommand>, state: SharedState, profiles: ProfilesFn) -> PipeDeps {
+        PipeDeps {
+            tx,
+            state,
+            profiles,
+            map: no_map(),
+            learn: idle_learn(),
+        }
+    }
+
     const FAST: Duration = Duration::from_millis(50);
 
     // -- protocol, no transport ---------------------------------------------
@@ -612,7 +774,11 @@ mod tests {
         let state = shared(RunState::Running { slots: 4 });
         state.lock().unwrap().game = Some("Street Fighter".into());
         let (tx, _rx) = unbounded();
-        let v = handle_request(r#"{"verb":"status"}"#, &tx, &state, &fixed_profiles(), FAST);
+        let v = handle_request(
+            r#"{"verb":"status"}"#,
+            &deps(tx.clone(), state.clone(), fixed_profiles()),
+            FAST,
+        );
         assert_eq!(v["ok"], true);
         assert_eq!(v["run"], "running");
         assert_eq!(v["slots"], 4);
@@ -635,9 +801,7 @@ mod tests {
         });
         let v = handle_request(
             r#"{"verb":"start","profile":"Metal Slug"}"#,
-            &tx,
-            &state,
-            &no_profiles(),
+            &deps(tx.clone(), state.clone(), no_profiles()),
             Duration::from_secs(2),
         );
         assert_eq!(v["ok"], true, "{v}");
@@ -655,7 +819,11 @@ mod tests {
         for request in [r#"{"verb":"start"}"#, r#"{"verb":"start","profile":" "}"#] {
             let state = shared(RunState::Stopped);
             let (tx, rx) = unbounded();
-            let _ = handle_request(request, &tx, &state, &no_profiles(), FAST);
+            let _ = handle_request(
+                request,
+                &deps(tx.clone(), state.clone(), no_profiles()),
+                FAST,
+            );
             assert_eq!(
                 rx.try_recv().unwrap(),
                 DaemonCommand::Start { game: None },
@@ -668,7 +836,11 @@ mod tests {
     fn start_while_running_is_refused_without_enqueuing() {
         let state = shared(RunState::Running { slots: 4 });
         let (tx, rx) = unbounded();
-        let v = handle_request(r#"{"verb":"start"}"#, &tx, &state, &no_profiles(), FAST);
+        let v = handle_request(
+            r#"{"verb":"start"}"#,
+            &deps(tx.clone(), state.clone(), no_profiles()),
+            FAST,
+        );
         assert_eq!(v["ok"], false);
         assert!(v["error"].as_str().unwrap().contains("already running"));
         assert!(rx.try_recv().is_err(), "nothing may be enqueued");
@@ -694,9 +866,7 @@ mod tests {
         });
         let v = handle_request(
             r#"{"verb":"start","profile":"Typo Fighter"}"#,
-            &tx,
-            &state,
-            &no_profiles(),
+            &deps(tx.clone(), state.clone(), no_profiles()),
             Duration::from_secs(2),
         );
         assert_eq!(v["ok"], false, "{v}");
@@ -721,9 +891,7 @@ mod tests {
         });
         let v = handle_request(
             r#"{"verb":"start"}"#,
-            &tx,
-            &state,
-            &no_profiles(),
+            &deps(tx.clone(), state.clone(), no_profiles()),
             Duration::from_secs(2),
         );
         assert_eq!(v["ok"], false, "{v}");
@@ -733,7 +901,11 @@ mod tests {
     fn an_unprocessed_command_times_out_into_an_honest_requested_answer() {
         let state = shared(RunState::Stopped);
         let (tx, _rx) = unbounded();
-        let v = handle_request(r#"{"verb":"start"}"#, &tx, &state, &no_profiles(), FAST);
+        let v = handle_request(
+            r#"{"verb":"start"}"#,
+            &deps(tx.clone(), state.clone(), no_profiles()),
+            FAST,
+        );
         assert_eq!(v["ok"], true, "{v}");
         assert!(v["message"].as_str().unwrap().contains("requested"), "{v}");
     }
@@ -742,7 +914,11 @@ mod tests {
     fn stop_when_nothing_runs_is_refused() {
         let state = shared(RunState::Stopped);
         let (tx, rx) = unbounded();
-        let v = handle_request(r#"{"verb":"stop"}"#, &tx, &state, &no_profiles(), FAST);
+        let v = handle_request(
+            r#"{"verb":"stop"}"#,
+            &deps(tx.clone(), state.clone(), no_profiles()),
+            FAST,
+        );
         assert_eq!(v["ok"], false);
         assert!(v["error"].as_str().unwrap().contains("not running"));
         assert!(rx.try_recv().is_err());
@@ -764,9 +940,7 @@ mod tests {
         });
         let v = handle_request(
             r#"{"verb":"stop"}"#,
-            &tx,
-            &state,
-            &no_profiles(),
+            &deps(tx.clone(), state.clone(), no_profiles()),
             Duration::from_secs(2),
         );
         assert_eq!(v["ok"], true, "{v}");
@@ -791,13 +965,220 @@ mod tests {
         });
         let v = handle_request(
             r#"{"verb":"reload"}"#,
-            &tx,
-            &state,
-            &no_profiles(),
+            &deps(tx.clone(), state.clone(), no_profiles()),
             Duration::from_secs(2),
         );
         assert_eq!(v["ok"], true, "{v}");
         assert!(v["message"].as_str().unwrap().contains("6 slot(s)"));
+    }
+
+    // -- the mapper verbs: map / learn-key / learn-poll / learn-cancel ------
+
+    /// A `map` that records what it was asked and reports a scripted result.
+    fn scripted_map(
+        result: fn(
+            &crate::mapping::MapSpec,
+        ) -> Result<crate::mapping::AppliedMap, crate::mapping::MapError>,
+        seen: Arc<Mutex<Vec<crate::mapping::MapSpec>>>,
+    ) -> MapFn {
+        Box::new(move |spec| {
+            seen.lock().unwrap().push(spec.clone());
+            result(spec)
+        })
+    }
+
+    fn applied_ok(
+        spec: &crate::mapping::MapSpec,
+    ) -> Result<crate::mapping::AppliedMap, crate::mapping::MapError> {
+        Ok(crate::mapping::AppliedMap {
+            path: std::path::PathBuf::from(r"C:\cfg\ksx\presets\IPAC P1.toml"),
+            preset: spec.preset.clone(),
+            function: spec.function.to_ascii_uppercase(),
+            key: spec.key.clone(),
+            stolen_from: Vec::new(),
+            overridden: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn map_validates_its_fields_before_touching_the_writer() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut d = deps(tx, state, no_profiles());
+        d.map = scripted_map(applied_ok, seen.clone());
+        for junk in [
+            r#"{"verb":"map"}"#,
+            r#"{"verb":"map","preset":"IPAC P1"}"#,
+            r#"{"verb":"map","preset":"IPAC P1","function":"A"}"#,
+            r#"{"verb":"map","preset":"IPAC P1","function":"A","key":"G","clear":true}"#,
+        ] {
+            let v = handle_request(junk, &d, FAST);
+            assert_eq!(v["ok"], false, "{junk} → {v}");
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no write may have happened"
+        );
+    }
+
+    #[test]
+    fn map_while_stopped_writes_and_says_the_next_start_reads_it() {
+        let state = shared(RunState::Stopped);
+        let (tx, rx) = unbounded();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut d = deps(tx, state, no_profiles());
+        d.map = scripted_map(applied_ok, seen.clone());
+        let v = handle_request(
+            r#"{"verb":"map","preset":"IPAC P1","function":"a","key":"G","reload":true}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["function"], "A");
+        assert_eq!(v["key"], "G");
+        assert_eq!(v["reloaded"], false);
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("next session start"),
+            "{v}"
+        );
+        assert!(rx.try_recv().is_err(), "nothing to reload when stopped");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].preset, "IPAC P1");
+        assert!(!seen[0].force);
+    }
+
+    /// `reload: true` with a running session enqueues the SAME
+    /// DaemonCommand::Reload a tray click would — the "hot-reload" is a clean
+    /// stop + re-read + start, never a hot-patch.
+    #[test]
+    fn map_with_reload_bounces_a_running_session() {
+        let state = shared(RunState::Running { slots: 4 });
+        let (tx, rx) = unbounded();
+        std::thread::spawn({
+            let state = state.clone();
+            move || {
+                assert_eq!(
+                    rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                    DaemonCommand::Reload
+                );
+                state.lock().unwrap().run = RunState::Starting;
+                std::thread::sleep(Duration::from_millis(10));
+                state.lock().unwrap().run = RunState::Running { slots: 4 };
+            }
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut d = deps(tx, state, no_profiles());
+        d.map = scripted_map(applied_ok, seen);
+        let v = handle_request(
+            r#"{"verb":"map","preset":"IPAC P1","function":"A","key":"G","reload":true}"#,
+            &d,
+            Duration::from_secs(2),
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["reloaded"], true, "{v}");
+        assert!(
+            v["message"].as_str().unwrap().contains("session reloaded"),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn map_without_reload_says_a_running_session_needs_one() {
+        let state = shared(RunState::Running { slots: 4 });
+        let (tx, rx) = unbounded();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut d = deps(tx, state, no_profiles());
+        d.map = scripted_map(applied_ok, seen);
+        let v = handle_request(
+            r#"{"verb":"map","preset":"IPAC P1","function":"A","key":"G"}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["reloaded"], false);
+        assert!(
+            v["message"].as_str().unwrap().contains("`reload` to apply"),
+            "{v}"
+        );
+        assert!(rx.try_recv().is_err(), "no unasked reload");
+    }
+
+    #[test]
+    fn map_conflicts_come_back_as_structured_rows() {
+        fn conflicted(
+            _spec: &crate::mapping::MapSpec,
+        ) -> Result<crate::mapping::AppliedMap, crate::mapping::MapError> {
+            Err(crate::mapping::MapError::Conflicts {
+                key: "G".into(),
+                conflicts: vec![crate::mapping::MapConflict {
+                    scope: crate::mapping::ConflictScope::Profile,
+                    preset: "IPAC P2".into(),
+                    function: "A".into(),
+                    profile: Some("Steam".into()),
+                    slot: Some(2),
+                }],
+            })
+        }
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let mut d = deps(tx, state, no_profiles());
+        d.map = scripted_map(conflicted, Arc::new(Mutex::new(Vec::new())));
+        let v = handle_request(
+            r#"{"verb":"map","preset":"IPAC P1","function":"B","key":"G"}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], false, "{v}");
+        assert_eq!(v["code"], "conflict");
+        assert_eq!(v["conflicts"][0]["preset"], "IPAC P2");
+        assert_eq!(v["conflicts"][0]["function"], "A");
+        assert_eq!(v["conflicts"][0]["profile"], "Steam");
+        assert_eq!(v["conflicts"][0]["slot"], 2);
+        assert!(
+            v["error"].as_str().unwrap().contains("\"IPAC P2\"'s A"),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn learn_key_is_refused_while_a_session_runs() {
+        for run in [RunState::Running { slots: 4 }, RunState::Starting] {
+            let state = shared(run);
+            let (tx, _rx) = unbounded();
+            let v = handle_request(
+                r#"{"verb":"learn-key"}"#,
+                &deps(tx, state, no_profiles()),
+                FAST,
+            );
+            assert_eq!(v["ok"], false, "{v}");
+            let error = v["error"].as_str().unwrap();
+            assert!(error.contains("while a session is running"), "{error}");
+            assert!(error.contains("ksx map"), "the way out is named: {error}");
+        }
+    }
+
+    #[test]
+    fn learn_key_listens_with_a_countdown_then_cancel_stops_it() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let d = deps(tx, state, no_profiles());
+        let v = handle_request(r#"{"verb":"learn-key"}"#, &d, FAST);
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["state"], "listening");
+        assert!(v["remaining_ms"].as_u64().unwrap() <= 10_000, "{v}");
+
+        let v = handle_request(r#"{"verb":"learn-poll"}"#, &d, FAST);
+        assert_eq!(v["state"], "listening");
+
+        let v = handle_request(r#"{"verb":"learn-cancel"}"#, &d, FAST);
+        assert_eq!(v["state"], "cancelled");
+        let v = handle_request(r#"{"verb":"learn-poll"}"#, &d, FAST);
+        assert_eq!(v["state"], "cancelled");
     }
 
     #[test]
@@ -805,7 +1186,7 @@ mod tests {
         let state = shared(RunState::Stopped);
         let (tx, rx) = unbounded();
         for junk in ["not json", "{}", r#"{"verb":"launch nukes"}"#, ""] {
-            let v = handle_request(junk, &tx, &state, &no_profiles(), FAST);
+            let v = handle_request(junk, &deps(tx.clone(), state.clone(), no_profiles()), FAST);
             assert_eq!(v["ok"], false, "{junk:?} → {v}");
             assert!(v["error"].is_string(), "{junk:?} → {v}");
         }
@@ -829,9 +1210,7 @@ mod tests {
             let (tx, _rx) = unbounded();
             server::spawn_with(
                 name.clone(),
-                tx,
-                state,
-                fixed_profiles(),
+                deps(tx, state, fixed_profiles()),
                 Duration::from_millis(100),
             );
 
@@ -852,9 +1231,7 @@ mod tests {
             let (tx, _rx) = unbounded();
             server::spawn_with(
                 name.clone(),
-                tx,
-                state,
-                no_profiles(),
+                deps(tx, state, no_profiles()),
                 Duration::from_millis(10),
             );
             let handles: Vec<_> = (0..4)
@@ -888,9 +1265,7 @@ mod tests {
             let (tx, _rx) = unbounded();
             server::spawn_with(
                 name.clone(),
-                tx.clone(),
-                state.clone(),
-                no_profiles(),
+                deps(tx.clone(), state.clone(), no_profiles()),
                 Duration::from_millis(10),
             );
             // Let the first server own the name before the pretender tries.
@@ -898,9 +1273,7 @@ mod tests {
             assert_eq!(v["ok"], true);
             server::spawn_with(
                 name.clone(),
-                tx,
-                state,
-                no_profiles(),
+                deps(tx, state, no_profiles()),
                 Duration::from_millis(10),
             );
             std::thread::sleep(Duration::from_millis(100));
@@ -958,9 +1331,7 @@ mod tests {
             let game = Arc::new(Mutex::new(None));
             server::spawn_with(
                 name.clone(),
-                tx.clone(),
-                state.clone(),
-                no_profiles(),
+                deps(tx.clone(), state.clone(), no_profiles()),
                 Duration::from_secs(2),
             );
             let loop_thread = std::thread::spawn({

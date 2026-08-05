@@ -96,7 +96,7 @@ const LIST_SLOT_PROFILES_PLAIN: &str = "list:profileRows#2:array";
 /// screen — hydrated on load. Its id keys the props in the
 /// `__forma_islands` script block; its name is the `activateIslands`
 /// registry key in `studio-ui/src/status.ts`. The layout test pins both.
-const ISLAND_ID: u16 = 0;
+pub(crate) const ISLAND_ID: u16 = 0;
 #[cfg(test)]
 const ISLAND_COMPONENT: &str = "StatusIsland";
 
@@ -149,21 +149,25 @@ const PAD_TILE_FLOOR: usize = 4;
 
 /// Parsed once at server start; immutable afterwards.
 pub(crate) struct EmbeddedPage {
-    manifest: AssetManifest,
-    module: IrModule,
+    pub(crate) manifest: AssetManifest,
+    pub(crate) module: IrModule,
 }
 
 impl EmbeddedPage {
-    pub(crate) fn load() -> Result<Self, StudioError> {
+    /// Load the embedded page for one manifest route (`"/"` = status,
+    /// `"/map"` = mapper).
+    pub(crate) fn load(route: &str) -> Result<Self, StudioError> {
         let manifest_json = Assets::get("manifest.json")
             .ok_or_else(|| StudioError::Asset("manifest.json missing from embed".into()))?;
         let manifest: AssetManifest = serde_json::from_slice(&manifest_json.data)
             .map_err(|e| StudioError::Asset(format!("manifest.json unparsable: {e}")))?;
 
         let ir_name = manifest
-            .route("/")
+            .route(route)
             .and_then(|r| r.ir.clone())
-            .ok_or_else(|| StudioError::Asset("manifest route '/' has no .ir entry".into()))?;
+            .ok_or_else(|| {
+                StudioError::Asset(format!("manifest route '{route}' has no .ir entry"))
+            })?;
         let ir_bytes = Assets::get(&ir_name)
             .ok_or_else(|| StudioError::Asset(format!("{ir_name} missing from embed")))?;
 
@@ -178,6 +182,24 @@ impl EmbeddedPage {
     #[cfg(test)]
     pub(crate) fn module(&self) -> &IrModule {
         &self.module
+    }
+}
+
+/// The vendored controller art, served from the embed (`/_assets/...`).
+/// Gamepad-Asset-Pack by AL2009man, MIT — see `studio-ui/art/README.md`; the
+/// page footers carry the visible credit (pinned by tests on both pages).
+pub(crate) const ART_XBOX: &str = "/_assets/pad-xbox.svg";
+pub(crate) const ART_DS4: &str = "/_assets/pad-ds4.svg";
+
+/// Pick the art for a persona LABEL ("PlayStation (DS4) pad") or persona id
+/// ("playstation"). Anything un-PlayStation renders as the Xbox pad — the
+/// cabinet's default persona.
+pub(crate) fn art_for(persona: &str) -> &'static str {
+    let lower = persona.to_ascii_lowercase();
+    if lower.contains("playstation") || lower.contains("ds4") || lower.contains("ps4") {
+        ART_DS4
+    } else {
+        ART_XBOX
     }
 }
 
@@ -243,6 +265,16 @@ fn list_values(snap: &StatusSnapshot) -> [(&'static str, SlotValue); 5] {
                     ("player".to_owned(), SlotValue::Text(format!("P{}", i + 1))),
                     ("persona".to_owned(), SlotValue::Text(p.persona.clone())),
                     ("instance".to_owned(), SlotValue::Text(p.instance.clone())),
+                    // Real controller art per persona (replaces the v3 hand
+                    // silhouettes) + the tile's jump into the mapper.
+                    (
+                        "art".to_owned(),
+                        SlotValue::Text(art_for(&p.persona).to_owned()),
+                    ),
+                    (
+                        "maphref".to_owned(),
+                        SlotValue::Text(format!("/map?slot={}", i + 1)),
+                    ),
                 ])
             })
             .collect(),
@@ -368,11 +400,12 @@ fn build_slots(
     slots
 }
 
-/// The island props JSON: `{"0": <StatusPayload>}`, keyed by [`ISLAND_ID`]
-/// the way `loadIslandProps` expects shared props. `<` is JSON-escaped so a
-/// hostile snapshot line can never close the `<script>` data block early —
-/// inside JSON, `<` only occurs in strings, where `<` is equivalent.
-fn island_props_json(payload: &StatusPayload) -> String {
+/// The island props JSON: `{"0": <payload>}`, keyed by [`ISLAND_ID`] the way
+/// `loadIslandProps` expects shared props (both pages compile to a single
+/// island with id 0 — each pins that in its layout test). `<` is JSON-escaped
+/// so a hostile snapshot line can never close the `<script>` data block early
+/// — inside JSON, `<` only occurs in strings, where `<` is equivalent.
+pub(crate) fn island_props_json<T: serde::Serialize>(payload: &T) -> String {
     let mut by_island = serde_json::Map::new();
     by_island.insert(
         ISLAND_ID.to_string(),
@@ -386,16 +419,16 @@ fn island_props_json(payload: &StatusPayload) -> String {
 /// Everything that precedes `#app`: the no-JS fallback refresh and the
 /// island props block.
 ///
-/// - The `<noscript>` meta refresh targets "/" WITHOUT the query string: a
-///   flash arrives via /?flash=… (post-redirect), shows for one cycle, and
-///   the next no-JS refresh lands on a clean URL. (With JS the poller keeps
-///   the page live and status.ts clears the flash + URL itself.)
+/// - The `<noscript>` meta refresh targets `refresh_url` WITHOUT any query
+///   string: a flash arrives via /?flash=… (post-redirect), shows for one
+///   cycle, and the next no-JS refresh lands on a clean URL. (With JS the
+///   poller keeps the page live and the entry clears the flash + URL itself.)
 /// - The props block is `type="application/json"` — a data block, never
 ///   executed, outside the CSP's script-src entirely; the client reads it by
 ///   id (`__forma_islands`, the islands protocol's script-tag props mode).
-fn body_prefix(payload: &StatusPayload) -> String {
+pub(crate) fn body_prefix<T: serde::Serialize>(payload: &T, refresh_url: &str) -> String {
     format!(
-        "<noscript><meta http-equiv=\"refresh\" content=\"{REFRESH_SECS}; url=/\"></noscript>\
+        "<noscript><meta http-equiv=\"refresh\" content=\"{REFRESH_SECS}; url={refresh_url}\"></noscript>\
          <script id=\"__forma_islands\" type=\"application/json\">{}</script>",
         island_props_json(payload)
     )
@@ -418,7 +451,7 @@ pub(crate) fn render_status(
         session: session.clone(),
         flash: flash.map(str::to_owned),
     };
-    let prefix = body_prefix(&payload);
+    let prefix = body_prefix(&payload, "/");
     render_page(&PageConfig {
         title: "ksx Studio — cabinet status",
         route_pattern: "/",
@@ -482,7 +515,7 @@ mod tests {
 
     #[test]
     fn embedded_page_loads_and_ir_is_fmir_v2() {
-        let page = EmbeddedPage::load().expect("embedded page must load");
+        let page = EmbeddedPage::load("/").expect("embedded page must load");
         assert_eq!(page.module().header.version, 2);
         // The raw-bytes guard from the forma spike: FMIR magic + u16 LE 2.
         let ir_name = page.manifest.route("/").unwrap().ir.clone().unwrap();
@@ -499,7 +532,7 @@ mod tests {
     /// this file drift.
     #[test]
     fn embedded_ir_slot_layout_matches_the_seam() {
-        let page = EmbeddedPage::load().unwrap();
+        let page = EmbeddedPage::load("/").unwrap();
         let module = page.module();
         let names: Vec<&str> = module
             .slots
@@ -561,7 +594,7 @@ mod tests {
 
     #[test]
     fn render_injects_real_snapshot_data_into_ssr_html() {
-        let page = EmbeddedPage::load().unwrap();
+        let page = EmbeddedPage::load("/").unwrap();
         let out = render_status(&page, &sample(), &idle_session(), None);
         // Phase 2 actually happened — not the Phase-1 empty-mount fallback.
         assert!(out.html.contains("data-forma-ssr"), "{}", out.html);
@@ -595,7 +628,7 @@ mod tests {
     /// nothing else). The anti-flash personality CSS rides the same nonce.
     #[test]
     fn render_emits_the_island_its_props_and_nonced_scripts() {
-        let page = EmbeddedPage::load().unwrap();
+        let page = EmbeddedPage::load("/").unwrap();
         let out = render_status(&page, &sample(), &idle_session(), None);
         // Island attributes on the SSR root (walker-emitted).
         assert!(
@@ -655,7 +688,7 @@ mod tests {
             "island props must be byte-compatible with what /api/status serves"
         );
         // And the rendered page embeds exactly that block.
-        let page = EmbeddedPage::load().unwrap();
+        let page = EmbeddedPage::load("/").unwrap();
         let out = render_status(&page, &payload.snapshot, &payload.session, None);
         assert!(out.html.contains(&props), "{}", out.html);
     }
@@ -682,30 +715,71 @@ mod tests {
     }
 
     /// The signature card: live pads render as accent tiles with a player
-    /// number and persona; the grid is padded with ghost tiles up to the
+    /// number, persona, the REAL controller art (v5: Gamepad-Asset-Pack
+    /// renders replaced the v3 hand-drawn silhouettes) and a per-slot jump
+    /// into the mapper; the grid is padded with ghost tiles up to the
     /// four-slot floor.
     #[test]
-    fn pad_tiles_render_live_pads_plus_ghosts_up_to_the_floor() {
-        let page = EmbeddedPage::load().unwrap();
+    fn pad_tiles_render_art_maplinks_and_ghosts_up_to_the_floor() {
+        let page = EmbeddedPage::load("/").unwrap();
         let out = render_status(&page, &sample(), &idle_session(), None);
         // Two live pads…
         assert!(out.html.contains(r#"class="padtile live""#), "{}", out.html);
         assert!(out.html.contains(">P1<"), "{}", out.html);
         assert!(out.html.contains(">P2<"), "{}", out.html);
         assert!(out.html.contains("Xbox 360 pad"));
+        // …with the vendored art per persona (P1 xbox, P2 playstation)…
+        assert!(
+            out.html.contains(r#"src="/_assets/pad-xbox.svg""#),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains(r#"src="/_assets/pad-ds4.svg""#),
+            "{}",
+            out.html
+        );
+        // …and a per-slot Map affordance into the mapper page.
+        assert!(out.html.contains(r#"href="/map?slot=1""#), "{}", out.html);
+        assert!(out.html.contains(r#"href="/map?slot=2""#), "{}", out.html);
         // …two ghosts to reach the floor of four…
         assert!(out.html.contains(r#"class="padtile ghost""#));
         assert!(out.html.contains(">P3<"), "{}", out.html);
         assert!(out.html.contains(">P4<"), "{}", out.html);
         assert!(!out.html.contains(">P5<"));
-        // …drawn as inline SVG silhouettes, no external assets — and the
-        // body path's `d` is really there. (v3 shipped `d: SIL_BODY`, an
-        // identifier the compiler silently turned into an empty client
-        // slot: the silhouette body was missing from every SSR paint.
-        // v4 inlines the literal; this pins it.)
-        assert!(out.html.contains(r#"d="M20 7 "#), "{}", out.html);
-        assert!(out.html.contains("<svg"), "{}", out.html);
-        assert!(!out.html.contains("<img"));
+    }
+
+    /// Both vendored art files are really embedded (rust-embed picks up
+    /// assets/), and the footer carries the MIT attribution the vendoring
+    /// promised (studio-ui/art/README.md).
+    #[test]
+    fn the_art_is_embedded_and_credited() {
+        assert!(
+            Assets::get("pad-xbox.svg").is_some(),
+            "pad-xbox.svg missing from embed"
+        );
+        assert!(
+            Assets::get("pad-ds4.svg").is_some(),
+            "pad-ds4.svg missing from embed"
+        );
+        let page = EmbeddedPage::load("/").unwrap();
+        let out = render_status(&page, &sample(), &idle_session(), None);
+        assert!(
+            out.html.contains("Gamepad-Asset-Pack (MIT) by AL2009man"),
+            "{}",
+            out.html
+        );
+        // And the header links into the mapper.
+        assert!(out.html.contains(r#"href="/map""#), "{}", out.html);
+    }
+
+    #[test]
+    fn art_for_maps_personas_to_the_vendored_files() {
+        assert_eq!(art_for("Xbox 360 pad"), ART_XBOX);
+        assert_eq!(art_for("xbox360"), ART_XBOX);
+        assert_eq!(art_for("PlayStation (DS4) pad"), ART_DS4);
+        assert_eq!(art_for("playstation"), ART_DS4);
+        assert_eq!(art_for("something unknown"), ART_XBOX, "default persona");
     }
 
     /// Status pills: exactly one side of each pair renders. The sample
@@ -713,7 +787,7 @@ mod tests {
     /// therefore on borrowed time (amber), never a paragraph-only warning.
     #[test]
     fn status_pills_pick_exactly_one_side_per_pair() {
-        let page = EmbeddedPage::load().unwrap();
+        let page = EmbeddedPage::load("/").unwrap();
         let out = render_status(&page, &sample(), &idle_session(), None);
         // Header pill: idle.
         assert!(
@@ -738,7 +812,7 @@ mod tests {
     /// A degraded snapshot must not say OK about anything.
     #[test]
     fn a_degraded_snapshot_renders_warn_pills_not_ok() {
-        let page = EmbeddedPage::load().unwrap();
+        let page = EmbeddedPage::load("/").unwrap();
         let snap = StatusSnapshot::degraded("collector panicked");
         let out = render_status(&page, &snap, &SessionView::default(), None);
         assert!(!out.html.contains(">OK<"), "{}", out.html);
@@ -751,7 +825,7 @@ mod tests {
     /// daemon will be asked for.
     #[test]
     fn profile_rows_get_start_buttons_only_when_startable() {
-        let page = EmbeddedPage::load().unwrap();
+        let page = EmbeddedPage::load("/").unwrap();
         let out = render_status(&page, &sample(), &idle_session(), None);
         assert!(
             out.html
@@ -771,7 +845,7 @@ mod tests {
     /// options), Stop does not, and no disabled-controls block appears.
     #[test]
     fn an_idle_reachable_daemon_renders_the_start_form_with_profile_options() {
-        let page = EmbeddedPage::load().unwrap();
+        let page = EmbeddedPage::load("/").unwrap();
         let out = render_status(&page, &sample(), &idle_session(), None);
         assert!(out.html.contains("idle — daemon reachable"), "{}", out.html);
         assert!(
@@ -797,7 +871,7 @@ mod tests {
     /// Running: Stop + Reload render, Start does not.
     #[test]
     fn a_running_session_renders_stop_and_reload() {
-        let page = EmbeddedPage::load().unwrap();
+        let page = EmbeddedPage::load("/").unwrap();
         let out = render_status(&page, &sample(), &running_session(), None);
         assert!(out.html.contains("running — Street Fighter — 4 pad(s)"));
         assert!(out.html.contains(r#"action="/session/stop""#));
@@ -809,7 +883,7 @@ mod tests {
     /// visible, inert, honest. No live form may appear.
     #[test]
     fn an_unreachable_daemon_renders_disabled_controls_with_the_reason() {
-        let page = EmbeddedPage::load().unwrap();
+        let page = EmbeddedPage::load("/").unwrap();
         let session = SessionView::unreachable("no daemon control channel");
         let out = render_status(&page, &sample(), &session, None);
         assert!(
@@ -827,7 +901,7 @@ mod tests {
 
     #[test]
     fn a_flash_message_renders_only_when_present() {
-        let page = EmbeddedPage::load().unwrap();
+        let page = EmbeddedPage::load("/").unwrap();
         let out = render_status(
             &page,
             &sample(),
@@ -843,7 +917,7 @@ mod tests {
     /// must be escaped like everything else.
     #[test]
     fn a_hostile_flash_is_escaped_not_injected() {
-        let page = EmbeddedPage::load().unwrap();
+        let page = EmbeddedPage::load("/").unwrap();
         let out = render_status(
             &page,
             &sample(),
@@ -859,7 +933,7 @@ mod tests {
 
     #[test]
     fn render_survives_an_empty_snapshot() {
-        let page = EmbeddedPage::load().unwrap();
+        let page = EmbeddedPage::load("/").unwrap();
         let out = render_status(
             &page,
             &StatusSnapshot::default(),
@@ -873,7 +947,7 @@ mod tests {
 
     #[test]
     fn snapshot_html_is_escaped_not_injected() {
-        let page = EmbeddedPage::load().unwrap();
+        let page = EmbeddedPage::load("/").unwrap();
         let mut snap = sample();
         snap.vigem = "<script>alert(1)</script>".into();
         let out = render_status(&page, &snap, &idle_session(), None);

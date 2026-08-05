@@ -77,6 +77,10 @@ interface PadTile {
   player: string;
   persona: string;
   instance: string;
+  /** Vendored controller art for this persona (render.rs `art_for`). */
+  art: string;
+  /** Per-slot jump into the mapper: `/map?slot=N`. */
+  maphref: string;
 }
 
 interface GhostTile {
@@ -184,6 +188,12 @@ export function applyStatus(p: StatusPayload): void {
       player: `P${i + 1}`,
       persona: pad.persona,
       instance: pad.instance,
+      // Mirrors render.rs art_for(): PlayStation-ish personas get the DS4
+      // art, everything else the Xbox pad.
+      art: /playstation|ds4|ps4/i.test(pad.persona)
+        ? "/_assets/pad-ds4.svg"
+        : "/_assets/pad-xbox.svg",
+      maphref: `/map?slot=${i + 1}`,
     })),
   );
   const ghosts: GhostTile[] = [];
@@ -249,6 +259,7 @@ export function StatusIsland() {
         h("span", { class: "brand-ksx" }, "ksx"),
         h("span", { class: "brand-studio" }, "Studio"),
       ),
+      h("a", { class: "navlink", href: "/map" }, "Mapper →"),
       createShow(
         () => pillRunning(),
         () => h("span", { class: "pill pill-run" }, "running"),
@@ -356,28 +367,21 @@ export function StatusIsland() {
             // pad unplugs) re-renders the tile instead of leaving stale text
             // — reconcile keeps, it does not re-render, matching keys.
             (p) => p.player + "|" + p.persona + "|" + p.instance,
+            // v5: the tile art is the REAL pad (Gamepad-Asset-Pack, MIT —
+            // vendored, served from the embed), per persona via p.art; the
+            // v3/v4 hand-drawn silhouette is gone. `Map` jumps to /map for
+            // this slot.
             (p) =>
               h(
                 "div",
                 { class: "padtile live" },
-                h(
-                  "svg",
-                  { class: "sil", viewBox: "0 0 72 48", "aria-hidden": "true" },
-                  h("path", { class: "sil-body", d: "M20 7 H52 C60 7 63 12 65 19 L68 30 C69.5 36 66 41 61 41 C56.5 41 54 37 51.5 33.5 L49.5 31 H22.5 L20.5 33.5 C18 37 15.5 41 11 41 C6 41 2.5 36 4 30 L7 19 C9 12 12 7 20 7 Z" }),
-                  h("circle", { class: "sil-stick", cx: "22", cy: "18", r: "5" }),
-                  h("circle", { class: "sil-stick", cx: "44", cy: "27", r: "4.5" }),
-                  h("rect", { class: "sil-dpad", x: "26", y: "25.5", width: "10", height: "3", rx: "1.5" }),
-                  h("rect", { class: "sil-dpad", x: "29.5", y: "22", width: "3", height: "10", rx: "1.5" }),
-                  h("circle", { class: "sil-dot", cx: "56", cy: "13" , r: "2.2" }),
-                  h("circle", { class: "sil-dot", cx: "51", cy: "18", r: "2.2" }),
-                  h("circle", { class: "sil-dot", cx: "61", cy: "18", r: "2.2" }),
-                  h("circle", { class: "sil-dot", cx: "56", cy: "23", r: "2.2" }),
-                ),
+                h("img", { class: "tileart", src: p.art, alt: p.persona }),
                 h(
                   "div",
                   { class: "padmeta" },
                   h("span", { class: "player" }, p.player),
                   h("span", { class: "persona" }, p.persona),
+                  h("a", { class: "maplink", href: p.maphref }, "Map"),
                 ),
                 h("div", { class: "instance" }, p.instance),
               ),
@@ -389,19 +393,11 @@ export function StatusIsland() {
               h(
                 "div",
                 { class: "padtile ghost" },
-                h(
-                  "svg",
-                  { class: "sil", viewBox: "0 0 72 48", "aria-hidden": "true" },
-                  h("path", { class: "sil-body", d: "M20 7 H52 C60 7 63 12 65 19 L68 30 C69.5 36 66 41 61 41 C56.5 41 54 37 51.5 33.5 L49.5 31 H22.5 L20.5 33.5 C18 37 15.5 41 11 41 C6 41 2.5 36 4 30 L7 19 C9 12 12 7 20 7 Z" }),
-                  h("circle", { class: "sil-stick", cx: "22", cy: "18", r: "5" }),
-                  h("circle", { class: "sil-stick", cx: "44", cy: "27", r: "4.5" }),
-                  h("rect", { class: "sil-dpad", x: "26", y: "25.5", width: "10", height: "3", rx: "1.5" }),
-                  h("rect", { class: "sil-dpad", x: "29.5", y: "22", width: "3", height: "10", rx: "1.5" }),
-                  h("circle", { class: "sil-dot", cx: "56", cy: "13" , r: "2.2" }),
-                  h("circle", { class: "sil-dot", cx: "51", cy: "18", r: "2.2" }),
-                  h("circle", { class: "sil-dot", cx: "61", cy: "18", r: "2.2" }),
-                  h("circle", { class: "sil-dot", cx: "56", cy: "23", r: "2.2" }),
-                ),
+                h("img", {
+                  class: "tileart",
+                  src: "/_assets/pad-xbox.svg",
+                  alt: "empty slot",
+                }),
                 h(
                   "div",
                   { class: "padmeta" },
@@ -550,6 +546,16 @@ export function StatusIsland() {
         "every 5 s instead. Generated ",
         h("span", { class: "mono" }, () => generatedAt()),
         ". Serving 127.0.0.1 only.",
+      ),
+      h(
+        "p",
+        null,
+        "controller art: ",
+        h(
+          "a",
+          { href: "https://github.com/AL2009man/Gamepad-Asset-Pack" },
+          "Gamepad-Asset-Pack (MIT) by AL2009man",
+        ),
       ),
     ),
   );

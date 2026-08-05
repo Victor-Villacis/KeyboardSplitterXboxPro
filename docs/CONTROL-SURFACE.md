@@ -23,7 +23,8 @@ list.
 | List / identify devices | `ksx devices [--json]` (both backends, read-only); `ksx winusb status [--json]` for the USB/claim view | M9: same enumeration in-process — strictly read-only, safe mid-session. M10: api devices | exists |
 | Pad test | `ksx pads --count N --persona xbox360\|playstation [--json]` (plug, test pattern, unplug) | M9: same routine in-process, only while emulation is stopped (test pads compete for the four XInput slots). M10: api | exists |
 | Per-slot persona | TOML edit: `persona = "playstation"` on the `[[slot]]` (aliases `ds4`/`ps4` accepted) | M7 wizard / mapping verbs first; then GUI forms write the same TOML and issue `Reload` | gap — TOML-only **by design** until M7 |
-| Preset editing | TOML edit; validated by the same resolution `ksx run`/`ksx daemon` perform at start | M7 `ksx map --slot 1 --function A --key G` (E5); GUI = a form over that verb, never a parallel writer | gap — verbs are M7 |
+| Preset editing | `ksx map --preset "IPAC P1" --function A --key G [--clear] [--force] [--json]`; pipe `map` (same writer: `ksx-app/src/mapping.rs::apply`); TOML edit still first-class | **Studio's `/map` mapper (live)**: click a control → pipe `learn-key` → pipe `map` — every write goes through the one shared writer, never a parallel editor. Conflict detection is server-side in that writer (see below) | exists — CLI + pipe + Studio live |
+| Learn a key ("press the panel key for P1·A") | pipe `learn-key` / `learn-poll` / `learn-cancel` (asynchronous; see "learn-key semantics" below) | **Studio's mapper drives it (live)**: `/api/learn*` → the pipe verbs. No CLI face yet (`ksx map` takes the key by name; `ksx monitor` shows names) | exists — pipe + Studio |
 | Game profiles | TOML edit (`games.toml`); consumed by `ksx run --game`, `ksx daemon --game`, `ksx autostart --game` | Editing: M7 verbs (E5 `ksx slot assign` family), then GUI forms over them. Consuming: `DaemonCommand`/api as above | gap for editing; consuming exists |
 | WinUSB claim / release / status | `ksx winusb status` (read-only); `claim`/`release` are dry runs by default, act only with `--yes` + an admin token | M9: same verbs in-process, preserving dry-run-first and the explicit consent step. M10: `status` is safe over the api; `claim`/`release` stay local + elevated | exists |
 | Autostart | `ksx autostart --enable/--disable/--status` (validates the config before registering) | M9: same verb in-process. M10: api | exists |
@@ -64,6 +65,63 @@ connection; then the server disconnects. Kept deliberately dumb.
 ← {"ok":true,"message":"running (4 slot(s))"}
 ```
 
+The M7 mapper slice adds four verbs on the same channel:
+
+```
+→ {"verb":"map","preset":"IPAC P1","function":"A","key":"G",
+   "force":false,"reload":true}          ("clear":true instead of "key" unbinds)
+← {"ok":true,"message":"\"IPAC P1\": A = G — the next session start reads it",
+   "path":"C:\\…\\presets\\IPAC P1.toml","preset":"IPAC P1","function":"A",
+   "key":"G","stolen_from":[],"conflicts":[],"reloaded":false}
+← {"ok":false,"code":"conflict",
+   "error":"refusing to bind G: G is \"IPAC P2\"'s A (slot 2 of \"Steam\") — use --force …",
+   "conflicts":[{"scope":"profile","preset":"IPAC P2","function":"A",
+                 "profile":"Steam","slot":2}]}
+
+→ {"verb":"learn-key"}      (refused while a session runs — see semantics below)
+← {"ok":true,"state":"listening","generation":3,"remaining_ms":9998,
+   "device":null,"key":null,"error":null}
+→ {"verb":"learn-poll"}
+← {"ok":true,"state":"hit","generation":3,"remaining_ms":null,
+   "device":"HID\\VID_D209&PID_0430&MI_00\\8&2A0D0500&0&0000","key":"G","error":null}
+→ {"verb":"learn-cancel"}
+← {"ok":true,"state":"cancelled", …}
+```
+
+`map` writes through the SAME `ksx-app/src/mapping.rs::apply` the CLI verb
+uses — replace-per-function, `"None"` placeholder on clear, canonical TOML
+rewrite (comments do not survive; the store's atomic-write trade), CONFLICT
+DETECTION server-side in the writer. Two scopes: the key on another function
+in the same preset (a `force` steals it, leaving a `"None"` placeholder), and
+the key bound in another slot's preset within any games.toml profile that
+uses the target preset (**never auto-edited** — `force` writes the target
+anyway and keeps reporting the double binding; silently rewriting a preset
+the caller did not name would be worse). `"reload":true` bounces a RUNNING
+session onto the new binding via the ordinary `DaemonCommand::Reload` — the
+"hot-reload" is a clean stop + re-read + start, never a hot-patch (the
+config invariant below). With nothing running there is nothing to bounce: the
+next start reads the file.
+
+**learn-key semantics** (the honest v1): the daemon observes the next key
+press via a Raw Input sink (`ksx-capture::observe_next_key` — instance path +
+the same corrected `Key` vocabulary presets store; injected input is ignored
+by construction). Because a running session's captured keyboards are
+suppressed below win32k — where a Raw Input sink hears nothing — `learn-key`
+is **refused while a session is running** instead of timing out silently; the
+mapper goes read-only with the reason and the `ksx map` fallback. Same honest
+limit for WinUSB-claimed interfaces: a claimed panel is not in the keyboard
+stack, so Raw Input cannot hear it even between sessions (its typethrough
+injection is deliberately filtered as injected input) — learning from a
+claimed panel through the daemon's own report stream is the M8-adjacent
+follow-up. Constants are PadForge's earned recorder numbers
+(docs/research/padforge-code-audit.md §1.2): 10 s timeout, 33 ms observer
+slices, wait-for-release re-baselining (keys held at learn start are ignored
+until released — autorepeat cannot steal a chained learn). The verb is
+asynchronous by design: the pipe serves clients sequentially, so `learn-key`
+only STARTS the observation and returns; `learn-poll` carries the outcome
+plus `remaining_ms` — the visible countdown PadForge never had. A second
+`learn-key` supersedes the first; `learn-cancel` stops within one slice.
+
 Action verbs poll the snapshot up to 5 s for the outcome; an unsettled command
 answers `ok:true` with a "requested — check `ksx session status`" message
 rather than guessing. `start`'s profile title is validated by the daemon's
@@ -95,11 +153,16 @@ gets the same channel for free.
 
 ## The honest gaps
 
-1. **No non-interactive mapping verbs yet.** `ksx map` / `ksx slot assign` are
-   M7 work and already specified in E5. Until they exist, "edit a binding" has
-   no verb — and therefore, by the rule above, no GUI mapping either.
+1. ~~No non-interactive mapping verbs yet.~~ **CLOSED (M7 slice, 2026-08-05)**:
+   `ksx map` + pipe `map`/`learn-*` + Studio's `/map` mapper, all over one
+   writer. Still open from the E5 family: `ksx slot assign` (device/preset
+   wiring per slot) — the mapper edits bindings inside a preset, not which
+   preset a slot uses.
 2. **Per-slot persona is a TOML edit today.** Deliberate until the M7 wizard:
    the hand-editable config *is* the interface, and it round-trips.
+3. **learn-key cannot hear a WinUSB-claimed panel** (see semantics above) —
+   Interception-backed cabinets learn fine; a migrated cabinet uses `ksx map`
+   until the claimed-panel learner lands.
 
 ## Invariants a GUI must not break
 

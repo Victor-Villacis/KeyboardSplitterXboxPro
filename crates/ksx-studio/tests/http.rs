@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ksx_studio::{ControlSource, PadRow, ProfileRow, SessionView, StatusSnapshot, StatusSource};
+use ksx_studio::{
+    BindConflict, BindOutcome, BindRequest, ControlSource, LearnView, MapperSlot, MapperSnapshot,
+    PadRow, ProfileRow, SessionView, StatusSnapshot, StatusSource,
+};
 
 struct FixedStatus;
 
@@ -32,6 +35,24 @@ impl StatusSource for FixedStatus {
             config_root: "C:\\cfg".into(),
         }
     }
+
+    fn mapper(&self) -> MapperSnapshot {
+        let mut bindings = std::collections::BTreeMap::new();
+        bindings.insert("A".to_owned(), vec!["G".to_owned()]);
+        MapperSnapshot {
+            generated_at: "test".into(),
+            source: "slots of profile \"Steam\" (games.toml)".into(),
+            config_root: "C:\\cfg".into(),
+            slots: vec![MapperSlot {
+                number: 1,
+                persona: "xbox360".into(),
+                persona_label: "Xbox 360".into(),
+                preset: "IPAC P1".into(),
+                keyboard: "HID\\TEST".into(),
+                bindings,
+            }],
+        }
+    }
 }
 
 /// Scriptable control: session() flips between idle and running; start()
@@ -40,6 +61,8 @@ struct ScriptedControl {
     running: AtomicBool,
     refuse_start: bool,
     started_with: std::sync::Mutex<Option<Option<String>>>,
+    learning: AtomicBool,
+    bound_with: std::sync::Mutex<Option<BindRequest>>,
 }
 
 impl ScriptedControl {
@@ -48,6 +71,8 @@ impl ScriptedControl {
             running: AtomicBool::new(false),
             refuse_start,
             started_with: std::sync::Mutex::new(None),
+            learning: AtomicBool::new(false),
+            bound_with: std::sync::Mutex::new(None),
         }
     }
 }
@@ -87,6 +112,86 @@ impl ControlSource for ScriptedControl {
     fn reload(&self) -> Result<String, String> {
         Ok("running (4 slot(s))".into())
     }
+
+    fn learn_start(&self) -> LearnView {
+        self.learning.store(true, Ordering::SeqCst);
+        LearnView {
+            ok: true,
+            state: "listening".into(),
+            remaining_ms: Some(10_000),
+            device: None,
+            key: None,
+            error: None,
+        }
+    }
+
+    fn learn_poll(&self) -> LearnView {
+        if self.learning.load(Ordering::SeqCst) {
+            LearnView {
+                ok: true,
+                state: "listening".into(),
+                remaining_ms: Some(9_000),
+                device: None,
+                key: None,
+                error: None,
+            }
+        } else {
+            LearnView {
+                ok: true,
+                state: "idle".into(),
+                remaining_ms: None,
+                device: None,
+                key: None,
+                error: None,
+            }
+        }
+    }
+
+    fn learn_cancel(&self) -> LearnView {
+        self.learning.store(false, Ordering::SeqCst);
+        LearnView {
+            ok: true,
+            state: "cancelled".into(),
+            remaining_ms: None,
+            device: None,
+            key: None,
+            error: None,
+        }
+    }
+
+    fn bind(&self, request: &BindRequest) -> BindOutcome {
+        *self.bound_with.lock().unwrap() = Some(request.clone());
+        if request.key.as_deref() == Some("G") && !request.force {
+            BindOutcome {
+                ok: false,
+                message: None,
+                error: Some("refusing to bind G: G is \"IPAC P2\"'s A".into()),
+                code: Some("conflict".into()),
+                conflicts: vec![BindConflict {
+                    scope: "profile".into(),
+                    preset: "IPAC P2".into(),
+                    function: "A".into(),
+                    profile: Some("Steam".into()),
+                    slot: Some(2),
+                }],
+                reloaded: false,
+            }
+        } else {
+            BindOutcome {
+                ok: true,
+                message: Some(format!(
+                    "\"{}\": {} = {}",
+                    request.preset,
+                    request.function,
+                    request.key.as_deref().unwrap_or("None")
+                )),
+                error: None,
+                code: None,
+                conflicts: Vec::new(),
+                reloaded: request.reload,
+            }
+        }
+    }
 }
 
 /// Bind port 0 to learn a free port, release it, and serve there. The tiny
@@ -108,6 +213,18 @@ fn start_server(control: Arc<ScriptedControl>) -> SocketAddr {
         }
         fn reload(&self) -> Result<String, String> {
             self.0.reload()
+        }
+        fn learn_start(&self) -> LearnView {
+            self.0.learn_start()
+        }
+        fn learn_poll(&self) -> LearnView {
+            self.0.learn_poll()
+        }
+        fn learn_cancel(&self) -> LearnView {
+            self.0.learn_cancel()
+        }
+        fn bind(&self, request: &BindRequest) -> BindOutcome {
+            self.0.bind(request)
         }
     }
     std::thread::spawn(move || {
@@ -158,6 +275,26 @@ fn post_form(addr: SocketAddr, path: &str, body: &str) -> String {
     )
 }
 
+fn post_json(addr: SocketAddr, path: &str, body: &str) -> String {
+    http(
+        addr,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+}
+
+/// The response body (everything after the blank line).
+fn body_of(response: &str) -> &str {
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("")
+}
+
 #[test]
 fn the_session_panel_round_trips_start_stop_and_the_flash() {
     let control = Arc::new(ScriptedControl::new(false));
@@ -193,6 +330,85 @@ fn the_session_panel_round_trips_start_stop_and_the_flash() {
     let response = post_form(addr, "/session/start", "profile=");
     assert!(response.starts_with("HTTP/1.1 303"), "{response}");
     assert_eq!(control.started_with.lock().unwrap().clone(), Some(None));
+}
+
+/// The whole mapper loop over real HTTP: the page renders zones with real
+/// bindings, the learn flow answers listening → cancel, and /api/bind
+/// round-trips the conflict → Replace(force) decision.
+#[test]
+fn the_mapper_page_learn_flow_and_bind_round_trip() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control.clone());
+
+    // The page: slot context, art, a zone with its binding tag, credit line.
+    let page = get(addr, "/map");
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    assert!(page.contains("P1 · Xbox 360 · IPAC P1"), "{page}");
+    assert!(page.contains("/_assets/pad-xbox.svg"), "{page}");
+    assert!(page.contains(r#"data-fn="A""#), "{page}");
+    assert!(page.contains(">G<"), "{page}");
+    assert!(
+        page.contains("Gamepad-Asset-Pack (MIT) by AL2009man"),
+        "{page}"
+    );
+
+    // The art itself is served with the right type.
+    let art = get(addr, "/_assets/pad-xbox.svg");
+    assert!(art.starts_with("HTTP/1.1 200"), "{art}");
+    assert!(art.contains("image/svg+xml"), "{art}");
+    assert!(art.contains("<svg"), "{art}");
+
+    // /api/map serves the payload the page embeds.
+    let api = get(addr, "/api/map");
+    let payload: serde_json::Value = serde_json::from_str(body_of(&api)).expect("json");
+    assert_eq!(payload["mapper"]["slots"][0]["preset"], "IPAC P1");
+    assert_eq!(payload["mapper"]["slots"][0]["bindings"]["A"][0], "G");
+    assert_eq!(payload["selected"], 1);
+    assert_eq!(payload["learn"]["state"], "idle");
+
+    // Learn: start → listening with the countdown, poll agrees, cancel ends.
+    let started = post_json(addr, "/api/learn/start", "");
+    let learn: serde_json::Value = serde_json::from_str(body_of(&started)).expect("json");
+    assert_eq!(learn["state"], "listening");
+    assert_eq!(learn["remaining_ms"], 10_000);
+    let polled = get(addr, "/api/learn");
+    let learn: serde_json::Value = serde_json::from_str(body_of(&polled)).expect("json");
+    assert_eq!(learn["state"], "listening");
+    let cancelled = post_json(addr, "/api/learn/cancel", "");
+    let learn: serde_json::Value = serde_json::from_str(body_of(&cancelled)).expect("json");
+    assert_eq!(learn["state"], "cancelled");
+
+    // Bind: the scripted conflict comes back structured; Replace (force)
+    // succeeds and reports the reload.
+    let refused = post_json(
+        addr,
+        "/api/bind",
+        r#"{"preset":"IPAC P1","function":"B","key":"G","force":false,"reload":true}"#,
+    );
+    let outcome: serde_json::Value = serde_json::from_str(body_of(&refused)).expect("json");
+    assert_eq!(outcome["ok"], false);
+    assert_eq!(outcome["code"], "conflict");
+    assert_eq!(outcome["conflicts"][0]["preset"], "IPAC P2");
+    assert_eq!(outcome["conflicts"][0]["slot"], 2);
+
+    let forced = post_json(
+        addr,
+        "/api/bind",
+        r#"{"preset":"IPAC P1","function":"B","key":"G","force":true,"reload":true}"#,
+    );
+    let outcome: serde_json::Value = serde_json::from_str(body_of(&forced)).expect("json");
+    assert_eq!(outcome["ok"], true, "{outcome}");
+    assert_eq!(outcome["reloaded"], true);
+    let bound = control
+        .bound_with
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("bind reached control");
+    assert_eq!(bound.preset, "IPAC P1");
+    assert_eq!(bound.function, "B");
+    assert!(bound.force);
+    assert!(bound.reload);
 }
 
 #[test]

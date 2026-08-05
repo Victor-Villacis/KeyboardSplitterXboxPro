@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize};
 /// never gathers machine state itself.
 pub trait StatusSource: Send + Sync {
     fn snapshot(&self) -> StatusSnapshot;
+
+    /// The mapper page's data: slots with their presets and bindings. The
+    /// default is an honest "no data" so existing sources keep compiling;
+    /// ksx-app overrides it with the config-store reader.
+    fn mapper(&self) -> MapperSnapshot {
+        MapperSnapshot::unavailable("this status source supplies no mapper data")
+    }
 }
 
 /// Everything the cabinet status sections show. Point-in-time by design: a
@@ -70,6 +77,66 @@ pub struct StatusPayload {
     /// `/api/status` — a poll is not an action — and `Some` only in the
     /// page-render props, where the client shows it once and clears it.
     pub flash: Option<String>,
+}
+
+/// What the mapper page maps: slots (from `config.toml` `[[slot]]` entries or
+/// a games.toml profile — the provider says which in [`source`](Self::source))
+/// with their presets' current bindings. Point-in-time like
+/// [`StatusSnapshot`]; re-read per request / per poll, which is exactly how a
+/// fresh `ksx map` write becomes a fresh zone tag.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapperSnapshot {
+    pub generated_at: String,
+    /// Where the slots came from, e.g. `slots of profile "Steam" (games.toml)`
+    /// — or, with an empty `slots`, why there is nothing to map.
+    pub source: String,
+    pub config_root: String,
+    pub slots: Vec<MapperSlot>,
+}
+
+impl MapperSnapshot {
+    /// No mappable slots; `reason` renders where the slot strip would be.
+    pub fn unavailable(reason: &str) -> Self {
+        Self {
+            generated_at: "(unavailable)".to_owned(),
+            source: reason.to_owned(),
+            config_root: "(unavailable)".to_owned(),
+            slots: Vec::new(),
+        }
+    }
+}
+
+/// One mappable slot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapperSlot {
+    pub number: u8,
+    /// Machine persona id: `"xbox360"` or `"playstation"` (picks the art).
+    pub persona: String,
+    /// Human persona label, e.g. `"Xbox 360"`.
+    pub persona_label: String,
+    /// Preset name the slot binds (`preset` in the slot entry).
+    pub preset: String,
+    /// Keyboard alias or hardware id, `"(any)"` when unassigned.
+    pub keyboard: String,
+    /// Canonical function name → bound key names (the inert `"None"` filtered
+    /// out — an unbound function is an EMPTY list here, so the page renders
+    /// an honest "unbound" tag instead of the placeholder's name).
+    pub bindings: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// What `GET /api/map` serves AND what the mapper island's props carry — the
+/// same one-struct-one-serializer rule as [`StatusPayload`], parity pinned in
+/// `render_map.rs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapPayload {
+    pub mapper: MapperSnapshot,
+    pub session: crate::control::SessionView,
+    /// Where the daemon's learner stands (also tells the page whether
+    /// learning is possible at all).
+    pub learn: crate::control::LearnView,
+    /// Slot number selected for the SSR paint (`/map?slot=N`, defaulting to
+    /// the first slot). The client keeps its own selection afterwards.
+    pub selected: u8,
 }
 
 /// One virtual pad currently exposed by ViGEmBus.

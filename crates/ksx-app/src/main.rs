@@ -11,6 +11,8 @@ mod devices;
 mod doctor;
 mod install;
 mod logging;
+mod map;
+mod mapping;
 mod monitor;
 mod pads;
 mod run;
@@ -310,6 +312,58 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Bind one preset function to one panel key (writes the preset TOML)
+    ///
+    /// The non-interactive mapping verb (docs/CONTROL-SURFACE.md): validates
+    /// the preset name against the files on disk, the function name against
+    /// the preset vocabulary (A B X Y start back guide lb rb lthumb rthumb,
+    /// lt rt, lx/ly/rx/ry with .min/.max/.<i16>, dpad.*), and the key against
+    /// the legacy key-name spelling (`ksx monitor` shows the name for any key
+    /// you press) — then rewrites exactly one preset file atomically.
+    ///
+    /// Binding REPLACES the function's keys (one key per control, what the
+    /// mapper shows); --clear leaves the inert "None" placeholder. The write
+    /// is canonical TOML: bindings come back sorted, dotted functions as
+    /// quoted literals ("dpad.up"), hand-written comments do not survive —
+    /// the trade for atomic, validated writes.
+    ///
+    /// CONFLICTS block by default: a key already on another function in the
+    /// same preset, or bound in another slot's preset within a games.toml
+    /// profile that uses this preset, is reported and nothing is written.
+    /// --force proceeds — same-preset conflicts are stolen (the old function
+    /// keeps a "None" placeholder); other presets are NEVER edited, the
+    /// response just keeps naming the double binding.
+    ///
+    /// A running session picks the change up after `ksx session reload` (or
+    /// its next start); Studio's mapper asks the daemon to do exactly that.
+    ///
+    /// Exit codes: 0 = written, 1 = error, 2 = refused (unknown
+    /// preset/function/key, or conflicts without --force; nothing written).
+    Map {
+        /// Preset name (the file's `name` field, e.g. "IPAC P1")
+        #[arg(long, value_name = "NAME")]
+        preset: String,
+        /// Function to bind, e.g. A, lt, dpad.up, lx.min
+        #[arg(long, value_name = "FUNCTION")]
+        function: String,
+        /// Key name to bind (legacy spelling, e.g. G, Enter, Left)
+        #[arg(
+            long,
+            value_name = "KEY",
+            required_unless_present = "clear",
+            conflicts_with = "clear"
+        )]
+        key: Option<String>,
+        /// Unbind the function (leaves the inert "None" placeholder)
+        #[arg(long)]
+        clear: bool,
+        /// Proceed despite conflicts (same-preset conflicts are stolen)
+        #[arg(long)]
+        force: bool,
+        /// One JSON object {ok, path, preset, function, key, conflicts} on stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// Control a running `ksx daemon`: status, start, stop, reload
     ///
     /// Talks to the daemon over its named pipe (\\.\pipe\ksx-daemon) — the
@@ -590,6 +644,22 @@ fn main() -> anyhow::Result<()> {
         }),
         #[cfg(feature = "studio")]
         Command::Studio { port } => studio::run(port),
+        Command::Map {
+            preset,
+            function,
+            key,
+            clear: _,
+            force,
+            json,
+        } => map::run(map::Options {
+            preset,
+            function,
+            // clap guarantees exactly one of --key/--clear; a `None` key IS
+            // the clear.
+            key,
+            force,
+            json,
+        }),
         Command::Session { command } => match command {
             SessionCommand::Status { json } => session::run(session::Verb::Status, json),
             SessionCommand::Start { game, json } => {
@@ -1274,6 +1344,109 @@ mod tests {
             "point-in-time",
             "Localhost only",
             "no LAN option",
+        ] {
+            assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // M7 slice: ksx map (the non-interactive mapping verb)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn map_parses_bind_clear_and_force() {
+        let cli = Cli::try_parse_from([
+            "ksx",
+            "map",
+            "--preset",
+            "IPAC P1",
+            "--function",
+            "A",
+            "--key",
+            "G",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Map {
+                preset,
+                function,
+                key,
+                clear,
+                force,
+                json,
+            } => {
+                assert_eq!(preset, "IPAC P1");
+                assert_eq!(function, "A");
+                assert_eq!(key.as_deref(), Some("G"));
+                assert!(!clear && !force && json);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+        let cli = Cli::try_parse_from([
+            "ksx",
+            "map",
+            "--preset",
+            "IPAC P1",
+            "--function",
+            "dpad.up",
+            "--clear",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Map {
+                key, clear, force, ..
+            } => {
+                assert_eq!(key, None);
+                assert!(clear && force);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+    }
+
+    /// Exactly one of --key/--clear: neither and both are parse errors, so
+    /// "bind to nothing" can never be expressed by accident.
+    #[test]
+    fn map_requires_exactly_one_of_key_or_clear() {
+        assert!(
+            Cli::try_parse_from(["ksx", "map", "--preset", "P", "--function", "A"]).is_err(),
+            "no key and no clear must not parse"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ksx",
+                "map",
+                "--preset",
+                "P",
+                "--function",
+                "A",
+                "--key",
+                "G",
+                "--clear",
+            ])
+            .is_err(),
+            "key AND clear must not parse"
+        );
+    }
+
+    /// The semantics a user must know before running it live in --help:
+    /// replace-per-function, the conflict gate, the canonical rewrite, and
+    /// the exit codes.
+    #[test]
+    fn map_help_documents_conflicts_rewrite_and_exit_codes() {
+        let mut cmd = Cli::command();
+        let map = cmd.find_subcommand_mut("map").unwrap();
+        let help = map.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "REPLACES the function's keys",
+            "CONFLICTS block by default",
+            "other presets are NEVER edited",
+            "canonical TOML",
+            "comments do not survive",
+            "ksx session reload",
+            "2 = refused",
         ] {
             assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
         }

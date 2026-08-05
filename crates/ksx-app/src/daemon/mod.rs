@@ -60,6 +60,7 @@
 //! End to end, that path is asserted in [`panel_tests`]: two real sessions over
 //! one mock-backed claim, with the panel typing in between.
 
+pub mod learn;
 pub mod live;
 pub mod panel;
 pub mod pipe;
@@ -819,11 +820,19 @@ pub fn run(
     #[cfg(windows)]
     {
         let profiles_root = factory.root.clone();
+        let map_root = factory.root.clone();
         pipe::server::spawn(
             pipe::PIPE_NAME.to_owned(),
-            tx.clone(),
-            state.clone(),
-            Box::new(move || pipe::profile_rows(&profiles_root)),
+            pipe::PipeDeps {
+                tx: tx.clone(),
+                state: state.clone(),
+                profiles: Box::new(move || pipe::profile_rows(&profiles_root)),
+                // The mapper verbs (M7 slice): `map` writes presets through
+                // the same crate::mapping::apply the CLI verb uses;
+                // learn-key observes idle keyboards over Raw Input.
+                map: pipe::map_fn(map_root),
+                learn: learn::LearnService::with_rawinput(),
+            },
         );
     }
 

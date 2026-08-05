@@ -19,13 +19,15 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
 
-use crate::control::{ControlSource, SessionView};
+use crate::control::{BindRequest, ControlSource, SessionView};
 use crate::error::StudioError;
 use crate::render::{render_status, Assets, EmbeddedPage};
-use crate::snapshot::{StatusPayload, StatusSnapshot, StatusSource};
+use crate::render_map::render_map;
+use crate::snapshot::{MapPayload, StatusPayload, StatusSnapshot, StatusSource};
 
 struct AppState {
     page: EmbeddedPage,
+    map_page: EmbeddedPage,
     source: Box<dyn StatusSource>,
     control: Box<dyn ControlSource>,
 }
@@ -47,9 +49,11 @@ pub fn serve(
     if !bind.ip().is_loopback() {
         return Err(StudioError::NonLoopbackBind { bind });
     }
-    let page = EmbeddedPage::load()?;
+    let page = EmbeddedPage::load("/")?;
+    let mapper = EmbeddedPage::load("/map")?;
     let state = Arc::new(AppState {
         page,
+        map_page: mapper,
         source,
         control,
     });
@@ -72,6 +76,15 @@ pub fn serve(
             .route("/session/start", post(session_start))
             .route("/session/stop", post(session_stop))
             .route("/config/reload", post(config_reload))
+            // The mapper (v5): page + poll payload + the learn/bind verbs,
+            // each a thin wrapper over one ControlSource method (= one pipe
+            // verb — no GUI-only code paths).
+            .route("/map", get(map_page))
+            .route("/api/map", get(api_map))
+            .route("/api/learn", get(api_learn_poll))
+            .route("/api/learn/start", post(api_learn_start))
+            .route("/api/learn/cancel", post(api_learn_cancel))
+            .route("/api/bind", post(api_bind))
             // Canon helper: correct no-cache + Service-Worker-Allowed
             // headers for free (replaced a hand-rolled handler).
             .route("/sw.js", get(forma_server::sw::serve_sw::<Assets>))
@@ -152,6 +165,111 @@ async fn api_status(State(state): State<Arc<AppState>>) -> Response {
         }),
     )
         .into_response()
+}
+
+/// One fresh mapper payload. Blocking work (config store reads + up to two
+/// pipe requests) off the async workers, like [`collect`].
+async fn collect_map(state: &Arc<AppState>, selected: Option<u8>) -> MapPayload {
+    let map_state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let mapper = map_state.source.mapper();
+        let session = map_state.control.session();
+        let learn = map_state.control.learn_poll();
+        let selected = selected
+            .filter(|n| mapper.slots.iter().any(|s| s.number == *n))
+            .or_else(|| mapper.slots.first().map(|s| s.number))
+            .unwrap_or(0);
+        MapPayload {
+            mapper,
+            session,
+            learn,
+            selected,
+        }
+    })
+    .await
+    .unwrap_or_else(|_| MapPayload {
+        mapper: crate::snapshot::MapperSnapshot::unavailable("mapper collection panicked"),
+        session: SessionView::unreachable("mapper collection panicked"),
+        learn: crate::control::LearnView::unavailable("mapper collection panicked"),
+        selected: 0,
+    })
+}
+
+#[derive(Deserialize)]
+struct MapQuery {
+    slot: Option<u8>,
+}
+
+async fn map_page(State(state): State<Arc<AppState>>, Query(query): Query<MapQuery>) -> Response {
+    let payload = collect_map(&state, query.slot).await;
+    let out = render_map(&state.map_page, &payload);
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_str(&out.csp)
+                    .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'")),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        out.html,
+    )
+        .into_response()
+}
+
+/// The mapper poller's endpoint — the same [`MapPayload`] shape the /map page
+/// embeds as island props (parity unit-tested in render_map.rs).
+async fn api_map(State(state): State<Arc<AppState>>, Query(query): Query<MapQuery>) -> Response {
+    let payload = collect_map(&state, query.slot).await;
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        axum::Json(payload),
+    )
+        .into_response()
+}
+
+/// One blocking ControlSource call → JSON, shared by the learn/bind routes.
+async fn control_json<T, F>(state: Arc<AppState>, call: F) -> Response
+where
+    T: serde::Serialize + Send + 'static,
+    F: FnOnce(&dyn ControlSource) -> T + Send + 'static,
+{
+    let value = tokio::task::spawn_blocking(move || call(state.control.as_ref())).await;
+    match value {
+        Ok(value) => (
+            [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+            axum::Json(value),
+        )
+            .into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "the control call panicked",
+        )
+            .into_response(),
+    }
+}
+
+async fn api_learn_poll(State(state): State<Arc<AppState>>) -> Response {
+    control_json(state, |control| control.learn_poll()).await
+}
+
+async fn api_learn_start(State(state): State<Arc<AppState>>) -> Response {
+    control_json(state, |control| control.learn_start()).await
+}
+
+async fn api_learn_cancel(State(state): State<Arc<AppState>>) -> Response {
+    control_json(state, |control| control.learn_cancel()).await
+}
+
+async fn api_bind(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<BindRequest>,
+) -> Response {
+    control_json(state, move |control| control.bind(&request)).await
 }
 
 #[derive(Deserialize)]

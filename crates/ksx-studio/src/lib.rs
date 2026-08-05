@@ -69,10 +69,13 @@
 mod control;
 mod error;
 mod render;
+mod render_map;
 mod server;
 mod snapshot;
 
-pub use control::{ControlSource, SessionView};
+pub use control::{BindConflict, BindOutcome, BindRequest, ControlSource, LearnView, SessionView};
 pub use error::StudioError;
 pub use server::serve;
-pub use snapshot::{PadRow, ProfileRow, StatusSnapshot, StatusSource};
+pub use snapshot::{
+    MapPayload, MapperSlot, MapperSnapshot, PadRow, ProfileRow, StatusSnapshot, StatusSource,
+};
