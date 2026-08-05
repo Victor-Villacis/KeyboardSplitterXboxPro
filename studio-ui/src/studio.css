@@ -503,9 +503,20 @@ select,
   font-size: 0.9rem;
 }
 
+/* The mapper column is a real flex stack: slot strip, banner/hint, stage,
+   legend, flashes — phone-friendly (stage full width, legend wraps beneath
+   into fewer columns). */
 .mapper main {
   max-width: 56rem;
   margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.mapper main > * {
+  margin-top: 0;
+  margin-bottom: 0;
 }
 
 .slotstrip {
@@ -612,18 +623,15 @@ select,
   inset: 0;
 }
 
-/* Hit zones: labeled chips over the art. Hover glow = the mapper's
-   affordance; the key tag is the current binding. */
+/* Hit zones: PURE hit areas over the art — transparent, no inline text (the
+   art is the label; the title tooltip names fn + binding, the legend below
+   the stage is the readable truth). Hover/focus — or the legend row's hover
+   via the shared .z-hot class — outlines the control rect with a soft glow. */
 .zone {
   position: absolute;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 0.05rem;
   padding: 0;
-  background: color-mix(in srgb, var(--panel) 55%, transparent);
-  border: 1px solid var(--line);
+  background: transparent;
+  border: 1px solid transparent;
   color: var(--text);
   cursor: pointer;
   font: inherit;
@@ -638,34 +646,75 @@ select,
   border-radius: 8px;
 }
 
+/* The shoulder shelf sits above the art (LB/RB/LT/RT are not drawn), so its
+   four zones keep a barely-there dashed hint; everything on the art itself
+   stays invisible until hovered. */
 .z-shoulder {
-  background: color-mix(in srgb, var(--panel-2) 80%, transparent);
+  border-color: var(--line-soft);
+  border-style: dashed;
 }
 
-.zone:hover {
+.zone:hover,
+.zone:focus-visible,
+.zone.z-hot {
   border-color: var(--accent);
+  border-style: solid;
   background: var(--accent-dim);
   box-shadow: 0 0 14px var(--accent-glow);
+  outline: none;
   z-index: 2;
 }
 
-.zlabel {
-  font: 600 0.62rem/1 var(--mono);
-  color: var(--muted);
-  pointer-events: none;
+/* ── Bindings legend: one row per mappable function, real grid ─────────── */
+
+.legend {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
+  gap: 0.15rem 0.9rem;
 }
 
-.zkey {
-  font: 700 0.78rem/1 var(--mono);
+.lrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  min-width: 0;
+  padding: 0.28rem 0.55rem;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.lrow:hover,
+.lrow:focus-visible,
+.lrow.l-hot {
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+  outline: none;
+}
+
+.llabel {
+  font-size: 0.82rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lkey {
+  font: 700 0.78rem/1.2 var(--mono);
   color: var(--accent);
-  pointer-events: none;
-  max-width: 100%;
+  max-width: 55%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.z-unbound .zkey {
+.l-unbound .lkey {
   color: var(--muted);
   font-weight: 400;
 }

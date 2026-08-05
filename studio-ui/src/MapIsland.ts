@@ -15,9 +15,13 @@ import { h, createSignal, createList, createShow } from "@getforma/core";
 // fixed-aspect stage; the top band is a shoulder shelf for LB/RB/LT/RT.
 // Every mappable control is a positioned hit-zone <button data-fn=…> from
 // the ZONES tables below (authored from ../art/extents.mjs output — the
-// PadForge rule: derive layout from art with a script). The zone's key tag
-// IS its current binding; interaction lives in map.ts (event delegation, so
-// list reconcile keeps zones wired).
+// PadForge rule: derive layout from art with a script). Zones are PURE HIT
+// AREAS — transparent, no inline text (the art is the label; the title
+// tooltip names fn + binding); the readable truth is the bindings LEGEND
+// below the stage, one row per function, which shares the zone click action
+// via the same data-fn delegation. A shared hover signal (`setHot`)
+// cross-highlights zone ↔ legend row. Interaction lives in map.ts (event
+// delegation, so list reconcile keeps everything wired).
 
 // ── Wire types: serde field names from ksx-studio {snapshot,control}.rs ────
 
@@ -86,16 +90,26 @@ interface SlotTab {
 
 interface ZoneRow {
   fn: string;
-  label: string;
-  key: string;
   cls: string;
   style: string;
   title: string;
 }
 
+interface LegendRow {
+  fn: string;
+  label: string;
+  key: string;
+  cls: string;
+  title: string;
+}
+
 // ── Zone tables — MIRROR of render_map.rs ZONE_XBOX / ZONE_DS4 ────────────
 // [fn, label, cx, cy, w, h, kind]; stage-percent boxes, art bottom-aligned
-// at 86% stage height (ART_SHARE).
+// at 86% stage height (ART_SHARE). Rects are pairwise DISJOINT (pinned by
+// render_map.rs `zone_tables_cover_every_mappable_function`): face buttons
+// sized to the drawn circles, dpad arrows to the drawn cross, and the four
+// stick-direction wedges RING the stick with the L3/R3 click zone as the
+// center hub — adjacent, never covering it.
 
 type ZoneDef = [string, string, number, number, number, number, string];
 
@@ -104,27 +118,27 @@ const ZONE_XBOX: ZoneDef[] = [
   ["lb", "LB", 25.5, 6.5, 11.5, 9.5, "shoulder"],
   ["rb", "RB", 74.5, 6.5, 11.5, 9.5, "shoulder"],
   ["rt", "RT", 88.0, 6.5, 11.5, 9.5, "shoulder"],
-  ["Y", "Y", 75.2, 31.1, 9.0, 11.5, "round"],
-  ["B", "B", 82.0, 39.6, 9.0, 11.5, "round"],
-  ["A", "A", 75.3, 48.3, 9.0, 11.5, "round"],
-  ["X", "X", 68.7, 39.7, 9.0, 11.5, "round"],
-  ["guide", "⌂", 50.0, 26.5, 10.0, 12.0, "round"],
-  ["back", "view", 43.0, 40.0, 7.5, 8.5, "chip"],
-  ["start", "menu", 57.0, 40.0, 7.5, 8.5, "chip"],
-  ["lthumb", "L3", 24.0, 39.7, 9.0, 11.5, "round"],
-  ["ly.max", "▲", 24.0, 27.7, 8.0, 10.0, "chip"],
-  ["ly.min", "▼", 24.0, 51.7, 8.0, 10.0, "chip"],
-  ["lx.min", "◀", 14.5, 39.7, 8.0, 10.0, "chip"],
-  ["lx.max", "▶", 33.5, 39.7, 8.0, 10.0, "chip"],
+  ["Y", "Y", 75.2, 31.1, 7.2, 8.4, "round"],
+  ["B", "B", 82.0, 39.6, 7.2, 8.4, "round"],
+  ["A", "A", 75.3, 48.3, 7.2, 8.4, "round"],
+  ["X", "X", 68.7, 39.7, 7.2, 8.4, "round"],
+  ["guide", "guide", 50.0, 27.0, 9.0, 11.0, "round"],
+  ["back", "view", 44.0, 39.0, 6.5, 8.0, "chip"],
+  ["start", "menu", 56.0, 39.0, 6.5, 8.0, "chip"],
+  ["lthumb", "L3", 24.0, 39.7, 8.0, 10.0, "round"],
+  ["ly.max", "▲", 24.0, 31.7, 7.0, 6.0, "chip"],
+  ["ly.min", "▼", 24.0, 47.7, 7.0, 6.0, "chip"],
+  ["lx.min", "◀", 17.25, 39.7, 5.5, 7.0, "chip"],
+  ["lx.max", "▶", 30.75, 39.7, 5.5, 7.0, "chip"],
   ["dpad.up", "▲", 36.4, 50.6, 7.0, 9.0, "chip"],
   ["dpad.down", "▼", 36.4, 69.2, 7.0, 9.0, "chip"],
   ["dpad.left", "◀", 29.2, 59.9, 7.0, 9.0, "chip"],
   ["dpad.right", "▶", 43.6, 59.9, 7.0, 9.0, "chip"],
-  ["rthumb", "R3", 62.5, 58.4, 9.0, 11.5, "round"],
-  ["ry.max", "▲", 61.0, 47.0, 7.0, 8.5, "chip"],
-  ["ry.min", "▼", 62.5, 70.4, 8.0, 10.0, "chip"],
-  ["rx.min", "◀", 53.0, 58.4, 8.0, 10.0, "chip"],
-  ["rx.max", "▶", 72.0, 59.5, 7.0, 9.5, "chip"],
+  ["rthumb", "R3", 62.5, 58.4, 8.0, 10.0, "round"],
+  ["ry.max", "▲", 62.5, 50.4, 7.0, 6.0, "chip"],
+  ["ry.min", "▼", 62.5, 66.4, 7.0, 6.0, "chip"],
+  ["rx.min", "◀", 55.75, 58.4, 5.5, 7.0, "chip"],
+  ["rx.max", "▶", 69.25, 58.4, 5.5, 7.0, "chip"],
 ];
 
 const ZONE_DS4: ZoneDef[] = [
@@ -132,27 +146,27 @@ const ZONE_DS4: ZoneDef[] = [
   ["lb", "L1", 20.5, 6.5, 10.0, 9.5, "shoulder"],
   ["rb", "R1", 79.5, 6.5, 10.0, 9.5, "shoulder"],
   ["rt", "R2", 92.0, 6.5, 10.0, 9.5, "shoulder"],
-  ["Y", "△", 81.2, 29.2, 8.5, 11.0, "round"],
-  ["B", "○", 88.4, 38.8, 8.5, 11.0, "round"],
-  ["A", "✕", 81.3, 48.1, 8.5, 11.0, "round"],
-  ["X", "□", 74.0, 38.7, 8.5, 11.0, "round"],
+  ["Y", "△", 81.2, 29.2, 7.0, 9.0, "round"],
+  ["B", "○", 88.4, 38.8, 7.0, 9.0, "round"],
+  ["A", "✕", 81.3, 48.1, 7.0, 9.0, "round"],
+  ["X", "□", 74.0, 38.7, 7.0, 9.0, "round"],
   ["back", "share", 30.0, 25.5, 7.0, 9.0, "chip"],
   ["start", "options", 70.0, 25.5, 7.0, 9.0, "chip"],
   ["guide", "PS", 50.0, 63.0, 8.0, 10.0, "round"],
-  ["lthumb", "L3", 33.8, 56.8, 9.0, 11.0, "round"],
-  ["ly.max", "▲", 33.8, 45.0, 7.5, 9.0, "chip"],
-  ["ly.min", "▼", 33.8, 68.6, 7.5, 9.5, "chip"],
-  ["lx.min", "◀", 24.0, 56.8, 7.5, 9.5, "chip"],
-  ["lx.max", "▶", 43.6, 56.8, 7.5, 9.5, "chip"],
-  ["dpad.up", "▲", 18.5, 32.5, 7.0, 9.0, "chip"],
-  ["dpad.down", "▼", 18.5, 45.6, 7.0, 9.0, "chip"],
-  ["dpad.left", "◀", 13.5, 39.2, 7.0, 9.0, "chip"],
-  ["dpad.right", "▶", 23.3, 39.2, 7.0, 9.0, "chip"],
-  ["rthumb", "R3", 66.1, 56.8, 9.0, 11.0, "round"],
-  ["ry.max", "▲", 66.1, 45.0, 7.0, 8.5, "chip"],
-  ["ry.min", "▼", 66.1, 68.6, 7.5, 9.5, "chip"],
-  ["rx.min", "◀", 56.4, 56.8, 7.5, 9.5, "chip"],
-  ["rx.max", "▶", 74.8, 58.2, 7.0, 9.5, "chip"],
+  ["lthumb", "L3", 33.8, 56.8, 8.0, 10.0, "round"],
+  ["ly.max", "▲", 33.8, 48.8, 7.0, 6.0, "chip"],
+  ["ly.min", "▼", 33.8, 64.8, 7.0, 6.0, "chip"],
+  ["lx.min", "◀", 27.05, 56.8, 5.5, 7.0, "chip"],
+  ["lx.max", "▶", 40.55, 56.8, 5.5, 7.0, "chip"],
+  ["dpad.up", "▲", 18.5, 31.5, 5.4, 7.2, "chip"],
+  ["dpad.down", "▼", 18.5, 46.6, 5.4, 7.2, "chip"],
+  ["dpad.left", "◀", 12.9, 39.2, 5.4, 7.2, "chip"],
+  ["dpad.right", "▶", 23.9, 39.2, 5.4, 7.2, "chip"],
+  ["rthumb", "R3", 66.1, 56.8, 8.0, 10.0, "round"],
+  ["ry.max", "▲", 66.1, 48.8, 7.0, 6.0, "chip"],
+  ["ry.min", "▼", 66.1, 64.8, 7.0, 6.0, "chip"],
+  ["rx.min", "◀", 59.35, 56.8, 5.5, 7.0, "chip"],
+  ["rx.max", "▶", 72.85, 56.8, 5.5, 7.0, "chip"],
 ];
 
 export function isPlaystation(persona: string): boolean {
@@ -189,12 +203,27 @@ const [modalConflict, setModalConflict] = createSignal(false);
 
 const [slotTabs, setSlotTabs] = createSignal<SlotTab[]>([]);
 const [zones, setZones] = createSignal<ZoneRow[]>([]);
+const [legendRows, setLegendRows] = createSignal<LegendRow[]>([]);
 
 // ── Client-side selection state (map.ts drives it) ─────────────────────────
 
 let lastPayload: MapPayload | null = null;
 let selectedSlot = 0; // slot NUMBER
 let selectedFn: string | null = null;
+/** The shared hover signal: hovering a zone highlights its legend row and
+ *  vice versa (both re-derive with the hot class). Client-only — the server
+ *  never emits a hot class (SSR has no hover). */
+let hotFn: string | null = null;
+
+export function setHot(fn: string | null): void {
+  if (hotFn === fn) return;
+  hotFn = fn;
+  const slot = currentSlot();
+  if (slot) {
+    setZones(zoneRows(slot));
+    setLegendRows(legendRowsFor(slot));
+  }
+}
 
 export function currentSlot(): MapperSlot | null {
   if (!lastPayload) return null;
@@ -242,17 +271,38 @@ function keyTag(slot: MapperSlot, fn: string): string {
 
 function zoneRows(slot: MapperSlot): ZoneRow[] {
   const table = isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
-  return table.map(([fn, label, cx, cy, w, h, kind]) => {
+  return table.map(([fn, , cx, cy, w, h, kind]) => {
+    const key = keyTag(slot, fn);
+    return {
+      fn,
+      cls: `zone z-${kind}${fn === hotFn ? " z-hot" : ""}`,
+      style:
+        `left:${(cx - w / 2).toFixed(1)}%;top:${(cy - h / 2).toFixed(1)}%;` +
+        `width:${w.toFixed(1)}%;height:${h.toFixed(1)}%`,
+      title: `${fn} — ${key}`,
+    };
+  });
+}
+
+/** "LS ▲", "D-pad ◀", "✕" — the legend's control label, persona-aware and
+ *  unambiguous once the four stick/dpad glyph groups are prefixed. */
+function legendLabel(fn: string, label: string): string {
+  if (fn.startsWith("lx.") || fn.startsWith("ly.")) return `LS ${label}`;
+  if (fn.startsWith("rx.") || fn.startsWith("ry.")) return `RS ${label}`;
+  if (fn.startsWith("dpad.")) return `D-pad ${label}`;
+  return label;
+}
+
+function legendRowsFor(slot: MapperSlot): LegendRow[] {
+  const table = isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
+  return table.map(([fn, label]) => {
     const key = keyTag(slot, fn);
     const unbound = key === "—";
     return {
       fn,
-      label,
+      label: legendLabel(fn, label),
       key,
-      cls: `zone z-${kind}${unbound ? " z-unbound" : ""}`,
-      style:
-        `left:${(cx - w / 2).toFixed(1)}%;top:${(cy - h / 2).toFixed(1)}%;` +
-        `width:${w.toFixed(1)}%;height:${h.toFixed(1)}%`,
+      cls: `lrow${unbound ? " l-unbound" : ""}${fn === hotFn ? " l-hot" : ""}`,
       title: `${fn} — ${key}`,
     };
   });
@@ -301,6 +351,7 @@ export function applyMap(p: MapPayload): void {
     })),
   );
   setZones(slot ? zoneRows(slot) : []);
+  setLegendRows(slot ? legendRowsFor(slot) : []);
   setSlotLine(
     slot ? `P${slot.number} · ${slot.persona_label} · ${slot.preset}` : "no mappable slots",
   );
@@ -469,14 +520,16 @@ export function MapIsland() {
                 { class: "zonelayer" },
                 createList(
                   () => zones(),
-                  (z) => z.fn + "|" + z.label + "|" + z.key + "|" + z.cls + "|" + z.style,
+                  (z) => z.fn + "|" + z.cls + "|" + z.style + "|" + z.title,
                   (z) =>
-                    h(
-                      "button",
-                      { class: z.cls, style: z.style, "data-fn": z.fn, type: "button", title: z.title },
-                      h("span", { class: "zlabel" }, z.label),
-                      h("span", { class: "zkey" }, z.key),
-                    ),
+                    h("button", {
+                      class: z.cls,
+                      style: z.style,
+                      "data-fn": z.fn,
+                      type: "button",
+                      title: z.title,
+                      "aria-label": z.title,
+                    }),
                 ),
               ),
             ),
@@ -497,17 +550,43 @@ export function MapIsland() {
                 { class: "zonelayer" },
                 createList(
                   () => zones(),
-                  (z) => z.fn + "|" + z.label + "|" + z.key + "|" + z.cls + "|" + z.style,
+                  (z) => z.fn + "|" + z.cls + "|" + z.style + "|" + z.title,
                   (z) =>
-                    h(
-                      "button",
-                      { class: z.cls, style: z.style, "data-fn": z.fn, type: "button", title: z.title },
-                      h("span", { class: "zlabel" }, z.label),
-                      h("span", { class: "zkey" }, z.key),
-                    ),
+                    h("button", {
+                      class: z.cls,
+                      style: z.style,
+                      "data-fn": z.fn,
+                      type: "button",
+                      title: z.title,
+                      "aria-label": z.title,
+                    }),
                 ),
               ),
             ),
+        ),
+      ),
+      // ── Bindings legend: the readable truth below the stage. One row per
+      // mappable function; a row click IS the zone click (same data-fn
+      // delegation → learn modal), hover cross-highlights the zone. Renders
+      // server-side too, so no-JS users still read their bindings here. ──
+      h(
+        "section",
+        { class: "card legendcard" },
+        h("h2", null, "Bindings"),
+        h(
+          "div",
+          { class: "legend" },
+          createList(
+            () => legendRows(),
+            (l) => l.fn + "|" + l.label + "|" + l.key + "|" + l.cls,
+            (l) =>
+              h(
+                "button",
+                { class: l.cls, "data-fn": l.fn, type: "button", title: l.title },
+                h("span", { class: "llabel" }, l.label),
+                h("span", { class: "lkey" }, l.key),
+              ),
+          ),
         ),
       ),
       // ── Save feedback ─────────────────────────────────────────────────

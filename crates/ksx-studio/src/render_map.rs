@@ -9,9 +9,14 @@
 //! is an `<img>` filling the bottom `ART_SHARE` of a fixed-aspect "stage";
 //! the top band is a shoulder shelf for LB/RB/LT/RT, which the icon art does
 //! not draw. Every mappable control is a HIT ZONE: an absolutely positioned
-//! `<button data-fn=…>` from the [`ZONE_XBOX`]/[`ZONE_DS4`] tables, carrying
-//! its label and its current binding as a key tag. One `createList` renders
-//! all 25 zones; geometry is data, not markup.
+//! `<button data-fn=…>` from the [`ZONE_XBOX`]/[`ZONE_DS4`] tables — a PURE
+//! hit area (transparent, no inline text; the art is the label and the
+//! `title` tooltip names fn + binding). The readable truth is the bindings
+//! LEGEND below the stage: one row per function (persona-aware label + key
+//! tag), carrying the same `data-fn` so a row click is exactly the zone
+//! click, and hover cross-highlights via the client's shared hot signal.
+//! One `createList` renders all 25 zones, another the 25 legend rows;
+//! geometry is data, not markup.
 //!
 //! Zone coordinates are STAGE percentages, authored from the art's real
 //! geometry (`studio-ui/art/extents.mjs` — the PadForge lesson: derive layout
@@ -35,6 +40,9 @@ use crate::snapshot::{MapPayload, MapperSlot};
 const LIST_SLOT_TABS: &str = "list:slotTabs:array";
 const LIST_SLOT_ZONES: &str = "list:zones:array";
 const LIST_SLOT_ZONES_2: &str = "list:zones#2:array";
+/// The legend reads its own signal (`() => legendRows()`), so it gets a
+/// binding-derived name of its own — no third `zones` occurrence.
+const LIST_SLOT_LEGEND: &str = "list:legendRows:array";
 
 #[cfg(test)]
 const ISLAND_COMPONENT: &str = "MapIsland";
@@ -100,75 +108,84 @@ const fn zone(
 /// from extents.mjs: face Y(75.2,19.9) B(82.0,29.8) A(75.3,39.9) X(68.7,29.9),
 /// Lstick(24.0,29.9), Rstick(62.5,51.6), dpad(36.4,53.4) — art Y mapped to
 /// stage as 14 + y·0.86).
+///
+/// Rects are pairwise DISJOINT (pinned by `zone_tables_cover_every_mappable_
+/// function`): face buttons sized to the drawn circles, and the four
+/// stick-direction wedges RING the stick with the L3/R3 click zone as the
+/// 8×10 center hub — adjacent, never covering it.
 pub(crate) const ZONE_XBOX: [Zone; 25] = [
     // Shoulder shelf (not drawn in the icon art): triggers outboard.
     zone("lt", "LT", 12.0, 6.5, 11.5, 9.5, "shoulder"),
     zone("lb", "LB", 25.5, 6.5, 11.5, 9.5, "shoulder"),
     zone("rb", "RB", 74.5, 6.5, 11.5, 9.5, "shoulder"),
     zone("rt", "RT", 88.0, 6.5, 11.5, 9.5, "shoulder"),
-    // Face cluster.
-    zone("Y", "Y", 75.2, 31.1, 9.0, 11.5, "round"),
-    zone("B", "B", 82.0, 39.6, 9.0, 11.5, "round"),
-    zone("A", "A", 75.3, 48.3, 9.0, 11.5, "round"),
-    zone("X", "X", 68.7, 39.7, 9.0, 11.5, "round"),
-    // Center row: guide up top, view/menu inboard.
-    zone("guide", "⌂", 50.0, 26.5, 10.0, 12.0, "round"),
-    zone("back", "view", 43.0, 40.0, 7.5, 8.5, "chip"),
-    zone("start", "menu", 57.0, 40.0, 7.5, 8.5, "chip"),
-    // Left stick + its four directions.
-    zone("lthumb", "L3", 24.0, 39.7, 9.0, 11.5, "round"),
-    zone("ly.max", "▲", 24.0, 27.7, 8.0, 10.0, "chip"),
-    zone("ly.min", "▼", 24.0, 51.7, 8.0, 10.0, "chip"),
-    zone("lx.min", "◀", 14.5, 39.7, 8.0, 10.0, "chip"),
-    zone("lx.max", "▶", 33.5, 39.7, 8.0, 10.0, "chip"),
+    // Face cluster (diamond — boxes trimmed to the drawn Ø7.3×9.1 circles so
+    // the diagonal neighbours stay disjoint).
+    zone("Y", "Y", 75.2, 31.1, 7.2, 8.4, "round"),
+    zone("B", "B", 82.0, 39.6, 7.2, 8.4, "round"),
+    zone("A", "A", 75.3, 48.3, 7.2, 8.4, "round"),
+    zone("X", "X", 68.7, 39.7, 7.2, 8.4, "round"),
+    // Center cluster: guide up top, view/menu inboard below it.
+    zone("guide", "guide", 50.0, 27.0, 9.0, 11.0, "round"),
+    zone("back", "view", 44.0, 39.0, 6.5, 8.0, "chip"),
+    zone("start", "menu", 56.0, 39.0, 6.5, 8.0, "chip"),
+    // Left stick: L3 hub + four ring wedges hugging it.
+    zone("lthumb", "L3", 24.0, 39.7, 8.0, 10.0, "round"),
+    zone("ly.max", "▲", 24.0, 31.7, 7.0, 6.0, "chip"),
+    zone("ly.min", "▼", 24.0, 47.7, 7.0, 6.0, "chip"),
+    zone("lx.min", "◀", 17.25, 39.7, 5.5, 7.0, "chip"),
+    zone("lx.max", "▶", 30.75, 39.7, 5.5, 7.0, "chip"),
     // Dpad cross.
     zone("dpad.up", "▲", 36.4, 50.6, 7.0, 9.0, "chip"),
     zone("dpad.down", "▼", 36.4, 69.2, 7.0, 9.0, "chip"),
     zone("dpad.left", "◀", 29.2, 59.9, 7.0, 9.0, "chip"),
     zone("dpad.right", "▶", 43.6, 59.9, 7.0, 9.0, "chip"),
-    // Right stick + directions.
-    zone("rthumb", "R3", 62.5, 58.4, 9.0, 11.5, "round"),
-    zone("ry.max", "▲", 61.0, 47.0, 7.0, 8.5, "chip"),
-    zone("ry.min", "▼", 62.5, 70.4, 8.0, 10.0, "chip"),
-    zone("rx.min", "◀", 53.0, 58.4, 8.0, 10.0, "chip"),
-    zone("rx.max", "▶", 72.0, 59.5, 7.0, 9.5, "chip"),
+    // Right stick: R3 hub + ring wedges.
+    zone("rthumb", "R3", 62.5, 58.4, 8.0, 10.0, "round"),
+    zone("ry.max", "▲", 62.5, 50.4, 7.0, 6.0, "chip"),
+    zone("ry.min", "▼", 62.5, 66.4, 7.0, 6.0, "chip"),
+    zone("rx.min", "◀", 55.75, 58.4, 5.5, 7.0, "chip"),
+    zone("rx.max", "▶", 69.25, 58.4, 5.5, 7.0, "chip"),
 ];
 
 /// DualShock 4 pad (art: `pad-ds4.svg`, viewBox 112.69×72.53; anchors:
 /// △(81.2,17.7) ○(88.4,28.8) ✕(81.3,39.7) □(74.0,28.7), sticks (33.8,49.8)
 /// and (66.1,49.8), dpad arrows around (18.5,29.3), touchpad x 32.9..67.0 —
-/// Sony labels, XInput functions).
+/// Sony labels, XInput functions). Same disjoint-rect rules as [`ZONE_XBOX`]:
+/// stick wedges ring the L3/R3 hub, dpad arrow boxes sit on the drawn arrows
+/// pushed slightly outward so the diagonal pairs never intersect.
 pub(crate) const ZONE_DS4: [Zone; 25] = [
     zone("lt", "L2", 8.0, 6.5, 10.0, 9.5, "shoulder"),
     zone("lb", "L1", 20.5, 6.5, 10.0, 9.5, "shoulder"),
     zone("rb", "R1", 79.5, 6.5, 10.0, 9.5, "shoulder"),
     zone("rt", "R2", 92.0, 6.5, 10.0, 9.5, "shoulder"),
-    // Face cluster (✕○△□ mapped onto A/B/Y/X).
-    zone("Y", "△", 81.2, 29.2, 8.5, 11.0, "round"),
-    zone("B", "○", 88.4, 38.8, 8.5, 11.0, "round"),
-    zone("A", "✕", 81.3, 48.1, 8.5, 11.0, "round"),
-    zone("X", "□", 74.0, 38.7, 8.5, 11.0, "round"),
+    // Face cluster (✕○△□ mapped onto A/B/Y/X), trimmed to the Ø6.9×9.2
+    // drawn circles.
+    zone("Y", "△", 81.2, 29.2, 7.0, 9.0, "round"),
+    zone("B", "○", 88.4, 38.8, 7.0, 9.0, "round"),
+    zone("A", "✕", 81.3, 48.1, 7.0, 9.0, "round"),
+    zone("X", "□", 74.0, 38.7, 7.0, 9.0, "round"),
     // Share / PS / Options.
     zone("back", "share", 30.0, 25.5, 7.0, 9.0, "chip"),
     zone("start", "options", 70.0, 25.5, 7.0, 9.0, "chip"),
     zone("guide", "PS", 50.0, 63.0, 8.0, 10.0, "round"),
-    // Left stick + directions.
-    zone("lthumb", "L3", 33.8, 56.8, 9.0, 11.0, "round"),
-    zone("ly.max", "▲", 33.8, 45.0, 7.5, 9.0, "chip"),
-    zone("ly.min", "▼", 33.8, 68.6, 7.5, 9.5, "chip"),
-    zone("lx.min", "◀", 24.0, 56.8, 7.5, 9.5, "chip"),
-    zone("lx.max", "▶", 43.6, 56.8, 7.5, 9.5, "chip"),
+    // Left stick: L3 hub + ring wedges.
+    zone("lthumb", "L3", 33.8, 56.8, 8.0, 10.0, "round"),
+    zone("ly.max", "▲", 33.8, 48.8, 7.0, 6.0, "chip"),
+    zone("ly.min", "▼", 33.8, 64.8, 7.0, 6.0, "chip"),
+    zone("lx.min", "◀", 27.05, 56.8, 5.5, 7.0, "chip"),
+    zone("lx.max", "▶", 40.55, 56.8, 5.5, 7.0, "chip"),
     // Dpad arrows.
-    zone("dpad.up", "▲", 18.5, 32.5, 7.0, 9.0, "chip"),
-    zone("dpad.down", "▼", 18.5, 45.6, 7.0, 9.0, "chip"),
-    zone("dpad.left", "◀", 13.5, 39.2, 7.0, 9.0, "chip"),
-    zone("dpad.right", "▶", 23.3, 39.2, 7.0, 9.0, "chip"),
-    // Right stick + directions.
-    zone("rthumb", "R3", 66.1, 56.8, 9.0, 11.0, "round"),
-    zone("ry.max", "▲", 66.1, 45.0, 7.0, 8.5, "chip"),
-    zone("ry.min", "▼", 66.1, 68.6, 7.5, 9.5, "chip"),
-    zone("rx.min", "◀", 56.4, 56.8, 7.5, 9.5, "chip"),
-    zone("rx.max", "▶", 74.8, 58.2, 7.0, 9.5, "chip"),
+    zone("dpad.up", "▲", 18.5, 31.5, 5.4, 7.2, "chip"),
+    zone("dpad.down", "▼", 18.5, 46.6, 5.4, 7.2, "chip"),
+    zone("dpad.left", "◀", 12.9, 39.2, 5.4, 7.2, "chip"),
+    zone("dpad.right", "▶", 23.9, 39.2, 5.4, 7.2, "chip"),
+    // Right stick: R3 hub + ring wedges.
+    zone("rthumb", "R3", 66.1, 56.8, 8.0, 10.0, "round"),
+    zone("ry.max", "▲", 66.1, 48.8, 7.0, 6.0, "chip"),
+    zone("ry.min", "▼", 66.1, 64.8, 7.0, 6.0, "chip"),
+    zone("rx.min", "◀", 59.35, 56.8, 5.5, 7.0, "chip"),
+    zone("rx.max", "▶", 72.85, 56.8, 5.5, 7.0, "chip"),
 ];
 
 pub(crate) fn zones_for(persona: &str) -> &'static [Zone; 25] {
@@ -200,25 +217,19 @@ fn key_tag(slot: &MapperSlot, function: &str) -> String {
 }
 
 /// Mirrors MapIsland.ts `zoneRows`. Every derived string the client also
-/// derives; the item SHAPE is client contract.
+/// derives; the item SHAPE is client contract. The client may append the
+/// hover class (`z-hot`) — SSR has no hover, so the server never does.
 fn zone_rows(slot: &MapperSlot) -> SlotValue {
     SlotValue::Array(
         zones_for(&slot.persona)
             .iter()
             .map(|z| {
                 let key = key_tag(slot, z.fn_name);
-                let unbound = key == "—";
                 SlotValue::Object(vec![
                     ("fn".to_owned(), SlotValue::Text(z.fn_name.to_owned())),
-                    ("label".to_owned(), SlotValue::Text(z.label.to_owned())),
-                    ("key".to_owned(), SlotValue::Text(key.clone())),
                     (
                         "cls".to_owned(),
-                        SlotValue::Text(format!(
-                            "zone z-{}{}",
-                            z.kind,
-                            if unbound { " z-unbound" } else { "" }
-                        )),
+                        SlotValue::Text(format!("zone z-{}", z.kind)),
                     ),
                     (
                         "style".to_owned(),
@@ -229,6 +240,51 @@ fn zone_rows(slot: &MapperSlot) -> SlotValue {
                             z.w,
                             z.h
                         )),
+                    ),
+                    (
+                        "title".to_owned(),
+                        SlotValue::Text(format!("{} — {}", z.fn_name, key)),
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// Mirrors MapIsland.ts `legendLabel`: the stick/dpad glyph groups need a
+/// prefix to stay unambiguous in a flat list ("LS ▲" vs "D-pad ▲"); every
+/// other control keeps its persona-aware on-art label (A vs ✕).
+fn legend_label(z: &Zone) -> String {
+    let group = if z.fn_name.starts_with("lx.") || z.fn_name.starts_with("ly.") {
+        "LS "
+    } else if z.fn_name.starts_with("rx.") || z.fn_name.starts_with("ry.") {
+        "RS "
+    } else if z.fn_name.starts_with("dpad.") {
+        "D-pad "
+    } else {
+        ""
+    };
+    format!("{group}{}", z.label)
+}
+
+/// Mirrors MapIsland.ts `legendRowsFor`: the bindings legend below the
+/// stage — one row per mappable function, unbound rendered as the honest
+/// "—" with the `l-unbound` class. Same client-may-append-hover rule as
+/// [`zone_rows`] (`l-hot`).
+fn legend_rows(slot: &MapperSlot) -> SlotValue {
+    SlotValue::Array(
+        zones_for(&slot.persona)
+            .iter()
+            .map(|z| {
+                let key = key_tag(slot, z.fn_name);
+                let unbound = key == "—";
+                SlotValue::Object(vec![
+                    ("fn".to_owned(), SlotValue::Text(z.fn_name.to_owned())),
+                    ("label".to_owned(), SlotValue::Text(legend_label(z))),
+                    ("key".to_owned(), SlotValue::Text(key.clone())),
+                    (
+                        "cls".to_owned(),
+                        SlotValue::Text(if unbound { "lrow l-unbound" } else { "lrow" }.to_owned()),
                     ),
                     (
                         "title".to_owned(),
@@ -376,10 +432,14 @@ fn build_slots(module: &IrModule, payload: &MapPayload) -> SlotData {
     let zones = selected
         .map(zone_rows)
         .unwrap_or(SlotValue::Array(Vec::new()));
+    let legend = selected
+        .map(legend_rows)
+        .unwrap_or(SlotValue::Array(Vec::new()));
     for (name, value) in [
         (LIST_SLOT_TABS, tabs),
         (LIST_SLOT_ZONES, zones.clone()),
         (LIST_SLOT_ZONES_2, zones),
+        (LIST_SLOT_LEGEND, legend),
     ] {
         if let Some(id) = named_slot_ids(module, name).into_iter().next() {
             slots.set(id, value);
@@ -525,6 +585,24 @@ mod tests {
                     z.fn_name
                 );
             }
+            // Zones are pure hit areas: two rects that overlap are two
+            // controls fighting for the same click. Pairwise disjoint, no
+            // exceptions — the stick wedges RING the L3/R3 hub, the face
+            // diamond and dpad cross keep their diagonals apart.
+            for (i, a) in table.iter().enumerate() {
+                for b in table.iter().skip(i + 1) {
+                    let ox = (a.cx + a.w / 2.0).min(b.cx + b.w / 2.0)
+                        - (a.cx - a.w / 2.0).max(b.cx - b.w / 2.0);
+                    let oy = (a.cy + a.h / 2.0).min(b.cy + b.h / 2.0)
+                        - (a.cy - a.h / 2.0).max(b.cy - b.h / 2.0);
+                    assert!(
+                        ox <= 0.0 || oy <= 0.0,
+                        "zones {} and {} overlap by {ox:.2}% × {oy:.2}%",
+                        a.fn_name,
+                        b.fn_name
+                    );
+                }
+            }
         }
     }
 
@@ -555,7 +633,12 @@ mod tests {
             .collect();
         assert_eq!(
             array_slots,
-            [LIST_SLOT_TABS, LIST_SLOT_ZONES, LIST_SLOT_ZONES_2],
+            [
+                LIST_SLOT_TABS,
+                LIST_SLOT_ZONES,
+                LIST_SLOT_ZONES_2,
+                LIST_SLOT_LEGEND
+            ],
             "mapper list slot names drifted; slots: {names:?}"
         );
         assert_eq!(
@@ -575,11 +658,12 @@ mod tests {
         );
     }
 
-    /// The big one: real bindings from the payload land as zone key tags in
-    /// the SSR HTML, the right art is referenced, and the slot strip shows
-    /// the context.
+    /// The big one: real bindings from the payload land as key tags in the
+    /// SSR LEGEND, the zones render as text-free hit areas positioned by the
+    /// table, the right art is referenced, and the slot strip shows the
+    /// context.
     #[test]
-    fn render_puts_bindings_on_zones_and_the_art_on_stage() {
+    fn render_puts_bindings_in_the_legend_and_text_free_zones_on_stage() {
         let out = render_map(&page(), &sample());
         assert!(out.html.contains("data-forma-ssr"), "{}", out.html);
         // Slot context strip.
@@ -591,15 +675,32 @@ mod tests {
             "{}",
             out.html
         );
-        // Zones carry their data-fn and their binding tags (A→G from the
-        // sample), positioned by the table.
+        // Zones are pure hit areas: data-fn + table-derived position + the
+        // fn—key tooltip, but NO inline label/key text (the old crammed-chip
+        // layout must not come back).
         assert!(out.html.contains(r#"data-fn="A""#), "{}", out.html);
         assert!(out.html.contains(r#"data-fn="dpad.up""#), "{}", out.html);
+        assert!(out.html.contains(r#"title="A — G""#), "{}", out.html);
+        assert!(!out.html.contains("zlabel"), "zone inline label came back");
+        assert!(!out.html.contains("zkey"), "zone inline key tag came back");
+        // The legend carries the readable truth: each zone appears a second
+        // time as a legend row (same data-fn → same click action), with the
+        // binding as its key tag (A→G, B→F, lx.min→M from the sample).
+        assert!(out.html.contains(r#"class="lrow""#), "{}", out.html);
+        assert_eq!(
+            out.html.matches(r#"data-fn="A""#).count(),
+            2,
+            "one zone + one legend row: {}",
+            out.html
+        );
         assert!(out.html.contains(">G<"), "A's key tag: {}", out.html);
         assert!(out.html.contains(">F<"), "B's key tag: {}", out.html);
         assert!(out.html.contains(">M<"), "lx.min's key tag: {}", out.html);
-        // A cleared function renders the honest unbound tag.
-        assert!(out.html.contains("z-unbound"), "{}", out.html);
+        // Persona-aware, disambiguated legend labels.
+        assert!(out.html.contains("LS ▲"), "{}", out.html);
+        assert!(out.html.contains("D-pad ◀"), "{}", out.html);
+        // A cleared function renders the honest unbound row.
+        assert!(out.html.contains("lrow l-unbound"), "{}", out.html);
         // Live mode: the hint renders, the read-only banner does not.
         assert!(out.html.contains("press the panel key"), "{}", out.html);
         assert!(!out.html.contains("read-only"), "{}", out.html);

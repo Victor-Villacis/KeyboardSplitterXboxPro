@@ -14,6 +14,7 @@ import {
   selectFn,
   selectSlot,
   selectedFnName,
+  setHot,
   showConflict,
   showListening,
   updateCountdown,
@@ -234,6 +235,17 @@ function wire(root: HTMLElement): void {
       }
     }
   });
+
+  // The shared hover signal: any element carrying data-fn (a zone on the art
+  // OR a legend row) hot-highlights BOTH renderings of that function; leaving
+  // it (or the island) clears. focusin keeps keyboard users in sync.
+  const hotFrom = (ev: Event): void => {
+    const el = (ev.target as HTMLElement | null)?.closest<HTMLElement>("[data-fn]");
+    setHot(el?.dataset.fn ?? null);
+  };
+  root.addEventListener("mouseover", hotFrom);
+  root.addEventListener("focusin", hotFrom);
+  root.addEventListener("mouseleave", () => setHot(null));
 
   window.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && learningFn !== null) {
