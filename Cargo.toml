@@ -12,6 +12,7 @@ default-members = [
     "crates/ksx-platform",
     "crates/ksx-games",
     "crates/ksx-app",
+    "crates/ksx-studio",
     "crates/ksx-fuzz",
 ]
 
@@ -31,6 +32,7 @@ ksx-capture = { path = "crates/ksx-capture" }
 ksx-output = { path = "crates/ksx-output" }
 ksx-platform = { path = "crates/ksx-platform" }
 ksx-games = { path = "crates/ksx-games" }
+ksx-studio = { path = "crates/ksx-studio" }
 vigem-client = { path = "crates/vigem-client", features = ["unstable_xtarget_notification", "unstable_ds4"] }
 # shared
 bitflags = "2"
@@ -56,6 +58,14 @@ kanata-interception = "0.3"
 nusb = "0.2"
 windows = "0.62"
 windows-sys = "0.60"
+# studio (E7 web supplement) — reaches ksx-app ONLY through the optional
+# `studio` feature; the default build must link none of these (provable with
+# `cargo tree -p ksx-app`).
+axum = "0.8"
+forma-ir = "0.1.4"
+forma-server = "0.1.4"
+rust-embed = "8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
 # dev / diagnostics
 proptest = "1"
 insta = "1"

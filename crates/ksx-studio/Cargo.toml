@@ -1,0 +1,19 @@
+[package]
+name = "ksx-studio"
+description = "ksx Studio — the optional Forma-powered web status page (localhost-only skeleton)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum.workspace = true
+forma-ir.workspace = true
+forma-server.workspace = true
+rust-embed.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

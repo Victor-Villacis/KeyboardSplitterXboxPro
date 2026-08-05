@@ -14,6 +14,8 @@ mod logging;
 mod monitor;
 mod pads;
 mod run;
+#[cfg(feature = "studio")]
+mod studio;
 mod winusb;
 
 use clap::{Parser, Subcommand};
@@ -336,6 +338,28 @@ enum Command {
         #[command(subcommand)]
         command: WinusbCommand,
     },
+    /// Serve the ksx Studio status page on 127.0.0.1 (skeleton)
+    ///
+    /// Renders the cabinet status screen — driver health, the virtual pads
+    /// the bus is exposing, autostart registration, the games.toml profiles,
+    /// and whether another ksx process is alive — as a localhost web page
+    /// that auto-refreshes every 2 seconds. Read-only: every request re-runs
+    /// the same collectors `ksx doctor` uses; nothing is opened, claimed or
+    /// changed.
+    ///
+    /// Snapshots are point-in-time. There is no daemon IPC yet, so this page
+    /// cannot see inside a running session and does not pretend to (the page
+    /// footer says the same). Localhost only — there is no LAN option; that
+    /// arrives with the pairing token.
+    ///
+    /// Exit codes: 0 = clean stop, 1 = error (bind failed, embedded UI
+    /// rejected).
+    #[cfg(feature = "studio")]
+    Studio {
+        /// TCP port on 127.0.0.1
+        #[arg(long, default_value_t = 4460)]
+        port: u16,
+    },
 }
 
 #[derive(Subcommand)]
@@ -506,6 +530,8 @@ fn main() -> anyhow::Result<()> {
             dry_run,
             json,
         }),
+        #[cfg(feature = "studio")]
+        Command::Studio { port } => studio::run(port),
         Command::Winusb { command } => match command {
             WinusbCommand::Status { json } => winusb::run(winusb::Options {
                 action: winusb::Action::Status,
@@ -1151,6 +1177,38 @@ mod tests {
         let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(flat.contains("polled from the RUNNING session"), "{help}");
         assert!(flat.contains("while it is happening"), "{help}");
+    }
+
+    // -----------------------------------------------------------------
+    // M10 skeleton: ksx studio (feature-gated)
+    // -----------------------------------------------------------------
+
+    #[cfg(feature = "studio")]
+    #[test]
+    fn studio_parses_and_defaults_to_port_4460() {
+        let cli = Cli::try_parse_from(["ksx", "studio"]).unwrap();
+        assert!(matches!(cli.command, Command::Studio { port: 4460 }));
+        let cli = Cli::try_parse_from(["ksx", "studio", "--port", "8099"]).unwrap();
+        assert!(matches!(cli.command, Command::Studio { port: 8099 }));
+    }
+
+    /// The honest-skeleton promises live in `--help`: read-only, snapshot
+    /// only (no daemon IPC), localhost only.
+    #[cfg(feature = "studio")]
+    #[test]
+    fn studio_help_states_the_snapshot_and_localhost_limits() {
+        let mut cmd = Cli::command();
+        let studio = cmd.find_subcommand_mut("studio").unwrap();
+        let help = studio.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "point-in-time",
+            "no daemon IPC",
+            "Localhost only",
+            "no LAN option",
+        ] {
+            assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
+        }
     }
 
     /// M1 regression: the exact invocation the milestone gate smoke-runs.

@@ -19,6 +19,10 @@ ksx-capture.workspace = true
 ksx-output.workspace = true
 ksx-platform.workspace = true
 ksx-games.workspace = true
+# E7 rule: the web supplement is compile-time optional. The DEFAULT build
+# links no axum, no tokio, no forma — provable with
+# `cargo tree -p ksx-app | grep -ciE "axum|tokio|forma"` == 0.
+ksx-studio = { workspace = true, optional = true }
 anyhow.workspace = true
 # `capture::SetupError` is matched on for a stable --json error code, so it is a
 # typed enum rather than an anyhow::Error.
@@ -46,6 +50,10 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Performance",
 ] }
+
+[features]
+# `ksx studio` — the optional localhost web status page (docs/ENHANCEMENTS.md E7).
+studio = ["dep:ksx-studio"]
 
 [dev-dependencies]
 insta.workspace = true

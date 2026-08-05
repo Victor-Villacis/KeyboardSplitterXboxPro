@@ -1,0 +1,15 @@
+{
+  "name": "ksx-studio-ui",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Forma authoring project for the ksx Studio cabinet-status page. Node is needed only to REGENERATE crates/ksx-studio/assets/ — never to build or run ksx.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@getforma/build": "0.1.8",
+    "@getforma/compiler": "0.1.8",
+    "@getforma/core": "1.5.0"
+  }
+}
