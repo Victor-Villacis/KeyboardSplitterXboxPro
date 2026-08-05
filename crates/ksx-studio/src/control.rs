@@ -22,8 +22,11 @@ pub trait ControlSource: Send + Sync {
 
 /// What the session panel needs to know, presentation-shaped like
 /// [`crate::snapshot::StatusSnapshot`]: the provider composes the line, this
-/// crate only places it and picks which controls to render.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// crate only places it and picks which controls to render. Serialized as
+/// part of the `/api/status` payload and the island props (snapshot.rs
+/// [`StatusPayload`](crate::snapshot::StatusPayload)) — field names are
+/// client contract.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionView {
     /// A daemon control channel answered. `false` renders every control
     /// disabled with the reason — never hidden, never silently inert.

@@ -56,6 +56,22 @@ impl StatusSnapshot {
     }
 }
 
+/// The one live-data shape: what `GET /api/status` serves AND what the
+/// island props carry (render.rs serializes it into the `__forma_islands`
+/// script block). One struct, one serializer — the client seeds its signals
+/// from the props and then overwrites the SAME signals from `/api/status`
+/// every 2 s, so the two must never drift. `render.rs` has the parity test;
+/// `studio-ui/src/StatusIsland.ts` mirrors the field names.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusPayload {
+    pub snapshot: StatusSnapshot,
+    pub session: crate::control::SessionView,
+    /// One-shot action feedback (the `?flash=` query). Always `None` from
+    /// `/api/status` — a poll is not an action — and `Some` only in the
+    /// page-render props, where the client shows it once and clears it.
+    pub flash: Option<String>,
+}
+
 /// One virtual pad currently exposed by ViGEmBus.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PadRow {
@@ -123,6 +139,41 @@ mod tests {
             v.pointer("/profiles/0/title"),
             Some(&serde_json::json!("Street Fighter"))
         );
+    }
+
+    /// The payload's field names are client contract (StatusIsland.ts reads
+    /// them); pin the envelope on top of the snapshot's own pinned names.
+    #[test]
+    fn payload_serializes_to_stable_envelope_field_names() {
+        let payload = StatusPayload {
+            snapshot: sample(),
+            session: crate::control::SessionView {
+                reachable: true,
+                running: false,
+                line: "idle — daemon reachable".into(),
+            },
+            flash: None,
+        };
+        let v = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            v.pointer("/snapshot/generated_at"),
+            Some(&serde_json::json!("2026-08-04 12:00:00 UTC"))
+        );
+        assert_eq!(
+            v.pointer("/session/reachable"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            v.pointer("/session/running"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            v.pointer("/session/line"),
+            Some(&serde_json::json!("idle — daemon reachable"))
+        );
+        // `flash` is always present (null when absent) — the client types it
+        // `string | null`, not optional.
+        assert_eq!(v.pointer("/flash"), Some(&serde_json::json!(null)));
     }
 
     #[test]

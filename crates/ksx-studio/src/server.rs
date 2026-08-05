@@ -1,16 +1,19 @@
 //! The blocking axum server around the render seam.
 //!
-//! GET / renders the page; the three POST routes each perform one
-//! [`ControlSource`] verb and 303-redirect back to /, carrying the outcome in
-//! a `flash` query parameter (rendered escaped, then gone on the next
-//! refresh). Plain HTML forms, no JS — the hardcoded forma CSP already
-//! allows `form-action 'self'` and nothing else is needed.
+//! GET / renders the page (SSR + island props); GET /api/status serves the
+//! same [`StatusPayload`] as JSON for the island's 2 s poller (same-origin
+//! only — the CSP's `connect-src 'self'` is exactly what permits the fetch).
+//! The three POST routes each perform one [`ControlSource`] verb and
+//! 303-redirect back to /, carrying the outcome in a `flash` query parameter
+//! — plain HTML forms remain the baseline (`form-action 'self'`), which the
+//! client optionally upgrades to fetch-submits that read the redirect's
+//! flash without a reload.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{Form, Query, State};
-use axum::http::{header, HeaderName, HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -18,8 +21,8 @@ use serde::Deserialize;
 
 use crate::control::{ControlSource, SessionView};
 use crate::error::StudioError;
-use crate::render::{render_status, Assets, EmbeddedPage, REFRESH_SECS};
-use crate::snapshot::{StatusSnapshot, StatusSource};
+use crate::render::{render_status, Assets, EmbeddedPage};
+use crate::snapshot::{StatusPayload, StatusSnapshot, StatusSource};
 
 struct AppState {
     page: EmbeddedPage,
@@ -65,10 +68,13 @@ pub fn serve(
             .map_err(|source| StudioError::Bind { bind, source })?;
         let app = Router::new()
             .route("/", get(status_page))
+            .route("/api/status", get(api_status))
             .route("/session/start", post(session_start))
             .route("/session/stop", post(session_stop))
             .route("/config/reload", post(config_reload))
-            .route("/sw.js", get(service_worker))
+            // Canon helper: correct no-cache + Service-Worker-Allowed
+            // headers for free (replaced a hand-rolled handler).
+            .route("/sw.js", get(forma_server::sw::serve_sw::<Assets>))
             .route(
                 "/_assets/{filename}",
                 get(forma_server::assets::serve_asset::<Assets>),
@@ -84,14 +90,12 @@ struct PageQuery {
     flash: Option<String>,
 }
 
-async fn status_page(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<PageQuery>,
-) -> Response {
-    // Collectors hit the registry, the SCM, schtasks.exe and the daemon
-    // pipe — blocking work, kept off the async workers.
-    let snap_state = Arc::clone(&state);
-    let (snap, session) = tokio::task::spawn_blocking(move || {
+/// One fresh (snapshot, session) pair. Collectors hit the registry, the
+/// SCM, schtasks.exe and the daemon pipe — blocking work, kept off the
+/// async workers.
+async fn collect(state: &Arc<AppState>) -> (StatusSnapshot, SessionView) {
+    let snap_state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
         (snap_state.source.snapshot(), snap_state.control.session())
     })
     .await
@@ -100,10 +104,20 @@ async fn status_page(
             StatusSnapshot::degraded("status collection panicked"),
             SessionView::unreachable("status collection panicked"),
         )
-    });
+    })
+}
+
+async fn status_page(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PageQuery>,
+) -> Response {
+    let (snap, session) = collect(&state).await;
 
     let flash = query.flash.as_deref().filter(|f| !f.trim().is_empty());
     let out = render_status(&state.page, &snap, &session, flash);
+    // No HTTP `Refresh` header any more: it would reload the page for JS
+    // users too, defeating the island poller. The no-JS fallback is the
+    // <noscript> meta refresh render.rs emits.
     (
         [
             (
@@ -115,16 +129,27 @@ async fn status_page(
                 HeaderValue::from_str(&out.csp)
                     .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'")),
             ),
-            // Belt to the body's meta-refresh braces; both are JS-free and
-            // both target "/" so a ?flash= query clears on the next cycle.
-            (
-                HeaderName::from_static("refresh"),
-                HeaderValue::from_str(&format!("{REFRESH_SECS}; url=/"))
-                    .unwrap_or_else(|_| HeaderValue::from_static("5; url=/")),
-            ),
             (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
         ],
         out.html,
+    )
+        .into_response()
+}
+
+/// The island poller's endpoint: the SAME [`StatusPayload`] shape the page
+/// embeds as island props (parity unit-tested in render.rs). `flash` is
+/// always null here — a poll is not an action. Loopback bind + no CORS
+/// headers keep it same-origin; the page's `connect-src 'self'` is what
+/// allows the fetch.
+async fn api_status(State(state): State<Arc<AppState>>) -> Response {
+    let (snapshot, session) = collect(&state).await;
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        axum::Json(StatusPayload {
+            snapshot,
+            session,
+            flash: None,
+        }),
     )
         .into_response()
 }
@@ -192,22 +217,6 @@ fn urlencode(text: &str) -> String {
         }
     }
     out
-}
-
-/// The page's (nonce'd, CSP-clean) inline script always registers /sw.js;
-/// serve the build's real service worker rather than 404 every refresh.
-async fn service_worker() -> Response {
-    match forma_server::assets::asset_bytes::<Assets>("sw.js") {
-        Some(bytes) => (
-            [(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/javascript; charset=utf-8"),
-            )],
-            bytes,
-        )
-            .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
 }
 
 #[cfg(test)]

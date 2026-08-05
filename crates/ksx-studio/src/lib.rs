@@ -5,11 +5,19 @@
 //! nav): a SESSION panel (daemon state, profile dropdown, Start / Stop /
 //! Reload as plain HTML forms) above the cabinet status — driver health
 //! (ViGEmBus / Interception), the pads the bus is exposing, autostart
-//! registration, the games.toml profile list. SSR only: forma-server 0.1.4
-//! renders the embedded FMIR per request, the page auto-refreshes via meta
-//! refresh (plus an HTTP `Refresh` header), and **zero JavaScript ships to
-//! the client** — which also sidesteps forma's hardcoded CSP entirely
-//! (whose `form-action 'self'` already covers the forms).
+//! registration, the games.toml profile list.
+//!
+//! v4 rendering model — SSR first paint + one live island:
+//! forma-server 0.1.4 renders the embedded FMIR per request (complete page,
+//! no JS required), and the whole screen is a Forma ISLAND whose client
+//! runtime seeds its signals from server props BEFORE adoption (the
+//! islands protocol; dogfood ledger #5) and then polls `GET /api/status`
+//! every 2 s, rewriting the same signals in place — pills, state line, pad
+//! tiles and profiles update without a reload. With JavaScript disabled the
+//! page IS the v3 experience: full SSR plus a `<noscript>` meta refresh
+//! every 5 s. The client bundle loads under forma's strict nonce'd CSP
+//! (`connect-src 'self'` covers the poller, `form-action 'self'` the
+//! forms).
 //!
 //! Session state and the three POST routes go through [`ControlSource`] —
 //! ksx-app implements it over the daemon's `\\.\pipe\ksx-daemon` control
@@ -35,11 +43,15 @@
 //!
 //! # Data injection
 //!
-//! Server-side FMIR slot injection — real prop injection, no JSON island, no
-//! string templating. Scalars and lists are injected by slot name; `createShow`
-//! booleans remain positional (the last shared-name slot kind). See `render.rs`
-//! for the mechanism and the E7 dogfood history — first cycle closed when
-//! `@getforma/compiler` 0.2.0 shipped the per-list naming this seam requested.
+//! The same per-request data is emitted twice, deliberately: server-side
+//! FMIR slot injection for the SSR first paint (scalars and lists by slot
+//! name; `createShow` booleans positional — the last shared-name slot kind),
+//! and a `StatusPayload` JSON as island props (`__forma_islands` script
+//! block) for client hydration — the identical shape `GET /api/status`
+//! serves the poller, pinned by a parity test. See `render.rs` for the
+//! mechanism, the rationale, and the E7 dogfood history — first cycle
+//! closed when `@getforma/compiler` 0.2.0 shipped the per-list naming this
+//! seam requested.
 //!
 //! # Boundaries (docs/ENHANCEMENTS.md E7, enforced)
 //!

@@ -1,0 +1,556 @@
+import { h, createSignal, createList, createShow } from "@getforma/core";
+
+// The island: the entire Studio screen, live.
+//
+// This file is BOTH halves of the islands protocol (v4):
+//
+// - **Compile time** — `StatusPage.ts` returns `StatusIsland()`, and the
+//   entry registers `StatusIsland` in `activateIslands`, so the compiler
+//   inlines the h() tree below between ISLAND_START/ISLAND_END opcodes. The
+//   Rust walker then renders the island server-side with real data AND stamps
+//   `data-forma-island="0" data-forma-component="StatusIsland"` on the root
+//   element — the client activation hook.
+// - **Run time** — the module-level signals below are the page's one live
+//   state store (single island, page lifetime). `applyStatus` seeds them from
+//   the server props BEFORE adoption (the ledger-#5 rule: hydration adopts
+//   whatever the signals hold, so they must hold the SSR truth first), and
+//   the 2 s poller in `status.ts` keeps writing the SAME signals afterwards.
+//
+// The derivations in `applyStatus` (summary sentences, pill booleans, pad
+// tile numbering, ghost padding) deliberately MIRROR render.rs — the server
+// derives them for first paint, the client re-derives them per poll from the
+// same `/api/status` payload. render.rs unit tests pin the Rust side; keep
+// both in sync when either changes.
+//
+// Compiler constraints honored below (same as v3, see render.rs):
+// - dynamic text/attrs must be bare `() => signalName()` calls — the slot is
+//   named after the getter, which must be declared in StatusPage.ts;
+// - list sources are bare `() => listSignal()` calls — compiler 0.2.0 derives
+//   the slot name from the binding (`list:padTiles:array`), which upgraded
+//   the old positional `list:#N:array` seam;
+// - list item bodies may only use direct member reads (`p.persona`);
+// - createShow conditions are ignored by the compiler (the server injects the
+//   boolean), but at runtime they are exactly what makes the pills live;
+// - every h() attribute must be a string literal — an identifier (the old
+//   shared SIL_BODY const) silently compiles to an empty client slot, which
+//   is why the silhouette `d` path is inlined verbatim in both tiles.
+
+// ── Wire types: serde field names from crates/ksx-studio/src/{snapshot,control}.rs ──
+
+export interface PadRow {
+  persona: string;
+  instance: string;
+}
+
+export interface ProfileRow {
+  title: string;
+  detail: string;
+}
+
+export interface StatusSnapshot {
+  generated_at: string;
+  vigem: string;
+  interception: string;
+  daemon_running: boolean;
+  daemon_detail: string;
+  autostart: string;
+  pads: PadRow[];
+  profiles: ProfileRow[];
+  config_root: string;
+}
+
+export interface SessionView {
+  reachable: boolean;
+  running: boolean;
+  line: string;
+}
+
+/** What GET /api/status serves and what the island props carry — one shape
+ *  (`StatusPayload` in snapshot.rs; the parity is unit-tested there). */
+export interface StatusPayload {
+  snapshot: StatusSnapshot;
+  session: SessionView;
+  flash: string | null;
+}
+
+interface PadTile {
+  player: string;
+  persona: string;
+  instance: string;
+}
+
+interface GhostTile {
+  slot: string;
+}
+
+/** Mirror of render.rs `PAD_TILE_FLOOR`: a 4-slot XInput cabinet at rest
+ *  still LOOKS like a 4-slot cabinet. */
+const PAD_TILE_FLOOR = 4;
+
+// ── The live state store (module-level: one island, page lifetime) ─────────
+// Getter names MUST match the slot declarations in StatusPage.ts — that is
+// the compile-time contract that names the FMIR slots.
+
+const [generatedAt, setGeneratedAt] = createSignal("(no snapshot)");
+const [vigemLine, setVigemLine] = createSignal("not collected");
+const [interceptionLine, setInterceptionLine] = createSignal("not collected");
+const [daemonYesNo, setDaemonYesNo] = createSignal("unknown");
+const [daemonDetail, setDaemonDetail] = createSignal("not collected");
+const [autostartLine, setAutostartLine] = createSignal("not collected");
+const [padsSummary, setPadsSummary] = createSignal("not collected");
+const [profilesSummary, setProfilesSummary] = createSignal("not collected");
+const [configRoot, setConfigRoot] = createSignal("(unknown)");
+const [sessionLine, setSessionLine] = createSignal("not collected");
+const [flashLine, setFlashLine] = createSignal("");
+
+const [pillRunning, setPillRunning] = createSignal(false);
+const [pillIdle, setPillIdle] = createSignal(false);
+const [pillDown, setPillDown] = createSignal(false);
+const [flashOk, setFlashOk] = createSignal(false);
+const [flashError, setFlashError] = createSignal(false);
+const [canStart, setCanStart] = createSignal(false);
+const [canStop, setCanStop] = createSignal(false);
+const [daemonDown, setDaemonDown] = createSignal(false);
+const [vigemOk, setVigemOk] = createSignal(false);
+const [vigemWarn, setVigemWarn] = createSignal(false);
+const [icptBorrowed, setIcptBorrowed] = createSignal(false);
+const [icptAbsent, setIcptAbsent] = createSignal(false);
+const [autostartOn, setAutostartOn] = createSignal(false);
+const [autostartOff, setAutostartOff] = createSignal(false);
+const [rowsLive, setRowsLive] = createSignal(false);
+const [rowsPlain, setRowsPlain] = createSignal(false);
+
+const [profileOptions, setProfileOptions] = createSignal<ProfileRow[]>([]);
+const [padTiles, setPadTiles] = createSignal<PadTile[]>([]);
+const [ghostTiles, setGhostTiles] = createSignal<GhostTile[]>([]);
+const [profileRows, setProfileRows] = createSignal<ProfileRow[]>([]);
+
+// ── Derivations (mirror render.rs; pinned there by unit tests) ─────────────
+
+function padsSummaryLine(count: number): string {
+  if (count === 0) return "no virtual pads exposed by the bus";
+  if (count === 1) return "1 virtual pad exposed by the bus:";
+  return `${count} virtual pads exposed by the bus:`;
+}
+
+function profilesSummaryLine(count: number): string {
+  if (count === 0) return "no profiles in games.toml";
+  if (count === 1) return "1 profile in games.toml:";
+  return `${count} profiles in games.toml:`;
+}
+
+/** Write one /api/status payload into every signal (flash excluded — flash
+ *  is one-shot action feedback, owned by `applyFlash`). Safe to call before
+ *  adoption AND per poll. */
+export function applyStatus(p: StatusPayload): void {
+  const snap = p.snapshot;
+  const session = p.session;
+
+  setGeneratedAt(snap.generated_at);
+  setVigemLine(snap.vigem);
+  setInterceptionLine(snap.interception);
+  setDaemonYesNo(snap.daemon_running ? "yes" : "no");
+  setDaemonDetail(snap.daemon_detail);
+  setAutostartLine(snap.autostart);
+  setPadsSummary(padsSummaryLine(snap.pads.length));
+  setProfilesSummary(profilesSummaryLine(snap.profiles.length));
+  setConfigRoot(snap.config_root);
+  setSessionLine(session.line);
+
+  const okVigem = snap.vigem.startsWith("installed — service running");
+  const icptInstalled = snap.interception.startsWith("installed");
+  const onAutostart = snap.autostart.startsWith("registered");
+  const startable = session.reachable && !session.running;
+
+  setPillRunning(session.reachable && session.running);
+  setPillIdle(startable);
+  setPillDown(!session.reachable);
+  setCanStart(startable);
+  setCanStop(session.reachable && session.running);
+  setDaemonDown(!session.reachable);
+  setVigemOk(okVigem);
+  setVigemWarn(!okVigem);
+  setIcptBorrowed(icptInstalled);
+  setIcptAbsent(!icptInstalled);
+  setAutostartOn(onAutostart);
+  setAutostartOff(!onAutostart);
+  setRowsLive(startable);
+  setRowsPlain(!startable);
+
+  setProfileOptions(snap.profiles);
+  setProfileRows(snap.profiles);
+  setPadTiles(
+    snap.pads.map((pad, i) => ({
+      player: `P${i + 1}`,
+      persona: pad.persona,
+      instance: pad.instance,
+    })),
+  );
+  const ghosts: GhostTile[] = [];
+  for (let i = snap.pads.length; i < PAD_TILE_FLOOR; i++) {
+    ghosts.push({ slot: `P${i + 1}` });
+  }
+  setGhostTiles(ghosts);
+}
+
+/** The studio server itself stopped answering /api/status: say so, disable
+ *  the controls, keep the last-known status cards visible (their timestamp
+ *  stops advancing, which is the honest tell). */
+export function applyUnreachable(): void {
+  setSessionLine("ksx-studio not responding — retrying every 2 s");
+  setPillRunning(false);
+  setPillIdle(false);
+  setPillDown(true);
+  setCanStart(false);
+  setCanStop(false);
+  setDaemonDown(true);
+  setRowsLive(false);
+  setRowsPlain(true);
+}
+
+/** One-shot action feedback (POST outcome or the seed's ?flash= value).
+ *  Auto-clears after FLASH_MS — the live page never navigates, so nothing
+ *  else would clear it (the v3 page relied on the meta refresh for that). */
+const FLASH_MS = 5000;
+let flashTimer: ReturnType<typeof setTimeout> | undefined;
+
+export function applyFlash(flash: string | null | undefined): void {
+  if (flashTimer !== undefined) {
+    clearTimeout(flashTimer);
+    flashTimer = undefined;
+  }
+  const line = (flash ?? "").trim();
+  if (line === "") {
+    setFlashLine("");
+    setFlashOk(false);
+    setFlashError(false);
+    return;
+  }
+  const isError = line.startsWith("error");
+  setFlashLine(line);
+  setFlashOk(!isError);
+  setFlashError(isError);
+  flashTimer = setTimeout(() => applyFlash(null), FLASH_MS);
+}
+
+// ── The screen (identical structure to v3 — the slot layout test pins it) ──
+
+export function StatusIsland() {
+  return h(
+    "div",
+    { class: "studio" },
+    // ── App shell: compact header — wordmark + live state pill ──────────
+    h(
+      "header",
+      { class: "top" },
+      h(
+        "div",
+        { class: "brand" },
+        h("span", { class: "brand-ksx" }, "ksx"),
+        h("span", { class: "brand-studio" }, "Studio"),
+      ),
+      createShow(
+        () => pillRunning(),
+        () => h("span", { class: "pill pill-run" }, "running"),
+      ),
+      createShow(
+        () => pillIdle(),
+        () => h("span", { class: "pill pill-idle" }, "idle"),
+      ),
+      createShow(
+        () => pillDown(),
+        () => h("span", { class: "pill pill-down" }, "no daemon"),
+      ),
+    ),
+    h(
+      "main",
+      null,
+      // ── SESSION: the hero card ────────────────────────────────────────
+      h(
+        "section",
+        { class: "card hero session" },
+        h("h2", null, "Session"),
+        h("p", { class: "state" }, () => sessionLine()),
+        // Flash = feedback from the LAST action, visually distinct from
+        // the state line above (which is the present-tense truth) and
+        // always rendered under it. Cleared by applyFlash's timer.
+        createShow(
+          () => flashOk(),
+          () => h("p", { class: "flash flash-ok" }, () => flashLine()),
+        ),
+        createShow(
+          () => flashError(),
+          () => h("p", { class: "flash flash-err" }, () => flashLine()),
+        ),
+        createShow(
+          () => canStart(),
+          () =>
+            h(
+              "form",
+              { class: "controls", method: "post", action: "/session/start" },
+              h("label", { for: "profile" }, "profile"),
+              h(
+                "select",
+                { id: "profile", name: "profile" },
+                h("option", { value: "" }, "(config default)"),
+                createList(
+                  () => profileOptions(),
+                  (o) => o.title,
+                  (o) => h("option", null, o.title),
+                ),
+              ),
+              h("button", { class: "btn btn-primary", type: "submit" }, "Start"),
+            ),
+        ),
+        createShow(
+          () => canStop(),
+          () =>
+            h(
+              "div",
+              { class: "controls" },
+              h(
+                "form",
+                { method: "post", action: "/session/stop" },
+                h("button", { class: "btn btn-danger", type: "submit" }, "Stop"),
+              ),
+              h(
+                "form",
+                { method: "post", action: "/config/reload" },
+                h("button", { class: "btn", type: "submit" }, "Reload config"),
+              ),
+            ),
+        ),
+        createShow(
+          () => daemonDown(),
+          () =>
+            h(
+              "div",
+              { class: "controls off" },
+              h(
+                "select",
+                { disabled: "" },
+                h("option", null, "(profiles unavailable)"),
+              ),
+              h("button", { class: "btn", disabled: "" }, "Start"),
+              h(
+                "p",
+                { class: "warn" },
+                "controls disabled — no daemon control channel: ",
+                "start the daemon (tray, or `ksx daemon`)",
+              ),
+            ),
+        ),
+      ),
+      // ── VIRTUAL PADS: the signature card ──────────────────────────────
+      h(
+        "section",
+        { class: "card wide" },
+        h("h2", null, "Virtual pads"),
+        h("p", { class: "cardline" }, () => padsSummary()),
+        h(
+          "div",
+          { class: "padgrid" },
+          createList(
+            () => padTiles(),
+            // Composite key: any visible change (player number shifts when a
+            // pad unplugs) re-renders the tile instead of leaving stale text
+            // — reconcile keeps, it does not re-render, matching keys.
+            (p) => p.player + "|" + p.persona + "|" + p.instance,
+            (p) =>
+              h(
+                "div",
+                { class: "padtile live" },
+                h(
+                  "svg",
+                  { class: "sil", viewBox: "0 0 72 48", "aria-hidden": "true" },
+                  h("path", { class: "sil-body", d: "M20 7 H52 C60 7 63 12 65 19 L68 30 C69.5 36 66 41 61 41 C56.5 41 54 37 51.5 33.5 L49.5 31 H22.5 L20.5 33.5 C18 37 15.5 41 11 41 C6 41 2.5 36 4 30 L7 19 C9 12 12 7 20 7 Z" }),
+                  h("circle", { class: "sil-stick", cx: "22", cy: "18", r: "5" }),
+                  h("circle", { class: "sil-stick", cx: "44", cy: "27", r: "4.5" }),
+                  h("rect", { class: "sil-dpad", x: "26", y: "25.5", width: "10", height: "3", rx: "1.5" }),
+                  h("rect", { class: "sil-dpad", x: "29.5", y: "22", width: "3", height: "10", rx: "1.5" }),
+                  h("circle", { class: "sil-dot", cx: "56", cy: "13" , r: "2.2" }),
+                  h("circle", { class: "sil-dot", cx: "51", cy: "18", r: "2.2" }),
+                  h("circle", { class: "sil-dot", cx: "61", cy: "18", r: "2.2" }),
+                  h("circle", { class: "sil-dot", cx: "56", cy: "23", r: "2.2" }),
+                ),
+                h(
+                  "div",
+                  { class: "padmeta" },
+                  h("span", { class: "player" }, p.player),
+                  h("span", { class: "persona" }, p.persona),
+                ),
+                h("div", { class: "instance" }, p.instance),
+              ),
+          ),
+          createList(
+            () => ghostTiles(),
+            (g) => g.slot,
+            (g) =>
+              h(
+                "div",
+                { class: "padtile ghost" },
+                h(
+                  "svg",
+                  { class: "sil", viewBox: "0 0 72 48", "aria-hidden": "true" },
+                  h("path", { class: "sil-body", d: "M20 7 H52 C60 7 63 12 65 19 L68 30 C69.5 36 66 41 61 41 C56.5 41 54 37 51.5 33.5 L49.5 31 H22.5 L20.5 33.5 C18 37 15.5 41 11 41 C6 41 2.5 36 4 30 L7 19 C9 12 12 7 20 7 Z" }),
+                  h("circle", { class: "sil-stick", cx: "22", cy: "18", r: "5" }),
+                  h("circle", { class: "sil-stick", cx: "44", cy: "27", r: "4.5" }),
+                  h("rect", { class: "sil-dpad", x: "26", y: "25.5", width: "10", height: "3", rx: "1.5" }),
+                  h("rect", { class: "sil-dpad", x: "29.5", y: "22", width: "3", height: "10", rx: "1.5" }),
+                  h("circle", { class: "sil-dot", cx: "56", cy: "13" , r: "2.2" }),
+                  h("circle", { class: "sil-dot", cx: "51", cy: "18", r: "2.2" }),
+                  h("circle", { class: "sil-dot", cx: "61", cy: "18", r: "2.2" }),
+                  h("circle", { class: "sil-dot", cx: "56", cy: "23", r: "2.2" }),
+                ),
+                h(
+                  "div",
+                  { class: "padmeta" },
+                  h("span", { class: "player" }, g.slot),
+                  h("span", { class: "persona" }, "empty"),
+                ),
+                h("div", { class: "instance" }, " "),
+              ),
+          ),
+        ),
+      ),
+      // ── Card grid: drivers + autostart ────────────────────────────────
+      h(
+        "div",
+        { class: "grid" },
+        h(
+          "section",
+          { class: "card" },
+          h("h2", null, "Drivers"),
+          h(
+            "div",
+            { class: "drow" },
+            h("span", { class: "dname" }, "ViGEmBus"),
+            createShow(
+              () => vigemOk(),
+              () => h("span", { class: "pill pill-ok" }, "OK"),
+            ),
+            createShow(
+              () => vigemWarn(),
+              () => h("span", { class: "pill pill-warn" }, "attention"),
+            ),
+          ),
+          h("p", { class: "ddetail" }, () => vigemLine()),
+          h(
+            "div",
+            { class: "drow" },
+            h("span", { class: "dname" }, "Interception"),
+            createShow(
+              () => icptBorrowed(),
+              () => h("span", { class: "pill pill-warn" }, "borrowed time"),
+            ),
+            createShow(
+              () => icptAbsent(),
+              () => h("span", { class: "pill pill-idle" }, "absent"),
+            ),
+          ),
+          h("p", { class: "ddetail" }, () => interceptionLine()),
+          h(
+            "div",
+            { class: "drow" },
+            h("span", { class: "dname" }, "Daemon process"),
+            h("span", { class: "dvalue" }, () => daemonYesNo()),
+          ),
+          h("p", { class: "ddetail" }, () => daemonDetail()),
+        ),
+        h(
+          "section",
+          { class: "card" },
+          h("h2", null, "Autostart"),
+          h(
+            "div",
+            { class: "drow" },
+            h("span", { class: "dname" }, "Logon task"),
+            createShow(
+              () => autostartOn(),
+              () => h("span", { class: "pill pill-ok" }, "on"),
+            ),
+            createShow(
+              () => autostartOff(),
+              () => h("span", { class: "pill pill-idle" }, "off"),
+            ),
+          ),
+          h("p", { class: "ddetail" }, () => autostartLine()),
+        ),
+      ),
+      // ── PROFILES: one row per games.toml entry, one click to start ────
+      h(
+        "section",
+        { class: "card wide" },
+        h("h2", null, "Profiles"),
+        h("p", { class: "cardline" }, () => profilesSummary()),
+        createShow(
+          () => rowsLive(),
+          () =>
+            h(
+              "ul",
+              { class: "plist" },
+              createList(
+                () => profileRows(),
+                (g) => g.title + "|" + g.detail,
+                (g) =>
+                  h(
+                    "li",
+                    null,
+                    h(
+                      "div",
+                      { class: "pmeta" },
+                      h("span", { class: "ptitle" }, g.title),
+                      h("span", { class: "pdetail" }, g.detail),
+                    ),
+                    h(
+                      "form",
+                      { method: "post", action: "/session/start" },
+                      h("input", { type: "hidden", name: "profile", value: g.title }),
+                      h("button", { class: "btn btn-row", type: "submit" }, "Start"),
+                    ),
+                  ),
+              ),
+            ),
+        ),
+        createShow(
+          () => rowsPlain(),
+          () =>
+            h(
+              "ul",
+              { class: "plist" },
+              createList(
+                () => profileRows(),
+                (g) => g.title + "|" + g.detail,
+                (g) =>
+                  h(
+                    "li",
+                    null,
+                    h(
+                      "div",
+                      { class: "pmeta" },
+                      h("span", { class: "ptitle" }, g.title),
+                      h("span", { class: "pdetail" }, g.detail),
+                    ),
+                  ),
+              ),
+            ),
+        ),
+      ),
+    ),
+    // ── Footer: the plumbing facts, out of the body ───────────────────────
+    h(
+      "footer",
+      null,
+      h("p", null, "config root: ", h("span", { class: "mono" }, () => configRoot())),
+      h(
+        "p",
+        null,
+        "Status re-read every 2 s in place; buttons go over the daemon pipe ",
+        "(\\\\.\\pipe\\ksx-daemon). Without JavaScript the page auto-refreshes ",
+        "every 5 s instead. Generated ",
+        h("span", { class: "mono" }, () => generatedAt()),
+        ". Serving 127.0.0.1 only.",
+      ),
+    ),
+  );
+}
