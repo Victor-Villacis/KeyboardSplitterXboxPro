@@ -1,20 +1,20 @@
 {
   "version": 1,
-  "build_hash": "a83a32b77b430f0762280b99663e99cf08e50d09d26da010a7af74e6931d1c9d",
+  "build_hash": "7503346b0ea08334249a880cde77ae76ed4d68dfa4d37162c15b5220436aa637",
   "assets": {
-    "status.ir": "status.3e85958c.ir",
-    "studio.css": "studio.b0a90a17.css"
+    "status.ir": "status.5273c93a.ir",
+    "studio.css": "studio.158e46a3.css"
   },
   "routes": {
     "/": {
       "js": [],
       "css": [
-        "studio.b0a90a17.css"
+        "studio.158e46a3.css"
       ],
       "fonts": [],
-      "total_size_br": 9384,
+      "total_size_br": 11532,
       "budget_warn_threshold": 200000,
-      "ir": "status.3e85958c.ir"
+      "ir": "status.5273c93a.ir"
     }
   }
 }

@@ -16,13 +16,15 @@
 //! - **Lists** — every `createList` becomes an Array slot with a unique
 //!   per-instance name: `list:#N:array`, N numbering the list instances in
 //!   document order (compiler 0.2.0). Injected by NAME, like the scalars;
-//!   the `LIST_SLOT_*` constants pin the three names this page has.
+//!   the `LIST_SLOT_*` constants pin the five names this page has.
 //! - **Shows** — every `createShow` still becomes a Bool slot named
 //!   `show:createShow` — 0.2.0 named lists uniquely but not shows — so shows
 //!   remain the one POSITIONAL seam (slot-table order == emission order ==
 //!   document order). [`SHOW_ORDER`] documents that mapping; the shows are
-//!   what let an SSR-only page render the session controls conditionally
-//!   (enabled / running / visibly-disabled) with zero client JS.
+//!   what let an SSR-only page render conditionally with zero client JS —
+//!   session controls (enabled / running / visibly-disabled) AND every
+//!   state-colored pill, which is a show pair whose sides carry different
+//!   static styling.
 //!
 //! `tests::embedded_ir_slot_layout_matches_the_seam` pins the exact list slot
 //! NAMES (order included) and the show count — a compiler bump that renames
@@ -53,26 +55,52 @@ pub(crate) struct Assets;
 
 /// Since 0.2.0 the compiler names each `createList` array slot uniquely:
 /// `list:#N:array`, N counting list instances in document order. These pin
-/// the names of the three lists in StatusPage.ts — adding or reordering
+/// the names of the five lists in StatusPage.ts — adding or reordering
 /// lists there shifts the numbering, and the layout test fails until the
 /// constants are updated to match.
 const LIST_SLOT_PROFILE_OPTIONS: &str = "list:#1:array";
 const LIST_SLOT_PADS: &str = "list:#2:array";
-const LIST_SLOT_PROFILES: &str = "list:#3:array";
+const LIST_SLOT_GHOST_PADS: &str = "list:#3:array";
+const LIST_SLOT_PROFILES_LIVE: &str = "list:#4:array";
+const LIST_SLOT_PROFILES_PLAIN: &str = "list:#5:array";
 
 /// `createShow` booleans did NOT gain unique names in compiler 0.2.0 — every
 /// show is still `show:createShow`, so shows are the remaining positional
-/// seam. Document order in StatusPage.ts: the flash line, the Start form,
-/// the Stop/Reload forms, the disabled controls + explanation shown when no
-/// daemon control channel answers.
+/// seam (slot-table order == document order in StatusPage.ts). All state
+/// COLOR on this SSR page is done with show pairs — the server picks which
+/// statically-styled variant renders — so the list is long; the layout test
+/// pins the count.
 const SHOW_SLOT_NAME: &str = "show:createShow";
-const SHOW_ORDER: [&str; 4] = ["flash", "start controls", "stop controls", "daemon down"];
+const SHOW_ORDER: [&str; 16] = [
+    "header pill: running",
+    "header pill: idle",
+    "header pill: no daemon",
+    "flash: success",
+    "flash: error",
+    "start controls",
+    "stop controls",
+    "daemon down controls",
+    "vigem: ok pill",
+    "vigem: attention pill",
+    "interception: borrowed-time pill",
+    "interception: absent pill",
+    "autostart: on pill",
+    "autostart: off pill",
+    "profile rows: with Start buttons",
+    "profile rows: inert",
+];
 const SHOW_COUNT: usize = SHOW_ORDER.len();
 
 /// Seconds between full-page refreshes (meta pragma + HTTP `Refresh`). Was
 /// 2 s while the page was read-only; a page with a dropdown must leave the
 /// user time to aim at it before the reload closes it.
 pub(crate) const REFRESH_SECS: u32 = 5;
+
+/// The minimum number of pad tiles the signature card shows: live pads
+/// first, then ghost outlines up to this floor (a 4-slot XInput cabinet at
+/// rest still LOOKS like a 4-slot cabinet). More than four live pads simply
+/// render more tiles — 8-player DS4 sessions show all eight.
+const PAD_TILE_FLOOR: usize = 4;
 
 /// Parsed once at server start; immutable afterwards.
 pub(crate) struct EmbeddedPage {
@@ -146,7 +174,13 @@ fn profiles_summary(snap: &StatusSnapshot) -> String {
 }
 
 /// The list array payloads, keyed by their (unique) slot names.
-fn list_values(snap: &StatusSnapshot) -> [(&'static str, SlotValue); 3] {
+///
+/// The two profile ROW lists carry the same array — which one renders is
+/// decided by the show pair around them (Start buttons only when a start
+/// could actually be accepted). The pad tiles get a server-computed player
+/// number ("P1"…), and the ghost list pads the grid out to
+/// [`PAD_TILE_FLOOR`].
+fn list_values(snap: &StatusSnapshot) -> [(&'static str, SlotValue); 5] {
     let options = SlotValue::Array(
         snap.profiles
             .iter()
@@ -158,11 +192,23 @@ fn list_values(snap: &StatusSnapshot) -> [(&'static str, SlotValue); 3] {
     let pads = SlotValue::Array(
         snap.pads
             .iter()
-            .map(|p| {
+            .enumerate()
+            .map(|(i, p)| {
                 SlotValue::Object(vec![
+                    ("player".to_owned(), SlotValue::Text(format!("P{}", i + 1))),
                     ("persona".to_owned(), SlotValue::Text(p.persona.clone())),
                     ("instance".to_owned(), SlotValue::Text(p.instance.clone())),
                 ])
+            })
+            .collect(),
+    );
+    let ghosts = SlotValue::Array(
+        (snap.pads.len()..PAD_TILE_FLOOR)
+            .map(|i| {
+                SlotValue::Object(vec![(
+                    "slot".to_owned(),
+                    SlotValue::Text(format!("P{}", i + 1)),
+                )])
             })
             .collect(),
     );
@@ -180,19 +226,58 @@ fn list_values(snap: &StatusSnapshot) -> [(&'static str, SlotValue); 3] {
     [
         (LIST_SLOT_PROFILE_OPTIONS, options),
         (LIST_SLOT_PADS, pads),
-        (LIST_SLOT_PROFILES, profiles),
+        (LIST_SLOT_GHOST_PADS, ghosts),
+        (LIST_SLOT_PROFILES_LIVE, profiles.clone()),
+        (LIST_SLOT_PROFILES_PLAIN, profiles),
     ]
 }
 
-/// The show booleans, in [`SHOW_ORDER`]. This is the whole conditional-UI
-/// policy: exactly one of "start", "stop" or "daemon down" is true, so the
-/// panel always says something and never offers a dead button as live.
-fn show_values(session: &SessionView, flash: Option<&str>) -> [bool; SHOW_COUNT] {
+/// Badge derivations from the presentation-shaped snapshot lines. The
+/// snapshot contract deliberately ships composed sentences (ksx-app owns
+/// the wording); these prefixes are the stable part of that wording and the
+/// unit tests pin them. Anything unrecognized degrades to the WARN side —
+/// a pill must never say OK about a line it does not understand.
+fn vigem_ok(snap: &StatusSnapshot) -> bool {
+    snap.vigem.starts_with("installed — service running")
+}
+
+fn interception_installed(snap: &StatusSnapshot) -> bool {
+    snap.interception.starts_with("installed")
+}
+
+fn autostart_on(snap: &StatusSnapshot) -> bool {
+    snap.autostart.starts_with("registered")
+}
+
+/// The show booleans, in [`SHOW_ORDER`]. The session-controls policy is
+/// unchanged: exactly one of "start", "stop" or "daemon down" is true, so
+/// the panel always says something and never offers a dead button as live.
+/// The same rule colors the header pill, and every status pill is a pair
+/// where exactly one side renders.
+fn show_values(
+    snap: &StatusSnapshot,
+    session: &SessionView,
+    flash: Option<&str>,
+) -> [bool; SHOW_COUNT] {
+    let flash_err = flash.is_some_and(|f| f.starts_with("error"));
+    let can_start = session.reachable && !session.running;
     [
-        flash.is_some(),
-        session.reachable && !session.running,
+        session.reachable && session.running,
+        can_start,
+        !session.reachable,
+        flash.is_some() && !flash_err,
+        flash_err,
+        can_start,
         session.reachable && session.running,
         !session.reachable,
+        vigem_ok(snap),
+        !vigem_ok(snap),
+        interception_installed(snap),
+        !interception_installed(snap),
+        autostart_on(snap),
+        !autostart_on(snap),
+        can_start,
+        !can_start,
     ]
 }
 
@@ -231,7 +316,7 @@ fn build_slots(
     // Shows by position — still all named `show:createShow` (module docs).
     for (id, value) in named_slot_ids(module, SHOW_SLOT_NAME)
         .into_iter()
-        .zip(show_values(session, flash))
+        .zip(show_values(snap, session, flash))
     {
         slots.set(id, SlotValue::Bool(value));
     }
@@ -248,7 +333,10 @@ pub(crate) fn render_status(
     flash: Option<&str>,
 ) -> PageOutput {
     let slots = build_slots(&page.module, snap, session, flash);
-    let refresh = format!(r#"<meta http-equiv="refresh" content="{REFRESH_SECS}">"#);
+    // The refresh targets "/" WITHOUT the query string: a flash arrives via
+    // /?flash=… (post-redirect), shows for one cycle, and the next refresh
+    // lands on a clean URL — action feedback never masquerades as state.
+    let refresh = format!(r#"<meta http-equiv="refresh" content="{REFRESH_SECS}; url=/">"#);
     render_page(&PageConfig {
         title: "ksx Studio — cabinet status",
         route_pattern: "/",
@@ -359,7 +447,9 @@ mod tests {
             [
                 LIST_SLOT_PROFILE_OPTIONS,
                 LIST_SLOT_PADS,
-                LIST_SLOT_PROFILES
+                LIST_SLOT_GHOST_PADS,
+                LIST_SLOT_PROFILES_LIVE,
+                LIST_SLOT_PROFILES_PLAIN
             ],
             "list slot names drifted between the compiler/StatusPage.ts and \
              the LIST_SLOT_* constants; slots: {names:?}"
@@ -390,11 +480,93 @@ mod tests {
         assert!(out.html.contains("PlayStation (DS4) pad"));
         assert!(out.html.contains("Street Fighter"));
         assert!(out.html.contains("2 virtual pads exposed by the bus"));
-        // The auto-refresh pragma and the no-client-JS shape.
+        // The auto-refresh pragma targets "/" (flash-clearing fix) and the
+        // no-client-JS shape holds.
         assert!(out
             .html
-            .contains(r#"<meta http-equiv="refresh" content="5">"#));
+            .contains(r#"<meta http-equiv="refresh" content="5; url=/">"#));
         assert!(!out.html.contains("<script type=\"module\""));
+    }
+
+    /// The signature card: live pads render as accent tiles with a player
+    /// number and persona; the grid is padded with ghost tiles up to the
+    /// four-slot floor.
+    #[test]
+    fn pad_tiles_render_live_pads_plus_ghosts_up_to_the_floor() {
+        let page = EmbeddedPage::load().unwrap();
+        let out = render_status(&page, &sample(), &idle_session(), None);
+        // Two live pads…
+        assert!(out.html.contains(r#"class="padtile live""#), "{}", out.html);
+        assert!(out.html.contains(">P1<"), "{}", out.html);
+        assert!(out.html.contains(">P2<"), "{}", out.html);
+        assert!(out.html.contains("Xbox 360 pad"));
+        // …two ghosts to reach the floor of four…
+        assert!(out.html.contains(r#"class="padtile ghost""#));
+        assert!(out.html.contains(">P3<"), "{}", out.html);
+        assert!(out.html.contains(">P4<"), "{}", out.html);
+        assert!(!out.html.contains(">P5<"));
+        // …drawn as inline SVG silhouettes, no external assets.
+        assert!(out.html.contains("<svg"), "{}", out.html);
+        assert!(!out.html.contains("<img"));
+    }
+
+    /// Status pills: exactly one side of each pair renders. The sample
+    /// snapshot is all-healthy except Interception, which is installed and
+    /// therefore on borrowed time (amber), never a paragraph-only warning.
+    #[test]
+    fn status_pills_pick_exactly_one_side_per_pair() {
+        let page = EmbeddedPage::load().unwrap();
+        let out = render_status(&page, &sample(), &idle_session(), None);
+        // Header pill: idle.
+        assert!(
+            out.html.contains(r#"class="pill pill-idle">idle<"#),
+            "{}",
+            out.html
+        );
+        assert!(!out.html.contains(r#"class="pill pill-run""#));
+        // ViGEmBus healthy, Interception installed → borrowed time.
+        assert!(out.html.contains(">OK<"), "{}", out.html);
+        assert!(out.html.contains(">borrowed time<"), "{}", out.html);
+        assert!(!out.html.contains(">attention<"));
+        assert!(!out.html.contains(">absent<"));
+        // Autostart registered → on.
+        assert!(
+            out.html.contains(r#"class="pill pill-ok">on<"#),
+            "{}",
+            out.html
+        );
+    }
+
+    /// A degraded snapshot must not say OK about anything.
+    #[test]
+    fn a_degraded_snapshot_renders_warn_pills_not_ok() {
+        let page = EmbeddedPage::load().unwrap();
+        let snap = StatusSnapshot::degraded("collector panicked");
+        let out = render_status(&page, &snap, &SessionView::default(), None);
+        assert!(!out.html.contains(">OK<"), "{}", out.html);
+        assert!(out.html.contains(">attention<"), "{}", out.html);
+        assert!(out.html.contains(">absent<"), "{}", out.html);
+    }
+
+    /// Profile rows carry their own one-click Start form when a start could
+    /// be accepted — the hidden input's value is the exact profile title the
+    /// daemon will be asked for.
+    #[test]
+    fn profile_rows_get_start_buttons_only_when_startable() {
+        let page = EmbeddedPage::load().unwrap();
+        let out = render_status(&page, &sample(), &idle_session(), None);
+        assert!(
+            out.html
+                .contains(r#"name="profile" value="Street Fighter""#),
+            "{}",
+            out.html
+        );
+        // Running: rows render inert — no per-row forms, no start actions.
+        let out = render_status(&page, &sample(), &running_session(), None);
+        assert!(out.html.contains("Street Fighter"), "{}", out.html);
+        assert!(!out
+            .html
+            .contains(r#"name="profile" value="Street Fighter""#));
     }
 
     /// Idle + reachable: the Start form renders (with the profiles as

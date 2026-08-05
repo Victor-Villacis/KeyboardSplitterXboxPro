@@ -115,11 +115,12 @@ async fn status_page(
                 HeaderValue::from_str(&out.csp)
                     .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'")),
             ),
-            // Belt to the body's meta-refresh braces; both are JS-free.
+            // Belt to the body's meta-refresh braces; both are JS-free and
+            // both target "/" so a ?flash= query clears on the next cycle.
             (
                 HeaderName::from_static("refresh"),
-                HeaderValue::from_str(&REFRESH_SECS.to_string())
-                    .unwrap_or_else(|_| HeaderValue::from_static("5")),
+                HeaderValue::from_str(&format!("{REFRESH_SECS}; url=/"))
+                    .unwrap_or_else(|_| HeaderValue::from_static("5; url=/")),
             ),
             (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
         ],
