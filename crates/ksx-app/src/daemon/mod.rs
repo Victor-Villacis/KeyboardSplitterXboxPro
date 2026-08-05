@@ -828,9 +828,12 @@ pub fn run(
                 state: state.clone(),
                 profiles: Box::new(move || pipe::profile_rows(&profiles_root)),
                 // The mapper verbs (M7 slice): `map` writes presets through
-                // the same crate::mapping::apply the CLI verb uses;
-                // learn-key observes idle keyboards over Raw Input.
-                map: pipe::map_fn(map_root),
+                // the same crate::mapping::apply the CLI verb uses (with the
+                // once-per-lifetime session backup); `map-restore` pulls the
+                // defaults / session-backup safety nets; learn-key observes
+                // idle keyboards over Raw Input.
+                map: pipe::map_fn(map_root.clone()),
+                restore: pipe::restore_fn(map_root),
                 learn: learn::LearnService::with_rawinput(),
             },
         );

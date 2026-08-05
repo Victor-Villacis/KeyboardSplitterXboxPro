@@ -316,8 +316,10 @@ select,
   opacity: 0.55;
 }
 
-/* v5: the tile art is the real pad (Gamepad-Asset-Pack, MIT). The SVGs are
-   drawn white-on-transparent (dark-theme icons); light mode inverts them. */
+/* v5: the tile art is the real pad (Gamepad-Asset-Pack, MIT). build.mjs
+   recolors the SVGs to the studio palette and bakes a
+   prefers-color-scheme:light override into each asset, so the same file is
+   right in both themes — no CSS filter tricks. */
 .tileart {
   display: block;
   width: 100%;
@@ -333,17 +335,6 @@ select,
 
 .padtile.ghost .tileart {
   opacity: 0.3;
-}
-
-@media (prefers-color-scheme: light) {
-  .tileart,
-  .padart {
-    filter: invert(1);
-  }
-
-  .padtile.live .tileart {
-    filter: invert(1) drop-shadow(0 0 6px rgba(0, 0, 0, 0.25));
-  }
 }
 
 .maplink {
@@ -587,8 +578,8 @@ select,
 }
 
 /* The stage: CONTROLLER HUGE. Fixed aspect per persona (art viewBox height /
-   ART_SHARE=0.86, render_map.rs); the art bottom-aligned, the top band is
-   the shoulder shelf. */
+   ART_SHARE=0.86, render_map.rs); the art bottom-aligned, the top band holds
+   the shoulder chips. */
 .stagecard {
   padding: 1rem 1.2rem 1.2rem;
 }
@@ -614,7 +605,6 @@ select,
   width: 100%;
   height: 86%;
   object-fit: contain;
-  opacity: 0.9;
   pointer-events: none;
 }
 
@@ -623,12 +613,17 @@ select,
   inset: 0;
 }
 
-/* Hit zones: PURE hit areas over the art — transparent, no inline text (the
-   art is the label; the title tooltip names fn + binding, the legend below
-   the stage is the readable truth). Hover/focus — or the legend row's hover
-   via the shared .z-hot class — outlines the control rect with a soft glow. */
+/* Hit zones over the art: transparent hit areas carrying a small binding
+   TAG (v6 — Victor: on-zone tags are the intuitive read; the legend stays
+   as the overview). The title tooltip names fn + binding. Hover/focus — or
+   the legend row's hover via the shared .z-hot class — outlines the control
+   rect with a soft glow. */
 .zone {
   position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
   padding: 0;
   background: transparent;
   border: 1px solid transparent;
@@ -637,21 +632,126 @@ select,
   font: inherit;
 }
 
+/* The on-zone binding tag: a tiny mono pill; unbound (empty) renders
+   nothing, so untouched controls stay clean art. */
+.ztag {
+  font: 700 0.62rem/1.15 var(--mono);
+  color: var(--accent);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.08rem 0.28rem;
+  max-width: 94%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* `:empty` cannot hide unbound tags — the SSR text slot leaves marker nodes
+   inside the span — so the zone carries an explicit class. */
+.ztag:empty,
+.z-unbound .ztag {
+  display: none;
+}
+
+/* Phone: the art shrinks but rem-sized tags do not — pull them in a step so
+   the stick/dpad clusters stay uncrowded. */
+@media (max-width: 560px) {
+  .ztag {
+    font-size: 0.55rem;
+    padding: 0.05rem 0.2rem;
+  }
+}
+
 .z-round {
   border-radius: 50%;
 }
 
-.z-chip,
-.z-shoulder {
+.z-chip {
   border-radius: 8px;
 }
 
-/* The shoulder shelf sits above the art (LB/RB/LT/RT are not drawn), so its
-   four zones keep a barely-there dashed hint; everything on the art itself
-   stays invisible until hovered. */
-.z-shoulder {
-  border-color: var(--line-soft);
-  border-style: dashed;
+/* The shoulders sit above the art (LB/RB/LT/RT are not drawn): slim
+   hardware-shaped chips, triggers stacked over bumpers like the real pad,
+   tilted a touch outward; each bumper drops a thin connector line onto the
+   body silhouette below. Labels are CSS content keyed off the persona stage
+   class (the zone buttons themselves stay text-free — the legend is the
+   readable truth). Everything ON the art stays invisible until hovered. */
+.z-trigger,
+.z-bumper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel-2);
+  border-color: var(--line);
+}
+
+.z-trigger {
+  border-radius: 45% 45% 30% 30% / 80% 80% 35% 35%;
+}
+
+.z-bumper {
+  border-radius: 40% 40% 22% 22% / 95% 95% 30% 30%;
+}
+
+.zone.z-trigger[data-fn="lt"],
+.zone.z-bumper[data-fn="lb"] {
+  transform: rotate(-3deg);
+}
+
+.zone.z-trigger[data-fn="rt"],
+.zone.z-bumper[data-fn="rb"] {
+  transform: rotate(3deg);
+}
+
+.z-bumper::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  width: 2px;
+  height: 55%;
+  background: linear-gradient(var(--line), transparent);
+}
+
+.z-trigger::before,
+.z-bumper::before {
+  font: 600 0.66rem/1 var(--mono);
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.stage-xbox .zone[data-fn="lt"]::before {
+  content: "LT";
+}
+
+.stage-xbox .zone[data-fn="lb"]::before {
+  content: "LB";
+}
+
+.stage-xbox .zone[data-fn="rb"]::before {
+  content: "RB";
+}
+
+.stage-xbox .zone[data-fn="rt"]::before {
+  content: "RT";
+}
+
+.stage-ds4 .zone[data-fn="lt"]::before {
+  content: "L2";
+}
+
+.stage-ds4 .zone[data-fn="lb"]::before {
+  content: "L1";
+}
+
+.stage-ds4 .zone[data-fn="rb"]::before {
+  content: "R1";
+}
+
+.stage-ds4 .zone[data-fn="rt"]::before {
+  content: "R2";
 }
 
 .zone:hover,
@@ -717,6 +817,27 @@ select,
 .l-unbound .lkey {
   color: var(--muted);
   font-weight: 400;
+}
+
+/* ── Preset actions: save semantics + the two restore safety nets ──────── */
+
+.pactions .savenote {
+  color: var(--muted);
+  font-size: 0.82rem;
+  margin: 0 0 0.7rem;
+}
+
+.pactrow {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+/* Inert look while no daemon can restore; map.ts still answers the click
+   with the honest flash. */
+.pactions.off .btn {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* The learn modal: prompt + visible countdown (ring→bar), conflict verdict. */

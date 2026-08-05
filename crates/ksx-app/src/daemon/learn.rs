@@ -314,6 +314,40 @@ mod tests {
         assert_eq!(snap["generation"], second["generation"]);
     }
 
+    /// Victor's regression (2026-08-05): a SECOND learn after a completed
+    /// one must listen again and land its own hit — the daemon state machine
+    /// must never wedge on the first generation's terminal phase.
+    #[test]
+    fn a_second_learn_after_a_hit_listens_and_hits_again() {
+        let (service, tx, count) = scripted();
+
+        // First full cycle.
+        service.start();
+        tx.send(Ok(Some(("dev-1".into(), "G".into())))).unwrap();
+        wait_for_state(&service, "hit");
+
+        // Second cycle: fresh listening state with a fresh countdown…
+        let snap = service.start();
+        assert_eq!(snap["state"], "listening", "{snap}");
+        assert!(snap["remaining_ms"].as_u64().unwrap() > 8_000, "{snap}");
+        assert_eq!(snap["key"], serde_json::Value::Null, "stale key leaked");
+
+        // …whose observer is really running and lands its own hit.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while count.active.load(Ordering::SeqCst) != 1 {
+            assert!(Instant::now() < deadline, "second observer never started");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        tx.send(Ok(Some(("dev-2".into(), "F2".into())))).unwrap();
+        let snap = wait_for_state(&service, "hit");
+        assert_eq!(snap["device"], "dev-2");
+        assert_eq!(snap["key"], "F2");
+
+        // And a third start still works after that.
+        assert_eq!(service.start()["state"], "listening");
+        service.cancel();
+    }
+
     #[test]
     fn an_observer_error_is_a_failed_state_with_the_reason() {
         let (service, tx, _count) = scripted();

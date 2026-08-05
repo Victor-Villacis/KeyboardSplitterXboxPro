@@ -27,6 +27,7 @@ upstream the report/PR).
 | 10 | An identifier as a static attr value (`d: SIL_BODY`, a module `const` string) is silently compiled to an empty SOURCE_CLIENT slot — SSR renders the element with the attribute MISSING, no build warning. Studio v1–v3 shipped pad silhouettes with no body path and nothing noticed until the v4 canon study; inlining the literal fixed it (was pinned by a `d="M20 7` SSR test until v5 replaced the silhouettes with vendored art) | **OURS-TO-SEND**: resolve module-level string consts (the compiler already folds `+` concatenations in `evalNode`) or at least warn | history: `StatusIsland.ts` (v4) |
 | 11 | Good news, load-bearing for v5: **member-expression attribute values in `createList` item bodies compile to per-item dyn-attr slots** (`h("img", { src: p.art })`, `style: z.style`, `"data-fn": z.fn`) — SSR emits the attribute from the injected array, the client runtime re-derives it per item. The whole mapper zone layer (25 positioned buttons × style/class/data-fn/title) and the status tiles' per-persona art ride this; without it every zone would have needed its own named signal. Constraint held from #9's world: the member read must be a bare `param.field` (or `String(param.field)`) — computed/derived expressions still get anonymous slots | worth documenting upstream as a SUPPORTED pattern (it is compiler 0.2.0's `listItemBindings` path) | `MapIsland.ts` zone list; `render_map.rs` `zone_rows` |
 | 12 | Two-route builds work end to end (entryPoints + routes + per-route `ssrEntryPoints`), including the twin-file pattern per page (#9 forces a `MapPage`/`MapIsland` split exactly like status) — but the island BYPRODUCT cleanup (#5's `*.islands.js`) must be repeated **per entry**, and the second occurrence of a reused list binding gets the `#N` suffix across a page, not across the build (each page's IR names are independent) | evidence for upstream docs; no bug | `build.mjs` (v5); `render_map.rs` `list:zones#2:array` |
+| 13 | TWO core/server findings behind the mapper learn-flow bugs (2026-08-05): **(a)** forma-server's CSP nonce-locks `style-src`, and per spec a nonce there makes browsers ignore inline-style semantics — every `style=""` ATTRIBUTE dies, including the ones forma's own compiled list bindings emit (#11!): all 25 zone hit-areas collapsed into a 2 px pile at the stage's top-left (the "corrupted glyph"), and the countdown bar's width never moved. **(b)** `@getforma/core`'s ADOPTION-path show effect (`setupShowEffect` in hydrate.ts) materializes re-toggled branches inside its own `internalEffect` run with no `createRoot`/`untrack` — every binding created there is owned by that run and disposed on the next re-run: stale modal prompts on reopen, empty flash boxes, a conflict dialog that never renders (Victor's frozen-modal repro). The runtime-path `createShow` already does it right | **WORKED AROUND locally, OURS-TO-SEND both**: (a) `relax_style_src` rewrites the header to `style-src 'self' 'unsafe-inline'` (scripts stay nonce-locked); (b) `build.mjs` patches the compiled `setupShowEffect` to route branch creation through an unowned root (`__ksxShowBranch`, installed by both entries) — anchored replacements that fail the build if upstream drifts | `crates/ksx-studio/src/server.rs` `relax_style_src`; `studio-ui/build.mjs` ledger-#13 patch; `map.ts`/`status.ts` helper |
 
 ## Details for filing — mechanism, upstream location, local repro
 
@@ -150,12 +151,42 @@ island byproduct cleanup (`*.islands.js`) must be repeated PER ENTRY; list
 `#N` occurrence suffixes are per-page, not per-build. No bug — upstream
 docs material. Local: `build.mjs` (v5).
 
-### #13 — reserved (under diagnosis)
-The mapper learn-flow freeze (second learn wedges the countdown; repeat
-learn renders an empty flash box; tags do not update live after save) is
-being diagnosed; if a same-value-signal-write reactivity quirk in
-`@getforma/core` is underneath, the mechanism lands here. Ours-vs-theirs
-verdict pending.
+### #13 — CSP kills style attributes; adopted shows dispose their branches
+Diagnosed 2026-08-05 (Playwright repro against a mocked /api backend —
+`learn-repro.mjs` / `conflict-repro.mjs` patterns; the daemon-side learn
+state machine was verified INNOCENT: generations supersede correctly and a
+second learn after a hit listens again, now pinned by
+`a_second_learn_after_a_hit_listens_and_hits_again`).
+
+**(a) forma-server CSP**: `PageOutput.csp` emits `style-src 'nonce-…'
+'self'`. The CSP spec says a nonce/hash in a directive disables
+`'unsafe-inline'` behavior — and inline `style=""` ATTRIBUTES can never
+carry a nonce, so they are ALL dropped. But the compiler's own
+`listItemBindings` path (#11) renders per-item `style:` attributes — the
+mapper's entire zone geometry — and `MapIsland`'s countdown bar drives
+`style: () => barStyle()`. Under the stock CSP the page quietly renders
+every zone as a 2 px pile at the stage's top-left corner. **Ask**: either
+stop nonce-locking style-src by default, or document that compiled style
+bindings require `style-src 'unsafe-inline'`. Local fix:
+`relax_style_src` in `server.rs` (scripts stay nonce-locked).
+
+**(b) core hydrate.ts `setupShowEffect`**: the adoption-path show
+materializes a branch inside its own `internalEffect` run —
+`desc.whenTrue()` / `ensureNode(branch)` with no `createRoot`/`untrack` —
+so the branch's reactive text, nested shows and lists are owned by that
+effect run and are DISPOSED when it re-runs (the very next toggle). The
+runtime-path `createShow` wraps branches in `createRoot(() =>
+untrack(branchFn))`; the adoption path must do the same. Symptoms shipped:
+modal reopens with the previous prompt, repeat flashes render an empty
+box, a conflict dialog appearing on a reopened modal never renders (the
+user-visible "second learn freezes" wedge). **Ask**: wrap adoption-path
+branch creation in an unowned root. Local fix: `build.mjs` rewrites the
+compiled seam (two anchored regex replacements, exactly-once enforced) to
+call `globalThis.__ksxShowBranch` = `createUnownedRoot(() =>
+untrack(make))`, installed by `map.ts`/`status.ts` before activation.
+Trade-off documented: branches created this way are never disposed —
+matching the seam's existing keep-the-fragment behavior, bounded by the
+page's small show count.
 
 ---
 Process note: findings 1+2 were reported through Victor and fixed upstream

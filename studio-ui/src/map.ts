@@ -1,5 +1,14 @@
-import { activateIslands } from "@getforma/core";
+import { activateIslands, createUnownedRoot, untrack } from "@getforma/core";
 import { fetchJSON } from "@getforma/core/http";
+
+// Dogfood ledger #13 (docs/FORMA-DOGFOOD.md): the adoption-path show effect
+// materializes re-toggled branches INSIDE its own reactive run, so every
+// binding created there is disposed when the effect re-runs — stale modal
+// prompts, empty flash boxes, dead conflict dialogs. build.mjs patches the
+// compiled setupShowEffect to route branch creation through this unowned
+// root; installed at module top so it exists before any island activates.
+(globalThis as unknown as Record<string, unknown>).__ksxShowBranch = (make: () => unknown) =>
+  createUnownedRoot(() => untrack(make));
 // Compile-time anchor: the imported *Page component NOT in the
 // activateIslands registry is this entry's SSR root (see status.ts).
 import { MapPage } from "./MapPage";
@@ -192,6 +201,37 @@ async function saveBinding(fn: string, key: string, force: boolean): Promise<voi
   void poll(); // zone tags refresh from disk truth
 }
 
+// ── Preset restore (the two safety nets) ───────────────────────────────────
+
+async function restorePreset(mode: "defaults" | "session-backup"): Promise<void> {
+  const slot = currentSlot();
+  if (!slot) return;
+  const question =
+    mode === "defaults"
+      ? `Restore "${slot.preset}" to the built-in default layout? ` +
+        "This rewrites every binding of that preset."
+      : `Undo this session's changes to "${slot.preset}"? ` +
+        "This restores the preset as it was before the daemon's first change.";
+  if (!window.confirm(question)) return;
+  try {
+    const out = await fetchJSON<{ ok: boolean; message: string | null; error: string | null }>(
+      "/api/preset/restore",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ preset: slot.preset, mode }),
+      },
+    );
+    flashSaved(
+      out.ok ? (out.message ?? "restored") : `error: ${out.error ?? "the daemon refused"}`,
+      !out.ok,
+    );
+  } catch {
+    flashSaved("error: restore request failed — is ksx studio still running?", true);
+  }
+  void poll();
+}
+
 // ── Wiring: delegated events on the island root ────────────────────────────
 
 function wire(root: HTMLElement): void {
@@ -207,6 +247,10 @@ function wire(root: HTMLElement): void {
     }
     if (act === "cancel") {
       void cancelLearn();
+      return;
+    }
+    if (act === "restore-defaults" || act === "restore-backup") {
+      void restorePreset(act === "restore-defaults" ? "defaults" : "session-backup");
       return;
     }
 

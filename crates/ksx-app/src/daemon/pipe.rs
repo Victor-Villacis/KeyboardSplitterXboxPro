@@ -56,6 +56,16 @@ pub type MapFn = Box<
         + Send,
 >;
 
+/// The `map-restore` verb's writer — [`crate::mapping::restore`], same
+/// injection rule as [`MapFn`].
+pub type RestoreFn = Box<
+    dyn Fn(
+            &str,
+            crate::mapping::RestoreKind,
+        ) -> Result<crate::mapping::AppliedRestore, crate::mapping::MapError>
+        + Send,
+>;
+
 /// Everything a pipe request can reach. One struct so the transport, the
 /// tests and future verbs share a single wiring point.
 pub struct PipeDeps {
@@ -63,12 +73,41 @@ pub struct PipeDeps {
     pub state: SharedState,
     pub profiles: ProfilesFn,
     pub map: MapFn,
+    pub restore: RestoreFn,
     pub learn: super::learn::LearnService,
 }
 
-/// The real [`MapFn`]: [`crate::mapping::apply`] against `root`'s store.
+/// The real [`MapFn`]: [`crate::mapping::apply`] against `root`'s store —
+/// with the session-backup hook: before this daemon lifetime's FIRST write to
+/// a preset, the current file is snapshotted to `<file>.session-bak`, which
+/// is exactly what `map-restore session-backup` ("undo this session")
+/// restores. Once per (daemon lifetime × preset); the set lives in the
+/// closure.
 pub fn map_fn(root: ksx_config::ConfigRoot) -> MapFn {
-    Box::new(move |spec| crate::mapping::apply(&ksx_config::Store::new(root.clone()), spec))
+    let backed_up = std::sync::Mutex::new(std::collections::BTreeSet::<String>::new());
+    Box::new(move |spec| {
+        let store = ksx_config::Store::new(root.clone());
+        {
+            let mut backed = backed_up.lock().expect("session-backup set poisoned");
+            if !backed.contains(&spec.preset) {
+                // Best-effort ordering: the backup is taken before apply so a
+                // successful write can always be undone; if the copy itself
+                // fails the bind proceeds (a missing undo must not block
+                // mapping) and restore will say "no session backup".
+                if crate::mapping::take_session_backup(&store, &spec.preset).is_ok() {
+                    backed.insert(spec.preset.clone());
+                }
+            }
+        }
+        crate::mapping::apply(&store, spec)
+    })
+}
+
+/// The real [`RestoreFn`]: [`crate::mapping::restore`] against `root`'s store.
+pub fn restore_fn(root: ksx_config::ConfigRoot) -> RestoreFn {
+    Box::new(move |preset, kind| {
+        crate::mapping::restore(&ksx_config::Store::new(root.clone()), preset, kind)
+    })
 }
 
 /// games.toml rows for the status response. Unreadable configuration reports
@@ -231,7 +270,7 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
     };
     let Some(verb) = request.get("verb").and_then(|v| v.as_str()) else {
         return err_msg(
-            r#"request has no "verb" (status | start | stop | reload | map | learn-key | learn-poll | learn-cancel)"#,
+            r#"request has no "verb" (status | start | stop | reload | map | map-restore | learn-key | learn-poll | learn-cancel)"#,
         );
     };
     match verb {
@@ -269,6 +308,7 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
             await_start(state, &baseline, settle)
         }
         "map" => handle_map(&request, deps, settle),
+        "map-restore" => handle_map_restore(&request, deps, settle),
         // Learn is only meaningful while nothing runs: a running session's
         // captured keyboards are suppressed below win32k, where the Raw Input
         // observer hears nothing — refusing is the honest answer, not a 10 s
@@ -290,7 +330,7 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
         "learn-cancel" => deps.learn.cancel(),
         other => err_msg(format!(
             "unknown verb '{other}' (status | start | stop | reload | map | \
-             learn-key | learn-poll | learn-cancel)"
+             map-restore | learn-key | learn-poll | learn-cancel)"
         )),
     }
 }
@@ -337,32 +377,7 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
     match (deps.map)(&spec) {
         Ok(applied) => {
             let mut message = applied.message();
-            let running = matches!(
-                snapshot(&deps.state).run,
-                RunState::Running { .. } | RunState::Starting
-            );
-            let want_reload = request
-                .get("reload")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let mut reloaded = false;
-            if running && want_reload {
-                let baseline = snapshot(&deps.state).run;
-                if deps.tx.send(DaemonCommand::Reload).is_ok() {
-                    let outcome = await_start(&deps.state, &baseline, settle);
-                    reloaded = outcome["ok"] == true;
-                    match outcome["message"].as_str().or(outcome["error"].as_str()) {
-                        Some(note) => message.push_str(&format!(" — session reloaded: {note}")),
-                        None => message.push_str(" — session reload requested"),
-                    }
-                } else {
-                    message.push_str(" — saved, but the daemon is shutting down (no reload)");
-                }
-            } else if running {
-                message.push_str(" — a session is running; `reload` to apply now");
-            } else {
-                message.push_str(" — the next session start reads it");
-            }
+            let reloaded = reload_after_write(request, deps, settle, &mut message);
             serde_json::json!({
                 "ok": true,
                 "message": message,
@@ -388,6 +403,85 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
                 "code": "conflict",
                 "error": err.to_string(),
                 "conflicts": crate::mapping::conflicts_json(conflicts),
+            })
+        }
+        Err(err) => err_msg(err.to_string()),
+    }
+}
+
+/// The shared tail of every write verb (`map`, `map-restore`): honour
+/// `"reload": true` against a RUNNING session (a clean Reload — stop, re-read
+/// from disk, start — never a hot-patch), and append the honest status note
+/// either way. Returns whether a reload actually completed.
+fn reload_after_write(
+    request: &serde_json::Value,
+    deps: &PipeDeps,
+    settle: Duration,
+    message: &mut String,
+) -> bool {
+    let running = matches!(
+        snapshot(&deps.state).run,
+        RunState::Running { .. } | RunState::Starting
+    );
+    let want_reload = request
+        .get("reload")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut reloaded = false;
+    if running && want_reload {
+        let baseline = snapshot(&deps.state).run;
+        if deps.tx.send(DaemonCommand::Reload).is_ok() {
+            let outcome = await_start(&deps.state, &baseline, settle);
+            reloaded = outcome["ok"] == true;
+            match outcome["message"].as_str().or(outcome["error"].as_str()) {
+                Some(note) => message.push_str(&format!(" — session reloaded: {note}")),
+                None => message.push_str(" — session reload requested"),
+            }
+        } else {
+            message.push_str(" — saved, but the daemon is shutting down (no reload)");
+        }
+    } else if running {
+        message.push_str(" — a session is running; `reload` to apply now");
+    } else {
+        message.push_str(" — the next session start reads it");
+    }
+    reloaded
+}
+
+/// The pipe `map-restore` verb: `{"verb":"map-restore","preset":…,"mode":
+/// "defaults"|"session-backup"}` plus the same optional `"reload"` as `map`.
+/// `defaults` rewrites the preset to the built-in default layout;
+/// `session-backup` restores the snapshot taken before this daemon lifetime's
+/// first `map` write to that preset ("undo this session").
+fn handle_map_restore(
+    request: &serde_json::Value,
+    deps: &PipeDeps,
+    settle: Duration,
+) -> serde_json::Value {
+    let Some(preset) = request
+        .get("preset")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+    else {
+        return err_msg(r#"map-restore needs a "preset""#);
+    };
+    let kind = match request.get("mode").and_then(|v| v.as_str()) {
+        Some("defaults") => crate::mapping::RestoreKind::Defaults,
+        Some("session-backup") => crate::mapping::RestoreKind::SessionBackup,
+        _ => {
+            return err_msg(r#"map-restore needs a "mode": "defaults" | "session-backup""#);
+        }
+    };
+    match (deps.restore)(preset, kind) {
+        Ok(applied) => {
+            let mut message = applied.message();
+            let reloaded = reload_after_write(request, deps, settle, &mut message);
+            serde_json::json!({
+                "ok": true,
+                "message": message,
+                "path": applied.path.display().to_string(),
+                "preset": applied.preset,
+                "reloaded": reloaded,
             })
         }
         Err(err) => err_msg(err.to_string()),
@@ -755,12 +849,24 @@ mod tests {
         }))
     }
 
+    /// A `map-restore` that refuses everything — protocol tests that never
+    /// restore.
+    fn no_restore() -> RestoreFn {
+        Box::new(|preset, _kind| {
+            Err(crate::mapping::MapError::UnknownPreset {
+                name: preset.to_owned(),
+                known: Vec::new(),
+            })
+        })
+    }
+
     fn deps(tx: Sender<DaemonCommand>, state: SharedState, profiles: ProfilesFn) -> PipeDeps {
         PipeDeps {
             tx,
             state,
             profiles,
             map: no_map(),
+            restore: no_restore(),
             learn: idle_learn(),
         }
     }
@@ -1143,6 +1249,122 @@ mod tests {
             v["error"].as_str().unwrap().contains("\"IPAC P2\"'s A"),
             "{v}"
         );
+    }
+
+    // -- map-restore --------------------------------------------------------
+
+    #[test]
+    fn map_restore_validates_preset_and_mode() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let d = deps(tx, state, no_profiles());
+        for junk in [
+            r#"{"verb":"map-restore"}"#,
+            r#"{"verb":"map-restore","preset":"IPAC P1"}"#,
+            r#"{"verb":"map-restore","preset":"IPAC P1","mode":"yolo"}"#,
+        ] {
+            let v = handle_request(junk, &d, FAST);
+            assert_eq!(v["ok"], false, "{junk} → {v}");
+        }
+    }
+
+    #[test]
+    fn map_restore_defaults_reports_the_write_and_honours_reload() {
+        let state = shared(RunState::Stopped);
+        let (tx, rx) = unbounded();
+        let mut d = deps(tx, state, no_profiles());
+        d.restore = Box::new(|preset, kind| {
+            assert_eq!(kind, crate::mapping::RestoreKind::Defaults);
+            Ok(crate::mapping::AppliedRestore {
+                path: std::path::PathBuf::from(r"C:\cfg\ksx\presets\IPAC P1.toml"),
+                preset: preset.to_owned(),
+                kind,
+            })
+        });
+        let v = handle_request(
+            r#"{"verb":"map-restore","preset":"IPAC P1","mode":"defaults","reload":true}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["preset"], "IPAC P1");
+        assert_eq!(v["reloaded"], false, "nothing runs, nothing reloads");
+        assert!(
+            v["message"].as_str().unwrap().contains("built-in defaults"),
+            "{v}"
+        );
+        assert!(rx.try_recv().is_err(), "no reload while stopped");
+    }
+
+    #[test]
+    fn map_restore_surfaces_the_no_backup_reason() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let mut d = deps(tx, state, no_profiles());
+        d.restore = Box::new(|preset, _kind| {
+            Err(crate::mapping::MapError::NoSessionBackup {
+                preset: preset.to_owned(),
+            })
+        });
+        let v = handle_request(
+            r#"{"verb":"map-restore","preset":"IPAC P1","mode":"session-backup"}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(
+            v["error"].as_str().unwrap().contains("nothing to undo"),
+            "{v}"
+        );
+    }
+
+    /// End-to-end through the REAL writers: the daemon-lifetime map_fn takes
+    /// the session backup before its first write, and map-restore
+    /// session-backup undoes every later write of that lifetime.
+    #[test]
+    fn map_fn_snapshots_once_and_session_backup_restores_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "ksx-pipe-session-bak-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = ksx_config::ConfigRoot::at(&dir);
+        let store = ksx_config::Store::new(root.clone());
+        let file: ksx_config::PresetFile =
+            toml::from_str("name = \"IPAC P1\"\n[bindings]\nA = \"S\"\n").unwrap();
+        store.save_preset(&file).unwrap();
+
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let mut d = deps(tx, state, no_profiles());
+        d.map = map_fn(root.clone());
+        d.restore = restore_fn(root);
+
+        for req in [
+            r#"{"verb":"map","preset":"IPAC P1","function":"A","key":"G"}"#,
+            r#"{"verb":"map","preset":"IPAC P1","function":"B","key":"F"}"#,
+        ] {
+            let v = handle_request(req, &d, FAST);
+            assert_eq!(v["ok"], true, "{req} → {v}");
+        }
+        let edited = std::fs::read_to_string(store.preset_path("IPAC P1").unwrap()).unwrap();
+        assert!(edited.contains("A = \"G\""), "{edited}");
+
+        let v = handle_request(
+            r#"{"verb":"map-restore","preset":"IPAC P1","mode":"session-backup"}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        let restored = std::fs::read_to_string(store.preset_path("IPAC P1").unwrap()).unwrap();
+        assert!(
+            restored.contains("A = \"S\""),
+            "backup is the PRE-first-write state: {restored}"
+        );
+        assert!(!restored.contains("B = \"F\""), "{restored}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

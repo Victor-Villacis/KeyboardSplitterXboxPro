@@ -41,6 +41,11 @@ pub trait ControlSource: Send + Sync {
     fn bind(&self, _request: &BindRequest) -> BindOutcome {
         BindOutcome::failed("this control source cannot write bindings")
     }
+    /// Restore a whole preset (pipe `map-restore`): `mode` is `"defaults"`
+    /// or `"session-backup"`. `Ok` is the daemon's confirmation line.
+    fn restore(&self, _preset: &str, _mode: &str) -> Result<String, String> {
+        Err("this control source cannot restore presets".to_owned())
+    }
 }
 
 /// The daemon learner's state, presentation-shaped from the pipe's

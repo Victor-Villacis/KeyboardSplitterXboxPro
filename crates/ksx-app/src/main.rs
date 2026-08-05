@@ -344,13 +344,13 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         preset: String,
         /// Function to bind, e.g. A, lt, dpad.up, lx.min
-        #[arg(long, value_name = "FUNCTION")]
-        function: String,
+        #[arg(long, value_name = "FUNCTION", required_unless_present = "restore")]
+        function: Option<String>,
         /// Key name to bind (legacy spelling, e.g. G, Enter, Left)
         #[arg(
             long,
             value_name = "KEY",
-            required_unless_present = "clear",
+            required_unless_present_any = ["clear", "restore"],
             conflicts_with = "clear"
         )]
         key: Option<String>,
@@ -360,6 +360,17 @@ enum Command {
         /// Proceed despite conflicts (same-preset conflicts are stolen)
         #[arg(long)]
         force: bool,
+        /// Restore the whole preset instead of binding one function:
+        /// "defaults" rewrites it to the built-in default layout,
+        /// "session-backup" restores the daemon's session-start snapshot
+        /// (taken before the first `map` write of a daemon lifetime)
+        #[arg(
+            long,
+            value_name = "MODE",
+            value_parser = ["defaults", "session-backup"],
+            conflicts_with_all = ["function", "key", "clear", "force"]
+        )]
+        restore: Option<String>,
         /// One JSON object {ok, path, preset, function, key, conflicts} on stdout
         #[arg(long)]
         json: bool,
@@ -650,14 +661,21 @@ fn main() -> anyhow::Result<()> {
             key,
             clear: _,
             force,
+            restore,
             json,
         } => map::run(map::Options {
             preset,
-            function,
-            // clap guarantees exactly one of --key/--clear; a `None` key IS
-            // the clear.
-            key,
-            force,
+            action: match restore.as_deref() {
+                Some("defaults") => map::Action::Restore(mapping::RestoreKind::Defaults),
+                Some(_) => map::Action::Restore(mapping::RestoreKind::SessionBackup),
+                None => map::Action::Bind {
+                    // clap: --function is required without --restore, and
+                    // exactly one of --key/--clear; a `None` key IS the clear.
+                    function: function.expect("clap requires --function without --restore"),
+                    key,
+                    force,
+                },
+            },
             json,
         }),
         Command::Session { command } => match command {
@@ -1374,12 +1392,14 @@ mod tests {
                 key,
                 clear,
                 force,
+                restore,
                 json,
             } => {
                 assert_eq!(preset, "IPAC P1");
-                assert_eq!(function, "A");
+                assert_eq!(function.as_deref(), Some("A"));
                 assert_eq!(key.as_deref(), Some("G"));
                 assert!(!clear && !force && json);
+                assert_eq!(restore, None);
             }
             _ => panic!("parsed to the wrong subcommand"),
         }
@@ -1402,6 +1422,63 @@ mod tests {
                 assert!(clear && force);
             }
             _ => panic!("parsed to the wrong subcommand"),
+        }
+    }
+
+    /// `--restore` stands alone: it parses without function/key, refuses to
+    /// combine with the binding flags, and only accepts the two documented
+    /// modes.
+    #[test]
+    fn map_restore_parses_alone_and_rejects_bind_flags() {
+        let cli =
+            Cli::try_parse_from(["ksx", "map", "--preset", "IPAC P1", "--restore", "defaults"])
+                .unwrap();
+        match cli.command {
+            Command::Map {
+                function,
+                key,
+                restore,
+                ..
+            } => {
+                assert_eq!(function, None);
+                assert_eq!(key, None);
+                assert_eq!(restore.as_deref(), Some("defaults"));
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+        assert!(Cli::try_parse_from([
+            "ksx",
+            "map",
+            "--preset",
+            "P",
+            "--restore",
+            "session-backup"
+        ])
+        .is_ok());
+        for bad in [
+            vec![
+                "ksx",
+                "map",
+                "--preset",
+                "P",
+                "--restore",
+                "defaults",
+                "--function",
+                "A",
+            ],
+            vec![
+                "ksx",
+                "map",
+                "--preset",
+                "P",
+                "--restore",
+                "defaults",
+                "--key",
+                "G",
+            ],
+            vec!["ksx", "map", "--preset", "P", "--restore", "everything"],
+        ] {
+            assert!(Cli::try_parse_from(bad.clone()).is_err(), "{bad:?}");
         }
     }
 

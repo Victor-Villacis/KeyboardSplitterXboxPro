@@ -80,6 +80,15 @@ impl ksx_studio::ControlSource for PipeControlSource {
         learn_request(serde_json::json!({ "verb": "learn-cancel" }))
     }
 
+    fn restore(&self, preset: &str, mode: &str) -> Result<String, String> {
+        action(serde_json::json!({
+            "verb": "map-restore",
+            "preset": preset,
+            "mode": mode,
+            "reload": true,
+        }))
+    }
+
     fn bind(&self, request: &BindRequest) -> BindOutcome {
         let mut wire = serde_json::json!({
             "verb": "map",

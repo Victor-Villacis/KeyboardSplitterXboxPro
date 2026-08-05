@@ -1,5 +1,11 @@
-import { activateIslands } from "@getforma/core";
+import { activateIslands, createUnownedRoot, untrack } from "@getforma/core";
 import { fetchJSON } from "@getforma/core/http";
+
+// Dogfood ledger #13 workaround — same install as map.ts (see there and
+// build.mjs): re-toggled show branches are materialized through an unowned
+// root so their bindings survive the show effect's re-runs.
+(globalThis as unknown as Record<string, unknown>).__ksxShowBranch = (make: () => unknown) =>
+  createUnownedRoot(() => untrack(make));
 // The compiler's island-first entry pattern (parseEntryPoint): the imported
 // `*Page` component NOT in the activateIslands registry is the SSR root.
 // StatusPage never runs in the browser — esbuild tree-shakes it — but this

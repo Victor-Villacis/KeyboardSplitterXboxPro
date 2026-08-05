@@ -11,8 +11,9 @@ import { h, createSignal, createList, createShow } from "@getforma/core";
 //
 // Layout per PadForge's lesson (docs/research/padforge-ui-lessons.md):
 // chrome minimal, CONTROLLER HUGE. The art (Gamepad-Asset-Pack, MIT, by
-// AL2009man — vendored, see ../art/README.md) fills the bottom of a
-// fixed-aspect stage; the top band is a shoulder shelf for LB/RB/LT/RT.
+// AL2009man — vendored + recolored by build.mjs, see ../art/README.md) fills
+// the bottom of a fixed-aspect stage; the top band holds the LB/RB/LT/RT
+// chips, stacked trigger-over-bumper and anchored to the body silhouette.
 // Every mappable control is a positioned hit-zone <button data-fn=…> from
 // the ZONES tables below (authored from ../art/extents.mjs output — the
 // PadForge rule: derive layout from art with a script). Zones are PURE HIT
@@ -93,6 +94,8 @@ interface ZoneRow {
   cls: string;
   style: string;
   title: string;
+  /// The on-zone binding tag ("" for unbound — CSS hides the empty pill).
+  tag: string;
 }
 
 interface LegendRow {
@@ -114,10 +117,10 @@ interface LegendRow {
 type ZoneDef = [string, string, number, number, number, number, string];
 
 const ZONE_XBOX: ZoneDef[] = [
-  ["lt", "LT", 12.0, 6.5, 11.5, 9.5, "shoulder"],
-  ["lb", "LB", 25.5, 6.5, 11.5, 9.5, "shoulder"],
-  ["rb", "RB", 74.5, 6.5, 11.5, 9.5, "shoulder"],
-  ["rt", "RT", 88.0, 6.5, 11.5, 9.5, "shoulder"],
+  ["lt", "LT", 31.0, 4.6, 10.0, 5.2, "trigger"],
+  ["lb", "LB", 34.0, 10.9, 11.0, 5.2, "bumper"],
+  ["rb", "RB", 66.0, 10.9, 11.0, 5.2, "bumper"],
+  ["rt", "RT", 69.0, 4.6, 10.0, 5.2, "trigger"],
   ["Y", "Y", 75.2, 31.1, 7.2, 8.4, "round"],
   ["B", "B", 82.0, 39.6, 7.2, 8.4, "round"],
   ["A", "A", 75.3, 48.3, 7.2, 8.4, "round"],
@@ -142,10 +145,10 @@ const ZONE_XBOX: ZoneDef[] = [
 ];
 
 const ZONE_DS4: ZoneDef[] = [
-  ["lt", "L2", 8.0, 6.5, 10.0, 9.5, "shoulder"],
-  ["lb", "L1", 20.5, 6.5, 10.0, 9.5, "shoulder"],
-  ["rb", "R1", 79.5, 6.5, 10.0, 9.5, "shoulder"],
-  ["rt", "R2", 92.0, 6.5, 10.0, 9.5, "shoulder"],
+  ["lt", "L2", 17.0, 4.6, 9.5, 5.2, "trigger"],
+  ["lb", "L1", 19.5, 10.9, 10.5, 5.2, "bumper"],
+  ["rb", "R1", 80.5, 10.9, 10.5, 5.2, "bumper"],
+  ["rt", "R2", 83.0, 4.6, 9.5, 5.2, "trigger"],
   ["Y", "△", 81.2, 29.2, 7.0, 9.0, "round"],
   ["B", "○", 88.4, 38.8, 7.0, 9.0, "round"],
   ["A", "✕", 81.3, 48.1, 7.0, 9.0, "round"],
@@ -204,6 +207,10 @@ const [modalConflict, setModalConflict] = createSignal(false);
 const [slotTabs, setSlotTabs] = createSignal<SlotTab[]>([]);
 const [zones, setZones] = createSignal<ZoneRow[]>([]);
 const [legendRows, setLegendRows] = createSignal<LegendRow[]>([]);
+/** The preset-actions card's class: "card pactions" when the daemon can
+ *  restore, "card pactions off" (inert look, clicks flash the reason) when
+ *  not. A class string, not a show — the card never unmounts. */
+const [actionsCls, setActionsCls] = createSignal("card pactions off");
 
 // ── Client-side selection state (map.ts drives it) ─────────────────────────
 
@@ -273,13 +280,16 @@ function zoneRows(slot: MapperSlot): ZoneRow[] {
   const table = isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
   return table.map(([fn, , cx, cy, w, h, kind]) => {
     const key = keyTag(slot, fn);
+    // z-unbound hides the tag pill via CSS: `:empty` cannot work, the SSR
+    // text slot leaves marker nodes inside the span.
     return {
       fn,
-      cls: `zone z-${kind}${fn === hotFn ? " z-hot" : ""}`,
+      cls: `zone z-${kind}${key === "—" ? " z-unbound" : ""}${fn === hotFn ? " z-hot" : ""}`,
       style:
         `left:${(cx - w / 2).toFixed(1)}%;top:${(cy - h / 2).toFixed(1)}%;` +
         `width:${w.toFixed(1)}%;height:${h.toFixed(1)}%`,
       title: `${fn} — ${key}`,
+      tag: key === "—" ? "" : key,
     };
   });
 }
@@ -362,6 +372,7 @@ export function applyMap(p: MapPayload): void {
   setReasonLine(reason(p));
   setReadOnly(!live);
   setCanLearn(live);
+  setActionsCls(p.session.reachable ? "card pactions" : "card pactions off");
   setArtXbox(slot !== null && !isPlaystation(slot.persona));
   setArtDs4(slot !== null && isPlaystation(slot.persona));
 
@@ -377,6 +388,7 @@ export function applyMapUnreachable(): void {
   setReasonLine("ksx-studio not responding — retrying every 2 s");
   setReadOnly(true);
   setCanLearn(false);
+  setActionsCls("card pactions off");
   setPillRunning(false);
   setPillIdle(false);
   setPillDown(true);
@@ -522,14 +534,18 @@ export function MapIsland() {
                   () => zones(),
                   (z) => z.fn + "|" + z.cls + "|" + z.style + "|" + z.title,
                   (z) =>
-                    h("button", {
-                      class: z.cls,
-                      style: z.style,
-                      "data-fn": z.fn,
-                      type: "button",
-                      title: z.title,
-                      "aria-label": z.title,
-                    }),
+                    h(
+                      "button",
+                      {
+                        class: z.cls,
+                        style: z.style,
+                        "data-fn": z.fn,
+                        type: "button",
+                        title: z.title,
+                        "aria-label": z.title,
+                      },
+                      h("span", { class: "ztag" }, z.tag),
+                    ),
                 ),
               ),
             ),
@@ -552,14 +568,18 @@ export function MapIsland() {
                   () => zones(),
                   (z) => z.fn + "|" + z.cls + "|" + z.style + "|" + z.title,
                   (z) =>
-                    h("button", {
-                      class: z.cls,
-                      style: z.style,
-                      "data-fn": z.fn,
-                      type: "button",
-                      title: z.title,
-                      "aria-label": z.title,
-                    }),
+                    h(
+                      "button",
+                      {
+                        class: z.cls,
+                        style: z.style,
+                        "data-fn": z.fn,
+                        type: "button",
+                        title: z.title,
+                        "aria-label": z.title,
+                      },
+                      h("span", { class: "ztag" }, z.tag),
+                    ),
                 ),
               ),
             ),
@@ -586,6 +606,37 @@ export function MapIsland() {
                 h("span", { class: "llabel" }, l.label),
                 h("span", { class: "lkey" }, l.key),
               ),
+          ),
+        ),
+      ),
+      // ── Preset actions: save semantics + the two restore safety nets.
+      // Always rendered (a class string flips the inert look — never a
+      // show, so its bindings survive; ledger #13). Buttons share map.ts's
+      // data-act delegation; each confirms before the pipe verb. ──────────
+      h(
+        "section",
+        { class: () => actionsCls() },
+        h("h2", null, "Preset"),
+        h(
+          "p",
+          { class: "savenote" },
+          "Bindings save to the preset file immediately — there is no separate ",
+          "Save. A running session hot-reloads on each save. Restore points: the ",
+          "built-in default layout, or the session-start backup taken before this ",
+          "daemon session's first change.",
+        ),
+        h(
+          "div",
+          { class: "pactrow" },
+          h(
+            "button",
+            { class: "btn btn-row", "data-act": "restore-backup", type: "button" },
+            "Undo this session",
+          ),
+          h(
+            "button",
+            { class: "btn btn-row", "data-act": "restore-defaults", type: "button" },
+            "Restore built-in defaults",
           ),
         ),
       ),

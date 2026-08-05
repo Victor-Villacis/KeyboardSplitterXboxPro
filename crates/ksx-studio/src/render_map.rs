@@ -7,8 +7,10 @@
 //!
 //! The controller art (Gamepad-Asset-Pack, MIT — see `studio-ui/art/README.md`)
 //! is an `<img>` filling the bottom `ART_SHARE` of a fixed-aspect "stage";
-//! the top band is a shoulder shelf for LB/RB/LT/RT, which the icon art does
-//! not draw. Every mappable control is a HIT ZONE: an absolutely positioned
+//! the top band holds the LB/RB/LT/RT chips (the icon art does not draw
+//! shoulders), stacked trigger-over-bumper and visually anchored to the body
+//! silhouette below. Every mappable control is a HIT ZONE: an absolutely
+//! positioned
 //! `<button data-fn=…>` from the [`ZONE_XBOX`]/[`ZONE_DS4`] tables — a PURE
 //! hit area (transparent, no inline text; the art is the label and the
 //! `title` tooltip names fn + binding). The readable truth is the bindings
@@ -20,8 +22,9 @@
 //!
 //! Zone coordinates are STAGE percentages, authored from the art's real
 //! geometry (`studio-ui/art/extents.mjs` — the PadForge lesson: derive layout
-//! from art with a script, never trace by eye) plus hand placement for
-//! controls the icons do not draw (start/back/guide, shoulders). The tables
+//! from art with a script, never trace by eye) plus hand placement for the
+//! shoulders and the small center buttons — which `build.mjs` now also draws
+//! into the recolored art at the same coordinates. The tables
 //! are mirrored in `studio-ui/src/MapIsland.ts` (client re-derivation per
 //! poll — the established applyStatus pattern); `zone_tables_cover_every_
 //! mappable_function` pins this side.
@@ -67,8 +70,8 @@ const MAP_SHOW_ORDER: [&str; 12] = [
 const MAP_SHOW_COUNT: usize = MAP_SHOW_ORDER.len();
 
 // The art `<img>` occupies the bottom 86% of the stage (`.padart` in
-// studio.css); the top band is the shoulder shelf. Zone Y values below are
-// authored as `14 + artY·0.86`.
+// studio.css); the top band holds the shoulder chips. Zone Y values below
+// are authored as `14 + artY·0.86`.
 
 /// One hit zone: canonical function, on-art label, stage-percent box, css
 /// variant.
@@ -80,7 +83,7 @@ pub(crate) struct Zone {
     pub cy: f32,
     pub w: f32,
     pub h: f32,
-    /// CSS variant class: round | chip | shoulder.
+    /// CSS variant class: round | chip | trigger | bumper.
     pub kind: &'static str,
 }
 
@@ -114,11 +117,13 @@ const fn zone(
 /// stick-direction wedges RING the stick with the L3/R3 click zone as the
 /// 8×10 center hub — adjacent, never covering it.
 pub(crate) const ZONE_XBOX: [Zone; 25] = [
-    // Shoulder shelf (not drawn in the icon art): triggers outboard.
-    zone("lt", "LT", 12.0, 6.5, 11.5, 9.5, "shoulder"),
-    zone("lb", "LB", 25.5, 6.5, 11.5, 9.5, "shoulder"),
-    zone("rb", "RB", 74.5, 6.5, 11.5, 9.5, "shoulder"),
-    zone("rt", "RT", 88.0, 6.5, 11.5, 9.5, "shoulder"),
+    // Shoulders (not drawn in the icon art): slim chips stacked trigger-over-
+    // bumper like the real pad, anchored just above the body's top plateau
+    // (stage x ≈ 32..68) — .z-bumper drops a connector line onto the body.
+    zone("lt", "LT", 31.0, 4.6, 10.0, 5.2, "trigger"),
+    zone("lb", "LB", 34.0, 10.9, 11.0, 5.2, "bumper"),
+    zone("rb", "RB", 66.0, 10.9, 11.0, 5.2, "bumper"),
+    zone("rt", "RT", 69.0, 4.6, 10.0, 5.2, "trigger"),
     // Face cluster (diamond — boxes trimmed to the drawn Ø7.3×9.1 circles so
     // the diagonal neighbours stay disjoint).
     zone("Y", "Y", 75.2, 31.1, 7.2, 8.4, "round"),
@@ -155,10 +160,12 @@ pub(crate) const ZONE_XBOX: [Zone; 25] = [
 /// stick wedges ring the L3/R3 hub, dpad arrow boxes sit on the drawn arrows
 /// pushed slightly outward so the diagonal pairs never intersect.
 pub(crate) const ZONE_DS4: [Zone; 25] = [
-    zone("lt", "L2", 8.0, 6.5, 10.0, 9.5, "shoulder"),
-    zone("lb", "L1", 20.5, 6.5, 10.0, 9.5, "shoulder"),
-    zone("rb", "R1", 79.5, 6.5, 10.0, 9.5, "shoulder"),
-    zone("rt", "R2", 92.0, 6.5, 10.0, 9.5, "shoulder"),
+    // Shoulders: same trigger-over-bumper stack as ZONE_XBOX, anchored on the
+    // DS4 body's raised humps (stage x ≈ 19 / 81, where L1/R1 really sit).
+    zone("lt", "L2", 17.0, 4.6, 9.5, 5.2, "trigger"),
+    zone("lb", "L1", 19.5, 10.9, 10.5, 5.2, "bumper"),
+    zone("rb", "R1", 80.5, 10.9, 10.5, 5.2, "bumper"),
+    zone("rt", "R2", 83.0, 4.6, 9.5, 5.2, "trigger"),
     // Face cluster (✕○△□ mapped onto A/B/Y/X), trimmed to the Ø6.9×9.2
     // drawn circles.
     zone("Y", "△", 81.2, 29.2, 7.0, 9.0, "round"),
@@ -225,11 +232,14 @@ fn zone_rows(slot: &MapperSlot) -> SlotValue {
             .iter()
             .map(|z| {
                 let key = key_tag(slot, z.fn_name);
+                // z-unbound hides the tag pill via CSS (`:empty` cannot: the
+                // SSR text slot leaves marker nodes inside the span).
+                let unbound = if key == "—" { " z-unbound" } else { "" };
                 SlotValue::Object(vec![
                     ("fn".to_owned(), SlotValue::Text(z.fn_name.to_owned())),
                     (
                         "cls".to_owned(),
-                        SlotValue::Text(format!("zone z-{}", z.kind)),
+                        SlotValue::Text(format!("zone z-{}{unbound}", z.kind)),
                     ),
                     (
                         "style".to_owned(),
@@ -244,6 +254,10 @@ fn zone_rows(slot: &MapperSlot) -> SlotValue {
                     (
                         "title".to_owned(),
                         SlotValue::Text(format!("{} — {}", z.fn_name, key)),
+                    ),
+                    (
+                        "tag".to_owned(),
+                        SlotValue::Text(if key == "—" { String::new() } else { key }),
                     ),
                 ])
             })
@@ -389,6 +403,13 @@ fn scalar_slots(payload: &MapPayload, selected: Option<&MapperSlot>) -> serde_js
         "conflictLine": "",
         "savedLine": "",
         "generatedAt": payload.mapper.generated_at,
+        // The preset-actions card: a class string, never a show (ledger #13
+        // — its bindings must survive; the off look is just a class).
+        "actionsCls": if payload.session.reachable {
+            "card pactions"
+        } else {
+            "card pactions off"
+        },
     })
 }
 
@@ -659,9 +680,9 @@ mod tests {
     }
 
     /// The big one: real bindings from the payload land as key tags in the
-    /// SSR LEGEND, the zones render as text-free hit areas positioned by the
-    /// table, the right art is referenced, and the slot strip shows the
-    /// context.
+    /// SSR LEGEND and as the small on-zone TAGS (v6 — both readers), the
+    /// zones are positioned by the table, the right art is referenced, and
+    /// the slot strip shows the context.
     #[test]
     fn render_puts_bindings_in_the_legend_and_text_free_zones_on_stage() {
         let out = render_map(&page(), &sample());
@@ -675,14 +696,49 @@ mod tests {
             "{}",
             out.html
         );
-        // Zones are pure hit areas: data-fn + table-derived position + the
-        // fn—key tooltip, but NO inline label/key text (the old crammed-chip
-        // layout must not come back).
+        // Zones: data-fn + table-derived position + the fn—key tooltip +
+        // the small binding tag — but never the old crammed label+key chip
+        // (zlabel/zkey must not come back; unbound tags render EMPTY, not
+        // "—").
         assert!(out.html.contains(r#"data-fn="A""#), "{}", out.html);
         assert!(out.html.contains(r#"data-fn="dpad.up""#), "{}", out.html);
         assert!(out.html.contains(r#"title="A — G""#), "{}", out.html);
+        assert!(out.html.contains(r#"class="ztag""#), "{}", out.html);
+        assert!(
+            !out.html.contains(r#"class="ztag">—<"#),
+            "unbound zones must render an empty tag, not a dash: {}",
+            out.html
+        );
         assert!(!out.html.contains("zlabel"), "zone inline label came back");
         assert!(!out.html.contains("zkey"), "zone inline key tag came back");
+        // The preset-actions card: save semantics + both safety nets, live
+        // (the daemon is reachable in the sample).
+        assert!(
+            out.html.contains(r#"class="card pactions""#),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains("save to the preset file immediately"),
+            "{}",
+            out.html
+        );
+        assert!(out.html.contains("Undo this session"), "{}", out.html);
+        assert!(
+            out.html.contains("Restore built-in defaults"),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains(r#"data-act="restore-backup""#),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains(r#"data-act="restore-defaults""#),
+            "{}",
+            out.html
+        );
         // The legend carries the readable truth: each zone appears a second
         // time as a legend row (same data-fn → same click action), with the
         // binding as its key tag (A→G, B→F, lx.min→M from the sample).
@@ -755,6 +811,12 @@ mod tests {
         // Zones still render (read-only browsing), bindings included.
         assert!(out.html.contains(r#"data-fn="A""#), "{}", out.html);
         assert!(out.html.contains(">G<"), "{}", out.html);
+        // The preset-actions card renders inert, never hidden.
+        assert!(
+            out.html.contains(r#"class="card pactions off""#),
+            "{}",
+            out.html
+        );
     }
 
     /// A running session is read-only too (the learner cannot hear captured

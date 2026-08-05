@@ -88,6 +88,26 @@ The M7 mapper slice adds four verbs on the same channel:
 ← {"ok":true,"state":"cancelled", …}
 ```
 
+The mapper's preset safety nets (2026-08-05) ride the same channel:
+
+```
+→ {"verb":"map-restore","preset":"IPAC P1","mode":"defaults","reload":true}
+← {"ok":true,"message":"\"IPAC P1\": bindings restored to the built-in defaults — …",
+   "path":"C:\\…\\presets\\IPAC P1.toml","preset":"IPAC P1","reloaded":false}
+→ {"verb":"map-restore","preset":"IPAC P1","mode":"session-backup"}
+← {"ok":false,"error":"no session backup for \"IPAC P1\" — nothing has been
+   mapped through the daemon this session, so there is nothing to undo"}
+```
+
+`map-restore` (writer: `mapping.rs::restore`; CLI face: `ksx map --preset …
+--restore defaults|session-backup`): `"defaults"` rewrites the preset's
+bindings to `ksx_core::Preset::builtin_default()` keeping its name;
+`"session-backup"` restores `<preset file>.session-bak` — the snapshot the
+daemon's `map` writer takes before its FIRST write to that preset in a
+daemon lifetime ("undo this session"; `pipe.rs::map_fn` owns the
+once-per-lifetime set). A corrupt backup is refused, never written. Same
+`"reload"` semantics as `map`.
+
 `map` writes through the SAME `ksx-app/src/mapping.rs::apply` the CLI verb
 uses — replace-per-function, `"None"` placeholder on clear, canonical TOML
 rewrite (comments do not survive; the store's atomic-write trade), CONFLICT

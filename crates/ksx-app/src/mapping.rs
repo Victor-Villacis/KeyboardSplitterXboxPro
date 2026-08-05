@@ -124,7 +124,7 @@ impl AppliedMap {
     }
 }
 
-/// Why an [`apply`] refused or failed.
+/// Why an [`apply`] (or [`restore`]) refused or failed.
 #[derive(Debug)]
 pub enum MapError {
     /// No preset with that name — nothing is guessed, nothing is created.
@@ -138,6 +138,17 @@ pub enum MapError {
     Conflicts {
         key: String,
         conflicts: Vec<MapConflict>,
+    },
+    /// `restore session-backup` with no backup on disk: nothing was mapped
+    /// through the daemon this session, so there is nothing to undo.
+    NoSessionBackup {
+        preset: String,
+    },
+    /// The session backup file exists but does not parse/validate — restoring
+    /// it would trade a good file for a bad one, so it is refused.
+    BadSessionBackup {
+        preset: String,
+        reason: String,
     },
     Config(ConfigError),
 }
@@ -177,6 +188,16 @@ impl std::fmt::Display for MapError {
                      stolen; other presets are never edited)"
                 )
             }
+            MapError::NoSessionBackup { preset } => write!(
+                f,
+                "no session backup for \"{preset}\" — nothing has been mapped through the \
+                 daemon this session, so there is nothing to undo"
+            ),
+            MapError::BadSessionBackup { preset, reason } => write!(
+                f,
+                "the session backup for \"{preset}\" is unreadable ({reason}) — refusing to \
+                 replace a good preset with it"
+            ),
             MapError::Config(err) => write!(f, "{err}"),
         }
     }
@@ -257,6 +278,128 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         key: key.map(|k| k.name().to_owned()),
         stolen_from,
         overridden,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Restore: the mapper's two safety nets (docs/CONTROL-SURFACE.md
+// "map-restore"). Both go through the same store writer as `apply` — no
+// private editing path.
+// ---------------------------------------------------------------------------
+
+/// Which safety net [`restore`] pulls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreKind {
+    /// Rewrite the preset's bindings to `ksx_core::Preset::builtin_default()`
+    /// (the classic KeyboardSplitter layout), keeping the preset's name.
+    Defaults,
+    /// Rewrite the preset from its `<file>.session-bak` — the snapshot
+    /// [`take_session_backup`] made before the daemon's FIRST map write to
+    /// that preset this daemon lifetime ("undo this session").
+    SessionBackup,
+}
+
+/// What a successful [`restore`] did.
+#[derive(Clone, Debug)]
+pub struct AppliedRestore {
+    pub path: PathBuf,
+    pub preset: String,
+    pub kind: RestoreKind,
+}
+
+impl AppliedRestore {
+    /// The one-line confirmation every surface prints.
+    pub fn message(&self) -> String {
+        match self.kind {
+            RestoreKind::Defaults => {
+                format!(
+                    "\"{}\": bindings restored to the built-in defaults",
+                    self.preset
+                )
+            }
+            RestoreKind::SessionBackup => format!(
+                "\"{}\": bindings restored from the session-start backup",
+                self.preset
+            ),
+        }
+    }
+}
+
+/// `<preset file>.session-bak`, next to the preset itself.
+pub fn session_backup_path(store: &Store, preset_name: &str) -> Result<PathBuf, MapError> {
+    let path = store.preset_path(preset_name)?;
+    Ok(PathBuf::from(format!("{}.session-bak", path.display())))
+}
+
+/// Snapshot the preset file to `<file>.session-bak` — called by the daemon's
+/// map writer before its FIRST write to that preset in this daemon lifetime
+/// (the caller keeps the once-per-lifetime set; this function just copies).
+/// A missing preset file is not an error here: `apply` will name it properly.
+pub fn take_session_backup(store: &Store, preset_name: &str) -> Result<(), MapError> {
+    let Ok(source) = store.preset_path(preset_name) else {
+        return Ok(());
+    };
+    if !source.exists() {
+        return Ok(());
+    }
+    let backup = PathBuf::from(format!("{}.session-bak", source.display()));
+    std::fs::copy(&source, &backup).map_err(|err| MapError::BadSessionBackup {
+        preset: preset_name.to_owned(),
+        reason: format!("could not write {}: {err}", backup.display()),
+    })?;
+    Ok(())
+}
+
+/// Restore a preset's bindings from one of the two safety nets. The write is
+/// canonical (same serializer as [`apply`]); the preset must already exist —
+/// restore edits presets, it never creates them.
+pub fn restore(
+    store: &Store,
+    preset_name: &str,
+    kind: RestoreKind,
+) -> Result<AppliedRestore, MapError> {
+    let file = load_preset_by_name(store, preset_name)?;
+    let rewritten = match kind {
+        RestoreKind::Defaults => PresetFile::from_core(&ksx_core::Preset {
+            name: file.name.clone(),
+            entries: ksx_core::Preset::builtin_default().entries,
+            protected: false,
+        }),
+        RestoreKind::SessionBackup => {
+            let backup = session_backup_path(store, preset_name)?;
+            if !backup.exists() {
+                return Err(MapError::NoSessionBackup {
+                    preset: preset_name.to_owned(),
+                });
+            }
+            let text =
+                std::fs::read_to_string(&backup).map_err(|err| MapError::BadSessionBackup {
+                    preset: preset_name.to_owned(),
+                    reason: err.to_string(),
+                })?;
+            let parsed: PresetFile =
+                toml::from_str(&text).map_err(|err| MapError::BadSessionBackup {
+                    preset: preset_name.to_owned(),
+                    reason: err.to_string(),
+                })?;
+            // Round through core so a hand-damaged backup is validated the
+            // same way every other write is.
+            let core = parsed.to_core().map_err(|err| MapError::BadSessionBackup {
+                preset: preset_name.to_owned(),
+                reason: err.to_string(),
+            })?;
+            PresetFile::from_core(&ksx_core::Preset {
+                name: file.name.clone(),
+                entries: core.entries,
+                protected: false,
+            })
+        }
+    };
+    let path = store.save_preset(&rewritten)?;
+    Ok(AppliedRestore {
+        path,
+        preset: file.name,
+        kind,
     })
 }
 
@@ -632,6 +775,82 @@ preset = "Other"
         assert_eq!(resolve_key("enter").unwrap(), Key::Enter);
         assert_eq!(resolve_key("Left").unwrap(), Key::Left);
         assert!(resolve_key("not a key").is_err());
+    }
+
+    #[test]
+    fn restore_defaults_rewrites_the_bindings_and_keeps_the_name() {
+        let root = TempRoot::new("restore-defaults");
+        let store = root.store();
+        preset(&store, "P1", "A = \"Q\"\nB = \"W\"\n");
+
+        let applied = restore(&store, "P1", RestoreKind::Defaults).unwrap();
+        assert_eq!(applied.preset, "P1");
+        assert!(applied.message().contains("built-in defaults"));
+        let reloaded = store.load_preset("P1").unwrap().unwrap().value;
+        assert_eq!(reloaded.name, "P1", "name survives a defaults restore");
+        let defaults = PresetFile::from_core(&ksx_core::Preset {
+            name: "P1".into(),
+            entries: ksx_core::Preset::builtin_default().entries,
+            protected: false,
+        });
+        assert_eq!(
+            reloaded.bindings, defaults.bindings,
+            "bindings are exactly the built-in default layout"
+        );
+    }
+
+    #[test]
+    fn restore_refuses_unknown_presets() {
+        let root = TempRoot::new("restore-unknown");
+        let store = root.store();
+        assert!(matches!(
+            restore(&store, "Nope", RestoreKind::Defaults),
+            Err(MapError::UnknownPreset { .. })
+        ));
+    }
+
+    #[test]
+    fn session_backup_round_trip_undoes_later_writes() {
+        let root = TempRoot::new("session-bak");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\nB = \"D\"\n");
+
+        // No backup yet: restore says so and writes nothing.
+        let err = restore(&store, "P1", RestoreKind::SessionBackup).unwrap_err();
+        assert!(matches!(err, MapError::NoSessionBackup { .. }), "{err:?}");
+        assert!(err.to_string().contains("nothing to undo"), "{err}");
+
+        // The daemon's first-write snapshot, then two edits.
+        take_session_backup(&store, "P1").unwrap();
+        apply(&store, &spec("P1", "A", Some("G"), false)).unwrap();
+        apply(&store, &spec("P1", "B", None, false)).unwrap();
+        let edited = std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap();
+        assert!(edited.contains("A = \"G\""), "{edited}");
+        assert!(edited.contains("B = \"None\""), "{edited}");
+
+        // Undo this session: both edits gone.
+        let applied = restore(&store, "P1", RestoreKind::SessionBackup).unwrap();
+        assert!(applied.message().contains("session-start backup"));
+        let restored = std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap();
+        assert!(restored.contains("A = \"S\""), "{restored}");
+        assert!(restored.contains("B = \"D\""), "{restored}");
+    }
+
+    #[test]
+    fn a_corrupt_session_backup_is_refused_not_written() {
+        let root = TempRoot::new("session-bak-corrupt");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\n");
+        std::fs::write(
+            session_backup_path(&store, "P1").unwrap(),
+            "this is not a preset",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap();
+        let err = restore(&store, "P1", RestoreKind::SessionBackup).unwrap_err();
+        assert!(matches!(err, MapError::BadSessionBackup { .. }), "{err:?}");
+        let after = std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap();
+        assert_eq!(before, after, "refusal must not touch the preset");
     }
 
     #[test]

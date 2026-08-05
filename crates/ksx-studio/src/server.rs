@@ -85,6 +85,7 @@ pub fn serve(
             .route("/api/learn/start", post(api_learn_start))
             .route("/api/learn/cancel", post(api_learn_cancel))
             .route("/api/bind", post(api_bind))
+            .route("/api/preset/restore", post(api_preset_restore))
             // Canon helper: correct no-cache + Service-Worker-Allowed
             // headers for free (replaced a hand-rolled handler).
             .route("/sw.js", get(forma_server::sw::serve_sw::<Assets>))
@@ -101,6 +102,31 @@ pub fn serve(
 #[derive(Deserialize)]
 struct PageQuery {
     flash: Option<String>,
+}
+
+/// Dogfood ledger #13: forma-server's CSP nonce-locks `style-src`, and per
+/// the CSP spec a nonce (or hash) in that directive makes browsers drop
+/// `'unsafe-inline'` semantics — every inline `style=""` ATTRIBUTE is then
+/// ignored. But forma's own compiled bindings EMIT style attributes (the
+/// mapper's zone geometry `style:` items, the countdown bar's `width:`),
+/// so under the stock CSP all 25 hit zones collapse into a 2 px pile at the
+/// stage's top-left corner. Until upstream grows an attribute story, rewrite
+/// the directive to `style-src 'self' 'unsafe-inline'`: scripts stay
+/// nonce-locked (the actual XSS boundary); inline style on a localhost-only,
+/// fully-escaped page is the accepted trade-off. The personality `<style>`
+/// keeps working — 'unsafe-inline' covers elements once the nonce is gone.
+fn relax_style_src(csp: &str) -> String {
+    csp.split(';')
+        .map(str::trim)
+        .map(|directive| {
+            if directive.starts_with("style-src") {
+                "style-src 'self' 'unsafe-inline'"
+            } else {
+                directive
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// One fresh (snapshot, session) pair. Collectors hit the registry, the
@@ -139,7 +165,7 @@ async fn status_page(
             ),
             (
                 header::CONTENT_SECURITY_POLICY,
-                HeaderValue::from_str(&out.csp)
+                HeaderValue::from_str(&relax_style_src(&out.csp))
                     .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'")),
             ),
             (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
@@ -211,7 +237,7 @@ async fn map_page(State(state): State<Arc<AppState>>, Query(query): Query<MapQue
             ),
             (
                 header::CONTENT_SECURITY_POLICY,
-                HeaderValue::from_str(&out.csp)
+                HeaderValue::from_str(&relax_style_src(&out.csp))
                     .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'")),
             ),
             (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
@@ -270,6 +296,43 @@ async fn api_bind(
     axum::Json(request): axum::Json<BindRequest>,
 ) -> Response {
     control_json(state, move |control| control.bind(&request)).await
+}
+
+#[derive(Deserialize)]
+struct RestoreRequest {
+    preset: String,
+    /// `"defaults"` or `"session-backup"` — validated here so a typo is a
+    /// 200-with-error the page can flash, not a daemon round-trip.
+    mode: String,
+}
+
+/// POST /api/preset/restore — the mapper's preset safety nets, one pipe
+/// `map-restore` per call (reload always requested: the daemon only bounces a
+/// RUNNING session). Answers `{ok, message}` / `{ok:false, error}`.
+async fn api_preset_restore(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<RestoreRequest>,
+) -> Response {
+    if request.mode != "defaults" && request.mode != "session-backup" {
+        return (
+            [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "unknown restore mode \"{}\" (defaults | session-backup)",
+                    request.mode
+                ),
+            })),
+        )
+            .into_response();
+    }
+    control_json(state, move |control| {
+        match control.restore(&request.preset, &request.mode) {
+            Ok(message) => serde_json::json!({ "ok": true, "message": message }),
+            Err(error) => serde_json::json!({ "ok": false, "error": error }),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -340,6 +403,29 @@ fn urlencode(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ledger #13: the nonce must LEAVE style-src (its presence makes
+    /// browsers ignore 'unsafe-inline', killing every style="" attribute the
+    /// compiled bindings emit), while script-src keeps its nonce untouched.
+    #[test]
+    fn relax_style_src_swaps_the_nonce_for_unsafe_inline_styles_only() {
+        let stock = "default-src 'none'; script-src 'nonce-abc123' 'self'; \
+                     style-src 'nonce-abc123' 'self'; connect-src 'self'";
+        let relaxed = relax_style_src(stock);
+        assert!(
+            relaxed.contains("style-src 'self' 'unsafe-inline'"),
+            "{relaxed}"
+        );
+        assert!(
+            !relaxed.contains("style-src 'nonce-"),
+            "a style-src nonce would disable 'unsafe-inline': {relaxed}"
+        );
+        assert!(
+            relaxed.contains("script-src 'nonce-abc123' 'self'"),
+            "scripts must stay nonce-locked: {relaxed}"
+        );
+        assert!(relaxed.contains("default-src 'none'"), "{relaxed}");
+    }
 
     struct NullSource;
     impl StatusSource for NullSource {

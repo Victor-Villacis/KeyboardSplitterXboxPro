@@ -63,6 +63,7 @@ struct ScriptedControl {
     started_with: std::sync::Mutex<Option<Option<String>>>,
     learning: AtomicBool,
     bound_with: std::sync::Mutex<Option<BindRequest>>,
+    restored_with: std::sync::Mutex<Option<(String, String)>>,
 }
 
 impl ScriptedControl {
@@ -73,6 +74,7 @@ impl ScriptedControl {
             started_with: std::sync::Mutex::new(None),
             learning: AtomicBool::new(false),
             bound_with: std::sync::Mutex::new(None),
+            restored_with: std::sync::Mutex::new(None),
         }
     }
 }
@@ -159,6 +161,17 @@ impl ControlSource for ScriptedControl {
         }
     }
 
+    fn restore(&self, preset: &str, mode: &str) -> Result<String, String> {
+        *self.restored_with.lock().unwrap() = Some((preset.to_owned(), mode.to_owned()));
+        if mode == "session-backup" {
+            Err(format!("no session backup for \"{preset}\""))
+        } else {
+            Ok(format!(
+                "\"{preset}\": bindings restored to the built-in defaults"
+            ))
+        }
+    }
+
     fn bind(&self, request: &BindRequest) -> BindOutcome {
         *self.bound_with.lock().unwrap() = Some(request.clone());
         if request.key.as_deref() == Some("G") && !request.force {
@@ -225,6 +238,9 @@ fn start_server(control: Arc<ScriptedControl>) -> SocketAddr {
         }
         fn bind(&self, request: &BindRequest) -> BindOutcome {
             self.0.bind(request)
+        }
+        fn restore(&self, preset: &str, mode: &str) -> Result<String, String> {
+            self.0.restore(preset, mode)
         }
     }
     std::thread::spawn(move || {
@@ -351,12 +367,23 @@ fn the_mapper_page_learn_flow_and_bind_round_trip() {
         page.contains("Gamepad-Asset-Pack (MIT) by AL2009man"),
         "{page}"
     );
+    // Ledger #13(a): the CSP header must allow inline STYLE attributes (the
+    // zone geometry rides them) while scripts stay nonce-locked.
+    let headers = page.split("\r\n\r\n").next().unwrap_or("");
+    assert!(
+        headers.contains("style-src 'self' 'unsafe-inline'"),
+        "{headers}"
+    );
+    assert!(headers.contains("script-src 'nonce-"), "{headers}");
 
-    // The art itself is served with the right type.
+    // The art itself is served with the right type, recolored for the theme
+    // (the palette sheet build.mjs injects) — never the source's black blob.
     let art = get(addr, "/_assets/pad-xbox.svg");
     assert!(art.starts_with("HTTP/1.1 200"), "{art}");
     assert!(art.contains("image/svg+xml"), "{art}");
     assert!(art.contains("<svg"), "{art}");
+    assert!(art.contains("pad-body"), "recolor classes missing: {art}");
+    assert!(!art.contains("fill:#000000"), "source black leaked: {art}");
 
     // /api/map serves the payload the page embeds.
     let api = get(addr, "/api/map");
@@ -409,6 +436,62 @@ fn the_mapper_page_learn_flow_and_bind_round_trip() {
     assert_eq!(bound.function, "B");
     assert!(bound.force);
     assert!(bound.reload);
+
+    // Preset restore: defaults succeeds, session-backup surfaces the honest
+    // "nothing to undo", and a junk mode never reaches the control source.
+    let restored = post_json(
+        addr,
+        "/api/preset/restore",
+        r#"{"preset":"IPAC P1","mode":"defaults"}"#,
+    );
+    let outcome: serde_json::Value = serde_json::from_str(body_of(&restored)).expect("json");
+    assert_eq!(outcome["ok"], true, "{outcome}");
+    assert!(
+        outcome["message"]
+            .as_str()
+            .unwrap()
+            .contains("built-in defaults"),
+        "{outcome}"
+    );
+    assert_eq!(
+        control.restored_with.lock().unwrap().clone(),
+        Some(("IPAC P1".to_owned(), "defaults".to_owned()))
+    );
+
+    let refused = post_json(
+        addr,
+        "/api/preset/restore",
+        r#"{"preset":"IPAC P1","mode":"session-backup"}"#,
+    );
+    let outcome: serde_json::Value = serde_json::from_str(body_of(&refused)).expect("json");
+    assert_eq!(outcome["ok"], false);
+    assert!(
+        outcome["error"]
+            .as_str()
+            .unwrap()
+            .contains("no session backup"),
+        "{outcome}"
+    );
+
+    let junk = post_json(
+        addr,
+        "/api/preset/restore",
+        r#"{"preset":"IPAC P1","mode":"yolo"}"#,
+    );
+    let outcome: serde_json::Value = serde_json::from_str(body_of(&junk)).expect("json");
+    assert_eq!(outcome["ok"], false);
+    assert!(
+        outcome["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown restore mode"),
+        "{outcome}"
+    );
+    assert_eq!(
+        control.restored_with.lock().unwrap().clone(),
+        Some(("IPAC P1".to_owned(), "session-backup".to_owned())),
+        "the junk mode must have been rejected before the control source"
+    );
 }
 
 #[test]

@@ -25,6 +25,9 @@ export function MapPage() {
   const [conflictLine] = createSignal("");
   const [savedLine] = createSignal("");
   const [generatedAt] = createSignal("(no snapshot)");
+  // The preset-actions card renders inert until a payload proves the daemon
+  // reachable (a class string, not a show — ledger #13).
+  const [actionsCls] = createSignal("card pactions off");
   // Booleans behind the createShow pairs (positional show:createShow slots —
   // render_map.rs MAP_SHOW_ORDER pins the document order). Default false:
   // nothing renders until the server says otherwise.
