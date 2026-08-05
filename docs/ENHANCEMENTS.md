@@ -215,3 +215,41 @@ feedback onto their outputs.
 draining `poll_feedback` and speaking the Ultimarc protocol, touching no
 pipeline thread (the same "lossy consumer off to the side" shape as E7's
 monitor). **Post-M7 priority, blocked on the hardware question.**
+
+### E8 update 2026-08-05 — hardware CONFIRMED, LEDBlinky in the picture, generalized to a feedback bus
+
+Victor: the cabinet **has LED-wired buttons**, and **LEDBlinky** (Arzoo's
+arcade LED software — the de-facto standard: per-game button lighting from its
+own controls database, attract modes, native LaunchBox integration) is planned
+for it. That changes the design from "ksx drives a PacLED64 directly" to a
+**coexistence model**:
+
+- **LEDBlinky owns the static layer** — which buttons are lit/active for the
+  current game, attract mode between games. It already knows per-game control
+  panels; re-implementing that database would be madness.
+- **ksx owns the dynamic layer LEDBlinky cannot see** — real-time rumble and
+  player-slot feedback arriving at the virtual pads mid-game. LEDBlinky has no
+  concept of rumble; ksx is the only process holding that stream.
+- Integration options to spike, in order of politeness: (1) drive spare LED
+  channels ksx reserves for itself; (2) momentary overrides through whatever
+  interface LEDBlinky/the LED controller exposes (LEDBlinky has a documented
+  command-line/API surface; the LedWiz/PacLED64 protocols are open); (3) full
+  direct-drive only when LEDBlinky is not running.
+
+**Generalized (Victor: "send it to whatever else"): the feedback consumer is a
+BUS, not a lamp driver.** One consumer thread drains `poll_feedback` and fans
+out to pluggable sinks behind a small trait:
+
+- cabinet LEDs (PacLED64 / Ultimate I/O / via LEDBlinky, above);
+- **OpenRGB** — this PC already has Aura (VID 0B05) and an NZXT Kraken
+  (VID 1E71) on WinUSB; rumble → case/room RGB flash is a spike away via
+  OpenRGB's open SDK server;
+- **ksx Studio** — the same live socket the mapper UI needs; rumble pulses
+  rendered on the on-screen controller (the PadForge live-echo pattern,
+  outbound direction);
+- whatever else earns a sink (OBS overlay, marquee light, audio cue). Sinks
+  are lossy consumers of a lossy stream by contract — a slow sink can never
+  backpressure the engine (same rule as everything else near the pipeline).
+
+Status: **unblocked**, still post-M7 in sequence; the sink trait should be
+designed alongside the Studio live socket since they consume the same stream.
