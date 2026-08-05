@@ -96,3 +96,54 @@ the 3D viewer later — one stream, three consumers.
 - WinUSB-claimed panels can't be learned via RawInput (injected typethrough
   is invisible) — the learn path needs a capture-side tap when M6 migration
   becomes real; recorded in CONTROL-SURFACE.
+
+## The 2026-native layer (what no tool in the field study could do)
+
+The study's tools span 1997–2026, but even the newest think like desktop
+apps. ksx Studio is a web surface backed by an AI-drivable CLI — these are
+the capabilities that stack only for us, ranked by leverage:
+
+1. **Close the loop in the browser: the Gamepad API sees our virtual pads.**
+   Our X360/DS4 targets are real controllers, so `navigator.getGamepads()`
+   in the very page doing the mapping can read them — no socket, no new
+   backend. Press a panel button → ksx translates → the virtual pad changes
+   → the mapper's render lights up. That is END-TO-END verification of the
+   entire product pipeline, drawn on the mapping surface (commandment 2),
+   and it makes Build C's core value buildable TODAY: the physical-side
+   echo still wants the live socket, but the virtual-side echo — the half
+   users actually need to trust the chain — is free. (Caveats: page must be
+   visible, first read needs a user gesture, mapping-order quirks per
+   browser — feature-detect and degrade to socket echo later.)
+2. **AI-assisted mapping (E5 grown up).** Every mapper in the study makes
+   humans do the layout. ksx's CLI verbs + MCP mean an assistant can be a
+   first-class mapping surface: "set P3 and P4 up like P1 but mirrored",
+   "this preset for street fighter — what's wrong?", "map this new panel"
+   → the assistant drives `ksx map`/the wizard and the page shows the
+   result live. The mapper UI and the AI share one control surface by
+   construction — no other tool in the field can say that.
+3. **QR-code handoff.** The status page (cab screen) shows a QR; the phone
+   scans it and lands in the mapper. When LAN mode ships (pairing token,
+   E7), the QR carries the pairing — the 2026 answer to "type this IP on
+   your phone". Zero cost to print the QR now for localhost-forwarded
+   setups; full value at LAN time.
+4. **PWA install.** Manifest + the service worker we already ship → "Add to
+   Home Screen" and the phone-at-cab surface becomes an app with an icon,
+   full-screen, no browser chrome. Cheap; do it in Build A polish.
+5. **Command palette (Ctrl+K).** Every CONTROL-SURFACE verb searchable in
+   one keystroke — start Steam profile, open P2 mapper, restore defaults.
+   The 2026 power-user pattern, and for us it's a thin view over verbs that
+   already exist.
+6. **Multi-surface sync.** Cab TV shows the big render, phone drives the
+   mapping, both fed by the same poller/socket state — presenter mode falls
+   out of the architecture (islands + shared API) rather than being built.
+7. **Platform polish as table stakes**: View Transitions for screen moves,
+   `prefers-reduced-motion` honored, container queries for the phone/TV
+   split, full keyboard-and-pad navigability of the mapper itself (Steam
+   proved config UIs should be drivable from the thing being configured —
+   on a cabinet, that's the panel).
+
+Build placement: #1 lands IN Build C (and pulls Build C earlier — no longer
+socket-blocked for its core); #4/#7 fold into Build A; #3 ships its QR half
+with Build B's wizard (the "new machine" moment); #2 begins as soon as the
+MCP shim (E5) exists — the verbs are already there; #5/#6 ride later Studio
+passes.
