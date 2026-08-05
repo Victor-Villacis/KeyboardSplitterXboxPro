@@ -1,9 +1,10 @@
 // ksx Studio UI build — TS → FMIR + hashed assets into crates/ksx-studio/assets/.
 //
 // Run with plain `node build.mjs` (no tsx needed — see
-// docs/research/forma-spike-1-fmir-compat.md). NEVER add a `tailwind: true`
-// cssEntry: @getforma/build 0.1.8 spawns `npx` via execFileSync without
-// shell:true, which is ENOENT on Windows. Plain-CSS entries only.
+// docs/research/forma-spike-1-fmir-compat.md). Plain-CSS entries only: this
+// page needs no tailwind. (The @getforma/build 0.1.8 Windows bug — `npx`
+// spawned via execFileSync without shell:true, ENOENT — was fixed in 0.1.9,
+// so a `tailwind: true` cssEntry would now work if ever wanted.)
 
 import { build } from "@getforma/build";
 import { readFileSync, writeFileSync, rmSync } from "fs";

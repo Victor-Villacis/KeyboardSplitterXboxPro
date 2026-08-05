@@ -8,16 +8,19 @@ import { h, createSignal, createList, createShow } from "@getforma/core";
 //   the Rust side overwrites it by name per request. The defaults here are
 //   what renders if injection ever misses — keep them honest ("not
 //   collected"), never fake data.
-// - each `createList` becomes a `list:array` slot and each `createShow` a
-//   `show:createShow` slot. The compiler gives EVERY list (and every show)
-//   the same slot name, so the Rust side resolves both kinds by POSITION in
-//   the slot table, which follows document order.
-//     lists, in order:  profile <option>s, virtual pads, game profiles
+// - each `createList` becomes a uniquely named Array slot (`list:#N:array`,
+//   N counting list instances in document order — compiler 0.2.0) and is
+//   injected by NAME:
+//     list:#1 profile <option>s, list:#2 virtual pads, list:#3 game profiles
+//   Each `createShow` still becomes a shared-name `show:createShow` Bool
+//   slot, so shows are resolved by POSITION in the slot table (document
+//   order) — the remaining positional seam:
 //     shows, in order:  flash, start controls, stop/reload controls,
 //                       daemon-down controls
-//   If you add/remove/reorder either kind, update `LIST_ORDER`/`SHOW_ORDER`
-//   in render.rs — ksx-studio unit tests pin both counts and will fail
-//   loudly otherwise.
+//   Adding/removing/reordering lists shifts the `#N` numbering — update the
+//   `LIST_SLOT_*` constants in render.rs; for shows update `SHOW_ORDER`.
+//   ksx-studio unit tests pin the list names and the show count and will
+//   fail loudly otherwise.
 // - the compiler ignores createShow's condition expression entirely (the
 //   server injects the boolean), so the signals referenced there are pure
 //   documentation of intent.

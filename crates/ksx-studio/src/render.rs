@@ -13,24 +13,28 @@
 //! - **Scalars** — every `createSignal` in `studio-ui/src/StatusPage.ts`
 //!   becomes a slot named after the signal getter. Unique names, injected via
 //!   [`SlotData::from_json`] (name-keyed, defaults preserved for misses).
-//! - **Lists** — every `createList` becomes a slot literally named
-//!   `list:array`. The compiler (0.1.8) gives ALL lists that same name, so
-//!   name-keyed injection cannot address more than one list per page; the
-//!   seam resolves them **positionally** instead (slot-table order == emission
-//!   order == document order). [`LIST_ORDER`] documents the mapping.
-//! - **Shows** — every `createShow` becomes a `show:createShow` Bool slot,
-//!   with exactly the same shared-name problem and the same positional
-//!   solution. [`SHOW_ORDER`] documents that mapping; the shows are what let
-//!   an SSR-only page render the session controls conditionally (enabled /
-//!   running / visibly-disabled) with zero client JS.
+//! - **Lists** — every `createList` becomes an Array slot with a unique
+//!   per-instance name: `list:#N:array`, N numbering the list instances in
+//!   document order (compiler 0.2.0). Injected by NAME, like the scalars;
+//!   the `LIST_SLOT_*` constants pin the three names this page has.
+//! - **Shows** — every `createShow` still becomes a Bool slot named
+//!   `show:createShow` — 0.2.0 named lists uniquely but not shows — so shows
+//!   remain the one POSITIONAL seam (slot-table order == emission order ==
+//!   document order). [`SHOW_ORDER`] documents that mapping; the shows are
+//!   what let an SSR-only page render the session controls conditionally
+//!   (enabled / running / visibly-disabled) with zero client JS.
 //!
-//! `tests::embedded_ir_slot_layout_matches_the_seam` pins both counts —
-//! reordering lists or shows in StatusPage.ts without updating this file is a
+//! `tests::embedded_ir_slot_layout_matches_the_seam` pins the exact list slot
+//! NAMES (order included) and the show count — a compiler bump that renames
+//! slots, or a StatusPage.ts edit that adds/reorders lists or shows, is a
 //! test failure, not a silently blank section.
 //!
-//! Upstream feature request this dogfoods (docs/ENHANCEMENTS.md E7 loop):
-//! per-instance slot naming (e.g. `list:<binding>` / `show:<signal>`), so
-//! multi-list, multi-show pages can be injected by name alone.
+//! History: compiler 0.1.8 named EVERY list `list:array`, and this seam
+//! resolved lists positionally too (a `LIST_ORDER` table, since deleted).
+//! Per-instance slot naming was the upstream feature request this page
+//! dogfooded (docs/ENHANCEMENTS.md E7 loop); fixed upstream in
+//! `@getforma/compiler` 0.2.0, adopted 2026-08-05 — the E7 dogfood loop's
+//! first closed cycle. Per-instance `createShow` naming is the remaining ask.
 
 use forma_ir::parser::IrModule;
 use forma_ir::slot::{SlotData, SlotValue};
@@ -47,16 +51,20 @@ use crate::snapshot::StatusSnapshot;
 #[folder = "assets/"]
 pub(crate) struct Assets;
 
-/// The compiler names every `createList` array slot identically; lists are
-/// therefore resolved by position. Document order in StatusPage.ts:
-/// profile dropdown options, then virtual pads, then game profiles.
-const LIST_SLOT_NAME: &str = "list:array";
-const LIST_ORDER: [&str; 3] = ["profile options", "pads", "profiles"];
-const LIST_COUNT: usize = LIST_ORDER.len();
+/// Since 0.2.0 the compiler names each `createList` array slot uniquely:
+/// `list:#N:array`, N counting list instances in document order. These pin
+/// the names of the three lists in StatusPage.ts — adding or reordering
+/// lists there shifts the numbering, and the layout test fails until the
+/// constants are updated to match.
+const LIST_SLOT_PROFILE_OPTIONS: &str = "list:#1:array";
+const LIST_SLOT_PADS: &str = "list:#2:array";
+const LIST_SLOT_PROFILES: &str = "list:#3:array";
 
-/// Same story for `createShow` booleans. Document order in StatusPage.ts:
-/// the flash line, the Start form, the Stop/Reload forms, the disabled
-/// controls + explanation shown when no daemon control channel answers.
+/// `createShow` booleans did NOT gain unique names in compiler 0.2.0 — every
+/// show is still `show:createShow`, so shows are the remaining positional
+/// seam. Document order in StatusPage.ts: the flash line, the Start form,
+/// the Stop/Reload forms, the disabled controls + explanation shown when no
+/// daemon control channel answers.
 const SHOW_SLOT_NAME: &str = "show:createShow";
 const SHOW_ORDER: [&str; 4] = ["flash", "start controls", "stop controls", "daemon down"];
 const SHOW_COUNT: usize = SHOW_ORDER.len();
@@ -137,8 +145,8 @@ fn profiles_summary(snap: &StatusSnapshot) -> String {
     }
 }
 
-/// The list arrays, in [`LIST_ORDER`].
-fn list_values(snap: &StatusSnapshot) -> [SlotValue; LIST_COUNT] {
+/// The list array payloads, keyed by their (unique) slot names.
+fn list_values(snap: &StatusSnapshot) -> [(&'static str, SlotValue); 3] {
     let options = SlotValue::Array(
         snap.profiles
             .iter()
@@ -169,7 +177,11 @@ fn list_values(snap: &StatusSnapshot) -> [SlotValue; LIST_COUNT] {
             })
             .collect(),
     );
-    [options, pads, profiles]
+    [
+        (LIST_SLOT_PROFILE_OPTIONS, options),
+        (LIST_SLOT_PADS, pads),
+        (LIST_SLOT_PROFILES, profiles),
+    ]
 }
 
 /// The show booleans, in [`SHOW_ORDER`]. This is the whole conditional-UI
@@ -208,13 +220,15 @@ fn build_slots(
     let mut slots = SlotData::from_json(&scalars, module)
         .unwrap_or_else(|_| SlotData::new_from_defaults(&module.slots));
 
-    // Lists and shows by position (see module docs).
-    for (id, value) in named_slot_ids(module, LIST_SLOT_NAME)
-        .into_iter()
-        .zip(list_values(snap))
-    {
-        slots.set(id, value);
+    // Lists by name (unique since compiler 0.2.0). A rename upstream
+    // degrades to the authored default (an empty list) — which is exactly
+    // what the layout test exists to catch before it ships.
+    for (name, value) in list_values(snap) {
+        if let Some(id) = named_slot_ids(module, name).into_iter().next() {
+            slots.set(id, value);
+        }
     }
+    // Shows by position — still all named `show:createShow` (module docs).
     for (id, value) in named_slot_ids(module, SHOW_SLOT_NAME)
         .into_iter()
         .zip(show_values(session, flash))
@@ -311,9 +325,10 @@ mod tests {
     }
 
     /// Pins the slot-table contract the seam depends on: every scalar signal
-    /// name exists, and there are exactly as many `list:array` / `show:
-    /// createShow` slots as [`LIST_ORDER`] / [`SHOW_ORDER`] claim. Fails when
-    /// StatusPage.ts and this file drift.
+    /// name exists, the `list:#N:array` slot NAMES are exactly the ones the
+    /// `LIST_SLOT_*` constants claim (order included), and there are exactly
+    /// as many `show:createShow` slots as [`SHOW_ORDER`] claims. Fails when
+    /// StatusPage.ts, the compiler's naming scheme, or this file drift.
     #[test]
     fn embedded_ir_slot_layout_matches_the_seam() {
         let page = EmbeddedPage::load().unwrap();
@@ -332,10 +347,22 @@ mod tests {
                 "scalar slot '{key}' missing from the embedded IR; slots: {names:?}"
             );
         }
+        // Every list array slot in the IR, in slot-table order, must be one
+        // the seam injects by name — no extras, no misses, no renames.
+        let array_slots: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| n.starts_with("list:") && n.ends_with(":array"))
+            .collect();
         assert_eq!(
-            named_slot_ids(module, LIST_SLOT_NAME).len(),
-            LIST_ORDER.len(),
-            "list count drifted between StatusPage.ts and LIST_ORDER; slots: {names:?}"
+            array_slots,
+            [
+                LIST_SLOT_PROFILE_OPTIONS,
+                LIST_SLOT_PADS,
+                LIST_SLOT_PROFILES
+            ],
+            "list slot names drifted between the compiler/StatusPage.ts and \
+             the LIST_SLOT_* constants; slots: {names:?}"
         );
         assert_eq!(
             named_slot_ids(module, SHOW_SLOT_NAME).len(),

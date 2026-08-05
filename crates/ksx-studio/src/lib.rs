@@ -36,9 +36,10 @@
 //! # Data injection
 //!
 //! Server-side FMIR slot injection — real prop injection, no JSON island, no
-//! string templating. See `render.rs` for the mechanism, its one wrinkle
-//! (positional resolution of `list:array` slots) and the upstream feature
-//! request that wrinkle generates per the E7 dogfood loop.
+//! string templating. Scalars and lists are injected by slot name; `createShow`
+//! booleans remain positional (the last shared-name slot kind). See `render.rs`
+//! for the mechanism and the E7 dogfood history — first cycle closed when
+//! `@getforma/compiler` 0.2.0 shipped the per-list naming this seam requested.
 //!
 //! # Boundaries (docs/ENHANCEMENTS.md E7, enforced)
 //!

@@ -1,8 +1,8 @@
 {
   "version": 1,
-  "build_hash": "17ee93b4ad1d8e518bdd0c67146a7843c0f8197be146682b9778ffeda0cb44a2",
+  "build_hash": "a83a32b77b430f0762280b99663e99cf08e50d09d26da010a7af74e6931d1c9d",
   "assets": {
-    "status.ir": "status.c80f9fcc.ir",
+    "status.ir": "status.3e85958c.ir",
     "studio.css": "studio.b0a90a17.css"
   },
   "routes": {
@@ -14,7 +14,7 @@
       "fonts": [],
       "total_size_br": 9384,
       "budget_warn_threshold": 200000,
-      "ir": "status.c80f9fcc.ir"
+      "ir": "status.3e85958c.ir"
     }
   }
 }
