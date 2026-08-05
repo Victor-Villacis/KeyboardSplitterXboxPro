@@ -80,7 +80,9 @@ use crossbeam_channel::{
 use ksx_capture::{
     CaptureBackend, CaptureCtl, CaptureHealth, DeviceInfo, EscapeStatus, ExitReason, HealthView,
 };
-use ksx_core::{DeviceId, Engine, InvalidationReason, KeyEvent, PadState, Persona, ResolvedSlot};
+use ksx_core::{
+    DeviceId, Engine, EngineTables, InvalidationReason, KeyEvent, PadState, Persona, ResolvedSlot,
+};
 use ksx_output::{PadHandle, VirtualPadBackend};
 
 use super::latency::{Clock, LatencyRecorder, LatencySummary};
@@ -197,6 +199,183 @@ pub struct NoHook;
 
 impl SessionHook for NoHook {}
 
+// ---------------------------------------------------------------------------
+// The binding hot-swap (Victor: "why does it need to disconnect to reconnect?")
+// ---------------------------------------------------------------------------
+
+/// Everything about a running session a preset edit is NOT allowed to change
+/// without a restart.
+///
+/// The split is drawn where the *drivers* are: anything that would make the
+/// output thread plug a different pad, or the capture thread block a different
+/// device, has to go through a real teardown. Everything else is a key→function
+/// table, which [`Engine::swap_tables`] can replace in place.
+///
+/// Deliberately NOT in the shape:
+///
+/// - **preset contents** — the whole point;
+/// - **which preset a slot names** (`SlotSpec::preset`). Pointing slot 2 at a
+///   different preset file changes the binding table and nothing else: same
+///   pad, same persona, same keyboard. It is the one "structural-looking"
+///   change that is genuinely hot;
+/// - **plan notes / config path** — reporting, not wiring.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionShape {
+    /// `(slot number, persona, keyboard, mouse)` per slot, in plan order.
+    slots: Vec<(u8, Persona, Option<DeviceId>, Option<DeviceId>)>,
+    block_keyboards: bool,
+    /// Exactly the `SetCaptured` set.
+    captureable: Vec<DeviceId>,
+    /// Which boards are WinUSB-claimed — a backend change per device.
+    winusb: Vec<DeviceId>,
+}
+
+impl SessionShape {
+    pub fn of(plan: &RunPlan) -> Self {
+        Self {
+            slots: plan
+                .slots
+                .iter()
+                .map(|s| {
+                    (
+                        s.spec.number,
+                        s.spec.persona,
+                        s.spec.keyboard.clone(),
+                        s.spec.mouse.clone(),
+                    )
+                })
+                .collect(),
+            block_keyboards: plan.block_keyboards,
+            captureable: plan.captureable.clone(),
+            winusb: plan.winusb.clone(),
+        }
+    }
+
+    /// Why `next` cannot be hot-swapped onto this shape — `None` when it can.
+    /// The string is user-facing: it says what changed, so "this restarts the
+    /// pads" is never a mystery.
+    pub fn bounce_reason(&self, next: &Self) -> Option<String> {
+        if self.slots.len() != next.slots.len() {
+            return Some(format!(
+                "the slot count changed ({} → {})",
+                self.slots.len(),
+                next.slots.len()
+            ));
+        }
+        for (before, after) in self.slots.iter().zip(&next.slots) {
+            if before.0 != after.0 {
+                return Some(format!("slot {} became slot {}", before.0, after.0));
+            }
+            if before.1 != after.1 {
+                return Some(format!(
+                    "slot {} changed persona ({} → {})",
+                    before.0,
+                    before.1.label(),
+                    after.1.label()
+                ));
+            }
+            if before.2 != after.2 || before.3 != after.3 {
+                return Some(format!("slot {}'s input device changed", before.0));
+            }
+        }
+        if self.block_keyboards != next.block_keyboards {
+            return Some("keyboard blocking was turned on or off".to_owned());
+        }
+        if self.captureable != next.captureable {
+            return Some("the set of captured keyboards changed".to_owned());
+        }
+        if self.winusb != next.winusb {
+            return Some("a device's capture backend changed".to_owned());
+        }
+        None
+    }
+}
+
+/// What an [`HotSwap::apply`] did — the two halves of the split, so the caller
+/// can say which one happened in the response message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SwapVerdict {
+    /// Bindings only: the tables were handed to the live engine. Pads stayed
+    /// plugged, keyboards stayed captured, nothing re-enumerated.
+    Applied,
+    /// Structural: the caller must bounce the session. Carries the reason.
+    NeedsRestart(String),
+}
+
+/// A handle onto the RUNNING session's engine thread. Published by
+/// [`supervise`] once the engine exists; the daemon's control loop is the only
+/// thing that holds one.
+#[derive(Clone)]
+pub struct HotSwap {
+    ectl: Sender<EngineCtl>,
+    shape: SessionShape,
+}
+
+impl HotSwap {
+    /// Try to apply `plan`'s bindings to the running session in place.
+    ///
+    /// The new dispatch tables are built HERE — on the caller's thread, which
+    /// is the daemon control loop and is allowed to block and allocate — so the
+    /// engine thread only ever moves a pointer. `Err` means the engine is gone
+    /// (the session ended underneath us) and the caller should treat it as a
+    /// restart.
+    pub fn apply(&self, plan: &RunPlan) -> Result<SwapVerdict, &'static str> {
+        if let Some(reason) = self.shape.bounce_reason(&SessionShape::of(plan)) {
+            return Ok(SwapVerdict::NeedsRestart(reason));
+        }
+        let tables = EngineTables::build(plan.slots.clone());
+        self.ectl
+            .send(EngineCtl::SwapTables(Box::new(tables)))
+            .map_err(|_| "the session's engine thread has gone")?;
+        Ok(SwapVerdict::Applied)
+    }
+}
+
+/// Where a session publishes its [`HotSwap`], the same way [`SessionHook`]-less
+/// health is published: taken by the caller BEFORE the session moves onto its
+/// own thread, filled in by the session once the engine exists, and cleared on
+/// teardown so nothing can hand tables to a dead engine.
+#[derive(Clone, Debug, Default)]
+pub struct HotSwapSlot(Arc<Mutex<Option<HotSwap>>>);
+
+impl std::fmt::Debug for HotSwap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HotSwap")
+            .field("shape", &self.shape)
+            .finish()
+    }
+}
+
+impl HotSwapSlot {
+    fn publish(&self, swap: HotSwap) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(swap);
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = None;
+        }
+    }
+
+    /// The handle, if a session is running and has an engine. Cloned out so
+    /// the (blocking) table build never holds the lock.
+    pub fn handle(&self) -> Option<HotSwap> {
+        self.0.lock().ok()?.clone()
+    }
+
+    /// Stand in for a real session's engine thread: publish a handle over a
+    /// fresh channel and return the receiving end, so a test can assert what
+    /// the daemon control loop pushed through it.
+    #[cfg(test)]
+    pub(crate) fn publish_test_handle(&self, shape: SessionShape) -> Receiver<EngineCtl> {
+        let (tx, rx) = unbounded();
+        self.publish(HotSwap { ectl: tx, shape });
+        rx
+    }
+}
+
 /// Everything about a run that is not the plan.
 pub struct RunOptions {
     /// `--latency`: print a rolling summary every 5 s.
@@ -217,6 +396,10 @@ pub struct RunOptions {
     /// Lifecycle hook — `--game` launching in M5. Defaults to [`NoHook`], so
     /// every pre-M5 caller and test is unaffected.
     pub hook: Box<dyn SessionHook>,
+    /// Where this session publishes its [`HotSwap`] handle, so a binding edit
+    /// can reach the live engine without bouncing the pads. Default is a slot
+    /// nobody reads — `ksx run` has no control channel to swap through.
+    pub hot_swap: HotSwapSlot,
 }
 
 impl Default for RunOptions {
@@ -231,6 +414,7 @@ impl Default for RunOptions {
             max_events: None,
             panic_after_events: None,
             hook: Box::new(NoHook),
+            hot_swap: HotSwapSlot::default(),
         }
     }
 }
@@ -577,9 +761,13 @@ impl DeltaTx {
     }
 }
 
-enum EngineCtl {
+pub(crate) enum EngineCtl {
     /// A bound device vanished: release everything it was holding down.
     ReleaseDevice(DeviceId),
+    /// The binding hot-swap: new dispatch tables, built by the SENDER on its
+    /// own thread, to be moved into the running engine. The pads, their
+    /// handles and the capture filters are untouched.
+    SwapTables(Box<EngineTables>),
     Stop,
 }
 
@@ -847,6 +1035,15 @@ pub fn supervise(
             move || engine_thread(slots, ev_rx, ectl_rx, delta_tx, msg, limits)
         })?;
 
+    // The engine exists: a binding edit can now reach it in place. Published
+    // here rather than at the top of the function because before this line
+    // there is nothing to swap into — and cleared in teardown below, so a swap
+    // can never be handed to an engine that has already joined.
+    opts.hot_swap.publish(HotSwap {
+        ectl: ectl_tx.clone(),
+        shape: SessionShape::of(plan),
+    });
+
     // Drop our own sender so a Disconnected on `msg_rx` genuinely means both
     // workers are gone.
     drop(msg_tx);
@@ -880,6 +1077,7 @@ pub fn supervise(
         let _ = writeln!(out, "[FAIL] {message}");
         let _ = out.flush();
         opts.hook.finished(out);
+        opts.hot_swap.clear();
         guard.release();
         let _ = ctl_tx.send(CaptureCtl::Shutdown);
         let capture_exit = match capture_handle.join() {
@@ -1057,6 +1255,8 @@ pub fn supervise(
     // `ksx_platform::process`' no-kill policy). A game the player is still in
     // keeps running, with a keyboard that types again.
     opts.hook.finished(out);
+    // Nothing may hand tables to an engine that is about to join.
+    opts.hot_swap.clear();
 
     // ---- teardown: uncapture, THEN unplug ----------------------------------
     //
@@ -1325,6 +1525,22 @@ fn engine_thread(
                             // No originating keystroke: attribute the release to
                             // "now" so it never pollutes the latency histogram
                             // with a synthetic sample.
+                            t_capture: u64::MAX,
+                        }).is_err() {
+                            finish!();
+                        }
+                    }
+                }
+                // The binding hot-swap. The tables arrive fully built (the
+                // sender did that work on its own thread), so this is a move
+                // and nothing else. `swap_tables` returns the neutral states of
+                // any control that was HELD across the edit — forwarding them
+                // is what stops a rebind stranding a pressed virtual button.
+                Ok(EngineCtl::SwapTables(tables)) => {
+                    for delta in engine.swap_tables(*tables) {
+                        if deltas.send(OutMsg {
+                            slot: delta.slot,
+                            state: delta.state,
                             t_capture: u64::MAX,
                         }).is_err() {
                             finish!();
@@ -1868,6 +2084,178 @@ mod tests {
             matches!(sent.as_slice(), [CaptureCtl::SetPassthrough]),
             "an unwinding supervisor MUST still free the keyboards"
         );
+    }
+
+    // -- the hot-swap eligibility split (FIX 3) -----------------------------
+
+    fn shape_plan(slots: Vec<ResolvedSlot>) -> RunPlan {
+        let captureable: Vec<DeviceId> = {
+            let mut ids: Vec<DeviceId> = slots
+                .iter()
+                .filter_map(|s| s.spec.keyboard.clone())
+                .collect();
+            ids.dedup();
+            ids
+        };
+        RunPlan {
+            source: super::super::plan::PlanSource::Config,
+            config_path: std::path::PathBuf::from("test"),
+            slots,
+            block_keyboards: true,
+            block_mice: false,
+            captureable,
+            winusb: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    fn shape_slot(number: u8, device: &str, preset: ksx_core::Preset) -> ResolvedSlot {
+        ResolvedSlot {
+            spec: ksx_core::SlotSpec::new(
+                number,
+                Some(DeviceId::from(device)),
+                None,
+                preset.name.clone(),
+            )
+            .expect("valid slot"),
+            preset,
+        }
+    }
+
+    const BOARD: &str = r"HID\VID_D209&PID_0430&REV_0056&MI_00";
+    const OTHER: &str = r"HID\VID_046D&PID_C31C&REV_6402&MI_00";
+
+    /// The whole point of the split: a preset EDIT is invisible to the shape,
+    /// so it takes the hot path. Which preset a slot names is invisible too —
+    /// it changes the binding table and nothing a driver can see.
+    #[test]
+    fn binding_only_changes_are_hot_swappable() {
+        let base = shape_plan(vec![shape_slot(
+            1,
+            BOARD,
+            ksx_core::Preset::builtin_empty(),
+        )]);
+
+        let mut edited_preset = ksx_core::Preset::builtin_empty();
+        edited_preset.entries.push((
+            ksx_core::Key::G,
+            ksx_core::Binding::Button(ksx_core::XButton::A),
+        ));
+        let edited = shape_plan(vec![shape_slot(1, BOARD, edited_preset)]);
+        assert_eq!(
+            SessionShape::of(&base).bounce_reason(&SessionShape::of(&edited)),
+            None,
+            "editing a binding must never bounce the pads"
+        );
+
+        let mut renamed = ksx_core::Preset::builtin_default();
+        renamed.name = "Another Preset".to_owned();
+        let repointed = shape_plan(vec![shape_slot(1, BOARD, renamed)]);
+        assert_eq!(
+            SessionShape::of(&base).bounce_reason(&SessionShape::of(&repointed)),
+            None,
+            "pointing a slot at a different preset is still just a table swap"
+        );
+    }
+
+    /// …and everything a driver can see bounces, each with a reason a user can
+    /// read on the page ("this change restarts the pads").
+    #[test]
+    fn structural_changes_bounce_and_say_what_changed() {
+        let empty = ksx_core::Preset::builtin_empty;
+        let base = shape_plan(vec![
+            shape_slot(1, BOARD, empty()),
+            shape_slot(2, BOARD, empty()),
+        ]);
+        let shape = SessionShape::of(&base);
+
+        let fewer = shape_plan(vec![shape_slot(1, BOARD, empty())]);
+        assert!(shape
+            .bounce_reason(&SessionShape::of(&fewer))
+            .is_some_and(|r| r.contains("slot count")));
+
+        let renumbered = shape_plan(vec![
+            shape_slot(1, BOARD, empty()),
+            shape_slot(3, BOARD, empty()),
+        ]);
+        assert!(shape
+            .bounce_reason(&SessionShape::of(&renumbered))
+            .is_some_and(|r| r.contains("became slot")));
+
+        let mut personas = base.slots.clone();
+        personas[1].spec.persona = Persona::PlayStation;
+        let repersona = shape_plan(personas);
+        let reason = shape
+            .bounce_reason(&SessionShape::of(&repersona))
+            .expect("a persona change replugs a different device");
+        assert!(reason.contains("persona"), "{reason}");
+
+        let moved = shape_plan(vec![
+            shape_slot(1, BOARD, empty()),
+            shape_slot(2, OTHER, empty()),
+        ]);
+        assert!(shape
+            .bounce_reason(&SessionShape::of(&moved))
+            .is_some_and(|r| r.contains("input device")));
+
+        let mut passthrough = shape_plan(base.slots.clone());
+        passthrough.block_keyboards = false;
+        assert!(shape
+            .bounce_reason(&SessionShape::of(&passthrough))
+            .is_some_and(|r| r.contains("blocking")));
+
+        let mut winusb = shape_plan(base.slots.clone());
+        winusb.winusb = vec![DeviceId::from(BOARD)];
+        assert!(shape
+            .bounce_reason(&SessionShape::of(&winusb))
+            .is_some_and(|r| r.contains("backend")));
+
+        // A plan identical in everything a driver sees stays hot even when the
+        // reporting fields differ.
+        let mut noisy = shape_plan(base.slots.clone());
+        noisy.notes = vec!["[WARN] something".to_owned()];
+        noisy.config_path = std::path::PathBuf::from("elsewhere");
+        assert_eq!(shape.bounce_reason(&SessionShape::of(&noisy)), None);
+    }
+
+    /// A handle whose engine has gone must report it rather than pretending the
+    /// swap landed — the caller then bounces, which is always safe.
+    #[test]
+    fn a_swap_onto_a_dead_engine_is_an_error_not_a_silent_success() {
+        let plan = shape_plan(vec![shape_slot(
+            1,
+            BOARD,
+            ksx_core::Preset::builtin_empty(),
+        )]);
+        let (tx, rx) = unbounded::<EngineCtl>();
+        let swap = HotSwap {
+            ectl: tx,
+            shape: SessionShape::of(&plan),
+        };
+        assert_eq!(swap.apply(&plan), Ok(SwapVerdict::Applied));
+        drop(rx);
+        assert!(swap.apply(&plan).is_err());
+    }
+
+    /// The slot is empty until a session publishes into it, and empty again
+    /// afterwards — nothing may hand tables to a joined engine.
+    #[test]
+    fn the_hot_swap_slot_is_empty_before_and_after_a_session() {
+        let plan = shape_plan(vec![shape_slot(
+            1,
+            BOARD,
+            ksx_core::Preset::builtin_empty(),
+        )]);
+        let slot = HotSwapSlot::default();
+        assert!(slot.handle().is_none());
+        let (tx, _rx) = unbounded::<EngineCtl>();
+        slot.publish(HotSwap {
+            ectl: tx,
+            shape: SessionShape::of(&plan),
+        });
+        assert!(slot.handle().is_some());
+        slot.clear();
+        assert!(slot.handle().is_none());
     }
 
     #[test]

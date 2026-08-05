@@ -43,12 +43,7 @@ impl LiveFactory {
 
 impl SessionFactory for LiveFactory {
     fn make(&mut self) -> anyhow::Result<Box<dyn SessionRunner>> {
-        // `resolve_as`, not `resolve`, for the same reason `daemon::run` uses it:
-        // this is the path a tray "Reload config" takes, so a "nothing to run"
-        // refusal must suggest `ksx daemon --game "…"`. Suggesting `ksx run`
-        // from inside a running daemon hands the user a foreground session.
-        let plan = crate::run::plan::resolve_as(&self.root, self.game.as_deref(), "ksx daemon")
-            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        let plan = self.resolve_plan()?;
         let launch = match (&self.game, self.no_launch) {
             (Some(title), false) => {
                 let games = ksx_config::Store::new(self.root.clone()).load_games()?;
@@ -70,7 +65,22 @@ impl SessionFactory for LiveFactory {
             games_toml: self.root.games_path(),
             panel: self.panel.clone(),
             health: HealthSlot::default(),
+            swap: crate::run::supervisor::HotSwapSlot::default(),
         }))
+    }
+
+    /// The same resolution [`Self::make`] does, without building a runner —
+    /// the input to the hot-swap eligibility check, and therefore necessarily
+    /// the SAME call, or the daemon would be comparing a plan it would never
+    /// actually run.
+    ///
+    /// `resolve_as`, not `resolve`, for the reason `daemon::run` uses it: this
+    /// is the path a tray "Reload config" takes, so a "nothing to run" refusal
+    /// must suggest `ksx daemon --game "…"`. Suggesting `ksx run` from inside a
+    /// running daemon hands the user a foreground session.
+    fn resolve_plan(&self) -> anyhow::Result<crate::run::plan::RunPlan> {
+        crate::run::plan::resolve_as(&self.root, self.game.as_deref(), "ksx daemon")
+            .map_err(|err| anyhow::anyhow!("{err}"))
     }
 
     fn config_dir(&self) -> PathBuf {
@@ -101,6 +111,9 @@ struct LiveRunner {
     /// Handed to the control loop before this runner moves onto its own thread,
     /// and filled in below the moment the capture backend exists.
     health: HealthSlot,
+    /// Same handshake for the binding hot-swap: taken by the control loop
+    /// before the move, filled in by `supervise` once the engine thread is up.
+    swap: crate::run::supervisor::HotSwapSlot,
 }
 
 impl SessionRunner for LiveRunner {
@@ -110,6 +123,10 @@ impl SessionRunner for LiveRunner {
 
     fn health_slot(&self) -> HealthSlot {
         self.health.clone()
+    }
+
+    fn hot_swap_slot(&self) -> crate::run::supervisor::HotSwapSlot {
+        self.swap.clone()
     }
 
     #[cfg(windows)]

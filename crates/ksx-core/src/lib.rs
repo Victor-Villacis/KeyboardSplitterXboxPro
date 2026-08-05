@@ -31,7 +31,7 @@ pub mod preset;
 pub mod slot;
 
 pub use device::{DeviceId, KeyEvent};
-pub use engine::{Deltas, Engine, PadDelta, ResolvedSlot};
+pub use engine::{Deltas, Engine, EngineTables, PadDelta, ResolvedSlot};
 pub use escape::{Escape, EscapeDetector};
 pub use key::Key;
 pub use pad::{

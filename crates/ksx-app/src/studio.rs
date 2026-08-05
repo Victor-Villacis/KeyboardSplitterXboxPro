@@ -43,8 +43,18 @@ impl ksx_studio::ControlSource for PipeControlSource {
     fn session(&self) -> SessionView {
         match client::request(pipe::PIPE_NAME, &serde_json::json!({ "verb": "status" })) {
             Ok(status) => session_view(&status),
-            Err(client::ClientError::NotRunning) => SessionView::unreachable(NO_CHANNEL),
-            Err(err) => SessionView::unreachable(err.to_string()),
+            // No daemon: the page's banner still has to print the command that
+            // would START one, and on a games.toml cabinet that command needs
+            // its --game flag or it refuses. So the profile comes from the
+            // CONFIG here, not from the pipe that just failed to answer.
+            Err(client::ClientError::NotRunning) => SessionView {
+                profile: configured_profile(),
+                ..SessionView::unreachable(NO_CHANNEL)
+            },
+            Err(err) => SessionView {
+                profile: configured_profile(),
+                ..SessionView::unreachable(err.to_string())
+            },
         }
     }
 
@@ -85,6 +95,14 @@ impl ksx_studio::ControlSource for PipeControlSource {
             "verb": "map-restore",
             "preset": preset,
             "mode": mode,
+            "reload": true,
+        }))
+    }
+
+    fn clear_all(&self, preset: &str) -> Result<String, String> {
+        action(serde_json::json!({
+            "verb": "map-clear-all",
+            "preset": preset,
             "reload": true,
         }))
     }
@@ -196,7 +214,34 @@ fn session_view(status: &serde_json::Value) -> SessionView {
         reachable: true,
         running,
         line,
+        profile: game.map(str::to_owned),
     }
+}
+
+/// The games.toml profile `ksx daemon` would need to start on this machine —
+/// used only when the pipe cannot be reached, so the no-daemon banner prints a
+/// command that actually works.
+///
+/// Mirrors the daemon's own plan resolution: `[[slot]]` entries in config.toml
+/// need no profile at all; without them the daemon must be pointed at a
+/// games.toml profile, and the first one is what `collect_mapper` is already
+/// showing the user.
+fn configured_profile() -> Option<String> {
+    let root = ksx_config::ConfigRoot::discover().ok()?;
+    let store = ksx_config::Store::new(root);
+    if store
+        .load_config()
+        .is_ok_and(|loaded| !loaded.value.slots.is_empty())
+    {
+        return None;
+    }
+    store
+        .load_games()
+        .ok()?
+        .value
+        .games
+        .first()
+        .map(|game| game.title.clone())
 }
 
 /// The real snapshot provider: nothing cached, nothing owned — each call
@@ -285,6 +330,12 @@ fn collect_mapper() -> MapperSnapshot {
         .into_iter()
         .map(|(number, keyboard, preset_name, persona)| {
             let bindings = preset_bindings(&store, &preset_name);
+            // The newest restore point, read from disk rather than from the
+            // daemon: the label is still true (and still worth showing) when
+            // nothing answers the pipe.
+            let backup = crate::mapping::list_backups(&store, &preset_name)
+                .ok()
+                .and_then(|backups| backups.first().map(|b| b.label()));
             MapperSlot {
                 number,
                 persona: persona.as_str().to_owned(),
@@ -292,6 +343,7 @@ fn collect_mapper() -> MapperSnapshot {
                 preset: preset_name,
                 keyboard,
                 bindings,
+                backup,
             }
         })
         .collect();

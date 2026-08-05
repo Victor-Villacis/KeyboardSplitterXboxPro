@@ -40,12 +40,16 @@ export function StatusPage() {
   const [configRoot] = createSignal("(unknown)");
   const [sessionLine] = createSignal("not collected");
   const [flashLine] = createSignal("");
+  // The remedy printed in the no-daemon banner, with this machine's profile
+  // flag when it needs one.
+  const [daemonCmd] = createSignal("ksx daemon");
   // Booleans behind the createShow pairs (injected positionally into the
   // show:createShow slots — render.rs SHOW_ORDER). Default false: nothing
   // renders until the server says otherwise.
   const [pillRunning] = createSignal(false);
   const [pillIdle] = createSignal(false);
   const [pillDown] = createSignal(false);
+  const [noDaemon] = createSignal(false);
   const [flashOk] = createSignal(false);
   const [flashError] = createSignal(false);
   const [canStart] = createSignal(false);

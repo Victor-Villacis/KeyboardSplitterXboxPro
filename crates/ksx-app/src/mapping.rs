@@ -144,10 +144,17 @@ pub enum MapError {
     NoSessionBackup {
         preset: String,
     },
-    /// The session backup file exists but does not parse/validate — restoring
-    /// it would trade a good file for a bad one, so it is refused.
-    BadSessionBackup {
+    /// `restore latest-backup` with no `*.toml.bak-*` file on disk: nothing has
+    /// ever been restored for this preset, so no timestamped backup exists.
+    NoBackup {
         preset: String,
+    },
+    /// A backup file exists but does not parse/validate — restoring it would
+    /// trade a good file for a bad one, so it is refused. `source` names which
+    /// backup ("the session-start backup", a file name).
+    BadBackup {
+        preset: String,
+        source: String,
         reason: String,
     },
     Config(ConfigError),
@@ -193,10 +200,20 @@ impl std::fmt::Display for MapError {
                 "no session backup for \"{preset}\" — nothing has been mapped through the \
                  daemon this session, so there is nothing to undo"
             ),
-            MapError::BadSessionBackup { preset, reason } => write!(
+            MapError::NoBackup { preset } => write!(
                 f,
-                "the session backup for \"{preset}\" is unreadable ({reason}) — refusing to \
-                 replace a good preset with it"
+                "no timestamped backup for \"{preset}\" — one is written next to the preset \
+                 (\"<preset>.toml.bak-YYYYMMDD-HHMMSS\") before every restore, so the first \
+                 restore of a preset has nothing older to go back to"
+            ),
+            MapError::BadBackup {
+                preset,
+                source,
+                reason,
+            } => write!(
+                f,
+                "{source} for \"{preset}\" is unreadable ({reason}) — refusing to replace a \
+                 good preset with it"
             ),
             MapError::Config(err) => write!(f, "{err}"),
         }
@@ -282,21 +299,207 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
 }
 
 // ---------------------------------------------------------------------------
-// Restore: the mapper's two safety nets (docs/CONTROL-SURFACE.md
-// "map-restore"). Both go through the same store writer as `apply` — no
-// private editing path.
+// Restore: the mapper's THREE destinations (docs/CONTROL-SURFACE.md
+// "map-restore"). All of them go through the same store writer as `apply` — no
+// private editing path — and all of them take a timestamped backup first.
+//
+// The three are deliberately different distances back, and the UI must name
+// them by their DESTINATION, never by the word "defaults" (MAPPER-UX
+// commandment 5: honest labels, guaranteed road home). "Defaults" is the one
+// that surprised Victor: it does NOT mean "how this preset shipped" — it means
+// the LEGACY GENERIC KEYBOARD layout (S=A, D=B, A=X, W=Y, Q/E triggers, arrows
+// = left stick, Esc=Start), which on an arcade cabinet replaces an I-PAC
+// panel map with a desktop-keyboard map. It stays available because it is the
+// always-there floor, but it is spelled out everywhere it appears.
 // ---------------------------------------------------------------------------
 
 /// Which safety net [`restore`] pulls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestoreKind {
-    /// Rewrite the preset's bindings to `ksx_core::Preset::builtin_default()`
-    /// (the classic KeyboardSplitter layout), keeping the preset's name.
+    /// Rewrite the preset's bindings to `ksx_core::Preset::builtin_default()` —
+    /// the LEGACY GENERIC KEYBOARD layout, not "this preset as it shipped".
+    /// Keeps the preset's name.
     Defaults,
     /// Rewrite the preset from its `<file>.session-bak` — the snapshot
     /// [`take_session_backup`] made before the daemon's FIRST map write to
-    /// that preset this daemon lifetime ("undo this session").
+    /// that preset this daemon lifetime ("undo everything since the daemon
+    /// started").
     SessionBackup,
+    /// Rewrite the preset from the NEWEST `<file>.bak-YYYYMMDD-HHMMSS` — the
+    /// snapshot taken automatically before the previous restore. This is the
+    /// undo for a restore itself.
+    LatestBackup,
+    /// Not a restore at all: [`clear_all`]'s destination, sharing this type so
+    /// every whole-preset write reports the same way (and takes the same
+    /// backup). Deliberately NOT parseable from a `--restore`/`"mode"` word —
+    /// "clear everything" is its own verb, never a spelling of "restore".
+    ClearAll,
+}
+
+impl RestoreKind {
+    /// The wire word (`ksx map --restore <mode>`, pipe `map-restore` `"mode"`,
+    /// and the `"mode"` field of every whole-preset response).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RestoreKind::Defaults => "defaults",
+            RestoreKind::SessionBackup => "session-backup",
+            RestoreKind::LatestBackup => "latest-backup",
+            RestoreKind::ClearAll => "clear-all",
+        }
+    }
+
+    /// Parse a RESTORE mode. `None` for anything else — callers report the
+    /// three valid spellings rather than guessing, and `clear-all` is
+    /// deliberately not one of them.
+    pub fn parse(mode: &str) -> Option<Self> {
+        match mode {
+            "defaults" => Some(RestoreKind::Defaults),
+            "session-backup" => Some(RestoreKind::SessionBackup),
+            "latest-backup" => Some(RestoreKind::LatestBackup),
+            _ => None,
+        }
+    }
+
+    /// What this destination WRITES, in one clause — the sentence every
+    /// confirm dialog and every CLI line is built from. Never the bare word
+    /// "defaults".
+    pub fn destination(self) -> &'static str {
+        match self {
+            RestoreKind::Defaults => {
+                "the generic keyboard layout (S=A, D=B, A=X, W=Y, Q/E triggers, arrow keys \
+                 = left stick, Esc=Start) — NOT this preset's original panel map"
+            }
+            RestoreKind::SessionBackup => {
+                "this preset as it was before the daemon's first change this session"
+            }
+            RestoreKind::LatestBackup => {
+                "this preset as it was before the most recent restore (the newest \
+                 timestamped backup)"
+            }
+            RestoreKind::ClearAll => {
+                "an empty preset — every control still listed, none of them bound"
+            }
+        }
+    }
+}
+
+/// One `<preset>.toml.bak-YYYYMMDD-HHMMSS` on disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresetBackup {
+    pub path: PathBuf,
+    /// `YYYYMMDD-HHMMSS` — sortable, and the file name's suffix verbatim.
+    pub stamp: String,
+}
+
+impl PresetBackup {
+    /// The stamp spelled for a human: `2026-08-05 14:32:07 UTC`.
+    ///
+    /// UTC, like every other timestamp ksx prints (the studio pages, the
+    /// snapshot lines): converting to local time needs a Win32 call that would
+    /// make this module platform-specific for a cosmetic gain, and a mixed
+    /// UTC/local page is worse than a consistent UTC one.
+    pub fn label(&self) -> String {
+        let (date, time) = match self.stamp.split_once('-') {
+            Some(split) => split,
+            None => return self.stamp.clone(),
+        };
+        if date.len() != 8 || time.len() < 6 {
+            return self.stamp.clone();
+        }
+        format!(
+            "{}-{}-{} {}:{}:{} UTC",
+            &date[0..4],
+            &date[4..6],
+            &date[6..8],
+            &time[0..2],
+            &time[2..4],
+            &time[4..6],
+        )
+    }
+}
+
+/// The suffix that marks a timestamped backup: `<preset file>.bak-<stamp>`.
+const BACKUP_MARK: &str = ".bak-";
+
+/// `YYYYMMDD-HHMMSS`, UTC — sortable as a plain string, which is what makes
+/// "newest" a lexicographic max rather than a filesystem-mtime guess.
+fn stamp_now() -> String {
+    let t = ksx_config::Timestamp::now_utc();
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    )
+}
+
+/// Every timestamped backup of `preset_name`, NEWEST FIRST.
+///
+/// Backups are never pruned: they are small text files, a restore is a rare
+/// deliberate act, and silently deleting a user's only copy of a panel map to
+/// save a few kilobytes is not a trade ksx gets to make. The mapper shows the
+/// newest one; the rest sit next to the preset for anyone who needs them.
+pub fn list_backups(store: &Store, preset_name: &str) -> Result<Vec<PresetBackup>, MapError> {
+    let preset_path = store.preset_path(preset_name)?;
+    let Some(dir) = preset_path.parent() else {
+        return Ok(Vec::new());
+    };
+    let Some(file_name) = preset_path.file_name().and_then(|n| n.to_str()) else {
+        return Ok(Vec::new());
+    };
+    let prefix = format!("{file_name}{BACKUP_MARK}");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(Vec::new()); // no presets dir yet = no backups, not an error
+    };
+    let mut backups: Vec<PresetBackup> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.to_owned();
+            let stamp = name.strip_prefix(&prefix)?.to_owned();
+            (!stamp.is_empty()).then_some(PresetBackup { path, stamp })
+        })
+        .collect();
+    // Newest first. The stamp is fixed-width and zero-padded, so a plain
+    // descending string sort IS chronological (and the collision suffix
+    // `-2`, `-3`… sorts after the bare stamp of the same second).
+    backups.sort_by(|a, b| b.stamp.cmp(&a.stamp));
+    Ok(backups)
+}
+
+/// Copy the preset file to `<file>.bak-YYYYMMDD-HHMMSS`.
+///
+/// Called before EVERY restore (see [`restore`]) — that is the whole point:
+/// no restore can be the last word, because the thing it overwrote is on disk
+/// with a timestamp on it. `Ok(None)` means there was no preset file to copy
+/// (a caller that is about to fail with `UnknownPreset` anyway).
+///
+/// Two restores inside one second get `-2`, `-3`… appended, so a backup is
+/// never silently overwritten by the restore that follows it.
+pub fn take_backup(store: &Store, preset_name: &str) -> Result<Option<PresetBackup>, MapError> {
+    let source = store.preset_path(preset_name)?;
+    if !source.exists() {
+        return Ok(None);
+    }
+    let base = stamp_now();
+    let (path, stamp) = (1u32..)
+        .map(|n| {
+            let stamp = if n == 1 {
+                base.clone()
+            } else {
+                format!("{base}-{n}")
+            };
+            (
+                PathBuf::from(format!("{}{BACKUP_MARK}{stamp}", source.display())),
+                stamp,
+            )
+        })
+        .find(|(path, _)| !path.exists())
+        .expect("an unbounded suffix search always finds a free name");
+    std::fs::copy(&source, &path).map_err(|err| MapError::BadBackup {
+        preset: preset_name.to_owned(),
+        source: "the pre-restore backup".to_owned(),
+        reason: format!("could not write {}: {err}", path.display()),
+    })?;
+    Ok(Some(PresetBackup { path, stamp }))
 }
 
 /// What a successful [`restore`] did.
@@ -305,22 +508,40 @@ pub struct AppliedRestore {
     pub path: PathBuf,
     pub preset: String,
     pub kind: RestoreKind,
+    /// The timestamped backup taken immediately before the write — the road
+    /// back from this very restore. `None` only when there was no file to copy.
+    pub backup: Option<PresetBackup>,
 }
 
 impl AppliedRestore {
-    /// The one-line confirmation every surface prints.
+    /// The one-line confirmation every surface prints. It names what was
+    /// WRITTEN and what was BACKED UP, in that order — a restore that does not
+    /// say both is a restore somebody will be afraid of.
     pub fn message(&self) -> String {
-        match self.kind {
-            RestoreKind::Defaults => {
-                format!(
-                    "\"{}\": bindings restored to the built-in defaults",
-                    self.preset
-                )
-            }
+        let wrote = match self.kind {
+            RestoreKind::Defaults => format!(
+                "\"{}\": bindings reset to the generic keyboard layout (S/D/A/W…)",
+                self.preset
+            ),
             RestoreKind::SessionBackup => format!(
                 "\"{}\": bindings restored from the session-start backup",
                 self.preset
             ),
+            RestoreKind::LatestBackup => format!(
+                "\"{}\": bindings restored from the newest timestamped backup",
+                self.preset
+            ),
+            RestoreKind::ClearAll => format!(
+                "\"{}\": every binding cleared (all controls still listed, none bound)",
+                self.preset
+            ),
+        };
+        match &self.backup {
+            Some(backup) => format!(
+                "{wrote} — the previous file is backed up as {}",
+                backup.stamp
+            ),
+            None => wrote,
         }
     }
 }
@@ -343,28 +564,47 @@ pub fn take_session_backup(store: &Store, preset_name: &str) -> Result<(), MapEr
         return Ok(());
     }
     let backup = PathBuf::from(format!("{}.session-bak", source.display()));
-    std::fs::copy(&source, &backup).map_err(|err| MapError::BadSessionBackup {
+    std::fs::copy(&source, &backup).map_err(|err| MapError::BadBackup {
         preset: preset_name.to_owned(),
+        source: "the session-start backup".to_owned(),
         reason: format!("could not write {}: {err}", backup.display()),
     })?;
     Ok(())
 }
 
-/// Restore a preset's bindings from one of the two safety nets. The write is
-/// canonical (same serializer as [`apply`]); the preset must already exist —
-/// restore edits presets, it never creates them.
+/// Read a backup file and validate it the way every other write is validated —
+/// a hand-damaged backup must never be swapped in for a good preset.
+fn bindings_from_backup(
+    path: &std::path::Path,
+    preset_name: &str,
+    source: &str,
+) -> Result<Vec<(Key, ksx_core::Binding)>, MapError> {
+    let bad = |reason: String| MapError::BadBackup {
+        preset: preset_name.to_owned(),
+        source: source.to_owned(),
+        reason,
+    };
+    let text = std::fs::read_to_string(path).map_err(|err| bad(err.to_string()))?;
+    let parsed: PresetFile = toml::from_str(&text).map_err(|err| bad(err.to_string()))?;
+    let core = parsed.to_core().map_err(|err| bad(err.to_string()))?;
+    Ok(core.entries)
+}
+
+/// Restore a preset's bindings from one of the three destinations.
+///
+/// The order is the safety property: the replacement is resolved and validated
+/// FIRST (so a refusal leaves no pointless backup lying around), then the
+/// current file is copied to `<file>.bak-YYYYMMDD-HHMMSS`, and only then is the
+/// preset overwritten. The write is canonical (same serializer as [`apply`]);
+/// the preset must already exist — restore edits presets, it never creates them.
 pub fn restore(
     store: &Store,
     preset_name: &str,
     kind: RestoreKind,
 ) -> Result<AppliedRestore, MapError> {
     let file = load_preset_by_name(store, preset_name)?;
-    let rewritten = match kind {
-        RestoreKind::Defaults => PresetFile::from_core(&ksx_core::Preset {
-            name: file.name.clone(),
-            entries: ksx_core::Preset::builtin_default().entries,
-            protected: false,
-        }),
+    let entries = match kind {
+        RestoreKind::Defaults => ksx_core::Preset::builtin_default().entries,
         RestoreKind::SessionBackup => {
             let backup = session_backup_path(store, preset_name)?;
             if !backup.exists() {
@@ -372,34 +612,62 @@ pub fn restore(
                     preset: preset_name.to_owned(),
                 });
             }
-            let text =
-                std::fs::read_to_string(&backup).map_err(|err| MapError::BadSessionBackup {
-                    preset: preset_name.to_owned(),
-                    reason: err.to_string(),
-                })?;
-            let parsed: PresetFile =
-                toml::from_str(&text).map_err(|err| MapError::BadSessionBackup {
-                    preset: preset_name.to_owned(),
-                    reason: err.to_string(),
-                })?;
-            // Round through core so a hand-damaged backup is validated the
-            // same way every other write is.
-            let core = parsed.to_core().map_err(|err| MapError::BadSessionBackup {
-                preset: preset_name.to_owned(),
-                reason: err.to_string(),
-            })?;
-            PresetFile::from_core(&ksx_core::Preset {
-                name: file.name.clone(),
-                entries: core.entries,
-                protected: false,
-            })
+            bindings_from_backup(&backup, preset_name, "the session-start backup")?
         }
+        RestoreKind::LatestBackup => {
+            let newest = list_backups(store, preset_name)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| MapError::NoBackup {
+                    preset: preset_name.to_owned(),
+                })?;
+            let source = format!("the backup from {}", newest.label());
+            bindings_from_backup(&newest.path, preset_name, &source)?
+        }
+        // `clear-all` is its own verb ([`clear_all`]) precisely so it cannot be
+        // reached by anything spelled "restore".
+        RestoreKind::ClearAll => ksx_core::Preset::builtin_empty().entries,
     };
+
+    // Everything below this line WILL write: take the road home first.
+    let backup = take_backup(store, preset_name)?;
+    let rewritten = PresetFile::from_core(&ksx_core::Preset {
+        name: file.name.clone(),
+        entries,
+        protected: false,
+    });
     let path = store.save_preset(&rewritten)?;
     Ok(AppliedRestore {
         path,
         preset: file.name,
         kind,
+        backup,
+    })
+}
+
+/// Unbind every function of a preset, keeping the file structurally valid.
+///
+/// This writes the `empty` built-in's SHAPE — every function present, keyed
+/// `Key::None` — rather than deleting rows, which is the same convention
+/// `--clear` uses for one function: a cleared control stays visible in the file
+/// and in the mapper's legend instead of silently vanishing.
+///
+/// Like every whole-preset write it takes a timestamped backup first, so
+/// "Clear all bindings" has the same one-click road home as a restore.
+pub fn clear_all(store: &Store, preset_name: &str) -> Result<AppliedRestore, MapError> {
+    let file = load_preset_by_name(store, preset_name)?;
+    let backup = take_backup(store, preset_name)?;
+    let rewritten = PresetFile::from_core(&ksx_core::Preset {
+        name: file.name.clone(),
+        entries: ksx_core::Preset::builtin_empty().entries,
+        protected: false,
+    });
+    let path = store.save_preset(&rewritten)?;
+    Ok(AppliedRestore {
+        path,
+        preset: file.name,
+        kind: RestoreKind::ClearAll,
+        backup,
     })
 }
 
@@ -785,7 +1053,16 @@ preset = "Other"
 
         let applied = restore(&store, "P1", RestoreKind::Defaults).unwrap();
         assert_eq!(applied.preset, "P1");
-        assert!(applied.message().contains("built-in defaults"));
+        // The label names the DESTINATION, never the bare word "defaults" —
+        // Victor's cabinet would otherwise read "restore defaults" as "put my
+        // I-PAC map back" and get a desktop-keyboard layout instead.
+        let message = applied.message();
+        assert!(message.contains("generic keyboard layout"), "{message}");
+        assert!(message.contains("S/D/A/W"), "{message}");
+        assert!(
+            message.contains("backed up as"),
+            "a restore must say where the old file went: {message}"
+        );
         let reloaded = store.load_preset("P1").unwrap().unwrap().value;
         assert_eq!(reloaded.name, "P1", "name survives a defaults restore");
         let defaults = PresetFile::from_core(&ksx_core::Preset {
@@ -848,9 +1125,178 @@ preset = "Other"
         .unwrap();
         let before = std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap();
         let err = restore(&store, "P1", RestoreKind::SessionBackup).unwrap_err();
-        assert!(matches!(err, MapError::BadSessionBackup { .. }), "{err:?}");
+        assert!(matches!(err, MapError::BadBackup { .. }), "{err:?}");
         let after = std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap();
         assert_eq!(before, after, "refusal must not touch the preset");
+        // A refusal must not leave a pointless timestamped backup behind
+        // either — the copy happens only once the write is certain.
+        assert!(list_backups(&store, "P1").unwrap().is_empty());
+    }
+
+    // -- timestamped backups (FIX 2) ---------------------------------------
+
+    /// The road home from a restore. "Reset to the generic keyboard layout"
+    /// is the most destructive button on the page; `latest-backup` is what
+    /// makes pressing it survivable.
+    #[test]
+    fn every_restore_backs_the_preset_up_first_and_latest_backup_undoes_it() {
+        let root = TempRoot::new("bak-undo");
+        let store = root.store();
+        preset(&store, "IPAC P1", "A = \"G\"\nB = \"F\"\n");
+        let original = std::fs::read_to_string(store.preset_path("IPAC P1").unwrap()).unwrap();
+
+        // Nothing to go back to yet: the refusal names the mechanism.
+        let err = restore(&store, "IPAC P1", RestoreKind::LatestBackup).unwrap_err();
+        assert!(matches!(err, MapError::NoBackup { .. }), "{err:?}");
+        assert!(err.to_string().contains("bak-YYYYMMDD-HHMMSS"), "{err}");
+
+        // The scary one: reset to the generic keyboard layout.
+        let applied = restore(&store, "IPAC P1", RestoreKind::Defaults).unwrap();
+        let backup = applied.backup.expect("a restore always backs up first");
+        assert!(backup.path.exists(), "{}", backup.path.display());
+        assert_eq!(
+            std::fs::read_to_string(&backup.path).unwrap(),
+            original,
+            "the backup must be the file as it was before the restore"
+        );
+        let generic = std::fs::read_to_string(store.preset_path("IPAC P1").unwrap()).unwrap();
+        // The legacy generic layout: S (and Enter) on A, W on Y, arrows on the
+        // left stick — a desktop keyboard, nothing like the panel map above.
+        assert!(generic.contains(r#"A = ["S", "Enter"]"#), "{generic}");
+        assert!(generic.contains(r#""lx.min" = "Left""#), "{generic}");
+
+        // …and one click back to the panel map.
+        let undone = restore(&store, "IPAC P1", RestoreKind::LatestBackup).unwrap();
+        assert!(
+            undone.message().contains("newest timestamped backup"),
+            "{}",
+            undone.message()
+        );
+        let back = std::fs::read_to_string(store.preset_path("IPAC P1").unwrap()).unwrap();
+        assert!(back.contains("A = \"G\""), "{back}");
+        assert!(back.contains("B = \"F\""), "{back}");
+        // Two restores, two backups, newest first.
+        let backups = list_backups(&store, "IPAC P1").unwrap();
+        assert_eq!(backups.len(), 2, "{backups:?}");
+        assert!(backups[0].stamp >= backups[1].stamp, "{backups:?}");
+    }
+
+    /// Two restores inside one second must not overwrite each other's backup —
+    /// the whole chain would collapse to one entry.
+    #[test]
+    fn backups_taken_in_the_same_second_do_not_collide() {
+        let root = TempRoot::new("bak-collide");
+        let store = root.store();
+        preset(&store, "P1", "A = \"G\"\n");
+        for _ in 0..3 {
+            take_backup(&store, "P1").unwrap().expect("preset exists");
+        }
+        let backups = list_backups(&store, "P1").unwrap();
+        assert_eq!(backups.len(), 3, "{backups:?}");
+        let mut stamps: Vec<&str> = backups.iter().map(|b| b.stamp.as_str()).collect();
+        stamps.sort_unstable();
+        stamps.dedup();
+        assert_eq!(stamps.len(), 3, "stamps must be distinct: {backups:?}");
+    }
+
+    /// Backups sit next to the preset with a non-`.toml` extension, so the
+    /// store's preset scan must never pick one up as a second preset.
+    #[test]
+    fn backups_are_invisible_to_the_preset_loader() {
+        let root = TempRoot::new("bak-invisible");
+        let store = root.store();
+        preset(&store, "P1", "A = \"G\"\n");
+        take_backup(&store, "P1").unwrap();
+        take_session_backup(&store, "P1").unwrap();
+        let loaded = store.load_presets().unwrap();
+        assert_eq!(loaded.value.len(), 1, "{:?}", loaded.value);
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    }
+
+    /// "Clear all bindings" empties the preset without breaking it — every
+    /// function is still listed (as the inert `"None"`), so the mapper's
+    /// legend keeps 25 rows and the file keeps parsing.
+    #[test]
+    fn clear_all_empties_the_preset_and_leaves_a_backup() {
+        let root = TempRoot::new("clear-all");
+        let store = root.store();
+        preset(&store, "IPAC P1", "A = \"G\"\nB = \"F\"\n");
+
+        let applied = clear_all(&store, "IPAC P1").unwrap();
+        assert_eq!(applied.kind, RestoreKind::ClearAll);
+        assert!(applied.backup.is_some(), "clearing must be undoable");
+        let message = applied.message();
+        assert!(message.contains("every binding cleared"), "{message}");
+        assert!(message.contains("backed up as"), "{message}");
+
+        let on_disk = std::fs::read_to_string(store.preset_path("IPAC P1").unwrap()).unwrap();
+        assert!(!on_disk.contains("\"G\""), "{on_disk}");
+        assert!(on_disk.contains("A = \"None\""), "{on_disk}");
+        assert!(on_disk.contains("\"dpad.up\" = \"None\""), "{on_disk}");
+        // Still a valid preset, and every function is still present.
+        let core = store
+            .load_preset("IPAC P1")
+            .unwrap()
+            .unwrap()
+            .value
+            .to_core()
+            .unwrap();
+        assert_eq!(core.entries.len(), 25);
+
+        // …and one click back to the panel map.
+        restore(&store, "IPAC P1", RestoreKind::LatestBackup).unwrap();
+        let back = std::fs::read_to_string(store.preset_path("IPAC P1").unwrap()).unwrap();
+        assert!(back.contains("A = \"G\""), "{back}");
+    }
+
+    #[test]
+    fn clear_all_refuses_an_unknown_preset() {
+        let root = TempRoot::new("clear-all-unknown");
+        assert!(matches!(
+            clear_all(&root.store(), "Nope"),
+            Err(MapError::UnknownPreset { .. })
+        ));
+    }
+
+    #[test]
+    fn a_backup_stamp_spells_itself_out_for_a_human() {
+        let backup = PresetBackup {
+            path: PathBuf::from("x"),
+            stamp: "20260805-143207".to_owned(),
+        };
+        assert_eq!(backup.label(), "2026-08-05 14:32:07 UTC");
+        // Anything unexpected degrades to the raw stamp, never to a lie.
+        let odd = PresetBackup {
+            path: PathBuf::from("x"),
+            stamp: "nonsense".to_owned(),
+        };
+        assert_eq!(odd.label(), "nonsense");
+    }
+
+    /// The wire words are contract: CLI `--restore`, pipe `"mode"`, Studio's
+    /// three buttons all speak the same three strings.
+    #[test]
+    fn restore_kinds_round_trip_their_wire_words_and_name_their_destination() {
+        for kind in [
+            RestoreKind::Defaults,
+            RestoreKind::SessionBackup,
+            RestoreKind::LatestBackup,
+        ] {
+            assert_eq!(RestoreKind::parse(kind.as_str()), Some(kind));
+            assert!(!kind.destination().is_empty());
+        }
+        assert_eq!(RestoreKind::parse("yolo"), None);
+        // "clear everything" is its own verb, never a spelling of "restore" —
+        // otherwise `--restore clear-all` would read as a way BACK.
+        assert_eq!(RestoreKind::parse("clear-all"), None);
+        assert_eq!(RestoreKind::ClearAll.as_str(), "clear-all");
+        // The one label that must never be vague.
+        assert!(RestoreKind::Defaults
+            .destination()
+            .contains("generic keyboard layout"));
+        assert!(RestoreKind::Defaults
+            .destination()
+            .contains("NOT this preset's original panel map"));
     }
 
     #[test]

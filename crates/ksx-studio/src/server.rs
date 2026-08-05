@@ -86,6 +86,14 @@ pub fn serve(
             .route("/api/learn/cancel", post(api_learn_cancel))
             .route("/api/bind", post(api_bind))
             .route("/api/preset/restore", post(api_preset_restore))
+            .route("/api/preset/clear-all", post(api_preset_clear_all))
+            // The mapper's own session controls (FIX 0): "Pause emulation &
+            // map" and "Resume emulation" are the SAME ControlSource verbs
+            // the status page's forms use — one pipe verb each, no GUI-only
+            // path — served as JSON so the mapper never navigates away and
+            // loses the user's place.
+            .route("/api/session/stop", post(api_session_stop))
+            .route("/api/session/start", post(api_session_start))
             // Canon helper: correct no-cache + Service-Worker-Allowed
             // headers for free (replaced a hand-rolled handler).
             .route("/sw.js", get(forma_server::sw::serve_sw::<Assets>))
@@ -301,26 +309,29 @@ async fn api_bind(
 #[derive(Deserialize)]
 struct RestoreRequest {
     preset: String,
-    /// `"defaults"` or `"session-backup"` — validated here so a typo is a
-    /// 200-with-error the page can flash, not a daemon round-trip.
+    /// One of [`crate::control::RESTORE_MODES`] — validated here so a typo is
+    /// a 200-with-error the page can flash, not a daemon round-trip.
     mode: String,
 }
 
-/// POST /api/preset/restore — the mapper's preset safety nets, one pipe
-/// `map-restore` per call (reload always requested: the daemon only bounces a
-/// RUNNING session). Answers `{ok, message}` / `{ok:false, error}`.
+/// POST /api/preset/restore — the mapper's three restore destinations, one
+/// pipe `map-restore` per call (reload always requested: the daemon only
+/// applies to a RUNNING session). Answers `{ok, message}` / `{ok:false,
+/// error}`; the daemon's message already names what was written and what was
+/// backed up first.
 async fn api_preset_restore(
     State(state): State<Arc<AppState>>,
     axum::Json(request): axum::Json<RestoreRequest>,
 ) -> Response {
-    if request.mode != "defaults" && request.mode != "session-backup" {
+    if !crate::control::RESTORE_MODES.contains(&request.mode.as_str()) {
         return (
             [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
             axum::Json(serde_json::json!({
                 "ok": false,
                 "error": format!(
-                    "unknown restore mode \"{}\" (defaults | session-backup)",
-                    request.mode
+                    "unknown restore mode \"{}\" ({})",
+                    request.mode,
+                    crate::control::RESTORE_MODES.join(" | ")
                 ),
             })),
         )
@@ -328,6 +339,63 @@ async fn api_preset_restore(
     }
     control_json(state, move |control| {
         match control.restore(&request.preset, &request.mode) {
+            Ok(message) => serde_json::json!({ "ok": true, "message": message }),
+            Err(error) => serde_json::json!({ "ok": false, "error": error }),
+        }
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct PresetRequest {
+    preset: String,
+}
+
+/// POST /api/preset/clear-all — unbind every function of one preset. One pipe
+/// `map-clear-all`; the daemon takes a timestamped backup first, so the page's
+/// confirm can promise a road home and mean it.
+async fn api_preset_clear_all(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<PresetRequest>,
+) -> Response {
+    control_json(state, move |control| {
+        match control.clear_all(&request.preset) {
+            Ok(message) => serde_json::json!({ "ok": true, "message": message }),
+            Err(error) => serde_json::json!({ "ok": false, "error": error }),
+        }
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct SessionRequest {
+    /// `None`/empty = whatever the daemon is already configured with.
+    profile: Option<String>,
+}
+
+/// POST /api/session/stop — "Pause emulation & map".
+async fn api_session_stop(State(state): State<Arc<AppState>>) -> Response {
+    control_json(state, |control| match control.stop() {
+        Ok(message) => serde_json::json!({ "ok": true, "message": message }),
+        Err(error) => serde_json::json!({ "ok": false, "error": error }),
+    })
+    .await
+}
+
+/// POST /api/session/start — "Resume emulation", with the profile the mapper
+/// remembered when it paused, so the cabinet comes back to the same game.
+async fn api_session_start(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<SessionRequest>,
+) -> Response {
+    let profile = request
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned);
+    control_json(state, move |control| {
+        match control.start(profile.as_deref()) {
             Ok(message) => serde_json::json!({ "ok": true, "message": message }),
             Err(error) => serde_json::json!({ "ok": false, "error": error }),
         }

@@ -122,6 +122,15 @@ pub struct MapperSlot {
     /// out — an unbound function is an EMPTY list here, so the page renders
     /// an honest "unbound" tag instead of the placeholder's name).
     pub bindings: std::collections::BTreeMap<String, Vec<String>>,
+    /// Human label of the NEWEST `<preset>.toml.bak-YYYYMMDD-HHMMSS` on disk,
+    /// e.g. `2026-08-05 14:32:07 UTC`. `None` when this preset has never been
+    /// restored, in which case the mapper hides the "Restore backup from …"
+    /// button instead of offering a road home that does not exist.
+    ///
+    /// Read straight from the config store, not from the daemon: the label is
+    /// still true (and still worth showing) when nothing answers the pipe.
+    #[serde(default)]
+    pub backup: Option<String>,
 }
 
 /// What `GET /api/map` serves AND what the mapper island's props carry — the
@@ -218,6 +227,7 @@ mod tests {
                 reachable: true,
                 running: false,
                 line: "idle — daemon reachable".into(),
+                profile: None,
             },
             flash: None,
         };

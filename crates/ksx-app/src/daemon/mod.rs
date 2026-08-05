@@ -90,6 +90,16 @@ pub enum DaemonCommand {
     Stop,
     /// Stop, re-read the configuration, start again.
     Reload,
+    /// Apply the configuration on disk to the RUNNING session the cheapest way
+    /// that is correct: a binding-only edit is hot-swapped into the live engine
+    /// (pads stay plugged, keyboards stay captured, Windows plays no
+    /// disconnect chime); anything structural falls back to the same bounce
+    /// [`DaemonCommand::Reload`] does. The verdict lands in
+    /// [`DaemonState::apply`] so the pipe can report which happened.
+    ///
+    /// This is what a mapper save asks for. `Reload` stays the blunt
+    /// "restart it, whatever changed" verb the tray offers.
+    ApplyBindings,
     /// Open the config folder in Explorer.
     OpenConfigFolder,
     /// Print the current state (headless mode's `status`).
@@ -171,6 +181,12 @@ impl LastSession {
 /// is most likely to be searching for.
 const REBOOT_NOTE: &str = "[!] REBOOT REQUIRED (Interception slot exhaustion)";
 
+/// How long [`apply_bindings`] waits for a just-started session to publish its
+/// hot-swap handle before giving up and bouncing. Long enough to cover pad
+/// plugging on a cold ViGEm bus, short enough that a runner which will never
+/// publish does not park the control loop.
+const SWAP_HANDLE_GRACE: Duration = Duration::from_secs(3);
+
 /// Capture health of the session running **right now**.
 ///
 /// [`LastSession`] is written by [`reap`], which by definition runs after the
@@ -245,6 +261,26 @@ impl HealthSlot {
     }
 }
 
+/// What the last [`DaemonCommand::ApplyBindings`] did.
+///
+/// The pipe cannot ask the control loop a question — it enqueues commands and
+/// reads this snapshot, which is exactly the reach the tray has (module docs).
+/// So the verdict travels back here, keyed by a generation the caller compares
+/// against the one it saw before enqueuing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ApplyReport {
+    /// Bumped once per handled `ApplyBindings`. A caller that still sees its
+    /// baseline generation is looking at somebody else's answer.
+    pub generation: u64,
+    pub ok: bool,
+    /// The new bindings went into the live engine — pads untouched.
+    pub hot: bool,
+    /// The session was torn down and started again.
+    pub restarted: bool,
+    /// One human sentence, already saying which of the two happened.
+    pub message: String,
+}
+
 /// The state the tray polls. Small, cloneable, no borrows of anything live.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DaemonState {
@@ -254,6 +290,9 @@ pub struct DaemonState {
     /// Refreshed by the control loop while a session runs; cleared when it is
     /// reaped, at which point [`Self::last`] is the truth again.
     pub live: Option<LiveHealth>,
+    /// The verdict of the last binding-apply. Never cleared: a caller
+    /// identifies its own answer by generation, not by presence.
+    pub apply: Option<ApplyReport>,
 }
 
 impl DaemonState {
@@ -365,6 +404,17 @@ pub trait SessionRunner: Send {
     fn health_slot(&self) -> HealthSlot {
         HealthSlot::default()
     }
+
+    /// Where this session will publish its binding hot-swap handle. Taken by
+    /// [`start`] before the runner moves onto its own thread, exactly like
+    /// [`Self::health_slot`].
+    ///
+    /// Defaulted to a slot nothing ever fills, which reads as "this runner
+    /// cannot hot-swap" — and the control loop then bounces, which is always
+    /// correct, only louder.
+    fn hot_swap_slot(&self) -> crate::run::supervisor::HotSwapSlot {
+        crate::run::supervisor::HotSwapSlot::default()
+    }
 }
 
 /// Makes a fresh runner per session, re-reading configuration each time. That
@@ -379,6 +429,17 @@ pub trait SessionFactory: Send {
     /// [`Self::make`]'s plan resolution — so a pipe `start --game X` fails
     /// exactly like a tray Start with a broken config, not via a second path.
     fn set_game(&mut self, game: Option<String>);
+
+    /// Re-resolve the plan from disk WITHOUT building a runner — the input to
+    /// the hot-swap eligibility check.
+    ///
+    /// Defaulted to a refusal so every existing factory (and every test one)
+    /// keeps compiling and simply never hot-swaps: the control loop reads
+    /// `Err` as "I cannot tell what changed" and bounces, which is the safe
+    /// direction to be wrong in.
+    fn resolve_plan(&self) -> anyhow::Result<crate::run::plan::RunPlan> {
+        anyhow::bail!("this session factory cannot re-resolve a plan")
+    }
 }
 
 /// The keystroke behaviour of a WinUSB-claimed panel between sessions.
@@ -458,6 +519,7 @@ pub fn control_loop_with(
     out: &mut dyn Write,
 ) {
     let mut session: Option<LiveSession> = None;
+    let mut apply_generation: u64 = 0;
     set_game(&state, factory.game());
 
     loop {
@@ -524,16 +586,19 @@ pub fn control_loop_with(
                 }
             },
             Ok(DaemonCommand::Reload) => {
-                if let Some(live) = session.take() {
-                    live.stop.store(true, Ordering::SeqCst);
-                    reap(live, &state, out);
-                }
                 let _ = writeln!(out, "reloading configuration…");
-                set_game(&state, factory.game());
-                panel.set_emulating(true);
-                session = start(factory, &state, out);
-                if session.is_none() {
-                    panel.set_emulating(false);
+                restart(&mut session, factory, &state, panel, out);
+            }
+            // The mapper's save path. Cheap when it can be, honest when it
+            // cannot: the pads only bounce for changes that genuinely move a
+            // driver, and the report says which happened either way.
+            Ok(DaemonCommand::ApplyBindings) => {
+                apply_generation += 1;
+                let report =
+                    apply_bindings(apply_generation, &mut session, factory, &state, panel, out);
+                let _ = writeln!(out, "{}", report.message);
+                if let Ok(mut s) = state.lock() {
+                    s.apply = Some(report);
                 }
             }
             Ok(DaemonCommand::OpenConfigFolder) => {
@@ -582,12 +647,158 @@ pub fn control_loop_with(
     }
 }
 
+/// Stop whatever is running, re-read the configuration, start again — the
+/// tray's "Reload config", and the fallback every structural change takes.
+///
+/// One function so `Reload` and the bounce half of [`apply_bindings`] can never
+/// drift into two different teardown orders.
+fn restart(
+    session: &mut Option<LiveSession>,
+    factory: &mut dyn SessionFactory,
+    state: &SharedState,
+    panel: &mut dyn PanelKeyboard,
+    out: &mut dyn Write,
+) {
+    if let Some(live) = session.take() {
+        live.stop.store(true, Ordering::SeqCst);
+        reap(live, state, out);
+    }
+    set_game(state, factory.game());
+    panel.set_emulating(true);
+    *session = start(factory, state, out);
+    if session.is_none() {
+        panel.set_emulating(false);
+    }
+}
+
+/// The hot-swap decision, in one place.
+///
+/// The rules, stated once so the UI can quote them:
+///
+/// - **nothing running** → nothing to do; the next start reads the files.
+/// - **binding-only change** (preset contents, or a slot pointing at a
+///   different preset) → hand the rebuilt tables to the live engine. Pads stay
+///   plugged, keyboards stay captured, Steam does not re-enumerate, and a game
+///   in progress notices nothing except the new binding. Controls held across
+///   the swap are released by the engine, so a rebind cannot strand a pressed
+///   virtual button.
+/// - **structural change** (slot count, slot numbering, persona, keyboard or
+///   mouse assignment, blocking policy, capture backend) → bounce, and say so.
+/// - **cannot tell** (the config no longer resolves, or the session has no
+///   swap handle because it is still starting) → do NOT bounce on a config we
+///   could not read: tearing a working session down to fail the restart is the
+///   worst of both. Report and leave it running.
+fn apply_bindings(
+    generation: u64,
+    session: &mut Option<LiveSession>,
+    factory: &mut dyn SessionFactory,
+    state: &SharedState,
+    panel: &mut dyn PanelKeyboard,
+    out: &mut dyn Write,
+) -> ApplyReport {
+    let report = |ok: bool, hot: bool, restarted: bool, message: String| ApplyReport {
+        generation,
+        ok,
+        hot,
+        restarted,
+        message,
+    };
+    if session.is_none() {
+        return report(
+            true,
+            false,
+            false,
+            "no session is running — the next start reads the new bindings".to_owned(),
+        );
+    }
+
+    let plan = match factory.resolve_plan() {
+        Ok(plan) => plan,
+        Err(err) => {
+            return report(
+                false,
+                false,
+                false,
+                format!(
+                    "the session is still running on its old bindings: the configuration \
+                     on disk does not resolve ({err})"
+                ),
+            );
+        }
+    };
+
+    // A session becomes "running" the moment its thread is spawned, but its
+    // engine — and therefore its swap door — appears a little later, after the
+    // pads have plugged. Mapping in that window is exactly what a user does
+    // right after pressing Start, so wait it out instead of punishing them
+    // with a bounce. Blocking here is free (module docs); the wait is bounded,
+    // and a runner that never publishes simply falls through to the restart.
+    let handle = {
+        let deadline = Instant::now() + SWAP_HANDLE_GRACE;
+        loop {
+            match session.as_ref().and_then(|live| live.swap.handle()) {
+                Some(handle) => break Some(handle),
+                None if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                None => break None,
+            }
+        }
+    };
+    let bounce = |reason: String,
+                  session: &mut Option<LiveSession>,
+                  factory: &mut dyn SessionFactory,
+                  panel: &mut dyn PanelKeyboard,
+                  out: &mut dyn Write| {
+        restart(session, factory, state, panel, out);
+        let started = session.is_some();
+        report(
+            started,
+            false,
+            started,
+            if started {
+                format!("session restarted — {reason} needs the pads replugged")
+            } else {
+                format!("session stopped — {reason} needs a restart, which then failed")
+            },
+        )
+    };
+
+    match handle {
+        Some(handle) => match handle.apply(&plan) {
+            Ok(crate::run::supervisor::SwapVerdict::Applied) => report(
+                true,
+                true,
+                false,
+                "bindings applied live — pads untouched".to_owned(),
+            ),
+            Ok(crate::run::supervisor::SwapVerdict::NeedsRestart(reason)) => {
+                bounce(reason, session, factory, panel, out)
+            }
+            Err(err) => bounce(err.to_owned(), session, factory, panel, out),
+        },
+        // Starting: the engine does not exist yet, so there is nothing to swap
+        // into. A bounce is the only correct answer and it is cheap here — the
+        // pads are not up.
+        None => bounce(
+            "the session was still starting".to_owned(),
+            session,
+            factory,
+            panel,
+            out,
+        ),
+    }
+}
+
 struct LiveSession {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<anyhow::Result<SessionSummary>>>,
     started: Instant,
     /// Filled in by the session thread once its capture backend exists.
     health: HealthSlot,
+    /// Filled in by the session thread once its engine thread exists — the
+    /// door a binding edit walks through without waking the drivers.
+    swap: crate::run::supervisor::HotSwapSlot,
     /// The last sample pushed into [`DaemonState::live`], so an unchanged
     /// reading costs no lock and a *newly* appeared problem is logged once
     /// rather than four times a second.
@@ -654,6 +865,7 @@ fn start(
     // Grabbed before the runner moves onto its own thread; the runner publishes
     // into it as soon as its capture backend is up.
     let health = runner.health_slot();
+    let swap = runner.hot_swap_slot();
     let stop = Arc::new(AtomicBool::new(false));
     let handle = std::thread::Builder::new()
         .name("ksx-session".into())
@@ -675,6 +887,7 @@ fn start(
         handle: Some(handle),
         started: Instant::now(),
         health,
+        swap,
         reported: None,
     })
 }
@@ -833,7 +1046,9 @@ pub fn run(
                 // defaults / session-backup safety nets; learn-key observes
                 // idle keyboards over Raw Input.
                 map: pipe::map_fn(map_root.clone()),
-                restore: pipe::restore_fn(map_root),
+                restore: pipe::restore_fn(map_root.clone()),
+                clear_all: pipe::clear_all_fn(map_root.clone()),
+                backups: pipe::backups_fn(map_root),
                 learn: learn::LearnService::with_rawinput(),
             },
         );
@@ -1008,6 +1223,11 @@ mod tests {
         /// flag from outside while the session runs.
         health: Option<ksx_capture::HealthHandle>,
         slot: HealthSlot,
+        /// The binding hot-swap door. `shape` is what the running session
+        /// claims to be; `swaps` counts what came through it.
+        swap: crate::run::supervisor::HotSwapSlot,
+        shape: Option<crate::run::supervisor::SessionShape>,
+        swaps: Option<Arc<std::sync::atomic::AtomicUsize>>,
     }
 
     impl SessionRunner for FakeRunner {
@@ -1029,6 +1249,19 @@ mod tests {
                     .publish(ksx_capture::HealthView::new(health.clone()));
             }
             self.ran.store(true, Ordering::SeqCst);
+            // Stand in for `supervise`: the engine exists, so a binding edit
+            // can reach it. Real sessions publish the same thing here.
+            if let Some(shape) = self.shape.clone() {
+                let rx = self.swap.publish_test_handle(shape);
+                if let Some(seen) = &self.swaps {
+                    let seen = seen.clone();
+                    std::thread::spawn(move || {
+                        while rx.recv().is_ok() {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                        }
+                    });
+                }
+            }
             let deadline = self.self_ends_after.map(|d| Instant::now() + d);
             loop {
                 if stop.load(Ordering::SeqCst) {
@@ -1048,6 +1281,10 @@ mod tests {
         fn slots(&self) -> usize {
             self.slots
         }
+
+        fn hot_swap_slot(&self) -> crate::run::supervisor::HotSwapSlot {
+            self.swap.clone()
+        }
     }
 
     struct FakeFactory {
@@ -1060,6 +1297,15 @@ mod tests {
         trace: Option<Trace>,
         health: Option<ksx_capture::HealthHandle>,
         game: Option<String>,
+        /// What `resolve_plan()` answers. `None` = "I cannot tell", which is
+        /// the default and makes every factory in these tests bounce.
+        plan: Option<crate::run::plan::RunPlan>,
+        /// The shape the RUNNING session publishes. Usually `SessionShape::of`
+        /// the same plan, so a binding edit is hot; give it a different one to
+        /// script a structural change.
+        shape: Option<crate::run::supervisor::SessionShape>,
+        swap: crate::run::supervisor::HotSwapSlot,
+        swaps: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Default for FakeFactory {
@@ -1078,6 +1324,10 @@ mod tests {
                 trace: None,
                 health: None,
                 game: Some("Street Fighter".into()),
+                plan: None,
+                shape: None,
+                swap: crate::run::supervisor::HotSwapSlot::default(),
+                swaps: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
     }
@@ -1096,6 +1346,9 @@ mod tests {
                 trace: self.trace.clone(),
                 health: self.health.clone(),
                 slot: HealthSlot::default(),
+                swap: self.swap.clone(),
+                shape: self.shape.clone(),
+                swaps: Some(self.swaps.clone()),
             }))
         }
 
@@ -1109,6 +1362,12 @@ mod tests {
 
         fn set_game(&mut self, game: Option<String>) {
             self.game = game;
+        }
+
+        fn resolve_plan(&self) -> anyhow::Result<crate::run::plan::RunPlan> {
+            self.plan
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("this fake factory has no plan"))
         }
     }
 
@@ -1183,6 +1442,147 @@ mod tests {
             "reload must build a new session from disk: {text}"
         );
         assert!(text.contains("reloading configuration"), "{text}");
+    }
+
+    // -- FIX 3: ApplyBindings, the mapper's save path ----------------------
+
+    /// A one-slot plan, so the tests can build shapes that match or don't.
+    fn tiny_plan(slot: u8, persona: ksx_core::Persona) -> crate::run::plan::RunPlan {
+        let preset = ksx_core::Preset::builtin_empty();
+        crate::run::plan::RunPlan {
+            source: crate::run::plan::PlanSource::Config,
+            config_path: std::path::PathBuf::from("test"),
+            slots: vec![ksx_core::ResolvedSlot {
+                spec: ksx_core::SlotSpec::new(
+                    slot,
+                    Some(ksx_core::DeviceId::from("BOARD")),
+                    None,
+                    preset.name.clone(),
+                )
+                .expect("valid slot")
+                .with_persona(persona),
+                preset,
+            }],
+            block_keyboards: true,
+            block_mice: false,
+            captureable: vec![ksx_core::DeviceId::from("BOARD")],
+            winusb: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// The headline: a binding-only edit reaches the live session without the
+    /// pads being rebuilt. `makes` staying at 1 IS the assertion — a second
+    /// `make()` would mean a teardown and a fresh pipeline, which is exactly
+    /// the disconnect/reconnect Victor was asking about.
+    #[test]
+    fn apply_bindings_hot_swaps_without_restarting_the_session() {
+        let plan = tiny_plan(1, ksx_core::Persona::Xbox360);
+        let mut factory = FakeFactory {
+            shape: Some(crate::run::supervisor::SessionShape::of(&plan)),
+            plan: Some(plan),
+            ..FakeFactory::default()
+        };
+        let swaps = factory.swaps.clone();
+        let (state, text) = drive(
+            &mut factory,
+            &[
+                DaemonCommand::Start { game: None },
+                DaemonCommand::ApplyBindings,
+                DaemonCommand::Quit,
+            ],
+        );
+        assert_eq!(
+            *factory.makes.lock().unwrap(),
+            1,
+            "the session must NOT have been rebuilt: {text}"
+        );
+        let report = state.apply.expect("a verdict was recorded");
+        assert!(report.ok && report.hot && !report.restarted, "{report:?}");
+        assert_eq!(report.generation, 1);
+        assert_eq!(report.message, "bindings applied live — pads untouched");
+        assert!(text.contains("pads untouched"), "{text}");
+        // The tables really went down the channel to the engine.
+        assert_eq!(swaps.load(Ordering::SeqCst), 1);
+    }
+
+    /// A structural change takes the old road, and says so in the same field
+    /// shape so the caller can tell them apart.
+    #[test]
+    fn apply_bindings_bounces_a_structural_change_and_names_it() {
+        // The session is running slot 1 as an Xbox pad; the config on disk now
+        // says PlayStation. That is a different device node: it has to replug.
+        let running = tiny_plan(1, ksx_core::Persona::Xbox360);
+        let ondisk = tiny_plan(1, ksx_core::Persona::PlayStation);
+        let mut factory = FakeFactory {
+            shape: Some(crate::run::supervisor::SessionShape::of(&running)),
+            plan: Some(ondisk),
+            ..FakeFactory::default()
+        };
+        let swaps = factory.swaps.clone();
+        let (state, text) = drive(
+            &mut factory,
+            &[
+                DaemonCommand::Start { game: None },
+                DaemonCommand::ApplyBindings,
+                DaemonCommand::Quit,
+            ],
+        );
+        assert_eq!(
+            *factory.makes.lock().unwrap(),
+            2,
+            "a persona change must rebuild the session: {text}"
+        );
+        let report = state.apply.expect("a verdict was recorded");
+        assert!(report.ok && !report.hot && report.restarted, "{report:?}");
+        assert!(report.message.contains("session restarted"), "{report:?}");
+        assert!(report.message.contains("persona"), "{report:?}");
+        assert_eq!(swaps.load(Ordering::SeqCst), 0, "nothing was hot-swapped");
+    }
+
+    /// Nothing running: nothing to do, and the answer says why rather than
+    /// starting a session nobody asked for.
+    #[test]
+    fn apply_bindings_with_no_session_changes_nothing() {
+        let mut factory = FakeFactory::default();
+        let (state, _) = drive(
+            &mut factory,
+            &[DaemonCommand::ApplyBindings, DaemonCommand::Quit],
+        );
+        assert_eq!(*factory.makes.lock().unwrap(), 0);
+        let report = state.apply.expect("a verdict was recorded");
+        assert!(report.ok && !report.hot && !report.restarted, "{report:?}");
+        assert!(
+            report.message.contains("no session is running"),
+            "{report:?}"
+        );
+    }
+
+    /// A config that no longer resolves must NOT cost the user their running
+    /// session: tearing it down to fail the restart is the worst of both.
+    #[test]
+    fn apply_bindings_keeps_a_running_session_when_the_config_is_broken() {
+        // `plan: None` = resolve_plan() errors.
+        let mut factory = FakeFactory::default();
+        let (state, text) = drive(
+            &mut factory,
+            &[
+                DaemonCommand::Start { game: None },
+                DaemonCommand::ApplyBindings,
+                DaemonCommand::Quit,
+            ],
+        );
+        assert_eq!(
+            *factory.makes.lock().unwrap(),
+            1,
+            "the running session must survive a broken config: {text}"
+        );
+        let report = state.apply.expect("a verdict was recorded");
+        assert!(!report.ok, "{report:?}");
+        assert!(
+            report.message.contains("still running on its old bindings"),
+            "{report:?}"
+        );
     }
 
     /// A pipe `start --game X` repoints this and every later session at that
@@ -1314,6 +1714,7 @@ mod tests {
                 ..LastSession::default()
             }),
             live: None,
+            apply: None,
         };
         let tip = state.tooltip();
         assert!(tip.contains("running, 4 pad(s)"), "{tip}");
@@ -1328,6 +1729,7 @@ mod tests {
             game: Some("y".repeat(200)),
             last: None,
             live: None,
+            apply: None,
         };
         assert!(long.tooltip().encode_utf16().count() <= 127);
         assert!(long.tooltip().ends_with('…'));
@@ -1352,6 +1754,7 @@ mod tests {
                 reboot_required: true,
                 ..LiveHealth::default()
             }),
+            apply: None,
         };
         let tip = state.tooltip();
         assert!(tip.contains("running, 4 pad(s)"), "{tip}");
@@ -1402,6 +1805,7 @@ mod tests {
                 ..LastSession::default()
             }),
             live: Some(LiveHealth::default()),
+            apply: None,
         };
         assert!(state.tooltip().contains("REBOOT REQUIRED"), "{state:?}");
     }
@@ -1421,6 +1825,7 @@ mod tests {
                 watchdog_tripped: true,
                 ..LiveHealth::default()
             }),
+            apply: None,
         };
         let tip = state.tooltip();
         assert!(tip.contains("watchdog TRIPPED"), "{tip}");
@@ -1440,6 +1845,7 @@ mod tests {
                 ..LastSession::default()
             }),
             game: None,
+            apply: None,
         };
         assert!(!state.tooltip().contains("[!]"), "{}", state.tooltip());
     }
@@ -1731,6 +2137,10 @@ mod tests {
                         DaemonCommand::OpenConfigFolder => "config",
                         DaemonCommand::Status => "status",
                         DaemonCommand::Quit => "quit",
+                        // Not a menu item: the mapper's save path, reachable
+                        // over the pipe only (there is nothing for a human to
+                        // click that means "apply bindings and nothing else").
+                        DaemonCommand::ApplyBindings => "reload",
                     }),
                 "{command:?} is in the tray menu but not reachable headlessly"
             );

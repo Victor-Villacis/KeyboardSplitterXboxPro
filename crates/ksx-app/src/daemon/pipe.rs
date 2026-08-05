@@ -66,6 +66,16 @@ pub type RestoreFn = Box<
         + Send,
 >;
 
+/// The `map-clear-all` verb's writer — [`crate::mapping::clear_all`], same
+/// injection rule as [`MapFn`].
+pub type ClearAllFn =
+    Box<dyn Fn(&str) -> Result<crate::mapping::AppliedRestore, crate::mapping::MapError> + Send>;
+
+/// The `map-backups` verb's reader — [`crate::mapping::list_backups`], same
+/// injection rule as [`MapFn`].
+pub type BackupsFn =
+    Box<dyn Fn(&str) -> Result<Vec<crate::mapping::PresetBackup>, crate::mapping::MapError> + Send>;
+
 /// Everything a pipe request can reach. One struct so the transport, the
 /// tests and future verbs share a single wiring point.
 pub struct PipeDeps {
@@ -74,6 +84,8 @@ pub struct PipeDeps {
     pub profiles: ProfilesFn,
     pub map: MapFn,
     pub restore: RestoreFn,
+    pub clear_all: ClearAllFn,
+    pub backups: BackupsFn,
     pub learn: super::learn::LearnService,
 }
 
@@ -107,6 +119,20 @@ pub fn map_fn(root: ksx_config::ConfigRoot) -> MapFn {
 pub fn restore_fn(root: ksx_config::ConfigRoot) -> RestoreFn {
     Box::new(move |preset, kind| {
         crate::mapping::restore(&ksx_config::Store::new(root.clone()), preset, kind)
+    })
+}
+
+/// The real [`ClearAllFn`]: [`crate::mapping::clear_all`] against `root`'s
+/// store.
+pub fn clear_all_fn(root: ksx_config::ConfigRoot) -> ClearAllFn {
+    Box::new(move |preset| crate::mapping::clear_all(&ksx_config::Store::new(root.clone()), preset))
+}
+
+/// The real [`BackupsFn`]: [`crate::mapping::list_backups`] against `root`'s
+/// store. Read-only — the one mapper verb that never writes.
+pub fn backups_fn(root: ksx_config::ConfigRoot) -> BackupsFn {
+    Box::new(move |preset| {
+        crate::mapping::list_backups(&ksx_config::Store::new(root.clone()), preset)
     })
 }
 
@@ -270,7 +296,7 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
     };
     let Some(verb) = request.get("verb").and_then(|v| v.as_str()) else {
         return err_msg(
-            r#"request has no "verb" (status | start | stop | reload | map | map-restore | learn-key | learn-poll | learn-cancel)"#,
+            r#"request has no "verb" (status | start | stop | reload | map | map-restore | map-clear-all | map-backups | learn-key | learn-poll | learn-cancel)"#,
         );
     };
     match verb {
@@ -309,10 +335,40 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
         }
         "map" => handle_map(&request, deps, settle),
         "map-restore" => handle_map_restore(&request, deps, settle),
-        // Learn is only meaningful while nothing runs: a running session's
-        // captured keyboards are suppressed below win32k, where the Raw Input
-        // observer hears nothing — refusing is the honest answer, not a 10 s
-        // silent timeout. (docs/CONTROL-SURFACE.md "learn-key semantics".)
+        "map-clear-all" => handle_map_clear_all(&request, deps, settle),
+        "map-backups" => handle_map_backups(&request, deps),
+        // Learn needs an IDLE daemon, and this refusal is deliberate — it was
+        // re-examined in full on 2026-08-05 and kept.
+        //
+        // The mechanical reason: a running session's bound keyboards are
+        // captured below win32k, so a Raw Input observer never sees them and
+        // the learn would sit there for 10 s hearing nothing. Refusing is the
+        // honest answer.
+        //
+        // The reason we did NOT "fix" it by tapping our own capture stream —
+        // which we demonstrably could, since the pipeline is holding those very
+        // keystrokes — is worth writing down, because it looks like an obvious
+        // win from the outside:
+        //
+        //   1. the capture thread is the one thread on this machine where a bug
+        //      freezes every keyboard until reboot. It is time-critical,
+        //      allocation-free and lock-free ON PURPOSE. A convenience feature
+        //      does not get a code path in it;
+        //   2. a key pressed to be LEARNED would also fire its current binding,
+        //      on every slot it fans out to — mapping would inject real
+        //      gameplay input into whatever is running;
+        //   3. rebinding a key while it is physically held could leave a
+        //      virtual button pressed under the old binding and released under
+        //      the new one: exactly the stuck-key class the engine's
+        //      all-keys-up rule and `swap_tables`' release-on-swap exist to
+        //      prevent;
+        //   4. mapping is a between-games activity in every tool in the field
+        //      study (MAME's TAB menu pauses the machine, RetroArch binds from
+        //      its menu). Nobody remaps mid-fight.
+        //
+        // So the refusal stays — and Studio turns it into one click ("Pause
+        // emulation & map", then "Resume emulation") instead of a dead end.
+        // docs/CONTROL-SURFACE.md "learn-key semantics".
         "learn-key" => {
             if matches!(
                 snapshot(state).run,
@@ -321,7 +377,8 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
                 return err_msg(
                     "learn-key is unavailable while a session is running — captured \
                      keys never reach the observer; stop the session first \
-                     (`ksx session stop`), or bind directly with `ksx map`",
+                     (`ksx session stop`, or Studio's \"Pause emulation & map\"), \
+                     or bind directly with `ksx map`",
                 );
             }
             deps.learn.start()
@@ -330,8 +387,73 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
         "learn-cancel" => deps.learn.cancel(),
         other => err_msg(format!(
             "unknown verb '{other}' (status | start | stop | reload | map | \
-             map-restore | learn-key | learn-poll | learn-cancel)"
+             map-restore | map-clear-all | map-backups | learn-key | learn-poll |              learn-cancel)"
         )),
+    }
+}
+
+/// The pipe `map-clear-all` verb: `{"verb":"map-clear-all","preset":…}` plus
+/// the same optional `"reload"` as `map`. Unbinds every function of one preset
+/// (leaving each one listed and inert), after taking a timestamped backup —
+/// so the most destructive mapper button is still one click from undone.
+fn handle_map_clear_all(
+    request: &serde_json::Value,
+    deps: &PipeDeps,
+    settle: Duration,
+) -> serde_json::Value {
+    let Some(preset) = request
+        .get("preset")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+    else {
+        return err_msg(r#"map-clear-all needs a "preset""#);
+    };
+    match (deps.clear_all)(preset) {
+        Ok(applied) => {
+            let mut message = applied.message();
+            let outcome = apply_after_write(request, deps, settle, &mut message);
+            serde_json::json!({
+                "ok": true,
+                "message": message,
+                "path": applied.path.display().to_string(),
+                "preset": applied.preset,
+                "mode": applied.kind.as_str(),
+                "wrote": applied.kind.destination(),
+                "backup": applied.backup.as_ref().map(|b| serde_json::json!({
+                    "stamp": b.stamp,
+                    "label": b.label(),
+                    "path": b.path.display().to_string(),
+                })),
+                "reloaded": outcome.reloaded,
+                "hot_swap": outcome.hot,
+            })
+        }
+        Err(err) => err_msg(err.to_string()),
+    }
+}
+
+/// The pipe `map-backups` verb: `{"verb":"map-backups","preset":…}` → the
+/// timestamped restore points on disk, newest first. Read-only, so it never
+/// touches the session and never reports a reload.
+fn handle_map_backups(request: &serde_json::Value, deps: &PipeDeps) -> serde_json::Value {
+    let Some(preset) = request
+        .get("preset")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+    else {
+        return err_msg(r#"map-backups needs a "preset""#);
+    };
+    match (deps.backups)(preset) {
+        Ok(backups) => serde_json::json!({
+            "ok": true,
+            "preset": preset,
+            "backups": backups.iter().map(|b| serde_json::json!({
+                "stamp": b.stamp,
+                "label": b.label(),
+                "path": b.path.display().to_string(),
+            })).collect::<Vec<_>>(),
+        }),
+        Err(err) => err_msg(err.to_string()),
     }
 }
 
@@ -377,7 +499,7 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
     match (deps.map)(&spec) {
         Ok(applied) => {
             let mut message = applied.message();
-            let reloaded = reload_after_write(request, deps, settle, &mut message);
+            let outcome = apply_after_write(request, deps, settle, &mut message);
             serde_json::json!({
                 "ok": true,
                 "message": message,
@@ -387,7 +509,9 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
                 "key": applied.key,
                 "stolen_from": applied.stolen_from,
                 "conflicts": crate::mapping::conflicts_json(&applied.overridden),
-                "reloaded": reloaded,
+                "reloaded": outcome.reloaded,
+                // true = the live session took it with the pads left plugged.
+                "hot_swap": outcome.hot,
             })
         }
         Err(crate::mapping::MapError::Conflicts {
@@ -409,16 +533,33 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
     }
 }
 
+/// What [`apply_after_write`] did to the running session — the pipe's half of
+/// FIX 3's split.
+struct Applied {
+    /// The running session now has the change (either way it got there).
+    reloaded: bool,
+    /// It got there WITHOUT the pads being unplugged.
+    hot: bool,
+}
+
 /// The shared tail of every write verb (`map`, `map-restore`): honour
-/// `"reload": true` against a RUNNING session (a clean Reload — stop, re-read
-/// from disk, start — never a hot-patch), and append the honest status note
-/// either way. Returns whether a reload actually completed.
-fn reload_after_write(
+/// `"reload": true` against a RUNNING session, and append the honest status
+/// note either way.
+///
+/// The verb enqueued is [`DaemonCommand::ApplyBindings`], not `Reload`. The
+/// control loop then decides: a binding-only edit is hot-swapped into the live
+/// engine (pads stay plugged — Victor's "why does it need to disconnect to
+/// reconnect?"), anything structural bounces the session exactly as before.
+/// The pipe keeps the tray's reach and no more: it enqueues a command and
+/// reads the [`DaemonState`] snapshot the control loop wrote the verdict into,
+/// identified by generation so a concurrent client's answer is never mistaken
+/// for this one.
+fn apply_after_write(
     request: &serde_json::Value,
     deps: &PipeDeps,
     settle: Duration,
     message: &mut String,
-) -> bool {
+) -> Applied {
     let running = matches!(
         snapshot(&deps.state).run,
         RunState::Running { .. } | RunState::Starting
@@ -427,32 +568,77 @@ fn reload_after_write(
         .get("reload")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let mut reloaded = false;
-    if running && want_reload {
-        let baseline = snapshot(&deps.state).run;
-        if deps.tx.send(DaemonCommand::Reload).is_ok() {
-            let outcome = await_start(&deps.state, &baseline, settle);
-            reloaded = outcome["ok"] == true;
-            match outcome["message"].as_str().or(outcome["error"].as_str()) {
-                Some(note) => message.push_str(&format!(" — session reloaded: {note}")),
-                None => message.push_str(" — session reload requested"),
-            }
-        } else {
-            message.push_str(" — saved, but the daemon is shutting down (no reload)");
-        }
-    } else if running {
-        message.push_str(" — a session is running; `reload` to apply now");
-    } else {
+    if !running {
         message.push_str(" — the next session start reads it");
+        return Applied {
+            reloaded: false,
+            hot: false,
+        };
     }
-    reloaded
+    if !want_reload {
+        message.push_str(" — a session is running; `reload` to apply now");
+        return Applied {
+            reloaded: false,
+            hot: false,
+        };
+    }
+
+    let baseline = snapshot(&deps.state)
+        .apply
+        .map_or(0, |report| report.generation);
+    if deps.tx.send(DaemonCommand::ApplyBindings).is_err() {
+        message.push_str(" — saved, but the daemon is shutting down (not applied)");
+        return Applied {
+            reloaded: false,
+            hot: false,
+        };
+    }
+    match await_apply(&deps.state, baseline, settle) {
+        Some(report) => {
+            message.push_str(&format!(" — {}", report.message));
+            Applied {
+                reloaded: report.ok && (report.hot || report.restarted),
+                hot: report.hot,
+            }
+        }
+        None => {
+            message.push_str(" — saved; the daemon has not reported applying it yet");
+            Applied {
+                reloaded: false,
+                hot: false,
+            }
+        }
+    }
+}
+
+/// Poll [`DaemonState::apply`] until its generation moves past `baseline`.
+fn await_apply(state: &SharedState, baseline: u64, settle: Duration) -> Option<super::ApplyReport> {
+    let deadline = Instant::now() + settle;
+    loop {
+        if let Some(report) = snapshot(state).apply {
+            if report.generation > baseline {
+                return Some(report);
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(SETTLE_POLL);
+    }
 }
 
 /// The pipe `map-restore` verb: `{"verb":"map-restore","preset":…,"mode":
-/// "defaults"|"session-backup"}` plus the same optional `"reload"` as `map`.
-/// `defaults` rewrites the preset to the built-in default layout;
-/// `session-backup` restores the snapshot taken before this daemon lifetime's
-/// first `map` write to that preset ("undo this session").
+/// "defaults"|"session-backup"|"latest-backup"}` plus the same optional
+/// `"reload"` as `map`.
+///
+/// The three destinations, spelled out because "defaults" is the one that
+/// surprises people: `defaults` writes the GENERIC KEYBOARD layout (S=A, D=B,
+/// A=X, W=Y…), not "this preset as it shipped"; `session-backup` restores the
+/// snapshot taken before this daemon lifetime's first `map` write ("undo this
+/// session"); `latest-backup` restores the newest
+/// `<preset>.toml.bak-YYYYMMDD-HHMMSS`, which is the undo for a previous
+/// restore. Every one of them copies the current file to a fresh timestamped
+/// backup first, and the response names it.
 fn handle_map_restore(
     request: &serde_json::Value,
     deps: &PipeDeps,
@@ -465,23 +651,34 @@ fn handle_map_restore(
     else {
         return err_msg(r#"map-restore needs a "preset""#);
     };
-    let kind = match request.get("mode").and_then(|v| v.as_str()) {
-        Some("defaults") => crate::mapping::RestoreKind::Defaults,
-        Some("session-backup") => crate::mapping::RestoreKind::SessionBackup,
-        _ => {
-            return err_msg(r#"map-restore needs a "mode": "defaults" | "session-backup""#);
-        }
+    let Some(kind) = request
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .and_then(crate::mapping::RestoreKind::parse)
+    else {
+        return err_msg(
+            r#"map-restore needs a "mode": "defaults" | "session-backup" | "latest-backup""#,
+        );
     };
     match (deps.restore)(preset, kind) {
         Ok(applied) => {
             let mut message = applied.message();
-            let reloaded = reload_after_write(request, deps, settle, &mut message);
+            let outcome = apply_after_write(request, deps, settle, &mut message);
             serde_json::json!({
                 "ok": true,
                 "message": message,
                 "path": applied.path.display().to_string(),
                 "preset": applied.preset,
-                "reloaded": reloaded,
+                "mode": applied.kind.as_str(),
+                // What the caller's confirm dialog promised, echoed back.
+                "wrote": applied.kind.destination(),
+                "backup": applied.backup.as_ref().map(|b| serde_json::json!({
+                    "stamp": b.stamp,
+                    "label": b.label(),
+                    "path": b.path.display().to_string(),
+                })),
+                "reloaded": outcome.reloaded,
+                "hot_swap": outcome.hot,
             })
         }
         Err(err) => err_msg(err.to_string()),
@@ -860,6 +1057,11 @@ mod tests {
         })
     }
 
+    /// A `map-backups` that always answers "none".
+    fn no_backups() -> BackupsFn {
+        Box::new(|_preset| Ok(Vec::new()))
+    }
+
     fn deps(tx: Sender<DaemonCommand>, state: SharedState, profiles: ProfilesFn) -> PipeDeps {
         PipeDeps {
             tx,
@@ -867,8 +1069,38 @@ mod tests {
             profiles,
             map: no_map(),
             restore: no_restore(),
+            clear_all: Box::new(|preset| {
+                Err(crate::mapping::MapError::UnknownPreset {
+                    name: preset.to_owned(),
+                    known: Vec::new(),
+                })
+            }),
+            backups: no_backups(),
             learn: idle_learn(),
         }
+    }
+
+    /// Play the control loop's `ApplyBindings` half: consume the command and
+    /// write the verdict back into the snapshot, exactly as
+    /// `daemon::apply_bindings` does.
+    fn answer_apply(
+        rx: crossbeam_channel::Receiver<DaemonCommand>,
+        state: SharedState,
+        report: super::super::ApplyReport,
+    ) -> std::thread::JoinHandle<DaemonCommand> {
+        std::thread::spawn(move || {
+            let command = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("a command was enqueued");
+            if let Ok(mut s) = state.lock() {
+                let generation = s.apply.as_ref().map_or(0, |a| a.generation) + 1;
+                s.apply = Some(super::super::ApplyReport {
+                    generation,
+                    ..report
+                });
+            }
+            command
+        })
     }
 
     const FAST: Duration = Duration::from_millis(50);
@@ -1158,25 +1390,24 @@ mod tests {
         assert!(!seen[0].force);
     }
 
-    /// `reload: true` with a running session enqueues the SAME
-    /// DaemonCommand::Reload a tray click would — the "hot-reload" is a clean
-    /// stop + re-read + start, never a hot-patch.
+    /// FIX 3, pipe half — the hot branch. `reload: true` with a running
+    /// session enqueues `ApplyBindings` (NOT `Reload`), and when the control
+    /// loop reports a hot swap the response says the pads were left alone.
     #[test]
-    fn map_with_reload_bounces_a_running_session() {
+    fn map_with_reload_hot_swaps_a_running_session() {
         let state = shared(RunState::Running { slots: 4 });
         let (tx, rx) = unbounded();
-        std::thread::spawn({
-            let state = state.clone();
-            move || {
-                assert_eq!(
-                    rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-                    DaemonCommand::Reload
-                );
-                state.lock().unwrap().run = RunState::Starting;
-                std::thread::sleep(Duration::from_millis(10));
-                state.lock().unwrap().run = RunState::Running { slots: 4 };
-            }
-        });
+        let loop_thread = answer_apply(
+            rx,
+            state.clone(),
+            super::super::ApplyReport {
+                generation: 0,
+                ok: true,
+                hot: true,
+                restarted: false,
+                message: "bindings applied live — pads untouched".to_owned(),
+            },
+        );
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut d = deps(tx, state, no_profiles());
         d.map = scripted_map(applied_ok, seen);
@@ -1185,10 +1416,55 @@ mod tests {
             &d,
             Duration::from_secs(2),
         );
+        assert_eq!(
+            loop_thread.join().unwrap(),
+            DaemonCommand::ApplyBindings,
+            "a binding save must not enqueue a blunt Reload any more"
+        );
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(v["reloaded"], true, "{v}");
+        assert_eq!(v["hot_swap"], true, "{v}");
         assert!(
-            v["message"].as_str().unwrap().contains("session reloaded"),
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("bindings applied live — pads untouched"),
+            "{v}"
+        );
+    }
+
+    /// …and the bounce branch: a structural change reports the restart, in the
+    /// same field shape, so the caller can tell the two apart.
+    #[test]
+    fn map_with_reload_reports_a_restart_when_the_change_is_structural() {
+        let state = shared(RunState::Running { slots: 4 });
+        let (tx, rx) = unbounded();
+        let loop_thread = answer_apply(
+            rx,
+            state.clone(),
+            super::super::ApplyReport {
+                generation: 0,
+                ok: true,
+                hot: false,
+                restarted: true,
+                message: "session restarted — slot 3 changed persona (Xbox 360 → PlayStation \
+                          (DS4)) needs the pads replugged"
+                    .to_owned(),
+            },
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut d = deps(tx, state, no_profiles());
+        d.map = scripted_map(applied_ok, seen);
+        let v = handle_request(
+            r#"{"verb":"map","preset":"IPAC P1","function":"A","key":"G","reload":true}"#,
+            &d,
+            Duration::from_secs(2),
+        );
+        assert_eq!(loop_thread.join().unwrap(), DaemonCommand::ApplyBindings);
+        assert_eq!(v["reloaded"], true, "{v}");
+        assert_eq!(v["hot_swap"], false, "{v}");
+        assert!(
+            v["message"].as_str().unwrap().contains("session restarted"),
             "{v}"
         );
     }
@@ -1266,20 +1542,41 @@ mod tests {
             let v = handle_request(junk, &d, FAST);
             assert_eq!(v["ok"], false, "{junk} → {v}");
         }
+        // The refusal must list all three spellings, or a caller cannot guess
+        // the one it is missing.
+        let v = handle_request(
+            r#"{"verb":"map-restore","preset":"P","mode":"x"}"#,
+            &d,
+            FAST,
+        );
+        let error = v["error"].as_str().unwrap();
+        for mode in ["defaults", "session-backup", "latest-backup"] {
+            assert!(error.contains(mode), "{error}");
+        }
+    }
+
+    fn restored(preset: &str, kind: crate::mapping::RestoreKind) -> crate::mapping::AppliedRestore {
+        crate::mapping::AppliedRestore {
+            path: std::path::PathBuf::from(r"C:\cfg\ksx\presets\IPAC P1.toml"),
+            preset: preset.to_owned(),
+            kind,
+            backup: Some(crate::mapping::PresetBackup {
+                path: std::path::PathBuf::from(
+                    r"C:\cfg\ksx\presets\IPAC P1.toml.bak-20260805-143207",
+                ),
+                stamp: "20260805-143207".to_owned(),
+            }),
+        }
     }
 
     #[test]
-    fn map_restore_defaults_reports_the_write_and_honours_reload() {
+    fn map_restore_defaults_reports_the_write_the_backup_and_honours_reload() {
         let state = shared(RunState::Stopped);
         let (tx, rx) = unbounded();
         let mut d = deps(tx, state, no_profiles());
         d.restore = Box::new(|preset, kind| {
             assert_eq!(kind, crate::mapping::RestoreKind::Defaults);
-            Ok(crate::mapping::AppliedRestore {
-                path: std::path::PathBuf::from(r"C:\cfg\ksx\presets\IPAC P1.toml"),
-                preset: preset.to_owned(),
-                kind,
-            })
+            Ok(restored(preset, kind))
         });
         let v = handle_request(
             r#"{"verb":"map-restore","preset":"IPAC P1","mode":"defaults","reload":true}"#,
@@ -1288,12 +1585,69 @@ mod tests {
         );
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(v["preset"], "IPAC P1");
+        assert_eq!(v["mode"], "defaults");
         assert_eq!(v["reloaded"], false, "nothing runs, nothing reloads");
+        // FIX 2: the response says exactly what was written — never the bare
+        // word "defaults" — and where the old file went.
         assert!(
-            v["message"].as_str().unwrap().contains("built-in defaults"),
+            v["wrote"].as_str().unwrap().contains("generic keyboard"),
             "{v}"
         );
+        assert_eq!(v["backup"]["stamp"], "20260805-143207", "{v}");
+        assert_eq!(v["backup"]["label"], "2026-08-05 14:32:07 UTC", "{v}");
+        let message = v["message"].as_str().unwrap();
+        assert!(message.contains("generic keyboard layout"), "{v}");
+        assert!(message.contains("backed up as"), "{v}");
         assert!(rx.try_recv().is_err(), "no reload while stopped");
+    }
+
+    /// The third destination (FIX 2): undo the previous restore.
+    #[test]
+    fn map_restore_accepts_latest_backup() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let mut d = deps(tx, state, no_profiles());
+        d.restore = Box::new(|preset, kind| {
+            assert_eq!(kind, crate::mapping::RestoreKind::LatestBackup);
+            Ok(restored(preset, kind))
+        });
+        let v = handle_request(
+            r#"{"verb":"map-restore","preset":"IPAC P1","mode":"latest-backup"}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["mode"], "latest-backup", "{v}");
+    }
+
+    /// `map-backups` is the read-only list the mapper labels its third button
+    /// with ("Restore backup from …").
+    #[test]
+    fn map_backups_lists_the_restore_points_newest_first() {
+        let state = shared(RunState::Stopped);
+        let (tx, rx) = unbounded();
+        let mut d = deps(tx, state, no_profiles());
+        d.backups = Box::new(|preset| {
+            assert_eq!(preset, "IPAC P1");
+            Ok(vec![
+                crate::mapping::PresetBackup {
+                    path: std::path::PathBuf::from("b.bak-20260805-143207"),
+                    stamp: "20260805-143207".to_owned(),
+                },
+                crate::mapping::PresetBackup {
+                    path: std::path::PathBuf::from("a.bak-20260804-090000"),
+                    stamp: "20260804-090000".to_owned(),
+                },
+            ])
+        });
+        let v = handle_request(r#"{"verb":"map-backups","preset":"IPAC P1"}"#, &d, FAST);
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["backups"][0]["label"], "2026-08-05 14:32:07 UTC", "{v}");
+        assert_eq!(v["backups"][1]["stamp"], "20260804-090000", "{v}");
+        assert!(rx.try_recv().is_err(), "a read-only verb touches nothing");
+
+        let v = handle_request(r#"{"verb":"map-backups"}"#, &d, FAST);
+        assert_eq!(v["ok"], false, "a preset is required: {v}");
     }
 
     #[test]

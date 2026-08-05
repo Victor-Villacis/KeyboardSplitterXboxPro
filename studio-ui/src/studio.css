@@ -924,3 +924,177 @@ footer p {
 .mono {
   font-family: var(--mono);
 }
+
+/* ── FIX 1 / FIX 0: the banners that must not be missable ──────────────────
+   A dead daemon used to be a footnote at the bottom of a card while the page
+   looked completely normal — Victor clicked controls and nothing happened at
+   all. These sit FIRST inside <main>, carry a full-width danger edge, and say
+   both what is wrong and the two ways out. */
+.alarm {
+  border-color: var(--danger);
+  border-left-width: 4px;
+  background: linear-gradient(180deg, var(--danger-dim) 0%, var(--panel) 60%);
+}
+
+.alarm h2 {
+  color: var(--danger);
+  font-size: 1.1rem;
+  letter-spacing: -0.01em;
+  margin: 0 0 0.4rem;
+}
+
+/* A running session is not an error — it is a state with a one-click answer. */
+.alarm.warn {
+  border-color: var(--warn);
+  background: linear-gradient(180deg, var(--warn-dim) 0%, var(--panel) 60%);
+}
+
+.alarm.warn h2 {
+  color: var(--warn);
+}
+
+/* Paused BY THIS PAGE: the accent colour, because it is a state the user
+   chose and has to be reminded to leave. */
+.alarm.paused {
+  border-color: var(--accent-line);
+  background: linear-gradient(180deg, var(--accent-dim) 0%, var(--panel) 60%);
+}
+
+.alarm.paused h2 {
+  color: var(--accent);
+}
+
+.alarmlead {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+  color: var(--text);
+}
+
+.alarmways {
+  margin: 0;
+  padding-left: 1.2rem;
+  font-size: 0.9rem;
+}
+
+.alarmways li {
+  margin: 0.2rem 0;
+}
+
+/* The command is meant to be selected and pasted: one click selects it all. */
+.copyable {
+  display: inline-block;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0.25rem 0.55rem;
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.pill-paused {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+}
+
+/* ── Controls that cannot work look like it (but still answer a click) ─────
+   Never the `disabled` attribute on a zone or legend row: a disabled button
+   swallows its own click, and a click on an unmappable control has to say
+   WHY. Dimmed + not-allowed is the honest middle. */
+.zone.z-dead,
+.lrow.l-dead {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.zone.z-dead .ztag {
+  filter: grayscale(1);
+}
+
+/* ── The legend's ✕ clear accelerator ──────────────────────────────────────
+   Desktop speed, revealed on hover/focus; always in the DOM so keyboard and
+   AT users can reach it. Empty content (unbound rows, dead pages) collapses. */
+.lclear {
+  flex: 0 0 auto;
+  width: 1.1rem;
+  text-align: center;
+  font-size: 0.8rem;
+  line-height: 1;
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity 90ms ease;
+}
+
+.lclear:empty {
+  display: none;
+}
+
+.lrow:hover .lclear,
+.lrow:focus-visible .lclear,
+.lrow.l-hot .lclear {
+  opacity: 1;
+}
+
+.lclear:hover {
+  color: var(--danger);
+}
+
+/* Touch and keyboard-only users never get a hover: keep it visible there. */
+@media (hover: none) {
+  .lclear {
+    opacity: 0.75;
+  }
+}
+
+/* ── The preset card's header row: heading + the auto-save receipt ─────────*/
+.phead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.phead h2 {
+  margin-bottom: 0.3rem;
+}
+
+.savedat {
+  font-size: 0.75rem;
+  color: var(--accent);
+}
+
+.savedat:empty {
+  display: none;
+}
+
+/* A destructive action should not look like the neighbours it can undo. */
+.btn-danger-ghost {
+  border-color: rgba(240, 86, 79, 0.45);
+  color: var(--danger);
+}
+
+/* ── The learn modal's "currently X" + Clear binding ───────────────────────*/
+.mbound {
+  border-top: 1px solid var(--line);
+  margin-top: 0.6rem;
+  padding-top: 0.6rem;
+}
+
+.mcurrent {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+/* The mapper's flash is the ANSWER to a click — including a click that could
+   not do anything (FIX 1). On a page this tall it has to stay in view, or the
+   answer scrolls off while the user is still looking at the control they
+   pressed. Sticky beats fixed here: it never covers the footer. */
+.mapper .flash {
+  position: sticky;
+  bottom: 0.6rem;
+  z-index: 5;
+  backdrop-filter: blur(6px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+}

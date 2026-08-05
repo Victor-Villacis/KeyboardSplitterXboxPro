@@ -334,23 +334,42 @@ enum Command {
     /// keeps a "None" placeholder); other presets are NEVER edited, the
     /// response just keeps naming the double binding.
     ///
-    /// A running session picks the change up after `ksx session reload` (or
-    /// its next start); Studio's mapper asks the daemon to do exactly that.
+    /// A running session picks the change up when Studio's mapper (or the pipe
+    /// `map` verb with "reload") applies it: a binding-only edit is hot-swapped
+    /// into the live engine with the pads left plugged; a structural change
+    /// still restarts the session. From a shell, `ksx session reload` is the
+    /// blunt equivalent.
+    ///
+    /// RESTORE has three destinations, and the labels say which:
+    ///   defaults        the GENERIC KEYBOARD layout (S=A, D=B, A=X, W=Y,
+    ///                   Q/E triggers, arrows = left stick, Esc=Start) — NOT
+    ///                   "this preset as it shipped". On an arcade panel this
+    ///                   replaces the I-PAC map with a desktop-keyboard map.
+    ///   session-backup  the preset as it was before the daemon's first change
+    ///                   this session ("undo this session").
+    ///   latest-backup   the preset as it was before the most recent restore.
+    /// Every restore copies the current file to
+    /// "<preset>.toml.bak-YYYYMMDD-HHMMSS" first; --list-backups shows them.
     ///
     /// Exit codes: 0 = written, 1 = error, 2 = refused (unknown
-    /// preset/function/key, or conflicts without --force; nothing written).
+    /// preset/function/key, conflicts without --force, or a restore with
+    /// nothing to restore; nothing written).
     Map {
         /// Preset name (the file's `name` field, e.g. "IPAC P1")
         #[arg(long, value_name = "NAME")]
         preset: String,
         /// Function to bind, e.g. A, lt, dpad.up, lx.min
-        #[arg(long, value_name = "FUNCTION", required_unless_present = "restore")]
+        #[arg(
+            long,
+            value_name = "FUNCTION",
+            required_unless_present_any = ["restore", "list_backups", "clear_all"]
+        )]
         function: Option<String>,
         /// Key name to bind (legacy spelling, e.g. G, Enter, Left)
         #[arg(
             long,
             value_name = "KEY",
-            required_unless_present_any = ["clear", "restore"],
+            required_unless_present_any = ["clear", "restore", "list_backups", "clear_all"],
             conflicts_with = "clear"
         )]
         key: Option<String>,
@@ -361,16 +380,27 @@ enum Command {
         #[arg(long)]
         force: bool,
         /// Restore the whole preset instead of binding one function:
-        /// "defaults" rewrites it to the built-in default layout,
-        /// "session-backup" restores the daemon's session-start snapshot
-        /// (taken before the first `map` write of a daemon lifetime)
+        /// "defaults" (the generic keyboard layout — read the note above),
+        /// "session-backup" (the daemon's session-start snapshot) or
+        /// "latest-backup" (undo the previous restore)
         #[arg(
             long,
             value_name = "MODE",
-            value_parser = ["defaults", "session-backup"],
-            conflicts_with_all = ["function", "key", "clear", "force"]
+            value_parser = ["defaults", "session-backup", "latest-backup"],
+            conflicts_with_all = ["function", "key", "clear", "force", "list_backups", "clear_all"]
         )]
         restore: Option<String>,
+        /// List this preset's timestamped backups, newest first, and exit
+        /// (writes nothing)
+        #[arg(long, conflicts_with_all = ["function", "key", "clear", "force", "restore"])]
+        list_backups: bool,
+        /// Unbind EVERY function of the preset (each one stays listed as the
+        /// inert "None"), after taking a timestamped backup
+        #[arg(
+            long,
+            conflicts_with_all = ["function", "key", "clear", "force", "restore", "list_backups"]
+        )]
+        clear_all: bool,
         /// One JSON object {ok, path, preset, function, key, conflicts} on stdout
         #[arg(long)]
         json: bool,
@@ -662,13 +692,20 @@ fn main() -> anyhow::Result<()> {
             clear: _,
             force,
             restore,
+            list_backups,
+            clear_all,
             json,
         } => map::run(map::Options {
             preset,
-            action: match restore.as_deref() {
-                Some("defaults") => map::Action::Restore(mapping::RestoreKind::Defaults),
-                Some(_) => map::Action::Restore(mapping::RestoreKind::SessionBackup),
-                None => map::Action::Bind {
+            action: match (list_backups, clear_all, restore.as_deref()) {
+                (true, _, _) => map::Action::ListBackups,
+                (_, true, _) => map::Action::ClearAll,
+                // clap's value_parser pins the three spellings, so a parse
+                // failure here is impossible rather than merely unlikely.
+                (false, false, Some(mode)) => map::Action::Restore(
+                    mapping::RestoreKind::parse(mode).expect("clap validated the restore mode"),
+                ),
+                (false, false, None) => map::Action::Bind {
                     // clap: --function is required without --restore, and
                     // exactly one of --key/--clear; a `None` key IS the clear.
                     function: function.expect("clap requires --function without --restore"),
@@ -1393,12 +1430,14 @@ mod tests {
                 clear,
                 force,
                 restore,
+                list_backups,
+                clear_all,
                 json,
             } => {
                 assert_eq!(preset, "IPAC P1");
                 assert_eq!(function.as_deref(), Some("A"));
                 assert_eq!(key.as_deref(), Some("G"));
-                assert!(!clear && !force && json);
+                assert!(!clear && !force && json && !list_backups && !clear_all);
                 assert_eq!(restore, None);
             }
             _ => panic!("parsed to the wrong subcommand"),
@@ -1426,7 +1465,7 @@ mod tests {
     }
 
     /// `--restore` stands alone: it parses without function/key, refuses to
-    /// combine with the binding flags, and only accepts the two documented
+    /// combine with the binding flags, and only accepts the three documented
     /// modes.
     #[test]
     fn map_restore_parses_alone_and_rejects_bind_flags() {
@@ -1477,8 +1516,52 @@ mod tests {
                 "G",
             ],
             vec!["ksx", "map", "--preset", "P", "--restore", "everything"],
+            vec![
+                "ksx",
+                "map",
+                "--preset",
+                "P",
+                "--restore",
+                "defaults",
+                "--list-backups",
+            ],
         ] {
             assert!(Cli::try_parse_from(bad.clone()).is_err(), "{bad:?}");
+        }
+        // The third destination (FIX 2): undo the previous restore.
+        assert!(
+            Cli::try_parse_from(["ksx", "map", "--preset", "P", "--restore", "latest-backup"])
+                .is_ok()
+        );
+    }
+
+    /// `--list-backups` is the read-only twin: no function, no key, no write.
+    #[test]
+    fn map_list_backups_parses_alone() {
+        let cli = Cli::try_parse_from([
+            "ksx",
+            "map",
+            "--preset",
+            "IPAC P1",
+            "--list-backups",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Map {
+                preset,
+                function,
+                key,
+                list_backups,
+                json,
+                ..
+            } => {
+                assert_eq!(preset, "IPAC P1");
+                assert_eq!(function, None);
+                assert_eq!(key, None);
+                assert!(list_backups && json);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
         }
     }
 
@@ -1524,6 +1607,14 @@ mod tests {
             "comments do not survive",
             "ksx session reload",
             "2 = refused",
+            // FIX 2: --help must never let "defaults" read as "how this preset
+            // shipped". It names the layout it writes, and the road back.
+            "the GENERIC KEYBOARD layout",
+            "NOT \"this preset as it shipped\"",
+            "latest-backup",
+            "bak-YYYYMMDD-HHMMSS",
+            // FIX 3: the honest description of what a live session does now.
+            "hot-swapped into the live engine with the pads left plugged",
         ] {
             assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
         }

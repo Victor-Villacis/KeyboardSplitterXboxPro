@@ -15,6 +15,10 @@ use ksx_studio::{
 
 struct FixedStatus;
 
+/// The newest timestamped backup this preset has, as `collect_mapper` reads
+/// it off disk — the label the mapper's third restore button wears.
+const BACKUP_LABEL: &str = "2026-08-05 14:32:07 UTC";
+
 impl StatusSource for FixedStatus {
     fn snapshot(&self) -> StatusSnapshot {
         StatusSnapshot {
@@ -50,6 +54,7 @@ impl StatusSource for FixedStatus {
                 preset: "IPAC P1".into(),
                 keyboard: "HID\\TEST".into(),
                 bindings,
+                backup: Some(BACKUP_LABEL.to_owned()),
             }],
         }
     }
@@ -60,10 +65,13 @@ impl StatusSource for FixedStatus {
 struct ScriptedControl {
     running: AtomicBool,
     refuse_start: bool,
+    /// Every ControlSource call fails the way an absent daemon fails.
+    no_daemon: bool,
     started_with: std::sync::Mutex<Option<Option<String>>>,
     learning: AtomicBool,
     bound_with: std::sync::Mutex<Option<BindRequest>>,
     restored_with: std::sync::Mutex<Option<(String, String)>>,
+    cleared: std::sync::Mutex<Option<String>>,
 }
 
 impl ScriptedControl {
@@ -71,27 +79,52 @@ impl ScriptedControl {
         Self {
             running: AtomicBool::new(false),
             refuse_start,
+            no_daemon: false,
             started_with: std::sync::Mutex::new(None),
             learning: AtomicBool::new(false),
             bound_with: std::sync::Mutex::new(None),
             restored_with: std::sync::Mutex::new(None),
+            cleared: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Nothing answers the pipe — the state Victor hit when he quit the tray
+    /// daemon and then clicked around /map.
+    fn dead() -> Self {
+        Self {
+            no_daemon: true,
+            ..Self::new(true)
         }
     }
 }
 
+/// What every verb says when there is no daemon, matching the real
+/// PipeControlSource's `NO_CHANNEL`.
+const NO_CHANNEL: &str = "no daemon control channel — start the daemon (tray, or `ksx daemon`)";
+
 impl ControlSource for ScriptedControl {
     fn session(&self) -> SessionView {
+        if self.no_daemon {
+            // The profile still comes from the config, so the banner can print
+            // a command that actually starts THIS cabinet.
+            return SessionView {
+                profile: Some("Steam".into()),
+                ..SessionView::unreachable(NO_CHANNEL)
+            };
+        }
         if self.running.load(Ordering::SeqCst) {
             SessionView {
                 reachable: true,
                 running: true,
                 line: "running — 4 pad(s)".into(),
+                profile: Some("Street Fighter".into()),
             }
         } else {
             SessionView {
                 reachable: true,
                 running: false,
                 line: "idle".into(),
+                profile: None,
             }
         }
     }
@@ -107,6 +140,9 @@ impl ControlSource for ScriptedControl {
     }
 
     fn stop(&self) -> Result<String, String> {
+        if self.no_daemon {
+            return Err(NO_CHANNEL.to_owned());
+        }
         self.running.store(false, Ordering::SeqCst);
         Ok("stopped".into())
     }
@@ -163,13 +199,26 @@ impl ControlSource for ScriptedControl {
 
     fn restore(&self, preset: &str, mode: &str) -> Result<String, String> {
         *self.restored_with.lock().unwrap() = Some((preset.to_owned(), mode.to_owned()));
-        if mode == "session-backup" {
-            Err(format!("no session backup for \"{preset}\""))
-        } else {
-            Ok(format!(
-                "\"{preset}\": bindings restored to the built-in defaults"
-            ))
+        if self.no_daemon {
+            return Err(NO_CHANNEL.to_owned());
         }
+        match mode {
+            "session-backup" => Err(format!("no session backup for \"{preset}\"")),
+            "latest-backup" => Ok(format!(
+                "\"{preset}\": bindings restored from the newest timestamped backup"
+            )),
+            _ => Ok(format!(
+                "\"{preset}\": bindings reset to the generic keyboard layout (S/D/A/W…)"
+            )),
+        }
+    }
+
+    fn clear_all(&self, preset: &str) -> Result<String, String> {
+        *self.cleared.lock().unwrap() = Some(preset.to_owned());
+        if self.no_daemon {
+            return Err(NO_CHANNEL.to_owned());
+        }
+        Ok(format!("\"{preset}\": every binding cleared"))
     }
 
     fn bind(&self, request: &BindRequest) -> BindOutcome {
@@ -241,6 +290,9 @@ fn start_server(control: Arc<ScriptedControl>) -> SocketAddr {
         }
         fn restore(&self, preset: &str, mode: &str) -> Result<String, String> {
             self.0.restore(preset, mode)
+        }
+        fn clear_all(&self, preset: &str) -> Result<String, String> {
+            self.0.clear_all(preset)
         }
     }
     std::thread::spawn(move || {
@@ -450,7 +502,7 @@ fn the_mapper_page_learn_flow_and_bind_round_trip() {
         outcome["message"]
             .as_str()
             .unwrap()
-            .contains("built-in defaults"),
+            .contains("generic keyboard layout"),
         "{outcome}"
     );
     assert_eq!(
@@ -492,6 +544,151 @@ fn the_mapper_page_learn_flow_and_bind_round_trip() {
         Some(("IPAC P1".to_owned(), "session-backup".to_owned())),
         "the junk mode must have been rejected before the control source"
     );
+}
+
+/// FIX 1, over real HTTP: the exact failure Victor hit. Quit the daemon, load
+/// either page, and the FIRST thing on it must be the banner — with the
+/// command that starts one, profile flag included.
+#[test]
+fn a_dead_daemon_is_loud_on_both_pages_with_a_runnable_command() {
+    let addr = start_server(Arc::new(ScriptedControl::dead()));
+
+    for path in ["/", "/map"] {
+        let page = get(addr, path);
+        assert!(page.starts_with("HTTP/1.1 200"), "{path}: {page}");
+        let body = body_of(&page);
+        assert!(
+            body.contains("No daemon — ksx Studio can see your config but cannot change anything."),
+            "{path} has no banner: {body}"
+        );
+        assert!(body.contains("tray icon"), "{path}: {body}");
+        assert!(
+            body.contains("ksx daemon --game &quot;Steam&quot;")
+                || body.contains(r#"ksx daemon --game "Steam""#),
+            "{path} must print the command that actually starts THIS cabinet: {body}"
+        );
+        // Unmissable = above everything it is about. On both pages the banner
+        // must precede the <main> content it warns you off touching.
+        let banner = body.find("No daemon —").expect("banner");
+        let footer = body.find("<footer").expect("footer");
+        assert!(banner < footer, "{path}: banner is below the fold: {body}");
+        let first_other_card = body[banner..]
+            .find(r#"class="card"#)
+            .map(|i| banner + i)
+            .expect("another card follows the banner");
+        assert!(
+            banner < first_other_card,
+            "{path}: the banner is not first inside <main>: {body}"
+        );
+    }
+
+    // The mapper additionally renders every control visibly inert…
+    let map = body_of(&get(addr, "/map")).to_owned();
+    assert!(map.contains("z-dead"), "{map}");
+    assert!(map.contains("l-dead"), "{map}");
+    assert!(map.contains("card pactions off"), "{map}");
+    // …and keeps the prefilled shell fallback, so the page is still useful.
+    assert!(map.contains("ksx map --preset"), "{map}");
+}
+
+/// FIX 0 over HTTP: the mapper's own session controls are the same
+/// ControlSource verbs the status page's forms use — one pipe verb each.
+#[test]
+fn the_mapper_can_pause_and_resume_emulation_over_json() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control.clone());
+
+    // Start something, then pause it from the mapper.
+    let started = post_json(
+        addr,
+        "/api/session/start",
+        r#"{"profile":"Street Fighter"}"#,
+    );
+    let out: serde_json::Value = serde_json::from_str(body_of(&started)).expect("json");
+    assert_eq!(out["ok"], true, "{out}");
+
+    let map = body_of(&get(addr, "/map")).to_owned();
+    assert!(map.contains("Emulation is running"), "{map}");
+    assert!(map.contains(r#"data-act="pause-map""#), "{map}");
+
+    let paused = post_json(addr, "/api/session/stop", "");
+    let out: serde_json::Value = serde_json::from_str(body_of(&paused)).expect("json");
+    assert_eq!(out["ok"], true, "{out}");
+    assert_eq!(out["message"], "stopped");
+
+    // Resume names the profile the page remembered.
+    let resumed = post_json(
+        addr,
+        "/api/session/start",
+        r#"{"profile":"Street Fighter"}"#,
+    );
+    let out: serde_json::Value = serde_json::from_str(body_of(&resumed)).expect("json");
+    assert_eq!(out["ok"], true, "{out}");
+    assert_eq!(
+        control.started_with.lock().unwrap().clone(),
+        Some(Some("Street Fighter".to_owned())),
+        "Resume must restart the SAME profile that was paused"
+    );
+}
+
+/// FIX 2 over HTTP: three destinations, and the label the third one wears.
+#[test]
+fn the_three_restore_destinations_and_clear_all_round_trip() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control.clone());
+
+    let map = body_of(&get(addr, "/map")).to_owned();
+    assert!(
+        map.contains(&format!("Restore backup from {BACKUP_LABEL}")),
+        "the newest backup's timestamp belongs in the label: {map}"
+    );
+    assert!(
+        map.contains("Reset to generic keyboard layout (S/D/A/W…)"),
+        "{map}"
+    );
+    assert!(!map.contains("Restore built-in defaults"), "{map}");
+
+    let out: serde_json::Value = serde_json::from_str(body_of(&post_json(
+        addr,
+        "/api/preset/restore",
+        r#"{"preset":"IPAC P1","mode":"latest-backup"}"#,
+    )))
+    .expect("json");
+    assert_eq!(out["ok"], true, "{out}");
+    assert_eq!(
+        control.restored_with.lock().unwrap().clone(),
+        Some(("IPAC P1".to_owned(), "latest-backup".to_owned()))
+    );
+
+    let out: serde_json::Value = serde_json::from_str(body_of(&post_json(
+        addr,
+        "/api/preset/clear-all",
+        r#"{"preset":"IPAC P1"}"#,
+    )))
+    .expect("json");
+    assert_eq!(out["ok"], true, "{out}");
+    assert_eq!(
+        control.cleared.lock().unwrap().clone(),
+        Some("IPAC P1".to_owned())
+    );
+}
+
+/// Clearing ONE binding is the plain `map` verb with a null key — no second
+/// writer, no GUI-only path.
+#[test]
+fn clearing_one_binding_goes_through_the_bind_verb_with_a_null_key() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control.clone());
+    let out: serde_json::Value = serde_json::from_str(body_of(&post_json(
+        addr,
+        "/api/bind",
+        r#"{"preset":"IPAC P1","function":"A","key":null,"force":false,"reload":true}"#,
+    )))
+    .expect("json");
+    assert_eq!(out["ok"], true, "{out}");
+    let bound = control.bound_with.lock().unwrap().clone().expect("bind");
+    assert_eq!(bound.function, "A");
+    assert_eq!(bound.key, None, "a null key is a CLEAR");
 }
 
 #[test]

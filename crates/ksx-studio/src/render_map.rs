@@ -33,7 +33,7 @@ use forma_ir::parser::IrModule;
 use forma_ir::slot::{SlotData, SlotValue};
 use forma_server::{render_page, PageConfig, PageOutput, RenderMode};
 
-use crate::render::{art_for, body_prefix, EmbeddedPage};
+use crate::render::{art_for, body_prefix, daemon_command, EmbeddedPage};
 use crate::snapshot::{MapPayload, MapperSlot};
 
 /// List slot names (binding-derived, compiler 0.2.0). The zones list appears
@@ -53,18 +53,30 @@ const ISLAND_COMPONENT: &str = "MapIsland";
 /// The mapper's positional `show:createShow` seam (ledger #4), document order
 /// in MapIsland.ts.
 const SHOW_SLOT_NAME: &str = "show:createShow";
-const MAP_SHOW_ORDER: [&str; 12] = [
+const MAP_SHOW_ORDER: [&str; 18] = [
     "header pill: running",
     "header pill: idle",
     "header pill: no daemon",
+    // FIX 0: client-only — set by the page's own Pause action, so the user
+    // cannot forget the cabinet is paused because they opened the mapper.
+    "header pill: paused for mapping",
+    // FIX 1: the unmissable banner, first child of <main>.
+    "no-daemon banner (top of page)",
+    // FIX 0: running-session banner + the one-click "Pause emulation & map".
+    "banner: emulation running (pause & map)",
+    // FIX 0: the road back — client-only, same flag as the pill.
+    "banner: paused for mapping (resume)",
     "read-only banner + CLI fallback",
     "hint: click-a-control (learnable)",
     "stage: xbox art (+ zone layer)",
     "stage: ds4 art (+ zone layer)",
+    // FIX 2: the third restore destination only exists when a backup does.
+    "preset actions: restore-backup button",
     "saved flash: ok",
     "saved flash: error",
     "modal: overlay open",
     "modal: listening (countdown)",
+    "modal: current binding + Clear",
     "modal: conflict (Replace / Cancel)",
 ];
 const MAP_SHOW_COUNT: usize = MAP_SHOW_ORDER.len();
@@ -226,7 +238,13 @@ fn key_tag(slot: &MapperSlot, function: &str) -> String {
 /// Mirrors MapIsland.ts `zoneRows`. Every derived string the client also
 /// derives; the item SHAPE is client contract. The client may append the
 /// hover class (`z-hot`) — SSR has no hover, so the server never does.
-fn zone_rows(slot: &MapperSlot) -> SlotValue {
+///
+/// `live` is [`learnable`]: when false the zone carries `z-dead`, which is a
+/// VISIBLY disabled look (dimmed, `cursor: not-allowed`) and deliberately NOT
+/// the `disabled` attribute — a disabled button swallows its own click, and a
+/// click on a control that cannot be learned must still say why (FIX 1: never
+/// a no-op).
+fn zone_rows(slot: &MapperSlot, live: bool) -> SlotValue {
     SlotValue::Array(
         zones_for(&slot.persona)
             .iter()
@@ -235,11 +253,12 @@ fn zone_rows(slot: &MapperSlot) -> SlotValue {
                 // z-unbound hides the tag pill via CSS (`:empty` cannot: the
                 // SSR text slot leaves marker nodes inside the span).
                 let unbound = if key == "—" { " z-unbound" } else { "" };
+                let dead = if live { "" } else { " z-dead" };
                 SlotValue::Object(vec![
                     ("fn".to_owned(), SlotValue::Text(z.fn_name.to_owned())),
                     (
                         "cls".to_owned(),
-                        SlotValue::Text(format!("zone z-{}{unbound}", z.kind)),
+                        SlotValue::Text(format!("zone z-{}{unbound}{dead}", z.kind)),
                     ),
                     (
                         "style".to_owned(),
@@ -285,24 +304,40 @@ fn legend_label(z: &Zone) -> String {
 /// stage — one row per mappable function, unbound rendered as the honest
 /// "—" with the `l-unbound` class. Same client-may-append-hover rule as
 /// [`zone_rows`] (`l-hot`).
-fn legend_rows(slot: &MapperSlot) -> SlotValue {
+fn legend_rows(slot: &MapperSlot, live: bool) -> SlotValue {
     SlotValue::Array(
         zones_for(&slot.persona)
             .iter()
             .map(|z| {
                 let key = key_tag(slot, z.fn_name);
                 let unbound = key == "—";
+                let mut cls = String::from("lrow");
+                if unbound {
+                    cls.push_str(" l-unbound");
+                }
+                if !live {
+                    cls.push_str(" l-dead");
+                }
                 SlotValue::Object(vec![
                     ("fn".to_owned(), SlotValue::Text(z.fn_name.to_owned())),
                     ("label".to_owned(), SlotValue::Text(legend_label(z))),
                     ("key".to_owned(), SlotValue::Text(key.clone())),
-                    (
-                        "cls".to_owned(),
-                        SlotValue::Text(if unbound { "lrow l-unbound" } else { "lrow" }.to_owned()),
-                    ),
+                    ("cls".to_owned(), SlotValue::Text(cls)),
                     (
                         "title".to_owned(),
                         SlotValue::Text(format!("{} — {}", z.fn_name, key)),
+                    ),
+                    // The ✕ accelerator: only offered where clearing would
+                    // actually do something (a bound function on a live page).
+                    // Empty string = the CSS hides it, so the row layout does
+                    // not jump between states.
+                    (
+                        "clear".to_owned(),
+                        SlotValue::Text(if live && !unbound { "✕" } else { "" }.to_owned()),
+                    ),
+                    (
+                        "cleartitle".to_owned(),
+                        SlotValue::Text(format!("clear {}", z.fn_name)),
                     ),
                 ])
             })
@@ -353,9 +388,9 @@ fn reason_line(payload: &MapPayload) -> String {
             .to_owned();
     }
     if payload.session.running {
-        return "read-only while a session is running: captured keys never reach the learner. \
-                Stop the session to map here, or bind from a shell with the command below \
-                (then Reload)"
+        return "read-only while emulation runs: the panel's keys are captured, so ksx cannot \
+                hear them for mapping. Use \"Pause emulation & map\" above, or bind from a \
+                shell with the command below"
             .to_owned();
     }
     if payload.learn.state == "unavailable" {
@@ -384,6 +419,15 @@ fn cli_line(slot: Option<&MapperSlot>) -> String {
     }
 }
 
+/// The third restore button's label — the timestamp is the whole point, so it
+/// is IN the label rather than hidden in a tooltip.
+fn backup_line(selected: Option<&MapperSlot>) -> String {
+    match selected.and_then(|s| s.backup.as_deref()) {
+        Some(label) => format!("Restore backup from {label}"),
+        None => "Restore backup".to_owned(),
+    }
+}
+
 fn scalar_slots(payload: &MapPayload, selected: Option<&MapperSlot>) -> serde_json::Value {
     let slot_line = match selected {
         Some(s) => format!("P{} · {} · {}", s.number, s.persona_label, s.preset),
@@ -397,11 +441,18 @@ fn scalar_slots(payload: &MapPayload, selected: Option<&MapperSlot>) -> serde_js
         ),
         "reasonLine": reason_line(payload),
         "cliLine": cli_line(selected),
+        // FIX 1: the copyable remedy, carrying this machine's profile flag.
+        "daemonCmd": daemon_command(&payload.session),
+        "backupLine": backup_line(selected),
         "modalPrompt": "",
+        "modalBinding": "",
         "countdownText": "",
         "barStyle": "width:100%",
         "conflictLine": "",
         "savedLine": "",
+        // Auto-save is invisible until it says so (Victor: "where is save?").
+        // Empty on SSR — the page has not written anything yet.
+        "savedAt": "",
         "generatedAt": payload.mapper.generated_at,
         // The preset-actions card: a class string, never a show (ledger #13
         // — its bindings must survive; the off look is just a class).
@@ -416,17 +467,24 @@ fn scalar_slots(payload: &MapPayload, selected: Option<&MapperSlot>) -> serde_js
 fn show_values(payload: &MapPayload, selected: Option<&MapperSlot>) -> [bool; MAP_SHOW_COUNT] {
     let art = selected.map(|s| art_for(&s.persona));
     let live = learnable(payload) && selected.is_some();
+    let running = payload.session.reachable && payload.session.running;
     [
-        payload.session.reachable && payload.session.running,
+        running,
         payload.session.reachable && !payload.session.running,
         !payload.session.reachable,
+        false, // "paused for mapping": client-only, set by the Pause action
+        !payload.session.reachable, // the top-of-page no-daemon banner
+        running, // the pause-and-map banner
+        false, // the resume bar: client-only, same flag
         !live,
         live,
         art == Some(crate::render::ART_XBOX),
         art == Some(crate::render::ART_DS4),
+        selected.is_some_and(|s| s.backup.is_some()),
         false, // saved flashes: client-only
         false,
         false, // modal: client-only, never SSR-open
+        false,
         false,
         false,
     ]
@@ -450,11 +508,12 @@ fn build_slots(module: &IrModule, payload: &MapPayload) -> SlotData {
         .unwrap_or_else(|_| SlotData::new_from_defaults(&module.slots));
 
     let tabs = slot_tabs(payload, selected);
+    let live = learnable(payload) && selected.is_some();
     let zones = selected
-        .map(zone_rows)
+        .map(|slot| zone_rows(slot, live))
         .unwrap_or(SlotValue::Array(Vec::new()));
     let legend = selected
-        .map(legend_rows)
+        .map(|slot| legend_rows(slot, live))
         .unwrap_or(SlotValue::Array(Vec::new()));
     for (name, value) in [
         (LIST_SLOT_TABS, tabs),
@@ -522,6 +581,7 @@ mod tests {
             preset: preset.to_owned(),
             keyboard: r"HID\VID_D209&PID_0430&REV_0056&MI_00".to_owned(),
             bindings,
+            backup: Some("2026-08-05 14:32:07 UTC".to_owned()),
         }
     }
 
@@ -541,6 +601,7 @@ mod tests {
                 reachable: true,
                 running: false,
                 line: "idle".into(),
+                profile: None,
             },
             learn: LearnView {
                 ok: true,
@@ -719,23 +780,42 @@ mod tests {
             out.html
         );
         assert!(
-            out.html.contains("save to the preset file immediately"),
+            out.html.contains("Every binding saves immediately"),
             "{}",
             out.html
         );
         assert!(out.html.contains("Undo this session"), "{}", out.html);
+        // FIX 2: the label names the LAYOUT it writes. The abstract word
+        // "defaults" must not survive anywhere on the page — it is what made
+        // Victor read a desktop-keyboard reset as "put my panel map back".
         assert!(
-            out.html.contains("Restore built-in defaults"),
+            out.html
+                .contains("Reset to generic keyboard layout (S/D/A/W…)"),
             "{}",
             out.html
         );
         assert!(
-            out.html.contains(r#"data-act="restore-backup""#),
-            "{}",
+            !out.html.contains("Restore built-in defaults"),
+            "the vague label came back: {}",
             out.html
         );
+        assert!(out.html.contains("Clear all bindings"), "{}", out.html);
+        for act in [
+            "restore-backup",
+            "restore-defaults",
+            "clear-all",
+            "restore-latest",
+        ] {
+            assert!(
+                out.html.contains(&format!(r#"data-act="{act}""#)),
+                "missing {act}: {}",
+                out.html
+            );
+        }
+        // The third destination wears its timestamp (the sample slot has one).
         assert!(
-            out.html.contains(r#"data-act="restore-defaults""#),
+            out.html
+                .contains("Restore backup from 2026-08-05 14:32:07 UTC"),
             "{}",
             out.html
         );
@@ -819,16 +899,113 @@ mod tests {
         );
     }
 
-    /// A running session is read-only too (the learner cannot hear captured
-    /// keys), and says so.
+    /// FIX 0. A running session still cannot be mapped — the daemon's refusal
+    /// is deliberate (daemon/pipe.rs writes out why) — but the page turns it
+    /// into ONE CLICK instead of a dead end: the banner explains the capture,
+    /// and "Pause emulation & map" is right there.
     #[test]
-    fn a_running_session_renders_the_capture_explanation() {
+    fn a_running_session_offers_pause_and_map_instead_of_a_dead_end() {
         let mut payload = sample();
         payload.session.running = true;
         payload.session.line = "running — 4 pad(s)".into();
+        payload.session.profile = Some("Steam".into());
         let out = render_map(&page(), &payload);
         assert!(
-            out.html.contains("captured keys never reach the learner"),
+            out.html
+                .contains("Emulation is running: panel keys are captured"),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains("Pause emulation &amp; map"),
+            "{}",
+            out.html
+        );
+        assert!(out.html.contains(r#"data-act="pause-map""#), "{}", out.html);
+        // …and every control looks as inert as it is, without being a
+        // `disabled` button that would swallow the click that explains why.
+        assert!(out.html.contains("z-dead"), "{}", out.html);
+        assert!(out.html.contains("l-dead"), "{}", out.html);
+        assert!(!out.html.contains("disabled"), "{}", out.html);
+    }
+
+    /// FIX 1, the headline case: Victor quit the tray daemon and then clicked
+    /// controls that silently did nothing. The banner has to be the FIRST
+    /// thing in <main>, name the split (read works, write does not) and print
+    /// the exact command — profile flag included, because plain `ksx daemon`
+    /// refuses to start on a games.toml cabinet.
+    #[test]
+    fn an_unreachable_daemon_shouts_at_the_top_of_the_page_with_the_command() {
+        let mut payload = sample();
+        payload.session = SessionView {
+            profile: Some("Steam".into()),
+            ..SessionView::unreachable("no daemon control channel")
+        };
+        payload.learn = LearnView::unavailable("no daemon control channel");
+        let out = render_map(&page(), &payload);
+
+        assert!(
+            out.html.contains(crate::render::NO_DAEMON_HEADLINE),
+            "the banner headline drifted from NO_DAEMON_HEADLINE: {}",
+            out.html
+        );
+        assert!(
+            out.html.contains("ksx daemon --game &quot;Steam&quot;")
+                || out.html.contains(r#"ksx daemon --game "Steam""#),
+            "the command must carry the profile flag: {}",
+            out.html
+        );
+        assert!(out.html.contains("tray icon"), "{}", out.html);
+        // Unmissable means BEFORE the content it is about.
+        let banner = out
+            .html
+            .find(crate::render::NO_DAEMON_HEADLINE)
+            .expect("banner present");
+        let stage = out.html.find("stagecard").expect("stage present");
+        assert!(
+            banner < stage,
+            "the banner is buried below the controller art"
+        );
+        // Controls that cannot work look like it, on both readers.
+        assert!(out.html.contains("z-dead"), "{}", out.html);
+        assert!(out.html.contains("l-dead"), "{}", out.html);
+    }
+
+    /// No backup on disk = no "Restore backup from …" button. Offering a road
+    /// home that is not there is worse than not offering one.
+    #[test]
+    fn the_backup_restore_button_appears_only_when_a_backup_exists() {
+        let mut payload = sample();
+        let out = render_map(&page(), &payload);
+        assert!(out.html.contains(r#"data-act="restore-latest""#));
+
+        for slot in &mut payload.mapper.slots {
+            slot.backup = None;
+        }
+        let out = render_map(&page(), &payload);
+        assert!(
+            !out.html.contains(r#"data-act="restore-latest""#),
+            "{}",
+            out.html
+        );
+        // …while the two that always exist stay.
+        assert!(out.html.contains(r#"data-act="restore-backup""#));
+        assert!(out.html.contains(r#"data-act="restore-defaults""#));
+    }
+
+    /// Auto-save is only reassuring if the page says so in words.
+    #[test]
+    fn the_preset_card_states_the_save_model_plainly() {
+        let out = render_map(&page(), &sample());
+        assert!(
+            out.html.contains("Every binding saves immediately"),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains("use the restore options below to undo")
+                || out.html.contains("Use the restore options below to undo")
+                || out.html.contains("the restore options below to undo"),
             "{}",
             out.html
         );

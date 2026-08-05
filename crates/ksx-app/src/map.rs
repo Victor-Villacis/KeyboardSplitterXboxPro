@@ -2,8 +2,9 @@
 //!
 //! The CLI face of [`crate::mapping::apply`] (the pipe's `map` verb and, over
 //! it, Studio's mapper are the other two faces — one writer, three surfaces).
-//! `--restore defaults|session-backup` is the same story for
-//! [`crate::mapping::restore`] (pipe verb `map-restore`).
+//! `--restore defaults|session-backup|latest-backup` is the same story for
+//! [`crate::mapping::restore`] (pipe verb `map-restore`), and
+//! `--list-backups` reads the timestamped backups every restore leaves behind.
 //!
 //! Exit codes: 0 = written, 1 = error (I/O, unreadable config),
 //! 2 = refused (unknown preset/function/key, a conflict without --force, or a
@@ -22,6 +23,10 @@ pub enum Action {
         force: bool,
     },
     Restore(RestoreKind),
+    /// Unbind every function of the preset (a timestamped backup first).
+    ClearAll,
+    /// Read-only: what timestamped backups exist for this preset.
+    ListBackups,
 }
 
 pub struct Options {
@@ -33,6 +38,13 @@ pub struct Options {
 pub fn run(options: Options) -> anyhow::Result<()> {
     let root = ksx_config::ConfigRoot::discover()?;
     let store = ksx_config::Store::new(root);
+
+    // The read-only verb answers before anything else: it writes nothing, so
+    // it shares none of the write path's reporting.
+    if let Action::ListBackups = options.action {
+        return list_backups(&store, &options.preset, options.json);
+    }
+
     let outcome = match options.action {
         Action::Bind {
             function,
@@ -59,14 +71,12 @@ pub fn run(options: Options) -> anyhow::Result<()> {
             });
             (applied.message(), applied.path, json)
         }),
-        Action::Restore(kind) => mapping::restore(&store, &options.preset, kind).map(|applied| {
-            let json = serde_json::json!({
-                "ok": true,
-                "path": applied.path.display().to_string(),
-                "preset": applied.preset,
-            });
-            (applied.message(), applied.path, json)
-        }),
+        Action::ClearAll => mapping::clear_all(&store, &options.preset).map(whole_preset_json),
+        Action::Restore(kind) => {
+            mapping::restore(&store, &options.preset, kind).map(whole_preset_json)
+        }
+        // Handled above; kept exhaustive so a new action cannot fall through.
+        Action::ListBackups => unreachable!("list-backups answered above"),
     };
     match outcome {
         Ok((message, path, json)) => {
@@ -90,7 +100,8 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                     | MapError::UnknownKey(_)
                     | MapError::Conflicts { .. }
                     | MapError::NoSessionBackup { .. }
-                    | MapError::BadSessionBackup { .. }
+                    | MapError::NoBackup { .. }
+                    | MapError::BadBackup { .. }
             );
             if options.json {
                 let conflicts = match &err {
@@ -101,15 +112,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                     "{}",
                     serde_json::json!({
                         "ok": false,
-                        "code": match &err {
-                            MapError::UnknownPreset { .. } => "unknown-preset",
-                            MapError::UnknownFunction(_) => "unknown-function",
-                            MapError::UnknownKey(_) => "unknown-key",
-                            MapError::Conflicts { .. } => "conflict",
-                            MapError::NoSessionBackup { .. } => "no-session-backup",
-                            MapError::BadSessionBackup { .. } => "bad-session-backup",
-                            MapError::Config(_) => "config-error",
-                        },
+                        "code": error_code(&err),
                         "error": err.to_string(),
                         "conflicts": conflicts,
                     })
@@ -123,4 +126,78 @@ pub fn run(options: Options) -> anyhow::Result<()> {
             Err(err.into())
         }
     }
+}
+
+/// The `--json` shape shared by every WHOLE-PRESET write (restore ×3, clear
+/// all). `mode` and `wrote` are the honest pair: the machine word and the
+/// sentence a human was shown before the write; `backup` is the road home.
+fn whole_preset_json(
+    applied: mapping::AppliedRestore,
+) -> (String, std::path::PathBuf, serde_json::Value) {
+    let json = serde_json::json!({
+        "ok": true,
+        "path": applied.path.display().to_string(),
+        "preset": applied.preset,
+        "mode": applied.kind.as_str(),
+        "wrote": applied.kind.destination(),
+        "backup": applied.backup.as_ref().map(|b| serde_json::json!({
+            "stamp": b.stamp,
+            "label": b.label(),
+            "path": b.path.display().to_string(),
+        })),
+    });
+    (applied.message(), applied.path, json)
+}
+
+/// The stable `--json` `code` for every refusal. One place, so the CLI, the
+/// pipe and docs/CONTROL-SURFACE.md cannot drift.
+pub fn error_code(err: &MapError) -> &'static str {
+    match err {
+        MapError::UnknownPreset { .. } => "unknown-preset",
+        MapError::UnknownFunction(_) => "unknown-function",
+        MapError::UnknownKey(_) => "unknown-key",
+        MapError::Conflicts { .. } => "conflict",
+        MapError::NoSessionBackup { .. } => "no-session-backup",
+        MapError::NoBackup { .. } => "no-backup",
+        MapError::BadBackup { .. } => "bad-backup",
+        MapError::Config(_) => "config-error",
+    }
+}
+
+/// `ksx map --list-backups --preset X [--json]` — the restore points on disk,
+/// newest first. Read-only: exit 0 even when the list is empty (an empty list
+/// is an answer, not a refusal).
+fn list_backups(store: &ksx_config::Store, preset: &str, json: bool) -> anyhow::Result<()> {
+    let backups = mapping::list_backups(store, preset)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "preset": preset,
+                "backups": backups.iter().map(|b| serde_json::json!({
+                    "stamp": b.stamp,
+                    "label": b.label(),
+                    "path": b.path.display().to_string(),
+                })).collect::<Vec<_>>(),
+            })
+        );
+        return Ok(());
+    }
+    if backups.is_empty() {
+        println!(
+            "no timestamped backups for \"{preset}\" — one is written before every \
+             restore, so the first restore has nothing older to go back to"
+        );
+        return Ok(());
+    }
+    println!(
+        "{} backup(s) for \"{preset}\", newest first:",
+        backups.len()
+    );
+    for backup in &backups {
+        println!("  {}  {}", backup.label(), backup.path.display());
+    }
+    println!("restore the newest with: ksx map --preset \"{preset}\" --restore latest-backup");
+    Ok(())
 }

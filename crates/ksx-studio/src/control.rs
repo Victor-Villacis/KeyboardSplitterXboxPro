@@ -37,16 +37,28 @@ pub trait ControlSource: Send + Sync {
     fn learn_cancel(&self) -> LearnView {
         LearnView::unavailable("this control source has no learner")
     }
-    /// Write one binding (pipe `map`).
+    /// Write one binding (pipe `map`). `request.key == None` clears it.
     fn bind(&self, _request: &BindRequest) -> BindOutcome {
         BindOutcome::failed("this control source cannot write bindings")
     }
-    /// Restore a whole preset (pipe `map-restore`): `mode` is `"defaults"`
-    /// or `"session-backup"`. `Ok` is the daemon's confirmation line.
+    /// Restore a whole preset (pipe `map-restore`): `mode` is one of
+    /// [`RESTORE_MODES`]. `Ok` is the daemon's confirmation line — which
+    /// already names what was written and what was backed up first.
     fn restore(&self, _preset: &str, _mode: &str) -> Result<String, String> {
         Err("this control source cannot restore presets".to_owned())
     }
+    /// Unbind every function of a preset, keeping the file structurally valid
+    /// (pipe `map-clear-all`). A timestamped backup is taken first, like any
+    /// other whole-preset write.
+    fn clear_all(&self, _preset: &str) -> Result<String, String> {
+        Err("this control source cannot clear presets".to_owned())
+    }
 }
+
+/// The three restore destinations, as the wire spells them. Validated at the
+/// HTTP edge so a typo is a flashed error, not a daemon round-trip; the same
+/// three strings are `ksx map --restore`'s values (mapping.rs `RestoreKind`).
+pub const RESTORE_MODES: [&str; 3] = ["defaults", "session-backup", "latest-backup"];
 
 /// The daemon learner's state, presentation-shaped from the pipe's
 /// `learn-key`/`learn-poll` response. `state` is the pipe's word verbatim
@@ -161,6 +173,15 @@ pub struct SessionView {
     /// The one state line: "running — Street Fighter — 4 pad(s)", "idle", or
     /// why the daemon cannot be reached.
     pub line: String,
+    /// The games.toml profile the daemon is pointed at, if any.
+    ///
+    /// Two jobs, both about not losing the user's place: the mapper's
+    /// "Pause emulation & map" remembers it so "Resume emulation" starts the
+    /// SAME thing back up, and the no-daemon banner prints the exact command
+    /// (`ksx daemon --game "Steam"`) rather than a generic one that would
+    /// start the wrong profile.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl SessionView {
@@ -170,6 +191,7 @@ impl SessionView {
             reachable: false,
             running: false,
             line: reason.into(),
+            profile: None,
         }
     }
 }

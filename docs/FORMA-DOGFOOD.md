@@ -18,7 +18,7 @@ upstream the report/PR).
 | 1 | `@getforma/build` tailwind step spawned `npx` via `execFileSync` without `shell:true` → ENOENT on Windows (`npx` is `npx.cmd`) | **FIXED upstream** (build 0.1.9, 2026-08-05) — adopted same day; we still use plain-CSS entries by choice | `studio-ui/build.mjs` note |
 | 2 | Compiler named every `createList` slot literally `list:array` — multi-list pages could not inject by name; we shipped a positional workaround | **FIXED upstream** (compiler 0.2.0, 2026-08-05) — adopted, workaround deleted | `crates/ksx-studio/src/render.rs` history note |
 | 3 | 0.2.0's list names are document-order indexed (`list:#N:array`), not binding-derived (`list:<source>:array`) as the release notes suggested — reordering lists in the page still shifts names | **MOSTLY RESOLVED for us (v4, 2026-08-05)**: binding-derived names DO exist when the list source is a derivable binding — `() => padTiles()` compiles to `list:padTiles:array` (occurrence-suffixed `#N` on reuse); only literal sources like `() => []` fall back to positional. v4's signal-backed lists get named slots for free. Residual ask: document it; derive something stabler than doc-order for literals | `render.rs` seam constants doc |
-| 4 | `createShow` slots are all named `show:createShow` — Bool show/hide state cannot be injected by name; SHOW_ORDER positional seam remains (16 entries deep after the design pass) | **OPEN ASK** (per-instance show naming) — the biggest remaining seam fragility | `render.rs` SHOW_ORDER |
+| 4 | `createShow` slots are all named `show:createShow` — Bool show/hide state cannot be injected by name; SHOW_ORDER positional seam remains (17 status + 18 mapper entries after the v6 pass — see #14 for what that costs) | **OPEN ASK** (per-instance show naming) — the biggest remaining seam fragility | `render.rs` SHOW_ORDER |
 | 5 | Plain hydration clobbers server-rendered values: `adoptNode` binds text to client signal state (first effect run overwrites SSR text with signal defaults) and list adoption removes SSR rows absent from the client array. The sanctioned path is the islands protocol (`data-forma-props` initializing signals BEFORE adoption) — discoverable only by reading `@getforma/core` internals | **ADOPTED in production (v4, 2026-08-05)**: Studio is now one island whose signals seed from props before adoption, then a 2 s `/api/status` poller — live updates, zero clobber. The docs ask ("SSR with server data" recipe) is still **OURS-TO-SEND** | `render.rs` module docs; `studio-ui/src/status.ts` |
 | 6 | `create-forma-app` dashboard template binds `0.0.0.0` with no auth and no warning (its own sibling, the minimal template, computes a CSP then discards it — earlier E7 finding) | **OURS-TO-SEND**: security nudge — default to `127.0.0.1`, make LAN opt-in | E7; canon study |
 | 7 | Good news worth telling upstream: FMIR format v2 held across five months of npm-side drift (core 1.5.0 vs Rust crates 0.1.4) — the binary contract is stable; `AssetManifest` deserialized byte-for-byte | evidence for a compat-guarantee doc | `docs/research/forma-spike-1-fmir-compat.md` |
@@ -28,6 +28,9 @@ upstream the report/PR).
 | 11 | Good news, load-bearing for v5: **member-expression attribute values in `createList` item bodies compile to per-item dyn-attr slots** (`h("img", { src: p.art })`, `style: z.style`, `"data-fn": z.fn`) — SSR emits the attribute from the injected array, the client runtime re-derives it per item. The whole mapper zone layer (25 positioned buttons × style/class/data-fn/title) and the status tiles' per-persona art ride this; without it every zone would have needed its own named signal. Constraint held from #9's world: the member read must be a bare `param.field` (or `String(param.field)`) — computed/derived expressions still get anonymous slots | worth documenting upstream as a SUPPORTED pattern (it is compiler 0.2.0's `listItemBindings` path) | `MapIsland.ts` zone list; `render_map.rs` `zone_rows` |
 | 12 | Two-route builds work end to end (entryPoints + routes + per-route `ssrEntryPoints`), including the twin-file pattern per page (#9 forces a `MapPage`/`MapIsland` split exactly like status) — but the island BYPRODUCT cleanup (#5's `*.islands.js`) must be repeated **per entry**, and the second occurrence of a reused list binding gets the `#N` suffix across a page, not across the build (each page's IR names are independent) | evidence for upstream docs; no bug | `build.mjs` (v5); `render_map.rs` `list:zones#2:array` |
 | 13 | TWO core/server findings behind the mapper learn-flow bugs (2026-08-05): **(a)** forma-server's CSP nonce-locks `style-src`, and per spec a nonce there makes browsers ignore inline-style semantics — every `style=""` ATTRIBUTE dies, including the ones forma's own compiled list bindings emit (#11!): all 25 zone hit-areas collapsed into a 2 px pile at the stage's top-left (the "corrupted glyph"), and the countdown bar's width never moved. **(b)** `@getforma/core`'s ADOPTION-path show effect (`setupShowEffect` in hydrate.ts) materializes re-toggled branches inside its own `internalEffect` run with no `createRoot`/`untrack` — every binding created there is owned by that run and disposed on the next re-run: stale modal prompts on reopen, empty flash boxes, a conflict dialog that never renders (Victor's frozen-modal repro). The runtime-path `createShow` already does it right | **WORKED AROUND locally, OURS-TO-SEND both**: (a) `relax_style_src` rewrites the header to `style-src 'self' 'unsafe-inline'` (scripts stay nonce-locked); (b) `build.mjs` patches the compiled `setupShowEffect` to route branch creation through an unowned root (`__ksxShowBranch`, installed by both entries) — anchored replacements that fail the build if upstream drifts | `crates/ksx-studio/src/server.rs` `relax_style_src`; `studio-ui/build.mjs` ledger-#13 patch; `map.ts`/`status.ts` helper |
+| 14 | The `show:createShow` positional seam (#4) does not just risk drift — it **prices** UI work. The v6 pass added 6 shows to the mapper (18) and 1 to the status page (17); each one is a four-file edit (island tree, twin Page declaration, `*_SHOW_ORDER` label, boolean position in `show_values`) whose only guard is our own count assertion, and an insertion in the MIDDLE of the document silently shifts every show after it. Named show slots would make all four edits one | reinforces the **OPEN ASK** in #4 with a cost measurement: 3 pages of seam is no longer hypothetical | `render_map.rs` MAP_SHOW_ORDER (18); `render.rs` SHOW_ORDER (17) |
+| 15 | Good news, and the pattern that made the v6 mapper affordable: **a per-item member read can carry a whole interaction**, not just presentation. The legend's ✕ clear accelerator is `h("span", { class: "lclear", "data-clear": l.fn, title: l.cleartitle }, l.clear)` — a bare `param.field` per #11, so SSR emits it and the client re-derives it per poll, and `map.ts` reads `data-clear` by delegation. Empty string = CSS-hidden, which is how "only offer the ✕ where clearing does something" costs zero shows. Same trick disables controls: `cls` carries `z-dead`/`l-dead` instead of a `disabled` attribute (which would swallow the click that owes the user an explanation) | confirms #11's contract holds for interaction attrs too — worth including in the upstream ask | `MapIsland.ts` legend list; `render_map.rs` `legend_rows` |
+| 16 | Ledger #13(b)'s patched show seam held under a much heavier load: the v6 mapper nests shows THREE deep inside a re-toggled branch (`modalOpen` → `modalListening` / `modalBound` / `modalConflict`) and re-toggles them dozens of times per session with no stale prompts or empty boxes. The `__ksxShowBranch` unowned-root rewrite is the reason; without it this design would have been unbuildable | evidence for the upstream fix's shape (**OURS-TO-SEND**, unchanged) | `build.mjs` ledger-#13 patch |
 
 ## Details for filing — mechanism, upstream location, local repro
 
@@ -60,12 +63,14 @@ literals. Local guard: layout tests pin exact names (`render.rs`,
 ### #4 — compiler: every `createShow` slot is `show:createShow`
 **Upstream**: forma-tools -> show/Bool slot emission. **Error mode**:
 silent — show/hide state cannot be injected by name at all; N shows on a
-page = N identically-named slots. **Cost here**: 16 Bool slots on the
-status page + 12 on the mapper, all injected positionally via SHOW_ORDER
-arrays that must mirror compile order exactly (drift = wrong pills/panels
-showing, caught only by our pinning tests). **Ask**: mirror the #2 fix for
-shows. Our single biggest remaining seam fragility. Local: `render.rs`
-SHOW_ORDER, `render_map.rs` MAP_SHOW_ORDER.
+page = N identically-named slots. **Cost here**: 17 Bool slots on the
+status page + 18 on the mapper after the v6 pass, all injected positionally
+via SHOW_ORDER arrays that must mirror compile order exactly (drift = wrong
+pills/panels showing, caught only by our pinning tests). **Ask**: mirror the
+#2 fix for shows. Our single biggest remaining seam fragility — and #14
+prices it: every new show is a FOUR-file edit, and inserting one in the middle
+of the document shifts every show after it. Local: `render.rs` SHOW_ORDER,
+`render_map.rs` MAP_SHOW_ORDER.
 
 ### #5 — core: plain hydration clobbers server-rendered values
 **Upstream**: `@getforma/core` -> `mount()` -> `hydrateIsland()` ->
@@ -187,6 +192,41 @@ untrack(make))`, installed by `map.ts`/`status.ts` before activation.
 Trade-off documented: branches created this way are never disposed —
 matching the seam's existing keep-the-fragment behavior, bounded by the
 page's small show count.
+
+### #14 — the show seam has a measured price now (v6, 2026-08-05)
+The mapper's v6 pass (loud no-daemon banner, pause/resume for mapping, a third
+restore destination, clear-one-in-modal) needed **6 new shows** on `/map` and
+**1** on `/`. Each one costs four coordinated edits — the island's `h()` tree,
+the twin `*Page.ts` compile-time declaration, the `*_SHOW_ORDER` label array,
+and the boolean's POSITION in `show_values` — and an insertion in the middle of
+the document (which is where a banner goes: first child of `<main>`) shifts
+every show after it. Nothing but our own count assertion catches a mismatch,
+and a mismatch is a wrong panel rendering, not an error. This is the same ask
+as #4; what is new is the evidence that it is a recurring tax on UI work, not a
+one-time setup annoyance.
+
+### #15 — per-item member attrs carry INTERACTION, not just style (good news)
+#11 established that bare `param.field` reads work as attribute values inside
+`createList` item bodies. v6 leaned on that for behavior: the legend's clear
+accelerator is `h("span", { class: "lclear", "data-clear": l.fn, title:
+l.cleartitle }, l.clear)` — SSR emits the whole affordance, the client
+re-derives it per poll, and `map.ts` picks it up by event delegation. Two
+patterns fall out that cost ZERO extra shows: an empty string for the content
+means "hide this per-row control" (CSS `:empty`), and a class-string field
+(`z-dead` / `l-dead`) is how a control is rendered visibly disabled WITHOUT the
+`disabled` attribute — which matters because a disabled button swallows its own
+click, and a click on an unmappable control is exactly the click that owes the
+user an explanation. Worth folding into the #11 upstream ask as the reason the
+contract matters.
+
+### #16 — the #13(b) patch held under three-deep nested shows
+The v6 learn modal nests shows three levels inside a re-toggled branch
+(`modalOpen` → `modalListening` / `modalBound` / `modalConflict`) and toggles
+them dozens of times per mapping session. With upstream's adoption-path
+`setupShowEffect` this would reproduce every symptom in #13(b) at once (stale
+prompts, empty boxes, a dialog that never renders); with the `__ksxShowBranch`
+unowned-root rewrite it is simply correct. Recorded because it strengthens the
+upstream report: the bug is not an edge case, it is load-bearing for any modal.
 
 ---
 Process note: findings 1+2 were reported through Victor and fixed upstream

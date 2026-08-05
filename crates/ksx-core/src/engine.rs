@@ -125,49 +125,28 @@ fn bit(words: &[u64], k: u32) -> bool {
     words[(k / 64) as usize] & (1 << (k % 64)) != 0
 }
 
-/// The pure translation engine: `KeyEvent`s in, `PadDelta`s out.
+/// Everything [`Engine::handle`] dispatches through, precompiled.
 ///
-/// Contract (each clause maps to a legacy behavior in
-/// `docs/research/design-risk-review.md` §3):
-///
-/// - **Fan-out**: an event is translated for *every* slot whose keyboard or
-///   mouse matches the event's device — no early break. One physical keyboard
-///   (an I-PAC4) legitimately drives up to 4 pads with disjoint presets.
-/// - **All-keys-up**: a function releases only when *every* key mapped to it in
-///   that slot's preset is up on the event's device. Aggregation is by
-///   `Binding` equality, which reproduces the legacy cross-category
-///   custom-function reverse lookup.
-/// - **Opposite-axis snap**: releasing a key bound to axis value `v` while a
-///   key bound to the same axis with an opposite-sign value is still held snaps
-///   the axis to the *held binding's own value* — not hardcoded ±32767. This is
-///   the deliberate fix of the legacy custom-axis inconsistency
-///   (`Splitter.cs:161`); document any test that depends on it.
-/// - **State diffing**: a `PadDelta` is emitted only when a slot's `PadState`
-///   genuinely changed versus the last emitted state (legacy early-returned on
-///   unchanged state so only real transitions hit the driver).
-/// - Entries keyed `Key::None` never match any event.
-pub struct Engine {
+/// Split out of the engine so it can be BUILT OFF THE HOT PATH and swapped in
+/// later ([`Engine::swap_tables`]): a binding edit rebuilds this on the
+/// supervisor's own thread and the engine thread only moves the pointers. The
+/// engine keeps no other per-run allocation, so a swap allocates nothing at
+/// all where it happens.
+pub struct EngineTables {
     slots: Vec<SlotRuntime>,
-    /// Distinct devices assigned to any slot; events from others are ignored.
     devices: Vec<DeviceId>,
-    /// Key -> dense id. Built once; `handle` never scans presets.
     index: HashMap<Key, u32>,
-    /// Dense id -> dispatch targets across all slots (fan-out preserved).
     targets: Vec<SmallVec<[Target; 4]>>,
-    /// Per-device key bitsets, `words` u64s per device: a key held on device A
-    /// is distinct from the same key held on device B.
     down: Vec<u64>,
     words: usize,
 }
 
-impl Engine {
-    /// Build the engine over resolved slots.
+impl EngineTables {
+    /// Precompile the dispatch tables for `slots`.
     ///
     /// Preconditions (validated upstream by `SlotSpec`/config): slot numbers
-    /// are unique and in 1..=4. All lookups are precompiled here so
-    /// [`Engine::handle`] performs no per-event preset iteration and no heap
-    /// allocation.
-    pub fn new(slots: Vec<ResolvedSlot>) -> Self {
+    /// are unique and in 1..=8.
+    pub fn build(slots: Vec<ResolvedSlot>) -> Self {
         debug_assert!(
             {
                 let mut numbers: Vec<u8> = slots.iter().map(|s| s.spec.number).collect();
@@ -238,6 +217,130 @@ impl Engine {
             down,
             words,
         }
+    }
+
+    /// Slot numbers in build order — the shape a hot swap must preserve.
+    pub fn slot_numbers(&self) -> Vec<u8> {
+        self.slots.iter().map(|s| s.number).collect()
+    }
+}
+
+/// The pure translation engine: `KeyEvent`s in, `PadDelta`s out.
+///
+/// Contract (each clause maps to a legacy behavior in
+/// `docs/research/design-risk-review.md` §3):
+///
+/// - **Fan-out**: an event is translated for *every* slot whose keyboard or
+///   mouse matches the event's device — no early break. One physical keyboard
+///   (an I-PAC4) legitimately drives up to 4 pads with disjoint presets.
+/// - **All-keys-up**: a function releases only when *every* key mapped to it in
+///   that slot's preset is up on the event's device. Aggregation is by
+///   `Binding` equality, which reproduces the legacy cross-category
+///   custom-function reverse lookup.
+/// - **Opposite-axis snap**: releasing a key bound to axis value `v` while a
+///   key bound to the same axis with an opposite-sign value is still held snaps
+///   the axis to the *held binding's own value* — not hardcoded ±32767. This is
+///   the deliberate fix of the legacy custom-axis inconsistency
+///   (`Splitter.cs:161`); document any test that depends on it.
+/// - **State diffing**: a `PadDelta` is emitted only when a slot's `PadState`
+///   genuinely changed versus the last emitted state (legacy early-returned on
+///   unchanged state so only real transitions hit the driver).
+/// - Entries keyed `Key::None` never match any event.
+pub struct Engine {
+    slots: Vec<SlotRuntime>,
+    /// Distinct devices assigned to any slot; events from others are ignored.
+    devices: Vec<DeviceId>,
+    /// Key -> dense id. Built once; `handle` never scans presets.
+    index: HashMap<Key, u32>,
+    /// Dense id -> dispatch targets across all slots (fan-out preserved).
+    targets: Vec<SmallVec<[Target; 4]>>,
+    /// Per-device key bitsets, `words` u64s per device: a key held on device A
+    /// is distinct from the same key held on device B.
+    down: Vec<u64>,
+    words: usize,
+}
+
+impl Engine {
+    /// Build the engine over resolved slots.
+    ///
+    /// Preconditions (validated upstream by `SlotSpec`/config): slot numbers
+    /// are unique and in 1..=8. All lookups are precompiled in
+    /// [`EngineTables::build`] so [`Engine::handle`] performs no per-event
+    /// preset iteration and no heap allocation.
+    pub fn new(slots: Vec<ResolvedSlot>) -> Self {
+        Self::from_tables(EngineTables::build(slots))
+    }
+
+    /// Build the engine over tables somebody else precompiled.
+    pub fn from_tables(tables: EngineTables) -> Self {
+        let EngineTables {
+            slots,
+            devices,
+            index,
+            targets,
+            down,
+            words,
+        } = tables;
+        Self {
+            slots,
+            devices,
+            index,
+            targets,
+            down,
+            words,
+        }
+    }
+
+    /// Replace the dispatch tables **in place** — the binding hot-swap.
+    ///
+    /// This is what makes "edit one binding" stop meaning "unplug four pads":
+    /// the pads, their handles and the capture filters are untouched; only the
+    /// key→function tables change. `tables` must have been built by
+    /// [`EngineTables::build`] on another thread, so the swap itself moves
+    /// pointers and allocates nothing.
+    ///
+    /// **Every control is released across the swap.** Dense key ids are an
+    /// artifact of the old tables, so the per-device down bitset cannot carry
+    /// over; keeping the old pad state instead would strand whatever was held
+    /// at the moment of the edit (the one failure a mapper must never cause).
+    /// The returned deltas are exactly the neutral states the caller has to
+    /// push so no pad is left holding a button — slots that were already
+    /// neutral produce nothing, which is the ordinary case (nobody is leaning
+    /// on the panel while they retype a binding).
+    ///
+    /// Slot state is matched by slot NUMBER, not by position, so a swap that
+    /// keeps the same slots in a different build order still reports honestly.
+    pub fn swap_tables(&mut self, tables: EngineTables) -> Deltas {
+        let previous: SmallVec<[(u8, PadState); 8]> = self
+            .slots
+            .iter()
+            .map(|s| (s.number, s.last_emitted))
+            .collect();
+        let EngineTables {
+            mut slots,
+            devices,
+            index,
+            targets,
+            down,
+            words,
+        } = tables;
+        for slot in &mut slots {
+            slot.current = PadState::default();
+            slot.last_emitted = previous
+                .iter()
+                .find(|(number, _)| *number == slot.number)
+                .map_or_else(PadState::default, |(_, state)| *state);
+        }
+        self.slots = slots;
+        self.devices = devices;
+        self.index = index;
+        self.targets = targets;
+        self.down = down;
+        self.words = words;
+
+        let mut deltas = Deltas::new();
+        self.collect_deltas(&mut deltas);
+        deltas
     }
 
     /// Translate one key event into pad-state deltas.

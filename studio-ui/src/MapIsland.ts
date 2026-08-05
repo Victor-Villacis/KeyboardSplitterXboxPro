@@ -33,6 +33,8 @@ export interface MapperSlot {
   preset: string;
   keyboard: string;
   bindings: Record<string, string[]>;
+  /** Newest timestamped backup label, or null when there is none. */
+  backup: string | null;
 }
 
 export interface MapperSnapshot {
@@ -46,6 +48,8 @@ export interface SessionView {
   reachable: boolean;
   running: boolean;
   line: string;
+  /** games.toml profile the daemon is pointed at — what Resume restarts. */
+  profile: string | null;
 }
 
 export interface LearnView {
@@ -104,6 +108,9 @@ interface LegendRow {
   key: string;
   cls: string;
   title: string;
+  /** "✕" on a bound row of a live page, "" otherwise (CSS hides empty). */
+  clear: string;
+  cleartitle: string;
 }
 
 // ── Zone tables — MIRROR of render_map.rs ZONE_XBOX / ZONE_DS4 ────────────
@@ -184,24 +191,34 @@ const [reasonLine, setReasonLine] = createSignal("");
 const [cliLine, setCliLine] = createSignal(
   "ksx map --preset <NAME> --function <FUNCTION> --key <KEY>",
 );
+const [daemonCmd, setDaemonCmd] = createSignal("ksx daemon");
+const [backupLine, setBackupLine] = createSignal("Restore backup");
 const [modalPrompt, setModalPrompt] = createSignal("");
+const [modalBinding, setModalBinding] = createSignal("");
 const [countdownText, setCountdownText] = createSignal("");
 const [barStyle, setBarStyle] = createSignal("width:100%");
 const [conflictLine, setConflictLine] = createSignal("");
 const [savedLine, setSavedLine] = createSignal("");
+const [savedAt, setSavedAt] = createSignal("");
 const [generatedAt, setGeneratedAt] = createSignal("(no snapshot)");
 
 const [pillRunning, setPillRunning] = createSignal(false);
 const [pillIdle, setPillIdle] = createSignal(false);
 const [pillDown, setPillDown] = createSignal(false);
+const [pillPaused, setPillPaused] = createSignal(false);
+const [noDaemon, setNoDaemon] = createSignal(false);
+const [sessionRunning, setSessionRunning] = createSignal(false);
+const [pausedBar, setPausedBar] = createSignal(false);
 const [readOnly, setReadOnly] = createSignal(false);
 const [canLearn, setCanLearn] = createSignal(false);
 const [artXbox, setArtXbox] = createSignal(false);
 const [artDs4, setArtDs4] = createSignal(false);
+const [hasBackup, setHasBackup] = createSignal(false);
 const [savedOk, setSavedOk] = createSignal(false);
 const [savedErr, setSavedErr] = createSignal(false);
 const [modalOpen, setModalOpen] = createSignal(false);
 const [modalListening, setModalListening] = createSignal(false);
+const [modalBound, setModalBound] = createSignal(false);
 const [modalConflict, setModalConflict] = createSignal(false);
 
 const [slotTabs, setSlotTabs] = createSignal<SlotTab[]>([]);
@@ -221,6 +238,9 @@ let selectedFn: string | null = null;
  *  vice versa (both re-derive with the hot class). Client-only — the server
  *  never emits a hot class (SSR has no hover). */
 let hotFn: string | null = null;
+/** Mirrors render_map.rs `learnable`: can a click actually record right now?
+ *  Drives the z-dead / l-dead look and the ✕ accelerator. */
+let liveMapping = false;
 
 export function setHot(fn: string | null): void {
   if (hotFn === fn) return;
@@ -278,13 +298,16 @@ function keyTag(slot: MapperSlot, fn: string): string {
 
 function zoneRows(slot: MapperSlot): ZoneRow[] {
   const table = isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
+  const dead = liveMapping ? "" : " z-dead";
   return table.map(([fn, , cx, cy, w, h, kind]) => {
     const key = keyTag(slot, fn);
     // z-unbound hides the tag pill via CSS: `:empty` cannot work, the SSR
-    // text slot leaves marker nodes inside the span.
+    // text slot leaves marker nodes inside the span. z-dead is the VISIBLY
+    // disabled look — never the `disabled` attribute, which would swallow the
+    // click that has to answer "why can't I map right now?".
     return {
       fn,
-      cls: `zone z-${kind}${key === "—" ? " z-unbound" : ""}${fn === hotFn ? " z-hot" : ""}`,
+      cls: `zone z-${kind}${key === "—" ? " z-unbound" : ""}${dead}${fn === hotFn ? " z-hot" : ""}`,
       style:
         `left:${(cx - w / 2).toFixed(1)}%;top:${(cy - h / 2).toFixed(1)}%;` +
         `width:${w.toFixed(1)}%;height:${h.toFixed(1)}%`,
@@ -312,8 +335,14 @@ function legendRowsFor(slot: MapperSlot): LegendRow[] {
       fn,
       label: legendLabel(fn, label),
       key,
-      cls: `lrow${unbound ? " l-unbound" : ""}${fn === hotFn ? " l-hot" : ""}`,
+      cls:
+        `lrow${unbound ? " l-unbound" : ""}${liveMapping ? "" : " l-dead"}` +
+        `${fn === hotFn ? " l-hot" : ""}`,
       title: `${fn} — ${key}`,
+      // The desktop accelerator. Only where clearing would do something; the
+      // learn modal's "Clear binding" is the primary, touch-first path.
+      clear: liveMapping && !unbound ? "✕" : "",
+      cleartitle: `clear ${fn}`,
     };
   });
 }
@@ -331,8 +360,9 @@ function reason(p: MapPayload): string {
     );
   if (p.session.running)
     return (
-      "read-only while a session is running: captured keys never reach the learner. " +
-      "Stop the session to map here, or bind from a shell with the command below (then Reload)"
+      "read-only while emulation runs: the panel's keys are captured, so ksx cannot " +
+      "hear them for mapping. Use the Pause button above, or bind from a shell " +
+      "with the command below"
     );
   if (p.learn.state === "unavailable")
     return (
@@ -352,6 +382,14 @@ export function applyMap(p: MapPayload): void {
     selectedSlot = p.selected;
   }
   const slot = currentSlot();
+  // Derived BEFORE the row builders run — they read it for the dead look.
+  liveMapping = learnable(p) && slot !== null;
+  // The daemon is answering and running again: whatever we paused has been
+  // started back up, so drop the paused affordance.
+  if (p.session.reachable && p.session.running) {
+    paused = false;
+    pausedProfile = null;
+  }
 
   setSlotTabs(
     p.mapper.slots.map((s) => ({
@@ -368,19 +406,103 @@ export function applyMap(p: MapPayload): void {
   setSourceLine(`${p.mapper.source} — config root: ${p.mapper.config_root}`);
   setGeneratedAt(p.mapper.generated_at);
 
-  const live = learnable(p) && slot !== null;
+  const live = liveMapping;
   setReasonLine(reason(p));
   setReadOnly(!live);
   setCanLearn(live);
   setActionsCls(p.session.reachable ? "card pactions" : "card pactions off");
   setArtXbox(slot !== null && !isPlaystation(slot.persona));
   setArtDs4(slot !== null && isPlaystation(slot.persona));
+  setDaemonCmd(
+    p.session.profile ? `ksx daemon --game "${p.session.profile}"` : "ksx daemon",
+  );
+  setHasBackup(slot !== null && slot.backup !== null);
+  setBackupLine(slot?.backup ? `Restore backup from ${slot.backup}` : "Restore backup");
 
-  setPillRunning(p.session.reachable && p.session.running);
-  setPillIdle(p.session.reachable && !p.session.running);
+  const running = p.session.reachable && p.session.running;
+  const idle = p.session.reachable && !p.session.running;
+  setPillRunning(running);
+  setPillIdle(idle && !paused);
   setPillDown(!p.session.reachable);
+  setPillPaused(idle && paused);
+  setNoDaemon(!p.session.reachable);
+  setSessionRunning(running);
+  setPausedBar(idle && paused);
 
   refreshCliLine();
+}
+
+// ── FIX 0: pause for mapping, and the road back ────────────────────────────
+// The daemon refuses to learn while emulation runs, for reasons written out in
+// full in daemon/pipe.rs (the capture thread is not a place features get
+// added, and a key pressed to be learned would also fire its binding). The
+// answer is not to weaken the refusal but to make obeying it ONE CLICK: pause,
+// map, resume — with the paused state visible the whole time so nobody walks
+// away from a cabinet they stopped.
+
+/** Client-only: this PAGE paused emulation. To the daemon it is just idle. */
+let paused = false;
+/** The profile that was running when we paused, so Resume restores it. */
+let pausedProfile: string | null = null;
+
+/** The pause landed. Flip the affordances NOW rather than re-deriving from
+ *  `lastPayload` — that payload still says "running" (it predates the stop by
+ *  definition), and applyMap's own rule "running ⇒ not paused" would undo the
+ *  pause the instant it was set. The next poll re-derives everything anyway. */
+export function markPaused(profile: string | null): void {
+  paused = true;
+  pausedProfile = profile;
+  setPillRunning(false);
+  setPillIdle(false);
+  setPillPaused(true);
+  setSessionRunning(false);
+  setPausedBar(true);
+}
+
+export function clearPaused(): void {
+  paused = false;
+  pausedProfile = null;
+  setPillPaused(false);
+  setPausedBar(false);
+}
+
+export function profileToResume(): string | null {
+  return pausedProfile;
+}
+
+export function isPaused(): boolean {
+  return paused;
+}
+
+/** The profile running right now — remembered at pause time. */
+export function liveProfile(): string | null {
+  return lastPayload?.session.profile ?? null;
+}
+
+/** The preset the visible slot maps — every preset-level verb's argument. */
+export function currentPreset(): string | null {
+  return currentSlot()?.preset ?? null;
+}
+
+/** The key(s) bound to `fn` right now, or null when unbound. Feeds the learn
+ *  modal's "currently …" line and its Clear button. */
+export function currentBinding(fn: string): string | null {
+  const slot = currentSlot();
+  if (!slot) return null;
+  const keys = slot.bindings[fn];
+  return keys && keys.length > 0 ? keys.join("+") : null;
+}
+
+/** Why a click cannot record right now — one clause, worst problem first.
+ *  `null` means it can. This is what turns a dead click into a sentence. */
+export function blockedReason(): string | null {
+  const p = lastPayload;
+  if (!p) return "no snapshot yet";
+  if (p.mapper.slots.length === 0) return "there is nothing to map";
+  if (!p.session.reachable) return "no daemon running";
+  if (p.session.running) return "emulation is running";
+  if (p.learn.state === "unavailable") return "this daemon has no learner";
+  return null;
 }
 
 /** The studio server itself stopped answering: keep the page, say so. */
@@ -388,16 +510,39 @@ export function applyMapUnreachable(): void {
   setReasonLine("ksx-studio not responding — retrying every 2 s");
   setReadOnly(true);
   setCanLearn(false);
+  liveMapping = false;
   setActionsCls("card pactions off");
   setPillRunning(false);
   setPillIdle(false);
+  setPillPaused(false);
   setPillDown(true);
+  setNoDaemon(true);
+  setSessionRunning(false);
+  setPausedBar(false);
+}
+
+/** "Saved 14:32:07" — auto-save made visible (Victor: "where is save?"). */
+export function markSaved(): void {
+  const now = new Date();
+  const two = (n: number) => String(n).padStart(2, "0");
+  setSavedAt(
+    `Saved ${two(now.getHours())}:${two(now.getMinutes())}:${two(now.getSeconds())}`,
+  );
 }
 
 // ── Modal + flash state (driven by map.ts) ─────────────────────────────────
 
-export function showListening(promptText: string, remainingMs: number, totalMs: number): void {
+export function showListening(
+  promptText: string,
+  bindingText: string | null,
+  remainingMs: number,
+  totalMs: number,
+): void {
   setModalPrompt(promptText);
+  // MAME's UI Clear lives inside the capture prompt; so does ours. Showing the
+  // current binding next to it is what makes "Clear binding" obviously safe.
+  setModalBinding(bindingText === null ? "" : `currently ${bindingText}`);
+  setModalBound(bindingText !== null);
   setModalOpen(true);
   setModalListening(true);
   setModalConflict(false);
@@ -415,6 +560,7 @@ export function showConflict(promptText: string, line: string): void {
   setModalPrompt(promptText);
   setModalOpen(true);
   setModalListening(false);
+  setModalBound(false);
   setModalConflict(true);
   setConflictLine(line);
 }
@@ -422,7 +568,13 @@ export function showConflict(promptText: string, line: string): void {
 export function closeModal(): void {
   setModalOpen(false);
   setModalListening(false);
+  setModalBound(false);
   setModalConflict(false);
+}
+
+/** Is the learn modal on screen? The browser-focus guard keys off this. */
+export function modalIsOpen(): boolean {
+  return modalOpen();
 }
 
 const FLASH_MS = 5000;
@@ -439,9 +591,14 @@ export function flashSaved(line: string, isError: boolean): void {
 }
 
 // ── The screen ─────────────────────────────────────────────────────────────
-// createShow document order == render_map.rs MAP_SHOW_ORDER (positional
-// seam, ledger #4): pills ×3, readOnly, canLearn, artXbox, artDs4, savedOk,
-// savedErr, modalOpen, modalListening, modalConflict.
+// createShow document order == render_map.rs MAP_SHOW_ORDER (positional seam,
+// ledger #4). Eighteen, in this order:
+//   pillRunning, pillIdle, pillDown, pillPaused,
+//   noDaemon, sessionRunning, pausedBar, readOnly, canLearn,
+//   artXbox, artDs4, hasBackup, savedOk, savedErr,
+//   modalOpen, modalListening, modalBound, modalConflict.
+// Adding or reordering one here without updating MAP_SHOW_ORDER shows the
+// wrong panel; `embedded_map_ir_slot_layout_matches_the_seam` catches it.
 
 export function MapIsland() {
   return h(
@@ -470,10 +627,103 @@ export function MapIsland() {
         () => pillDown(),
         () => h("span", { class: "pill pill-down" }, "no daemon"),
       ),
+      createShow(
+        () => pillPaused(),
+        () => h("span", { class: "pill pill-paused" }, "paused for mapping"),
+      ),
     ),
     h(
       "main",
       null,
+      // ── FIX 1: the no-daemon banner. TOP of the page, not buried at the
+      // bottom of a card — the failure it exists for is a page that looks
+      // completely normal and silently ignores every click. ──────────────
+      createShow(
+        () => noDaemon(),
+        () =>
+          h(
+            "section",
+            { class: "card alarm" },
+            h(
+              "h2",
+              null,
+              "No daemon — ksx Studio can see your config but cannot change anything.",
+            ),
+            h(
+              "p",
+              { class: "alarmlead" },
+              "Bindings below are the real ones on disk. Nothing you click here can ",
+              "be saved until a daemon is running. Two ways to start one:",
+            ),
+            h(
+              "ol",
+              { class: "alarmways" },
+              h("li", null, "the ksx tray icon → Start emulation, or"),
+              h(
+                "li",
+                null,
+                "run this in a shell: ",
+                h("code", { class: "mono copyable" }, () => daemonCmd()),
+              ),
+            ),
+          ),
+      ),
+      // ── FIX 0: emulation is running, so the learner cannot hear the panel.
+      // One click to obey that instead of a dead end. ────────────────────
+      createShow(
+        () => sessionRunning(),
+        () =>
+          h(
+            "section",
+            { class: "card alarm warn" },
+            h(
+              "h2",
+              null,
+              "Emulation is running: panel keys are captured, so ksx can't hear them ",
+              "for mapping.",
+            ),
+            h(
+              "p",
+              { class: "alarmlead" },
+              "Pausing unplugs the pads and gives the panel back to Windows; ",
+              "Resume starts the same profile again when you are done.",
+            ),
+            h(
+              "div",
+              { class: "pactrow" },
+              h(
+                "button",
+                { class: "btn btn-primary", "data-act": "pause-map", type: "button" },
+                "Pause emulation & map",
+              ),
+            ),
+          ),
+      ),
+      // ── FIX 0: the road back, persistent while this page holds the pause.
+      createShow(
+        () => pausedBar(),
+        () =>
+          h(
+            "section",
+            { class: "card alarm paused" },
+            h("h2", null, "Emulation is paused for mapping."),
+            h(
+              "p",
+              { class: "alarmlead" },
+              "The cabinet has no virtual pads right now. Map what you need, then ",
+              "put it back:",
+            ),
+            h(
+              "div",
+              { class: "pactrow" },
+              h(
+                "button",
+                { class: "btn btn-primary", "data-act": "resume", type: "button" },
+                "Resume emulation",
+              ),
+            ),
+          ),
+      ),
       // ── Slot context strip ────────────────────────────────────────────
       h(
         "section",
@@ -508,8 +758,8 @@ export function MapIsland() {
             "p",
             { class: "hint" },
             "Click a control, then press the panel key for it — Esc or a click ",
-            "outside cancels. Saved bindings hot-reload a running session via a ",
-            "clean daemon Reload.",
+            "outside cancels, Delete clears. Saves are immediate, and a running ",
+            "session takes them live without unplugging the pads.",
           ),
       ),
       // ── THE CONTROLLER (huge). Art + zone layer per persona. ──────────
@@ -598,13 +848,21 @@ export function MapIsland() {
           { class: "legend" },
           createList(
             () => legendRows(),
-            (l) => l.fn + "|" + l.label + "|" + l.key + "|" + l.cls,
+            (l) => l.fn + "|" + l.label + "|" + l.key + "|" + l.cls + "|" + l.clear,
             (l) =>
               h(
                 "button",
                 { class: l.cls, "data-fn": l.fn, type: "button", title: l.title },
                 h("span", { class: "llabel" }, l.label),
                 h("span", { class: "lkey" }, l.key),
+                // The desktop accelerator (revealed on hover/focus, always
+                // present for keyboard and AT users). Never the ONLY way to
+                // clear: the learn modal's button is the touch-first path.
+                h(
+                  "span",
+                  { class: "lclear", "data-clear": l.fn, title: l.cleartitle },
+                  l.clear,
+                ),
               ),
           ),
         ),
@@ -616,27 +874,52 @@ export function MapIsland() {
       h(
         "section",
         { class: () => actionsCls() },
-        h("h2", null, "Preset"),
+        h(
+          "div",
+          { class: "phead" },
+          h("h2", null, "Preset"),
+          // Auto-save, made visible. Empty until this page writes something.
+          h("span", { class: "savedat mono" }, () => savedAt()),
+        ),
         h(
           "p",
           { class: "savenote" },
-          "Bindings save to the preset file immediately — there is no separate ",
-          "Save. A running session hot-reloads on each save. Restore points: the ",
-          "built-in default layout, or the session-start backup taken before this ",
-          "daemon session's first change.",
+          "Every binding saves immediately — there is no Save button. A running ",
+          "session takes binding changes live, without unplugging the pads. Use ",
+          "the restore options below to undo.",
         ),
         h(
           "div",
           { class: "pactrow" },
           h(
             "button",
-            { class: "btn btn-row", "data-act": "restore-backup", type: "button" },
-            "Undo this session",
+            { class: "btn btn-row", "data-act": "clear-all", type: "button" },
+            "Clear all bindings",
           ),
           h(
             "button",
-            { class: "btn btn-row", "data-act": "restore-defaults", type: "button" },
-            "Restore built-in defaults",
+            { class: "btn btn-row", "data-act": "restore-backup", type: "button" },
+            "Undo this session",
+          ),
+          // FIX 2's third destination — only rendered when a backup exists,
+          // because an offer of a road home that is not there is worse than
+          // no offer. The timestamp is IN the label, not in a tooltip.
+          createShow(
+            () => hasBackup(),
+            () =>
+              h(
+                "button",
+                { class: "btn btn-row", "data-act": "restore-latest", type: "button" },
+                () => backupLine(),
+              ),
+          ),
+          // FIX 2: the label names the LAYOUT it writes. "Restore built-in
+          // defaults" read, to Victor, as "put my I-PAC map back" — and wrote
+          // a desktop-keyboard layout over it.
+          h(
+            "button",
+            { class: "btn btn-row btn-danger-ghost", "data-act": "restore-defaults", type: "button" },
+            "Reset to generic keyboard layout (S/D/A/W…)",
           ),
         ),
       ),
@@ -678,6 +961,29 @@ export function MapIsland() {
                     { class: "mhint" },
                     "waiting for a key press on the panel… Esc or click outside to cancel",
                   ),
+                ),
+            ),
+            // MAME's "UI Clear during capture", ported: the prompt that asks
+            // for a new key is also where you say "none". Touch-first — the
+            // legend's ✕ and the Delete key are accelerators, not the path.
+            createShow(
+              () => modalBound(),
+              () =>
+                h(
+                  "div",
+                  { class: "mbody mbound" },
+                  h("p", { class: "mcurrent mono" }, () => modalBinding()),
+                  h(
+                    "div",
+                    { class: "mbtns" },
+                    h(
+                      "button",
+                      { class: "btn", "data-act": "clear-one", type: "button" },
+                      "Clear binding",
+                    ),
+                    h("button", { class: "btn", "data-act": "cancel", type: "button" }, "Cancel"),
+                  ),
+                  h("p", { class: "mhint" }, "Delete or Backspace also clears it."),
                 ),
             ),
             createShow(

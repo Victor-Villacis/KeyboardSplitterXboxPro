@@ -107,10 +107,12 @@ const ISLAND_COMPONENT: &str = "StatusIsland";
 /// statically-styled variant renders — so the list is long; the layout test
 /// pins the count.
 const SHOW_SLOT_NAME: &str = "show:createShow";
-const SHOW_ORDER: [&str; 16] = [
+const SHOW_ORDER: [&str; 17] = [
     "header pill: running",
     "header pill: idle",
     "header pill: no daemon",
+    // FIX 1: the unmissable banner, first child of <main> on BOTH pages.
+    "no-daemon banner (top of page)",
     "flash: success",
     "flash: error",
     "start controls",
@@ -191,6 +193,34 @@ impl EmbeddedPage {
 pub(crate) const ART_XBOX: &str = "/_assets/pad-xbox.svg";
 pub(crate) const ART_DS4: &str = "/_assets/pad-ds4.svg";
 
+/// The exact command that starts a daemon for THIS machine's configuration.
+///
+/// The profile flag matters: on a cabinet whose slots live in games.toml,
+/// plain `ksx daemon` refuses to start ("nothing to run"), so printing it as
+/// the remedy would send the user in a circle. `SessionView::profile` carries
+/// the title — from the pipe when the daemon answers, and from the config when
+/// it does not, which is precisely the case this string exists for.
+pub(crate) fn daemon_command(session: &SessionView) -> String {
+    match session.profile.as_deref().map(str::trim) {
+        Some(profile) if !profile.is_empty() => format!("ksx daemon --game \"{profile}\""),
+        _ => "ksx daemon".to_owned(),
+    }
+}
+
+/// The headline of the no-daemon banner, on both pages, word for word.
+///
+/// It is deliberately blunt about the SPLIT — read works, write does not —
+/// because the failure Victor hit was a page that looked completely normal and
+/// silently ignored every click.
+///
+/// The string itself lives in the TypeScript (`StatusIsland.ts` /
+/// `MapIsland.ts`) because it is static markup, not injected data — so this is
+/// the test oracle that keeps the two pages saying the same sentence, and is
+/// compiled only for tests.
+#[cfg(test)]
+pub(crate) const NO_DAEMON_HEADLINE: &str =
+    "No daemon — ksx Studio can see your config but cannot change anything.";
+
 /// Pick the art for a persona LABEL ("PlayStation (DS4) pad") or persona id
 /// ("playstation"). Anything un-PlayStation renders as the Xbox pad — the
 /// cabinet's default persona.
@@ -221,6 +251,8 @@ fn scalar_slots(
         "configRoot": snap.config_root,
         "sessionLine": session.line,
         "flashLine": flash.unwrap_or(""),
+        // FIX 1: the copyable remedy, with this machine's profile flag.
+        "daemonCmd": daemon_command(session),
     })
 }
 
@@ -342,6 +374,7 @@ fn show_values(
         session.reachable && session.running,
         can_start,
         !session.reachable,
+        !session.reachable, // the top-of-page banner
         flash.is_some() && !flash_err,
         flash_err,
         can_start,
@@ -502,6 +535,7 @@ mod tests {
             reachable: true,
             running: false,
             line: "idle — daemon reachable".into(),
+            profile: None,
         }
     }
 
@@ -510,6 +544,7 @@ mod tests {
             reachable: true,
             running: true,
             line: "running — Street Fighter — 4 pad(s)".into(),
+            profile: Some("Street Fighter".into()),
         }
     }
 

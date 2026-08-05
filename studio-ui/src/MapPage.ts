@@ -19,11 +19,19 @@ export function MapPage() {
   const [sourceLine] = createSignal("not collected");
   const [reasonLine] = createSignal("");
   const [cliLine] = createSignal("ksx map --preset <NAME> --function <FUNCTION> --key <KEY>");
+  // The remedy printed in the no-daemon banner, with this machine's profile
+  // flag when it needs one.
+  const [daemonCmd] = createSignal("ksx daemon");
+  // The third restore destination's label carries its timestamp.
+  const [backupLine] = createSignal("Restore backup");
   const [modalPrompt] = createSignal("");
+  const [modalBinding] = createSignal("");
   const [countdownText] = createSignal("");
   const [barStyle] = createSignal("width:100%");
   const [conflictLine] = createSignal("");
   const [savedLine] = createSignal("");
+  // Auto-save made visible; empty until this page has written something.
+  const [savedAt] = createSignal("");
   const [generatedAt] = createSignal("(no snapshot)");
   // The preset-actions card renders inert until a payload proves the daemon
   // reachable (a class string, not a show — ledger #13).
@@ -34,14 +42,20 @@ export function MapPage() {
   const [pillRunning] = createSignal(false);
   const [pillIdle] = createSignal(false);
   const [pillDown] = createSignal(false);
+  const [pillPaused] = createSignal(false);
+  const [noDaemon] = createSignal(false);
+  const [sessionRunning] = createSignal(false);
+  const [pausedBar] = createSignal(false);
   const [readOnly] = createSignal(false);
   const [canLearn] = createSignal(false);
   const [artXbox] = createSignal(false);
   const [artDs4] = createSignal(false);
+  const [hasBackup] = createSignal(false);
   const [savedOk] = createSignal(false);
   const [savedErr] = createSignal(false);
   const [modalOpen] = createSignal(false);
   const [modalListening] = createSignal(false);
+  const [modalBound] = createSignal(false);
   const [modalConflict] = createSignal(false);
 
   return MapIsland();

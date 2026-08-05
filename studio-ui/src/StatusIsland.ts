@@ -63,6 +63,9 @@ export interface SessionView {
   reachable: boolean;
   running: boolean;
   line: string;
+  /** games.toml profile the daemon is (or would be) pointed at — the --game
+   *  flag the no-daemon banner's command needs on a profile-driven cabinet. */
+  profile: string | null;
 }
 
 /** What GET /api/status serves and what the island props carry — one shape
@@ -106,10 +109,12 @@ const [profilesSummary, setProfilesSummary] = createSignal("not collected");
 const [configRoot, setConfigRoot] = createSignal("(unknown)");
 const [sessionLine, setSessionLine] = createSignal("not collected");
 const [flashLine, setFlashLine] = createSignal("");
+const [daemonCmd, setDaemonCmd] = createSignal("ksx daemon");
 
 const [pillRunning, setPillRunning] = createSignal(false);
 const [pillIdle, setPillIdle] = createSignal(false);
 const [pillDown, setPillDown] = createSignal(false);
+const [noDaemon, setNoDaemon] = createSignal(false);
 const [flashOk, setFlashOk] = createSignal(false);
 const [flashError, setFlashError] = createSignal(false);
 const [canStart, setCanStart] = createSignal(false);
@@ -160,6 +165,7 @@ export function applyStatus(p: StatusPayload): void {
   setProfilesSummary(profilesSummaryLine(snap.profiles.length));
   setConfigRoot(snap.config_root);
   setSessionLine(session.line);
+  setDaemonCmd(session.profile ? `ksx daemon --game "${session.profile}"` : "ksx daemon");
 
   const okVigem = snap.vigem.startsWith("installed — service running");
   const icptInstalled = snap.interception.startsWith("installed");
@@ -169,6 +175,7 @@ export function applyStatus(p: StatusPayload): void {
   setPillRunning(session.reachable && session.running);
   setPillIdle(startable);
   setPillDown(!session.reachable);
+  setNoDaemon(!session.reachable);
   setCanStart(startable);
   setCanStop(session.reachable && session.running);
   setDaemonDown(!session.reachable);
@@ -211,6 +218,7 @@ export function applyUnreachable(): void {
   setPillRunning(false);
   setPillIdle(false);
   setPillDown(true);
+  setNoDaemon(true);
   setCanStart(false);
   setCanStop(false);
   setDaemonDown(true);
@@ -276,6 +284,41 @@ export function StatusIsland() {
     h(
       "main",
       null,
+      // ── FIX 1: the no-daemon banner, TOP of the page and identical in
+      // wording to the mapper's. The session card below already renders its
+      // controls disabled; this is what makes the state impossible to miss
+      // before you have touched anything. ───────────────────────────────
+      createShow(
+        () => noDaemon(),
+        () =>
+          h(
+            "section",
+            { class: "card alarm" },
+            h(
+              "h2",
+              null,
+              "No daemon — ksx Studio can see your config but cannot change anything.",
+            ),
+            h(
+              "p",
+              { class: "alarmlead" },
+              "Everything below is a real reading of this machine. Nothing on this ",
+              "page can start, stop or change anything until a daemon is running. ",
+              "Two ways to start one:",
+            ),
+            h(
+              "ol",
+              { class: "alarmways" },
+              h("li", null, "the ksx tray icon → Start emulation, or"),
+              h(
+                "li",
+                null,
+                "run this in a shell: ",
+                h("code", { class: "mono copyable" }, () => daemonCmd()),
+              ),
+            ),
+          ),
+      ),
       // ── SESSION: the hero card ────────────────────────────────────────
       h(
         "section",

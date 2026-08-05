@@ -19,11 +19,11 @@ list.
 | Start emulation | `ksx run` (foreground session); daemon: tray "Start emulation" / headless stdin `start` / pipe `start` / `ksx session start [--game TITLE]` — all → `DaemonCommand::Start` | M9: enqueue `DaemonCommand::Start` on the control loop the UI hosts in-process. **M10: Studio's Start button POSTs `/session/start` → pipe `start` → the same command (live)** | exists — pipe + CLI + Studio live |
 | Stop emulation | tray "Stop emulation" / stdin `stop` / pipe `stop` / `ksx session stop` → `DaemonCommand::Stop`; the emergency escapes (LeftCtrl ×5, Ctrl+Alt+Del) live in the capture thread, not in any control surface | M9: `DaemonCommand::Stop`. **M10: Studio's Stop button POSTs `/session/stop` → pipe `stop` (live).** Escapes are deliberately NOT a GUI concern — see invariants | exists — pipe + CLI + Studio live |
 | Session status + live health | tray tooltip (`DaemonState::tooltip`: `RunState` + `LiveHealth` while running, `LastSession` after); stdin `status` → `DaemonCommand::Status`; pipe `status` / `ksx session status [--json]` (state + game + profiles + last/live health); `ksx run --latency` for the rolling latency summary | M9: poll the same `SharedState` snapshot (`DaemonState`) the tray polls — small, cloneable, no borrows of anything live. **M10: Studio's session panel renders the pipe `status` response (live)** | exists — pipe + CLI + Studio live |
-| Reload config | tray "Reload config" / stdin `reload` / pipe `reload` / `ksx session reload` → `DaemonCommand::Reload` — a clean stop and a clean start from disk, never a hot-patch | M9: `DaemonCommand::Reload`. **M10: Studio's Reload button POSTs `/config/reload` → pipe `reload` (live)** | exists — pipe + CLI + Studio live |
+| Reload config | tray "Reload config" / stdin `reload` / pipe `reload` / `ksx session reload` → `DaemonCommand::Reload` — a clean stop and a clean start from disk. A mapper SAVE takes the narrower `DaemonCommand::ApplyBindings` instead: binding-only edits hot-swap into the live engine with the pads left plugged, structural changes fall back to the same bounce (see "the binding hot-swap") | M9: `DaemonCommand::Reload`. **M10: Studio's Reload button POSTs `/config/reload` → pipe `reload` (live)** | exists — pipe + CLI + Studio live |
 | List / identify devices | `ksx devices [--json]` (both backends, read-only); `ksx winusb status [--json]` for the USB/claim view | M9: same enumeration in-process — strictly read-only, safe mid-session. M10: api devices | exists |
 | Pad test | `ksx pads --count N --persona xbox360\|playstation [--json]` (plug, test pattern, unplug) | M9: same routine in-process, only while emulation is stopped (test pads compete for the four XInput slots). M10: api | exists |
 | Per-slot persona | TOML edit: `persona = "playstation"` on the `[[slot]]` (aliases `ds4`/`ps4` accepted) | M7 wizard / mapping verbs first; then GUI forms write the same TOML and issue `Reload` | gap — TOML-only **by design** until M7 |
-| Preset editing | `ksx map --preset "IPAC P1" --function A --key G [--clear] [--force] [--json]`; pipe `map` (same writer: `ksx-app/src/mapping.rs::apply`); TOML edit still first-class | **Studio's `/map` mapper (live)**: click a control → pipe `learn-key` → pipe `map` — every write goes through the one shared writer, never a parallel editor. Conflict detection is server-side in that writer (see below) | exists — CLI + pipe + Studio live |
+| Preset editing | `ksx map --preset "IPAC P1" --function A --key G [--clear] [--force] [--json]`; whole-preset: `--restore defaults\|session-backup\|latest-backup`, `--clear-all`, `--list-backups`; pipe `map` / `map-restore` / `map-clear-all` / `map-backups` (same writers: `ksx-app/src/mapping.rs`); TOML edit still first-class | **Studio's `/map` mapper (live)**: click a control → pipe `learn-key` → pipe `map` — every write goes through the one shared writer, never a parallel editor. Conflict detection is server-side in that writer (see below) | exists — CLI + pipe + Studio live |
 | Learn a key ("press the panel key for P1·A") | pipe `learn-key` / `learn-poll` / `learn-cancel` (asynchronous; see "learn-key semantics" below) | **Studio's mapper drives it (live)**: `/api/learn*` → the pipe verbs. No CLI face yet (`ksx map` takes the key by name; `ksx monitor` shows names) | exists — pipe + Studio |
 | Game profiles | TOML edit (`games.toml`); consumed by `ksx run --game`, `ksx daemon --game`, `ksx autostart --game` | Editing: M7 verbs (E5 `ksx slot assign` family), then GUI forms over them. Consuming: `DaemonCommand`/api as above | gap for editing; consuming exists |
 | WinUSB claim / release / status | `ksx winusb status` (read-only); `claim`/`release` are dry runs by default, act only with `--yes` + an admin token | M9: same verbs in-process, preserving dry-run-first and the explicit consent step. M10: `status` is safe over the api; `claim`/`release` stay local + elevated | exists |
@@ -88,25 +88,73 @@ The M7 mapper slice adds four verbs on the same channel:
 ← {"ok":true,"state":"cancelled", …}
 ```
 
-The mapper's preset safety nets (2026-08-05) ride the same channel:
+### Whole-preset writes: three restore destinations, plus clear-all
 
 ```
-→ {"verb":"map-restore","preset":"IPAC P1","mode":"defaults","reload":true}
-← {"ok":true,"message":"\"IPAC P1\": bindings restored to the built-in defaults — …",
-   "path":"C:\\…\\presets\\IPAC P1.toml","preset":"IPAC P1","reloaded":false}
+→ {"verb":"map-restore","preset":"IPAC P1","mode":"latest-backup","reload":true}
+← {"ok":true,"mode":"latest-backup",
+   "message":"\"IPAC P1\": bindings restored from the newest timestamped backup
+              — the previous file is backed up as 20260805-221500 — bindings
+              applied live — pads untouched",
+   "wrote":"this preset as it was before the most recent restore (…)",
+   "backup":{"stamp":"20260805-221500","label":"2026-08-05 22:15:00 UTC",
+             "path":"C:\\…\\presets\\IPAC P1.toml.bak-20260805-221500"},
+   "path":"C:\\…\\presets\\IPAC P1.toml","preset":"IPAC P1",
+   "reloaded":true,"hot_swap":true}
+
 → {"verb":"map-restore","preset":"IPAC P1","mode":"session-backup"}
 ← {"ok":false,"error":"no session backup for \"IPAC P1\" — nothing has been
    mapped through the daemon this session, so there is nothing to undo"}
+
+→ {"verb":"map-clear-all","preset":"IPAC P1","reload":true}
+← {"ok":true,"mode":"clear-all","message":"\"IPAC P1\": every binding cleared …"}
+
+→ {"verb":"map-backups","preset":"IPAC P1"}          (read-only)
+← {"ok":true,"preset":"IPAC P1","backups":[
+     {"stamp":"20260805-221500","label":"2026-08-05 22:15:00 UTC","path":"…"},
+     {"stamp":"20260804-090000","label":"2026-08-04 09:00:00 UTC","path":"…"}]}
 ```
 
 `map-restore` (writer: `mapping.rs::restore`; CLI face: `ksx map --preset …
---restore defaults|session-backup`): `"defaults"` rewrites the preset's
-bindings to `ksx_core::Preset::builtin_default()` keeping its name;
-`"session-backup"` restores `<preset file>.session-bak` — the snapshot the
-daemon's `map` writer takes before its FIRST write to that preset in a
-daemon lifetime ("undo this session"; `pipe.rs::map_fn` owns the
-once-per-lifetime set). A corrupt backup is refused, never written. Same
-`"reload"` semantics as `map`.
+--restore defaults|session-backup|latest-backup`) has **three destinations**,
+and every surface must name the destination rather than the word "restore":
+
+| mode | writes | undoes |
+|---|---|---|
+| `defaults` | the **generic keyboard layout** — `ksx_core::Preset::builtin_default()`: S=A, D=B, A=X, W=Y, Q/E triggers, arrow keys = left stick, Esc=Start, Backspace=Back. Keeps the preset's NAME | nothing — it is the always-there floor |
+| `session-backup` | the preset as it was before the daemon's FIRST `map` write of this daemon lifetime (`<preset>.toml.session-bak`; `pipe.rs::map_fn` owns the once-per-lifetime set) | everything mapped since the daemon started |
+| `latest-backup` | the preset as it was before the most recent whole-preset write (the newest `<preset>.toml.bak-YYYYMMDD-HHMMSS`) | the previous restore, or a clear-all |
+
+**`defaults` is the one that surprises people, and the labels exist to stop
+it.** It does NOT mean "this preset as it shipped" — on an arcade cabinet it
+replaces an I-PAC panel map with a desktop-keyboard map. Studio's button
+therefore reads "Reset to generic keyboard layout (S/D/A/W…)", `--help` spells
+the layout out, and the confirm dialog names every key it writes. The abstract
+phrase "restore defaults" appears nowhere in the UI any more.
+
+**Every whole-preset write takes a timestamped backup first** — restore ×3 and
+`map-clear-all` alike. The current file is copied to
+`<preset>.toml.bak-YYYYMMDD-HHMMSS` (UTC, sortable; a second write inside the
+same second gets `-2`, `-3`…) BEFORE the new content is written, and only once
+the replacement has been read and validated — so a refusal leaves no stray
+backup. Backups are never pruned: they are small, restores are rare and
+deliberate, and deleting a cabinet's only copy of a panel map to save kilobytes
+is not a trade ksx makes. The response's `backup` field, `ksx map
+--list-backups --preset X [--json]` and the pipe's `map-backups` all read the
+same list, newest first; Studio labels its third button with the newest
+timestamp ("Restore backup from 2026-08-05 14:32:07 UTC") and HIDES the button
+when there is none, because offering a road home that does not exist is worse
+than not offering one.
+
+`map-clear-all` (writer: `mapping.rs::clear_all`; CLI face: `ksx map --preset …
+--clear-all`) unbinds every function while keeping the file structurally valid:
+it writes the `empty` built-in's SHAPE — all 25 functions present, each keyed
+`"None"` — the same convention single-function `--clear` uses, so a cleared
+control stays visible in the legend instead of vanishing.
+
+Refusal codes (`--json` `code`, stable): `unknown-preset`, `unknown-function`,
+`unknown-key`, `conflict`, `no-session-backup`, `no-backup`, `bad-backup`,
+`config-error`. A corrupt backup is refused, never written.
 
 `map` writes through the SAME `ksx-app/src/mapping.rs::apply` the CLI verb
 uses — replace-per-function, `"None"` placeholder on clear, canonical TOML
@@ -116,19 +164,77 @@ in the same preset (a `force` steals it, leaving a `"None"` placeholder), and
 the key bound in another slot's preset within any games.toml profile that
 uses the target preset (**never auto-edited** — `force` writes the target
 anyway and keeps reporting the double binding; silently rewriting a preset
-the caller did not name would be worse). `"reload":true` bounces a RUNNING
-session onto the new binding via the ordinary `DaemonCommand::Reload` — the
-"hot-reload" is a clean stop + re-read + start, never a hot-patch (the
-config invariant below). With nothing running there is nothing to bounce: the
-next start reads the file.
+the caller did not name would be worse).
+
+### `"reload":true` — the binding hot-swap (2026-08-05)
+
+Every write verb (`map`, `map-restore`, `map-clear-all`) takes the same
+optional `"reload":true`. It used to mean `DaemonCommand::Reload`: a clean
+stop, re-read, start — which unplugged four pads, made Windows play its
+disconnect/reconnect chime, made Steam re-enumerate, and made a game in
+progress see its controllers vanish. Victor's question, verbatim: "why does it
+need to disconnect to reconnect?"
+
+It now enqueues `DaemonCommand::ApplyBindings`, and the control loop picks the
+cheapest correct answer:
+
+| change | what happens |
+|---|---|
+| preset CONTENTS, or a slot pointing at a different preset | **hot swap**: `ksx-core`'s `EngineTables` are rebuilt on the daemon's control thread and moved into the live engine (`Engine::swap_tables`). Pads stay plugged, keyboards stay captured, nothing re-enumerates. Response: `"hot_swap":true`, message "bindings applied live — pads untouched" |
+| slot count, slot numbering, persona, keyboard/mouse assignment, blocking policy, capture backend | **bounce**: exactly the old `Reload`, and the message names what changed ("session restarted — slot 3 changed persona … needs the pads replugged"). Response: `"hot_swap":false` |
+| the config no longer resolves | nothing is torn down. Tearing a working session down to fail the restart is the worst of both; the response says the session is still running on its old bindings |
+| nothing running | nothing to do — the next start reads the file |
+
+The split is drawn where the DRIVERS are: anything that would make the output
+thread plug a different pad, or the capture thread block a different device,
+takes a real teardown (`run/supervisor.rs::SessionShape::bounce_reason` is the
+one place that rule lives). Everything else is a key→function table.
+
+**Hot-path purity is preserved**: the new tables are built off-thread (the
+control loop may block and allocate freely) and the engine thread only moves
+pointers. **Stuck keys are impossible**: dense key ids belong to the old
+tables, so `swap_tables` re-baselines the key state and RETURNS the neutral
+states of any control that was held across the edit — the supervisor forwards
+them, so a rebind can never strand a pressed virtual button.
+
+The config invariant below is unchanged in substance: config still lives in
+hand-editable TOML, changes still land by re-reading that TOML, and there is
+still no parallel binary store or GUI-only state. What changed is that a
+BINDING-ONLY re-read no longer requires destroying and rebuilding the driver
+objects around it.
+
+`ksx session reload` and the tray's "Reload config" keep the blunt
+stop-and-start semantics — they exist for "restart whatever changed".
 
 **learn-key semantics** (the honest v1): the daemon observes the next key
 press via a Raw Input sink (`ksx-capture::observe_next_key` — instance path +
 the same corrected `Key` vocabulary presets store; injected input is ignored
 by construction). Because a running session's captured keyboards are
 suppressed below win32k — where a Raw Input sink hears nothing — `learn-key`
-is **refused while a session is running** instead of timing out silently; the
-mapper goes read-only with the reason and the `ksx map` fallback. Same honest
+is **refused while a session is running** instead of timing out silently.
+
+That refusal was re-examined in full on 2026-08-05 (a live session had Victor
+clicking a mapper that answered nothing) and deliberately KEPT, because ksx
+could obviously tap its own capture stream instead and must not:
+
+1. the capture thread is the one thread on this machine where a bug freezes
+   every keyboard until reboot. It is time-critical, allocation-free and
+   lock-free on purpose; a convenience feature does not get a code path in it;
+2. a key pressed to be LEARNED would also fire its current binding, on every
+   slot it fans out to — mapping would inject real gameplay input;
+3. rebinding a key while it is physically held could leave a virtual button
+   pressed under the old binding and released under the new one: exactly the
+   stuck-key class the all-keys-up rule and `swap_tables`' release-on-swap
+   exist to prevent;
+4. mapping is a between-games activity in every tool in the field study
+   (MAME's TAB menu pauses the machine; RetroArch binds from its menu).
+
+What changed instead is the UX around the refusal: Studio's mapper renders the
+running state as a banner with a **"Pause emulation & map"** button (the plain
+`stop` verb), then a persistent **"Resume emulation"** (the `start` verb with
+the profile it remembered), with a "paused for mapping" pill in the header so
+nobody walks away from a cabinet they stopped. One click each way, no tray
+hunt, no CLI — and the `ksx map` fallback is still printed. Same honest
 limit for WinUSB-claimed interfaces: a claimed panel is not in the keyboard
 stack, so Raw Input cannot hear it even between sessions (its typethrough
 injection is deliberately filtered as injected input) — learning from a
@@ -183,6 +289,14 @@ gets the same channel for free.
 3. **learn-key cannot hear a WinUSB-claimed panel** (see semantics above) —
    Interception-backed cabinets learn fine; a migrated cabinet uses `ksx map`
    until the claimed-panel learner lands.
+4. **learn-key still needs emulation stopped** — deliberately, for the four
+   reasons in "learn-key semantics". Studio makes obeying it one click
+   (Pause → map → Resume) rather than a dead end.
+5. **`ksx slot assign` (which preset a slot uses) is still a TOML edit.** The
+   mapper edits bindings inside a preset; pointing slot 2 at a different
+   preset is a games.toml/config.toml change today. Worth noting it is
+   nevertheless a HOT change at the engine level — only the binding table
+   moves — so it does not need a pad bounce once the verb exists.
 
 ## Invariants a GUI must not break
 
@@ -205,6 +319,19 @@ Each one maps to a legacy defect or a measured constraint
   chain, because the escapes' one property is that they work when everything
   downstream — the GUI included — is wedged.
 - **Config stays hand-editable TOML.** The GUI edits the same files the user
-  can edit, and changes land via `Reload` (clean stop, re-read from disk,
-  clean start) — never a hot-patch of a live pipeline, never a parallel
-  binary store, never GUI-only state.
+  can edit, and changes land by RE-READING those files — never a parallel
+  binary store, never GUI-only state. How the re-read reaches a running
+  session depends on what changed: a binding-only edit is applied by rebuilding
+  the engine's dispatch tables off-thread and swapping them in
+  (`ApplyBindings`), anything structural is still a clean stop + re-read +
+  start (`Reload`). Both paths read the same TOML; neither patches a live
+  pipeline's state in place, and the swap releases anything held so it cannot
+  strand a pressed control.
+- **A surface that cannot act must SAY so, per click.** No control may be a
+  silent no-op. When the daemon is unreachable Studio shows a banner at the top
+  of the page ("No daemon — ksx Studio can see your config but cannot change
+  anything") with the exact command to start one (profile flag included),
+  renders every dead control visibly inert — a CSS look, never the `disabled`
+  attribute, which would swallow the click that owes an explanation — and
+  answers each click by naming the control, the reason, and the `ksx map`
+  one-liner that works anyway.

@@ -1870,3 +1870,207 @@ fn stopping_emulation_leaves_the_game_running_and_says_so() {
     );
     assert!(script.get().alive, "the game was never touched");
 }
+
+// ---------------------------------------------------------------------------
+// FIX 3 — the binding hot-swap, end to end through the real supervisor
+// ---------------------------------------------------------------------------
+
+/// A hook that hot-swaps the running session's bindings from the supervisor
+/// thread, the way `daemon::apply_bindings` does, and records every verdict.
+struct SwapHook {
+    swap: super::supervisor::HotSwapSlot,
+    plan: RunPlan,
+    /// Swap on each of the first N polls, so the swap really does land in the
+    /// middle of a live session rather than at a quiet edge.
+    remaining: usize,
+    verdicts: Arc<Mutex<Vec<String>>>,
+}
+
+impl super::supervisor::SessionHook for SwapHook {
+    fn poll(&mut self, _out: &mut dyn std::io::Write) -> Option<super::supervisor::HookStop> {
+        if self.remaining == 0 {
+            return None;
+        }
+        // `handle()` is None until the engine thread exists; keep trying.
+        if let Some(handle) = self.swap.handle() {
+            self.remaining -= 1;
+            let verdict = handle.apply(&self.plan).expect("the engine is alive");
+            self.verdicts
+                .lock()
+                .expect("verdicts poisoned")
+                .push(format!("{verdict:?}"));
+        }
+        None
+    }
+}
+
+/// Victor's question, answered where it can be measured: swapping a preset's
+/// bindings into a RUNNING session must not plug or unplug a single pad.
+///
+/// The assertion is deliberately made against the mock driver's own call log
+/// (not a step the supervisor writes down): every `plug` happens before the
+/// first pad update, every `unplug` after the last one. Anything in between
+/// would be a pad vanishing from `joy.cpl` mid-game — the Windows chime, the
+/// Steam re-enumeration and the "controller disconnected" banner Victor saw.
+#[test]
+fn a_binding_hot_swap_never_plugs_or_unplugs_a_pad() {
+    let plan = cabinet_plan();
+    let swap = super::supervisor::HotSwapSlot::default();
+    let verdicts: Arc<Mutex<Vec<String>>> = Arc::default();
+
+    // A real edit: P1's A moves from G to F1, everything else identical.
+    let mut edited = plan.clone();
+    for entry in &mut edited.slots[0].preset.entries {
+        if entry.1 == ksx_core::Binding::Button(ksx_core::XButton::A) {
+            entry.0 = Key::F1;
+        }
+    }
+
+    // A script long enough (and slow enough) to outlive several supervisor
+    // polls, so the swaps land while pads are being driven.
+    let script: Vec<MockStroke> = (0..12)
+        .flat_map(|_| {
+            [
+                key_stroke(0, Key::G, true),
+                key_stroke(0, Key::G, false),
+                key_stroke(0, Key::Eight, true),
+                key_stroke(0, Key::Eight, false),
+            ]
+        })
+        .collect();
+    let events = script.len() as u64;
+
+    let session = run_session(
+        &plan,
+        vec![keyboard(IPAC, 1)],
+        script,
+        Some(Duration::from_millis(12)),
+        |options, _| {
+            options.max_events = Some(events);
+            options.hot_swap = swap.clone();
+            options.hook = Box::new(SwapHook {
+                swap: swap.clone(),
+                plan: edited,
+                remaining: 3,
+                verdicts: verdicts.clone(),
+            });
+        },
+    );
+
+    let verdicts = verdicts.lock().unwrap().clone();
+    assert_eq!(
+        verdicts,
+        vec!["Applied".to_owned(); 3],
+        "a binding-only edit must take the hot path every time"
+    );
+
+    // Four pads, plugged once, unplugged once, nothing in between.
+    assert_eq!(session.outcome.pads.len(), 4);
+    let plugs: Vec<usize> = session
+        .pads
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, PadEvent::Plug(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let unplugs: Vec<usize> = session
+        .pads
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, PadEvent::Unplug(_)))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(plugs.len(), 4, "{:?}", session.pads);
+    assert_eq!(unplugs.len(), 4, "{:?}", session.pads);
+    let first_update = session
+        .pads
+        .iter()
+        .position(|e| matches!(e, PadEvent::Update(_, _)))
+        .expect("the session drove pads");
+    assert!(
+        plugs.iter().all(|i| *i < first_update),
+        "a pad was plugged after the session started driving: {:?}",
+        session.pads
+    );
+    let last_update = session
+        .pads
+        .iter()
+        .rposition(|e| matches!(e, PadEvent::Update(_, _)))
+        .expect("the session drove pads");
+    assert!(
+        unplugs.iter().all(|i| *i > last_update),
+        "a pad was unplugged mid-session — the hot swap bounced the pads: {:?}",
+        session.pads
+    );
+    // …and the supervisor's own lifecycle agrees: one plug phase, one unplug.
+    assert_eq!(
+        session
+            .trace
+            .iter()
+            .filter(|s| **s == Step::PadsPlugged)
+            .count(),
+        1
+    );
+    assert_eq!(
+        session
+            .trace
+            .iter()
+            .filter(|s| **s == Step::PadsUnplugged)
+            .count(),
+        1
+    );
+    assert_uncaptured_before_unplug(&session.timeline);
+
+    // The new binding really is live: F1 was NOT in the cabinet presets, so
+    // the only way slot 1 can answer to it is through the swapped tables.
+    let mut engine = Engine::new(cabinet_slots());
+    assert!(
+        engine
+            .handle(&KeyEvent {
+                device: DeviceId::from(IPAC),
+                key: Key::F1,
+                down: true,
+                t: 0,
+            })
+            .is_empty(),
+        "F1 must be unbound in the pre-swap cabinet presets for this test to mean anything"
+    );
+}
+
+/// The other half of the split: a structural change is refused by the handle,
+/// so the daemon knows to bounce instead of silently doing nothing.
+#[test]
+fn a_structural_change_is_refused_by_the_live_handle() {
+    let plan = cabinet_plan();
+    let swap = super::supervisor::HotSwapSlot::default();
+    let verdicts: Arc<Mutex<Vec<String>>> = Arc::default();
+
+    // Drop slot 4: fewer pads, so the pads genuinely have to be replugged.
+    let mut structural = plan.clone();
+    structural.slots.pop();
+
+    let session = run_session(
+        &plan,
+        vec![keyboard(IPAC, 1)],
+        vec![key_stroke(0, Key::G, true), key_stroke(0, Key::G, false)],
+        Some(Duration::from_millis(10)),
+        |options, _| {
+            options.max_events = Some(2);
+            options.hot_swap = swap.clone();
+            options.hook = Box::new(SwapHook {
+                swap: swap.clone(),
+                plan: structural,
+                remaining: 1,
+                verdicts: verdicts.clone(),
+            });
+        },
+    );
+
+    let verdicts = verdicts.lock().unwrap().clone();
+    assert_eq!(verdicts.len(), 1, "{verdicts:?}");
+    assert!(
+        verdicts[0].contains("NeedsRestart") && verdicts[0].contains("slot count"),
+        "the refusal must name what changed: {verdicts:?}"
+    );
+    assert_eq!(session.outcome.pads.len(), 4, "the session kept its shape");
+}
