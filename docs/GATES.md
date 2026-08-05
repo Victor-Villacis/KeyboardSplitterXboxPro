@@ -497,3 +497,14 @@ pre-gate months of boots with no task.
 
 **Verdict: GATE 1 PASSED with Phase C hardware-pending.** The 10-minute
 completion pass when the 5big returns is listed above.
+
+# GATE 2 PAUSE — 2026-08-05
+
+Paused by Victor before any system change. State: preconditions surveyed only —
+baseline saved to `%APPDATA%\ksx\winusb-before.json`, dry-run reviewed (INF
+scoped to MI_00 only, instance path unchanged from the runbook), Zadig 2.9
+staged in the session scratchpad (re-download from pbatard/libwdi releases if
+gone). Signing decision made: Zadig one-time bind for this cabinet (no inf2cat
+on the machine — SDK yes, WDK no); the ksx-signed-INF path is an M7 item.
+Nothing claimed, nothing installed, machine untouched. Resume at
+"Preconditions — every one, no exceptions".
