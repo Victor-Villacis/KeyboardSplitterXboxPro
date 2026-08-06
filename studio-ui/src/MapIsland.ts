@@ -2789,11 +2789,6 @@ function refreshMacro(): void {
 // authored on purpose, and Studio does not overrule a file the loader accepts.
 // The second click is the whole ceremony.
 
-/** Does this draft hold a step below the sampling floor? */
-export function macroHasShortSteps(): boolean {
-  return macroDraft?.steps.some(stepIsShort) ?? false;
-}
-
 /** ASK: put the question on screen and answer "yes, I asked". Returns false
  *  when there is nothing to ask about, which is the ordinary save. */
 export function macroAskAboutShortSteps(): boolean {

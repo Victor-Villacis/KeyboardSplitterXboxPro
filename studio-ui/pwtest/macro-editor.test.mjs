@@ -392,6 +392,15 @@ describe("a step shorter than the sampling floor", () => {
       assert.match(asked.confirmLine, /Save anyway\?$/);
       assert.match(asked.dirty, /unsaved/, "the draft was written while being asked about");
 
+      // The question survives the 2 s poll — a dialog that vanishes on its own
+      // is the same silent save with extra steps.
+      await settle(page);
+      assert.doesNotMatch(
+        (await editorState(page)).confirmClass,
+        /\boff\b/,
+        "the poll took the question down",
+      );
+
       // "Not yet" takes it down and leaves the preset alone.
       await page.locator('[data-act="macro-save-cancel"]').click();
       const cancelled = await editorState(page);

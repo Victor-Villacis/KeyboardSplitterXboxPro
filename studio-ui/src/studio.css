@@ -3031,7 +3031,7 @@ a.strow:hover {
    compared down the list ("which step is the odd one out?"), and numbers that
    start at a different x on every row cannot be. */
 .macdur {
-  flex: 0 0 6.5rem;
+  flex: 0 0 6rem;
   font-family: var(--mono);
   font-size: var(--fs-xs);
   font-weight: var(--fw-bold);
@@ -3079,7 +3079,7 @@ a.strow:hover {
 /* FIX 1 — WHAT THE ROW HOLDS, in words. First-class text: this is the row's
    MEANING, and it used to be tertiary-grey filler at the end of the line. */
 .machold {
-  flex: 0 0 15rem;
+  flex: 0 0 12rem;
   min-width: 0;
   font-size: var(--fs-xs);
   font-weight: var(--fw-semibold);
@@ -3096,7 +3096,7 @@ a.strow:hover {
 }
 
 .machold.both::after {
-  content: " · held together";
+  content: " · together";
   font-weight: var(--fw-regular);
   color: var(--text-tertiary);
 }
@@ -3615,7 +3615,7 @@ a.strow:hover {
   }
 
   .machold {
-    flex-basis: 9rem;
+    flex-basis: 8rem;
   }
 
   .macdur {

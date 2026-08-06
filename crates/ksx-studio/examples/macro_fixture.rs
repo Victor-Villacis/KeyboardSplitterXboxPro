@@ -14,7 +14,7 @@
 //! user's own `ksx studio` (4460):
 //!
 //! ```text
-//! cargo run -p ksx-studio --example macro_fixture -- 4474
+//! cargo run -p ksx-studio --example macro_fixture -- 4475
 //! ```
 
 use std::collections::BTreeMap;
