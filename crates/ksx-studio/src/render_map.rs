@@ -11,14 +11,34 @@
 //! shoulders), stacked trigger-over-bumper and visually anchored to the body
 //! silhouette below. Every mappable control is a HIT ZONE: an absolutely
 //! positioned
-//! `<button data-fn=…>` from the [`ZONE_XBOX`]/[`ZONE_DS4`] tables — a PURE
-//! hit area (transparent, no inline text; the art is the label and the
-//! `title` tooltip names fn + binding). The readable truth is the bindings
-//! LEGEND below the stage: one row per function (persona-aware label + key
-//! tag), carrying the same `data-fn` so a row click is exactly the zone
-//! click, and hover cross-highlights via the client's shared hot signal.
-//! One `createList` renders all 25 zones, another the 25 legend rows;
-//! geometry is data, not markup.
+//! `<button data-fn=…>` from the [`ZONE_XBOX`]/[`ZONE_DS4`] tables.
+//!
+//! v7 — **every zone wears its own IDENTITY** (Victor: "I can see G is mapped
+//! to A but I can't see the A xbox button"). The vendored art is a line
+//! drawing with no letters on it, so the zone renders the control's name
+//! itself: a persona-aware glyph in the canonical colours (A green, B red,
+//! X blue, Y amber; ✕ blue, ○ red, △ green, □ pink), LB/RB/LT/RT and
+//! view/menu/guide as text chips, arrows for the dpad and the stick wedges.
+//! The bound key rides UNDER the identity as the small mono `ztag` — identity
+//! always, key tag whenever the stage is wide enough for it (a container query
+//! drops the tag on a phone; the legend still carries every key). An unbound
+//! control therefore still reads as a controller, which is the whole point.
+//!
+//! The readable truth is the bindings LEGEND below the stage: one row per
+//! function (same identity glyph + group prefix + key tag), carrying the same
+//! `data-fn` so a row click is exactly the zone click, and hover
+//! cross-highlights via the client's shared hot signal. One `createList`
+//! renders all 25 zones, another the 25 legend rows; geometry is data, not
+//! markup.
+//!
+//! # Shared keys are information, never a conflict
+//!
+//! One key driving several controls is native to the engine (`preset.rs`: "one
+//! key → many functions"; docs/INPUT-TRANSFORMS.md §1a) and is exactly what
+//! v7's multi-select flow writes. Both readers say so instead of complaining:
+//! a control whose key is also bound elsewhere in the same preset gets
+//! `z-shared`/`l-shared` (a cool-toned key tag), and its legend row carries a
+//! compact "also A · B" badge naming the co-bound controls.
 //!
 //! Zone coordinates are STAGE percentages, authored from the art's real
 //! geometry (`studio-ui/art/extents.mjs` — the PadForge lesson: derive layout
@@ -53,7 +73,7 @@ const ISLAND_COMPONENT: &str = "MapIsland";
 /// The mapper's positional `show:createShow` seam (ledger #4), document order
 /// in MapIsland.ts.
 const SHOW_SLOT_NAME: &str = "show:createShow";
-const MAP_SHOW_ORDER: [&str; 18] = [
+const MAP_SHOW_ORDER: [&str; 19] = [
     "header pill: running",
     "header pill: idle",
     "header pill: no daemon",
@@ -78,6 +98,11 @@ const MAP_SHOW_ORDER: [&str; 18] = [
     "modal: listening (countdown)",
     "modal: current binding + Clear",
     "modal: conflict (Replace / Cancel)",
+    // v7 multi-select. APPENDED, deliberately: ledger #14 — a show inserted in
+    // the middle shifts every show after it, so a new client-only overlay goes
+    // LAST in document order (it is `position: fixed`, so the DOM position
+    // costs nothing visually).
+    "selection bar: N controls selected (multi-select)",
 ];
 const MAP_SHOW_COUNT: usize = MAP_SHOW_ORDER.len();
 
@@ -85,11 +110,18 @@ const MAP_SHOW_COUNT: usize = MAP_SHOW_ORDER.len();
 // studio.css); the top band holds the shoulder chips. Zone Y values below
 // are authored as `14 + artY·0.86`.
 
-/// One hit zone: canonical function, on-art label, stage-percent box, css
-/// variant.
+/// One hit zone: canonical function, on-art identity label, identity palette,
+/// stage-percent box, css variant.
 pub(crate) struct Zone {
     pub fn_name: &'static str,
+    /// What this control is CALLED on this persona — the identity drawn on the
+    /// art ("A", "✕", "LB", "▲", "menu").
     pub label: &'static str,
+    /// Identity palette class suffix (`id-<idk>` in studio.css): the Xbox face
+    /// colours `xa`/`xb`/`xx`/`xy`, the Sony glyphs `pc`/`po`/`pt`/`psq`,
+    /// `dir` (dpad + stick arrows), `hub` (L3/R3), `txt` (view/menu/guide,
+    /// share/options/PS), `sh` (shoulders).
+    pub idk: &'static str,
     /// Center, stage percent.
     pub cx: f32,
     pub cy: f32,
@@ -99,22 +131,23 @@ pub(crate) struct Zone {
     pub kind: &'static str,
 }
 
+/// `rect` is the stage-percent box as `[cx, cy, w, h]` — one argument so the
+/// tables below read as columns, and so geometry stays a unit.
 const fn zone(
     fn_name: &'static str,
     label: &'static str,
-    cx: f32,
-    cy: f32,
-    w: f32,
-    h: f32,
+    idk: &'static str,
+    rect: [f32; 4],
     kind: &'static str,
 ) -> Zone {
     Zone {
         fn_name,
         label,
-        cx,
-        cy,
-        w,
-        h,
+        idk,
+        cx: rect[0],
+        cy: rect[1],
+        w: rect[2],
+        h: rect[3],
         kind,
     }
 }
@@ -132,37 +165,37 @@ pub(crate) const ZONE_XBOX: [Zone; 25] = [
     // Shoulders (not drawn in the icon art): slim chips stacked trigger-over-
     // bumper like the real pad, anchored just above the body's top plateau
     // (stage x ≈ 32..68) — .z-bumper drops a connector line onto the body.
-    zone("lt", "LT", 31.0, 4.6, 10.0, 5.2, "trigger"),
-    zone("lb", "LB", 34.0, 10.9, 11.0, 5.2, "bumper"),
-    zone("rb", "RB", 66.0, 10.9, 11.0, 5.2, "bumper"),
-    zone("rt", "RT", 69.0, 4.6, 10.0, 5.2, "trigger"),
+    zone("lt", "LT", "sh", [31.0, 4.6, 10.0, 5.2], "trigger"),
+    zone("lb", "LB", "sh", [34.0, 10.9, 11.0, 5.2], "bumper"),
+    zone("rb", "RB", "sh", [66.0, 10.9, 11.0, 5.2], "bumper"),
+    zone("rt", "RT", "sh", [69.0, 4.6, 10.0, 5.2], "trigger"),
     // Face cluster (diamond — boxes trimmed to the drawn Ø7.3×9.1 circles so
-    // the diagonal neighbours stay disjoint).
-    zone("Y", "Y", 75.2, 31.1, 7.2, 8.4, "round"),
-    zone("B", "B", 82.0, 39.6, 7.2, 8.4, "round"),
-    zone("A", "A", 75.3, 48.3, 7.2, 8.4, "round"),
-    zone("X", "X", 68.7, 39.7, 7.2, 8.4, "round"),
+    // the diagonal neighbours stay disjoint). Canonical Xbox colours.
+    zone("Y", "Y", "xy", [75.2, 31.1, 7.2, 8.4], "round"),
+    zone("B", "B", "xb", [82.0, 39.6, 7.2, 8.4], "round"),
+    zone("A", "A", "xa", [75.3, 48.3, 7.2, 8.4], "round"),
+    zone("X", "X", "xx", [68.7, 39.7, 7.2, 8.4], "round"),
     // Center cluster: guide up top, view/menu inboard below it.
-    zone("guide", "guide", 50.0, 27.0, 9.0, 11.0, "round"),
-    zone("back", "view", 44.0, 39.0, 6.5, 8.0, "chip"),
-    zone("start", "menu", 56.0, 39.0, 6.5, 8.0, "chip"),
+    zone("guide", "guide", "txt", [50.0, 27.0, 9.0, 11.0], "round"),
+    zone("back", "view", "txt", [44.0, 39.0, 6.5, 8.0], "chip"),
+    zone("start", "menu", "txt", [56.0, 39.0, 6.5, 8.0], "chip"),
     // Left stick: L3 hub + four ring wedges hugging it.
-    zone("lthumb", "L3", 24.0, 39.7, 8.0, 10.0, "round"),
-    zone("ly.max", "▲", 24.0, 31.7, 7.0, 6.0, "chip"),
-    zone("ly.min", "▼", 24.0, 47.7, 7.0, 6.0, "chip"),
-    zone("lx.min", "◀", 17.25, 39.7, 5.5, 7.0, "chip"),
-    zone("lx.max", "▶", 30.75, 39.7, 5.5, 7.0, "chip"),
+    zone("lthumb", "L3", "hub", [24.0, 39.7, 8.0, 10.0], "round"),
+    zone("ly.max", "▲", "dir", [24.0, 31.7, 7.0, 6.0], "chip"),
+    zone("ly.min", "▼", "dir", [24.0, 47.7, 7.0, 6.0], "chip"),
+    zone("lx.min", "◀", "dir", [17.25, 39.7, 5.5, 7.0], "chip"),
+    zone("lx.max", "▶", "dir", [30.75, 39.7, 5.5, 7.0], "chip"),
     // Dpad cross.
-    zone("dpad.up", "▲", 36.4, 50.6, 7.0, 9.0, "chip"),
-    zone("dpad.down", "▼", 36.4, 69.2, 7.0, 9.0, "chip"),
-    zone("dpad.left", "◀", 29.2, 59.9, 7.0, 9.0, "chip"),
-    zone("dpad.right", "▶", 43.6, 59.9, 7.0, 9.0, "chip"),
+    zone("dpad.up", "▲", "dir", [36.4, 50.6, 7.0, 9.0], "chip"),
+    zone("dpad.down", "▼", "dir", [36.4, 69.2, 7.0, 9.0], "chip"),
+    zone("dpad.left", "◀", "dir", [29.2, 59.9, 7.0, 9.0], "chip"),
+    zone("dpad.right", "▶", "dir", [43.6, 59.9, 7.0, 9.0], "chip"),
     // Right stick: R3 hub + ring wedges.
-    zone("rthumb", "R3", 62.5, 58.4, 8.0, 10.0, "round"),
-    zone("ry.max", "▲", 62.5, 50.4, 7.0, 6.0, "chip"),
-    zone("ry.min", "▼", 62.5, 66.4, 7.0, 6.0, "chip"),
-    zone("rx.min", "◀", 55.75, 58.4, 5.5, 7.0, "chip"),
-    zone("rx.max", "▶", 69.25, 58.4, 5.5, 7.0, "chip"),
+    zone("rthumb", "R3", "hub", [62.5, 58.4, 8.0, 10.0], "round"),
+    zone("ry.max", "▲", "dir", [62.5, 50.4, 7.0, 6.0], "chip"),
+    zone("ry.min", "▼", "dir", [62.5, 66.4, 7.0, 6.0], "chip"),
+    zone("rx.min", "◀", "dir", [55.75, 58.4, 5.5, 7.0], "chip"),
+    zone("rx.max", "▶", "dir", [69.25, 58.4, 5.5, 7.0], "chip"),
 ];
 
 /// DualShock 4 pad (art: `pad-ds4.svg`, viewBox 112.69×72.53; anchors:
@@ -174,37 +207,37 @@ pub(crate) const ZONE_XBOX: [Zone; 25] = [
 pub(crate) const ZONE_DS4: [Zone; 25] = [
     // Shoulders: same trigger-over-bumper stack as ZONE_XBOX, anchored on the
     // DS4 body's raised humps (stage x ≈ 19 / 81, where L1/R1 really sit).
-    zone("lt", "L2", 17.0, 4.6, 9.5, 5.2, "trigger"),
-    zone("lb", "L1", 19.5, 10.9, 10.5, 5.2, "bumper"),
-    zone("rb", "R1", 80.5, 10.9, 10.5, 5.2, "bumper"),
-    zone("rt", "R2", 83.0, 4.6, 9.5, 5.2, "trigger"),
+    zone("lt", "L2", "sh", [17.0, 4.6, 9.5, 5.2], "trigger"),
+    zone("lb", "L1", "sh", [19.5, 10.9, 10.5, 5.2], "bumper"),
+    zone("rb", "R1", "sh", [80.5, 10.9, 10.5, 5.2], "bumper"),
+    zone("rt", "R2", "sh", [83.0, 4.6, 9.5, 5.2], "trigger"),
     // Face cluster (✕○△□ mapped onto A/B/Y/X), trimmed to the Ø6.9×9.2
-    // drawn circles.
-    zone("Y", "△", 81.2, 29.2, 7.0, 9.0, "round"),
-    zone("B", "○", 88.4, 38.8, 7.0, 9.0, "round"),
-    zone("A", "✕", 81.3, 48.1, 7.0, 9.0, "round"),
-    zone("X", "□", 74.0, 38.7, 7.0, 9.0, "round"),
+    // drawn circles. Sony glyph colours.
+    zone("Y", "△", "pt", [81.2, 29.2, 7.0, 9.0], "round"),
+    zone("B", "○", "po", [88.4, 38.8, 7.0, 9.0], "round"),
+    zone("A", "✕", "pc", [81.3, 48.1, 7.0, 9.0], "round"),
+    zone("X", "□", "psq", [74.0, 38.7, 7.0, 9.0], "round"),
     // Share / PS / Options.
-    zone("back", "share", 30.0, 25.5, 7.0, 9.0, "chip"),
-    zone("start", "options", 70.0, 25.5, 7.0, 9.0, "chip"),
-    zone("guide", "PS", 50.0, 63.0, 8.0, 10.0, "round"),
+    zone("back", "share", "txt", [30.0, 25.5, 7.0, 9.0], "chip"),
+    zone("start", "options", "txt", [70.0, 25.5, 7.0, 9.0], "chip"),
+    zone("guide", "PS", "txt", [50.0, 63.0, 8.0, 10.0], "round"),
     // Left stick: L3 hub + ring wedges.
-    zone("lthumb", "L3", 33.8, 56.8, 8.0, 10.0, "round"),
-    zone("ly.max", "▲", 33.8, 48.8, 7.0, 6.0, "chip"),
-    zone("ly.min", "▼", 33.8, 64.8, 7.0, 6.0, "chip"),
-    zone("lx.min", "◀", 27.05, 56.8, 5.5, 7.0, "chip"),
-    zone("lx.max", "▶", 40.55, 56.8, 5.5, 7.0, "chip"),
+    zone("lthumb", "L3", "hub", [33.8, 56.8, 8.0, 10.0], "round"),
+    zone("ly.max", "▲", "dir", [33.8, 48.8, 7.0, 6.0], "chip"),
+    zone("ly.min", "▼", "dir", [33.8, 64.8, 7.0, 6.0], "chip"),
+    zone("lx.min", "◀", "dir", [27.05, 56.8, 5.5, 7.0], "chip"),
+    zone("lx.max", "▶", "dir", [40.55, 56.8, 5.5, 7.0], "chip"),
     // Dpad arrows.
-    zone("dpad.up", "▲", 18.5, 31.5, 5.4, 7.2, "chip"),
-    zone("dpad.down", "▼", 18.5, 46.6, 5.4, 7.2, "chip"),
-    zone("dpad.left", "◀", 12.9, 39.2, 5.4, 7.2, "chip"),
-    zone("dpad.right", "▶", 23.9, 39.2, 5.4, 7.2, "chip"),
+    zone("dpad.up", "▲", "dir", [18.5, 31.5, 5.4, 7.2], "chip"),
+    zone("dpad.down", "▼", "dir", [18.5, 46.6, 5.4, 7.2], "chip"),
+    zone("dpad.left", "◀", "dir", [12.9, 39.2, 5.4, 7.2], "chip"),
+    zone("dpad.right", "▶", "dir", [23.9, 39.2, 5.4, 7.2], "chip"),
     // Right stick: R3 hub + ring wedges.
-    zone("rthumb", "R3", 66.1, 56.8, 8.0, 10.0, "round"),
-    zone("ry.max", "▲", 66.1, 48.8, 7.0, 6.0, "chip"),
-    zone("ry.min", "▼", 66.1, 64.8, 7.0, 6.0, "chip"),
-    zone("rx.min", "◀", 59.35, 56.8, 5.5, 7.0, "chip"),
-    zone("rx.max", "▶", 72.85, 56.8, 5.5, 7.0, "chip"),
+    zone("rthumb", "R3", "hub", [66.1, 56.8, 8.0, 10.0], "round"),
+    zone("ry.max", "▲", "dir", [66.1, 48.8, 7.0, 6.0], "chip"),
+    zone("ry.min", "▼", "dir", [66.1, 64.8, 7.0, 6.0], "chip"),
+    zone("rx.min", "◀", "dir", [59.35, 56.8, 5.5, 7.0], "chip"),
+    zone("rx.max", "▶", "dir", [72.85, 56.8, 5.5, 7.0], "chip"),
 ];
 
 pub(crate) fn zones_for(persona: &str) -> &'static [Zone; 25] {
@@ -235,9 +268,63 @@ fn key_tag(slot: &MapperSlot, function: &str) -> String {
     }
 }
 
+/// How many co-bound controls a shared-key badge names before it summarizes.
+const SHARE_MAX: usize = 3;
+
+/// Mirrors MapIsland.ts `sharedLabels`: for every zone (table order), the
+/// LABELS of the other controls in this preset bound to the same key.
+///
+/// This is the whole of FEATURE 3's data model. A key bound twice is not a
+/// conflict here — the engine applies both (docs/INPUT-TRANSFORMS.md §1a) — so
+/// the page's job is to name what a key drives, not to complain about it.
+/// Unbound controls (`—`) never "share" anything.
+fn shared_labels(slot: &MapperSlot) -> Vec<Vec<String>> {
+    let zones = zones_for(&slot.persona);
+    let tags: Vec<String> = zones.iter().map(|z| key_tag(slot, z.fn_name)).collect();
+    tags.iter()
+        .enumerate()
+        .map(|(i, tag)| {
+            if tag == "—" {
+                return Vec::new();
+            }
+            zones
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i && &tags[*j] == tag)
+                .map(|(_, z)| legend_label(z))
+                .collect()
+        })
+        .collect()
+}
+
+/// "also A · B" — the legend's compact shared-key badge, capped so one key
+/// driving eight controls cannot blow the row apart. Empty = not shared (the
+/// CSS hides it through the row's `l-shared` class, never `:empty`, which
+/// cannot work on an SSR text slot).
+fn share_text(names: &[String]) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    let shown: Vec<&str> = names.iter().take(SHARE_MAX).map(String::as_str).collect();
+    let mut text = format!("also {}", shown.join(" · "));
+    if names.len() > SHARE_MAX {
+        text.push_str(&format!(" +{}", names.len() - SHARE_MAX));
+    }
+    text
+}
+
+/// The badge's tooltip — the full list, plus the key that does the driving.
+fn share_title(key: &str, names: &[String]) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    format!("{key} also drives {}", names.join(", "))
+}
+
 /// Mirrors MapIsland.ts `zoneRows`. Every derived string the client also
 /// derives; the item SHAPE is client contract. The client may append the
-/// hover class (`z-hot`) — SSR has no hover, so the server never does.
+/// hover class (`z-hot`) and the multi-select class (`z-sel`) — SSR has
+/// neither hover nor a selection, so the server never emits them.
 ///
 /// `live` is [`learnable`]: when false the zone carries `z-dead`, which is a
 /// VISIBLY disabled look (dimmed, `cursor: not-allowed`) and deliberately NOT
@@ -245,20 +332,29 @@ fn key_tag(slot: &MapperSlot, function: &str) -> String {
 /// click on a control that cannot be learned must still say why (FIX 1: never
 /// a no-op).
 fn zone_rows(slot: &MapperSlot, live: bool) -> SlotValue {
+    let shared = shared_labels(slot);
     SlotValue::Array(
         zones_for(&slot.persona)
             .iter()
-            .map(|z| {
+            .zip(shared)
+            .map(|(z, share)| {
                 let key = key_tag(slot, z.fn_name);
                 // z-unbound hides the tag pill via CSS (`:empty` cannot: the
                 // SSR text slot leaves marker nodes inside the span).
                 let unbound = if key == "—" { " z-unbound" } else { "" };
                 let dead = if live { "" } else { " z-dead" };
+                let shared_cls = if share.is_empty() { "" } else { " z-shared" };
                 SlotValue::Object(vec![
                     ("fn".to_owned(), SlotValue::Text(z.fn_name.to_owned())),
                     (
                         "cls".to_owned(),
-                        SlotValue::Text(format!("zone z-{}{unbound}{dead}", z.kind)),
+                        SlotValue::Text(format!("zone z-{}{unbound}{dead}{shared_cls}", z.kind)),
+                    ),
+                    // FEATURE 1: the control's own name, drawn on the art.
+                    ("id".to_owned(), SlotValue::Text(z.label.to_owned())),
+                    (
+                        "idcls".to_owned(),
+                        SlotValue::Text(format!("zid id-{}", z.idk)),
                     ),
                     (
                         "style".to_owned(),
@@ -272,7 +368,11 @@ fn zone_rows(slot: &MapperSlot, live: bool) -> SlotValue {
                     ),
                     (
                         "title".to_owned(),
-                        SlotValue::Text(format!("{} — {}", z.fn_name, key)),
+                        SlotValue::Text(if share.is_empty() {
+                            format!("{} — {}", z.fn_name, key)
+                        } else {
+                            format!("{} — {} ({})", z.fn_name, key, share_title(&key, &share))
+                        }),
                     ),
                     (
                         "tag".to_owned(),
@@ -284,11 +384,11 @@ fn zone_rows(slot: &MapperSlot, live: bool) -> SlotValue {
     )
 }
 
-/// Mirrors MapIsland.ts `legendLabel`: the stick/dpad glyph groups need a
+/// Mirrors MapIsland.ts `legendGroup`: the stick/dpad glyph groups need a
 /// prefix to stay unambiguous in a flat list ("LS ▲" vs "D-pad ▲"); every
-/// other control keeps its persona-aware on-art label (A vs ✕).
-fn legend_label(z: &Zone) -> String {
-    let group = if z.fn_name.starts_with("lx.") || z.fn_name.starts_with("ly.") {
+/// other control is named by its identity alone (A vs ✕).
+fn legend_group(z: &Zone) -> &'static str {
+    if z.fn_name.starts_with("lx.") || z.fn_name.starts_with("ly.") {
         "LS "
     } else if z.fn_name.starts_with("rx.") || z.fn_name.starts_with("ry.") {
         "RS "
@@ -296,19 +396,30 @@ fn legend_label(z: &Zone) -> String {
         "D-pad "
     } else {
         ""
-    };
-    format!("{group}{}", z.label)
+    }
+}
+
+/// Group + identity as one string — the row's tooltip/aria text and what a
+/// shared-key badge calls a co-bound control.
+fn legend_label(z: &Zone) -> String {
+    format!("{}{}", legend_group(z), z.label)
 }
 
 /// Mirrors MapIsland.ts `legendRowsFor`: the bindings legend below the
 /// stage — one row per mappable function, unbound rendered as the honest
 /// "—" with the `l-unbound` class. Same client-may-append-hover rule as
-/// [`zone_rows`] (`l-hot`).
+/// [`zone_rows`] (`l-hot`, `l-sel`).
+///
+/// v7: the row leads with the same identity glyph the art now wears (so the
+/// two readers are visibly the same control) and ends with the shared-key
+/// badge — FEATURE 3's "P also drives A · B", stated as information.
 fn legend_rows(slot: &MapperSlot, live: bool) -> SlotValue {
+    let shared = shared_labels(slot);
     SlotValue::Array(
         zones_for(&slot.persona)
             .iter()
-            .map(|z| {
+            .zip(shared)
+            .map(|(z, share)| {
                 let key = key_tag(slot, z.fn_name);
                 let unbound = key == "—";
                 let mut cls = String::from("lrow");
@@ -318,11 +429,28 @@ fn legend_rows(slot: &MapperSlot, live: bool) -> SlotValue {
                 if !live {
                     cls.push_str(" l-dead");
                 }
+                if !share.is_empty() {
+                    cls.push_str(" l-shared");
+                }
                 SlotValue::Object(vec![
                     ("fn".to_owned(), SlotValue::Text(z.fn_name.to_owned())),
                     ("label".to_owned(), SlotValue::Text(legend_label(z))),
+                    ("id".to_owned(), SlotValue::Text(z.label.to_owned())),
+                    (
+                        "idcls".to_owned(),
+                        SlotValue::Text(format!("lid id-{}", z.idk)),
+                    ),
+                    (
+                        "group".to_owned(),
+                        SlotValue::Text(legend_group(z).to_owned()),
+                    ),
                     ("key".to_owned(), SlotValue::Text(key.clone())),
                     ("cls".to_owned(), SlotValue::Text(cls)),
+                    ("share".to_owned(), SlotValue::Text(share_text(&share))),
+                    (
+                        "sharetitle".to_owned(),
+                        SlotValue::Text(share_title(&key, &share)),
+                    ),
                     (
                         "title".to_owned(),
                         SlotValue::Text(format!("{} — {}", z.fn_name, key)),
@@ -428,6 +556,12 @@ fn backup_line(selected: Option<&MapperSlot>) -> String {
     }
 }
 
+/// The multi-select toggle's resting class/label. Mirrored in MapIsland.ts,
+/// which flips them to `… on` / "Selecting — tap controls" while the mode is
+/// live (a class string, never a show — ledger #13).
+const SEL_TOGGLE_OFF: &str = "btn btn-row seltoggle";
+const SEL_TOGGLE_LABEL_OFF: &str = "Select multiple";
+
 fn scalar_slots(payload: &MapPayload, selected: Option<&MapperSlot>) -> serde_json::Value {
     let slot_line = match selected {
         Some(s) => format!("P{} · {} · {}", s.number, s.persona_label, s.preset),
@@ -454,6 +588,13 @@ fn scalar_slots(payload: &MapPayload, selected: Option<&MapperSlot>) -> serde_js
         // Empty on SSR — the page has not written anything yet.
         "savedAt": "",
         "generatedAt": payload.mapper.generated_at,
+        // FEATURE 2's multi-select is a JS enhancement: SSR always paints the
+        // toggle OFF and no selection. (`.seltoggle` is hidden until map.ts
+        // marks the island `.js`, so a no-JS page keeps exactly the v6
+        // single-click-to-learn behaviour instead of growing a dead button.)
+        "selToggleCls": SEL_TOGGLE_OFF,
+        "selToggleLabel": SEL_TOGGLE_LABEL_OFF,
+        "selCountLine": "",
         // The preset-actions card: a class string, never a show (ledger #13
         // — its bindings must survive; the off look is just a class).
         "actionsCls": if payload.session.reachable {
@@ -487,6 +628,7 @@ fn show_values(payload: &MapPayload, selected: Option<&MapperSlot>) -> [bool; MA
         false,
         false,
         false,
+        false, // the multi-select bar: client-only, nothing is selected on SSR
     ]
 }
 
@@ -614,6 +756,17 @@ mod tests {
 
     fn page() -> EmbeddedPage {
         EmbeddedPage::load("/map").expect("embedded mapper page must load")
+    }
+
+    /// The injected text inside the FIRST element carrying `class="<cls>"`.
+    /// SSR wraps every slot value in `<!--f:tN-->…<!--/f:tN-->` markers, so
+    /// "this class holds that glyph" cannot be asserted as one substring.
+    fn text_in(html: &str, cls: &str) -> Option<String> {
+        let start = html.find(&format!("class=\"{cls}\">"))?;
+        let rest = &html[start..];
+        let open = rest.find("-->")? + 3;
+        let end = rest[open..].find("<!--")? + open;
+        Some(rest[open..end].to_owned())
     }
 
     /// Both tables cover exactly the 25 mappable functions, once each — a
@@ -745,7 +898,7 @@ mod tests {
     /// zones are positioned by the table, the right art is referenced, and
     /// the slot strip shows the context.
     #[test]
-    fn render_puts_bindings_in_the_legend_and_text_free_zones_on_stage() {
+    fn render_puts_bindings_in_the_legend_and_on_the_zones() {
         let out = render_map(&page(), &sample());
         assert!(out.html.contains("data-forma-ssr"), "{}", out.html);
         // Slot context strip.
@@ -772,6 +925,20 @@ mod tests {
         );
         assert!(!out.html.contains("zlabel"), "zone inline label came back");
         assert!(!out.html.contains("zkey"), "zone inline key tag came back");
+        // v7: the multi-select toggle ships in the controller card's header
+        // (CSS keeps it hidden until map.ts marks the island `.js`), and
+        // nothing is selected on an SSR paint.
+        assert!(
+            out.html.contains(r#"data-act="multi-toggle""#),
+            "{}",
+            out.html
+        );
+        assert!(out.html.contains("Select multiple"), "{}", out.html);
+        assert!(
+            !out.html.contains("controls selected"),
+            "the selection bar must never SSR: {}",
+            out.html
+        );
         // The preset-actions card: save semantics + both safety nets, live
         // (the daemon is reachable in the sample).
         assert!(
@@ -832,14 +999,154 @@ mod tests {
         assert!(out.html.contains(">G<"), "A's key tag: {}", out.html);
         assert!(out.html.contains(">F<"), "B's key tag: {}", out.html);
         assert!(out.html.contains(">M<"), "lx.min's key tag: {}", out.html);
-        // Persona-aware, disambiguated legend labels.
-        assert!(out.html.contains("LS ▲"), "{}", out.html);
-        assert!(out.html.contains("D-pad ◀"), "{}", out.html);
+        // Persona-aware, disambiguated legend labels: the glyph is its own
+        // styled span now, the group prefix sits beside it.
+        assert!(out.html.contains(">LS <"), "{}", out.html);
+        assert!(out.html.contains(">D-pad <"), "{}", out.html);
+        assert_eq!(
+            text_in(&out.html, "lid id-dir").as_deref(),
+            Some("▲"),
+            "the legend leads with the same identity glyph: {}",
+            out.html
+        );
         // A cleared function renders the honest unbound row.
         assert!(out.html.contains("lrow l-unbound"), "{}", out.html);
         // Live mode: the hint renders, the read-only banner does not.
         assert!(out.html.contains("press the panel key"), "{}", out.html);
         assert!(!out.html.contains("read-only"), "{}", out.html);
+    }
+
+    /// FEATURE 1, Xbox. The vendored art is a line drawing with no letters on
+    /// it, so every zone must say what it IS — in the canonical colours, and
+    /// whether or not anything is bound to it. Victor: "I can see G is mapped
+    /// to A but I can't see the A xbox button".
+    #[test]
+    fn every_xbox_zone_wears_its_identity_in_the_canonical_palette() {
+        let out = render_map(&page(), &sample());
+        for (idk, glyph) in [("xa", "A"), ("xb", "B"), ("xx", "X"), ("xy", "Y")] {
+            assert_eq!(
+                text_in(&out.html, &format!("zid id-{idk}")).as_deref(),
+                Some(glyph),
+                "face button {glyph} lost its identity glyph: {}",
+                out.html
+            );
+        }
+        // Shoulders are DATA now, not CSS `content` keyed off the stage class.
+        for label in ["LT", "LB", "RB", "RT"] {
+            assert!(
+                out.html.contains(&format!(">{label}<")),
+                "{label}: {}",
+                out.html
+            );
+        }
+        assert_eq!(
+            text_in(&out.html, "zid id-sh").as_deref(),
+            Some("LT"),
+            "{}",
+            out.html
+        );
+        // Center cluster + sticks + dpad.
+        assert!(out.html.contains(">view<"), "{}", out.html);
+        assert!(out.html.contains(">menu<"), "{}", out.html);
+        assert!(out.html.contains(">guide<"), "{}", out.html);
+        assert_eq!(
+            text_in(&out.html, "zid id-hub").as_deref(),
+            Some("L3"),
+            "{}",
+            out.html
+        );
+        assert_eq!(
+            text_in(&out.html, "zid id-dir").as_deref(),
+            Some("▲"),
+            "{}",
+            out.html
+        );
+        // The point of the exercise: an UNBOUND control still reads as a
+        // control. `start` is cleared in the sample — identity present, tag
+        // empty.
+        assert!(
+            out.html.contains(r#"class="zone z-chip z-unbound""#),
+            "{}",
+            out.html
+        );
+    }
+
+    /// FEATURE 1, PlayStation: the Sony glyphs in the Sony hues, and the
+    /// shoulders named L1/L2 rather than LB/LT.
+    #[test]
+    fn every_playstation_zone_wears_the_sony_glyphs() {
+        let mut payload = sample();
+        payload.selected = 3;
+        let out = render_map(&page(), &payload);
+        for (idk, glyph) in [("pc", "✕"), ("po", "○"), ("pt", "△"), ("psq", "□")] {
+            assert_eq!(
+                text_in(&out.html, &format!("zid id-{idk}")).as_deref(),
+                Some(glyph),
+                "Sony glyph {glyph} missing: {}",
+                out.html
+            );
+        }
+        for label in ["L1", "L2", "R1", "R2"] {
+            assert!(
+                out.html.contains(&format!(">{label}<")),
+                "{label}: {}",
+                out.html
+            );
+        }
+        assert!(out.html.contains(">share<"), "{}", out.html);
+        assert!(out.html.contains(">PS<"), "{}", out.html);
+        // …and no Xbox letters anywhere on a PlayStation slot.
+        assert!(!out.html.contains(r#"id-xa"#), "{}", out.html);
+    }
+
+    /// FEATURE 3. One key driving several controls is native to the engine
+    /// (docs/INPUT-TRANSFORMS.md §1a), so both readers report it as a GROUP,
+    /// never as a conflict: the zone tag turns cool-toned, the legend row
+    /// carries "also …", and every co-bound control names its partners.
+    #[test]
+    fn a_key_bound_twice_reads_as_a_group_not_a_conflict() {
+        let mut payload = sample();
+        // A and B and rt all on G — Victor's "one key, three controls".
+        payload.mapper.slots[0]
+            .bindings
+            .insert("B".into(), vec!["G".into()]);
+        payload.mapper.slots[0]
+            .bindings
+            .insert("rt".into(), vec!["G".into()]);
+        let out = render_map(&page(), &payload);
+        assert!(out.html.contains("z-shared"), "{}", out.html);
+        assert!(out.html.contains("l-shared"), "{}", out.html);
+        // Every co-bound control names its partners, in ZONE-TABLE order (the
+        // pad's own reading order, not the order they were bound).
+        assert!(out.html.contains(">also RT · B<"), "A's row: {}", out.html);
+        assert!(out.html.contains(">also RT · A<"), "B's row: {}", out.html);
+        assert!(out.html.contains(">also B · A<"), "RT's row: {}", out.html);
+        assert!(
+            out.html.contains(r#"title="G also drives RT, B""#),
+            "{}",
+            out.html
+        );
+        // Nothing about it is styled or worded as an error.
+        assert!(!out.html.contains("conflict"), "{}", out.html);
+        // A control bound to a key nobody else uses stays plain.
+        assert!(
+            !out.html.contains(">also LS ◀<"),
+            "lx.min is not shared: {}",
+            out.html
+        );
+    }
+
+    /// The badge summarizes instead of growing without bound.
+    #[test]
+    fn a_key_on_many_controls_summarizes_the_tail() {
+        let names: Vec<String> = ["A", "B", "X", "Y", "RT"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(share_text(&names[..1]), "also A");
+        assert_eq!(share_text(&names), "also A · B · X +2");
+        assert_eq!(share_text(&[]), "");
+        assert_eq!(share_title("G", &names[..2]), "G also drives A, B");
     }
 
     /// `?slot=3` selects the PlayStation slot: DS4 art, Sony labels.

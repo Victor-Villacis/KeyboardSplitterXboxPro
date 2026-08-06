@@ -33,6 +33,10 @@ export function MapPage() {
   // Auto-save made visible; empty until this page has written something.
   const [savedAt] = createSignal("");
   const [generatedAt] = createSignal("(no snapshot)");
+  // v7 multi-select (a JS enhancement — SSR always paints it off).
+  const [selToggleCls] = createSignal("btn btn-row seltoggle");
+  const [selToggleLabel] = createSignal("Select multiple");
+  const [selCountLine] = createSignal("");
   // The preset-actions card renders inert until a payload proves the daemon
   // reachable (a class string, not a show — ledger #13).
   const [actionsCls] = createSignal("card pactions off");
@@ -57,6 +61,9 @@ export function MapPage() {
   const [modalListening] = createSignal(false);
   const [modalBound] = createSignal(false);
   const [modalConflict] = createSignal(false);
+  // Appended LAST, deliberately: a show inserted mid-document shifts every
+  // show after it (ledger #14). See render_map.rs MAP_SHOW_ORDER.
+  const [selBar] = createSignal(false);
 
   return MapIsland();
 }

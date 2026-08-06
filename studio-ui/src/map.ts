@@ -18,11 +18,14 @@ import {
   applyMapUnreachable,
   blockedReason,
   clearPaused,
+  clearSelection,
   closeModal,
   currentBinding,
   currentPreset,
   currentSlot,
   flashSaved,
+  identityLabel,
+  isMultiMode,
   isPaused,
   learnAllowed,
   liveProfile,
@@ -33,9 +36,13 @@ import {
   selectFn,
   selectSlot,
   selectedFnName,
+  selectedFns,
+  selectionCount,
   setHot,
+  setMultiMode,
   showConflict,
   showListening,
+  toggleSelected,
   updateCountdown,
   type BindOutcome,
   type LearnView,
@@ -91,15 +98,46 @@ async function verb(path: string, body?: Json): Promise<VerbOutcome> {
 // click zone → POST /api/learn/start → poll GET /api/learn until hit /
 // timeout / cancelled → on hit POST /api/bind (conflict → Replace re-POSTs
 // with force) → flash the outcome → immediate /api/map refresh.
+//
+// v7: the same flow serves ONE control or MANY. A multi-select arm captures a
+// single key press and writes it to every selected control — N ordinary `map`
+// calls, which is all a multi-bind is (docs/INPUT-TRANSFORMS.md §1a).
 
-let learningFn: string | null = null;
+/** What the armed learn will write to. Empty = nothing armed, one entry = the
+ *  single rebind, several = "map all to one key". */
+let learnTargets: string[] = [];
+/** Supersede guard. The single-fn flow could compare `learningFn` by value;
+ *  a list cannot, so every arm bumps a generation and late polls check it. */
+let learnGen = 0;
 let learnTimer: number | undefined;
 /** The hit waiting on the conflict dialog's verdict. */
 let pendingKey: string | null = null;
 
+function learning(): boolean {
+  return learnTargets.length > 0;
+}
+
 function prompt(fn: string): string {
   const slot = currentSlot();
   return slot ? `Press the panel key for P${slot.number} · ${fn}` : `Press the panel key for ${fn}`;
+}
+
+/** "both" / "all three" / "all 12" — the multi prompt says what the press will
+ *  DO, in words, before it happens. */
+function allOf(n: number): string {
+  const words = ["", "", "both", "all three", "all four", "all five", "all six"];
+  return words[n] ?? `all ${n}`;
+}
+
+/** FEATURE 2's prompt: names every selected control by its identity on THIS
+ *  persona, and states the outcome plainly (MAPPER-UX commandment 6). */
+function multiPrompt(fns: string[]): string {
+  const slot = currentSlot();
+  const who = slot ? `P${slot.number} · ` : "";
+  return (
+    `Press the panel key for ${who}${fns.map(identityLabel).join(", ")}` +
+    ` — one key will drive ${allOf(fns.length)}.`
+  );
 }
 
 function stopLearnTimer(): void {
@@ -120,7 +158,7 @@ function stopLearnTimer(): void {
 // Escape is never swallowed (it cancels); Delete/Backspace are not swallowed
 // either — they are the modal's Clear accelerator, handled below.
 function guardKeys(ev: KeyboardEvent): void {
-  if (learningFn === null) return;
+  if (!learning()) return;
   if (ev.key === "Escape" || ev.key === "Delete" || ev.key === "Backspace") return;
   ev.preventDefault();
   ev.stopPropagation();
@@ -138,42 +176,49 @@ function disarmFocusGuard(): void {
   window.removeEventListener("keypress", guardKeys, true);
 }
 
-async function startLearn(fn: string): Promise<void> {
+async function startLearn(fns: string[]): Promise<void> {
+  if (fns.length === 0) return;
   // PadForge convention: clicking the control being recorded cancels it.
-  if (learningFn === fn) {
+  if (learnTargets.length === 1 && fns.length === 1 && learnTargets[0] === fns[0]) {
     await cancelLearn();
     return;
   }
-  learningFn = fn;
+  learnTargets = fns;
+  const gen = ++learnGen;
   pendingKey = null;
-  selectFn(fn);
+  selectFn(fns[0]);
   armFocusGuard();
   try {
     const started = await fetchJSON<LearnView>("/api/learn/start", { method: "POST" });
+    if (learnGen !== gen) return; // superseded while the POST was in flight
     if (started.state !== "listening") {
-      learningFn = null;
+      learnTargets = [];
       disarmFocusGuard();
       flashSaved(`error: ${started.error ?? `learn refused (${started.state})`}`, true);
       return;
     }
+    const single = fns.length === 1;
     showListening(
-      prompt(fn),
-      currentBinding(fn),
+      single ? prompt(fns[0]) : multiPrompt(fns),
+      // "currently X" + Clear only makes sense for one control; a multi arm
+      // has N current bindings and its own Clear lives in the selection bar.
+      single ? currentBinding(fns[0]) : null,
       started.remaining_ms ?? LEARN_TOTAL_MS,
       LEARN_TOTAL_MS,
     );
     stopLearnTimer();
     learnTimer = window.setInterval(() => void pollLearn(), LEARN_POLL_MS);
   } catch {
-    learningFn = null;
+    learnTargets = [];
     disarmFocusGuard();
     flashSaved("error: request failed — is ksx studio still running?", true);
   }
 }
 
 async function pollLearn(): Promise<void> {
-  const fn = learningFn;
-  if (fn === null) {
+  const targets = learnTargets;
+  const gen = learnGen;
+  if (targets.length === 0) {
     stopLearnTimer();
     return;
   }
@@ -183,37 +228,39 @@ async function pollLearn(): Promise<void> {
   } catch {
     return; // transient — keep the countdown running on the last known value
   }
-  if (learningFn !== fn) return; // superseded meanwhile
+  if (learnGen !== gen) return; // superseded meanwhile
+  const names = targets.map(identityLabel).join(", ");
   switch (learn.state) {
     case "listening":
       updateCountdown(learn.remaining_ms ?? 0, LEARN_TOTAL_MS);
       break;
     case "hit":
       stopLearnTimer();
-      learningFn = null;
+      learnTargets = [];
       disarmFocusGuard();
       closeModal();
       if (learn.key) {
-        await saveBinding(fn, learn.key, false);
+        if (targets.length === 1) await saveBinding(targets[0], learn.key, false);
+        else await mapAll(targets, learn.key);
       }
       break;
     case "timeout":
       stopLearnTimer();
-      learningFn = null;
+      learnTargets = [];
       disarmFocusGuard();
       closeModal();
-      flashSaved(`timed out — no key pressed within 10 s for ${fn}`, true);
+      flashSaved(`timed out — no key pressed within 10 s for ${names}`, true);
       break;
     case "cancelled":
       stopLearnTimer();
-      learningFn = null;
+      learnTargets = [];
       disarmFocusGuard();
       closeModal();
       break;
     default:
       // failed / unavailable / idle-after-restart: report and stop.
       stopLearnTimer();
-      learningFn = null;
+      learnTargets = [];
       disarmFocusGuard();
       closeModal();
       flashSaved(`error: ${learn.error ?? `learn ${learn.state}`}`, true);
@@ -223,7 +270,8 @@ async function pollLearn(): Promise<void> {
 
 async function cancelLearn(): Promise<void> {
   stopLearnTimer();
-  learningFn = null;
+  learnTargets = [];
+  learnGen += 1;
   pendingKey = null;
   disarmFocusGuard();
   closeModal();
@@ -234,17 +282,20 @@ async function cancelLearn(): Promise<void> {
   }
 }
 
-/** Write one binding — `key: null` CLEARS it (the `ksx map --clear` verb, same
- *  writer, no GUI-only path). */
-async function saveBinding(fn: string, key: string | null, force: boolean): Promise<void> {
-  const slot = currentSlot();
-  if (!slot) return;
+/** One `map` write. Transport failure is folded into the same shape so no
+ *  caller can forget it — the multi-write loop below depends on that. */
+async function bindOnce(
+  preset: string,
+  fn: string,
+  key: string | null,
+  force: boolean,
+): Promise<BindOutcome> {
   try {
-    const outcome = await fetchJSON<BindOutcome>("/api/bind", {
+    return await fetchJSON<BindOutcome>("/api/bind", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        preset: slot.preset,
+        preset,
         function: fn,
         key,
         force,
@@ -253,37 +304,148 @@ async function saveBinding(fn: string, key: string | null, force: boolean): Prom
         reload: true,
       }),
     });
-    if (outcome.ok) {
-      closeModal();
-      pendingKey = null;
-      markSaved();
-      let line = outcome.message ?? (key === null ? `${fn} cleared` : `${fn} = ${key}`);
-      if (isPaused()) line += " — Resume emulation when you're done";
-      flashSaved(line, false);
-    } else if (outcome.code === "conflict") {
-      // The caller decides (the PadForge gap this closes): show what owns
-      // the key, offer Replace / Cancel.
-      pendingKey = key;
-      const lines = outcome.conflicts.map((c) =>
-        c.scope === "preset"
-          ? `${key} is already this preset's ${c.function}`
-          : `${key} is "${c.preset}"'s ${c.function}` +
-            (c.profile ? ` (slot ${c.slot} of "${c.profile}")` : ""),
-      );
-      showConflict(
-        prompt(fn).replace("Press the panel key for", "Bind") + ` = ${key}?`,
-        lines.join("; ") +
-          " — Replace binds it here anyway (same-preset conflicts are stolen; other presets are never edited).",
-      );
-    } else {
-      closeModal();
-      flashSaved(`error: ${outcome.error ?? "the daemon refused the write"}`, true);
-    }
   } catch {
+    return {
+      ok: false,
+      message: null,
+      error: "bind request failed — is ksx studio still running?",
+      code: null,
+      conflicts: [],
+      reloaded: false,
+    };
+  }
+}
+
+/** Write one binding — `key: null` CLEARS it (the `ksx map --clear` verb, same
+ *  writer, no GUI-only path). */
+async function saveBinding(fn: string, key: string | null, force: boolean): Promise<void> {
+  const slot = currentSlot();
+  if (!slot) return;
+  const outcome = await bindOnce(slot.preset, fn, key, force);
+  if (outcome.ok) {
     closeModal();
-    flashSaved("error: bind request failed — is ksx studio still running?", true);
+    pendingKey = null;
+    markSaved();
+    let line = outcome.message ?? (key === null ? `${fn} cleared` : `${fn} = ${key}`);
+    if (isPaused()) line += " — Resume emulation when you're done";
+    flashSaved(line, false);
+  } else if (outcome.code === "conflict" && outcome.conflicts.length > 0) {
+    // FEATURE 3. A key already used by ANOTHER CONTROL IN THIS PRESET is a
+    // multi-bind, not an error: the engine compiles one key to several targets
+    // and applies them all (docs/INPUT-TRANSFORMS.md §1a). So no dialog, no
+    // "Replace" — write it and let the flash carry the daemon's own sentence.
+    // The legend's "also …" badges then re-derive from disk on the next poll,
+    // so the page shows what actually happened rather than what we assumed.
+    if (outcome.conflicts.every((c) => c.scope === "preset")) {
+      await saveBinding(fn, key, true);
+      return;
+    }
+    // Cross-slot (another preset in a profile that uses this one) stays as it
+    // was: informational, the caller decides. Fan-out is the product.
+    pendingKey = key;
+    const lines = outcome.conflicts.map((c) =>
+      c.scope === "preset"
+        ? `${key} also drives this preset's ${c.function}`
+        : `${key} is "${c.preset}"'s ${c.function}` +
+          (c.profile ? ` (slot ${c.slot} of "${c.profile}")` : ""),
+    );
+    showConflict(
+      prompt(fn).replace("Press the panel key for", "Bind") + ` = ${key}?`,
+      lines.join("; ") +
+        " — Replace binds it here anyway (other presets are never edited).",
+    );
+  } else {
+    closeModal();
+    flashSaved(`error: ${outcome.error ?? "the daemon refused the write"}`, true);
   }
   void poll(); // zone tags refresh from disk truth
+}
+
+/** FEATURE 2's write: the captured key goes to EVERY selected control as N
+ *  ordinary `map` calls — which is exactly what a multi-bind is in the preset
+ *  file (`A = "P"`, `B = "P"`, `rt = "P"`). `force` is set because the second
+ *  and later writes see the first as a same-preset "conflict", which here is
+ *  the intent. Sequential on purpose: the writer is one file, and a partial
+ *  result must be reportable control by control. */
+async function mapAll(fns: string[], key: string): Promise<void> {
+  const slot = currentSlot();
+  if (!slot) return;
+  flashSaved(`binding ${fns.length} controls to ${key}…`, false);
+  const refused: string[] = [];
+  for (const fn of fns) {
+    const outcome = await bindOnce(slot.preset, fn, key, true);
+    if (!outcome.ok) {
+      refused.push(`${identityLabel(fn)} (${outcome.error ?? outcome.code ?? "refused"})`);
+    }
+  }
+  // Report from the FILE, not from the requests. A daemon whose `map` verb
+  // still MOVES a key rather than sharing it (mapping.rs: "same-preset
+  // conflicts are stolen") will accept all N writes and leave only the last
+  // one bound — so claiming "one key now drives all three" off the outcomes
+  // would be exactly the silent-wipe lie MAPPER-UX commandment 7 forbids.
+  // One extra poll, and the sentence is whatever the preset really says.
+  await poll();
+  const kept = fns.filter((fn) => currentBinding(fn) === key);
+  const lost = fns.filter((fn) => currentBinding(fn) !== key);
+  if (kept.length > 0) markSaved();
+
+  let line: string;
+  let bad = refused.length > 0;
+  if (kept.length === fns.length) {
+    line = `${key} now drives ${kept.map(identityLabel).join(" · ")}`;
+    if (isPaused()) line += " — Resume emulation when you're done";
+  } else if (kept.length > 0 && refused.length === 0) {
+    // Every write was accepted and they still did not stack: this daemon
+    // moves the key instead of sharing it. Name the mechanism, not a shrug.
+    bad = true;
+    line =
+      `${key} ended up on ${kept.map(identityLabel).join(" · ")} only — ` +
+      `${lost.map(identityLabel).join(" · ")} did not keep it. This daemon's ` +
+      "map verb still MOVES a key between controls instead of letting one key " +
+      "drive several; the legend below shows what is really in the preset.";
+  } else {
+    bad = true;
+    line =
+      kept.length > 0
+        ? `${key} drives ${kept.map(identityLabel).join(" · ")}`
+        : `nothing was bound to ${key}`;
+  }
+  if (refused.length > 0) line += ` — REFUSED: ${refused.join("; ")}`;
+  flashSaved(line, bad);
+  clearSelection();
+}
+
+/** Clear every selected control in one action (the selection bar's second
+ *  button). Confirms first — this is N destructive writes, and MAPPER-UX
+ *  commandment 5 says a whole-group write states what it will do. */
+async function clearSelectedBindings(): Promise<void> {
+  const fns = selectedFns();
+  if (fns.length === 0) return;
+  if (!learnAllowed()) {
+    refuseSelection();
+    return;
+  }
+  const names = fns.map(identityLabel).join(", ");
+  const question =
+    `Clear the binding on ${fns.length} control${fns.length === 1 ? "" : "s"}?\n\n` +
+    `${names}\n\n` +
+    "They stay listed and unbound; nothing else in the preset is touched.";
+  if (!window.confirm(question)) return;
+  const slot = currentSlot();
+  if (!slot) return;
+  const done: string[] = [];
+  const failed: string[] = [];
+  for (const fn of fns) {
+    const outcome = await bindOnce(slot.preset, fn, null, false);
+    if (outcome.ok) done.push(identityLabel(fn));
+    else failed.push(`${identityLabel(fn)} (${outcome.error ?? outcome.code ?? "refused"})`);
+  }
+  if (done.length > 0) markSaved();
+  let line = done.length > 0 ? `cleared ${done.join(" · ")}` : "nothing was cleared";
+  if (failed.length > 0) line += ` — FAILED: ${failed.join("; ")}`;
+  flashSaved(line, failed.length > 0);
+  clearSelection();
+  void poll();
 }
 
 /** Clear one control. Reached three ways — the modal's button, the legend's
@@ -293,7 +455,7 @@ async function clearBinding(fn: string): Promise<void> {
     refuse(fn);
     return;
   }
-  if (learningFn !== null) await cancelLearn();
+  if (learning()) await cancelLearn();
   await saveBinding(fn, null, false);
 }
 
@@ -307,6 +469,14 @@ function refuse(fn: string): void {
     ? `ksx map --preset "${slot.preset}" --function ${fn} --key <KEY>`
     : `ksx map --preset <NAME> --function ${fn} --key <KEY>`;
   flashSaved(`can't learn ${fn} — ${reason}. From a shell: ${cli}`, true);
+}
+
+/** The same answer for an action that is about a SELECTION, not one control. */
+function refuseSelection(): void {
+  flashSaved(
+    `can't map right now — ${blockedReason() ?? "mapping is unavailable"}`,
+    true,
+  );
 }
 
 // ── FIX 0: pause / resume, so the refusal is one click, not a dead end ─────
@@ -404,6 +574,11 @@ async function clearAll(): Promise<void> {
 // ── Wiring: delegated events on the island root ────────────────────────────
 
 function wire(root: HTMLElement): void {
+  // Multi-select is a JS enhancement: the "Select multiple" toggle stays
+  // hidden until this class exists, so a no-JS page never shows a control that
+  // cannot do anything (the whole page's standing rule — FIX 1).
+  root.classList.add("js");
+
   root.addEventListener("click", (ev) => {
     const target = ev.target as HTMLElement | null;
     if (!target) return;
@@ -444,6 +619,35 @@ function wire(root: HTMLElement): void {
       void clearAll();
       return;
     }
+    // ── FEATURE 2: multi-select ──────────────────────────────────────────
+    if (act === "multi-toggle") {
+      if (!learnAllowed()) {
+        refuseSelection();
+        return;
+      }
+      setMultiMode(!isMultiMode());
+      return;
+    }
+    if (act === "map-selected") {
+      const fns = selectedFns();
+      if (fns.length === 0) return;
+      if (!learnAllowed()) {
+        refuseSelection();
+        return;
+      }
+      void startLearn(fns);
+      return;
+    }
+    if (act === "clear-selected") {
+      void clearSelectedBindings();
+      return;
+    }
+    if (act === "cancel-select") {
+      // One exit for both entry points: drop the selection AND leave the
+      // touch mode, so "Cancel" never leaves taps still selecting.
+      setMultiMode(false);
+      return;
+    }
     if (act === "restore-defaults" || act === "restore-backup" || act === "restore-latest") {
       const mode: RestoreMode =
         act === "restore-defaults"
@@ -471,8 +675,24 @@ function wire(root: HTMLElement): void {
     const zone = target.closest<HTMLElement>("[data-fn]");
     if (zone?.dataset.fn) {
       const fn = zone.dataset.fn;
+      // Victor's file-explorer analogy: Ctrl/Shift/⌘-click ADDS to a
+      // selection — and on touch, where no modifier exists, the header's
+      // "Select multiple" toggle makes every plain tap do the same.
+      const additive = ev.ctrlKey || ev.metaKey || ev.shiftKey || isMultiMode();
+      if (additive) {
+        ev.preventDefault();
+        if (!learnAllowed()) {
+          refuse(fn); // selecting what cannot be mapped would be a dead end
+          return;
+        }
+        toggleSelected(fn);
+        return;
+      }
+      // A plain click is the single-control flow, and (like an explorer) it
+      // drops any selection rather than silently acting on a stale one.
+      if (selectionCount() > 0) clearSelection();
       if (learnAllowed()) {
-        void startLearn(fn);
+        void startLearn([fn]);
       } else {
         // FIX 1: never a silent no-op. Say which control, why it cannot be
         // learned, and the shell one-liner that works anyway.
@@ -503,12 +723,22 @@ function wire(root: HTMLElement): void {
   root.addEventListener("mouseleave", () => setHot(null));
 
   window.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape" && learningFn !== null) {
-      void cancelLearn();
-      return;
-    }
     if (ev.key === "Escape") {
-      closeModal();
+      // One key, one road out, most-specific first: cancel the capture, close
+      // the modal, drop the selection, leave select mode.
+      if (learning()) {
+        void cancelLearn();
+        return;
+      }
+      if (modalIsOpen()) {
+        closeModal();
+        return;
+      }
+      if (selectionCount() > 0) {
+        clearSelection();
+        return;
+      }
+      if (isMultiMode()) setMultiMode(false);
       return;
     }
     // MAME's UI Clear, keyboard edition — ONLY while the modal is open, so it

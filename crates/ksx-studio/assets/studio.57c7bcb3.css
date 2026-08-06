@@ -584,10 +584,16 @@ select,
   padding: 1rem 1.2rem 1.2rem;
 }
 
+/* The stage is a size CONTAINER: every glyph and tag on the art is sized in
+   cqh (1cqh = 1% of the stage's height), so the identities scale with the
+   controller instead of with the root font — the same layout reads at 1400 px
+   and at 420 px. Every cq declaration is preceded by a rem fallback, so a
+   browser without container queries still renders readable text. */
 .stage {
   position: relative;
   width: 100%;
   margin: 0 auto;
+  container: padstage / size;
 }
 
 .stage-xbox {
@@ -613,17 +619,20 @@ select,
   inset: 0;
 }
 
-/* Hit zones over the art: transparent hit areas carrying a small binding
-   TAG (v6 — Victor: on-zone tags are the intuitive read; the legend stays
-   as the overview). The title tooltip names fn + binding. Hover/focus — or
-   the legend row's hover via the shared .z-hot class — outlines the control
-   rect with a soft glow. */
+/* Hit zones over the art. v7: each one carries its own IDENTITY (the vendored
+   drawing has no letters on it — Victor: "I can see G is mapped to A but I
+   can't see the A xbox button") with the bound key as a small mono tag
+   underneath. Stacked, never side by side: the rects are sized to the drawn
+   controls, and two things across a 7 % box would both be unreadable.
+   Hover/focus — or the legend row's hover via the shared .z-hot class —
+   outlines the control rect with a soft glow. */
 .zone {
   position: absolute;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 0.25rem;
+  gap: 0.1rem;
   padding: 0;
   background: transparent;
   border: 1px solid transparent;
@@ -632,16 +641,156 @@ select,
   font: inherit;
 }
 
-/* The on-zone binding tag: a tiny mono pill; unbound (empty) renders
-   nothing, so untouched controls stay clean art. */
+/* The identity itself: what this control is CALLED on this persona. */
+.zid {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-weight: 800;
+  line-height: 1;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* Face buttons — the four canonical colours, drawn as the filled discs the
+   hardware prints. Sized to sit inside the art's own circle. */
+.id-xa,
+.id-xb,
+.id-xx,
+.id-xy,
+.id-pc,
+.id-po,
+.id-pt,
+.id-psq {
+  width: 1.7rem;
+  height: 1.7rem;
+  width: 5.4cqh;
+  height: 5.4cqh;
+  border-radius: 50%;
+  font-size: 0.85rem;
+  font-size: 2.9cqh;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+.id-xa {
+  background: #57c04a;
+  color: #08170a;
+}
+
+.id-xb {
+  background: #e04b3f;
+  color: #fff;
+}
+
+.id-xx {
+  background: #3f7fe0;
+  color: #fff;
+}
+
+.id-xy {
+  background: #f0b429;
+  color: #201603;
+}
+
+/* Sony glyph colours: the DS4 prints coloured shapes on grey buttons, so the
+   glyph carries the colour and the disc stays neutral. */
+.id-pc,
+.id-po,
+.id-pt,
+.id-psq {
+  background: #2b3346;
+  font-size: 1rem;
+  font-size: 3.4cqh;
+}
+
+.id-pc {
+  color: #6ea8ff;
+}
+
+.id-po {
+  color: #ff6b7d;
+}
+
+.id-pt {
+  color: #46d6a8;
+}
+
+.id-psq {
+  color: #f083c6;
+}
+
+/* Dpad + stick-wedge arrows, the stick hubs, the small named chips and the
+   shoulders: text identities, quiet enough to read as part of the drawing.
+   They sit ON the art's own control shapes (the dpad cross, the stick discs,
+   the little centre buttons), which are DARK in the light theme and LIGHT in
+   the dark one — the exact inverse of the page text. So each one carries a
+   halo of the page background: whichever way the theme runs, text and shape
+   cannot both be the same tone. */
+.zid.id-dir,
+.zid.id-hub,
+.zid.id-txt {
+  color: var(--text);
+  text-shadow:
+    0 0 2px var(--bg),
+    0 0 4px var(--bg),
+    0 0 6px var(--bg);
+}
+
+.id-dir {
+  font-size: 0.72rem;
+  font-size: 2.8cqh;
+}
+
+.id-hub {
+  font-size: 0.66rem;
+  font-size: 2.3cqh;
+  letter-spacing: 0.04em;
+}
+
+/* view / menu / guide / share / options / PS — the smallest zones on the pad,
+   so the cq size gets a floor: a 5 px word is not an identity, it is dirt. */
+.id-txt {
+  font-size: max(0.48rem, 2cqh);
+  letter-spacing: 0;
+}
+
+.id-sh {
+  font-size: 0.66rem;
+  font-size: 2.2cqh;
+  color: var(--muted);
+  letter-spacing: 0.06em;
+}
+
+/* Bound controls wear an accent ring on their identity — Razer's
+   modified-vs-stock read, and the one glance that answers "what have I
+   actually mapped?". */
+.zone:not(.z-unbound) .zid {
+  box-shadow: 0 0 0 1.5px var(--accent-line);
+}
+
+.zone:not(.z-unbound) .id-dir,
+.zone:not(.z-unbound) .id-hub,
+.zone:not(.z-unbound) .id-txt,
+.zone:not(.z-unbound) .id-sh {
+  color: var(--text);
+  box-shadow: none;
+}
+
+/* The on-zone binding tag: a tiny mono pill under the identity; unbound
+   (empty) renders nothing, so untouched controls stay clean art. */
 .ztag {
-  font: 700 0.62rem/1.15 var(--mono);
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 0.58rem;
+  font-size: 2cqh;
+  line-height: 1.15;
   color: var(--accent);
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 5px;
-  padding: 0.08rem 0.28rem;
-  max-width: 94%;
+  padding: 0.05rem 0.24rem;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -655,12 +804,20 @@ select,
   display: none;
 }
 
-/* Phone: the art shrinks but rem-sized tags do not — pull them in a step so
-   the stick/dpad clusters stay uncrowded. */
-@media (max-width: 560px) {
+/* A shared key is information, not a fault (FEATURE 3): the tag switches to
+   the steel-blue "this is a group" tone, and the legend row spells out which
+   controls it drives. */
+.z-shared .ztag {
+  color: var(--cool);
+  border-color: rgba(92, 184, 230, 0.5);
+}
+
+/* Phone-sized stage: the identity always survives, the key tag steps aside
+   (the legend below still carries every key). Keyed off the STAGE width, not
+   the viewport — the controller is what got small. */
+@container padstage (max-width: 26rem) {
   .ztag {
-    font-size: 0.55rem;
-    padding: 0.05rem 0.2rem;
+    display: none;
   }
 }
 
@@ -715,44 +872,9 @@ select,
   background: linear-gradient(var(--line), transparent);
 }
 
-.z-trigger::before,
-.z-bumper::before {
-  font: 600 0.66rem/1 var(--mono);
-  letter-spacing: 0.06em;
-  color: var(--muted);
-}
-
-.stage-xbox .zone[data-fn="lt"]::before {
-  content: "LT";
-}
-
-.stage-xbox .zone[data-fn="lb"]::before {
-  content: "LB";
-}
-
-.stage-xbox .zone[data-fn="rb"]::before {
-  content: "RB";
-}
-
-.stage-xbox .zone[data-fn="rt"]::before {
-  content: "RT";
-}
-
-.stage-ds4 .zone[data-fn="lt"]::before {
-  content: "L2";
-}
-
-.stage-ds4 .zone[data-fn="lb"]::before {
-  content: "L1";
-}
-
-.stage-ds4 .zone[data-fn="rb"]::before {
-  content: "R1";
-}
-
-.stage-ds4 .zone[data-fn="rt"]::before {
-  content: "R2";
-}
+/* (The shoulder labels used to be CSS `content` keyed off the persona stage
+   class. v7 renders every identity from the zone tables instead — one source
+   for both readers, and the DS4's L1/L2 come along for free.) */
 
 .zone:hover,
 .zone:focus-visible,
@@ -765,19 +887,44 @@ select,
   z-index: 2;
 }
 
+/* ── Multi-select: the file-explorer read ─────────────────────────────────
+   A selected control is ringed and ticked, on the art and in the legend, so
+   "what will 'Map all to one key' write?" is answerable at a glance. */
+.zone.z-sel {
+  border-color: var(--accent);
+  border-style: solid;
+  background: var(--accent-dim);
+  box-shadow: 0 0 0 2px var(--accent-line);
+  z-index: 3;
+}
+
+.zone.z-sel::after {
+  content: "✓";
+  position: absolute;
+  top: -0.35rem;
+  right: -0.35rem;
+  font: 700 0.55rem/1 var(--mono);
+  font-size: 1.9cqh;
+  color: var(--bg);
+  background: var(--accent);
+  border-radius: 50%;
+  padding: 0.12rem 0.2rem;
+  pointer-events: none;
+}
+
 /* ── Bindings legend: one row per mappable function, real grid ─────────── */
 
 .legend {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr));
   gap: 0.15rem 0.9rem;
 }
 
 .lrow {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 0.6rem;
+  flex-wrap: wrap;
+  gap: 0.4rem;
   min-width: 0;
   padding: 0.28rem 0.55rem;
   background: transparent;
@@ -797,6 +944,43 @@ select,
   outline: none;
 }
 
+/* The legend's copy of the identity glyph — same colours as the art, so the
+   two readers are visibly the same control. */
+.lid {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.35rem;
+  height: 1.35rem;
+  font: 800 0.72rem/1 var(--mono);
+}
+
+.lid.id-xa,
+.lid.id-xb,
+.lid.id-xx,
+.lid.id-xy,
+.lid.id-pc,
+.lid.id-po,
+.lid.id-pt,
+.lid.id-psq {
+  width: 1.35rem;
+  font-size: 0.75rem;
+}
+
+.lid.id-dir {
+  color: var(--text);
+  font-size: 0.8rem;
+}
+
+.lid.id-hub,
+.lid.id-txt,
+.lid.id-sh {
+  color: var(--muted);
+  font-size: 0.7rem;
+  justify-content: flex-start;
+}
+
 .llabel {
   font-size: 0.82rem;
   font-weight: 600;
@@ -805,7 +989,12 @@ select,
   text-overflow: ellipsis;
 }
 
+.llabel:empty {
+  display: none;
+}
+
 .lkey {
+  margin-left: auto;
   font: 700 0.78rem/1.2 var(--mono);
   color: var(--accent);
   max-width: 55%;
@@ -817,6 +1006,41 @@ select,
 .l-unbound .lkey {
   color: var(--muted);
   font-weight: 400;
+}
+
+/* FEATURE 3: the shared-key badge. Its own line, so a multi-bound row grows
+   rather than squeezing the key out, and in the steel-blue group tone —
+   sharing a key is a decision, not a warning. */
+.lshare {
+  display: none;
+  flex-basis: 100%;
+  font: 600 0.68rem/1.3 var(--mono);
+  color: var(--cool);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.l-shared .lshare {
+  display: block;
+}
+
+.l-shared .lkey {
+  color: var(--cool);
+}
+
+.lrow.l-sel {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  box-shadow: inset 0 0 0 1px var(--accent-line);
+}
+
+.lrow.l-sel .lid::after {
+  content: "✓";
+  position: absolute;
+  margin: -1.1rem 0 0 1rem;
+  font: 700 0.6rem/1 var(--mono);
+  color: var(--accent);
 }
 
 /* ── Preset actions: save semantics + the two restore safety nets ──────── */
@@ -1085,6 +1309,87 @@ footer p {
   margin: 0 0 0.5rem;
   font-size: 0.85rem;
   color: var(--muted);
+}
+
+/* ── The controller card's header row + the multi-select toggle ────────────
+   The toggle is the DISCOVERABLE half of multi-select (Victor: "tick
+   something") — on a phone there is no Ctrl to hold. It only exists once
+   map.ts has marked the island `.js`: with scripting off it could not do
+   anything, and a control that looks clickable and is not is exactly the
+   failure this page has spent two passes removing. */
+.stagehead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-bottom: 0.5rem;
+}
+
+.stagehead h2 {
+  margin: 0;
+}
+
+.seltoggle {
+  display: none;
+  font-size: 0.78rem;
+  padding: 0.28rem 0.8rem;
+}
+
+.studio.js .seltoggle {
+  display: inline-block;
+}
+
+.seltoggle.on {
+  color: var(--bg);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 650;
+}
+
+.seltoggle.on:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* The floating action bar: what is selected, and the three things that can
+   happen to it. Fixed to the bottom so it is reachable with a thumb at the
+   cabinet and never scrolls away from the controls it is about. */
+.selbar {
+  position: fixed;
+  left: 50%;
+  bottom: 1rem;
+  transform: translateX(-50%);
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: min(94vw, 42rem);
+  padding: 0.6rem 0.9rem;
+  border: 1px solid var(--accent-line);
+  border-radius: 999px;
+  background: var(--panel);
+  box-shadow:
+    0 8px 26px rgba(0, 0, 0, 0.45),
+    0 0 20px var(--accent-glow);
+}
+
+.selcount {
+  font: 700 0.82rem/1 var(--mono);
+  color: var(--accent);
+  white-space: nowrap;
+  padding-right: 0.2rem;
+}
+
+@media (max-width: 560px) {
+  .selbar {
+    left: 0.5rem;
+    right: 0.5rem;
+    transform: none;
+    max-width: none;
+    border-radius: var(--radius);
+  }
 }
 
 /* The mapper's flash is the ANSWER to a click — including a click that could

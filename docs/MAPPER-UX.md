@@ -62,6 +62,23 @@ complex tool with the simplest interface."
 
 ## The three builds (in order)
 
+**Build A status (v7, 2026-08-05).** Landed on the mapper page: every zone
+now carries its own IDENTITY on the art (persona-aware, canonical colours —
+the vendored drawing has no letters, so "I can see G is mapped to A but I
+can't see the A xbox button" was a real gap in commandment 4's "render as
+summary"); MULTI-SELECT (Ctrl/Shift-click on desktop, a "Select multiple"
+toggle for touch, a floating bar with "Map all to one key") which exposes the
+engine's native multi-bind (docs/INPUT-TRANSFORMS.md §1a) with one captured
+key written to N controls; and commandment 7 finished for the same-preset
+case — a key already used by another control in the SAME preset is no longer
+offered a "Replace" dialog, it is written and then SHOWN as a group ("also
+A · B" badges on every co-bound legend row, cool-toned key tags on the art).
+Cross-slot duplicates keep their existing informational dialog. Note for the
+engine side: `ksx map --force` still STEALS a same-preset key (mapping.rs
+module docs), so until that verb learns multi-bind the page reports whatever
+the daemon says it did — the legend derives sharing from disk, never from
+what the UI assumed.
+
 **Build A — finish v5 to spec (now).** Layout fix (in flight: clean hover
 zones + legend) plus: press-to-select (panel press focuses the control on
 the open mapper — reuses the learn observer in a passive "select" mode,

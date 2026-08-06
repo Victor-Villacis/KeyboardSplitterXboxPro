@@ -16,13 +16,20 @@ import { h, createSignal, createList, createShow } from "@getforma/core";
 // chips, stacked trigger-over-bumper and anchored to the body silhouette.
 // Every mappable control is a positioned hit-zone <button data-fn=…> from
 // the ZONES tables below (authored from ../art/extents.mjs output — the
-// PadForge rule: derive layout from art with a script). Zones are PURE HIT
-// AREAS — transparent, no inline text (the art is the label; the title
-// tooltip names fn + binding); the readable truth is the bindings LEGEND
-// below the stage, one row per function, which shares the zone click action
-// via the same data-fn delegation. A shared hover signal (`setHot`)
-// cross-highlights zone ↔ legend row. Interaction lives in map.ts (event
-// delegation, so list reconcile keeps everything wired).
+// PadForge rule: derive layout from art with a script).
+//
+// v7 — each zone wears its own IDENTITY (Victor: "I can see G is mapped to A
+// but I can't see the A xbox button"). The vendored art draws no letters, so
+// the zone renders the control's name itself in the canonical colours (A
+// green / B red / X blue / Y amber; ✕ ○ △ □ in the Sony hues), with the bound
+// key as the small mono tag underneath. Unbound controls still show their
+// identity — the pad reads like a controller with nothing mapped at all.
+// The bindings LEGEND below the stage is the second reader: the same identity
+// glyph, the group prefix, the key, and FEATURE 3's "also A · B" shared-key
+// badge; a row click IS the zone click (same data-fn delegation). A shared
+// hover signal (`setHot`) cross-highlights zone ↔ legend row, and the
+// selection Set does the same for multi-select. Interaction lives in map.ts
+// (event delegation, so list reconcile keeps everything wired).
 
 // ── Wire types: serde field names from ksx-studio {snapshot,control}.rs ────
 
@@ -96,6 +103,10 @@ interface SlotTab {
 interface ZoneRow {
   fn: string;
   cls: string;
+  /** FEATURE 1: the control's own name, drawn ON the art ("A", "✕", "LB"). */
+  id: string;
+  /** Identity palette class — `zid id-xa`, `zid id-pc`, … */
+  idcls: string;
   style: string;
   title: string;
   /// The on-zone binding tag ("" for unbound — CSS hides the empty pill).
@@ -104,10 +115,19 @@ interface ZoneRow {
 
 interface LegendRow {
   fn: string;
+  /** group + identity, for the tooltip and for shared-key badges. */
   label: string;
+  /** The identity glyph alone, styled as the button. */
+  id: string;
+  idcls: string;
+  /** "LS " / "RS " / "D-pad " / "" — the disambiguating prefix. */
+  group: string;
   key: string;
   cls: string;
   title: string;
+  /** FEATURE 3: "also A · B" when this key drives other controls too. */
+  share: string;
+  sharetitle: string;
   /** "✕" on a bound row of a live page, "" otherwise (CSS hides empty). */
   clear: string;
   cleartitle: string;
@@ -121,62 +141,63 @@ interface LegendRow {
 // stick-direction wedges RING the stick with the L3/R3 click zone as the
 // center hub — adjacent, never covering it.
 
-type ZoneDef = [string, string, number, number, number, number, string];
+// [fn, identity label, identity palette, cx, cy, w, h, kind]
+type ZoneDef = [string, string, string, number, number, number, number, string];
 
 const ZONE_XBOX: ZoneDef[] = [
-  ["lt", "LT", 31.0, 4.6, 10.0, 5.2, "trigger"],
-  ["lb", "LB", 34.0, 10.9, 11.0, 5.2, "bumper"],
-  ["rb", "RB", 66.0, 10.9, 11.0, 5.2, "bumper"],
-  ["rt", "RT", 69.0, 4.6, 10.0, 5.2, "trigger"],
-  ["Y", "Y", 75.2, 31.1, 7.2, 8.4, "round"],
-  ["B", "B", 82.0, 39.6, 7.2, 8.4, "round"],
-  ["A", "A", 75.3, 48.3, 7.2, 8.4, "round"],
-  ["X", "X", 68.7, 39.7, 7.2, 8.4, "round"],
-  ["guide", "guide", 50.0, 27.0, 9.0, 11.0, "round"],
-  ["back", "view", 44.0, 39.0, 6.5, 8.0, "chip"],
-  ["start", "menu", 56.0, 39.0, 6.5, 8.0, "chip"],
-  ["lthumb", "L3", 24.0, 39.7, 8.0, 10.0, "round"],
-  ["ly.max", "▲", 24.0, 31.7, 7.0, 6.0, "chip"],
-  ["ly.min", "▼", 24.0, 47.7, 7.0, 6.0, "chip"],
-  ["lx.min", "◀", 17.25, 39.7, 5.5, 7.0, "chip"],
-  ["lx.max", "▶", 30.75, 39.7, 5.5, 7.0, "chip"],
-  ["dpad.up", "▲", 36.4, 50.6, 7.0, 9.0, "chip"],
-  ["dpad.down", "▼", 36.4, 69.2, 7.0, 9.0, "chip"],
-  ["dpad.left", "◀", 29.2, 59.9, 7.0, 9.0, "chip"],
-  ["dpad.right", "▶", 43.6, 59.9, 7.0, 9.0, "chip"],
-  ["rthumb", "R3", 62.5, 58.4, 8.0, 10.0, "round"],
-  ["ry.max", "▲", 62.5, 50.4, 7.0, 6.0, "chip"],
-  ["ry.min", "▼", 62.5, 66.4, 7.0, 6.0, "chip"],
-  ["rx.min", "◀", 55.75, 58.4, 5.5, 7.0, "chip"],
-  ["rx.max", "▶", 69.25, 58.4, 5.5, 7.0, "chip"],
+  ["lt", "LT", "sh", 31.0, 4.6, 10.0, 5.2, "trigger"],
+  ["lb", "LB", "sh", 34.0, 10.9, 11.0, 5.2, "bumper"],
+  ["rb", "RB", "sh", 66.0, 10.9, 11.0, 5.2, "bumper"],
+  ["rt", "RT", "sh", 69.0, 4.6, 10.0, 5.2, "trigger"],
+  ["Y", "Y", "xy", 75.2, 31.1, 7.2, 8.4, "round"],
+  ["B", "B", "xb", 82.0, 39.6, 7.2, 8.4, "round"],
+  ["A", "A", "xa", 75.3, 48.3, 7.2, 8.4, "round"],
+  ["X", "X", "xx", 68.7, 39.7, 7.2, 8.4, "round"],
+  ["guide", "guide", "txt", 50.0, 27.0, 9.0, 11.0, "round"],
+  ["back", "view", "txt", 44.0, 39.0, 6.5, 8.0, "chip"],
+  ["start", "menu", "txt", 56.0, 39.0, 6.5, 8.0, "chip"],
+  ["lthumb", "L3", "hub", 24.0, 39.7, 8.0, 10.0, "round"],
+  ["ly.max", "▲", "dir", 24.0, 31.7, 7.0, 6.0, "chip"],
+  ["ly.min", "▼", "dir", 24.0, 47.7, 7.0, 6.0, "chip"],
+  ["lx.min", "◀", "dir", 17.25, 39.7, 5.5, 7.0, "chip"],
+  ["lx.max", "▶", "dir", 30.75, 39.7, 5.5, 7.0, "chip"],
+  ["dpad.up", "▲", "dir", 36.4, 50.6, 7.0, 9.0, "chip"],
+  ["dpad.down", "▼", "dir", 36.4, 69.2, 7.0, 9.0, "chip"],
+  ["dpad.left", "◀", "dir", 29.2, 59.9, 7.0, 9.0, "chip"],
+  ["dpad.right", "▶", "dir", 43.6, 59.9, 7.0, 9.0, "chip"],
+  ["rthumb", "R3", "hub", 62.5, 58.4, 8.0, 10.0, "round"],
+  ["ry.max", "▲", "dir", 62.5, 50.4, 7.0, 6.0, "chip"],
+  ["ry.min", "▼", "dir", 62.5, 66.4, 7.0, 6.0, "chip"],
+  ["rx.min", "◀", "dir", 55.75, 58.4, 5.5, 7.0, "chip"],
+  ["rx.max", "▶", "dir", 69.25, 58.4, 5.5, 7.0, "chip"],
 ];
 
 const ZONE_DS4: ZoneDef[] = [
-  ["lt", "L2", 17.0, 4.6, 9.5, 5.2, "trigger"],
-  ["lb", "L1", 19.5, 10.9, 10.5, 5.2, "bumper"],
-  ["rb", "R1", 80.5, 10.9, 10.5, 5.2, "bumper"],
-  ["rt", "R2", 83.0, 4.6, 9.5, 5.2, "trigger"],
-  ["Y", "△", 81.2, 29.2, 7.0, 9.0, "round"],
-  ["B", "○", 88.4, 38.8, 7.0, 9.0, "round"],
-  ["A", "✕", 81.3, 48.1, 7.0, 9.0, "round"],
-  ["X", "□", 74.0, 38.7, 7.0, 9.0, "round"],
-  ["back", "share", 30.0, 25.5, 7.0, 9.0, "chip"],
-  ["start", "options", 70.0, 25.5, 7.0, 9.0, "chip"],
-  ["guide", "PS", 50.0, 63.0, 8.0, 10.0, "round"],
-  ["lthumb", "L3", 33.8, 56.8, 8.0, 10.0, "round"],
-  ["ly.max", "▲", 33.8, 48.8, 7.0, 6.0, "chip"],
-  ["ly.min", "▼", 33.8, 64.8, 7.0, 6.0, "chip"],
-  ["lx.min", "◀", 27.05, 56.8, 5.5, 7.0, "chip"],
-  ["lx.max", "▶", 40.55, 56.8, 5.5, 7.0, "chip"],
-  ["dpad.up", "▲", 18.5, 31.5, 5.4, 7.2, "chip"],
-  ["dpad.down", "▼", 18.5, 46.6, 5.4, 7.2, "chip"],
-  ["dpad.left", "◀", 12.9, 39.2, 5.4, 7.2, "chip"],
-  ["dpad.right", "▶", 23.9, 39.2, 5.4, 7.2, "chip"],
-  ["rthumb", "R3", 66.1, 56.8, 8.0, 10.0, "round"],
-  ["ry.max", "▲", 66.1, 48.8, 7.0, 6.0, "chip"],
-  ["ry.min", "▼", 66.1, 64.8, 7.0, 6.0, "chip"],
-  ["rx.min", "◀", 59.35, 56.8, 5.5, 7.0, "chip"],
-  ["rx.max", "▶", 72.85, 56.8, 5.5, 7.0, "chip"],
+  ["lt", "L2", "sh", 17.0, 4.6, 9.5, 5.2, "trigger"],
+  ["lb", "L1", "sh", 19.5, 10.9, 10.5, 5.2, "bumper"],
+  ["rb", "R1", "sh", 80.5, 10.9, 10.5, 5.2, "bumper"],
+  ["rt", "R2", "sh", 83.0, 4.6, 9.5, 5.2, "trigger"],
+  ["Y", "△", "pt", 81.2, 29.2, 7.0, 9.0, "round"],
+  ["B", "○", "po", 88.4, 38.8, 7.0, 9.0, "round"],
+  ["A", "✕", "pc", 81.3, 48.1, 7.0, 9.0, "round"],
+  ["X", "□", "psq", 74.0, 38.7, 7.0, 9.0, "round"],
+  ["back", "share", "txt", 30.0, 25.5, 7.0, 9.0, "chip"],
+  ["start", "options", "txt", 70.0, 25.5, 7.0, 9.0, "chip"],
+  ["guide", "PS", "txt", 50.0, 63.0, 8.0, 10.0, "round"],
+  ["lthumb", "L3", "hub", 33.8, 56.8, 8.0, 10.0, "round"],
+  ["ly.max", "▲", "dir", 33.8, 48.8, 7.0, 6.0, "chip"],
+  ["ly.min", "▼", "dir", 33.8, 64.8, 7.0, 6.0, "chip"],
+  ["lx.min", "◀", "dir", 27.05, 56.8, 5.5, 7.0, "chip"],
+  ["lx.max", "▶", "dir", 40.55, 56.8, 5.5, 7.0, "chip"],
+  ["dpad.up", "▲", "dir", 18.5, 31.5, 5.4, 7.2, "chip"],
+  ["dpad.down", "▼", "dir", 18.5, 46.6, 5.4, 7.2, "chip"],
+  ["dpad.left", "◀", "dir", 12.9, 39.2, 5.4, 7.2, "chip"],
+  ["dpad.right", "▶", "dir", 23.9, 39.2, 5.4, 7.2, "chip"],
+  ["rthumb", "R3", "hub", 66.1, 56.8, 8.0, 10.0, "round"],
+  ["ry.max", "▲", "dir", 66.1, 48.8, 7.0, 6.0, "chip"],
+  ["ry.min", "▼", "dir", 66.1, 64.8, 7.0, 6.0, "chip"],
+  ["rx.min", "◀", "dir", 59.35, 56.8, 5.5, 7.0, "chip"],
+  ["rx.max", "▶", "dir", 72.85, 56.8, 5.5, 7.0, "chip"],
 ];
 
 export function isPlaystation(persona: string): boolean {
@@ -201,6 +222,14 @@ const [conflictLine, setConflictLine] = createSignal("");
 const [savedLine, setSavedLine] = createSignal("");
 const [savedAt, setSavedAt] = createSignal("");
 const [generatedAt, setGeneratedAt] = createSignal("(no snapshot)");
+/** v7 multi-select: the header toggle's look/label, and the floating bar's
+ *  count line. Class strings, not shows (ledger #13) — the toggle button is
+ *  always in the DOM, hidden until map.ts marks the island `.js`. */
+const SEL_TOGGLE_OFF = "btn btn-row seltoggle";
+const SEL_TOGGLE_LABEL_OFF = "Select multiple";
+const [selToggleCls, setSelToggleCls] = createSignal(SEL_TOGGLE_OFF);
+const [selToggleLabel, setSelToggleLabel] = createSignal(SEL_TOGGLE_LABEL_OFF);
+const [selCountLine, setSelCountLine] = createSignal("");
 
 const [pillRunning, setPillRunning] = createSignal(false);
 const [pillIdle, setPillIdle] = createSignal(false);
@@ -220,6 +249,7 @@ const [modalOpen, setModalOpen] = createSignal(false);
 const [modalListening, setModalListening] = createSignal(false);
 const [modalBound, setModalBound] = createSignal(false);
 const [modalConflict, setModalConflict] = createSignal(false);
+const [selBar, setSelBar] = createSignal(false);
 
 const [slotTabs, setSlotTabs] = createSignal<SlotTab[]>([]);
 const [zones, setZones] = createSignal<ZoneRow[]>([]);
@@ -242,14 +272,85 @@ let hotFn: string | null = null;
  *  Drives the z-dead / l-dead look and the ✕ accelerator. */
 let liveMapping = false;
 
+// ── v7 multi-select (FEATURE 2) ────────────────────────────────────────────
+// Victor's file-explorer analogy: Ctrl/Shift-click ADDS a control to a
+// selection, and one action then applies to all of them. Client-only state —
+// nothing here exists without JS, and the no-JS page keeps the v6
+// single-click-to-learn behaviour untouched.
+
+/** Selected function names. Iteration order is insertion order; the UI shows
+ *  them in TABLE order so the prompt reads like the pad, not like the clicks. */
+const selection = new Set<string>();
+/** Touch mode: while on, a plain tap toggles selection instead of learning.
+ *  The discoverable half of the feature (Victor: "tick something"). */
+let multiMode = false;
+
+/** Repaint both readers from the current slot — every selection/hover change
+ *  goes through here, so the art and the legend can never disagree. */
+function refreshRows(): void {
+  const slot = currentSlot();
+  if (!slot) return;
+  setZones(zoneRows(slot));
+  setLegendRows(legendRowsFor(slot));
+}
+
 export function setHot(fn: string | null): void {
   if (hotFn === fn) return;
   hotFn = fn;
-  const slot = currentSlot();
-  if (slot) {
-    setZones(zoneRows(slot));
-    setLegendRows(legendRowsFor(slot));
-  }
+  refreshRows();
+}
+
+/** Selected controls in the order they were PICKED — a Set keeps insertion
+ *  order, and the prompt reading back "A, B, RT" in the order the user tapped
+ *  them is how they check the selection before pressing a key. (The legend's
+ *  shared-key badges use table order instead: those come from disk and have no
+ *  click history.) */
+export function selectedFns(): string[] {
+  return Array.from(selection);
+}
+
+export function selectionCount(): number {
+  return selection.size;
+}
+
+export function isMultiMode(): boolean {
+  return multiMode;
+}
+
+/** "A", "✕", "D-pad ▲" — how this persona names a control, for prompts. */
+export function identityLabel(fn: string): string {
+  const def = zoneTable().find((z) => z[0] === fn);
+  return def ? legendLabel(def[0], def[1]) : fn;
+}
+
+export function toggleSelected(fn: string): void {
+  if (selection.has(fn)) selection.delete(fn);
+  else selection.add(fn);
+  syncSelection();
+}
+
+export function clearSelection(): void {
+  if (selection.size === 0 && !multiMode) return;
+  selection.clear();
+  syncSelection();
+}
+
+export function setMultiMode(on: boolean): void {
+  multiMode = on;
+  if (!on) selection.clear();
+  syncSelection();
+}
+
+/** One place where selection state reaches the screen. */
+function syncSelection(): void {
+  const n = selection.size;
+  setSelBar(n > 0);
+  setSelCountLine(
+    n === 1 ? "1 control selected" : `${n} controls selected`,
+  );
+  setSelToggleCls(multiMode ? `${SEL_TOGGLE_OFF} on` : SEL_TOGGLE_OFF);
+  setSelToggleLabel(multiMode ? "Selecting — tap controls" : SEL_TOGGLE_LABEL_OFF);
+  refreshRows();
 }
 
 export function currentSlot(): MapperSlot | null {
@@ -263,6 +364,10 @@ export function currentSlot(): MapperSlot | null {
 
 export function selectSlot(num: number): void {
   selectedSlot = num;
+  // A selection belongs to ONE preset — carrying it across slots would apply
+  // an action to controls the user is no longer looking at.
+  selection.clear();
+  setSelBar(false);
   if (lastPayload) applyMap(lastPayload);
 }
 
@@ -296,49 +401,109 @@ function keyTag(slot: MapperSlot, fn: string): string {
   return keys && keys.length > 0 ? keys.join("+") : "—";
 }
 
+/** The zone table of the slot on screen. */
+function zoneTable(): ZoneDef[] {
+  const slot = currentSlot();
+  return slot && isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
+}
+
+/** How many co-bound controls a shared-key badge names before summarizing. */
+const SHARE_MAX = 3;
+
+/** Mirrors render_map.rs `shared_labels`: per zone (table order), the LABELS
+ *  of the other controls this preset binds to the same key. A key bound twice
+ *  is a multi-bind, not a conflict (docs/INPUT-TRANSFORMS.md §1a) — this is
+ *  the data that lets both readers say so. */
+function sharedLabels(slot: MapperSlot): string[][] {
+  const table = isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
+  const tags = table.map(([fn]) => keyTag(slot, fn));
+  return tags.map((tag, i) =>
+    tag === "—"
+      ? []
+      : table
+          .filter((_, j) => j !== i && tags[j] === tag)
+          .map(([fn, label]) => legendLabel(fn, label)),
+  );
+}
+
+/** "also A · B", capped — mirrors render_map.rs `share_text`. */
+function shareText(names: string[]): string {
+  if (names.length === 0) return "";
+  const text = `also ${names.slice(0, SHARE_MAX).join(" · ")}`;
+  return names.length > SHARE_MAX ? `${text} +${names.length - SHARE_MAX}` : text;
+}
+
+function shareTitle(key: string, names: string[]): string {
+  return names.length === 0 ? "" : `${key} also drives ${names.join(", ")}`;
+}
+
 function zoneRows(slot: MapperSlot): ZoneRow[] {
   const table = isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
   const dead = liveMapping ? "" : " z-dead";
-  return table.map(([fn, , cx, cy, w, h, kind]) => {
+  const shared = sharedLabels(slot);
+  return table.map(([fn, label, idk, cx, cy, w, h, kind], i) => {
     const key = keyTag(slot, fn);
+    const share = shared[i];
     // z-unbound hides the tag pill via CSS: `:empty` cannot work, the SSR
     // text slot leaves marker nodes inside the span. z-dead is the VISIBLY
     // disabled look — never the `disabled` attribute, which would swallow the
     // click that has to answer "why can't I map right now?".
     return {
       fn,
-      cls: `zone z-${kind}${key === "—" ? " z-unbound" : ""}${dead}${fn === hotFn ? " z-hot" : ""}`,
+      cls:
+        `zone z-${kind}${key === "—" ? " z-unbound" : ""}${dead}` +
+        `${share.length > 0 ? " z-shared" : ""}${fn === hotFn ? " z-hot" : ""}` +
+        `${selection.has(fn) ? " z-sel" : ""}`,
+      // FEATURE 1: the identity, drawn on art that has no letters of its own.
+      id: label,
+      idcls: `zid id-${idk}`,
       style:
         `left:${(cx - w / 2).toFixed(1)}%;top:${(cy - h / 2).toFixed(1)}%;` +
         `width:${w.toFixed(1)}%;height:${h.toFixed(1)}%`,
-      title: `${fn} — ${key}`,
+      title:
+        share.length > 0
+          ? `${fn} — ${key} (${shareTitle(key, share)})`
+          : `${fn} — ${key}`,
       tag: key === "—" ? "" : key,
     };
   });
 }
 
-/** "LS ▲", "D-pad ◀", "✕" — the legend's control label, persona-aware and
- *  unambiguous once the four stick/dpad glyph groups are prefixed. */
+/** "LS ", "RS ", "D-pad ", "" — the prefix that keeps four identical arrow
+ *  glyphs apart in a flat list. */
+function legendGroup(fn: string): string {
+  if (fn.startsWith("lx.") || fn.startsWith("ly.")) return "LS ";
+  if (fn.startsWith("rx.") || fn.startsWith("ry.")) return "RS ";
+  if (fn.startsWith("dpad.")) return "D-pad ";
+  return "";
+}
+
+/** "LS ▲", "D-pad ◀", "✕" — group + identity, for tooltips and prompts. */
 function legendLabel(fn: string, label: string): string {
-  if (fn.startsWith("lx.") || fn.startsWith("ly.")) return `LS ${label}`;
-  if (fn.startsWith("rx.") || fn.startsWith("ry.")) return `RS ${label}`;
-  if (fn.startsWith("dpad.")) return `D-pad ${label}`;
-  return label;
+  return `${legendGroup(fn)}${label}`;
 }
 
 function legendRowsFor(slot: MapperSlot): LegendRow[] {
   const table = isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
-  return table.map(([fn, label]) => {
+  const shared = sharedLabels(slot);
+  return table.map(([fn, label, idk], i) => {
     const key = keyTag(slot, fn);
     const unbound = key === "—";
+    const share = shared[i];
     return {
       fn,
       label: legendLabel(fn, label),
+      id: label,
+      idcls: `lid id-${idk}`,
+      group: legendGroup(fn),
       key,
       cls:
         `lrow${unbound ? " l-unbound" : ""}${liveMapping ? "" : " l-dead"}` +
-        `${fn === hotFn ? " l-hot" : ""}`,
+        `${share.length > 0 ? " l-shared" : ""}${fn === hotFn ? " l-hot" : ""}` +
+        `${selection.has(fn) ? " l-sel" : ""}`,
       title: `${fn} — ${key}`,
+      share: shareText(share),
+      sharetitle: shareTitle(key, share),
       // The desktop accelerator. Only where clearing would do something; the
       // learn modal's "Clear binding" is the primary, touch-first path.
       clear: liveMapping && !unbound ? "✕" : "",
@@ -592,11 +757,12 @@ export function flashSaved(line: string, isError: boolean): void {
 
 // ── The screen ─────────────────────────────────────────────────────────────
 // createShow document order == render_map.rs MAP_SHOW_ORDER (positional seam,
-// ledger #4). Eighteen, in this order:
+// ledger #4). Nineteen, in this order:
 //   pillRunning, pillIdle, pillDown, pillPaused,
 //   noDaemon, sessionRunning, pausedBar, readOnly, canLearn,
 //   artXbox, artDs4, hasBackup, savedOk, savedErr,
-//   modalOpen, modalListening, modalBound, modalConflict.
+//   modalOpen, modalListening, modalBound, modalConflict,
+//   selBar (v7 — APPENDED, never inserted: ledger #14).
 // Adding or reordering one here without updating MAP_SHOW_ORDER shows the
 // wrong panel; `embedded_map_ir_slot_layout_matches_the_seam` catches it.
 
@@ -758,14 +924,35 @@ export function MapIsland() {
             "p",
             { class: "hint" },
             "Click a control, then press the panel key for it — Esc or a click ",
-            "outside cancels, Delete clears. Saves are immediate, and a running ",
-            "session takes them live without unplugging the pads.",
+            "outside cancels, Delete clears. Ctrl-click (or “Select multiple”) ",
+            "picks several controls and maps them all to ONE key. Saves are ",
+            "immediate, and a running session takes them live without ",
+            "unplugging the pads.",
           ),
       ),
       // ── THE CONTROLLER (huge). Art + zone layer per persona. ──────────
       h(
         "section",
         { class: "card stagecard" },
+        // FEATURE 2's discoverable half: a "Select multiple" toggle in the
+        // card header (Victor: "tick something"). Hidden until map.ts marks
+        // the island `.js` — with JS off it would be a dead button, and this
+        // page's rule is that nothing ever looks clickable and does nothing.
+        h(
+          "div",
+          { class: "stagehead" },
+          h("h2", null, "Controller"),
+          h(
+            "button",
+            {
+              class: () => selToggleCls(),
+              "data-act": "multi-toggle",
+              type: "button",
+              title: "Select several controls, then map them all to one key",
+            },
+            () => selToggleLabel(),
+          ),
+        ),
         createShow(
           () => artXbox(),
           () =>
@@ -782,7 +969,7 @@ export function MapIsland() {
                 { class: "zonelayer" },
                 createList(
                   () => zones(),
-                  (z) => z.fn + "|" + z.cls + "|" + z.style + "|" + z.title,
+                  (z) => z.fn + "|" + z.cls + "|" + z.style + "|" + z.title + "|" + z.tag,
                   (z) =>
                     h(
                       "button",
@@ -794,6 +981,10 @@ export function MapIsland() {
                         title: z.title,
                         "aria-label": z.title,
                       },
+                      // FEATURE 1: identity first (the art draws no letters),
+                      // binding key underneath it. Both are bare `param.field`
+                      // reads — the supported per-item attr path, ledger #11.
+                      h("span", { class: z.idcls }, z.id),
                       h("span", { class: "ztag" }, z.tag),
                     ),
                 ),
@@ -816,7 +1007,7 @@ export function MapIsland() {
                 { class: "zonelayer" },
                 createList(
                   () => zones(),
-                  (z) => z.fn + "|" + z.cls + "|" + z.style + "|" + z.title,
+                  (z) => z.fn + "|" + z.cls + "|" + z.style + "|" + z.title + "|" + z.tag,
                   (z) =>
                     h(
                       "button",
@@ -828,6 +1019,10 @@ export function MapIsland() {
                         title: z.title,
                         "aria-label": z.title,
                       },
+                      // FEATURE 1: identity first (the art draws no letters),
+                      // binding key underneath it. Both are bare `param.field`
+                      // reads — the supported per-item attr path, ledger #11.
+                      h("span", { class: z.idcls }, z.id),
                       h("span", { class: "ztag" }, z.tag),
                     ),
                 ),
@@ -848,12 +1043,16 @@ export function MapIsland() {
           { class: "legend" },
           createList(
             () => legendRows(),
-            (l) => l.fn + "|" + l.label + "|" + l.key + "|" + l.cls + "|" + l.clear,
+            (l) =>
+              l.fn + "|" + l.label + "|" + l.key + "|" + l.cls + "|" + l.clear + "|" + l.share,
             (l) =>
               h(
                 "button",
                 { class: l.cls, "data-fn": l.fn, type: "button", title: l.title },
-                h("span", { class: "llabel" }, l.label),
+                // The same identity glyph the art wears, so the two readers
+                // are visibly the same control.
+                h("span", { class: l.idcls }, l.id),
+                h("span", { class: "llabel" }, l.group),
                 h("span", { class: "lkey" }, l.key),
                 // The desktop accelerator (revealed on hover/focus, always
                 // present for keyboard and AT users). Never the ONLY way to
@@ -863,6 +1062,10 @@ export function MapIsland() {
                   { class: "lclear", "data-clear": l.fn, title: l.cleartitle },
                   l.clear,
                 ),
+                // FEATURE 3: a shared key is information. This names the other
+                // controls the same key drives, on its own line so a
+                // multi-bound row grows instead of squeezing.
+                h("span", { class: "lshare", title: l.sharetitle }, l.share),
               ),
           ),
         ),
@@ -1005,6 +1208,33 @@ export function MapIsland() {
                   ),
                 ),
             ),
+          ),
+        ),
+    ),
+    // ── FEATURE 2: the multi-select action bar (client-only). Appended LAST
+    // in document order on purpose — ledger #14: a show inserted in the middle
+    // shifts every show after it, and this one is `position: fixed` anyway. ──
+    createShow(
+      () => selBar(),
+      () =>
+        h(
+          "div",
+          { class: "selbar" },
+          h("span", { class: "selcount" }, () => selCountLine()),
+          h(
+            "button",
+            { class: "btn btn-primary", "data-act": "map-selected", type: "button" },
+            "Map all to one key",
+          ),
+          h(
+            "button",
+            { class: "btn", "data-act": "clear-selected", type: "button" },
+            "Clear selected",
+          ),
+          h(
+            "button",
+            { class: "btn", "data-act": "cancel-select", type: "button" },
+            "Cancel",
           ),
         ),
     ),
