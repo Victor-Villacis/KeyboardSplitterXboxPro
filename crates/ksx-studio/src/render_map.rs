@@ -1101,6 +1101,8 @@ pub(crate) fn new_macro_body(name: &str) -> MacroView {
         turbo_hz: None,
         gap_ms: None,
         triggers: Vec::new(),
+        // A new macro RUNS. Nobody creates one switched off.
+        disabled: false,
     }
 }
 
@@ -1541,6 +1543,28 @@ fn macro_trigger_line(mac: Option<&MacroView>) -> String {
     }
 }
 
+/// The slot-wide `macros = "off"` switch, in words — and the exact line to
+/// change. Empty for every slot that runs macros, which is every slot until
+/// somebody says otherwise.
+///
+/// A SENTENCE and not a button, deliberately. The switch lives in config.toml
+/// (or in the games.toml profile), and Studio writes presets only — every verb
+/// on this page goes through `map`/`map-macro`. A toggle that silently did
+/// nothing is worse than a line that says which file to edit, so this is the
+/// line. Mirrored in MapIsland.ts `slotMacrosLineFor`.
+fn slot_macros_line(slot: Option<&MapperSlot>) -> String {
+    match slot {
+        Some(slot) if slot.macros_off => format!(
+            "Slot {} says macros = \"off\" — the TOURNAMENT SWITCH. Nothing in this card runs on \
+             it, whatever each macro's own switch says, and nothing is deleted. To bring them \
+             back, set macros = \"on\" on that [[slot]] in config.toml (or on the slot of the \
+             games.toml profile you are running) and reload the session.",
+            slot.number
+        ),
+        _ => String::new(),
+    }
+}
+
 /// The one-line summary above the grid.
 fn macro_head(
     payload: &MapPayload,
@@ -1549,11 +1573,18 @@ fn macro_head(
 ) -> String {
     match mac {
         Some(mac) => format!(
-            "{} — {} step{} · {} ms total",
+            "{} — {} step{} · {} ms total{}",
             mac.name,
             mac.steps.len(),
             if mac.steps.len() == 1 { "" } else { "s" },
-            total_ms(mac)
+            total_ms(mac),
+            // Loud, and in the head line, because everything under it
+            // describes something that will not happen.
+            if mac.disabled {
+                " · DISABLED (keeps its steps and its trigger; never runs)"
+            } else {
+                ""
+            }
         ),
         None if payload.macros.available => {
             format!("\"{}\" has no macros yet", preset_name(payload, selected))
@@ -1810,6 +1841,25 @@ fn scalar_slots(
         // grid is exactly what the file says.
         "macroDirtyLine": if mac.is_some() { "saved" } else { "" },
         "macroSaveCls": "btn btn-mini macsave off",
+        // v14: the per-macro ON/OFF switch. Two class-string scalars and no
+        // show, like everything else on this card, and the button reads as the
+        // STATE it is in rather than the action it performs — "Disable" on a
+        // macro that is already off is the one label a person in a hurry
+        // cannot read correctly.
+        "macroEnableCls": match mac {
+            Some(m) if m.disabled => "btn btn-mini macen offstate",
+            Some(_) => "btn btn-mini macen on",
+            // Nothing loaded: inert, not a switch for a macro that is not there.
+            None => "btn btn-mini macen off dead",
+        },
+        "macroEnableLabel": match mac {
+            Some(m) if m.disabled => "DISABLED — click to enable",
+            _ => "Enabled",
+        },
+        // v14: the SLOT's master switch, in words and never as a button — it
+        // lives in config.toml, and Studio has no config writer. See
+        // `slot_macros_line`.
+        "slotMacrosLine": slot_macros_line(selected),
         "macroStepLine": "click a step's ⏱ to edit its duration",
         "macroDurValue": "50",
         // The frame maths, at the selector's default rate — no step is
@@ -1988,6 +2038,7 @@ mod tests {
             turbo_hz: None,
             gap_ms: None,
             triggers: vec!["P".to_owned()],
+            disabled: false,
         }
     }
 
@@ -2013,6 +2064,7 @@ mod tests {
             bindings,
             backup: Some("2026-08-05 14:32:07 UTC".to_owned()),
             turbo,
+            macros_off: false,
         }
     }
 
@@ -2612,7 +2664,79 @@ mod tests {
         // `disabled` button that would swallow the click that explains why.
         assert!(out.html.contains("z-dead"), "{}", out.html);
         assert!(out.html.contains("l-dead"), "{}", out.html);
-        assert!(!out.html.contains("disabled"), "{}", out.html);
+        // The ATTRIBUTE, specifically: `MacroView.disabled` (a macro switched
+        // off) is a legitimate word in the island's JSON props and must not be
+        // mistaken for a dead control.
+        assert!(!out.html.contains(" disabled>"), "{}", out.html);
+        assert!(!out.html.contains(" disabled="), "{}", out.html);
+        assert!(!out.html.contains(" disabled "), "{}", out.html);
+    }
+
+    /// A macro switched OFF has to say so where the eye lands — the head line
+    /// and the switch itself — because every other line on the card describes
+    /// a sequence that will not run.
+    #[test]
+    fn a_disabled_macro_says_so_on_the_card_and_on_its_switch() {
+        let mut payload = sample();
+        payload.macros.macros[0].disabled = true;
+        let mac = selected_macro(&payload);
+        let slots = scalar_slots(&payload, payload.mapper.slots.first(), mac.as_ref(), None);
+
+        let head = slots["macroHead"].as_str().unwrap();
+        assert!(head.contains("DISABLED"), "{head}");
+        // ...and it names what SURVIVES, so "disabled" never reads as "gone".
+        assert!(head.contains("keeps its steps"), "{head}");
+        assert_eq!(slots["macroEnableCls"], "btn btn-mini macen offstate");
+        // The button reads as the STATE, not the action.
+        assert!(
+            slots["macroEnableLabel"]
+                .as_str()
+                .unwrap()
+                .contains("DISABLED"),
+            "{slots}"
+        );
+
+        // An enabled macro is quiet on both.
+        let slots = scalar_slots(&sample(), None, Some(&hadouken()), None);
+        assert!(!slots["macroHead"].as_str().unwrap().contains("DISABLED"));
+        assert_eq!(slots["macroEnableCls"], "btn btn-mini macen on");
+        assert_eq!(slots["macroEnableLabel"], "Enabled");
+        // No macro at all: an inert switch, not one for a table that is absent.
+        let slots = scalar_slots(&sample(), None, None, None);
+        assert_eq!(slots["macroEnableCls"], "btn btn-mini macen off dead");
+    }
+
+    /// The SLOT's master switch: a sentence naming the file to edit, because
+    /// Studio has no config writer and a control that did nothing would be
+    /// worse than none. Silent on every slot that runs macros.
+    #[test]
+    fn a_slot_with_macros_off_says_which_line_to_change() {
+        let mut payload = sample();
+        payload.mapper.slots[0].macros_off = true;
+        let line = slot_macros_line(payload.mapper.slots.first());
+        for part in [
+            "Slot 1",
+            "macros = \"off\"",
+            "TOURNAMENT",
+            "nothing is deleted",
+            "config.toml",
+            "games.toml",
+        ] {
+            assert!(line.contains(part), "{line}");
+        }
+        // ...and it reaches the page.
+        let slots = scalar_slots(
+            &payload,
+            payload.mapper.slots.first(),
+            Some(&hadouken()),
+            None,
+        );
+        assert_eq!(slots["slotMacrosLine"], line);
+
+        // The ordinary slot says nothing at all — an empty string renders as
+        // no element, which is the honest amount of screen for "as usual".
+        assert_eq!(slot_macros_line(sample().mapper.slots.first()), "");
+        assert_eq!(slot_macros_line(None), "");
     }
 
     /// FIX 1, the headline case: Victor quit the tray daemon and then clicked

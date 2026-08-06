@@ -98,6 +98,15 @@ struct MacroRt {
     /// Dense ids of the keys that start this macro (multi-bind: several keys
     /// may, and one key may start several macros).
     triggers: SmallVec<[u32; 2]>,
+    /// [`crate::Macro::enabled`] — this macro's OWN switch. `false` ⇒ the
+    /// trigger is still interned and still a key of this slot (so `interrupt`,
+    /// consumption and the legend are unchanged) and
+    /// [`SlotRuntime::macro_start`] simply never begins a run.
+    ///
+    /// The slot's master switch is kept separately ([`SlotRuntime::macros_on`])
+    /// rather than folded in here, so that flipping one of the two live can
+    /// never lose the other's answer.
+    enabled: bool,
     /// Which step is live. `None` ⇒ not running, and every one of this macro's
     /// holders is down.
     step: Option<u16>,
@@ -292,6 +301,10 @@ struct SlotRuntime {
     /// press and the step it starts land in ONE delta batch. Sized to the
     /// slot's total step + turbo count at build time.
     macro_dirty: Vec<u32>,
+    /// The slot's macro MASTER switch ([`crate::MacroSwitch`]) — "tournament
+    /// mode". `false` silences every macro of this slot whatever its own
+    /// `enabled` says, and nothing else about the slot changes.
+    macros_on: bool,
 
     // ---- turbo runtime -----------------------------------------------------
     /// Auto-firing endpoints; EMPTY for a slot with none.
@@ -658,6 +671,14 @@ impl SlotRuntime {
         let first = self.macros[m].first_holder;
         if self.macros[m].ends.is_empty() {
             return; // an empty macro is inert; validation names it
+        }
+        if !self.macros_on || !self.macros[m].enabled {
+            // Switched off — by the slot's master switch, or by this macro's
+            // own `enabled`. The master switch is tested FIRST and wins, which
+            // is what makes it a master switch. Either way the trigger key
+            // still exists and still does everything else it is bound to: this
+            // is a mute on a sequence, not a dead key.
+            return;
         }
         if let Some(step) = self.macros[m].step {
             match self.macros[m].retrigger {
@@ -1103,6 +1124,7 @@ impl EngineTables {
                         .filter(|t| usize::from(t.index) == m && t.key != Key::None)
                         .map(|t| intern_key(&mut index, &mut targets, t.key))
                         .collect(),
+                    enabled: def.enabled,
                     step: None,
                     gapping: false,
                     start: 0,
@@ -1131,6 +1153,7 @@ impl EngineTables {
                 macros: macro_rts,
                 macro_base: 0,
                 macro_dirty: Vec::new(),
+                macros_on: rs.spec.macros.is_on(),
                 // Turbo rows whose endpoint nothing in this preset drives are
                 // dropped here (a rate on an unbound function auto-fires
                 // nothing) and reported by validation. `sources` is filled in
@@ -1821,6 +1844,59 @@ impl Engine {
             // auto-fire that keeps firing into a game the player just escaped
             // from is the stuck-input failure this project refuses to ship.
             self.slots[si].cancel_all_turbo(si as u8, &mut self.timers);
+        }
+        self.apply_macro_moves(&mut deltas);
+        deltas
+    }
+
+    /// Switch ONE macro of one slot on or off while the engine is running, and
+    /// release whatever it was holding if it goes off mid-run.
+    ///
+    /// `slot` is the slot NUMBER and `index` indexes that slot's
+    /// [`crate::Macros::defs`] — the same index a [`crate::MacroTrigger`]
+    /// carries, so a caller that knows the preset knows this. Unknown slot or
+    /// index is a no-op, like every other lookup in this engine.
+    ///
+    /// Disabling is an EXIT, not a pause: it takes the one path every other
+    /// exit takes ([`SlotRuntime::macro_cancel`]) — pending steps cancelled,
+    /// everything the macro held released, one delta batch. Anything less would
+    /// mean a macro could be switched off while it was holding ↓→ and leave the
+    /// game reading a direction nobody is pressing, which is the stuck-input
+    /// failure this project refuses to ship.
+    ///
+    /// Re-enabling never resumes: the run is gone, and the next press starts a
+    /// fresh one. A half-finished quarter-circle is not a thing to restore.
+    pub fn set_macro_enabled(&mut self, slot: u8, index: u16, enabled: bool) -> Deltas {
+        let mut deltas = Deltas::new();
+        let Some(si) = self.slots.iter().position(|s| s.number == slot) else {
+            return deltas;
+        };
+        if usize::from(index) >= self.slots[si].macros.len() {
+            return deltas;
+        }
+        self.slots[si].macros[usize::from(index)].enabled = enabled;
+        if !enabled {
+            self.slots[si].macro_cancel(usize::from(index), si as u8, &mut self.timers);
+        }
+        self.apply_macro_moves(&mut deltas);
+        deltas
+    }
+
+    /// Flip a slot's macro MASTER switch (`macros = "on" | "off"`) live.
+    ///
+    /// Turning it off cancels every macro in flight on that slot, exactly as
+    /// [`Engine::cancel_macros`] does for all of them — same door, same
+    /// release-everything guarantee. Turning it back on restores each macro's
+    /// own `enabled`, which was never touched: the master switch overrides the
+    /// individual flags, it does not overwrite them.
+    pub fn set_slot_macros(&mut self, slot: u8, switch: crate::MacroSwitch) -> Deltas {
+        let mut deltas = Deltas::new();
+        let Some(si) = self.slots.iter().position(|s| s.number == slot) else {
+            return deltas;
+        };
+        self.slots[si].macros_on = switch.is_on();
+        if !switch.is_on() {
+            self.slots[si].cancel_all_macros(si as u8, &mut self.timers);
         }
         self.apply_macro_moves(&mut deltas);
         deltas

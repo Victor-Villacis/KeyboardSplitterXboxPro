@@ -16,8 +16,8 @@ use crate::games::GamesFile;
 use crate::preset::{BindingEntry, GuardedEntry, MacroFile, PresetFile};
 use ksx_core::socd::{opposing_pairs, shadowing_chord};
 use ksx_core::{
-    Axis, Binding, Key, Persona, Preset, Repeat, Socd, TurboBinding, MAX_SLOTS, MAX_XINPUT_SLOTS,
-    MIN_STEP_MS, TURBO_MAX_HZ,
+    Axis, Binding, Key, MacroSwitch, Persona, Preset, Repeat, Socd, TurboBinding, MAX_SLOTS,
+    MAX_XINPUT_SLOTS, MIN_STEP_MS, TURBO_MAX_HZ,
 };
 
 /// One validation finding. All findings are non-fatal: the caller decides
@@ -140,6 +140,19 @@ pub enum Issue {
         key: String,
         /// Every macro this key starts, in file order.
         macros: Vec<String>,
+    },
+    /// Advisory: a macro says `enabled = false`. It keeps its steps and its
+    /// trigger row and never runs — deliberate, and exactly the kind of thing
+    /// that is invisible from a cabinet, so it is said out loud every run.
+    MacroDisabled { preset: String, name: String },
+    /// Advisory: a slot says `macros = "off"` while its preset defines some.
+    /// The other half of [`Issue::MacroDisabled`]: "my macro does nothing" has
+    /// two causes and this is the one you cannot see by reading the preset.
+    SlotMacrosOff {
+        slot: u8,
+        preset: String,
+        /// How many macros the preset defines — all of them silenced.
+        macros: usize,
     },
     /// Two `[macros]` tables whose names differ only in case. Macro names are
     /// matched case-insensitively (function names are), so one would shadow the
@@ -296,7 +309,16 @@ impl Issue {
                 | Issue::TurboOnConsume { .. }
                 // Advisory because several macros on one key is a real thing to
                 // want; what it is not is something to discover from a cabinet.
+                // Kept advisory rather than promoted to a fault even though the
+                // WRITERS now refuse to create one: files that already have the
+                // shape (hand-edited, or written before the rule) must keep
+                // loading and keep warning, not break.
                 | Issue::SharedMacroTrigger { .. }
+                // Advisory on both sides for the same reason: switching a macro
+                // off is a deliberate act, and the only failure mode is
+                // forgetting you did it.
+                | Issue::MacroDisabled { .. }
+                | Issue::SlotMacrosOff { .. }
         )
     }
 }
@@ -548,6 +570,23 @@ impl fmt::Display for Issue {
                 "preset '{preset}': '{MACRO_PREFIX}{name}' carries a when/unless guard, but a \
                  macro is started by a key — a chord that starts a sequence is not implemented"
             ),
+            Issue::MacroDisabled { preset, name } => write!(
+                f,
+                "preset '{preset}': macro '{name}' is `enabled = false`, so pressing its trigger \
+                 key does nothing — the steps and the `{MACRO_PREFIX}{name}` row are still there, \
+                 waiting for `enabled = true` (or `ksx macro --preset \"{preset}\" --name {name} \
+                 --enable`)"
+            ),
+            Issue::SlotMacrosOff {
+                slot,
+                preset,
+                macros,
+            } => write!(
+                f,
+                "slot {slot}: macros = \"off\", so none of the {macros} macro(s) preset '{preset}' \
+                 defines will run on it — nothing is deleted and each macro's own `enabled` is \
+                 untouched; set `macros = \"on\"` on that [[slot]] to bring them back"
+            ),
             Issue::DuplicateMacroName { preset, name } => write!(
                 f,
                 "preset '{preset}': more than one [macros] table is called '{name}' (macro names \
@@ -717,6 +756,7 @@ pub fn validate(config: &ConfigFile, presets: &[PresetFile]) -> Vec<Issue> {
     let cores = core_presets(presets);
     for slot in &config.slots {
         socd_issues(&cores, slot.number, &slot.preset, slot.socd, &mut issues);
+        macros_off_issue(&cores, slot.number, &slot.preset, slot.macros, &mut issues);
     }
     issues
 }
@@ -754,6 +794,7 @@ pub fn validate_games(games: &GamesFile, presets: &[PresetFile]) -> Vec<Issue> {
                 });
             }
             socd_issues(&cores, slot.number, &slot.preset, slot.socd, &mut issues);
+            macros_off_issue(&cores, slot.number, &slot.preset, slot.macros, &mut issues);
             if let Some(value) = slot.user_index {
                 if !(1..=4).contains(&value) {
                     issues.push(Issue::GameUserIndexOutOfRange {
@@ -819,6 +860,32 @@ fn socd_issues(
             function: crate::function_name(&chord.binding),
         });
     }
+}
+
+/// The master switch, said out loud — but only when it actually silences
+/// something. A slot with `macros = "off"` and a preset that defines none is a
+/// setting with no consequence, and validation does not narrate those.
+fn macros_off_issue(
+    cores: &BTreeMap<String, Preset>,
+    slot: u8,
+    preset_name: &str,
+    switch: MacroSwitch,
+    issues: &mut Vec<Issue>,
+) {
+    if switch.is_on() {
+        return;
+    }
+    let Some(core) = cores.get(preset_name) else {
+        return; // an unknown preset ref is already reported
+    };
+    if core.macros.defs.is_empty() {
+        return;
+    }
+    issues.push(Issue::SlotMacrosOff {
+        slot,
+        preset: preset_name.to_owned(),
+        macros: core.macros.defs.len(),
+    });
 }
 
 fn known_preset_names(presets: &[PresetFile]) -> BTreeSet<&str> {
@@ -1043,6 +1110,14 @@ fn validate_macros(preset: &PresetFile, pairs: &[(String, Flat<'_>)], issues: &m
     for (macro_name, def) in &preset.macros {
         if def.steps.is_empty() {
             issues.push(Issue::EmptyMacro {
+                preset: name(),
+                name: macro_name.clone(),
+            });
+        }
+        // Said out loud every run, because "this macro does nothing" is the
+        // report, and a flag in a file is not somewhere anyone looks first.
+        if !def.enabled {
+            issues.push(Issue::MacroDisabled {
                 preset: name(),
                 name: macro_name.clone(),
             });
@@ -1420,6 +1495,7 @@ preset = "default"
                     preset: "missing".into(),
                     persona: Persona::default(),
                     socd: Socd::default(),
+                    macros: Default::default(),
                 },
                 SlotEntry {
                     number: 1,
@@ -1428,6 +1504,7 @@ preset = "default"
                     preset: "default".into(),
                     persona: Persona::default(),
                     socd: Socd::default(),
+                    macros: Default::default(),
                 },
                 SlotEntry {
                     number: MAX_SLOTS + 1,
@@ -1436,6 +1513,7 @@ preset = "default"
                     preset: "empty".into(),
                     persona: Persona::default(),
                     socd: Socd::default(),
+                    macros: Default::default(),
                 },
             ],
             ..ConfigFile::default()
@@ -1465,6 +1543,7 @@ preset = "default"
             preset: "default".into(),
             persona,
             socd: Socd::default(),
+            macros: Default::default(),
         };
         // 5 Xbox slots: one more than Windows can ever show to a game.
         let cfg = ConfigFile {
@@ -1507,6 +1586,7 @@ preset = "default"
             preset: "default".into(),
             persona: Persona::Xbox360,
             socd: Socd::default(),
+            macros: Default::default(),
         };
         let mut games: GamesFile =
             toml::from_str("[[game]]\ntitle = \"MAME 8P\"\npath = \"C:\\\\mame\\\\mame.exe\"\n")
@@ -1847,6 +1927,103 @@ preset = "default"
         for part in ["Q", "op", "ppp", "test", "SUPERPOSITION", "repeat"] {
             assert!(text.contains(part), "{text}");
         }
+    }
+
+    /// The advisory has to survive the WRITERS refusing to create the shape.
+    /// Hand-edited files with a shared trigger already exist (Victor's did),
+    /// and the rule for them is unchanged: they load, and they warn.
+    #[test]
+    fn a_pre_existing_shared_trigger_still_only_warns() {
+        let presets = vec![macro_preset(
+            "[bindings]\nmacro.a = \"Q\"\nmacro.b = \"Q\"\n\
+             [macros.a]\nsteps = [{ hold = [\"A\"], ms = 50 }]\n\
+             [macros.b]\nsteps = [{ hold = [\"B\"], ms = 50 }]\n",
+        )];
+        let issues = validate(&ConfigFile::default(), &presets);
+        assert!(
+            issues.iter().all(Issue::is_advisory),
+            "an existing collision must never become a load failure: {issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| matches!(i, Issue::SharedMacroTrigger { .. })),
+            "{issues:?}"
+        );
+    }
+
+    /// A disabled macro is advice, said every run, because "this macro does
+    /// nothing" is the report and a flag in a file is not where anyone looks.
+    #[test]
+    fn a_disabled_macro_is_named_and_advisory() {
+        let presets = vec![macro_preset(
+            "[bindings]\nmacro.hadouken = \"P\"\n\
+             [macros.hadouken]\nenabled = false\nsteps = [{ hold = [\"A\"], ms = 50 }]\n",
+        )];
+        let issues = validate(&ConfigFile::default(), &presets);
+        assert_eq!(
+            issues,
+            vec![Issue::MacroDisabled {
+                preset: "m".into(),
+                name: "hadouken".into()
+            }],
+            "{issues:?}"
+        );
+        assert!(issues[0].is_advisory());
+        let text = issues[0].to_string();
+        for part in ["hadouken", "enabled = false", "--enable"] {
+            assert!(text.contains(part), "{text}");
+        }
+    }
+
+    /// The other half: the slot switch, reported only when it silences
+    /// something. A setting with no consequence is not narrated.
+    #[test]
+    fn a_slot_with_macros_off_says_what_it_silenced() {
+        let presets = vec![macro_preset(
+            "[bindings]\nmacro.hadouken = \"P\"\n\
+             [macros.hadouken]\nsteps = [{ hold = [\"A\"], ms = 50 }]\n",
+        )];
+        let slot = |preset: &str, macros: MacroSwitch| SlotEntry {
+            number: 1,
+            keyboard: None,
+            mouse: None,
+            preset: preset.into(),
+            persona: Persona::default(),
+            socd: Socd::default(),
+            macros,
+        };
+
+        let cfg = ConfigFile {
+            slots: vec![slot("m", MacroSwitch::Off)],
+            ..ConfigFile::default()
+        };
+        let issues = validate(&cfg, &presets);
+        assert!(
+            issues.contains(&Issue::SlotMacrosOff {
+                slot: 1,
+                preset: "m".into(),
+                macros: 1,
+            }),
+            "{issues:?}"
+        );
+        assert!(issues.iter().all(Issue::is_advisory), "{issues:?}");
+
+        // `on` says nothing, and neither does `off` on a preset with no macros
+        // to silence.
+        let quiet = ConfigFile {
+            slots: vec![
+                slot("m", MacroSwitch::On),
+                slot("default", MacroSwitch::Off),
+            ],
+            ..ConfigFile::default()
+        };
+        assert!(
+            !validate(&quiet, &presets)
+                .iter()
+                .any(|i| matches!(i, Issue::SlotMacrosOff { .. })),
+            "a switch with no consequence must not be narrated"
+        );
     }
 
     /// Macro names are matched ignoring case, so two tables differing only in

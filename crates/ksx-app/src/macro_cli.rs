@@ -48,6 +48,9 @@ pub struct Options {
     /// Delete the table (and the `macro.<name>` trigger rows that would
     /// otherwise dangle) instead of writing one. No body is read.
     pub delete: bool,
+    /// `--enable` / `--disable`: switch the existing table on or off and
+    /// change nothing else. No body is read.
+    pub set_enabled: Option<bool>,
     pub json: bool,
 }
 
@@ -55,7 +58,11 @@ pub fn run(options: Options) -> anyhow::Result<()> {
     let root = ksx_config::ConfigRoot::discover()?;
     let store = ksx_config::Store::new(root);
 
-    let body = if options.delete {
+    // Both --delete and --enable/--disable are whole-table operations that
+    // name the table and say nothing about its contents, so neither reads a
+    // body: a toggle that had to be handed a step list could not promise the
+    // steps came back unchanged.
+    let body = if options.delete || options.set_enabled.is_some() {
         ksx_config::MacroFile::default()
     } else {
         read_body(options.from_json.as_deref())?
@@ -68,6 +75,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
             name: options.name,
             body,
             delete: options.delete,
+            set_enabled: options.set_enabled,
         },
     ) {
         Ok(applied) => {
@@ -82,6 +90,10 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                         "steps": applied.steps,
                         "total_ms": applied.total_ms,
                         "deleted": applied.deleted,
+                        // Does it RUN? `toggled` says this write was only
+                        // --enable/--disable and touched nothing else.
+                        "enabled": applied.enabled,
+                        "toggled": applied.toggled,
                         // The keys that START it. Unchanged by this verb —
                         // `ksx map --function macro.<name>` writes those —
                         // except on a delete, where they went with the table.

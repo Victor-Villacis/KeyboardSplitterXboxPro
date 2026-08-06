@@ -3154,8 +3154,42 @@ a.strow:hover {
   width: 6rem;
 }
 
-.macdelmac {
+/* v14: the per-macro ON/OFF switch. It sits beside Delete because they are the
+   two answers to "not this macro, not now" — and it has to look like the
+   cheaper one. Enabled is quiet; DISABLED is loud, because a card whose every
+   other line describes a sequence that will not run must say so at a glance. */
+.macen {
   margin-left: auto;
+}
+
+.macen.on {
+  color: var(--text-tertiary);
+}
+
+.macen.offstate {
+  color: var(--warn);
+  border-color: var(--warn);
+  background: var(--warn-dim, transparent);
+  font-weight: var(--fw-semibold);
+}
+
+/* No macro loaded: inert, not a switch for something that is not there. */
+.macen.dead {
+  opacity: 0.5;
+}
+
+/* The SLOT's `macros = "off"`, above everything it silences. Empty (and so
+   invisible) on every slot that runs macros. */
+.macslotoff:not(:empty) {
+  margin: 0 0 var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border-left: 3px solid var(--warn);
+  font-size: var(--fs-xs);
+  color: var(--warn);
+}
+
+.macdelmac {
+  margin-left: var(--sp-2);
   color: var(--danger);
   border-color: var(--danger-line);
 }

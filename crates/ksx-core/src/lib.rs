@@ -22,6 +22,8 @@
 //! - [`slot`] — [`SlotSpec`] and the 13-variant [`InvalidationReason`] taxonomy
 //! - [`socd`] — [`Socd`]: SOCD cleaning, generated as chords rather than as a
 //!   new engine rule
+//! - [`templates`] — in-box preset [`Template`]s for standard panels: the
+//!   zero-mapping out-of-box experience (`docs/MAPPER-UX.md` commandment 9)
 //! - [`persona`] — [`Persona`]: which controller a slot presents itself as
 //! - [`engine`] — the [`Engine`]: precompiled dispatch, per-device key state, diffing
 //! - [`escape`] — [`EscapeDetector`], emergency-escape detection (policy lives upstream)
@@ -36,15 +38,16 @@ pub mod persona;
 pub mod preset;
 pub mod slot;
 pub mod socd;
+pub mod templates;
 
 pub use device::{DeviceId, KeyEvent};
 pub use engine::{Deltas, Engine, EngineTables, PadDelta, ResolvedSlot};
 pub use escape::{Escape, EscapeDetector};
 pub use key::Key;
 pub use macros::{
-    Interrupt, Macro, MacroStep, MacroTrigger, OnRelease, Repeat, Retrigger, StepDuration,
-    TurboRate, UnknownInterrupt, UnknownOnRelease, UnknownRepeat, UnknownRetrigger, MIN_STEP_MS,
-    TURBO_MAX_HZ,
+    Interrupt, Macro, MacroStep, MacroSwitch, MacroTrigger, OnRelease, Repeat, Retrigger,
+    StepDuration, TurboRate, UnknownInterrupt, UnknownMacroSwitch, UnknownOnRelease, UnknownRepeat,
+    UnknownRetrigger, MIN_STEP_MS, TURBO_MAX_HZ,
 };
 pub use pad::{
     safe_axis, Axis, DpadDirection, PadState, Trigger, XButton, XButtons, AXIS_CENTER, AXIS_MAX,
@@ -53,4 +56,5 @@ pub use pad::{
 pub use persona::{Persona, UnknownPersona};
 pub use preset::{Binding, Chord, Macros, Preset, TurboBinding};
 pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS, MAX_XINPUT_SLOTS};
+pub use templates::{Template, TemplateError, MAX_TEMPLATE_PLAYERS, TEMPLATES};
 pub use socd::{OpposingPair, Socd, UnknownSocd};

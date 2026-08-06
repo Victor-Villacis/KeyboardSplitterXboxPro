@@ -710,6 +710,7 @@ mod tests {
                 preset: "street-fighter-p1".into(),
                 persona: ksx_core::Persona::default(),
                 socd: ksx_core::Socd::default(),
+                macros: Default::default(),
             }],
         }
     }
@@ -763,6 +764,7 @@ mod tests {
                     preset: "IPAC P1".into(),
                     persona: ksx_core::Persona::default(),
                     socd: ksx_core::Socd::default(),
+                    macros: Default::default(),
                 }],
             }],
         };

@@ -1149,6 +1149,35 @@ async function macroWrite(preset: string, mac: MacroView, remove = false): Promi
   }
 }
 
+/** The TOGGLE request: `enabled` and no body. See `macroToggleEnabled`. */
+async function macroSetEnabled(
+  preset: string,
+  name: string,
+  enabled: boolean,
+): Promise<MacroOutcome> {
+  try {
+    return await fetchJSON<MacroOutcome>("/api/macro/save", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      // NO `steps`: that is what makes this a toggle rather than a write of
+      // whatever the grid happens to be holding.
+      body: JSON.stringify({ preset, name, enabled, reload: true }),
+    });
+  } catch {
+    return {
+      ok: false,
+      message: null,
+      error: "the macro switch request failed — is ksx studio still running?",
+      code: null,
+      problems: [],
+      warnings: [],
+      deleted: false,
+      backup: null,
+      reloaded: false,
+    };
+  }
+}
+
 /** A refusal, in one sentence: the daemon's own words plus every problem row
  *  it listed (validation names them one per fault — a step holding `warp`, a
  *  duration in two units — and swallowing them would leave the user guessing
@@ -1385,6 +1414,60 @@ async function macroRename(): Promise<void> {
       undone: `It is called "${from.name}" again.`,
     },
   );
+}
+
+/** SWITCH ON/OFF: the one write on this card that touches nothing but a flag.
+ *
+ *  Sent WITHOUT `steps`, which is the daemon's toggle spelling (pipe.rs
+ *  `map-macro`): the table on disk keeps every step and every policy, and only
+ *  `enabled` moves. That matters more than it looks — the whole reason to
+ *  disable rather than delete is that what comes back is exactly what went
+ *  away, and a toggle that re-sent the browser's draft could not promise it
+ *  (the grid may be dirty, and it may be dirty in a way that would not save).
+ *
+ *  So this deliberately ignores the draft and reads the ON-DISK state. */
+async function macroToggleEnabled(): Promise<void> {
+  const target = macroTarget();
+  if (!target) return;
+  const { mac, preset } = target;
+  if (!macroIsOnDisk()) {
+    pushToast(
+      `"${mac.name}" is not in the preset file yet, so there is nothing to switch off. ` +
+        "Press Save macro first.",
+      { kind: "warn" },
+    );
+    return;
+  }
+  const onDisk = macroOnDiskCopy(mac.name);
+  const wasDisabled = onDisk?.disabled === true;
+  const out = await macroSetEnabled(preset, mac.name, wasDisabled);
+  if (!out.ok) {
+    oops(
+      `"${mac.name}" was NOT switched ${wasDisabled ? "on" : "off"}: ${macroRefusal(out)}. ` +
+        "The preset file is untouched.",
+    );
+    return;
+  }
+  markSaved();
+  await poll();
+  syncMacroControls();
+  const line = wasDisabled
+    ? `"${mac.name}" is ON again in "${preset}" — its trigger starts it as before.`
+    : `"${mac.name}" is OFF in "${preset}" — it keeps its steps and its trigger row, and ` +
+      "never runs. Switch it back on any time; nothing was lost." +
+      (mac.triggers.length > 0 ? ` ${keyList(mac.triggers)} now starts nothing.` : "");
+  pushToast(line + macroNotes(out), {
+    kind: "ok",
+    // The undo is the opposite flag — one field back, exactly like the write.
+    undo: async () => {
+      await macroSetEnabled(preset, mac.name, !wasDisabled);
+      await poll();
+      syncMacroControls();
+    },
+    undone: wasDisabled
+      ? `"${mac.name}" is switched off again.`
+      : `"${mac.name}" runs again.`,
+  });
 }
 
 /** DELETE: remove the table (and the trigger rows that would dangle). */
@@ -1665,6 +1748,10 @@ function wire(root: HTMLElement): void {
     }
     if (act === "macro-delete") {
       void macroDelete();
+      return;
+    }
+    if (act === "macro-enable") {
+      void macroToggleEnabled();
       return;
     }
     if (act === "macro-addstep") {

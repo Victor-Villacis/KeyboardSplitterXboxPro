@@ -29,6 +29,17 @@
 //!   That is what makes the mapper's "Map all to one key" work: N ordinary
 //!   writes of one key, and all N stick (MAPPER-UX commandment 7 — duplicates
 //!   are information, fan-out is the product).
+//! - **MACROS ARE THE ONE EXCEPTION, and it is not an inconsistency.** Binding
+//!   `macro.B` to a key that already starts `macro.A` in the SAME preset is
+//!   REFUSED before any write ([`MapError::MacroTriggerTaken`]), naming both
+//!   macros and the key, with `--force` to do it anyway. A binding is
+//!   declarative STATE — two keys setting one bit, or one key setting two, are
+//!   both well-defined, which is exactly why duplicates are information here. A
+//!   macro is an imperative TIMELINE, and two timelines started together do not
+//!   compose into a third: they interleave, and the game reads a superposition
+//!   containing states no single step list has. Fan-out is the product for
+//!   state and a bug for time. Cross-slot and cross-preset sharing stay legal —
+//!   two players pressing one key is fan-out again.
 //! - **`--clear`** leaves the function in the file bound to the inert `"None"`
 //!   placeholder — the same convention as the built-in empty preset, so a
 //!   cleared control stays visible instead of silently vanishing. Guarded rows
@@ -89,9 +100,16 @@ pub struct MapSpec {
     /// Empty means "not given" — the write then follows [`MapSpec::key`], and
     /// neither one is a clear.
     pub keys: Vec<String>,
-    /// Write anyway when the key is already bound in ANOTHER SLOT's preset
-    /// (the only conflict left). It removes nothing, anywhere: see module
-    /// docs. Same-preset duplicates never need it — they are multi-binds.
+    /// Write anyway when the write would otherwise be refused. Two refusals
+    /// answer to it, and it removes nothing in either case (see module docs):
+    ///
+    /// - the key is already bound in ANOTHER SLOT's preset (cross-slot);
+    /// - `macro.<name>` whose key already starts a DIFFERENT macro of the SAME
+    ///   preset — "start both anyway", reported as
+    ///   [`AppliedMap::shared_macros`].
+    ///
+    /// Same-preset duplicates on ordinary BINDINGS never need it — those are
+    /// multi-binds, and they are the product rather than a hazard.
     pub force: bool,
     /// Take this key away from exactly ONE other function of the same preset
     /// (`--move-from B`). The old, explicit "move the key" behaviour; the
@@ -206,6 +224,11 @@ pub struct AppliedMap {
     /// bound to on its own)`. ksx does not defer input, so that binding shows
     /// for a moment before the chord completes.
     pub flash: Vec<(String, String)>,
+    /// MACRO TRIGGERS ONLY, and only after `--force`: the OTHER macros of this
+    /// same preset that these keys also start. Empty on every ordinary write,
+    /// because the write is refused instead ([`MapError::MacroTriggerTaken`]).
+    /// Reported so a forced superposition is at least a stated one.
+    pub shared_macros: Vec<String>,
     /// The auto-fire rate this function now holds, as authored, or `None` if it
     /// does not auto-fire.
     pub turbo_hz: Option<u32>,
@@ -288,6 +311,17 @@ impl AppliedMap {
             for conflict in &self.overridden {
                 line.push_str(&format!("; still {}", conflict.line()));
             }
+            // A forced superposition, stated. Not the same sentence as
+            // `also_drives`: two macros on one key do not fan out, they
+            // INTERLEAVE, and the game reads a timeline neither of them has.
+            if !self.shared_macros.is_empty() {
+                line.push_str(&format!(
+                    "; WARNING: {} also starts {} — both sequences now run at once and the game \
+                     reads their superposition",
+                    self.keys.join(", "),
+                    self.shared_macros.join(", ")
+                ));
+            }
         }
         for (key, bound_to) in &self.flash {
             line.push_str(&format!(
@@ -325,6 +359,28 @@ pub enum MapError {
     Conflicts {
         key: String,
         conflicts: Vec<MapConflict>,
+    },
+    /// ONE MACRO PER KEY: this key already starts a DIFFERENT macro of the same
+    /// preset. Refused before any write, with both macros and the key named.
+    ///
+    /// The rule that is right for bindings is wrong here, and the reason is in
+    /// [`ksx_core::MacroTrigger`]: a binding is declarative STATE, so two of
+    /// them on one key compose (fan-out is the product); a macro is an
+    /// imperative TIMELINE, and two of those on one key do not compose into a
+    /// third — they run at once and the game reads their SUPERPOSITION, a
+    /// sequence nobody authored and one that is invisible from either macro's
+    /// own definition. That cost an evening of ghost-hunting once.
+    ///
+    /// `--force` writes it anyway (the response then says so out loud), and
+    /// cross-slot / cross-preset sharing is untouched — that IS fan-out.
+    MacroTriggerTaken {
+        preset: String,
+        /// The key that is already spoken for.
+        key: String,
+        /// The macro it already starts.
+        taken_by: String,
+        /// The macro this write wanted to add to it.
+        wanted: String,
     },
     /// `macro.<name>` for a macro this preset does not define. `ksx map` binds
     /// a TRIGGER; the sequence itself is authored in the file's `[macros]`
@@ -409,6 +465,23 @@ impl std::fmt::Display for MapError {
                      edited)"
                 )
             }
+            MapError::MacroTriggerTaken {
+                preset,
+                key,
+                taken_by,
+                wanted,
+            } => write!(
+                f,
+                "refusing to bind {key} to macro \"{wanted}\": in preset \"{preset}\" that key \
+                 already starts macro \"{taken_by}\". Two macros on one key do not take turns — \
+                 they run AT ONCE, and the game reads their superposition: states neither step \
+                 list contains, repeating for as long as the loudest `repeat` policy among them \
+                 says. (Ordinary bindings compose safely because they are declarative STATE; a \
+                 macro is an imperative TIMELINE, so the rule that is right for bindings is wrong \
+                 here.) Give \"{wanted}\" its own key, or unbind \"{taken_by}\" first \
+                 (`ksx map --preset \"{preset}\" --function macro.{taken_by} --clear`) — or pass \
+                 --force to start both anyway. Nothing was written"
+            ),
             MapError::UnknownMacro {
                 preset,
                 name,
@@ -634,6 +707,20 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
                     .filter(|(k, b)| k == key && ksx_config::function_name(b) != canonical)
                     .map(|(_, b)| ksx_config::function_name(b)),
             );
+            // A `macro.<name>` row is something this key ALSO does, and it is
+            // the one co-binding that is worth reading twice: pressing this key
+            // now starts a timed sequence as well as driving this control.
+            // Legal (a macro trigger is not a pad function, so there is no
+            // superposition here — see `MapError::MacroTriggerTaken` for the
+            // case that is), and never a surprise if it is reported.
+            also_drives.extend(
+                core.macros
+                    .triggers
+                    .iter()
+                    .filter(|t| t.key == *key)
+                    .filter_map(|t| core.macros.get(t.index))
+                    .map(|m| ksx_config::macro_function_name(&m.name)),
+            );
         }
         also_drives.sort();
         also_drives.dedup();
@@ -678,6 +765,8 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         moved_from,
         overridden,
         flash,
+        // A pad-function write can never share a macro trigger — it is not one.
+        shared_macros: Vec::new(),
         turbo_hz: turbo_row.map(|t| t.hz),
         turbo_effective_hz: turbo_row.map(|t| t.effective_hz()),
     })
@@ -718,6 +807,40 @@ fn apply_macro_trigger(store: &Store, spec: &MapSpec, name: &str) -> Result<Appl
         });
     };
     let canonical = ksx_config::macro_function_name(&core.macros.defs[usize::from(index)].name);
+    let wanted = core.macros.defs[usize::from(index)].name.clone();
+
+    // ONE MACRO PER KEY, inside one preset. Checked BEFORE the cross-slot
+    // conflict and before any write, because this is the closer, cheaper
+    // mistake: the other slot's preset is at least somewhere else, while this
+    // one hides in the same file and shows up only as a sequence that grew
+    // steps. See `MapError::MacroTriggerTaken` for why macros get a rule
+    // bindings do not.
+    //
+    // The trigger rows this write is about are excluded (`t.index != index`) —
+    // rebinding a macro onto a key it already has is not a collision — and so
+    // is the inert `"None"` placeholder, which starts nothing.
+    let mut shared_macros: Vec<String> = Vec::new();
+    for key in &keys {
+        for trigger in &core.macros.triggers {
+            if trigger.index == index || trigger.key != *key || trigger.key == Key::None {
+                continue;
+            }
+            let Some(other) = core.macros.get(trigger.index) else {
+                continue; // a dangling index starts nothing; validation names it
+            };
+            if !spec.force {
+                return Err(MapError::MacroTriggerTaken {
+                    preset: file.name.clone(),
+                    key: key.name().to_owned(),
+                    taken_by: other.name.clone(),
+                    wanted,
+                });
+            }
+            if !shared_macros.contains(&other.name) {
+                shared_macros.push(other.name.clone());
+            }
+        }
+    }
 
     // A macro trigger is a key like any other, so the one conflict that
     // survives — the key already doing something in ANOTHER slot's preset —
@@ -778,6 +901,7 @@ fn apply_macro_trigger(store: &Store, spec: &MapSpec, name: &str) -> Result<Appl
         unless: Vec::new(),
         also_drives,
         moved_from: None,
+        shared_macros,
         // A macro repeats by saying so in its own table; a trigger row has no
         // rate of its own to report.
         turbo_hz: None,
@@ -1323,6 +1447,20 @@ pub struct MacroSpec {
     /// grid, or a caller whose `steps` field was misspelled, gets a refusal
     /// instead of quietly deleting the user's macro.
     pub delete: bool,
+    /// SWITCH the existing table on or off and change nothing else
+    /// (`ksx macro --enable` / `--disable`, the pipe's `"enabled"`, Studio's
+    /// per-macro toggle).
+    ///
+    /// `Some(_)` makes this a TOGGLE rather than a write: [`MacroSpec::body`]
+    /// is ignored, the table on disk keeps every step and every policy it had,
+    /// and only `enabled` moves. That is deliberate — the whole value of
+    /// disabling instead of deleting is that what comes back is exactly what
+    /// went away, and a toggle that round-tripped the body through a caller's
+    /// idea of it would not guarantee that.
+    ///
+    /// `None` is an ordinary whole-table write, which carries whatever
+    /// `body.enabled` says.
+    pub set_enabled: Option<bool>,
 }
 
 /// What a successful [`save_macro`] did.
@@ -1338,6 +1476,11 @@ pub struct AppliedMacro {
     /// applied) — 0 for a delete.
     pub total_ms: u64,
     pub deleted: bool,
+    /// Does the table now RUN? `true` for every ordinary write and for a
+    /// delete (nothing is left to be off), `false` after `--disable`.
+    pub enabled: bool,
+    /// This write was a `--enable`/`--disable` and touched nothing else.
+    pub toggled: bool,
     /// The keys that START this macro. Untouched by this verb either way:
     /// on a write they are what the trigger rows already say (`ksx map
     /// --function macro.<name>` is what changes them), and on a delete they
@@ -1356,6 +1499,33 @@ impl AppliedMacro {
     /// The one-line confirmation every surface prints — what was written, what
     /// starts it, what was backed up, and every advisory, in that order.
     pub fn message(&self) -> String {
+        // A toggle gets its own sentence: it changed one flag, and saying
+        // "3 steps · 200 ms" for it would read like a rewrite.
+        if self.toggled {
+            let mut line = format!(
+                "\"{}\": macro \"{}\" {} — its steps and trigger row are untouched",
+                self.preset,
+                self.name,
+                if self.enabled {
+                    "ENABLED (it runs again)"
+                } else {
+                    "DISABLED (it keeps everything and never runs)"
+                }
+            );
+            if !self.enabled {
+                line.push_str(&match self.triggers.as_slice() {
+                    [] => String::new(),
+                    keys => format!(", so {} now starts nothing", keys.join(", ")),
+                });
+            }
+            if let Some(backup) = &self.backup {
+                line.push_str(&format!(
+                    " — the previous file is backed up as {}",
+                    backup.stamp
+                ));
+            }
+            return line;
+        }
         let mut line = if self.deleted {
             let mut line = format!("\"{}\": macro \"{}\" deleted", self.preset, self.name);
             if !self.triggers.is_empty() {
@@ -1441,6 +1611,45 @@ pub fn save_macro(store: &Store, spec: &MacroSpec) -> Result<AppliedMacro, MapEr
 
     let mut next = file.clone();
     let mut warnings = Vec::new();
+    if let Some(enabled) = spec.set_enabled {
+        // A TOGGLE: the table on disk keeps every step and every policy, and
+        // only `enabled` moves. Nothing is validated beyond "it exists" —
+        // switching a macro off must work on a macro that is already broken
+        // (that is often exactly WHY you are switching it off), and switching
+        // one on cannot introduce a fault the file did not already have.
+        let Some(key) = existing else {
+            return Err(MapError::UnknownMacro {
+                preset: file.name.clone(),
+                name: name.to_owned(),
+                known: file.macros.keys().cloned().collect(),
+            });
+        };
+        if spec.delete {
+            return Err(refuse(vec![
+                "--enable/--disable and --delete ask for opposite things (one keeps the macro, \
+                 the other removes it) — pick one"
+                    .to_owned(),
+            ]));
+        }
+        let body = next.macros.get_mut(&key).expect("the table was just found");
+        body.enabled = enabled;
+        let (steps, total_ms) = (body.steps.len(), body_total_ms(body));
+        let backup = take_backup(store, &file.name)?;
+        let path = store.save_preset(&next)?;
+        return Ok(AppliedMacro {
+            path,
+            preset: file.name,
+            name: key,
+            steps,
+            total_ms,
+            deleted: false,
+            enabled,
+            toggled: true,
+            triggers,
+            backup,
+            warnings,
+        });
+    }
     if spec.delete {
         let Some(key) = existing else {
             return Err(MapError::UnknownMacro {
@@ -1500,6 +1709,10 @@ pub fn save_macro(store: &Store, spec: &MacroSpec) -> Result<AppliedMacro, MapEr
         steps: written.map_or(0, |(_, body)| body.steps.len()),
         total_ms: written.map_or(0, |(_, body)| body_total_ms(body)),
         deleted: spec.delete,
+        // A delete leaves nothing to be switched off, so it reports `true`
+        // rather than inventing a state for a table that is gone.
+        enabled: written.is_none_or(|(_, body)| body.enabled),
+        toggled: false,
         triggers,
         backup,
         warnings,
@@ -3043,6 +3256,7 @@ steps = [{ hold = ["A"], ms = 50 }]
                         "interrupt": "opposing" }"#,
                 ),
                 delete: false,
+                set_enabled: None,
             },
         )
         .unwrap();
@@ -3099,6 +3313,7 @@ steps = [{ hold = ["A"], ms = 50 }]
                 name: "shoryuken".into(),
                 body: body(r#"{ "steps": [{ "hold": ["dpad.right"], "ms": 50 }] }"#),
                 delete: false,
+                set_enabled: None,
             },
         )
         .unwrap();
@@ -3134,6 +3349,7 @@ steps = [{ hold = ["A"], ms = 50 }]
                                    { "hold": ["warp"], "ms": 50 }] }"#,
                 ),
                 delete: false,
+                set_enabled: None,
             },
         )
         .unwrap_err();
@@ -3177,6 +3393,7 @@ steps = [{ hold = ["A"], ms = 50 }]
                     name: "hadouken".into(),
                     body: body(json),
                     delete: false,
+                    set_enabled: None,
                 },
             )
             .unwrap_err();
@@ -3194,6 +3411,7 @@ steps = [{ hold = ["A"], ms = 50 }]
                 name: "   ".into(),
                 body: body(r#"{ "steps": [{ "hold": ["A"], "ms": 50 }] }"#),
                 delete: false,
+                set_enabled: None,
             },
         )
         .unwrap_err();
@@ -3217,6 +3435,7 @@ steps = [{ hold = ["A"], ms = 50 }]
                                    { "hold": [], "ms": 5, "allow_short": true }] }"#,
                 ),
                 delete: false,
+                set_enabled: None,
             },
         )
         .unwrap();
@@ -3254,6 +3473,7 @@ steps = [{ hold = ["A"], ms = 50 }]
                 name: "hadouken".into(),
                 body: body(r#"{ "steps": [{ "hold": ["dpad.down"], "ms": 50 }] }"#),
                 delete: false,
+                set_enabled: None,
             },
         )
         .unwrap();
@@ -3289,6 +3509,7 @@ steps = [{ hold = ["A"], ms = 50 }]
                 name: "HADOUKEN".into(), // names match case-insensitively
                 body: MacroFile::default(),
                 delete: true,
+                set_enabled: None,
             },
         )
         .unwrap();
@@ -3330,12 +3551,259 @@ steps = [{ hold = ["A"], ms = 50 }]
                 name: "shoryuken".into(),
                 body: MacroFile::default(),
                 delete: true,
+                set_enabled: None,
             },
         )
         .unwrap_err();
         assert!(matches!(err, MapError::UnknownMacro { .. }), "{err}");
         assert!(err.to_string().contains("hadouken"), "{err}");
         assert!(list_backups(&store, "P1").unwrap().is_empty());
+    }
+
+    // ---- ONE MACRO PER KEY (docs/INPUT-TRANSFORMS.md §1c) -----------------
+
+    /// A preset with two macros and one of them already on `P` — the shape the
+    /// second `macro.<name> = "P"` row would turn into a superposition.
+    const TWO_MACROS: &str = r#"
+name = "P1"
+[bindings]
+A = "S"
+macro.hadouken = "P"
+
+[macros.hadouken]
+steps = [{ hold = ["A"], ms = 50 }]
+
+[macros.shoryuken]
+steps = [{ hold = ["A"], ms = 50 }]
+"#;
+
+    fn macro_trigger_spec(name: &str, key: &str, force: bool) -> MapSpec {
+        MapSpec {
+            preset: "P1".into(),
+            function: format!("macro.{name}"),
+            keys: vec![key.to_owned()],
+            force,
+            ..MapSpec::default()
+        }
+    }
+
+    /// The rule Victor's evening paid for: a key that already starts one macro
+    /// will not quietly start a second. Refused BEFORE any write, naming both
+    /// macros and the key.
+    #[test]
+    fn a_second_macro_on_one_key_is_refused_and_writes_nothing() {
+        let root = TempRoot::new("macro-trigger-taken");
+        let store = root.store();
+        preset_toml(&store, TWO_MACROS);
+        let before = std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap();
+
+        let err = apply(&store, &macro_trigger_spec("shoryuken", "P", false)).unwrap_err();
+        let MapError::MacroTriggerTaken {
+            ref key,
+            ref taken_by,
+            ref wanted,
+            ..
+        } = err
+        else {
+            panic!("expected MacroTriggerTaken, got {err}");
+        };
+        assert_eq!(
+            (key.as_str(), taken_by.as_str(), wanted.as_str()),
+            ("P", "hadouken", "shoryuken")
+        );
+        // The message has to name all three, and say WHY macros differ from
+        // bindings — a refusal nobody understands is a refusal people --force.
+        let text = err.to_string();
+        for part in [
+            "P",
+            "hadouken",
+            "shoryuken",
+            "AT ONCE",
+            "TIMELINE",
+            "--force",
+        ] {
+            assert!(text.contains(part), "{text}");
+        }
+        assert_eq!(crate::map::error_code(&err), "macro-trigger-taken");
+        // Refused BEFORE any write: not one byte moved, and no backup either.
+        assert_eq!(
+            std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap(),
+            before
+        );
+    }
+
+    /// `--force` is the explicit "start both anyway", and the answer says so.
+    #[test]
+    fn force_starts_both_macros_and_says_so() {
+        let root = TempRoot::new("macro-trigger-forced");
+        let store = root.store();
+        preset_toml(&store, TWO_MACROS);
+
+        let applied = apply(&store, &macro_trigger_spec("shoryuken", "P", true)).unwrap();
+        assert_eq!(applied.shared_macros, ["hadouken"]);
+        let text = applied.message();
+        for part in ["WARNING", "hadouken", "superposition"] {
+            assert!(text.contains(part), "{text}");
+        }
+        // ...and the file really does hold both rows now.
+        let core = load_preset_by_name(&store, "P1")
+            .unwrap()
+            .to_core()
+            .unwrap();
+        let starts: Vec<&str> = core
+            .macros
+            .triggers
+            .iter()
+            .filter(|t| t.key == Key::P)
+            .filter_map(|t| core.macros.get(t.index))
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(starts.len(), 2, "{starts:?}");
+    }
+
+    /// The rule is per PRESET and per KEY, and it never gets in the way of the
+    /// things that are legal: rebinding a macro onto a key it already has,
+    /// binding it to a free key, or an ordinary pad function sharing that key
+    /// (that is a multi-bind, and multi-binds are the product).
+    #[test]
+    fn one_macro_per_key_never_refuses_the_legal_shapes() {
+        let root = TempRoot::new("macro-trigger-legal");
+        let store = root.store();
+        preset_toml(&store, TWO_MACROS);
+
+        // Same macro, same key: a no-op rewrite, not a collision with itself.
+        apply(&store, &macro_trigger_spec("hadouken", "P", false)).unwrap();
+        // A different key is simply free.
+        let applied = apply(&store, &macro_trigger_spec("shoryuken", "O", false)).unwrap();
+        assert!(applied.shared_macros.is_empty());
+        // A pad FUNCTION on the macro's key is a multi-bind — reported, never
+        // refused (docs/INPUT-TRANSFORMS.md §1a).
+        let applied = apply(
+            &store,
+            &MapSpec {
+                preset: "P1".into(),
+                function: "B".into(),
+                keys: vec!["P".into()],
+                ..MapSpec::default()
+            },
+        )
+        .unwrap();
+        assert!(applied.also_drives.contains(&"macro.hadouken".to_owned()));
+        assert!(applied.shared_macros.is_empty());
+    }
+
+    // ---- enabled / disabled (docs/INPUT-TRANSFORMS.md §1c) -----------------
+
+    /// `--disable` keeps EVERYTHING and only moves the flag; `--enable` puts it
+    /// back. That is the whole promise: what comes back is what went away.
+    #[test]
+    fn disabling_a_macro_keeps_its_body_and_its_triggers() {
+        let root = TempRoot::new("macro-disable");
+        let store = root.store();
+        preset_toml(&store, SF_PRESET);
+
+        let toggle = |enabled: bool| MacroSpec {
+            preset: "P1".into(),
+            name: "HADOUKEN".into(), // case-insensitive, like every name in ksx
+            // A toggle reads NO body: it must work without one.
+            body: MacroFile::default(),
+            delete: false,
+            set_enabled: Some(enabled),
+        };
+
+        let applied = save_macro(&store, &toggle(false)).unwrap();
+        assert!(applied.toggled && !applied.enabled && !applied.deleted);
+        assert_eq!(applied.name, "hadouken", "the file keeps its own spelling");
+        assert_eq!(applied.steps, 1, "the steps are still there");
+        assert_eq!(applied.triggers, ["P", "O"], "and so are the trigger rows");
+        assert!(
+            applied.backup.is_some(),
+            "a toggle is backed up like any write"
+        );
+        let text = applied.message();
+        for part in ["DISABLED", "untouched", "starts nothing"] {
+            assert!(text.contains(part), "{text}");
+        }
+
+        // On disk: the flag, and nothing else moved.
+        let file = load_preset_by_name(&store, "P1").unwrap();
+        assert!(!file.macros["hadouken"].enabled);
+        assert_eq!(file.macros["hadouken"].steps.len(), 1);
+        assert_eq!(macro_trigger_keys(&file, "hadouken"), ["P", "O"]);
+        // ...and it reaches the core model the engine builds from.
+        assert!(!file.to_core().unwrap().macros.defs[0].enabled);
+        // Validation says it out loud rather than leaving a silent ghost.
+        assert!(ksx_config::validate(
+            &ksx_config::ConfigFile::default(),
+            std::slice::from_ref(&file)
+        )
+        .iter()
+        .any(|i| matches!(i, ksx_config::Issue::MacroDisabled { .. })));
+
+        // Back on: byte-identical to where it started, `enabled` gone again.
+        let applied = save_macro(&store, &toggle(true)).unwrap();
+        assert!(applied.toggled && applied.enabled);
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(!on_disk.contains("enabled"), "{on_disk}");
+    }
+
+    /// A toggle for a macro that does not exist is the same refusal a delete
+    /// gets, and the two flags together are refused rather than resolved.
+    #[test]
+    fn a_toggle_needs_a_macro_and_never_doubles_as_a_delete() {
+        let root = TempRoot::new("macro-toggle-refusals");
+        let store = root.store();
+        preset_toml(&store, SF_PRESET);
+
+        let err = save_macro(
+            &store,
+            &MacroSpec {
+                preset: "P1".into(),
+                name: "shoryuken".into(),
+                body: MacroFile::default(),
+                delete: false,
+                set_enabled: Some(false),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, MapError::UnknownMacro { .. }), "{err}");
+
+        let err = save_macro(
+            &store,
+            &MacroSpec {
+                preset: "P1".into(),
+                name: "hadouken".into(),
+                body: MacroFile::default(),
+                delete: true,
+                set_enabled: Some(false),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, MapError::BadMacro { .. }), "{err}");
+        // Neither refusal wrote, and neither took a backup.
+        assert!(list_backups(&store, "P1").unwrap().is_empty());
+    }
+
+    /// A whole-table write carries `enabled` like any other field, so an editor
+    /// that saves a disabled macro does not silently switch it back on.
+    #[test]
+    fn a_whole_table_write_carries_the_enabled_flag() {
+        let root = TempRoot::new("macro-write-disabled");
+        let store = root.store();
+        preset_toml(&store, SF_PRESET);
+        let applied = save_macro(
+            &store,
+            &MacroSpec {
+                preset: "P1".into(),
+                name: "hadouken".into(),
+                body: body(r#"{ "steps": [{ "hold": ["A"], "ms": 50 }], "enabled": false }"#),
+                delete: false,
+                set_enabled: None,
+            },
+        )
+        .unwrap();
+        assert!(!applied.enabled && !applied.toggled);
+        assert!(!load_preset_by_name(&store, "P1").unwrap().macros["hadouken"].enabled);
     }
 
     /// The trigger reader sees both spellings of the same row — the flat
@@ -3369,6 +3837,7 @@ steps = [{ hold = ["A"], ms = 50 }]
                 name: "m".into(),
                 body: body(r#"{ "steps": [{ "hold": ["A"], "ms": 50 }] }"#),
                 delete: false,
+                set_enabled: None,
             },
         )
         .unwrap_err();

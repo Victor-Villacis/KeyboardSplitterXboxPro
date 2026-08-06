@@ -455,6 +455,7 @@ mod tests {
                     preset: "IPAC P1".into(),
                     persona: Persona::Xbox360,
                     socd: Socd::default(),
+                    macros: Default::default(),
                 },
                 SlotEntry {
                     number: 5,
@@ -463,6 +464,7 @@ mod tests {
                     preset: "IPAC P2".into(),
                     persona: Persona::PlayStation,
                     socd: Socd::Neutral,
+                    macros: ksx_core::MacroSwitch::Off,
                 },
             ],
         }
@@ -488,6 +490,7 @@ mod tests {
                         preset: "IPAC P1".into(),
                         persona: Persona::PlayStation,
                         socd: Socd::UpPriority,
+                        macros: ksx_core::MacroSwitch::Off,
                     }],
                 },
                 // The minimal shape: every optional field absent.
@@ -598,6 +601,9 @@ mod tests {
                 // other spelling and the round-trip must not swap them.
                 turbo_hz: Some(12),
                 gap_ms: None,
+                // Away from its default too — `enabled = false` must survive
+                // every export/import path, or a disabled macro comes back on.
+                enabled: false,
             },
         )]
         .into_iter()

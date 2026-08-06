@@ -66,6 +66,10 @@ export interface MapperSlot {
    *  what turbo is a property of — several keys on one control share ONE
    *  clock. Absent for every preset written before turbo existed. */
   turbo?: Record<string, number>;
+  /** This slot says `macros = "off"` — the TOURNAMENT SWITCH. Every macro of
+   *  its preset is silenced whatever each one's own `enabled` says, and
+   *  nothing is deleted. */
+  macros_off?: boolean;
 }
 
 export interface MapperSnapshot {
@@ -122,6 +126,10 @@ export interface MacroView {
   gap_ms: number | null;
   /** Key names that START this macro. */
   triggers: string[];
+  /** This macro is `enabled = false`: it keeps its steps AND its trigger row
+   *  and never runs. Said as the negative so an older payload (no field)
+   *  reads as the ordinary case. */
+  disabled?: boolean;
 }
 
 export interface MacroSnapshot {
@@ -224,6 +232,10 @@ export interface MacroOutcome {
   problems: string[];
   warnings: string[];
   deleted: boolean;
+  /** Does the table RUN now? */
+  enabled?: boolean;
+  /** This write moved ONLY the enabled flag. */
+  toggled?: boolean;
   backup: string | null;
   reloaded: boolean;
 }
@@ -517,6 +529,25 @@ const [macroDurValue, setMacroDurValue] = createSignal("50");
  *  write, "… dirty" the moment the draft differs from the file. A class
  *  string, never a show (ledger #13/#14). */
 const [macroSaveCls, setMacroSaveCls] = createSignal("btn btn-mini macsave off");
+/** v14: the per-macro ON/OFF switch. Two scalars, no show (ledger #13/#14):
+ *  a class string for the look and a label for the word on the button.
+ *
+ *  This one IS a button, unlike the slot switch below, because it writes a
+ *  preset — the same `map-macro` verb every other macro write uses, in its
+ *  TOGGLE spelling (no `steps`, so the table on disk keeps everything and only
+ *  the flag moves). */
+const [macroEnableCls, setMacroEnableCls] = createSignal("btn btn-mini macen off");
+const [macroEnableLabel, setMacroEnableLabel] = createSignal("Enabled");
+/** v14: the slot-wide `macros = "off"` switch, in words. Blank when the slot
+ *  runs macros, which is every slot until somebody says otherwise.
+ *
+ *  Deliberately NOT a button. It lives in config.toml (or the games.toml
+ *  profile), and Studio has no config writer at all — every write on this page
+ *  goes through a preset verb. A switch that silently did nothing would be
+ *  worse than a sentence that says exactly which line to change, so this is
+ *  the sentence. The macro card renders it above the grid, because a card full
+ *  of steps that cannot run has to say so before it shows them. */
+const [slotMacrosLine, setSlotMacrosLine] = createSignal("");
 /** v12: the frame arithmetic, live, wherever a duration is edited (Victor: "a
  *  60fps frame is only like sixteenth milliseconds? maybe we can show that
  *  math"). Carries the sampling floor in the SAME units, so "too short" needs
@@ -2309,6 +2340,18 @@ function macroTomlFor(mac: MacroView): string {
   return out;
 }
 
+/** The slot switch, in words — and the exact line to change. Empty when the
+ *  slot runs macros, which is the ordinary case. */
+export function slotMacrosLineFor(slot: MapperSlot | undefined): string {
+  if (!slot?.macros_off) return "";
+  return (
+    `Slot ${slot.number} says macros = "off" — the TOURNAMENT SWITCH. Nothing in this ` +
+    `card runs on it, whatever each macro's own switch says, and nothing is deleted. To ` +
+    `bring them back, set macros = "on" on that [[slot]] in config.toml (or on the slot of ` +
+    `the games.toml profile you are running) and reload the session.`
+  );
+}
+
 function macroTriggerLineFor(mac: MacroView): string {
   if (mac.triggers.length === 0) return "no trigger key yet — nothing starts this macro";
   if (mac.triggers.length === 1) return `started by ${mac.triggers[0]}`;
@@ -2374,6 +2417,9 @@ function refreshMacro(): void {
     setMacroCardCls(p?.macros.available ? "card macrocard" : "card macrocard off");
     setMacroDirtyLine("");
     setMacroSaveCls("btn btn-mini macsave off");
+    setMacroEnableCls("btn btn-mini macen off dead");
+    setMacroEnableLabel("Enabled");
+    setSlotMacrosLine(slotMacrosLineFor(slot));
     setMacroStepLine("");
     setMacroDurValue("50");
     setMacroMathLine(frameMath(undefined, macroRateHz));
@@ -2386,7 +2432,10 @@ function refreshMacro(): void {
   setMacroTabs(p ? macroTabsFor(p, mac, slot ? slot.number : p.selected) : []);
   setMacroHead(
     `${mac.name} — ${mac.steps.length} step${mac.steps.length === 1 ? "" : "s"} · ` +
-      `${macroTotalMs(mac)} ms total`,
+      `${macroTotalMs(mac)} ms total` +
+      // Loud, and in the head line, because everything below it describes
+      // something that will not happen.
+      (mac.disabled ? " · DISABLED (keeps its steps and its trigger; never runs)" : ""),
   );
   setMacroRuleLine(MACRO_RULE_LINE);
   setMacroPolicyLine(
@@ -2421,6 +2470,12 @@ function refreshMacro(): void {
     macroDirty ? "unsaved changes — press Save macro to write them to the preset" : "saved",
   );
   setMacroSaveCls(macroDirty ? "btn btn-mini macsave dirty" : "btn btn-mini macsave off");
+  // The switch reads as the STATE it is in, not as the action it performs: a
+  // button labelled "Disable" on a macro that is already off is the one thing
+  // a person in a hurry cannot read correctly.
+  setMacroEnableCls(mac.disabled ? "btn btn-mini macen offstate" : "btn btn-mini macen on");
+  setMacroEnableLabel(mac.disabled ? "DISABLED — click to enable" : "Enabled");
+  setSlotMacrosLine(slotMacrosLineFor(slot));
   setMacroTrigCls(macroFromDisk ? "mactrigger" : "mactrigger off");
   const step = macroStep === null ? undefined : mac.steps[macroStep];
   setMacroStepLine(
@@ -3080,6 +3135,10 @@ export function MapIsland() {
           ),
         ),
         h("p", { class: "machead" }, () => macroHead()),
+        // The slot-wide switch, above everything it silences. Empty (and so
+        // invisible) on every slot that runs macros — see `slotMacrosLine` for
+        // why this is a sentence and not a button.
+        h("p", { class: "macslotoff" }, () => slotMacrosLine()),
         h("p", { class: "macpolicy mono" }, () => macroPolicyLine()),
         // The grid. Two aligned columns: the row bar (step number, duration,
         // amber flag, the five step verbs) and the scrollable matrix with its
@@ -3264,6 +3323,23 @@ export function MapIsland() {
               title: "save this macro under the name in the box and remove the old table",
             },
             "Rename",
+          ),
+          // The SWITCH, next to Delete on purpose: they are the two answers to
+          // "I do not want this macro right now", and the cheap one should be
+          // the one you reach for. Disabling keeps the steps and the trigger
+          // row; deleting takes both.
+          h(
+            "button",
+            {
+              class: () => macroEnableCls(),
+              "data-act": "macro-enable",
+              type: "button",
+              title:
+                "switch this macro off (or back on) without losing it — the steps and the " +
+                "key that starts it stay exactly where they are. Disable one to TEST the " +
+                "others, or the lot for a tournament",
+            },
+            () => macroEnableLabel(),
           ),
           h(
             "button",

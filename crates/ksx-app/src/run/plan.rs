@@ -579,9 +579,22 @@ pub fn render_human(plan: &RunPlan) -> String {
                     mac.turbo_gap_ms()
                 ),
             };
+            // OFF is printed on the macro's own line, before anything that
+            // describes what it would do: the validation advisory below says
+            // it too, but a reader scanning the slot's macros must not have to
+            // reach the warnings to learn that this one is silent. The slot's
+            // master switch beats the flag, so `macros = "off"` reads as off
+            // whatever each macro says.
+            let state = if !slot.spec.macros.is_on() {
+                " [OFF — slot macros = \"off\"]"
+            } else if !mac.enabled {
+                " [OFF — enabled = false]"
+            } else {
+                ""
+            };
             let _ = writeln!(
                 out,
-                "           macro \"{}\" {} step(s), {} ms  on_release={} retrigger={} interrupt={} repeat={}  key(s) {}",
+                "           macro \"{}\"{state} {} step(s), {} ms  on_release={} retrigger={} interrupt={} repeat={}  key(s) {}",
                 mac.name,
                 mac.steps.len(),
                 mac.total_ms(),
@@ -625,6 +638,10 @@ pub fn plan_json(plan: &RunPlan) -> serde_json::Value {
                 "chords": s.preset.chords.len(),
                 "keyboard": s.spec.keyboard.as_ref().map(|d| d.as_str()),
                 "mouse": s.spec.mouse.as_ref().map(|d| d.as_str()),
+                // The slot's macro MASTER switch. "off" silences every macro
+                // below whatever its own `enabled` says, so a reader that only
+                // looks at the per-macro flags would be reading the wrong one.
+                "macros_switch": s.spec.macros.as_str(),
                 "macros": s.preset.macros.defs.iter().enumerate().map(|(i, mac)| serde_json::json!({
                     "name": mac.name,
                     "steps": mac.steps.len(),
@@ -633,6 +650,12 @@ pub fn plan_json(plan: &RunPlan) -> serde_json::Value {
                     "retrigger": mac.retrigger.as_str(),
                     "interrupt": mac.interrupt.as_str(),
                     "repeat": mac.repeat.as_str(),
+                    // Its own flag, and what it AMOUNTS to once the slot
+                    // switch has had its say — both, because a reader wants
+                    // one of them and guessing which is how a caller ends up
+                    // reporting "enabled" for a macro that cannot run.
+                    "enabled": mac.enabled,
+                    "runs": mac.enabled && s.spec.macros.is_on(),
                     // Only meaningful for turbo, and always the EFFECTIVE
                     // numbers — what the pad will do, not what was asked.
                     "turbo_gap_ms": mac.turbo_gap_ms(),
@@ -1044,6 +1067,85 @@ preset = "IPAC P1"
             plan.notes.iter().any(|n| n.contains("only a mouse")),
             "{:?}",
             plan.notes
+        );
+    }
+
+    /// A macro that will not run says so ON ITS OWN LINE, before anything
+    /// describing what it would do — and the slot's master switch is reported
+    /// as the reason when it is the reason, because a reader looking at the
+    /// per-macro flags would otherwise be reading the wrong one.
+    #[test]
+    fn the_plan_says_which_macros_are_switched_off_and_why() {
+        let macro_preset = |name: &str, enabled: &str| -> PresetFile {
+            toml::from_str(&format!(
+                "name = \"{name}\"\n[bindings]\nA = \"S\"\nmacro.m = \"P\"\n\
+                 [macros.m]\n{enabled}steps = [{{ hold = [\"A\"], ms = 50 }}]\n"
+            ))
+            .unwrap()
+        };
+        let cfg = config(
+            r#"
+schema_version = 1
+[[slot]]
+number = 1
+keyboard = 'HID\VID_D209&PID_0430&MI_00\1'
+preset = "off-by-flag"
+
+[[slot]]
+number = 2
+keyboard = 'HID\VID_D209&PID_0430&MI_00\1'
+preset = "off-by-slot"
+macros = "off"
+
+[[slot]]
+number = 3
+keyboard = 'HID\VID_D209&PID_0430&MI_00\1'
+preset = "running"
+"#,
+        );
+        let files = vec![
+            macro_preset("off-by-flag", "enabled = false\n"),
+            macro_preset("off-by-slot", ""),
+            macro_preset("running", ""),
+        ];
+        let plan = build_plan(&cfg, &GamesFile::default(), &files, None).unwrap();
+        let text = render_human(&plan);
+        assert!(text.contains("[OFF — enabled = false]"), "{text}");
+        assert!(text.contains("[OFF — slot macros = \"off\"]"), "{text}");
+        // The running one is unmarked — the ordinary line, unchanged.
+        assert_eq!(text.matches("[OFF").count(), 2, "{text}");
+
+        let v = plan_json(&plan);
+        // Its own flag AND what it amounts to, both, on every slot.
+        assert_eq!(
+            v.pointer("/slots/0/macros_switch"),
+            Some(&serde_json::json!("on"))
+        );
+        assert_eq!(
+            v.pointer("/slots/0/macros/0/enabled"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            v.pointer("/slots/0/macros/0/runs"),
+            Some(&serde_json::json!(false))
+        );
+        // The slot switch overrides an `enabled = true`: the flag still reads
+        // true, and `runs` is the honest answer.
+        assert_eq!(
+            v.pointer("/slots/1/macros_switch"),
+            Some(&serde_json::json!("off"))
+        );
+        assert_eq!(
+            v.pointer("/slots/1/macros/0/enabled"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            v.pointer("/slots/1/macros/0/runs"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            v.pointer("/slots/2/macros/0/runs"),
+            Some(&serde_json::json!(true))
         );
     }
 

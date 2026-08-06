@@ -66,6 +66,12 @@
 //!   capture, output, or a live session — a control implementation is a
 //!   client of the daemon's pipe, never a second control loop.
 
+// The mapper's scalar-slot object is one `serde_json::json!` literal per page
+// (render_map.rs `scalar_slots`), and that macro recurses once per field. The
+// object is deliberately flat and deliberately long — every state on the page
+// is a named scalar — so it outgrew the default 128.
+#![recursion_limit = "256"]
+
 mod control;
 mod error;
 mod render;

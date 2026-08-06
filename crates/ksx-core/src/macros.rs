@@ -523,6 +523,28 @@ pub struct Macro {
     /// every policy so a file that experiments with the setting does not lose
     /// the number when it flips back to `once`.
     pub turbo: Option<TurboRate>,
+    /// Does this macro run at all? `true` by default, and omitted from the file
+    /// when it is, so every preset written before the setting existed is byte
+    /// identical.
+    ///
+    /// A disabled macro keeps EVERYTHING — its steps, its policies, its
+    /// `macro.<name>` trigger row — and simply never starts. Deleting it would
+    /// lose the work and unbind the key; this loses neither. There are exactly
+    /// two reasons to want it, and both are why it is a flag rather than a
+    /// comment-out:
+    ///
+    /// - **to TEST.** Isolating one macro means silencing its neighbours, and
+    ///   the thing you silence has to come back unchanged afterwards — a
+    ///   half-remembered retyping of a step list is a new bug hunting the old
+    ///   one.
+    /// - **to COMPETE.** A cabinet in a tournament wants macros OFF, not
+    ///   deleted: the panel goes back to being a panel for an evening and the
+    ///   sequences are still there on Monday. (For a whole slot at once, that
+    ///   is [`MacroSwitch`], and it overrides this.)
+    ///
+    /// Disabling a macro that is RUNNING is an exit like any other: pending
+    /// steps cancelled, everything it held released, one delta batch.
+    pub enabled: bool,
 }
 
 impl Macro {
@@ -537,6 +559,7 @@ impl Macro {
             interrupt: Interrupt::default(),
             repeat: Repeat::default(),
             turbo: None,
+            enabled: true,
         }
     }
 
@@ -653,12 +676,95 @@ fn cycle_ms(hz: u32) -> u32 {
     (1_000 + hz / 2) / hz
 }
 
+/// A slot-wide master switch for macros — the "tournament mode" setting.
+///
+/// [`Macro::enabled`] silences ONE macro; this silences a whole slot in one
+/// edit, which is the shape the request actually comes in: a cabinet entering a
+/// tournament wants every sequence off on that panel, not a hunt through a
+/// preset flipping flags it will have to flip back. It is a SLOT property
+/// rather than a preset one for the same reason [`crate::Socd`] is — the panel
+/// and the occasion decide it, and the preset (which is shared, and which M7
+/// lets people hand around) must not have to change to suit them.
+///
+/// [`MacroSwitch::Off`] beats every per-macro `enabled = true`: a master switch
+/// that individual settings could out-vote would not be a master switch.
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MacroSwitch {
+    /// Macros run, subject to their own [`Macro::enabled`]. The default, and
+    /// what every configuration written before this setting existed means.
+    #[default]
+    On,
+    /// No macro on this slot runs, whatever its own flag says. Definitions and
+    /// trigger rows are untouched — this is a mute, not a delete.
+    Off,
+}
+
+impl MacroSwitch {
+    pub const ALL: &'static [MacroSwitch] = &[MacroSwitch::On, MacroSwitch::Off];
+
+    /// Canonical name — what a config file stores.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MacroSwitch::On => "on",
+            MacroSwitch::Off => "off",
+        }
+    }
+
+    /// Does this slot run macros at all? `false` is the tournament setting.
+    pub const fn is_on(self) -> bool {
+        matches!(self, MacroSwitch::On)
+    }
+}
+
+impl fmt::Display for MacroSwitch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("unknown macros switch '{0}' (expected one of: on, off)")]
+pub struct UnknownMacroSwitch(pub String);
+
+impl FromStr for MacroSwitch {
+    type Err = UnknownMacroSwitch;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match normalize(s).as_str() {
+            "on" | "true" | "yes" | "enabled" => Ok(MacroSwitch::On),
+            "off" | "false" | "no" | "disabled" | "none" => Ok(MacroSwitch::Off),
+            _ => Err(UnknownMacroSwitch(s.to_owned())),
+        }
+    }
+}
+
 /// A key that starts a macro: the file row `macro.<name> = "<key>"`.
 ///
 /// Triggers are a separate list from [`crate::Preset::entries`] for the same
 /// reason chords are: "no macros ⇒ nothing changed" stays checkable rather than
-/// claimed. Many keys → one macro is native (multi-bind), and so is one key →
-/// several macros; nothing here is unique.
+/// claimed. Many keys → one macro is native (multi-bind).
+///
+/// # One macro per key, per preset
+///
+/// One key starting SEVERAL macros of the same preset is refused by the writers
+/// (`ksx map`, the pipe, Studio) unless the caller forces it, and the reason is
+/// worth stating where the model lives, because the rule that is right for
+/// bindings is wrong here:
+///
+/// - an ordinary BINDING is declarative STATE. Two keys setting the same bit is
+///   well-defined, one key setting two bits is well-defined, and fan-out is the
+///   product rather than a hazard — which is why nothing about
+///   [`crate::Preset::entries`] is unique.
+/// - a MACRO is an imperative TIMELINE. Two of them started by one key do not
+///   compose into a third timeline; they run at once and the game reads their
+///   SUPERPOSITION — a state no single step list contains, repeating for as long
+///   as the loudest `repeat` policy among them says. Nobody asked for that
+///   sequence, and it is invisible in the macro you are debugging.
+///
+/// So the model still ALLOWS it (hand-edited files exist, and validation warns
+/// about them rather than refusing to load), and the write path is what says no.
+/// Cross-slot and cross-preset sharing are untouched: that is fan-out again —
+/// two players, two timelines, one key — and it stays legal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MacroTrigger {
     /// [`Key::None`] makes the row an inert placeholder, like an unbound entry.
@@ -906,6 +1012,35 @@ mod tests {
         assert_eq!(m.turbo_rate_clamped(), None);
         m.repeat = Repeat::Turbo;
         assert_eq!(m.turbo_gap_ms(), 50);
+    }
+
+    /// `enabled` is the one policy whose default is `true`, and the whole point
+    /// of the flag is that turning it off loses nothing.
+    #[test]
+    fn a_macro_is_enabled_until_it_is_told_otherwise() {
+        let mut m = hadouken();
+        assert!(m.enabled);
+        m.enabled = false;
+        // Everything that makes it a macro survives being switched off — that
+        // is the difference between disabling and deleting.
+        assert_eq!(m.steps.len(), 4);
+        assert_eq!(m.total_ms(), 200);
+        assert!(!m.is_inert(), "a disabled macro is silenced, not emptied");
+    }
+
+    #[test]
+    fn the_slot_switch_defaults_to_on_and_takes_the_spellings_people_type() {
+        for &switch in MacroSwitch::ALL {
+            assert_eq!(switch.as_str().parse::<MacroSwitch>(), Ok(switch));
+            assert_eq!(switch.to_string(), switch.as_str());
+        }
+        assert_eq!(MacroSwitch::default(), MacroSwitch::On);
+        assert!(MacroSwitch::On.is_on() && !MacroSwitch::Off.is_on());
+        assert_eq!("Off".parse(), Ok(MacroSwitch::Off));
+        assert_eq!("disabled".parse(), Ok(MacroSwitch::Off));
+        assert_eq!("true".parse(), Ok(MacroSwitch::On));
+        let err = "sometimes".parse::<MacroSwitch>().unwrap_err();
+        assert!(err.to_string().contains("off"), "{err}");
     }
 
     #[test]

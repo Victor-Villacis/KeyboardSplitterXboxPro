@@ -64,6 +64,7 @@ impl StatusSource for FixedStatus {
                 // One AUTO-FIRING control, so the legend badge is covered by
                 // the ordinary page assertions.
                 turbo: std::collections::BTreeMap::from([("B".to_owned(), 12)]),
+                macros_off: false,
             }],
         }
     }
@@ -97,6 +98,7 @@ impl StatusSource for FixedStatus {
                 turbo_hz: None,
                 gap_ms: None,
                 triggers: vec!["P".into()],
+                disabled: false,
             }],
         )
     }

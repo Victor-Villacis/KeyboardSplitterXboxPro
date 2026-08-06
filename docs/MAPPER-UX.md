@@ -52,6 +52,30 @@ complex tool with the simplest interface."
    the WRITER cannot either: the only path that unbinds a control the caller
    did not name is `--move-from`/`"move_from"`, which names it in the request
    and again in the response (`moved_from`).
+
+   **MACROS ARE THE ONE EXCEPTION, and it is not a softening of this
+   commandment — it is the same reasoning applied to a different kind of
+   thing.** Since 2026-08-06 a key that already starts one macro will not
+   quietly start a second *in the same preset*: the write is refused, both
+   macros and the key are named, and `--force` is the way through. Duplicates
+   are information because a binding is declarative STATE — two keys setting
+   one bit compose, and the result has no opinion about order or timing. A
+   macro is an imperative TIMELINE, and two timelines started together do not
+   compose: they interleave, and the game reads a superposition that neither
+   step list contains. Fan-out is the product for state and a bug for time.
+   Cross-slot and cross-preset sharing are untouched — that is fan-out again.
+   The mapper offers no "start both anyway" button, on purpose: a one-click
+   override beside a warning is how people click past warnings, and this
+   particular warning cost an evening.
+
+   Its cheap companion, on the same card: **switch a macro OFF instead of
+   deleting it** (`enabled = false`) — the steps and the trigger row stay
+   exactly where they are and nothing runs. You do it to TEST (isolate one
+   macro, get the others back unchanged) and to COMPETE (a tournament wants
+   macros off, not lost). For a whole panel there is the slot's `macros =
+   "off"`, which overrides every macro's own switch; the mapper *states* that
+   one above the grid — naming the file and the line — rather than offering a
+   control it has no config writer for.
 8. **Player identity is static; the chain is visible.** I-PAC bakes P1–P4
    into scancodes and MAME never asks again; RetroArch's dynamic ports are
    a decade of cabinet forum grief. ksx slots are static by config, and one

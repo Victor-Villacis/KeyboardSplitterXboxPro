@@ -262,10 +262,12 @@ fn parse_slot(
         mouse: device("Mouse"),
         preset,
         // Legacy predates personas and only ever emulated Xbox 360 pads, so
-        // every imported slot is exactly what it was. Same for SOCD, which
-        // legacy had no concept of: `off` is "behave as legacy did".
+        // every imported slot is exactly what it was. Same for SOCD and for the
+        // macro master switch, neither of which legacy had any concept of:
+        // `off`/`on` respectively are "behave as legacy did".
         persona: ksx_core::Persona::default(),
         socd: ksx_core::Socd::default(),
+        macros: ksx_core::MacroSwitch::default(),
     })
 }
 

@@ -318,6 +318,13 @@ export function MapPage() {
   // v12's three: the Save button's look, the live frame arithmetic, and the
   // trigger block's inert class while the preset holds no macro.
   const [macroSaveCls] = createSignal("btn btn-mini macsave off");
+  // v14: the per-macro switch (a class string plus its label — never a show),
+  // and the slot-wide `macros = "off"` sentence. An SSR paint has read the
+  // file, so both come from the payload; these are the honest defaults for a
+  // page with no macro loaded and a slot that runs macros.
+  const [macroEnableCls] = createSignal("btn btn-mini macen off dead");
+  const [macroEnableLabel] = createSignal("Enabled");
+  const [slotMacrosLine] = createSignal("");
   const [macroMathLine] = createSignal("");
   // v13: the repeat policy's own live math, and the rate box's value.
   const [macroTurboLine] = createSignal("");

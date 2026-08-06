@@ -155,6 +155,15 @@ pub struct MapperSlot {
     /// one rate per row of the legend.
     #[serde(default)]
     pub turbo: std::collections::BTreeMap<String, u32>,
+    /// This slot says `macros = "off"` (config.toml or the games.toml profile)
+    /// — the TOURNAMENT SWITCH. Every macro of its preset is silenced whatever
+    /// each one's own `enabled` says; nothing is deleted.
+    ///
+    /// The negative again, and for the same reason as
+    /// [`MacroView::disabled`]: `false` is the ordinary case, so every payload
+    /// that predates the switch still means "macros run".
+    #[serde(default)]
+    pub macros_off: bool,
 }
 
 /// The macro editor's read side: every `[macros.<name>]` table of ONE preset,
@@ -231,6 +240,15 @@ pub struct MacroView {
     /// `[bindings]`). Many keys → one macro is native, like any binding.
     #[serde(default)]
     pub triggers: Vec<String>,
+    /// Does this macro RUN? Spelled as the negative so that the default
+    /// (`false`) is the ordinary case, which keeps every existing payload and
+    /// every older client reading exactly what it read before.
+    ///
+    /// A disabled macro keeps its steps and its trigger row and never runs, so
+    /// the card must say so loudly: it is the one state where the whole card
+    /// describes something that will not happen.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// One step: what it HOLDS, and for how long, in the unit the file used.

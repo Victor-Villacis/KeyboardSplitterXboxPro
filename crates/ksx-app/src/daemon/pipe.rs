@@ -651,6 +651,16 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
 /// `{"delete": true}` removes the table (and the `macro.<name>` trigger rows
 /// that would otherwise dangle) — an explicit word, never an empty step list.
 ///
+/// `"enabled"` is the one field that means two things, and which one is decided
+/// by whether a BODY came with it:
+///
+/// - `{"steps":[…], "enabled":false}` — an ordinary whole-table write that
+///   happens to land disabled. `enabled` is a `MacroFile` field like any other.
+/// - `{"name":"hadouken","enabled":false}` with NO `steps` — a TOGGLE. The
+///   table on disk keeps every step and every policy and only the flag moves,
+///   which is the whole promise of disabling instead of deleting: what comes
+///   back is exactly what went away. (`ksx macro --disable` sends this.)
+///
 /// `"reload": true` applies it to a RUNNING session, and a macro body is a
 /// BINDING change: it changes no slot, persona, device or capture backend, so
 /// [`crate::run::supervisor::SessionShape::bounce_reason`] finds nothing and
@@ -677,6 +687,7 @@ const MACRO_BODY_FIELDS: &[&str] = &[
     "repeat",
     "turbo_hz",
     "gap_ms",
+    "enabled",
 ];
 
 /// The `[macros.<name>]` table a `map-macro` request carries, in the preset
@@ -722,10 +733,20 @@ fn handle_map_macro(
         .get("delete")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if !delete && request.get("steps").is_none() {
+    // A bare `"enabled"` with no body is the TOGGLE spelling; with a body it is
+    // just another field of the table being written.
+    let toggle = match (delete, request.get("steps"), request.get("enabled")) {
+        (false, None, Some(value)) => match value.as_bool() {
+            Some(enabled) => Some(enabled),
+            None => return err_msg(r#"map-macro "enabled" is true or false"#),
+        },
+        _ => None,
+    };
+    if !delete && toggle.is_none() && request.get("steps").is_none() {
         return err_msg(
-            "map-macro needs \"steps\" (or \"delete\": true) — an absent step list is a \
-             misspelled field far more often than an intended deletion, and deleting a \
+            "map-macro needs \"steps\" (or \"delete\": true, or \"enabled\": true/false to \
+             switch an existing macro on or off without touching it) — an absent step list \
+             is a misspelled field far more often than an intended deletion, and deleting a \
              macro is its own word",
         );
     }
@@ -739,6 +760,7 @@ fn handle_map_macro(
         name,
         body,
         delete,
+        set_enabled: toggle,
     };
     match (deps.save_macro)(&spec) {
         Ok(applied) => {
@@ -753,6 +775,9 @@ fn handle_map_macro(
                 "steps": applied.steps,
                 "total_ms": applied.total_ms,
                 "deleted": applied.deleted,
+                // Does the table RUN, and was this write nothing BUT that flag?
+                "enabled": applied.enabled,
+                "toggled": applied.toggled,
                 // The keys that START it — unchanged by this verb (`map` with
                 // "macro.<name>" is what writes those), except on a delete,
                 // where these are the rows that had to go with the table.
@@ -1690,6 +1715,7 @@ steps = [{ hold = ["A"], ms = 50, allow_short = true }]
             moved_from: None,
             overridden: Vec::new(),
             flash: Vec::new(),
+            shared_macros: Vec::new(),
             turbo_hz: spec.turbo_hz.filter(|hz| *hz > 0),
             turbo_effective_hz: spec.turbo_hz.filter(|hz| *hz > 0).map(|hz| {
                 ksx_core::TurboBinding::new(ksx_core::Binding::Button(ksx_core::XButton::A), hz)
@@ -1710,6 +1736,8 @@ steps = [{ hold = ["A"], ms = 50, allow_short = true }]
                 steps: spec.body.steps.len(),
                 total_ms: 200,
                 deleted: spec.delete,
+                enabled: spec.set_enabled.unwrap_or(spec.body.enabled),
+                toggled: spec.set_enabled.is_some(),
                 triggers: vec!["P".to_owned()],
                 backup: Some(crate::mapping::PresetBackup {
                     path: std::path::PathBuf::from(r"C:\cfg\ksx\presets\IPAC P1.toml.bak-x"),
@@ -1806,6 +1834,71 @@ steps = [{ hold = ["A"], ms = 50, allow_short = true }]
         assert_eq!(v["deleted"], true, "{v}");
         assert_eq!(v["triggers"][0], "P", "{v}");
         assert!(seen.lock().unwrap()[0].delete);
+    }
+
+    /// `"enabled"` with NO `steps` is the TOGGLE: it reaches the writer as
+    /// `set_enabled` and carries no body, so the table on disk keeps
+    /// everything. With `steps` it is an ordinary field of the table instead.
+    #[test]
+    fn map_macro_enabled_is_a_toggle_without_a_body_and_a_field_with_one() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut d = deps(tx, state, no_profiles());
+        d.save_macro = scripted_macro(seen.clone());
+
+        // No steps: a toggle. `steps` is absent, so the writer is told to move
+        // the flag and nothing else.
+        let v = handle_request(
+            r#"{"verb":"map-macro","preset":"IPAC P1","name":"hadouken","enabled":false}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["toggled"], true, "{v}");
+        assert_eq!(v["enabled"], false, "{v}");
+        assert_eq!(seen.lock().unwrap()[0].set_enabled, Some(false));
+        assert!(
+            seen.lock().unwrap()[0].body.steps.is_empty(),
+            "a toggle carries no body"
+        );
+
+        // With steps: an ordinary whole-table write that lands disabled.
+        let v = handle_request(
+            r#"{"verb":"map-macro","preset":"IPAC P1","name":"hadouken",
+                "steps":[{"hold":["A"],"ms":50}],"enabled":false}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["toggled"], false, "{v}");
+        assert_eq!(v["enabled"], false, "{v}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[1].set_enabled, None);
+        assert!(!seen[1].body.enabled, "the field reached the body");
+        assert_eq!(seen[1].body.steps.len(), 1);
+    }
+
+    /// The absent-steps refusal has to name the toggle now that one exists —
+    /// otherwise the only documented way out of it is `delete`.
+    #[test]
+    fn map_macro_without_steps_names_both_ways_out() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut d = deps(tx, state, no_profiles());
+        d.save_macro = scripted_macro(seen.clone());
+        let v = handle_request(
+            r#"{"verb":"map-macro","preset":"IPAC P1","name":"hadouken"}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], false, "{v}");
+        let text = v["error"].as_str().unwrap_or_default();
+        for part in ["steps", "delete", "enabled"] {
+            assert!(text.contains(part), "{text}");
+        }
+        assert!(seen.lock().unwrap().is_empty(), "nothing may be written");
     }
 
     /// A macro BODY is a binding change: `reload: true` enqueues

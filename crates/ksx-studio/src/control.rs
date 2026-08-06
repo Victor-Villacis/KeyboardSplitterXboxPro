@@ -167,6 +167,19 @@ pub struct MacroWrite {
     /// cannot delete the user's macro by omission.
     #[serde(default)]
     pub delete: bool,
+    /// Does this macro RUN? Two meanings, decided by whether a BODY came with
+    /// it — exactly as on the pipe verb this maps onto:
+    ///
+    /// - with `steps`: a field of the table being written, so an editor that
+    ///   saves a disabled macro does not silently switch it back on;
+    /// - `Some(_)` with NO `steps` and no `delete`: a TOGGLE. The table on disk
+    ///   keeps every step and every policy and only the flag moves, which is
+    ///   the whole promise of disabling instead of deleting.
+    ///
+    /// `None` on a write means "the default", i.e. enabled, like every other
+    /// omitted field here.
+    #[serde(default)]
+    pub enabled: Option<bool>,
     /// Apply it to a running session. A macro body is a BINDING change, so the
     /// daemon swaps it into the live engine with the pads left plugged.
     #[serde(default)]
@@ -191,6 +204,13 @@ pub struct MacroOutcome {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub deleted: bool,
+    /// Does the table RUN now? (`true` for an ordinary write and for a delete.)
+    #[serde(default)]
+    pub enabled: bool,
+    /// This write was ONLY `enabled` — the table's steps and policies were not
+    /// touched, and the toast says so instead of claiming a rewrite.
+    #[serde(default)]
+    pub toggled: bool,
     /// Human label of the timestamped backup taken before the write — the undo
     /// this edit leaves behind. The mapper's existing "Restore backup from …"
     /// (mode `latest-backup`) is what walks it back; this field is what lets

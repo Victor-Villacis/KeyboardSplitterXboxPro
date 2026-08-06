@@ -1376,3 +1376,93 @@ fn a_turbo_macro_on_the_same_key_is_what_keeps_repeating() {
     assert_eq!(state(&engine), PadState::default());
     assert!(engine.tick(10_000).is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// enabled / the slot master switch (docs/INPUT-TRANSFORMS.md §1c)
+//
+// You disable a macro to TEST (isolate one without deleting it) and to COMPETE
+// (a cabinet in a tournament wants macros off, not lost). Both mean the same
+// thing to the engine: the definition and the trigger row are still there, and
+// nothing starts.
+// ---------------------------------------------------------------------------
+
+/// A disabled macro never runs — and its trigger key is still an ordinary key.
+#[test]
+fn a_disabled_macro_never_starts() {
+    let mut mac = hadouken();
+    mac.enabled = false;
+    let mut engine = engine_with(mac);
+
+    // The press produces nothing at all: no step, no timer, no delta.
+    assert_eq!(press(&mut engine, Key::P, 0), 0);
+    assert_eq!(state(&engine), PadState::default());
+    assert_eq!(engine.next_deadline(), None);
+    assert!(engine.tick(1_000).is_empty());
+    assert_eq!(release(&mut engine, Key::P, 1_000), 0);
+}
+
+/// Switching a macro off MID-RUN is an exit like any other: pending steps
+/// cancelled, everything it held released, one delta batch. Anything less would
+/// leave the game reading a direction nobody is pressing.
+#[test]
+fn disabling_a_macro_while_it_runs_releases_everything() {
+    let mut engine = engine_with(hadouken());
+    press(&mut engine, Key::P, 0);
+    engine.tick(50);
+    assert_eq!(
+        state(&engine).buttons,
+        XButtons::DPAD_DOWN | XButtons::DPAD_RIGHT,
+        "the macro is mid-motion, holding the diagonal"
+    );
+
+    let deltas = engine.set_macro_enabled(1, 0, false);
+    assert_eq!(deltas.len(), 1, "the release is one batch");
+    assert_eq!(state(&engine), PadState::default());
+    assert_eq!(engine.next_deadline(), None);
+    // ...and it stays gone: re-enabling never resumes a half-finished run.
+    assert!(engine.tick(10_000).is_empty());
+    engine.set_macro_enabled(1, 0, true);
+    assert_eq!(state(&engine), PadState::default());
+    assert!(engine.tick(20_000).is_empty());
+    // A FRESH press runs it whole, exactly as before.
+    release(&mut engine, Key::P, 20_000);
+    press(&mut engine, Key::P, 20_001);
+    assert_eq!(state(&engine).buttons, XButtons::DPAD_DOWN);
+}
+
+/// The master switch beats every individual `enabled = true`, and turning it
+/// off mid-run releases the same way.
+#[test]
+fn the_slot_switch_overrides_the_individual_enables() {
+    let p = preset_with_macros(
+        "tournament",
+        Vec::new(),
+        macros(vec![hadouken()], vec![MacroTrigger::new(Key::P, 0)]),
+    );
+    let mut engine = Engine::new(vec![ResolvedSlot {
+        // `macros = "off"` on the slot, with the macro itself enabled.
+        spec: SlotSpec::new(1, Some(ipac_device()), None, p.name.clone())
+            .expect("valid slot")
+            .with_macros(ksx_core::MacroSwitch::Off),
+        preset: p,
+    }]);
+    assert_eq!(press(&mut engine, Key::P, 0), 0);
+    assert_eq!(engine.next_deadline(), None);
+    // Enabling the macro individually changes nothing while the slot is off:
+    // a master switch individual settings could out-vote is not a master switch.
+    engine.set_macro_enabled(1, 0, true);
+    assert_eq!(press(&mut engine, Key::P, 10), 0);
+    assert_eq!(state(&engine), PadState::default());
+
+    // Flip the slot back on and the same key runs the same macro.
+    engine.set_slot_macros(1, ksx_core::MacroSwitch::On);
+    release(&mut engine, Key::P, 20);
+    assert_eq!(press(&mut engine, Key::P, 30), 1);
+    assert_eq!(state(&engine).buttons, XButtons::DPAD_DOWN);
+
+    // ...and flipping it off mid-run releases everything, in one batch.
+    let deltas = engine.set_slot_macros(1, ksx_core::MacroSwitch::Off);
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(state(&engine), PadState::default());
+    assert_eq!(engine.next_deadline(), None);
+}

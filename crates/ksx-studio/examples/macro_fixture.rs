@@ -61,6 +61,7 @@ fn seed_macros() -> Vec<MacroView> {
         turbo_hz: None,
         gap_ms: None,
         triggers: vec!["P".into()],
+        disabled: false,
     }]
 }
 
@@ -110,6 +111,7 @@ impl StatusSource for Store {
                 bindings: BTreeMap::from([("A".to_owned(), vec!["G".to_owned()])]),
                 backup: None,
                 turbo: BTreeMap::new(),
+                macros_off: false,
             }],
         }
     }
@@ -159,6 +161,8 @@ impl ControlSource for Store {
                 // Triggers live in `[bindings]`, not in the macro table — the
                 // real writer does not touch them either.
                 triggers: vec!["P".into()],
+                // A whole-table write carries the flag like any field.
+                disabled: request.enabled == Some(false),
             });
             held.sort_by(|a, b| a.name.cmp(&b.name));
         }

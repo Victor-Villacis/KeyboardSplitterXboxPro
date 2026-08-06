@@ -111,6 +111,10 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                 // now. Information, never an error — the write succeeded and
                 // none of them was touched (docs/INPUT-TRANSFORMS.md §1a).
                 "also_drives": applied.also_drives,
+                // ONE MACRO PER KEY: empty unless --force overrode the rule.
+                // Non-empty means the key now starts several timelines at once
+                // and the game reads their superposition.
+                "shared_macros": applied.shared_macros,
                 // What --move-from unbound, or null. The ONLY field that can
                 // ever report a binding this verb removed on its own.
                 "moved_from": mapping::moved_from_json(applied.moved_from.as_ref()),
@@ -151,6 +155,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                     | MapError::InvalidGuard(_)
                     | MapError::BadMoveFrom(_)
                     | MapError::Conflicts { .. }
+                    | MapError::MacroTriggerTaken { .. }
                     | MapError::NoSessionBackup { .. }
                     | MapError::NoBackup { .. }
                     | MapError::BadBackup { .. }
@@ -214,6 +219,11 @@ pub fn error_code(err: &MapError) -> &'static str {
         MapError::InvalidGuard(_) => "invalid-guard",
         MapError::BadMoveFrom(_) => "bad-move-from",
         MapError::Conflicts { .. } => "conflict",
+        // Distinct from "conflict" on purpose: a cross-slot conflict is about
+        // another FILE, this one is about another MACRO in the file you named,
+        // and a tool that offers "--force" for one should be able to tell the
+        // user which of the two it is forcing.
+        MapError::MacroTriggerTaken { .. } => "macro-trigger-taken",
         MapError::NoSessionBackup { .. } => "no-session-backup",
         MapError::NoBackup { .. } => "no-backup",
         MapError::BadBackup { .. } => "bad-backup",

@@ -554,6 +554,15 @@ enum Command {
     /// no steps" — an empty step list is refused, so a tool that lost its
     /// draft cannot delete a macro by omission.
     ///
+    /// --disable switches a macro OFF without losing it: the steps and the
+    /// `macro.<name>` trigger row stay exactly where they are and nothing
+    /// runs. That is what you want to TEST (isolate one macro without deleting
+    /// its neighbours, and get them back unchanged) and to COMPETE (a cabinet
+    /// in a tournament wants macros off, not gone). --enable puts it back. Both
+    /// read no body and change nothing else. To silence a WHOLE SLOT in one
+    /// edit, set `macros = "off"` on that [[slot]] in config.toml — the
+    /// tournament switch, which overrides every macro's own flag.
+    ///
     /// A timestamped backup ("<preset>.toml.bak-YYYYMMDD-HHMMSS") is taken
     /// before the write and named in the answer; `ksx map --list-backups`
     /// shows them and `--restore latest-backup` walks one back.
@@ -590,9 +599,19 @@ enum Command {
         /// Delete the macro (and its trigger rows) instead of writing one
         #[arg(long)]
         delete: bool,
+        /// Switch this macro back ON (it keeps everything; only the flag moves)
+        #[arg(long, conflicts_with_all = ["delete", "from_json", "disable"])]
+        enable: bool,
+        /// Switch this macro OFF: it keeps its steps AND its trigger row and
+        /// simply never runs. Disable to TEST (isolate one macro without
+        /// deleting it) and to COMPETE (a cabinet in a tournament wants macros
+        /// off, not lost). For a whole slot at once, set `macros = "off"` on
+        /// its [[slot]] in config.toml
+        #[arg(long, conflicts_with_all = ["delete", "from_json"])]
+        disable: bool,
         /// One JSON object on stdout: {ok, path, preset, name, steps,
-        /// total_ms, deleted, triggers, warnings, backup}; on a refusal
-        /// {ok:false, code, error, problems}
+        /// total_ms, deleted, enabled, toggled, triggers, warnings, backup};
+        /// on a refusal {ok:false, code, error, problems}
         #[arg(long)]
         json: bool,
     },
@@ -1130,6 +1149,8 @@ fn main() -> anyhow::Result<()> {
             name,
             from_json,
             delete,
+            enable,
+            disable,
             json,
         } => macro_cli::run(macro_cli::Options {
             // `required = true` on both, negated only by a subcommand — which
@@ -1138,6 +1159,8 @@ fn main() -> anyhow::Result<()> {
             name: name.expect("clap enforces --name"),
             from_json,
             delete,
+            // clap makes the two mutually exclusive, so at most one is set.
+            set_enabled: enable.then_some(true).or(disable.then_some(false)),
             json,
         }),
         Command::Session { command } => match command {

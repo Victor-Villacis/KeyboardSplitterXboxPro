@@ -440,6 +440,97 @@ Every exit uses the same cancel-and-release path, and each has a test:
 | `reset` | clears macro state and every armed deadline |
 | process death | unchanged: the pads vanish and the driver releases everything |
 
+#### ONE MACRO PER KEY — the rule that is right for bindings is wrong here (2026-08-06)
+
+Binding `macro.B` to a key that already starts `macro.A` **in the same
+preset** is now **refused before any write**, naming both macros and the
+key, with `--force` to do it anyway.
+
+That looks like an exception to §1a, and it is not. The two shapes are
+different kinds of thing:
+
+- an ordinary **binding is declarative STATE**. Two keys setting the same
+  bit is well-defined; one key setting two bits is well-defined; the result
+  does not depend on order, timing, or which row the file lists first. That
+  is exactly why duplicates here are *information* and fan-out is the
+  product.
+- a **macro is an imperative TIMELINE**. Two of them started by one key do
+  not compose into a third timeline. They run at once, and the game reads
+  their **superposition** — a state no single step list contains, repeating
+  for as long as the loudest `repeat` policy among them says.
+
+Nobody asks for a superposition, and it is the one shape you cannot see by
+reading the macro you are debugging: the evidence is spread across as many
+`macro.<name>` rows as there are macros. It cost an evening of
+ghost-hunting, and produced both 2026-08-06 cabinet reports ("a phantom
+direction between my steps", "`once` still repeats while I hold it").
+
+What did **not** change:
+
+- **`SharedMacroTrigger` stays an advisory.** Hand-edited files with the
+  shape already exist. They load, and they warn — a rule the writers enforce
+  must never turn a file somebody has into a file that will not open.
+- **Cross-slot and cross-preset sharing stay legal.** Two players pressing
+  one key is fan-out again: two slots, two timelines, no interleaving.
+- **The core model still allows it.** The refusal lives in the write path
+  (`ksx map`, the pipe's `map` verb, Studio's mapper — one writer, three
+  surfaces), which is where a decision can be explained and overridden.
+
+The override is `--force` on the CLI and the pipe. Studio has no button for
+it, deliberately: the mapper's job is to stop this from being *discovered*,
+and a one-click "start both anyway" beside a warning is how a person clicks
+past a warning. Anyone who genuinely wants a superposition can say so in a
+shell or in the TOML, where the sentence explaining it is right there.
+
+#### Switching a macro off — `enabled`, and the slot's master switch (2026-08-06)
+
+```toml
+[macros.hadouken]
+enabled = false          # keeps the steps AND the trigger row; never runs
+steps = [ ... ]
+```
+
+```toml
+[[slot]]
+number = 1
+macros = "off"           # the TOURNAMENT SWITCH: this whole slot, one edit
+```
+
+`enabled` defaults to `true` and is **never written when true**, so every
+preset that predates it is byte-identical. `macros` defaults to `"on"` for
+the same reason. The slot switch **overrides** every macro's own flag — a
+master switch individual settings could out-vote would not be one.
+
+Two reasons to want this, and both are why it is a flag rather than a
+comment-out:
+
+- **to TEST.** Isolating one macro means silencing its neighbours, and the
+  thing you silence has to come back *unchanged*. A half-remembered
+  retyping of a step list is a new bug hunting the old one.
+- **to COMPETE.** A cabinet in a tournament wants macros OFF, not deleted:
+  the panel goes back to being a panel for an evening, and the sequences are
+  still there on Monday. That is the slot switch — one line, whole panel,
+  nothing lost. It pairs with the M7 preset-sharing policy: a preset you
+  hand somebody can carry macros, and the *slot* decides whether they run,
+  so accepting a shared preset never means accepting its automation.
+
+A disabled macro keeps everything: its steps, its policies, and its
+`macro.<name>` trigger row. The trigger key is not dead — it still drives
+whatever else it is bound to; it just starts nothing.
+
+**Disabling mid-run is an exit like any other**: pending steps cancelled,
+everything the macro held released, one delta batch (the same
+`macro_cancel` path in the table above). Anything less would leave a game
+reading ↓→ that nobody is pressing. Re-enabling never resumes — the run is
+gone, and the next press starts a fresh one.
+
+Surfaces: `ksx macro --preset P --name N --enable|--disable` (reads no body,
+touches nothing else), the pipe's `map-macro` with `"enabled": true|false`
+and **no** `steps` (with `steps`, it is an ordinary field of the table being
+written), and Studio's per-macro switch beside Delete. The slot switch is
+config, so Studio *states* it above the grid — naming the file and the line
+— rather than offering a button it has no writer for.
+
 #### Validation
 
 `EmptyMacro`, `UnknownMacroHold`, `UnknownMacroRef` (a trigger naming a
@@ -448,8 +539,15 @@ macro the preset does not define), `GuardedMacroTrigger`,
 only in case would silently shadow), `MacroStepBadDuration` (both units or
 neither), `MacroTurboBadRate` (both rate units, or a turbo with none) — all
 faults. `MacroStepRaised`, `MacroStepMayBeMissed`, `TurboRateClamped`,
-`TurboGapRaised`, `TurboRateWithoutTurbo` and `MacroHoldsOtherMechanism`
-are the advisories, printed by the plan as `[WARN]`.
+`TurboGapRaised`, `TurboRateWithoutTurbo`, `MacroHoldsOtherMechanism`,
+`SharedMacroTrigger`, `MacroDisabled` and `SlotMacrosOff` are the
+advisories, printed by the plan as `[WARN]`.
+
+`MacroDisabled` and `SlotMacrosOff` are said **every run**, on purpose:
+"this macro does nothing" is the report, and a flag in a file is not
+somewhere anyone looks first. `SlotMacrosOff` stays quiet when the switch
+silences nothing (a slot whose preset defines no macros) — a setting with no
+consequence is not narrated.
 
 ##### `MacroHoldsOtherMechanism` — "the diagonal never comes out"
 
@@ -479,8 +577,14 @@ an unbound placeholder row, or a preset with no direction keys at all.
 `ksx map --preset "SF P1" --function macro.hadouken --key P` binds the key
 that STARTS a macro, and `--clear` unbinds it; cross-slot conflicts,
 `--force` and the `also_drives` multi-bind report all work exactly as they
-do for a pad function. `--when`/`--unless` and `--move-from` are refused
-with a reason.
+do for a pad function — with the one addition above: a key that already
+starts a DIFFERENT macro of this preset is refused (`macro-trigger-taken`)
+unless `--force` says "start both anyway". `--when`/`--unless` and
+`--move-from` are refused with a reason.
+
+`ksx macro --enable` / `--disable` switch one table on or off without
+touching it (see above); `ksx macro --from-json` writes a whole table, and
+`--delete` removes one.
 
 **Authoring the sequence itself stays TOML-only**, and that is a decision,
 not a gap: a step list is a timeline with durations, a hold set and three

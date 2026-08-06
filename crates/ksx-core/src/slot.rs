@@ -1,6 +1,7 @@
 //! Slot configuration and the invalidation taxonomy.
 
 use crate::device::DeviceId;
+use crate::macros::MacroSwitch;
 use crate::persona::Persona;
 use crate::socd::Socd;
 
@@ -53,6 +54,12 @@ pub struct SlotSpec {
     /// is applied by generating chords onto the resolved preset
     /// ([`crate::socd`]), never by a special case in the engine.
     pub socd: Socd,
+    /// Does this slot run macros at all? Defaults to [`MacroSwitch::On`] — the
+    /// behavior of every configuration written before the switch existed — and
+    /// [`MacroSwitch::Off`] silences every macro of this slot's preset whatever
+    /// each one's own `enabled` says. The tournament switch; see
+    /// [`MacroSwitch`].
+    pub macros: MacroSwitch,
 }
 
 impl SlotSpec {
@@ -77,6 +84,7 @@ impl SlotSpec {
             preset: preset.into(),
             persona: Persona::default(),
             socd: Socd::default(),
+            macros: MacroSwitch::default(),
         })
     }
 
@@ -91,6 +99,13 @@ impl SlotSpec {
     #[must_use]
     pub fn with_socd(mut self, socd: Socd) -> Self {
         self.socd = socd;
+        self
+    }
+
+    /// Sets the slot-wide macro master switch ("tournament mode").
+    #[must_use]
+    pub fn with_macros(mut self, macros: MacroSwitch) -> Self {
+        self.macros = macros;
         self
     }
 }
@@ -211,6 +226,13 @@ mod tests {
         // Same guarantee for SOCD: absent means "behave exactly as before".
         assert_eq!(spec.socd, Socd::Off);
         assert_eq!(spec.clone().with_socd(Socd::Neutral).socd, Socd::Neutral);
+        // ...and for the macro master switch: absent means "macros run", which
+        // is what every pre-switch config meant.
+        assert_eq!(spec.macros, MacroSwitch::On);
+        assert_eq!(
+            spec.clone().with_macros(MacroSwitch::Off).macros,
+            MacroSwitch::Off
+        );
         let ps = spec.clone().with_persona(Persona::PlayStation);
         assert_eq!(ps.persona, Persona::PlayStation);
         // …and changes nothing else about the slot.

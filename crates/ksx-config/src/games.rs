@@ -2,7 +2,7 @@
 //! `splitter_games.xml` (title, path, args, block flags, per-slot
 //! device-by-id + preset-by-name).
 
-use ksx_core::{DeviceId, Persona, SlotSpec, Socd};
+use ksx_core::{DeviceId, MacroSwitch, Persona, SlotSpec, Socd};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
@@ -97,6 +97,16 @@ pub struct GameSlotEntry {
         skip_serializing_if = "crate::socd_serde::is_default"
     )]
     pub socd: Socd,
+    /// See [`crate::config::SlotEntry::macros`] — the macro master switch, per
+    /// game. Per-game because "macros off" is a property of the OCCASION (a
+    /// tournament build of the same cabinet, a title whose rules forbid them),
+    /// which is exactly what a games.toml profile is for.
+    #[serde(
+        default,
+        with = "crate::macro_serde::switch",
+        skip_serializing_if = "crate::macro_serde::switch::is_default"
+    )]
+    pub macros: MacroSwitch,
 }
 
 impl GameSlotEntry {
@@ -107,7 +117,11 @@ impl GameSlotEntry {
             self.mouse.as_deref().map(DeviceId::new),
             self.preset.clone(),
         )
-        .map(|spec| spec.with_persona(self.persona).with_socd(self.socd))
+        .map(|spec| {
+            spec.with_persona(self.persona)
+                .with_socd(self.socd)
+                .with_macros(self.macros)
+        })
         .map_err(Into::into)
     }
 
@@ -118,6 +132,7 @@ impl GameSlotEntry {
             user_index: None,
             persona: spec.persona,
             socd: spec.socd,
+            macros: spec.macros,
             keyboard: spec.keyboard.as_ref().map(|d| d.as_str().to_owned()),
             mouse: spec.mouse.as_ref().map(|d| d.as_str().to_owned()),
             preset: spec.preset.clone(),
@@ -255,6 +270,7 @@ preset = "IPAC P2"
             preset: "p".into(),
             persona: Persona::default(),
             socd: Socd::default(),
+            macros: Default::default(),
         };
         assert!(matches!(
             entry.to_spec(),

@@ -12,6 +12,45 @@ pub fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// `serde(default = …)` for a flag whose absence means TRUE — `enabled`, and so
+/// far only `enabled`. Serde's own `default` for `bool` is `false`, which would
+/// silently disable every macro in every file written before the setting
+/// existed.
+pub fn default_true() -> bool {
+    true
+}
+
+/// `skip_serializing_if` for the same flag: `enabled = true` is the default and
+/// is never written, so a preset that never touches it round-trips byte for
+/// byte.
+pub fn is_true(value: &bool) -> bool {
+    *value
+}
+
+/// A slot's macro MASTER switch (`macros = "on" | "off"`) — the tournament
+/// setting. Same shape as [`crate::socd_serde`], and `"on"` is skipped on write.
+pub mod switch {
+    use std::str::FromStr;
+
+    use ksx_core::MacroSwitch;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(switch: &MacroSwitch, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(switch.as_str())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<MacroSwitch, D::Error> {
+        let raw = String::deserialize(d)?;
+        MacroSwitch::from_str(&raw).map_err(serde::de::Error::custom)
+    }
+
+    /// `on` is the default and is never written — every config that predates
+    /// the switch serializes to exactly the bytes it always did.
+    pub fn is_default(switch: &MacroSwitch) -> bool {
+        *switch == MacroSwitch::default()
+    }
+}
+
 pub mod on_release {
     use std::str::FromStr;
 

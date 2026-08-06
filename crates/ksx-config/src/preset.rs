@@ -46,7 +46,7 @@ pub struct PresetFile {
 /// `deny_unknown_fields` because a typo in `on_release` must not silently mean
 /// "the default" on a setting whose whole job is to decide what happens when
 /// the player lets go.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MacroFile {
     /// Ordered steps. An empty list is accepted by the parser and reported by
@@ -101,6 +101,41 @@ pub struct MacroFile {
     /// reason a step is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gap_ms: Option<u32>,
+    /// Does this macro run? `true` by default and NEVER written when true, so
+    /// every preset that predates the setting is byte-identical.
+    ///
+    /// ```toml
+    /// [macros.hadouken]
+    /// enabled = false        # keeps the steps AND the trigger row; never runs
+    /// steps = [ ... ]
+    /// ```
+    ///
+    /// See [`ksx_core::Macro::enabled`] for why it exists (you disable to TEST
+    /// and to COMPETE) and [`ksx_core::MacroSwitch`] for the slot-wide version
+    /// that overrides it.
+    #[serde(
+        default = "crate::macro_serde::default_true",
+        skip_serializing_if = "crate::macro_serde::is_true"
+    )]
+    pub enabled: bool,
+}
+
+impl Default for MacroFile {
+    /// Every policy at its default, and `enabled = true` — which is the one
+    /// field whose default is not `Default::default()` for its type, and the
+    /// reason this impl is written by hand.
+    fn default() -> Self {
+        Self {
+            steps: Vec::new(),
+            on_release: OnRelease::default(),
+            retrigger: Retrigger::default(),
+            interrupt: Interrupt::default(),
+            repeat: Repeat::default(),
+            turbo_hz: None,
+            gap_ms: None,
+            enabled: true,
+        }
+    }
 }
 
 impl MacroFile {
@@ -194,6 +229,7 @@ impl MacroFile {
             interrupt: self.interrupt,
             repeat: self.repeat,
             turbo,
+            enabled: self.enabled,
         })
     }
 
@@ -231,6 +267,7 @@ impl MacroFile {
                 Some(TurboRate::GapMs(ms)) => Some(ms),
                 _ => None,
             },
+            enabled: mac.enabled,
         }
     }
 }
@@ -1271,6 +1308,63 @@ steps = [{ hold = ["A"], frames = 2 }]
             );
             assert!(err.to_string().contains("turbo_hz"), "{err}");
         }
+    }
+
+    // ---- enabled (docs/INPUT-TRANSFORMS.md §1c, "switching one off") -------
+
+    /// `enabled = false` survives the trip, and a disabled macro keeps
+    /// EVERYTHING — steps, policies and its trigger row. That is the whole
+    /// difference between disabling and deleting.
+    #[test]
+    fn a_disabled_macro_keeps_its_body_and_its_trigger() {
+        let file: PresetFile = toml::from_str(
+            r#"
+name = "p"
+[bindings]
+macro.hadouken = "P"
+
+[macros.hadouken]
+enabled = false
+steps = [{ hold = ["A"], ms = 50 }]
+"#,
+        )
+        .unwrap();
+        let core = file.to_core().unwrap();
+        let mac = &core.macros.defs[0];
+        assert!(!mac.enabled);
+        assert_eq!(mac.steps.len(), 1);
+        // The trigger row is untouched: the key still says what it starts.
+        assert_eq!(
+            core.macros.triggers,
+            vec![ksx_core::MacroTrigger::new(Key::P, 0)]
+        );
+
+        let text = toml::to_string(&PresetFile::from_core(&core)).unwrap();
+        assert!(text.contains("enabled = false"), "{text}");
+        assert_eq!(
+            toml::from_str::<PresetFile>(&text)
+                .unwrap()
+                .to_core()
+                .unwrap()
+                .macros,
+            core.macros,
+            "{text}"
+        );
+    }
+
+    /// The regression guarantee, and the reason `enabled` needs a hand-written
+    /// default: serde's own default for `bool` is FALSE, which would silently
+    /// disable every macro in every file written before the setting existed.
+    #[test]
+    fn an_absent_enabled_means_true_and_writes_no_byte() {
+        let file: PresetFile = toml::from_str(HADOUKEN).unwrap();
+        let core = file.to_core().unwrap();
+        assert!(core.macros.defs[0].enabled);
+        // The hand-written Default impl, which is the whole reason serde's
+        // own `bool` default (false) cannot be used here.
+        assert!(MacroFile::default().enabled);
+        let text = toml::to_string(&PresetFile::from_core(&core)).unwrap();
+        assert!(!text.contains("enabled"), "{text}");
     }
 
     /// The regression guarantee: `once` is the default and is never written, so

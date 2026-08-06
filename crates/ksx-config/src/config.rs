@@ -1,7 +1,7 @@
 //! Main config file schema: `%APPDATA%\ksx\config.toml`
 //! (`docs/research/design-architecture.md` §4.1).
 
-use ksx_core::{DeviceId, Persona, SlotSpec, Socd};
+use ksx_core::{DeviceId, MacroSwitch, Persona, SlotSpec, Socd};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
@@ -100,6 +100,20 @@ pub struct SlotEntry {
         skip_serializing_if = "crate::socd_serde::is_default"
     )]
     pub socd: Socd,
+    /// Does this slot run macros at all: `"on"` (default — today's behavior) or
+    /// `"off"`. THE TOURNAMENT SWITCH: one edit takes every macro off a panel
+    /// without deleting a single one, and it overrides each macro's own
+    /// `enabled = true`. See [`ksx_core::MacroSwitch`].
+    ///
+    /// A slot property rather than a preset one for the same reason
+    /// [`SlotEntry::socd`] is: the panel and the occasion decide it, and a
+    /// preset that gets shared (M7) must not have to change to suit them.
+    #[serde(
+        default,
+        with = "crate::macro_serde::switch",
+        skip_serializing_if = "crate::macro_serde::switch::is_default"
+    )]
+    pub macros: MacroSwitch,
 }
 
 impl ConfigFile {
@@ -128,7 +142,11 @@ impl ConfigFile {
             .map(|m| self.resolve_device(m))
             .transpose()?;
         SlotSpec::new(slot.number, keyboard, mouse, slot.preset.clone())
-            .map(|spec| spec.with_persona(slot.persona).with_socd(slot.socd))
+            .map(|spec| {
+                spec.with_persona(slot.persona)
+                    .with_socd(slot.socd)
+                    .with_macros(slot.macros)
+            })
             .map_err(Into::into)
     }
 
@@ -149,6 +167,7 @@ impl ConfigFile {
             preset: spec.preset.clone(),
             persona: spec.persona,
             socd: spec.socd,
+            macros: spec.macros,
         }
     }
 }
@@ -217,6 +236,36 @@ preset = "street-fighter-p1"
         assert!(cfg.slots.is_empty());
     }
 
+    /// The macro master switch: absent means "on" and writes nothing, so every
+    /// config that predates it round-trips byte for byte; `"off"` survives.
+    #[test]
+    fn the_macro_switch_defaults_to_on_and_costs_no_bytes() {
+        let cfg: ConfigFile = toml::from_str(DOC_EXAMPLE).unwrap();
+        assert_eq!(cfg.slots[0].macros, MacroSwitch::On);
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(!text.contains("macros"), "{text}");
+        // ...and it reaches the core spec the engine builds from.
+        assert_eq!(
+            cfg.slot_spec(&cfg.slots[0]).unwrap().macros,
+            MacroSwitch::On
+        );
+
+        let off: ConfigFile = toml::from_str(&format!("{DOC_EXAMPLE}macros = \"off\"\n")).unwrap();
+        assert_eq!(off.slots[0].macros, MacroSwitch::Off);
+        assert_eq!(
+            off.slot_spec(&off.slots[0]).unwrap().macros,
+            MacroSwitch::Off
+        );
+        let text = toml::to_string(&off).unwrap();
+        assert!(text.contains("macros = \"off\""), "{text}");
+        assert_eq!(toml::from_str::<ConfigFile>(&text).unwrap(), off);
+        // ...and back through the spec, unchanged.
+        assert_eq!(
+            off.slot_entry(&off.slot_spec(&off.slots[0]).unwrap()),
+            off.slots[0]
+        );
+    }
+
     #[test]
     fn backend_winusb_parses() {
         let entry: DeviceEntry =
@@ -269,6 +318,7 @@ preset = "street-fighter-p1"
             preset: "p".into(),
             persona: Persona::default(),
             socd: Socd::default(),
+            macros: MacroSwitch::default(),
         };
         assert!(matches!(
             cfg.slot_spec(&slot),

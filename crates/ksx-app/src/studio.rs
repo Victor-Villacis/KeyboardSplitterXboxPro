@@ -186,9 +186,20 @@ fn macro_wire(request: &MacroWrite) -> serde_json::Value {
     } else if let Some(ms) = request.gap_ms {
         wire["gap_ms"] = serde_json::json!(ms);
     }
+    // `enabled`: a FIELD when a body goes with it, and the whole request when
+    // one does not (the toggle). The daemon reads it exactly that way, so the
+    // editor's per-macro switch is one small request rather than a rewrite of
+    // a table it might be showing stale.
+    if let Some(enabled) = request.enabled {
+        wire["enabled"] = serde_json::json!(enabled);
+    }
     // A delete carries no body at all — the verb's own refusal for a missing
     // step list is what protects a WRITE from an editor that lost its grid.
-    if !request.delete {
+    // Neither does a pure TOGGLE (`enabled` and no steps): sending `"steps":
+    // []` alongside it would be a whole-table write with an empty grid, which
+    // is exactly the refusal that protection exists for.
+    let toggle = request.enabled.is_some() && request.steps.is_empty();
+    if !request.delete && !toggle {
         wire["steps"] = serde_json::to_value(&request.steps)
             .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
     }
@@ -217,6 +228,10 @@ fn macro_request(wire: serde_json::Value) -> MacroOutcome {
             problems: strings(&response["problems"]),
             warnings: strings(&response["warnings"]),
             deleted: response["deleted"] == true,
+            // Defaulted to "it runs" for a daemon that predates the flag: an
+            // older answer never means "disabled".
+            enabled: response["enabled"].as_bool().unwrap_or(true),
+            toggled: response["toggled"] == true,
             backup: response["backup"]["label"].as_str().map(str::to_owned),
             reloaded: response["reloaded"] == true,
         },
@@ -475,6 +490,9 @@ fn collect_macros(store: &ksx_config::Store, preset_name: &str) -> MacroSnapshot
             repeat: def.repeat.as_str().to_owned(),
             turbo_hz: def.turbo_hz,
             gap_ms: def.gap_ms,
+            // Said as the negative on the wire so the default is the ordinary
+            // case; the card renders it as the loud state it is.
+            disabled: !def.enabled,
             // The `macro.<name>` rows of `[bindings]` — many keys → one macro
             // is native, exactly like many keys → one button. Read through the
             // mapping writer's own helper, so the keys the card shows are the
@@ -498,10 +516,11 @@ fn collect_mapper() -> MapperSnapshot {
     let config_root = root.dir().display().to_string();
     let store = ksx_config::Store::new(root);
 
-    // (number, keyboard, preset, persona, source-line)
+    // (number, keyboard, preset, persona, macro master switch), plus the
+    // source line
     let (rows, source) = match store.load_config() {
         Ok(loaded) if !loaded.value.slots.is_empty() => {
-            let rows: Vec<(u8, String, String, ksx_core::Persona)> = loaded
+            let rows: Vec<(u8, String, String, ksx_core::Persona, ksx_core::MacroSwitch)> = loaded
                 .value
                 .slots
                 .iter()
@@ -511,6 +530,7 @@ fn collect_mapper() -> MapperSnapshot {
                         s.keyboard.clone().unwrap_or_else(|| "(any)".to_owned()),
                         s.preset.clone(),
                         s.persona,
+                        s.macros,
                     )
                 })
                 .collect();
@@ -528,6 +548,7 @@ fn collect_mapper() -> MapperSnapshot {
                                 s.keyboard.clone().unwrap_or_else(|| "(any)".to_owned()),
                                 s.preset.clone(),
                                 s.persona,
+                                s.macros,
                             )
                         })
                         .collect();
@@ -554,7 +575,7 @@ fn collect_mapper() -> MapperSnapshot {
 
     let slots = rows
         .into_iter()
-        .map(|(number, keyboard, preset_name, persona)| {
+        .map(|(number, keyboard, preset_name, persona, macros)| {
             let bindings = preset_bindings(&store, &preset_name);
             let turbo = preset_turbo(&store, &preset_name);
             // The newest restore point, read from disk rather than from the
@@ -572,6 +593,10 @@ fn collect_mapper() -> MapperSnapshot {
                 bindings,
                 backup,
                 turbo,
+                // The tournament switch, straight off the slot entry: "my
+                // macros do nothing" has two causes, and this is the one you
+                // cannot see by reading the preset.
+                macros_off: !macros.is_on(),
             }
         })
         .collect();
@@ -1124,6 +1149,7 @@ steps = [{ hold = ["A"], ms = 50 }]
                 turbo_hz: draft.turbo_hz,
                 gap_ms: draft.gap_ms,
                 delete: false,
+                enabled: Some(!draft.disabled),
                 reload: true,
             });
             let body = crate::daemon::pipe::macro_body(&wire)
@@ -1135,6 +1161,7 @@ steps = [{ hold = ["A"], ms = 50 }]
                     name: draft.name.clone(),
                     body,
                     delete: false,
+                    set_enabled: None,
                 },
             )
             .unwrap_or_else(|err| panic!("{}: the write was refused: {err}", case.what));
@@ -1191,6 +1218,7 @@ steps = [{ hold = ["A"], ms = 50 }]
             turbo_hz: None,
             gap_ms: None,
             delete: false,
+            enabled: None,
             reload: true,
         };
         let wire = macro_wire(&write);
