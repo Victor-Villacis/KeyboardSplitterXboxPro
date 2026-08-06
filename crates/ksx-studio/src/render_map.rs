@@ -805,21 +805,27 @@ fn backup_line(selected: Option<&MapperSlot>) -> String {
 const SEL_TOGGLE_OFF: &str = "btn btn-row seltoggle";
 const SEL_TOGGLE_LABEL_OFF: &str = "Select multiple";
 
-// ── v11: THE MACRO EDITOR — the piano roll ─────────────────────────────────
+// ── v11/v12: THE MACRO EDITOR — the piano roll, and it SAVES ───────────────
 // docs/INPUT-TRANSFORMS.md §6.2, adopted from TAStudio: "rows = steps,
 // columns = the slot's controls, cells = held or not". That beats a form with
 // an "add step" button because a timed sequence is a SHAPE — you have to see
 // ↓, ↘, → as three rows with the diagonal overlapping to know you wrote a
 // quarter-circle rather than three unrelated presses.
 //
-// It is READ-ONLY against disk, and says so everywhere. §1c is explicit that
-// "authoring the sequence itself stays TOML-only": `ksx map` binds the key
-// that STARTS a macro (mapping.rs `apply_macro_trigger`) and there is no
-// daemon verb that writes a step list at all. So this editor is a COMPOSER —
-// it seeds from the file, every edit moves a local draft, and the output is a
-// TOML block to paste plus the exact `ksx map` line for the trigger. What IS
-// a real write is the trigger, and it goes through the same `map` verb every
-// other binding on this page uses — no second writer, no faked one.
+// v11 shipped this READ-ONLY, when §1c's "authoring the sequence itself stays
+// TOML-only" was still true and the only output was a block to paste. It is
+// not true any more: the daemon grew `map-macro`, which takes ONE WHOLE
+// `[macros.<name>]` table ([`crate::control::ControlSource::save_macro`],
+// `POST /api/macro/save`, `ksx macro`). So v12 wires the card to it — New,
+// Save, Rename and Delete are real writes through that one verb — and the
+// TOML block is demoted to a collapsed "copy for sharing" detail.
+//
+// The SAVE MODEL is explicit-Save, not save-per-edit (the rationale is in
+// MapIsland.ts, where the buttons live: a macro write takes a backup and
+// hot-swaps the sequence into the running session, so autosaving every painted
+// cell would publish half-authored sequences and litter backups). Everything
+// that WRITES is JavaScript-only, so the SSR paint below renders the same card
+// in its read state — plus the honest note that says which of the two it is.
 //
 // Every derivation below is mirrored in MapIsland.ts (server derives the SSR
 // paint, the client re-derives per edit and per poll), the established rule
@@ -935,9 +941,16 @@ fn total_ms(mac: &MacroView) -> u32 {
 }
 
 /// The macro the page paints: the payload's `macro_selected` if the preset has
-/// it (case-insensitively, like every function name), else the first one, else
-/// the starter draft.
-fn selected_macro(payload: &MapPayload) -> MacroView {
+/// it (case-insensitively, like every function name), else the first one —
+/// and `None` when the preset holds no macros at all.
+///
+/// v12 removed the "starter draft" fallback that used to fill this. It minted
+/// a macro called `my-macro` that existed ONLY in the browser, so the card
+/// offered to bind a trigger to it and the daemon answered — correctly —
+/// `preset "IPAC P1" defines no macro called "my-macro"`. A name on this card
+/// is now always a name the preset holds; the way to get a new one is the
+/// card's own "＋ New macro", which WRITES it.
+fn selected_macro(payload: &MapPayload) -> Option<MacroView> {
     payload
         .macros
         .macros
@@ -945,17 +958,23 @@ fn selected_macro(payload: &MapPayload) -> MacroView {
         .find(|m| m.name.eq_ignore_ascii_case(&payload.macro_selected))
         .or_else(|| payload.macros.macros.first())
         .cloned()
-        .unwrap_or_else(starter_macro)
 }
 
-/// The macro a preset with none starts from — a real, valid one-step sequence,
-/// so the grid, the warnings and the TOML block are the same code path whether
-/// you are reading a macro or writing your first.
-pub(crate) fn starter_macro() -> MacroView {
+/// The body "＋ New macro" writes: one real 50 ms step at the default
+/// policies. A macro with NO steps is refused by the loader and by the daemon
+/// (`mapping::macro_body_issues`), so a new table has to arrive with one.
+///
+/// The BUTTON lives in MapIsland.ts (`newMacroBody`) — creating a macro is a
+/// fetch, and this crate renders rather than writes. This mirror exists so the
+/// starter body can be pinned against the real loader in a test: a "New macro"
+/// the daemon would refuse is a dead button, and nobody would find out until a
+/// user pressed it.
+#[cfg(test)]
+pub(crate) fn new_macro_body(name: &str) -> MacroView {
     MacroView {
-        name: "my-macro".to_owned(),
+        name: name.to_owned(),
         steps: vec![MacroStepView {
-            hold: vec!["dpad.down".to_owned()],
+            hold: Vec::new(),
             ms: Some(50),
             frames: None,
             allow_short: false,
@@ -967,14 +986,79 @@ pub(crate) fn starter_macro() -> MacroView {
     }
 }
 
-/// Is this macro one the preset actually holds (rather than the starter draft)?
-fn is_on_disk(payload: &MapPayload, mac: &MacroView) -> bool {
-    payload
-        .macros
-        .macros
-        .iter()
-        .any(|m| m.name.eq_ignore_ascii_case(&mac.name))
+// ── v12: the frame arithmetic, on screen ───────────────────────────────────
+// Victor asked it directly: "a 60fps frame is only like sixteenth
+// milliseconds? maybe we can show that math." So the duration editor prints
+// the conversion live, with the sampling floor in the SAME units — which is
+// what makes an amber row explain itself instead of citing a rule.
+//
+// The target rate is DISPLAY-ONLY. Authoring against a game's real rate is
+// useful (59.94, 57, 55 are all common on a cabinet), but there is nowhere to
+// put one: the preset file's step is hold / ms / frames / allow_short, the
+// `map-macro` body ([`crate::control::MacroWrite`]) carries exactly those, and
+// `ksx_core::StepDuration::Frames` counts frames at 60 Hz full stop. A field
+// the daemon would drop is the silent no-op this page bans — so the selector
+// converts for the author and SAYS that `frames = N` still runs at 60 Hz.
+// The rate lives client-side; SSR paints the 60 Hz line.
+
+/// The engine's floor in the author's units: "33 ms (2.0 frames @ 60 Hz)".
+fn floor_text(rate: f64) -> String {
+    format!(
+        "{MIN_STEP_MS} ms ({:.1} frames @ {} Hz)",
+        (f64::from(MIN_STEP_MS) * rate) / 1000.0,
+        rate_text(rate)
+    )
 }
+
+fn rate_text(rate: f64) -> String {
+    if rate.fract() == 0.0 {
+        format!("{rate:.0}")
+    } else {
+        format!("{rate:.2}")
+    }
+}
+
+/// The live conversion for one step. Mirrored in MapIsland.ts `frameMath`.
+fn frame_math(step: Option<&MacroStepView>, rate: f64) -> String {
+    let floor = format!(
+        "The engine can only see steps of {} or longer.",
+        floor_text(rate)
+    );
+    let Some(step) = step else {
+        return format!("Pick a step's ⏱ to retime it. {floor}");
+    };
+    match (step.ms, step.frames) {
+        (Some(_), Some(_)) => format!(
+            "This step says both ms and frames — keep exactly one, or the preset will not \
+             load. {floor}"
+        ),
+        (None, None) => format!("This step has no duration — give it ms or frames. {floor}"),
+        (None, Some(frames)) => {
+            let ksx = f64::from(frames_ms(frames));
+            let plural = if frames == 1 { "" } else { "s" };
+            if (rate - 60.0).abs() < f64::EPSILON {
+                format!("{frames} frame{plural} @ 60 Hz = {ksx:.1} ms. {floor}")
+            } else {
+                let at_rate = (f64::from(frames) * 1000.0) / rate;
+                format!(
+                    "{frames} frame{plural} @ {} Hz = {at_rate:.1} ms — but ksx counts frames at \
+                     60 Hz, so this step runs {ksx:.1} ms. To match the game, switch the unit to \
+                     ms and enter {}. {floor}",
+                    rate_text(rate),
+                    at_rate.round() as u32
+                )
+            }
+        }
+        (Some(ms), None) => format!(
+            "{ms} ms = {:.1} frames @ {} Hz. {floor}",
+            (f64::from(ms) * rate) / 1000.0,
+            rate_text(rate)
+        ),
+    }
+}
+
+/// The rate the SSR paint assumes — the default of the card's own selector.
+const SSR_RATE_HZ: f64 = 60.0;
 
 /// `macro.<name>` — the function name the `map` verb takes for a TRIGGER.
 /// Same spelling `ksx_config::macro_function_name` writes into the file.
@@ -984,14 +1068,15 @@ fn macro_function(name: &str) -> String {
 
 /// The macro tab strip: one anchor per macro the preset defines, so switching
 /// works with JavaScript off (`/map?slot=N&macro=NAME` is a route).
-fn macro_tabs(payload: &MapPayload, current: &MacroView) -> SlotValue {
+fn macro_tabs(payload: &MapPayload, current: Option<&MacroView>) -> SlotValue {
     SlotValue::Array(
         payload
             .macros
             .macros
             .iter()
             .map(|m| {
-                let active = m.name.eq_ignore_ascii_case(&current.name);
+                let active =
+                    current.is_some_and(|current| m.name.eq_ignore_ascii_case(&current.name));
                 SlotValue::Object(vec![
                     ("name".to_owned(), SlotValue::Text(m.name.clone())),
                     (
@@ -1085,7 +1170,14 @@ fn hold_text(slot: Option<&MapperSlot>, hold: &[String]) -> String {
 ///
 /// `selected` is the step the duration editor is pointed at (client-only: an
 /// SSR paint has selected nothing, so it passes `None`).
-fn macro_rows(mac: &MacroView, slot: Option<&MapperSlot>, selected: Option<usize>) -> SlotValue {
+fn macro_rows(
+    mac: Option<&MacroView>,
+    slot: Option<&MapperSlot>,
+    selected: Option<usize>,
+) -> SlotValue {
+    let Some(mac) = mac else {
+        return SlotValue::Array(Vec::new());
+    };
     let last = mac.steps.len().saturating_sub(1);
     SlotValue::Array(
         mac.steps
@@ -1164,7 +1256,14 @@ fn macro_rows(mac: &MacroView, slot: Option<&MapperSlot>, selected: Option<usize
 /// key chips fixed fields). One list of `rows × columns` cells and a
 /// `grid-template-columns` is the shape that survives it, and it reconciles
 /// exactly as well as a nested one would.
-fn macro_cells(mac: &MacroView, slot: Option<&MapperSlot>, selected: Option<usize>) -> SlotValue {
+fn macro_cells(
+    mac: Option<&MacroView>,
+    slot: Option<&MapperSlot>,
+    selected: Option<usize>,
+) -> SlotValue {
+    let Some(mac) = mac else {
+        return SlotValue::Array(Vec::new());
+    };
     let persona = slot.map_or("xbox360", |s| s.persona.as_str());
     let zones = zones_for(persona);
     let mut cells = Vec::with_capacity(mac.steps.len() * zones.len());
@@ -1220,7 +1319,9 @@ fn toml_str(text: &str) -> String {
     out
 }
 
-/// The whole point of a read-only editor: the block you paste.
+/// The macro as TOML — v12's "advanced / copy for sharing" detail, and the
+/// hand-editing path for a page with no JavaScript. Not the save any more:
+/// that is the card's own Save button, through the `map-macro` verb.
 ///
 /// Emitted exactly as `ksx_config::MacroFile` spells it — defaults omitted (a
 /// macro-free-looking file stays macro-free-looking), the duration in the unit
@@ -1278,9 +1379,13 @@ fn macro_toml(mac: &MacroView) -> String {
     out
 }
 
-/// The trigger's `ksx map` line — the ONE macro edit that is a real write, so
-/// the line is complete rather than a template when a key is already bound.
-fn macro_cli(preset: &str, mac: &MacroView) -> String {
+/// The trigger's `ksx map` line — complete rather than a template when a key
+/// is already bound, and a template naming no macro when the preset holds
+/// none (there is nothing to point a key at yet).
+fn macro_cli(preset: &str, mac: Option<&MacroView>) -> String {
+    let Some(mac) = mac else {
+        return format!("ksx map --preset \"{preset}\" --function macro.<NAME> --key <KEY>");
+    };
     let key = mac.triggers.first().map_or("<KEY>", String::as_str);
     format!(
         "ksx map --preset \"{preset}\" --function {} --key {key}",
@@ -1289,7 +1394,10 @@ fn macro_cli(preset: &str, mac: &MacroView) -> String {
 }
 
 /// Which keys start this macro, in words.
-fn macro_trigger_line(mac: &MacroView) -> String {
+fn macro_trigger_line(mac: Option<&MacroView>) -> String {
+    let Some(mac) = mac else {
+        return String::new();
+    };
     match mac.triggers.as_slice() {
         [] => "no trigger key yet — nothing starts this macro".to_owned(),
         [one] => format!("started by {one}"),
@@ -1302,62 +1410,87 @@ fn macro_trigger_line(mac: &MacroView) -> String {
 }
 
 /// The one-line summary above the grid.
-fn macro_head(mac: &MacroView) -> String {
-    format!(
-        "{} — {} step{} · {} ms total",
-        mac.name,
-        mac.steps.len(),
-        if mac.steps.len() == 1 { "" } else { "s" },
-        total_ms(mac)
-    )
+fn macro_head(
+    payload: &MapPayload,
+    selected: Option<&MapperSlot>,
+    mac: Option<&MacroView>,
+) -> String {
+    match mac {
+        Some(mac) => format!(
+            "{} — {} step{} · {} ms total",
+            mac.name,
+            mac.steps.len(),
+            if mac.steps.len() == 1 { "" } else { "s" },
+            total_ms(mac)
+        ),
+        None if payload.macros.available => {
+            format!("\"{}\" has no macros yet", preset_name(payload, selected))
+        }
+        None => "no macro loaded yet".to_owned(),
+    }
+}
+
+/// The preset every macro line is about — the snapshot's own name when the
+/// provider gave one, else the selected slot's.
+fn preset_name(payload: &MapPayload, selected: Option<&MapperSlot>) -> String {
+    if payload.macros.preset.is_empty() {
+        selected
+            .map_or("<PRESET>", |s| s.preset.as_str())
+            .to_owned()
+    } else {
+        payload.macros.preset.clone()
+    }
 }
 
 /// The three policies, as the file holds them right now — the READABLE half of
 /// the three selects beside them (those are draft controls and are hidden
 /// without JavaScript, this line never is).
-fn macro_policy_line(mac: &MacroView) -> String {
-    format!(
-        "on release: {} · retrigger: {} · interrupt: {}",
-        mac.on_release, mac.retrigger, mac.interrupt
-    )
+fn macro_policy_line(mac: Option<&MacroView>) -> String {
+    match mac {
+        Some(mac) => format!(
+            "on release: {} · retrigger: {} · interrupt: {}",
+            mac.on_release, mac.retrigger, mac.interrupt
+        ),
+        None => String::new(),
+    }
 }
 
-/// The honest sentence about what this panel can and cannot do — the whole
-/// §1c "authoring stays TOML-only" fact, plus whatever the provider could not
-/// tell us, worst problem first. It is never empty: a read-only editor that
-/// does not say it is read-only is the silent no-op this page bans.
-fn macro_note(payload: &MapPayload, mac: &MacroView) -> String {
+/// What this card can do right now, in the user's words rather than the
+/// architecture's. Never empty, and it tells the three states apart: the
+/// provider could not read macros / the preset has none / here is one, and
+/// here is what Save does. (Since v12 the "read-only draft" state is gone —
+/// there is a Save button, and the note says what it writes.)
+fn macro_note(payload: &MapPayload, mac: Option<&MacroView>) -> String {
     if !payload.macros.available {
         return format!(
-            "This preset's macros could not be read ({}), so the grid starts from a blank \
-             sequence rather than from your file. Everything below still composes a valid \
-             [macros] block — but check it against the preset before pasting.",
+            "This preset's macros could not be read ({}), so there is nothing to edit and \
+             nothing here can be saved. That is NOT the same as \"this preset has no macros\" \
+             — it means nobody could tell this page either way.",
             payload.macros.reason
         );
     }
     if payload.macros.macros.is_empty() {
-        return "This preset defines no macros yet. The grid below is a NEW sequence — paint \
-                the cells, then paste the TOML block into the preset file. (Step lists are \
-                authored in TOML on purpose: the daemon's map verb writes the key that STARTS \
-                a macro, and has no shape for a step list at all.)"
+        return "This preset has no macros yet. Type a name above and press ＋ New macro: it \
+                is written into the preset straight away (one empty 50 ms step), and then you \
+                paint the grid and press Save macro."
             .to_owned();
     }
-    if !is_on_disk(payload, mac) {
-        return "This is a NEW sequence, not one of the preset's — paste the TOML block below \
-                to add it."
-            .to_owned();
-    }
-    "Steps are read from the preset file and edited here as a DRAFT: nothing in this grid is \
-     saved. Copy the TOML block below into the preset (docs/INPUT-TRANSFORMS.md §1c keeps \
-     step authoring in TOML — the daemon's map verb writes the key that STARTS a macro, and \
-     has no shape for a step list). The trigger below IS a real write, through that same verb."
-        .to_owned()
+    let Some(mac) = mac else {
+        return "Pick a macro above to edit it, or type a name and press ＋ New macro.".to_owned();
+    };
+    format!(
+        "Steps and policies are a DRAFT until you press Save macro — that writes the whole \
+         \"{}\" table into the preset file (a timestamped backup is taken first) and swaps it \
+         into a running session with the pads left plugged. New, Rename and Delete write \
+         immediately. Every one of them can be undone from the toast it leaves.",
+        mac.name
+    )
 }
 
 fn scalar_slots(
     payload: &MapPayload,
     selected: Option<&MapperSlot>,
-    mac: &MacroView,
+    mac: Option<&MacroView>,
     flash: Option<&str>,
 ) -> serde_json::Value {
     let slot_line = match selected {
@@ -1410,37 +1543,45 @@ fn scalar_slots(
         // shows are POSITIONAL, so a new one in the middle of the document
         // silently shifts every panel after it). The card dims when there is
         // no macro data rather than vanishing, exactly like the preset card.
-        "macroHead": macro_head(mac),
+        "macroHead": macro_head(payload, selected, mac),
         "macroRuleLine": MACRO_RULE_LINE,
         "macroPolicyLine": macro_policy_line(mac),
         "macroNote": macro_note(payload, mac),
         "macroTriggerLine": macro_trigger_line(mac),
-        "macroFnName": macro_function(&mac.name),
-        "macroName": mac.name.clone(),
-        "macroCliLine": macro_cli(
-            if payload.macros.preset.is_empty() {
-                selected.map_or("<PRESET>", |s| s.preset.as_str())
-            } else {
-                payload.macros.preset.as_str()
-            },
-            mac,
-        ),
-        "macroToml": macro_toml(mac),
+        // Empty when the preset holds no macro: `data-fn=""` is inert in the
+        // click delegation, which is the honest state for a trigger that has
+        // nothing to start. Never a placeholder name the daemon would reject.
+        "macroFnName": mac.map_or_else(String::new, |m| macro_function(&m.name)),
+        "macroName": mac.map_or_else(String::new, |m| m.name.clone()),
+        "macroCliLine": macro_cli(&preset_name(payload, selected), mac),
+        "macroToml": mac.map_or_else(String::new, macro_toml),
         "macroCardCls": if payload.macros.available {
             "card macrocard"
         } else {
             "card macrocard off"
         },
-        "macroGridCls": if mac.steps.is_empty() {
+        "macroGridCls": if mac.is_none_or(|m| m.steps.is_empty()) {
             "macgrid empty"
         } else {
             "macgrid"
         },
-        // Client-only, both of them: an SSR paint has edited nothing and has
-        // no step selected for the duration editor.
-        "macroDirtyLine": "",
+        // v12: the trigger block is inert while there is no macro to start.
+        "macroTrigCls": if mac.is_some() {
+            "mactrigger"
+        } else {
+            "mactrigger off"
+        },
+        // Client-only: an SSR paint has edited nothing, has no step selected
+        // for the duration editor, and cannot save (every write on this card
+        // is a fetch). "saved" is the honest resting state for a card whose
+        // grid is exactly what the file says.
+        "macroDirtyLine": if mac.is_some() { "saved" } else { "" },
+        "macroSaveCls": "btn btn-mini macsave off",
         "macroStepLine": "click a step's ⏱ to edit its duration",
         "macroDurValue": "50",
+        // The frame maths, at the selector's default rate — no step is
+        // selected on an SSR paint, so this is the floor sentence.
+        "macroMathLine": frame_math(None, SSR_RATE_HZ),
     })
 }
 
@@ -1494,7 +1635,8 @@ fn named_slot_ids(module: &IrModule, name: &str) -> Vec<u16> {
 fn build_slots(module: &IrModule, payload: &MapPayload, flash: Option<&str>) -> SlotData {
     let selected = selected_slot(payload);
     let mac = selected_macro(payload);
-    let scalars = scalar_slots(payload, selected, &mac, flash).to_string();
+    let mac = mac.as_ref();
+    let scalars = scalar_slots(payload, selected, mac, flash).to_string();
     let mut slots = SlotData::from_json(&scalars, module)
         .unwrap_or_else(|_| SlotData::new_from_defaults(&module.slots));
 
@@ -1516,10 +1658,10 @@ fn build_slots(module: &IrModule, payload: &MapPayload, flash: Option<&str>) -> 
         (LIST_SLOT_TOASTS, SlotValue::Array(Vec::new())),
         // v11's piano roll. `None` for the selected step: an SSR paint has
         // pointed the duration editor at nothing.
-        (LIST_SLOT_MACRO_TABS, macro_tabs(payload, &mac)),
+        (LIST_SLOT_MACRO_TABS, macro_tabs(payload, mac)),
         (LIST_SLOT_MACRO_COLS, macro_cols(selected)),
-        (LIST_SLOT_MACRO_ROWS, macro_rows(&mac, selected, None)),
-        (LIST_SLOT_MACRO_CELLS, macro_cells(&mac, selected, None)),
+        (LIST_SLOT_MACRO_ROWS, macro_rows(mac, selected, None)),
+        (LIST_SLOT_MACRO_CELLS, macro_cells(mac, selected, None)),
     ] {
         if let Some(id) = named_slot_ids(module, name).into_iter().next() {
             slots.set(id, value);
@@ -1753,7 +1895,7 @@ mod tests {
             .filter_map(|e| module.strings.get(e.name_str_idx).ok())
             .collect();
 
-        let scalars = scalar_slots(&sample(), None, &hadouken(), None);
+        let scalars = scalar_slots(&sample(), None, Some(&hadouken()), None);
         for key in scalars.as_object().unwrap().keys() {
             assert!(
                 names.contains(&key.as_str()),
@@ -2345,7 +2487,7 @@ mod tests {
         // The server-rendered flash channel (savedLine + its two shows) is
         // still part of the seam — that is the no-JS page's only feedback.
         assert!(
-            scalar_slots(&sample(), None, &hadouken(), None)
+            scalar_slots(&sample(), None, Some(&hadouken()), None)
                 .as_object()
                 .unwrap()
                 .contains_key("savedLine"),
@@ -2869,21 +3011,35 @@ mod tests {
         );
     }
 
-    /// Read-only is stated, always, and the three cases are told apart: the
-    /// provider could not read macros / the preset has none / this is a draft.
-    /// "No macros" and "nobody told us" look identical on screen unless the
-    /// page says which, and only one of them is the user's fault.
+    /// The card says what it DOES, and the three states are told apart: the
+    /// provider could not read macros / the preset has none / here is one and
+    /// here is what Save writes. "No macros" and "nobody told us" look
+    /// identical on screen unless the page says which, and only one of them is
+    /// the user's fault.
     #[test]
     fn the_editor_says_what_it_cannot_do_and_why() {
         let out = render_map(&page(), &sample(), None);
         assert!(
-            out.html.contains("nothing in this grid is saved"),
+            out.html.contains("are a DRAFT until you press Save macro"),
+            "the save model is stated where the grid is: {}",
+            out.html
+        );
+        assert!(
+            out.html
+                .contains("New, Rename and Delete write immediately"),
+            "…and so is the half that does NOT wait for Save: {}",
+            out.html
+        );
+        // The dead read-only copy is GONE — it described a card that could not
+        // save, and repeating it beside a Save button is the worst of both.
+        assert!(
+            !out.html.contains("nothing in this grid is saved"),
             "{}",
             out.html
         );
         assert!(
-            out.html.contains("The trigger below IS a real write"),
-            "{}",
+            !out.html.to_lowercase().contains("paste the toml block"),
+            "copy-and-paste is no longer the primary path: {}",
             out.html
         );
 
@@ -2891,15 +3047,28 @@ mod tests {
         empty.macros = crate::snapshot::MacroSnapshot::read("IPAC P1", Vec::new());
         let out = render_map(&page(), &empty, None);
         assert!(
-            out.html.contains("This preset defines no macros yet"),
+            out.html.contains("This preset has no macros yet"),
             "{}",
             out.html
         );
-        // The starter draft is a REAL macro, so the grid is never a blank slate
-        // with no way in.
         assert!(
-            out.html.contains(r#"data-cell="0|dpad.down""#),
+            out.html.contains("press ＋ New macro"),
+            "the way out of an empty preset is named: {}",
+            out.html
+        );
+        // …and NOTHING is drawn in the grid. v11 painted a browser-only
+        // "my-macro" here, which is what produced `preset "IPAC P1" defines no
+        // macro called "my-macro"` when its trigger was bound.
+        assert!(!out.html.contains("my-macro"), "{}", out.html);
+        assert!(!out.html.contains("data-cell="), "{}", out.html);
+        assert!(
+            out.html.contains(r#"class="macgrid empty""#),
             "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains(r#"class="mactrigger off""#),
+            "a trigger with nothing to start renders inert: {}",
             out.html
         );
 
@@ -2916,6 +3085,145 @@ mod tests {
             out.html.contains(r#"class="card macrocard off""#),
             "{}",
             out.html
+        );
+    }
+
+    /// v12: the card WRITES. Every verb is on screen, pointed at the one save
+    /// seam, and the name on it is always a name the preset holds.
+    #[test]
+    fn the_macro_card_offers_the_four_writes_and_invents_no_macro() {
+        let out = render_map(&page(), &sample(), None);
+        let html = &out.html;
+        for act in ["macro-save", "macro-new", "macro-rename", "macro-delete"] {
+            assert!(
+                html.contains(&format!(r#"data-act="{act}""#)),
+                "{act} is not on the card: {html}"
+            );
+        }
+        // The create affordance is a NAME plus a button — not a button that
+        // mints a draft nobody asked for.
+        assert!(html.contains(r#"class="macnewin""#), "{html}");
+        assert!(html.contains("＋ New macro"), "{html}");
+        // The name the card shows is the preset's own.
+        assert!(html.contains(r#"data-fn="macro.hadouken""#), "{html}");
+        assert!(!html.contains("my-macro"), "{html}");
+        // The save state is visible without hunting (Victor: "where is save?").
+        assert!(
+            html.contains(r#"class="btn btn-mini macsave off""#),
+            "{html}"
+        );
+    }
+
+    /// The user's own question, answered on screen: "a 60fps frame is only
+    /// like sixteenth milliseconds? maybe we can show that math." The floor
+    /// rides along in the SAME units, which is what makes an amber row
+    /// self-explanatory.
+    #[test]
+    fn the_duration_editor_shows_the_frame_math_and_the_floor() {
+        let out = render_map(&page(), &sample(), None);
+        assert!(
+            out.html
+                .contains("The engine can only see steps of 33 ms (2.0 frames @ 60 Hz)"),
+            "the floor, in both units: {}",
+            out.html
+        );
+
+        // Frames → ms, at 60 Hz, exactly as the engine rounds it.
+        let three = step(&[], None, Some(3), false);
+        assert!(
+            frame_math(Some(&three), 60.0).starts_with("3 frames @ 60 Hz = 50.0 ms"),
+            "{}",
+            frame_math(Some(&three), 60.0)
+        );
+        assert!(frame_math(Some(&step(&[], None, Some(1), false)), 60.0).starts_with("1 frame @"));
+        // ms → frames, the other direction.
+        assert!(
+            frame_math(Some(&step(&[], Some(50), None, false)), 60.0)
+                .starts_with("50 ms = 3.0 frames @ 60 Hz"),
+            "{}",
+            frame_math(Some(&step(&[], Some(50), None, false)), 60.0)
+        );
+        // A non-60 target rate is a DISPLAY convenience, and the line says so
+        // rather than pretending the file can store one: ksx counts frames at
+        // 60 Hz, so it names the ms value that matches the game instead.
+        let at57 = frame_math(Some(&three), 57.0);
+        assert!(at57.contains("3 frames @ 57 Hz = 52.6 ms"), "{at57}");
+        assert!(at57.contains("ksx counts frames at 60 Hz"), "{at57}");
+        assert!(at57.contains("this step runs 50.0 ms"), "{at57}");
+        assert!(at57.contains("enter 53"), "{at57}");
+        // A fractional rate keeps its two decimals — 59.94 is not "60".
+        assert_eq!(rate_text(59.94), "59.94");
+        assert_eq!(rate_text(60.0), "60");
+        assert!(
+            frame_math(Some(&three), 59.94).contains("@ 59.94 Hz"),
+            "{}",
+            frame_math(Some(&three), 59.94)
+        );
+        // The faults keep saying what they are here too.
+        assert!(frame_math(Some(&step(&[], Some(5), Some(1), false)), 60.0)
+            .starts_with("This step says both ms and frames"));
+        assert!(frame_math(Some(&step(&[], None, None, false)), 60.0)
+            .starts_with("This step has no duration"));
+    }
+
+    /// The copy-and-paste path is still there and is no longer the point: a
+    /// collapsed detail, labelled as the sharing/hand-editing route.
+    #[test]
+    fn the_toml_block_is_secondary_now() {
+        let out = render_map(&page(), &sample(), None);
+        let html = &out.html;
+        assert!(html.contains(r#"<details class="mactomlbox">"#), "{html}");
+        assert!(
+            html.contains("Advanced — this macro as TOML"),
+            "the summary says what it is for: {html}"
+        );
+        assert!(
+            html.contains("You do not need this to keep your work"),
+            "{html}"
+        );
+        // …and the block itself is still exactly the one the loader accepts
+        // (`the_generated_toml_block_parses_back_into_the_same_macro`).
+        assert!(html.contains("[macros.hadouken]"), "{html}");
+    }
+
+    /// "＋ New macro" writes a REAL table, so what it writes has to load. A
+    /// starter body the daemon refuses would be a button that fails the first
+    /// time anybody presses it.
+    #[test]
+    fn the_body_new_macro_writes_is_one_the_loader_accepts() {
+        let body = new_macro_body("uppercut");
+        assert_eq!(body.steps.len(), 1, "a macro with no steps is refused");
+        let block = macro_toml(&body);
+        let file: ksx_config::PresetFile =
+            toml::from_str(&format!("name = \"p\"\n{block}")).expect("the new body must parse");
+        let core = file.to_core().expect("…and must load");
+        assert_eq!(core.macros.defs.len(), 1);
+        assert_eq!(core.macros.defs[0].name, "uppercut");
+        assert_eq!(core.macros.defs[0].steps.len(), 1);
+        // It arrives with no trigger, and the block says so in a COMMENT
+        // rather than a placeholder key that would not load.
+        assert!(core.macros.triggers.is_empty());
+    }
+
+    /// A first-time reader has to learn two words from this card alone: what a
+    /// macro is, and what a trigger is. Nobody should have to open
+    /// docs/INPUT-TRANSFORMS.md to press a button.
+    #[test]
+    fn the_card_explains_a_macro_and_its_trigger_in_words() {
+        let out = render_map(&page(), &sample(), None);
+        let html = &out.html;
+        assert!(html.contains("A MACRO is a timed sequence"), "{html}");
+        assert!(
+            html.contains("A TRIGGER is the panel key that STARTS the macro"),
+            "{html}"
+        );
+        assert!(
+            html.contains("Trigger — the key that STARTS this macro"),
+            "the trigger row names its own job: {html}"
+        );
+        assert!(
+            html.contains("A macro with no trigger is inert"),
+            "…and what happens if you skip it: {html}"
         );
     }
 

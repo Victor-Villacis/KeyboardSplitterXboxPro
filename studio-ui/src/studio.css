@@ -1706,12 +1706,11 @@ footer p {
    `createList` inside a list item has no seam — ledger #17's neighbour).
 
    Everything that EDITS is JavaScript-only, and hidden until map.ts marks the
-   island `.js`: the grid writes a local draft whose output is a TOML block
-   (§1c keeps step authoring in TOML — no daemon verb writes a step list), so
-   without scripting there is nothing for those controls to do, and this page
-   never renders a control that does nothing. What stays for everyone is the
-   READ: the grid, the durations, the amber flags, the policies, the trigger
-   form, and the block to paste. */
+   island `.js`: New / Save / Rename / Delete are JSON verbs (v12 —
+   `POST /api/macro/save`), and a control that cannot reach them is a control
+   that does nothing, which this page never renders. What stays for everyone is
+   the READ: the grid, the durations, the amber flags, the policies, the
+   trigger form, and — collapsed at the bottom — the TOML block to copy. */
 
 .macrocard {
   --macrow: 1.85rem;
@@ -1722,9 +1721,55 @@ footer p {
   opacity: 0.75;
 }
 
+/* v12: the save state, said twice — this line and the button's own look.
+   Quiet at rest ("saved"), amber the moment the Save button goes dirty. */
 .macdirty {
   font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.macsave.dirty + .macdirty {
   color: var(--warn);
+  font-weight: 700;
+}
+
+/* THE Save button. Hidden without scripting (it is a fetch), loud when there
+   is something to write, quiet when the grid matches the file — never
+   `disabled`, so a click can always answer "why not?". */
+.macsave {
+  display: none;
+}
+
+.studio.js .macsave {
+  display: inline-flex;
+}
+
+.macsave.dirty {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+  font-weight: 700;
+}
+
+.macsave.off {
+  opacity: 0.6;
+}
+
+/* CREATE: a name and a button, on their own row above the grid. */
+.macnewbox {
+  display: none;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.5rem;
+  margin-bottom: 0.7rem;
+}
+
+.studio.js .macnewbox {
+  display: flex;
+}
+
+.macnewin {
+  width: 12rem;
 }
 
 .mactabs {
@@ -1786,7 +1831,7 @@ footer p {
 }
 
 .macgrid.empty::after {
-  content: "no steps yet — add one with “Add step at end”, or paste a [macros] block into the preset file";
+  content: "no steps to show — pick a macro above, or create one with “＋ New macro”";
 }
 
 .macrowbar {
@@ -2014,6 +2059,28 @@ footer p {
   width: 10rem;
 }
 
+/* v12: the frame arithmetic, full-width under the duration controls — it is a
+   sentence, not a chip, and it carries the sampling floor in the same units. */
+.macmath {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 0.74rem;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.macrate {
+  width: 6rem;
+}
+
+/* Delete is the one destructive verb on this card; it wears the same warning
+   hue the per-step ✕ does on hover, never a confirm dialog (v8's rule: the
+   toast that reports it carries the way back). */
+.macdelmac:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
 .macshortlbl {
   display: flex;
   align-items: center;
@@ -2057,10 +2124,15 @@ footer p {
   color: var(--muted);
 }
 
-.mactrigger h3,
-.mactomlbox h3 {
+.mactrigger h3 {
   margin: 0 0 0.35rem;
   font-size: 0.9rem;
+}
+
+/* No macro is loaded, so there is nothing for a trigger to start. Dimmed, not
+   removed — the reason is written above it. */
+.mactrigger.off {
+  opacity: 0.55;
 }
 
 .mactrigline {
@@ -2081,8 +2153,22 @@ footer p {
   max-width: 14rem;
 }
 
+/* v12: SECONDARY. Save macro is the way to keep a sequence; this is the way to
+   share one. A collapsed <details>, so it is available and out of the way. */
 .mactomlbox {
   margin-top: 0.9rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.6rem;
+}
+
+.mactomlbox > summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.mactomlbox > summary:hover {
+  color: var(--text);
 }
 
 .mactoml {

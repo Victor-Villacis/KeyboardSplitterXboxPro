@@ -31,8 +31,11 @@ import {
   keyList,
   learnAllowed,
   liveProfile,
+  macroDraftTriggers,
   macroIsDirty,
-  macroRename,
+  macroIsOnDisk,
+  macroNameProblem,
+  macroOnDiskCopy,
   macroSeededFrom,
   macroSetAllowShort,
   macroSetDuration,
@@ -41,8 +44,12 @@ import {
   macroStepAllowShort,
   macroStepUnit,
   macroStepVerb,
+  macroTargetRate,
   macroToggleCell,
   macroTomlText,
+  markMacroSaved,
+  newMacroBody,
+  setMacroTargetRate,
   markPaused,
   markSaved,
   modalIsOpen,
@@ -71,6 +78,8 @@ import {
   writableKeys,
   type BindOutcome,
   type LearnView,
+  type MacroOutcome,
+  type MacroView,
   type MapPayload,
   type ToastOptions,
 } from "./MapIsland";
@@ -937,25 +946,42 @@ async function submitNoJsForm(
   void poll();
 }
 
-// ── v11: the macro editor's controls ───────────────────────────────────────
-// The grid edits a DRAFT (docs/INPUT-TRANSFORMS.md §1c keeps step authoring in
-// TOML — no daemon verb writes a step list), so nothing here calls a write
-// verb. What it does call is `syncMacroControls`: three <select>s, a number
-// input, a checkbox and a text input whose VALUES cannot come from an
-// attribute binding once the user has touched them (a dirty form control
-// ignores its attribute), so the island exposes the draft's truth and this
-// writes it onto the DOM after every edit and every poll.
+// ── v11/v12: the macro editor's controls ───────────────────────────────────
+// The grid edits a DRAFT and ONE button writes it: `POST /api/macro/save` →
+// `ControlSource::save_macro` → the daemon's `map-macro` verb → the same
+// `mapping::save_macro` the `ksx macro` CLI calls. Whole table per call, so
+// what the grid holds and what lands in the preset are the same object.
+//
+// WHY EXPLICIT SAVE and not save-per-edit like the binding side: every macro
+// write takes a timestamped backup and hot-swaps the sequence into the running
+// session. Autosaving each painted cell would push a half-authored sequence
+// into a live game and leave one backup file per click; a grid edit is a
+// composition whose unit is the finished sequence. The three STRUCTURAL verbs
+// (New / Rename / Delete) are single deliberate actions, so those write
+// immediately. Toast + Undo on all four, same as every other write here.
+//
+// `syncMacroControls` remains what it was: four <select>s, a number input, a
+// checkbox and a text input whose VALUES cannot come from an attribute binding
+// once the user has touched them (a dirty form control ignores its attribute),
+// so the island exposes the draft's truth and this writes it onto the DOM
+// after every edit and every poll.
 
 let islandRoot: HTMLElement | null = null;
 
 function syncMacroControls(): void {
   const root = islandRoot;
+  if (!root) return;
   const mac = currentMacro();
-  if (!root || !mac) return;
   const set = (sel: string, value: string): void => {
     const el = root.querySelector<HTMLInputElement | HTMLSelectElement>(sel);
     if (el && el.value !== value) el.value = value;
   };
+  // The rate is the author's, not the file's — it survives a macro switch.
+  set(".macrate", String(macroTargetRate()));
+  if (!mac) {
+    set(".macnamein", "");
+    return;
+  }
   set(".macdurin", String(macroDurationValue()));
   set(".macunit", macroStepUnit());
   set(".macnamein", mac.name);
@@ -964,6 +990,332 @@ function syncMacroControls(): void {
   set('.macsel[data-macpol="interrupt"]', mac.interrupt);
   const short = root.querySelector<HTMLInputElement>(".macshortin");
   if (short) short.checked = macroStepAllowShort();
+}
+
+/** The text in the "new macro name" box, trimmed. */
+function newMacroName(): string {
+  return islandRoot?.querySelector<HTMLInputElement>(".macnewin")?.value.trim() ?? "";
+}
+
+/** The text in the name box beside the grid, trimmed — Rename's argument. */
+function typedMacroName(): string {
+  return islandRoot?.querySelector<HTMLInputElement>(".macnamein")?.value.trim() ?? "";
+}
+
+function clearNewMacroName(): void {
+  const el = islandRoot?.querySelector<HTMLInputElement>(".macnewin");
+  if (el) el.value = "";
+}
+
+// ── The one macro writer ───────────────────────────────────────────────────
+
+/** One whole-table write (or delete). Never throws — transport failure comes
+ *  back in the same shape, so no caller can forget it. */
+async function macroWrite(preset: string, mac: MacroView, remove = false): Promise<MacroOutcome> {
+  try {
+    return await fetchJSON<MacroOutcome>("/api/macro/save", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        preset,
+        name: mac.name,
+        // A delete carries no body: an EMPTY step list is a refusal on the
+        // daemon side precisely so an editor that lost its grid cannot delete
+        // a macro by omission (control.rs `MacroWrite::delete`).
+        steps: remove ? [] : mac.steps,
+        on_release: mac.on_release,
+        retrigger: mac.retrigger,
+        interrupt: mac.interrupt,
+        delete: remove,
+        // The server forces this on anyway; sent so the request says what it
+        // means. A macro body is a binding change — the pads stay plugged.
+        reload: true,
+      }),
+    });
+  } catch {
+    return {
+      ok: false,
+      message: null,
+      error: "the macro save request failed — is ksx studio still running?",
+      code: null,
+      problems: [],
+      warnings: [],
+      deleted: false,
+      backup: null,
+      reloaded: false,
+    };
+  }
+}
+
+/** A refusal, in one sentence: the daemon's own words plus every problem row
+ *  it listed (validation names them one per fault — a step holding `warp`, a
+ *  duration in two units — and swallowing them would leave the user guessing
+ *  which step is wrong). */
+function macroRefusal(out: MacroOutcome): string {
+  const lead = out.error ?? out.code ?? "the daemon refused the write";
+  return out.problems.length === 0 ? lead : `${lead} — ${out.problems.join("; ")}`;
+}
+
+/** The advisories a SUCCESSFUL write still has to say out loud (a step below
+ *  the sampling floor was raised, or runs as written and may be missed). */
+function macroNotes(out: MacroOutcome): string {
+  return out.warnings.length === 0 ? "" : ` Note: ${out.warnings.join("; ")}.`;
+}
+
+/** Put a macro back exactly as it was — the undo of a save, a delete, or half
+ *  of a rename. `null` = it did not exist before, so the undo is a delete. */
+function undoMacroTo(
+  preset: string,
+  before: MacroView | null,
+  name: string,
+): () => Promise<string | null> {
+  return async () => {
+    if (before === null) {
+      const out = await macroWrite(preset, { ...newMacroBody(name) }, true);
+      if (!out.ok) return macroRefusal(out);
+    } else {
+      const out = await macroWrite(preset, before);
+      if (!out.ok) return macroRefusal(out);
+      // The table is back; so are its trigger rows, which live in [bindings]
+      // and are written by the `map` verb, not by this one.
+      if (before.triggers.length > 0) {
+        const back = await bindKeys(preset, `macro.${before.name}`, before.triggers, true);
+        if (!back.ok) {
+          return `the macro is back, but its trigger key(s) are not: ${back.error ?? "refused"}`;
+        }
+      }
+    }
+    markSaved();
+    await poll();
+    seedMacro(before === null ? null : before.name);
+    syncMacroControls();
+    return null;
+  };
+}
+
+/** What a macro verb needs before it can do anything, or the sentence saying
+ *  why it cannot. Never a silent return: a button that answers nothing is the
+ *  one thing this page does not ship. */
+function macroTarget(): { mac: MacroView; preset: string } | null {
+  const mac = currentMacro();
+  const preset = currentPreset();
+  if (!preset) {
+    oops("No slot is selected, so there is no preset to write a macro into.");
+    return null;
+  }
+  if (!mac) {
+    oops(
+      "No macro is loaded. Pick one from the tabs above, or type a name and press ＋ New macro.",
+    );
+    return null;
+  }
+  return { mac, preset };
+}
+
+/** SAVE: the whole draft table into the preset. */
+async function macroSave(): Promise<void> {
+  const target = macroTarget();
+  if (!target) return;
+  const { mac, preset } = target;
+  if (!macroIsDirty()) {
+    pushToast(`"${mac.name}" already matches the preset file — nothing to save.`, { kind: "warn" });
+    return;
+  }
+  // Read BEFORE the write: this is the entire undo.
+  const before = macroOnDiskCopy(mac.name);
+  const out = await macroWrite(preset, mac);
+  if (!out.ok) {
+    oops(`"${mac.name}" was NOT saved: ${macroRefusal(out)}. The preset file is untouched.`);
+    return;
+  }
+  markMacroSaved(mac.name);
+  markSaved();
+  await poll();
+  seedMacro(mac.name);
+  syncMacroControls();
+  let line =
+    `"${mac.name}" saved into "${preset}" — ${mac.steps.length} step` +
+    `${mac.steps.length === 1 ? "" : "s"}.${macroNotes(out)}`;
+  if (out.reloaded) line += " The running session is already playing this version.";
+  pushToast(line, {
+    kind: out.warnings.length > 0 ? "warn" : "ok",
+    undo: undoMacroTo(preset, before, mac.name),
+    undone:
+      before === null
+        ? `"${mac.name}" is gone again.`
+        : `"${mac.name}" is back to the version that was in the file.`,
+  });
+}
+
+/** NEW: create the macro in the preset, right now, with one starter step. */
+async function macroNew(): Promise<void> {
+  const preset = currentPreset();
+  if (!preset) {
+    oops("No slot is selected, so there is no preset to create a macro in.");
+    return;
+  }
+  const name = newMacroName();
+  const problem = macroNameProblem(name);
+  if (problem !== null) {
+    oops(problem);
+    return;
+  }
+  // Creating switches the editor, so an unsaved grid is about to be dropped.
+  // Say it before it happens, naming what it was.
+  const leaving = currentMacro();
+  if (macroIsDirty() && leaving) {
+    pushToast(
+      `Unsaved changes to "${leaving.name}" were discarded — Save macro writes them, ` +
+        "creating another macro does not. (The preset file is unchanged.)",
+      { kind: "warn" },
+    );
+  }
+  const out = await macroWrite(preset, newMacroBody(name));
+  if (!out.ok) {
+    oops(`"${name}" was NOT created: ${macroRefusal(out)}`);
+    return;
+  }
+  clearNewMacroName();
+  markSaved();
+  await poll();
+  seedMacro(name);
+  syncMacroControls();
+  pushToast(
+    `"${name}" now exists in "${preset}" — one empty 50 ms step. Paint the grid, press ` +
+      "Save macro, then bind a trigger key at the bottom of this card." +
+      macroNotes(out),
+    {
+      undo: undoMacroTo(preset, null, name),
+      undone: `"${name}" is gone again.`,
+    },
+  );
+}
+
+/** RENAME: save under the new name, delete the old table, then move the
+ *  trigger keys across. Three calls of two verbs that already exist — there is
+ *  no rename verb, and inventing one here would be a second macro writer.
+ *  Reported as ONE action, and its Undo is the exact inverse. */
+async function macroRenameTo(
+  preset: string,
+  from: MacroView,
+  to: string,
+): Promise<string | null> {
+  const moved: MacroView = { ...from, name: to, steps: from.steps, triggers: [...from.triggers] };
+  const wrote = await macroWrite(preset, moved);
+  if (!wrote.ok) return `${macroRefusal(wrote)} — nothing was renamed`;
+  const removed = await macroWrite(preset, from, true);
+  if (!removed.ok) {
+    return (
+      `"${to}" was written, but the old "${from.name}" table could NOT be removed ` +
+      `(${macroRefusal(removed)}) — the preset now holds both. Delete one of them.`
+    );
+  }
+  // Deleting the old table took its `macro.<old>` trigger rows with it (they
+  // would not load without it), so the keys have to be pointed at the new
+  // name. That is an ordinary binding write, through the `map` verb.
+  if (from.triggers.length > 0) {
+    const bound = await bindKeys(preset, `macro.${to}`, from.triggers, true);
+    if (!bound.ok) {
+      return (
+        `"${from.name}" is now "${to}", but its trigger key(s) ${keyList(from.triggers)} ` +
+        `could not be moved across (${bound.error ?? "refused"}) — set the trigger again below`
+      );
+    }
+  }
+  return null;
+}
+
+async function macroRename(): Promise<void> {
+  const target = macroTarget();
+  if (!target) return;
+  const { mac, preset } = target;
+  const to = typedMacroName();
+  if (to === mac.name) {
+    pushToast("That is already this macro's name — nothing to rename.", { kind: "warn" });
+    return;
+  }
+  // A rename that only changes CASE would destroy the macro: the writer
+  // matches names case-insensitively and keeps the file's own spelling
+  // (mapping.rs `save_macro`), so "Hadouken" would land back in the
+  // "hadouken" table — and the delete that follows would then take it away
+  // entirely. Refused in those words rather than performed as data loss.
+  if (to.toLowerCase() === mac.name.toLowerCase()) {
+    pushToast(
+      `Macro names are matched without case, so "${to}" and "${mac.name}" are the same ` +
+        "table and the file keeps the spelling it already has. Nothing was changed — pick a " +
+        "different name.",
+      { kind: "warn" },
+    );
+    return;
+  }
+  const problem = macroNameProblem(to, mac.name);
+  if (problem !== null) {
+    oops(`Not renamed. ${problem}`);
+    return;
+  }
+  const from = { ...mac, triggers: [...mac.triggers] };
+  const failure = await macroRenameTo(preset, from, to);
+  await poll();
+  if (failure !== null) {
+    oops(`Rename problem: ${failure}.`);
+    seedMacro(null);
+    syncMacroControls();
+    return;
+  }
+  markMacroSaved(to);
+  markSaved();
+  seedMacro(to);
+  syncMacroControls();
+  pushToast(
+    `"${from.name}" is now "${to}" in "${preset}"` +
+      (from.triggers.length > 0
+        ? `, and ${keyList(from.triggers)} still starts it.`
+        : ". It has no trigger key yet — set one below."),
+    {
+      undo: async () => {
+        const back = await macroRenameTo(preset, { ...from, name: to }, from.name);
+        markSaved();
+        await poll();
+        seedMacro(from.name);
+        syncMacroControls();
+        return back;
+      },
+      undone: `It is called "${from.name}" again.`,
+    },
+  );
+}
+
+/** DELETE: remove the table (and the trigger rows that would dangle). */
+async function macroDelete(): Promise<void> {
+  const target = macroTarget();
+  if (!target) return;
+  const { mac, preset } = target;
+  if (!macroIsOnDisk()) {
+    pushToast(`"${mac.name}" is not in the preset file, so there is nothing to delete.`, {
+      kind: "warn",
+    });
+    return;
+  }
+  const before = macroOnDiskCopy(mac.name) ?? { ...mac, triggers: macroDraftTriggers() };
+  const out = await macroWrite(preset, mac, true);
+  if (!out.ok) {
+    oops(`"${mac.name}" was NOT deleted: ${macroRefusal(out)}`);
+    return;
+  }
+  markSaved();
+  await poll();
+  seedMacro(null);
+  syncMacroControls();
+  pushToast(
+    `"${mac.name}" is gone from "${preset}"` +
+      (before.triggers.length > 0
+        ? ` — ${keyList(before.triggers)} no longer starts anything.`
+        : "."),
+    {
+      undo: undoMacroTo(preset, before, mac.name),
+      undone: `"${mac.name}" is back, exactly as it was.`,
+    },
+  );
 }
 
 /** The number the duration box should show for the selected step, in the unit
@@ -996,14 +1348,15 @@ function macroCell(payload: string): void {
   syncMacroControls();
 }
 
-/** Switch the editor to another macro — or to a fresh sequence. A draft with
- *  unsaved edits is not silently thrown away: it says so, and the TOML block
- *  it produced was on screen the whole time. */
+/** Switch the editor to another of the preset's macros. Unsaved grid edits are
+ *  DISCARDED — and said so, naming what they were, because the one thing this
+ *  page never does is lose work quietly. */
 function macroSwitch(name: string | null): void {
-  if (macroIsDirty()) {
+  const leaving = currentMacro();
+  if (macroIsDirty() && leaving) {
     pushToast(
-      "That draft was not saved anywhere — macro steps are pasted into the preset as TOML, " +
-        "and this one is gone. (Nothing on disk changed.)",
+      `Unsaved changes to "${leaving.name}" were discarded — Save macro writes them, ` +
+        "switching macros does not. (The preset file is unchanged.)",
       { kind: "warn" },
     );
   }
@@ -1016,7 +1369,10 @@ async function macroCopy(): Promise<void> {
   if (text === "") return;
   try {
     await navigator.clipboard.writeText(text);
-    pushToast("The [macros] block is on the clipboard — paste it into the preset file.");
+    pushToast(
+      "The [macros] block is on the clipboard — for sharing or hand-editing. " +
+        "(Save macro already writes it into the preset for you.)",
+    );
   } catch {
     oops("Could not reach the clipboard — select the block and copy it by hand.");
   }
@@ -1171,10 +1527,23 @@ function wire(root: HTMLElement): void {
       setMultiMode(false);
       return;
     }
-    // ── v11: macro-card verbs. None of them writes anything — the output is
-    // the TOML block (§1c: step authoring stays TOML-only). ───────────────
+    // ── v11/v12: macro-card verbs. Four of them WRITE, through the one
+    // `save_macro` seam (= the daemon's `map-macro`); the rest move the
+    // draft. ─────────────────────────────────────────────────────────────
+    if (act === "macro-save") {
+      void macroSave();
+      return;
+    }
     if (act === "macro-new") {
-      macroSwitch(null);
+      void macroNew();
+      return;
+    }
+    if (act === "macro-rename") {
+      void macroRename();
+      return;
+    }
+    if (act === "macro-delete") {
+      void macroDelete();
       return;
     }
     if (act === "macro-addstep") {
@@ -1218,6 +1587,20 @@ function wire(root: HTMLElement): void {
       void cancelLearn();
       selectSlot(Number(tab.dataset.slot));
       window.history.replaceState(null, "", `/map?slot=${tab.dataset.slot}`);
+      return;
+    }
+
+    // v12: the trigger block while the preset holds no macro. Its learn button
+    // carries an EMPTY data-fn (there is nothing to point a key at), which the
+    // branch below would read as "not a zone" and do nothing at all. Say why
+    // instead — a dead click is the silent no-op this page bans.
+    const inertTrigger = target.closest<HTMLElement>(".mactrigger.off");
+    if (inertTrigger && target.closest("button") !== null) {
+      ev.preventDefault();
+      oops(
+        "There is no macro for a key to start yet. Create one with ＋ New macro, then set " +
+          "its trigger here.",
+      );
       return;
     }
 
@@ -1302,9 +1685,21 @@ function wire(root: HTMLElement): void {
       macroSetAllowShort(el.checked);
       return;
     }
-    if (el.classList.contains("macnamein")) {
-      if (committed) macroRename(el.value);
+    if (el.classList.contains("macrate")) {
+      // Display-only (MapIsland's `setMacroTargetRate` says why): it converts
+      // frames ↔ ms for the author and changes nothing in the file.
+      setMacroTargetRate(Number(el.value));
       return;
+    }
+    if (el.classList.contains("macnamein")) {
+      // Typing a name changes NOTHING on its own — the Rename button is the
+      // write. The old build renamed the draft here, which is why a rename
+      // "just reset back": the next poll re-seeded from a file that had never
+      // heard of the new name.
+      return;
+    }
+    if (el.classList.contains("macnewin")) {
+      return; // ＋ New macro is the write; the box is just a name
     }
     const field = el.dataset.macpol;
     if (field) macroSetPolicy(field, el.value);

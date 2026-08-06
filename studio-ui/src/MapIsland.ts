@@ -197,6 +197,23 @@ export interface BindOutcome {
   reloaded: boolean;
 }
 
+/** What `POST /api/macro/save` answers — `MacroOutcome` in control.rs. One
+ *  whole `[macros.<name>]` table in, one answer out: `problems` are a
+ *  refusal's rows, `warnings` are the advisories a SUCCESSFUL write still has
+ *  to say out loud (a step the engine raised), and `backup` names the
+ *  timestamped copy the daemon took before writing. */
+export interface MacroOutcome {
+  ok: boolean;
+  message: string | null;
+  error: string | null;
+  code: string | null;
+  problems: string[];
+  warnings: string[];
+  deleted: boolean;
+  backup: string | null;
+  reloaded: boolean;
+}
+
 interface SlotTab {
   num: string;
   label: string;
@@ -433,7 +450,11 @@ const [toasts, setToasts] = createSignal<ToastRow[]>([]);
 const [actionsCls, setActionsCls] = createSignal("card pactions off");
 
 // ── v11: the macro editor's own signals (twins in MapPage.ts) ──────────────
-const [macroHead, setMacroHead] = createSignal("no macro selected");
+// v12 defaults say "nothing is loaded", never a made-up macro name: the old
+// "my-macro" placeholder existed only in the browser, so binding a trigger to
+// it came back "preset defines no macro called my-macro". A name on this card
+// is now always a name the PRESET holds.
+const [macroHead, setMacroHead] = createSignal("no macro loaded yet");
 const [macroRuleLine, setMacroRuleLine] = createSignal("");
 const [macroPolicyLine, setMacroPolicyLine] = createSignal(
   "on release: finish · retrigger: ignore · interrupt: none",
@@ -442,8 +463,8 @@ const [macroNote, setMacroNote] = createSignal("");
 const [macroTriggerLine, setMacroTriggerLine] = createSignal(
   "no trigger key yet — nothing starts this macro",
 );
-const [macroFnName, setMacroFnName] = createSignal("macro.my-macro");
-const [macroName, setMacroName] = createSignal("my-macro");
+const [macroFnName, setMacroFnName] = createSignal("");
+const [macroName, setMacroName] = createSignal("");
 const [macroCliLine, setMacroCliLine] = createSignal(
   "ksx map --preset <NAME> --function macro.<NAME> --key <KEY>",
 );
@@ -455,6 +476,18 @@ const [macroStepLine, setMacroStepLine] = createSignal(
   "click a step's ⏱ to edit its duration",
 );
 const [macroDurValue, setMacroDurValue] = createSignal("50");
+/** v12: the Save button's own look — "btn macsave" when there is nothing to
+ *  write, "… dirty" the moment the draft differs from the file. A class
+ *  string, never a show (ledger #13/#14). */
+const [macroSaveCls, setMacroSaveCls] = createSignal("btn btn-mini macsave off");
+/** v12: the frame arithmetic, live, wherever a duration is edited (Victor: "a
+ *  60fps frame is only like sixteenth milliseconds? maybe we can show that
+ *  math"). Carries the sampling floor in the SAME units, so "too short" needs
+ *  no other explanation. */
+const [macroMathLine, setMacroMathLine] = createSignal("");
+/** The trigger block's class: inert while the preset holds no macro, because
+ *  a key that starts nothing is exactly the confusion this card had. */
+const [macroTrigCls, setMacroTrigCls] = createSignal("mactrigger off");
 const [macroTabs, setMacroTabs] = createSignal<MacroTab[]>([]);
 const [macroCols, setMacroCols] = createSignal<MacroCol[]>([]);
 const [macroRows, setMacroRows] = createSignal<MacroRow[]>([]);
@@ -885,8 +918,10 @@ export function applyMap(p: MapPayload): void {
 
   // v11: seed the macro draft from the file, but never over an edit in
   // flight — a 2 s poll that ate a half-painted sequence would be the exact
-  // silent data loss this page bans. The TRIGGER is re-read either way: that
-  // half IS saved, and a draft has no business remembering a stale copy of it.
+  // silent data loss this page bans (and with an explicit Save, an unsaved
+  // draft is the normal state while authoring, not an edge case). The TRIGGER
+  // is re-read either way: that half is written by the `map` verb, so a draft
+  // has no business remembering a stale copy of it.
   if (macroDraft === null || !macroDirty) {
     seedMacro(null);
   } else {
@@ -1294,17 +1329,29 @@ export async function runUndo(id: string | null): Promise<void> {
   syncToasts();
 }
 
-// ── v11: THE MACRO EDITOR — the piano roll ─────────────────────────────────
+// ── v11/v12: THE MACRO EDITOR — the piano roll, and it SAVES ───────────────
 // docs/INPUT-TRANSFORMS.md §6.2 (TAStudio, adopted): rows = steps, columns =
 // the slot's controls, cells = held or not. A timed sequence is a SHAPE, and
 // an "add step" form hides it.
 //
-// READ-ONLY against disk, and it says so in every state. §1c: "authoring the
-// sequence itself stays TOML-only" — the daemon's `map` verb writes the key
-// that STARTS a macro (mapping.rs `apply_macro_trigger`) and has no shape for
-// a step list at all. So the grid edits a local DRAFT seeded from the file,
-// and its output is a `[macros.<name>]` block to paste. The trigger is the one
-// real write, through that same verb.
+// v12 wires the write path that landed after this card shipped: the daemon's
+// `map-macro` verb (= `ksx macro`, = `ControlSource::save_macro`, =
+// `POST /api/macro/save`) takes ONE WHOLE `[macros.<name>]` table. So the grid
+// is no longer a copy-and-paste composer — New, Save, Rename and Delete are
+// real writes to the preset file, through the same verb the CLI uses. The TOML
+// block stays, collapsed, as the sharing/hand-editing path it always was.
+//
+// THE SAVE MODEL — explicit Save, not save-on-edit. The rest of this page is
+// save-immediately (a bind is one atomic key write), but a macro save is a
+// WHOLE-TABLE write that (a) takes a timestamped backup every time and (b) is
+// hot-swapped into the running session. Autosaving every painted cell would
+// therefore publish a half-authored sequence into a live game and leave one
+// backup file per click. A grid edit is also a COMPOSITION — paint, reorder,
+// retime — and the unit the user means is the finished sequence. Hence: the
+// body (cells, steps, durations, policies) is a draft with a loud dirty
+// indicator and one Save button; the STRUCTURAL verbs (New / Rename / Delete)
+// are single explicit actions and write straight away. Both report through the
+// toast stack with Undo, exactly like every other write on this page.
 //
 // Every derivation here mirrors render_map.rs; the Rust unit tests pin that
 // side, including the sampling floor against ksx-core's own MIN_STEP_MS.
@@ -1370,16 +1417,91 @@ function macroTotalMs(mac: MacroView): number {
   return mac.steps.reduce((sum, s) => sum + effectiveMs(s), 0);
 }
 
+// ── v12: the frame arithmetic, on screen ───────────────────────────────────
+// Victor asked the question this answers: "a 60fps frame is only like
+// sixteenth milliseconds? maybe we can show that math." So wherever a duration
+// is edited the conversion is printed live, with the sampling floor in the
+// SAME units — which makes "too short" self-explanatory instead of a rule to
+// remember.
+//
+// The target rate is DISPLAY-ONLY, deliberately. Many arcade titles are not
+// exactly 60 Hz (59.94, 57, 55 are common), so authoring against the game's
+// real rate is genuinely useful — but neither the preset file
+// (`ksx_config::MacroStepFile` = hold / ms / frames / allow_short) nor the
+// `map-macro` wire body (`MacroWrite`) has anywhere to store a rate, and
+// `ksx_core::StepDuration::Frames` counts frames at 60 Hz FULL STOP. Inventing
+// a field the daemon would drop is the silent-no-op this page bans. So the
+// selector converts for the author and says, in words, that a `frames = N`
+// step still runs at 60 Hz — and offers the ms value that matches the game.
+
+/** The rate the AUTHOR is thinking in. Never written anywhere; see above. */
+let macroRateHz = 60;
+
+export function macroTargetRate(): number {
+  return macroRateHz;
+}
+
+/** `60`, `59.94`, `57`… — anything else is ignored rather than turned into a
+ *  divide-by-zero in the line below. */
+export function setMacroTargetRate(hz: number): void {
+  if (!Number.isFinite(hz) || hz <= 0) return;
+  macroRateHz = hz;
+  refreshMacro();
+}
+
+function hz(rate: number): string {
+  return `${Number.isInteger(rate) ? rate : rate.toFixed(2)} Hz`;
+}
+
+/** The floor, in the author's own units: "33 ms (2.0 frames @ 60 Hz)". */
+function floorText(rate: number): string {
+  return `${MIN_STEP_MS} ms (${((MIN_STEP_MS * rate) / 1000).toFixed(1)} frames @ ${hz(rate)})`;
+}
+
+/** The live conversion for ONE step. Mirrored in render_map.rs `frame_math`. */
+function frameMath(step: MacroStepView | undefined, rate: number): string {
+  const floor = `The engine can only see steps of ${floorText(rate)} or longer.`;
+  if (!step) return `Pick a step's ⏱ to retime it. ${floor}`;
+  if (step.ms !== null && step.frames !== null) {
+    return `This step says both ms and frames — keep exactly one, or the preset will not load. ${floor}`;
+  }
+  if (step.ms === null && step.frames === null) {
+    return `This step has no duration — give it ms or frames. ${floor}`;
+  }
+  if (step.frames !== null) {
+    const f = step.frames;
+    const ksx = framesMs(f);
+    if (rate === 60) {
+      return `${f} frame${f === 1 ? "" : "s"} @ 60 Hz = ${ksx.toFixed(1)} ms. ${floor}`;
+    }
+    const atRate = (f * 1000) / rate;
+    return (
+      `${f} frame${f === 1 ? "" : "s"} @ ${hz(rate)} = ${atRate.toFixed(1)} ms — but ksx counts ` +
+      `frames at 60 Hz, so this step runs ${ksx.toFixed(1)} ms. To match the game, switch the ` +
+      `unit to ms and enter ${Math.round(atRate)}. ${floor}`
+    );
+  }
+  const ms = step.ms as number;
+  return `${ms} ms = ${((ms * rate) / 1000).toFixed(1)} frames @ ${hz(rate)}. ${floor}`;
+}
+
 const MACRO_RULE_LINE =
   "Amber steps are shorter than ~2 poll intervals (33 ms at 60 Hz), which is the shortest " +
   "thing a game can be relied on to see — a 5 ms step is not unreliable, it is invisible. " +
   "ksx raises a short step to 33 ms so it lands; a step marked allow_short runs exactly as " +
   "written and can be missed entirely. Neither is ever silent.";
 
-export function starterMacro(): MacroView {
+/** The body "＋ New macro" WRITES: one real 50 ms step, at the default
+ *  policies. A macro with no steps is refused by the loader (and by the
+ *  daemon), so a new table has to arrive with one — and one empty step is the
+ *  honest starting point, because the grid below it is where the holds are
+ *  painted. There is no browser-only draft version of this: the macro exists
+ *  in the preset the moment the button lands, which is what makes its trigger
+ *  bindable. */
+export function newMacroBody(name: string): MacroView {
   return {
-    name: "my-macro",
-    steps: [{ hold: ["dpad.down"], ms: 50, frames: null, allow_short: false }],
+    name,
+    steps: [{ hold: [], ms: 50, frames: null, allow_short: false }],
     on_release: "finish",
     retrigger: "ignore",
     interrupt: "none",
@@ -1402,18 +1524,70 @@ function cloneMacro(mac: MacroView): MacroView {
 // saved and the draft has no business remembering a stale version of it.
 
 let macroDraft: MacroView | null = null;
-/** The draft came from a `[macros]` table that exists on disk. */
-let macroOnDisk = false;
-/** The name it was seeded FROM — what "Revert to file" goes back to, which a
- *  rename must not lose. */
+/** The draft came from a `[macros]` table that exists on disk. Since v12 that
+ *  is true of every draft this page can produce — the only way to get a new
+ *  macro is to CREATE it — but it stays as the guard that keeps Save, Rename
+ *  and Delete pointed at something the preset really holds. */
+let macroFromDisk = false;
+/** The name it was seeded FROM — what "Revert to file" goes back to. */
 let macroSeedName: string | null = null;
-/** Something in the grid has been changed and not pasted anywhere. */
+/** The macro the USER is looking at, which a poll must not change. */
+let macroChosen: string | null = null;
+/** The grid differs from the file: there is something for Save to write. */
 let macroDirty = false;
 /** Which step the duration editor is pointed at. */
 let macroStep: number | null = null;
 
 export function currentMacro(): MacroView | null {
   return macroDraft;
+}
+
+/** This preset's macro NAMES, as the file spells them. */
+export function macroNames(): string[] {
+  return (lastPayload?.macros.macros ?? []).map((m) => m.name);
+}
+
+/** The macro as it is ON DISK right now — what an undo has to put back, read
+ *  before the write like every other undo on this page. */
+export function macroOnDiskCopy(name: string): MacroView | null {
+  const found = (lastPayload?.macros.macros ?? []).find(
+    (m) => m.name.toLowerCase() === name.toLowerCase(),
+  );
+  return found ? cloneMacro(found) : null;
+}
+
+/** Is the draft a table the preset actually holds? */
+export function macroIsOnDisk(): boolean {
+  return macroFromDisk;
+}
+
+/** What is wrong with `name` as a macro name, in one sentence — or null.
+ *
+ *  The name is half of the `macro.<name>` function that starts the sequence
+ *  and it is a TOML table key, so the vocabulary is kept to what survives both
+ *  without quoting: letters, digits, dash, underscore, dot. The daemon
+ *  validates for itself and its refusal is what lands on screen; this is the
+ *  local half, so an obvious mistake is answered before a round trip. */
+export function macroNameProblem(name: string, except?: string | null): string | null {
+  const clean = name.trim();
+  if (clean === "") {
+    return "A macro needs a name — it is half of the `macro.<name>` key that starts it.";
+  }
+  if (clean.length > 64) return "That name is longer than 64 characters.";
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(clean)) {
+    return (
+      `"${clean}" has characters a macro name cannot use. Use letters, digits, dash, ` +
+      "underscore or dot, starting with a letter or digit — the name is a TOML table key " +
+      "and half of the `macro.<name>` function, and both have to hold it without quoting."
+    );
+  }
+  const taken = macroNames().find(
+    (n) => n.toLowerCase() === clean.toLowerCase() && n.toLowerCase() !== (except ?? "").toLowerCase(),
+  );
+  if (taken !== undefined) {
+    return `"${taken}" already exists in this preset. Pick another name, or open that macro and edit it.`;
+  }
+  return null;
 }
 
 export function currentMacroStep(): number | null {
@@ -1433,18 +1607,40 @@ export function macroTriggersOf(fn: string): string[] {
   return found ? [...found.triggers] : [];
 }
 
-/** Point the editor at one macro (or at a fresh sequence when `name` names
- *  nothing), discarding whatever draft was open. */
+/** Point the editor at one of the preset's macros, discarding whatever draft
+ *  was open.
+ *
+ *  v12: a name that matches nothing leaves the editor EMPTY rather than
+ *  inventing a draft. The old fallback minted a browser-only "my-macro" whose
+ *  trigger could not be bound ("preset defines no macro called my-macro") —
+ *  the exact confusion this rewrite exists to remove. The way to get a new
+ *  macro is now "＋ New macro", which writes one. */
 export function seedMacro(name: string | null): void {
   const list = lastPayload?.macros.macros ?? [];
-  const want = (name ?? lastPayload?.macro_selected ?? "").toLowerCase();
-  const found =
-    list.find((m) => m.name.toLowerCase() === want) ?? (name === null ? list[0] : undefined);
-  macroDraft = found ? cloneMacro(found) : starterMacro();
-  macroOnDisk = found !== undefined;
+  // `null` = "whatever the user is looking at", which is what every 2 s poll
+  // asks for. Remembering it here is what stops a poll from yanking the editor
+  // back to the preset's FIRST macro two seconds after a tab click — the same
+  // snap-back that made a rename look like it "just resets".
+  const want = (name ?? macroChosen ?? lastPayload?.macro_selected ?? "").toLowerCase();
+  const found = list.find((m) => m.name.toLowerCase() === want) ?? (name === null ? list[0] : undefined);
+  macroChosen = found ? found.name : null;
+  macroDraft = found ? cloneMacro(found) : null;
+  macroFromDisk = found !== undefined;
   macroSeedName = found ? found.name : null;
   macroDirty = false;
   macroStep = null;
+  refreshMacro();
+}
+
+/** The write landed: this draft IS the file now. Called by map.ts after a
+ *  successful save so the dirty flag clears without waiting for the poll (and
+ *  so the poll's re-seed, which only fires on a clean draft, takes over). */
+export function markMacroSaved(name: string): void {
+  if (macroDraft) macroDraft.name = name;
+  macroFromDisk = true;
+  macroSeedName = name;
+  macroChosen = name;
+  macroDirty = false;
   refreshMacro();
 }
 
@@ -1458,8 +1654,9 @@ export function macroSeededFrom(): string | null {
  *  the multi-select follows. */
 export function resetMacroDraft(): void {
   macroDraft = null;
-  macroOnDisk = false;
+  macroFromDisk = false;
   macroSeedName = null;
+  macroChosen = null;
   macroDirty = false;
   macroStep = null;
 }
@@ -1604,14 +1801,9 @@ export function macroSetPolicy(field: string, value: string): void {
   macroEdited();
 }
 
-export function macroRename(name: string): void {
-  const mac = macroDraft;
-  const clean = name.trim();
-  if (!mac || clean === "" || clean === mac.name) return;
-  mac.name = clean;
-  // A renamed draft is no longer the table it came from.
-  macroOnDisk = false;
-  macroEdited();
+/** The draft's TRIGGER keys, for a rename that must not lose them. */
+export function macroDraftTriggers(): string[] {
+  return macroDraft ? [...macroDraft.triggers] : [];
 }
 
 export function macroTomlText(): string {
@@ -1696,6 +1888,17 @@ function macroTabsFor(p: MapPayload, mac: MacroView, slotNumber: number): MacroT
   }));
 }
 
+/** The same strip with nothing selected — the preset's macros are still all
+ *  there to click, which is the way back into the editor. */
+function macroTabsForNone(p: MapPayload, slotNumber: number): MacroTab[] {
+  return p.macros.macros.map((m) => ({
+    name: m.name,
+    label: `${m.name} · ${m.steps.length} steps`,
+    href: `/map?slot=${slotNumber}&macro=${encodeURIComponent(m.name)}`,
+    cls: "mactab",
+  }));
+}
+
 function tomlStr(text: string): string {
   return `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n")}"`;
 }
@@ -1743,33 +1946,29 @@ function macroTriggerLineFor(mac: MacroView): string {
   return `started by ${mac.triggers.join(KEY_SEP)} — any one of them (${mac.triggers.length} keys)`;
 }
 
-function macroNoteFor(p: MapPayload | null, mac: MacroView): string {
+function macroNoteFor(p: MapPayload | null, mac: MacroView | null): string {
   if (!p || !p.macros.available) {
     return (
       `This preset's macros could not be read (${p?.macros.reason ?? "no snapshot yet"}), so ` +
-      "the grid starts from a blank sequence rather than from your file. Everything below " +
-      "still composes a valid [macros] block — but check it against the preset before pasting."
+      "there is nothing to edit and nothing here can be saved. That is NOT the same as " +
+      "\"this preset has no macros\" — it means nobody could tell this page either way."
     );
   }
   if (p.macros.macros.length === 0) {
     return (
-      "This preset defines no macros yet. The grid below is a NEW sequence — paint the " +
-      "cells, then paste the TOML block into the preset file. (Step lists are authored in " +
-      "TOML on purpose: the daemon's map verb writes the key that STARTS a macro, and has " +
-      "no shape for a step list at all.)"
+      "This preset has no macros yet. Type a name above and press ＋ New macro: it is " +
+      "written into the preset straight away (one empty 50 ms step), and then you paint the " +
+      "grid and press Save macro."
     );
   }
-  if (!macroOnDisk) {
-    return (
-      "This is a NEW sequence, not one of the preset's — paste the TOML block below to add it."
-    );
+  if (!mac) {
+    return "Pick a macro above to edit it, or type a name and press ＋ New macro.";
   }
   return (
-    "Steps are read from the preset file and edited here as a DRAFT: nothing in this grid " +
-    "is saved. Copy the TOML block below into the preset (docs/INPUT-TRANSFORMS.md §1c " +
-    "keeps step authoring in TOML — the daemon's map verb writes the key that STARTS a " +
-    "macro, and has no shape for a step list). The trigger below IS a real write, through " +
-    "that same verb."
+    `Steps and policies are a DRAFT until you press Save macro — that writes the whole ` +
+    `"${mac.name}" table into the preset file (a timestamped backup is taken first) and ` +
+    "swaps it into a running session with the pads left plugged. New, Rename and Delete " +
+    "write immediately. Every one of them can be undone from the toast it leaves."
   );
 }
 
@@ -1778,15 +1977,38 @@ function refreshMacro(): void {
   const p = lastPayload;
   const slot = currentSlot();
   const mac = macroDraft;
+  const preset = p && p.macros.preset !== "" ? p.macros.preset : (slot?.preset ?? "<PRESET>");
   if (!mac) {
-    setMacroTabs([]);
+    // No macro loaded: the card stays, every reader says so, and the only
+    // affordance that does anything is "＋ New macro". Nothing invents a
+    // sequence the preset does not hold.
+    setMacroTabs(p ? macroTabsForNone(p, slot ? slot.number : p.selected) : []);
+    setMacroCols(macroColsFor(slot));
     setMacroRows([]);
     setMacroCells([]);
     setMacroGridCls("macgrid empty");
-    setMacroNote(macroNoteFor(p, starterMacro()));
+    setMacroNote(macroNoteFor(p, null));
+    setMacroHead(
+      p && p.macros.available && p.macros.macros.length === 0
+        ? `"${preset}" has no macros yet`
+        : "no macro selected",
+    );
+    setMacroRuleLine(MACRO_RULE_LINE);
+    setMacroPolicyLine("");
+    setMacroTriggerLine("");
+    setMacroFnName("");
+    setMacroName("");
+    setMacroCliLine(`ksx map --preset "${preset}" --function macro.<NAME> --key <KEY>`);
+    setMacroToml("");
+    setMacroCardCls(p?.macros.available ? "card macrocard" : "card macrocard off");
+    setMacroDirtyLine("");
+    setMacroSaveCls("btn btn-mini macsave off");
+    setMacroStepLine("");
+    setMacroDurValue("50");
+    setMacroMathLine(frameMath(undefined, macroRateHz));
+    setMacroTrigCls("mactrigger off");
     return;
   }
-  const preset = p && p.macros.preset !== "" ? p.macros.preset : (slot?.preset ?? "<PRESET>");
   setMacroCols(macroColsFor(slot));
   setMacroRows(macroRowsFor(mac, slot));
   setMacroCells(macroCellsFor(mac, slot));
@@ -1811,8 +2033,10 @@ function refreshMacro(): void {
   setMacroCardCls(p?.macros.available ? "card macrocard" : "card macrocard off");
   setMacroGridCls(mac.steps.length === 0 ? "macgrid empty" : "macgrid");
   setMacroDirtyLine(
-    macroDirty ? "edited — not saved; copy the TOML block below into the preset" : "",
+    macroDirty ? "unsaved changes — press Save macro to write them to the preset" : "saved",
   );
+  setMacroSaveCls(macroDirty ? "btn btn-mini macsave dirty" : "btn btn-mini macsave off");
+  setMacroTrigCls(macroFromDisk ? "mactrigger" : "mactrigger off");
   const step = macroStep === null ? undefined : mac.steps[macroStep];
   setMacroStepLine(
     step === undefined
@@ -1823,6 +2047,7 @@ function refreshMacro(): void {
   setMacroDurValue(
     step === undefined ? "50" : String(step.frames ?? step.ms ?? 50),
   );
+  setMacroMathLine(frameMath(step, macroRateHz));
 }
 
 /** The unit the duration editor should show for the selected step. map.ts
@@ -2310,7 +2535,39 @@ export function MapIsland() {
           "div",
           { class: "phead" },
           h("h2", null, "Macros"),
+          // THE save. One button, always in the same place, and its class says
+          // whether there is anything to write — the answer to "why can't you
+          // just save it? do I need to go to a folder and open it up?".
+          h(
+            "button",
+            {
+              class: () => macroSaveCls(),
+              "data-act": "macro-save",
+              type: "button",
+              title: "write this whole macro into the preset file",
+            },
+            "Save macro",
+          ),
+          // The same fact in words, AFTER the button on purpose: CSS can then
+          // colour it from the button's own dirty class (`.macsave.dirty +
+          // .macdirty`), so "unsaved" is amber and "saved" is quiet without a
+          // second signal.
           h("span", { class: "macdirty mono" }, () => macroDirtyLine()),
+        ),
+        // What this card IS, before any of its controls. A first-time reader
+        // should not have to open docs/INPUT-TRANSFORMS.md to use it.
+        h(
+          "p",
+          { class: "savenote" },
+          "A MACRO is a timed sequence the pad plays by itself: each row below ",
+          "is one step, the columns are this pad's controls, and a step holds ",
+          "whatever its row has filled in — for its own duration — before the ",
+          "next one starts. A quarter-circle is three rows. A TRIGGER is the ",
+          "panel key that STARTS the macro: bind one in the Trigger section at ",
+          "the bottom, and from then on that single key press plays the whole ",
+          "sequence. The two are separate on purpose — the sequence lives in ",
+          "the preset's [macros] table, the trigger is an ordinary binding ",
+          "pointing at it.",
         ),
         h("p", { class: "savenote" }, () => macroNote()),
         h(
@@ -2324,15 +2581,35 @@ export function MapIsland() {
             // the preset defines. map.ts intercepts and switches in place.
             (t) => h("a", { class: t.cls, href: t.href, "data-macro": t.name }, t.label),
           ),
+        ),
+        // CREATE. A name, validated, and a button that WRITES the macro into
+        // the preset (one empty 50 ms step) — so a macro on this card is never
+        // a thing that exists only in the browser, and its trigger is always
+        // bindable. JS-only, like every other JSON verb here; without
+        // JavaScript the TOML block at the bottom is still the way in.
+        h(
+          "div",
+          { class: "macnewbox" },
+          h(
+            "label",
+            { class: "bindlabel" },
+            "new macro name",
+            h("input", {
+              class: "macnewin",
+              type: "text",
+              placeholder: "e.g. hadouken",
+              "aria-label": "new macro name",
+            }),
+          ),
           h(
             "button",
             {
               class: "btn btn-mini macnew",
               "data-act": "macro-new",
               type: "button",
-              title: "start a new sequence from scratch",
+              title: "create this macro in the preset now",
             },
-            "＋ New",
+            "＋ New macro",
           ),
         ),
         h("p", { class: "machead" }, () => macroHead()),
@@ -2459,12 +2736,34 @@ export function MapIsland() {
               h("option", null, "frames"),
             ),
           ),
+          // The target rate the AUTHOR is thinking in. Display-only — nothing
+          // stores a rate, and ksx counts `frames` at 60 Hz — which the math
+          // line below says out loud whenever this is not 60.
+          h(
+            "label",
+            { class: "bindlabel" },
+            "game runs at",
+            h(
+              "select",
+              { class: "macrate", title: "used only to convert frames ↔ ms while you author" },
+              h("option", null, "60"),
+              h("option", null, "59.94"),
+              h("option", null, "57"),
+              h("option", null, "55"),
+              h("option", null, "50"),
+              h("option", null, "30"),
+            ),
+          ),
           h(
             "label",
             { class: "macshortlbl" },
             h("input", { class: "macshortin", type: "checkbox" }),
             "allow short (run it as written even below 33 ms)",
           ),
+          // THE MATH, live (Victor: "maybe we can show that math"). Full-width
+          // under the duration controls, and it carries the sampling floor in
+          // the same units, so an amber row explains itself.
+          h("p", { class: "macmath mono" }, () => macroMathLine()),
           h(
             "button",
             { class: "btn btn-mini", "data-act": "macro-addstep", type: "button" },
@@ -2475,11 +2774,39 @@ export function MapIsland() {
             { class: "btn btn-mini", "data-act": "macro-revert", type: "button" },
             "Revert to file",
           ),
+          // RENAME is a real write: save under the new name, then delete the
+          // old table, then move the trigger keys across — one action, one
+          // toast, one Undo (map.ts). Typing here changes nothing on its own.
           h(
             "label",
             { class: "bindlabel" },
             "name",
-            h("input", { class: "macnamein", type: "text", value: () => macroName() }),
+            h("input", {
+              class: "macnamein",
+              type: "text",
+              value: () => macroName(),
+              "aria-label": "macro name",
+            }),
+          ),
+          h(
+            "button",
+            {
+              class: "btn btn-mini macrename",
+              "data-act": "macro-rename",
+              type: "button",
+              title: "save this macro under the name in the box and remove the old table",
+            },
+            "Rename",
+          ),
+          h(
+            "button",
+            {
+              class: "btn btn-mini macdelmac",
+              "data-act": "macro-delete",
+              type: "button",
+              title: "delete this macro from the preset (its trigger rows go with it)",
+            },
+            "Delete macro",
           ),
         ),
         // The three interruption policies. The SELECTS are draft controls, so
@@ -2564,8 +2891,17 @@ export function MapIsland() {
         // JavaScript, a plain form without it. No second writer, no fake one.
         h(
           "div",
-          { class: "mactrigger" },
-          h("h3", null, "Trigger"),
+          { class: () => macroTrigCls() },
+          h("h3", null, "Trigger — the key that STARTS this macro"),
+          h(
+            "p",
+            { class: "savenote" },
+            "This is an ordinary binding, saved the moment you set it: it points ",
+            "the panel key at this macro instead of at a pad button, so pressing ",
+            "it plays the sequence above from step 1. Several keys can start the ",
+            "same macro. A macro with no trigger is inert — it exists in the ",
+            "preset and nothing ever runs it.",
+          ),
           h("p", { class: "mactrigline" }, () => macroTriggerLine()),
           h(
             "button",
@@ -2630,28 +2966,29 @@ export function MapIsland() {
           ),
           h("p", { class: "clifall" }, h("code", { class: "mono copyable" }, () => macroCliLine())),
         ),
-        // ── The output: the block you paste ──────────────────────────────
+        // ── Advanced: the TOML block ─────────────────────────────────────
+        // DEMOTED in v12 and collapsed by default. It was the only way to keep
+        // a macro before the save path was wired, which is why the card used
+        // to end with "copy this and go find the file". Save macro does that
+        // now; this stays for sharing a sequence with someone else and for
+        // hand-editing the preset — secondary, and it looks it.
         h(
-          "div",
+          "details",
           { class: "mactomlbox" },
-          h(
-            "div",
-            { class: "phead" },
-            h("h3", null, "TOML to paste"),
-            h(
-              "button",
-              { class: "btn btn-mini maccopy", "data-act": "macro-copy", type: "button" },
-              "Copy",
-            ),
-          ),
-          h("pre", { class: "mono mactoml" }, () => macroToml()),
+          h("summary", null, "Advanced — this macro as TOML (for sharing, or hand-editing the file)"),
           h(
             "p",
             { class: "savenote" },
-            "Paste this into the preset file (Preset card above names the config root; ",
-            "the file is presets\\<preset>.toml). A [macros] table already there keeps ",
-            "its other macros — replace only the one with this name. Reload the daemon ",
-            "afterwards and the sequence is live.",
+            "You do not need this to keep your work: Save macro writes the same ",
+            "table into the preset for you. Copy it to send a sequence to ",
+            "someone else, or to paste it into presets\\<preset>.toml by hand ",
+            "(the Preset card above names the config root).",
+          ),
+          h("pre", { class: "mono mactoml" }, () => macroToml()),
+          h(
+            "button",
+            { class: "btn btn-mini maccopy", "data-act": "macro-copy", type: "button" },
+            "Copy",
           ),
         ),
       ),

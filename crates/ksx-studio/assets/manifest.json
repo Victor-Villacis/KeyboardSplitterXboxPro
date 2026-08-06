@@ -1,12 +1,12 @@
 {
   "version": 1,
-  "build_hash": "50f0b1174e08241d5ab01926f9c3355f631db63c42f362797a7f2bcfe0816130",
+  "build_hash": "cacd7b0cf3fe290776e13a31b8133bca5c64b4faa86af5e8176374013c6590b0",
   "assets": {
-    "map.ir": "map.96c92999.ir",
-    "map.js": "map.33b01b99.js",
+    "map.ir": "map.557f565a.ir",
+    "map.js": "map.2accc4bb.js",
     "status.ir": "status.ce7ea0aa.ir",
     "status.js": "status.d1d10a09.js",
-    "studio.css": "studio.33b99faa.css"
+    "studio.css": "studio.ef2b5c8b.css"
   },
   "routes": {
     "/": {
@@ -14,24 +14,24 @@
         "status.d1d10a09.js"
       ],
       "css": [
-        "studio.33b99faa.css"
+        "studio.ef2b5c8b.css"
       ],
       "fonts": [],
-      "total_size_br": 21609,
+      "total_size_br": 22109,
       "budget_warn_threshold": 200000,
       "ir": "status.ce7ea0aa.ir"
     },
     "/map": {
       "js": [
-        "map.33b01b99.js"
+        "map.2accc4bb.js"
       ],
       "css": [
-        "studio.33b99faa.css"
+        "studio.ef2b5c8b.css"
       ],
       "fonts": [],
-      "total_size_br": 35660,
+      "total_size_br": 38729,
       "budget_warn_threshold": 200000,
-      "ir": "map.96c92999.ir"
+      "ir": "map.557f565a.ir"
     }
   }
 }

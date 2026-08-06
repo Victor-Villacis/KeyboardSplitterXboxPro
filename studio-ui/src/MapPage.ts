@@ -293,13 +293,15 @@ export function MapPage() {
   // always in the DOM, so MAP_SHOW_ORDER does not move (ledger #4/#14 — shows
   // are positional, and one inserted in the middle silently shifts every panel
   // after it). Defaults are the honest "nothing read yet" values.
-  const [macroHead] = createSignal("no macro selected");
+  const [macroHead] = createSignal("no macro loaded yet");
   const [macroRuleLine] = createSignal("");
   const [macroPolicyLine] = createSignal("on release: finish · retrigger: ignore · interrupt: none");
   const [macroNote] = createSignal("");
   const [macroTriggerLine] = createSignal("no trigger key yet — nothing starts this macro");
-  const [macroFnName] = createSignal("macro.my-macro");
-  const [macroName] = createSignal("my-macro");
+  // v12: never a made-up macro name. The old "my-macro" default existed only
+  // in the browser, so its trigger could not be bound.
+  const [macroFnName] = createSignal("");
+  const [macroName] = createSignal("");
   const [macroCliLine] = createSignal(
     "ksx map --preset <NAME> --function macro.<NAME> --key <KEY>",
   );
@@ -309,6 +311,11 @@ export function MapPage() {
   const [macroDirtyLine] = createSignal("");
   const [macroStepLine] = createSignal("click a step's ⏱ to edit its duration");
   const [macroDurValue] = createSignal("50");
+  // v12's three: the Save button's look, the live frame arithmetic, and the
+  // trigger block's inert class while the preset holds no macro.
+  const [macroSaveCls] = createSignal("btn btn-mini macsave off");
+  const [macroMathLine] = createSignal("");
+  const [macroTrigCls] = createSignal("mactrigger off");
   // Booleans behind the createShow pairs (positional show:createShow slots —
   // render_map.rs MAP_SHOW_ORDER pins the document order). Default false:
   // nothing renders until the server says otherwise.
