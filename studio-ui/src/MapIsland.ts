@@ -232,6 +232,16 @@ interface SlotTab {
   num: string;
   label: string;
   cls: string;
+  /** "P1" — the rail chip and the table's first column. */
+  player: string;
+  /** The preset FILE this slot binds, e.g. "player1". */
+  preset: string;
+  /** Human persona label, e.g. "Xbox 360". */
+  pad: string;
+  /** Keyboard alias or hardware id; "(any)" when unassigned. */
+  kbd: string;
+  /** The management table's row class — "strow" / "strow on". */
+  rowcls: string;
   /** v9: the tab is an ANCHOR, so slot switching works with JS off —
    *  `/map?slot=N` is a route the server already understands. map.ts still
    *  intercepts the click and switches in place. */
@@ -414,6 +424,11 @@ const [cliLine, setCliLine] = createSignal(
 );
 const [daemonCmd, setDaemonCmd] = createSignal("ksx daemon");
 const [backupLine, setBackupLine] = createSignal("Restore backup");
+/** v14, the preset surface's identity block: which file, where, and whether a
+ *  road home exists. Read straight off the payload — no new verbs. */
+const [presetLine, setPresetLine] = createSignal("(no preset)");
+const [presetPath, setPresetPath] = createSignal("(unknown)");
+const [backupFact, setBackupFact] = createSignal("none yet — the first restore writes one");
 /** v9: the selected slot NUMBER as a string — the hidden field every no-JS
  *  form outside the legend list carries (preset actions, the bind-by-name
  *  panel). The server resolves the preset from it. */
@@ -982,6 +997,11 @@ export function applyMap(p: MapPayload): void {
       label: `P${s.number} · ${s.preset}`,
       cls: slot && s.number === slot.number ? "tab active" : "tab",
       href: `/map?slot=${s.number}`,
+      player: `P${s.number}`,
+      preset: s.preset,
+      pad: s.persona_label,
+      kbd: s.keyboard,
+      rowcls: slot && s.number === slot.number ? "strow on" : "strow",
     })),
   );
   setSlotNum(String(slot ? slot.number : p.selected));
@@ -991,6 +1011,15 @@ export function applyMap(p: MapPayload): void {
     slot ? `P${slot.number} · ${slot.persona_label} · ${slot.preset}` : "no mappable slots",
   );
   setSourceLine(`${p.mapper.source} — config root: ${p.mapper.config_root}`);
+  setPresetLine(slot ? slot.preset : "(no preset)");
+  setPresetPath(
+    slot ? `${p.mapper.config_root}\\presets\\${slot.preset}.toml` : p.mapper.config_root,
+  );
+  setBackupFact(
+    slot && slot.backup
+      ? `newest ${slot.backup}`
+      : "none yet — the first restore writes one",
+  );
   setGeneratedAt(p.mapper.generated_at);
 
   const live = liveMapping;
@@ -2352,9 +2381,13 @@ export function MapIsland() {
         { class: "brand" },
         h("span", { class: "brand-ksx" }, "ksx"),
         h("span", { class: "brand-studio" }, "Studio"),
-        h("span", { class: "crumb" }, "mapper"),
       ),
-      h("a", { class: "navlink", href: "/" }, "← Status"),
+      h(
+        "nav",
+        { class: "topnav", "aria-label": "screens" },
+        h("a", { class: "navlink", href: "/" }, "Status"),
+        h("a", { class: "navlink on", href: "/map", "aria-current": "page" }, "Mapper"),
+      ),
       createShow(
         () => pillRunning(),
         () => h("span", { class: "pill pill-run" }, "running"),
@@ -2472,12 +2505,17 @@ export function MapIsland() {
           ),
       ),
       // ── Slot context strip ────────────────────────────────────────────
+      // ── The slot rail ────────────────────────────────────────────────
+      // v14: was a card of pills above two lines of text, which read as the
+      // page's first CONTENT. It is navigation — which player am I editing —
+      // so it sits in a sticky bar with the identity of the current slot
+      // beside it, and nothing below it moves when you switch.
       h(
         "section",
-        { class: "card slotstrip" },
+        { class: "slotstrip" },
         h(
           "div",
-          { class: "tabs" },
+          { class: "tabs", role: "tablist", "aria-label": "slot" },
           createList(
             () => slotTabs(),
             (t) => t.num + "|" + t.label + "|" + t.cls,
@@ -2488,8 +2526,12 @@ export function MapIsland() {
             (t) => h("a", { class: t.cls, href: t.href, "data-slot": t.num }, t.label),
           ),
         ),
-        h("p", { class: "slotline" }, () => slotLine()),
-        h("p", { class: "srcline mono" }, () => sourceLine()),
+        h(
+          "div",
+          { class: "slotmeta" },
+          h("p", { class: "slotline" }, () => slotLine()),
+          h("p", { class: "srcline mono" }, () => sourceLine()),
+        ),
       ),
       // ── Read-only banner + CLI fallback ───────────────────────────────
       createShow(
@@ -2505,18 +2547,36 @@ export function MapIsland() {
       createShow(
         () => canLearn(),
         () =>
+          // v14: this was eleven lines of prose sitting between the slot rail
+          // and the controller — the manual, printed on the wall, in front of
+          // the thing it describes. The one sentence you need to start stays
+          // visible; the rest is one click away and does not push the hero
+          // down the page.
           h(
-            "p",
+            "details",
             { class: "hint" },
-            "Click a control, then press the panel key for it — Esc or a click ",
-            "outside cancels, Delete clears. A control that already has a key ",
-            "offers “Add another key” too, so several keys can drive one ",
-            "control (press any of them); each key in the Bindings list below ",
-            "carries its own ✕ that removes only that key. Ctrl-click (or “Select multiple”) ",
-            "picks several controls and maps them all to ONE key. Saves are ",
-            "immediate — nothing asks “are you sure?”; every action reports ",
-            "itself with an Undo button (Ctrl-Z undoes the newest) — and a ",
-            "running session takes them live without unplugging the pads.",
+            h(
+              "summary",
+              null,
+              h(
+                "span",
+                { class: "hintlead" },
+                "Click a control, then press the panel key for it.",
+              ),
+            ),
+            h(
+              "p",
+              { class: "hintbody" },
+              "Esc or a click outside cancels, Delete clears. A control that ",
+              "already has a key offers “Add another key” too, so several keys ",
+              "can drive one control (press any of them); each key in the ",
+              "Bindings list below carries its own ✕ that removes only that ",
+              "key. Ctrl-click (or “Select multiple”) picks several controls ",
+              "and maps them all to ONE key. Saves are immediate — nothing ",
+              "asks “are you sure?”; every action reports itself with an Undo ",
+              "button (Ctrl-Z undoes the newest) — and a running session takes ",
+              "them live without unplugging the pads.",
+            ),
           ),
       ),
       // ── THE CONTROLLER (huge). Art + zone layer per persona. ──────────
@@ -2827,13 +2887,25 @@ export function MapIsland() {
       // (docs/INPUT-TRANSFORMS.md §6.2). NOT a createShow anywhere in here:
       // every state is a class string on an element that is always in the
       // DOM, so MAP_SHOW_ORDER does not move (ledger #4/#14).
+      // v14: a <details>, closed on arrival. Everything it holds is still
+      // here and still SSR-rendered (a closed disclosure is markup, not a
+      // removal — the no-JS reader opens it with one click), but a piano roll,
+      // four policy explainers and a TOML block no longer occupy 40 % of the
+      // page in front of a user who came to map a button. Not a createShow:
+      // MAP_SHOW_ORDER does not move (ledger #4/#14).
       h(
-        "section",
+        "details",
         { class: () => macroCardCls() },
+        h(
+          "summary",
+          null,
+          h("span", { class: "sumtitle" }, "Macros"),
+          h("span", { class: "sumnote mono" }, () => macroHead()),
+        ),
         h(
           "div",
           { class: "phead" },
-          h("h2", null, "Macros"),
+          h("h2", { class: "sr-head" }, "This preset's macros"),
           // THE save. One button, always in the same place, and its class says
           // whether there is anything to write — the answer to "why can't you
           // just save it? do I need to go to a folder and open it up?".
@@ -3501,13 +3573,21 @@ export function MapIsland() {
       // Always rendered (a class string flips the inert look — never a
       // show, so its bindings survive; ledger #13). Buttons share map.ts's
       // data-act delegation; each confirms before the pipe verb. ──────────
+      // ── PRESETS & FILES ──────────────────────────────────────────────
+      // v14: this was a bare row of four buttons under a paragraph, and the
+      // answer to "which file am I editing, which slots share it, and where
+      // do backups go?" existed nowhere on the screen — Victor: "the save of
+      // the files and profiles feels amateur". It is now a real management
+      // surface: the preset's identity, every slot and the preset it binds,
+      // then the actions, graded by consequence with the destructive one
+      // pushed to the end of the row. No new verbs — the same four forms.
       h(
         "section",
         { class: () => actionsCls() },
         h(
           "div",
           { class: "phead" },
-          h("h2", null, "Preset"),
+          h("h2", null, "Presets & files"),
           // Auto-save, made visible. Empty until this page writes something.
           h("span", { class: "savedat mono" }, () => savedAt()),
         ),
@@ -3519,6 +3599,52 @@ export function MapIsland() {
           "Undo for a few seconds (Ctrl-Z takes the newest). The restore options ",
           "below are the wider road home, and every one of them writes a ",
           "timestamped backup first.",
+        ),
+        // What you are editing, and where it lives on disk.
+        h(
+          "div",
+          { class: "presetid" },
+          h("span", { class: "presetname mono" }, () => presetLine()),
+          h(
+            "span",
+            { class: "presetfact" },
+            h("b", null, "file"),
+            h("span", null, () => presetPath()),
+          ),
+          h(
+            "span",
+            { class: "presetfact" },
+            h("b", null, "backups"),
+            h("span", null, () => backupFact()),
+          ),
+        ),
+        // Every slot, the preset it binds and the keyboard that drives it —
+        // the "which slots use this file?" read. Rows are the same anchors
+        // the rail uses, so this table is also a way to switch slot.
+        h(
+          "div",
+          { class: "slottable" },
+          h(
+            "div",
+            { class: "strow sthead" },
+            h("span", { class: "stcell stnum" }, "slot"),
+            h("span", { class: "stcell stpreset" }, "preset"),
+            h("span", { class: "stcell stpersona" }, "pad"),
+            h("span", { class: "stcell stkbd" }, "keyboard"),
+          ),
+          createList(
+            () => slotTabs(),
+            (t) => t.num + "|" + t.rowcls + "|" + t.preset + "|" + t.pad + "|" + t.kbd,
+            (t) =>
+              h(
+                "a",
+                { class: t.rowcls, href: t.href, "data-slot": t.num, title: t.label },
+                h("span", { class: "stcell stnum" }, t.player),
+                h("span", { class: "stcell stpreset" }, t.preset),
+                h("span", { class: "stcell stpersona" }, t.pad),
+                h("span", { class: "stcell stkbd" }, t.kbd),
+              ),
+          ),
         ),
         // v9: every one of these is a REAL form now — method=post, a hidden
         // slot number, a submit button. With JavaScript off they POST and

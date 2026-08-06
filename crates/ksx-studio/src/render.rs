@@ -118,14 +118,18 @@ const SHOW_ORDER: [&str; 17] = [
     "start controls",
     "stop controls",
     "daemon down controls",
+    // v14 moved the plumbing panel BELOW the profiles list (it is tertiary
+    // information and was reading as loud as the session), so the profile-row
+    // pair now precedes the driver/autostart pills. Shows are positional
+    // (ledger #4): this order IS the document order in StatusIsland.ts.
+    "profile rows: with Start buttons",
+    "profile rows: inert",
     "vigem: ok pill",
     "vigem: attention pill",
     "interception: borrowed-time pill",
     "interception: absent pill",
     "autostart: on pill",
     "autostart: off pill",
-    "profile rows: with Start buttons",
-    "profile rows: inert",
 ];
 const SHOW_COUNT: usize = SHOW_ORDER.len();
 
@@ -380,14 +384,14 @@ fn show_values(
         can_start,
         session.reachable && session.running,
         !session.reachable,
+        can_start,
+        !can_start,
         vigem_ok(snap),
         !vigem_ok(snap),
         interception_installed(snap),
         !interception_installed(snap),
         autostart_on(snap),
         !autostart_on(snap),
-        can_start,
-        !can_start,
     ]
 }
 

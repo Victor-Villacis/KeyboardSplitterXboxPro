@@ -269,6 +269,10 @@ export function MapPage() {
   const [daemonCmd] = createSignal("ksx daemon");
   // The third restore destination's label carries its timestamp.
   const [backupLine] = createSignal("Restore backup");
+  // v14, the preset surface's identity block (twins in MapIsland.ts).
+  const [presetLine] = createSignal("(no preset)");
+  const [presetPath] = createSignal("(unknown)");
+  const [backupFact] = createSignal("none yet — the first restore writes one");
   // v9: the selected slot number, as the hidden field of every no-JS form
   // that lives outside the legend list (preset actions, bind-by-name).
   const [slotNum] = createSignal("1");

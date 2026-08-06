@@ -257,7 +257,10 @@ export function StatusIsland() {
   return h(
     "div",
     { class: "studio" },
-    // ── App shell: compact header — wordmark + live state pill ──────────
+    // ── App shell: brand, route nav, live state ─────────────────────────
+    // The nav is a REAL two-item rail on both screens (v14): a wordmark and a
+    // one-way "Mapper →" link read as a page that happens to have a sibling;
+    // a rail with the current route marked reads as an application.
     h(
       "header",
       { class: "top" },
@@ -267,7 +270,12 @@ export function StatusIsland() {
         h("span", { class: "brand-ksx" }, "ksx"),
         h("span", { class: "brand-studio" }, "Studio"),
       ),
-      h("a", { class: "navlink", href: "/map" }, "Mapper →"),
+      h(
+        "nav",
+        { class: "topnav", "aria-label": "screens" },
+        h("a", { class: "navlink on", href: "/", "aria-current": "page" }, "Status"),
+        h("a", { class: "navlink", href: "/map" }, "Mapper"),
+      ),
       createShow(
         () => pillRunning(),
         () => h("span", { class: "pill pill-run" }, "running"),
@@ -398,7 +406,7 @@ export function StatusIsland() {
       // ── VIRTUAL PADS: the signature card ──────────────────────────────
       h(
         "section",
-        { class: "card wide" },
+        { class: "card wide padcard" },
         h("h2", null, "Virtual pads"),
         h("p", { class: "cardline" }, () => padsSummary()),
         h(
@@ -452,76 +460,18 @@ export function StatusIsland() {
           ),
         ),
       ),
-      // ── Card grid: drivers + autostart ────────────────────────────────
-      h(
-        "div",
-        { class: "grid" },
-        h(
-          "section",
-          { class: "card" },
-          h("h2", null, "Drivers"),
-          h(
-            "div",
-            { class: "drow" },
-            h("span", { class: "dname" }, "ViGEmBus"),
-            createShow(
-              () => vigemOk(),
-              () => h("span", { class: "pill pill-ok" }, "OK"),
-            ),
-            createShow(
-              () => vigemWarn(),
-              () => h("span", { class: "pill pill-warn" }, "attention"),
-            ),
-          ),
-          h("p", { class: "ddetail" }, () => vigemLine()),
-          h(
-            "div",
-            { class: "drow" },
-            h("span", { class: "dname" }, "Interception"),
-            createShow(
-              () => icptBorrowed(),
-              () => h("span", { class: "pill pill-warn" }, "borrowed time"),
-            ),
-            createShow(
-              () => icptAbsent(),
-              () => h("span", { class: "pill pill-idle" }, "absent"),
-            ),
-          ),
-          h("p", { class: "ddetail" }, () => interceptionLine()),
-          h(
-            "div",
-            { class: "drow" },
-            h("span", { class: "dname" }, "Daemon process"),
-            h("span", { class: "dvalue" }, () => daemonYesNo()),
-          ),
-          h("p", { class: "ddetail" }, () => daemonDetail()),
-        ),
-        h(
-          "section",
-          { class: "card" },
-          h("h2", null, "Autostart"),
-          h(
-            "div",
-            { class: "drow" },
-            h("span", { class: "dname" }, "Logon task"),
-            createShow(
-              () => autostartOn(),
-              () => h("span", { class: "pill pill-ok" }, "on"),
-            ),
-            createShow(
-              () => autostartOff(),
-              () => h("span", { class: "pill pill-idle" }, "off"),
-            ),
-          ),
-          h("p", { class: "ddetail" }, () => autostartLine()),
-        ),
-      ),
       // ── PROFILES: one row per games.toml entry, one click to start ────
       h(
         "section",
-        { class: "card wide" },
+        { class: "card wide profilecard" },
         h("h2", null, "Profiles"),
-        h("p", { class: "cardline" }, () => profilesSummary()),
+        h(
+          "p",
+          { class: "cardline" },
+          "Each profile is a games.toml entry: the program to launch and the ",
+          "slots it hands out. Starting one is what puts pads on the bus.",
+        ),
+        h("p", { class: "cardline mono" }, () => profilesSummary()),
         createShow(
           () => rowsLive(),
           () =>
@@ -575,12 +525,84 @@ export function StatusIsland() {
             ),
         ),
       ),
+      // ── SYSTEM: the plumbing, LAST and quiet ──────────────────────────
+      // v14: was two equal-weight cards in the middle of the page (an
+      // Autostart card four fifths empty beside a Drivers one), which put the
+      // least actionable facts on the screen at the same volume as the
+      // session. One panel, key/value rows, tertiary surface, bottom of the
+      // page. Show order inside is untouched — render.rs SHOW_ORDER moved the
+      // whole block, not its contents.
+      h(
+        "section",
+        { class: "card sysinfo" },
+        h("h2", null, "System"),
+        h(
+          "p",
+          { class: "cardline" },
+          "What ksx is standing on. Nothing here is a control — it is what the ",
+          "machine reports right now.",
+        ),
+        h(
+          "div",
+          { class: "drow" },
+          h("span", { class: "dname" }, "ViGEmBus"),
+          createShow(
+            () => vigemOk(),
+            () => h("span", { class: "pill pill-ok" }, "OK"),
+          ),
+          createShow(
+            () => vigemWarn(),
+            () => h("span", { class: "pill pill-warn" }, "attention"),
+          ),
+        ),
+        h("p", { class: "ddetail" }, () => vigemLine()),
+        h(
+          "div",
+          { class: "drow" },
+          h("span", { class: "dname" }, "Interception"),
+          createShow(
+            () => icptBorrowed(),
+            () => h("span", { class: "pill pill-warn" }, "borrowed time"),
+          ),
+          createShow(
+            () => icptAbsent(),
+            () => h("span", { class: "pill pill-idle" }, "absent"),
+          ),
+        ),
+        h("p", { class: "ddetail" }, () => interceptionLine()),
+        h(
+          "div",
+          { class: "drow" },
+          h("span", { class: "dname" }, "Autostart at logon"),
+          createShow(
+            () => autostartOn(),
+            () => h("span", { class: "pill pill-ok" }, "on"),
+          ),
+          createShow(
+            () => autostartOff(),
+            () => h("span", { class: "pill pill-idle" }, "off"),
+          ),
+        ),
+        h("p", { class: "ddetail" }, () => autostartLine()),
+        h(
+          "div",
+          { class: "drow" },
+          h("span", { class: "dname" }, "Daemon process"),
+          h("span", { class: "dvalue" }, () => daemonYesNo()),
+        ),
+        h("p", { class: "ddetail" }, () => daemonDetail()),
+        h(
+          "div",
+          { class: "drow" },
+          h("span", { class: "dname" }, "Config root"),
+          h("span", { class: "dvalue mono" }, () => configRoot()),
+        ),
+      ),
     ),
     // ── Footer: the plumbing facts, out of the body ───────────────────────
     h(
       "footer",
       null,
-      h("p", null, "config root: ", h("span", { class: "mono" }, () => configRoot())),
       h(
         "p",
         null,

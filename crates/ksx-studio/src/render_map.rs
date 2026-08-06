@@ -61,6 +61,11 @@ use crate::snapshot::{MacroStepView, MacroView, MapPayload, MapperSlot};
 /// occurrence gets the `#2` suffix, exactly like the status page's
 /// profileRows pair; both receive the same array.
 const LIST_SLOT_TABS: &str = "list:slotTabs:array";
+/// v14: the SAME slot array, rendered a second time as the preset surface's
+/// "which slot binds which file" table. Compiler 0.2.0 suffixes repeat
+/// bindings by document order, exactly as the status page's two profile-row
+/// lists are named — so the rail is `slotTabs` and the table `slotTabs#2`.
+const LIST_SLOT_TABS_2: &str = "list:slotTabs#2:array";
 const LIST_SLOT_ZONES: &str = "list:zones:array";
 const LIST_SLOT_ZONES_2: &str = "list:zones#2:array";
 /// The legend reads its own signal (`() => legendRows()`), so it gets a
@@ -808,6 +813,19 @@ fn slot_tabs(payload: &MapPayload, selected: Option<&MapperSlot>) -> SlotValue {
                     (
                         "cls".to_owned(),
                         SlotValue::Text(if active { "tab active" } else { "tab" }.to_owned()),
+                    ),
+                    // v14: the management table's columns. Same array, second
+                    // reader — no new payload, no new verb.
+                    (
+                        "player".to_owned(),
+                        SlotValue::Text(format!("P{}", s.number)),
+                    ),
+                    ("preset".to_owned(), SlotValue::Text(s.preset.clone())),
+                    ("pad".to_owned(), SlotValue::Text(s.persona_label.clone())),
+                    ("kbd".to_owned(), SlotValue::Text(s.keyboard.clone())),
+                    (
+                        "rowcls".to_owned(),
+                        SlotValue::Text(if active { "strow on" } else { "strow" }.to_owned()),
                     ),
                 ])
             })
@@ -1708,6 +1726,21 @@ fn scalar_slots(
         // FIX 1: the copyable remedy, carrying this machine's profile flag.
         "daemonCmd": daemon_command(&payload.session),
         "backupLine": backup_line(selected),
+        // v14: the preset surface's identity block. Derived, never a new
+        // payload field — the slot already carries the preset name and the
+        // snapshot the config root.
+        "presetLine": selected.map_or("(no preset)", |s| s.preset.as_str()),
+        "presetPath": match selected {
+            Some(s) => format!(
+                r"{}\presets\{}.toml",
+                payload.mapper.config_root, s.preset
+            ),
+            None => payload.mapper.config_root.clone(),
+        },
+        "backupFact": match selected.and_then(|s| s.backup.as_deref()) {
+            Some(label) => format!("newest {label}"),
+            None => "none yet — the first restore writes one".to_owned(),
+        },
         "modalPrompt": "",
         "modalBinding": "",
         "countdownText": "",
@@ -1859,11 +1892,12 @@ fn build_slots(module: &IrModule, payload: &MapPayload, flash: Option<&str>) -> 
         .map(|slot| legend_rows(slot, live, write))
         .unwrap_or(SlotValue::Array(Vec::new()));
     for (name, value) in [
-        (LIST_SLOT_TABS, tabs),
+        (LIST_SLOT_TABS, tabs.clone()),
         (LIST_SLOT_ZONES, zones.clone()),
         (LIST_SLOT_ZONES_2, zones),
         (LIST_SLOT_LEGEND, legend),
         // Explicitly empty, so the toast stack can never SSR a stale report.
+        (LIST_SLOT_TABS_2, tabs),
         (LIST_SLOT_TOASTS, SlotValue::Array(Vec::new())),
         // v11's piano roll. `None` for the selected step: an SSR paint has
         // pointed the duration editor at nothing.
@@ -2136,6 +2170,7 @@ mod tests {
                 LIST_SLOT_MACRO_ROWS,
                 LIST_SLOT_MACRO_COLS,
                 LIST_SLOT_MACRO_CELLS,
+                LIST_SLOT_TABS_2,
                 LIST_SLOT_TOASTS
             ],
             "mapper list slot names drifted; slots: {names:?}"
