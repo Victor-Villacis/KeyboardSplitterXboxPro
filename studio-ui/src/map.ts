@@ -73,6 +73,7 @@ import {
   selectedFns,
   selectionCount,
   setHot,
+  setMacroEditorFocused,
   setMultiMode,
   showConflict,
   showLearnMode,
@@ -1056,7 +1057,14 @@ function syncMacroControls(): void {
   const mac = currentMacro();
   const set = (sel: string, value: string): void => {
     const el = root.querySelector<HTMLInputElement | HTMLSelectElement>(sel);
-    if (el && el.value !== value) el.value = value;
+    if (!el || el.value === value) return;
+    // NEVER over a control the user's hands are on. This runs after every 2 s
+    // poll, and writing into a focused field takes the caret (or the open
+    // dropdown) with it — the difference between a page that refreshes and a
+    // page that argues with you. Whatever it wanted to say is still true on
+    // the next sync, once they have moved on.
+    if (el === document.activeElement) return;
+    el.value = value;
   };
   // The rate is the author's, not the file's — it survives a macro switch.
   set(".macrate", String(macroTargetRate()));
@@ -1421,9 +1429,19 @@ function macroDurationValue(): number {
   return step.frames ?? step.ms ?? 50;
 }
 
-function macroCurrentUnit(): string {
-  const el = islandRoot?.querySelector<HTMLSelectElement>(".macunit");
-  return el?.value === "frames" ? "frames" : "ms";
+/** Any editable control in the island holds the caret. Hover highlighting
+ *  re-derives the zone and legend lists, which REBUILDS their DOM — and a
+ *  rebuild under a focused control takes the focus with it. A highlight is
+ *  cosmetic; a half-finished edit is not, so the highlight yields. */
+function islandIsBeingEdited(): boolean {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || islandRoot === null) return false;
+  if (!islandRoot.contains(active)) return false;
+  return (
+    active instanceof HTMLInputElement ||
+    active instanceof HTMLSelectElement ||
+    active instanceof HTMLTextAreaElement
+  );
 }
 
 /** One `verb|index` payload from a row button. */
@@ -1773,7 +1791,10 @@ function wire(root: HTMLElement): void {
     // editor. The selects and the checkbox have no caret, so they are live.
     const committed = ev.type === "change";
     if (el.classList.contains("macdurin")) {
-      if (committed) macroSetDuration(Number(el.value), macroCurrentUnit());
+      // The unit comes from the DRAFT, not from reading it back off the
+      // <select>: the model is where the authored unit lives, and a control
+      // that had drifted would otherwise decide what the typed number means.
+      if (committed) macroSetDuration(Number(el.value), macroStepUnit());
       return;
     }
     if (el.classList.contains("macunit")) {
@@ -1838,12 +1859,31 @@ function wire(root: HTMLElement): void {
   // OR a legend row) hot-highlights BOTH renderings of that function; leaving
   // it (or the island) clears. focusin keeps keyboard users in sync.
   const hotFrom = (ev: Event): void => {
+    // v12.1: never while something in the island is being typed into. The
+    // highlight rebuilds the zone and legend lists, and a pointer that merely
+    // crosses the card must not be able to reach into a field somebody is
+    // still filling in.
+    if (islandIsBeingEdited()) return;
     const el = (ev.target as HTMLElement | null)?.closest<HTMLElement>("[data-fn]");
     setHot(el?.dataset.fn ?? null);
   };
   root.addEventListener("mouseover", hotFrom);
   root.addEventListener("focusin", hotFrom);
-  root.addEventListener("mouseleave", () => setHot(null));
+  root.addEventListener("mouseleave", () => {
+    if (!islandIsBeingEdited()) setHot(null);
+  });
+
+  // The macro editor's own focus, tracked so the 2 s poll can tell "a draft
+  // nobody is touching" (re-seed it from the file) from "an edit in progress"
+  // (leave it alone). focusout fires BEFORE the new element takes focus, so
+  // the answer is computed from relatedTarget, not from activeElement.
+  const macroFocusChanged = (ev: Event): void => {
+    const to =
+      ev.type === "focusout" ? (ev as FocusEvent).relatedTarget : (ev.target as EventTarget | null);
+    setMacroEditorFocused(to instanceof HTMLElement && to.closest(".macedit") !== null);
+  };
+  root.addEventListener("focusin", macroFocusChanged);
+  root.addEventListener("focusout", macroFocusChanged);
 
   // A toast must not vanish under the hand reaching for its Undo button, so
   // pointer or keyboard focus anywhere in the stack freezes every timer in

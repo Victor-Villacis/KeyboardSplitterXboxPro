@@ -1,0 +1,13 @@
+{
+  "name": "ksx-studio-pwtest",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Browser-level tests for the ksx Studio islands. Separate from studio-ui/ on purpose: the build must never need a browser.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

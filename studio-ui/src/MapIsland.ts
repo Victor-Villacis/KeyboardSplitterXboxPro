@@ -1041,7 +1041,10 @@ export function applyMap(p: MapPayload): void {
   // draft is the normal state while authoring, not an edge case). The TRIGGER
   // is re-read either way: that half is written by the `map` verb, so a draft
   // has no business remembering a stale copy of it.
-  if (macroDraft === null || !macroDirty) {
+  // v12.1: "untouched" now includes "nobody's hands are on it". A clean draft
+  // whose duration box has the caret is still an edit in flight — re-seeding
+  // it repaints the very control being typed into.
+  if (macroDraft === null || !macroEditorBusy()) {
     seedMacro(null);
   } else {
     const fresh = p.macros.macros.find(
@@ -1714,10 +1717,43 @@ export function newMacroBody(name: string): MacroView {
   };
 }
 
+/** The two spellings a duration can be authored in (§1c). */
+type StepUnit = "ms" | "frames";
+
+/** The unit each step was AUTHORED in — its own state, remembered per step.
+ *
+ *  Keyed by the STEP OBJECT rather than by an index, so the choice follows the
+ *  step through every move / insert / delete without a parallel array anybody
+ *  has to remember to splice in step.
+ *
+ *  Why it is state and not a derivation: the editor used to read the unit back
+ *  off the value ("`frames` is not null? then frames, else ms"), which means a
+ *  step that is not there — or a value normalised anywhere between here and
+ *  the file — answers "ms". That is exactly how a unit the author picked
+ *  turned back into ms on its own. The value is the file's; the unit is the
+ *  author's, and this is where the author's half lives. */
+const stepUnits = new WeakMap<MacroStepView, StepUnit>();
+
+/** The unit the duration control shows when NO step is selected: the last one
+ *  the author actually picked, never a default that overwrites their choice. */
+let macroLastUnit: StepUnit = "ms";
+
+/** How the FILE spells this step's duration. Reading the preset's own shape is
+ *  not inference — `ms` and `frames` are kept apart on disk precisely so an
+ *  authored unit round-trips (§1c) — but it is the ONLY place a unit is ever
+ *  read from a value, and it happens once, when a draft is seeded. */
+function fileUnitOf(step: MacroStepView): StepUnit {
+  return step.frames !== null && step.ms === null ? "frames" : "ms";
+}
+
 function cloneMacro(mac: MacroView): MacroView {
   return {
     ...mac,
-    steps: mac.steps.map((s) => ({ ...s, hold: [...s.hold] })),
+    steps: mac.steps.map((s) => {
+      const copy = { ...s, hold: [...s.hold] };
+      stepUnits.set(copy, fileUnitOf(s));
+      return copy;
+    }),
     triggers: [...mac.triggers],
   };
 }
@@ -1742,6 +1778,20 @@ let macroChosen: string | null = null;
 let macroDirty = false;
 /** Which step the duration editor is pointed at. */
 let macroStep: number | null = null;
+/** A macro-editor control has the caret right now — an edit in progress, which
+ *  no poll and no hover may repaint out from under. map.ts drives this from
+ *  focusin/focusout: the island holds the state, the page holds the DOM. */
+let macroEditorFocused = false;
+
+/** Is there an edit in flight the poll must leave alone? Unsaved changes, or a
+ *  control the user's hands are on this second. */
+function macroEditorBusy(): boolean {
+  return macroDirty || macroEditorFocused;
+}
+
+export function setMacroEditorFocused(on: boolean): void {
+  macroEditorFocused = on;
+}
 
 export function currentMacro(): MacroView | null {
   return macroDraft;
@@ -1828,12 +1878,28 @@ export function seedMacro(name: string | null): void {
   // snap-back that made a rename look like it "just resets".
   const want = (name ?? macroChosen ?? lastPayload?.macro_selected ?? "").toLowerCase();
   const found = list.find((m) => m.name.toLowerCase() === want) ?? (name === null ? list[0] : undefined);
+  const wasChosen = macroChosen;
+  const wasStep = macroStep;
   macroChosen = found ? found.name : null;
   macroDraft = found ? cloneMacro(found) : null;
   macroFromDisk = found !== undefined;
   macroSeedName = found ? found.name : null;
   macroDirty = false;
-  macroStep = null;
+  // WHICH STEP the editor points at is the USER's place in the macro, not the
+  // file's — so re-seeding the SAME macro keeps it. The 2 s poll re-seeds
+  // every clean draft, and clearing the selection there is what made the
+  // duration editor let go on its own: with no step to edit, the unit control
+  // has nothing to describe, `Set unit` finds nothing to set, and the next
+  // sync writes "ms" back over the author's pick. A DIFFERENT macro is a
+  // different sequence, so that still starts with nothing selected.
+  macroStep =
+    found !== undefined &&
+    wasChosen !== null &&
+    found.name.toLowerCase() === wasChosen.toLowerCase() &&
+    wasStep !== null &&
+    wasStep < found.steps.length
+      ? wasStep
+      : null;
   refreshMacro();
 }
 
@@ -1864,6 +1930,7 @@ export function resetMacroDraft(): void {
   macroChosen = null;
   macroDirty = false;
   macroStep = null;
+  macroLastUnit = "ms";
 }
 
 /** Every mutation lands here: mark the draft edited and repaint. */
@@ -1891,7 +1958,9 @@ export function macroToggleCell(index: number, fn: string): void {
 }
 
 function newStep(): MacroStepView {
-  return { hold: [], ms: 50, frames: null, allow_short: false };
+  const step: MacroStepView = { hold: [], ms: 50, frames: null, allow_short: false };
+  stepUnits.set(step, "ms");
+  return step;
 }
 
 /** add / insert above / insert below / delete / move up / move down. */
@@ -1950,7 +2019,12 @@ export function macroSetDuration(value: number, unit: string): void {
   const step = macroStep === null ? undefined : macroDraft?.steps[macroStep];
   if (!step || !Number.isFinite(value) || value <= 0) return;
   const n = Math.round(value);
-  if (unit === "frames") {
+  const want: StepUnit = unit === "frames" ? "frames" : "ms";
+  // A number typed into the box is authored in whatever unit is showing, so
+  // the write records BOTH halves — the value and the unit it was meant in.
+  stepUnits.set(step, want);
+  macroLastUnit = want;
+  if (want === "frames") {
     step.frames = n;
     step.ms = null;
   } else {
@@ -1965,16 +2039,31 @@ export function macroSetDuration(value: number, unit: string): void {
  *  unit is an authoring convenience (§1c — it buys readability and nothing
  *  else), so changing it must not change how long the step runs. */
 export function macroSetUnit(unit: string): void {
+  const want: StepUnit = unit === "frames" ? "frames" : "ms";
+  // Remembered even when it lands on nothing, so the control keeps showing
+  // what the author picked instead of snapping back to a unit nobody chose.
+  macroLastUnit = want;
   const step = macroStep === null ? undefined : macroDraft?.steps[macroStep];
-  if (!step) return;
-  if (unit === "frames") {
-    if (step.frames !== null) return;
-    step.frames = Math.max(1, Math.round(((step.ms ?? 50) * 60) / 1000));
-    step.ms = null;
-  } else {
-    if (step.ms !== null) return;
+  if (!step) {
+    refreshMacro();
+    return;
+  }
+  const already = stepUnits.get(step) === want && fileUnitOf(step) === want;
+  stepUnits.set(step, want);
+  if (want === "frames") {
+    if (step.frames === null) {
+      step.frames = Math.max(1, Math.round(((step.ms ?? 50) * 60) / 1000));
+      step.ms = null;
+    }
+  } else if (step.ms === null) {
     step.ms = framesMs(step.frames ?? 1);
     step.frames = null;
+  }
+  // Picking the unit a step is already in is not an edit — it must not light
+  // up "unsaved changes" over a choice that changed nothing.
+  if (already) {
+    refreshMacro();
+    return;
   }
   macroEdited();
 }
@@ -2347,10 +2436,17 @@ function refreshMacro(): void {
 }
 
 /** The unit the duration editor should show for the selected step. map.ts
- *  writes it onto the <select>, which an attribute binding cannot do. */
-export function macroStepUnit(): string {
+ *  writes it onto the <select>, which an attribute binding cannot do.
+ *
+ *  Read from [`stepUnits`] — the authored choice — and NEVER re-derived from
+ *  the value. With no step selected it answers the last unit the author
+ *  picked, so the control cannot contradict them while they are looking at it.
+ *  (The `??` is a safety net for a step object that never came through
+ *  `cloneMacro`/`newStep`; nothing in this file produces one.) */
+export function macroStepUnit(): StepUnit {
   const step = macroStep === null ? undefined : macroDraft?.steps[macroStep];
-  return step?.frames !== null && step?.frames !== undefined ? "frames" : "ms";
+  if (!step) return macroLastUnit;
+  return stepUnits.get(step) ?? fileUnitOf(step);
 }
 
 export function macroStepAllowShort(): boolean {

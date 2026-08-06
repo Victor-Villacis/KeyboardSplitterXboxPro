@@ -126,6 +126,21 @@ pub enum Issue {
     /// A `macro.<name>` row carries a when/unless guard. A chord that starts a
     /// sequence is not implemented; the guard would be silently ignored.
     GuardedMacroTrigger { preset: String, name: String },
+    /// Advisory: ONE key starts several macros. Legal and deliberate (multi-bind
+    /// is native to triggers too), and the reason it is said out loud is that
+    /// what the game reads is then the SUPERPOSITION of every one of them —
+    /// which contains states no single macro's step list has, and repeats for
+    /// as long as the loudest `repeat` policy among them says.
+    ///
+    /// This is the shape behind both 2026-08-06 cabinet reports ("a phantom
+    /// direction between my steps", "`once` still repeats while I hold it"), and
+    /// neither is visible by reading the macro that was blamed.
+    SharedMacroTrigger {
+        preset: String,
+        key: String,
+        /// Every macro this key starts, in file order.
+        macros: Vec<String>,
+    },
     /// Two `[macros]` tables whose names differ only in case. Macro names are
     /// matched case-insensitively (function names are), so one would shadow the
     /// other and a trigger would silently start the wrong sequence.
@@ -279,6 +294,9 @@ impl Issue {
                 | Issue::TurboRateWithoutTurbo { .. }
                 | Issue::BindingTurboClamped { .. }
                 | Issue::TurboOnConsume { .. }
+                // Advisory because several macros on one key is a real thing to
+                // want; what it is not is something to discover from a cabinet.
+                | Issue::SharedMacroTrigger { .. }
         )
     }
 }
@@ -534,6 +552,20 @@ impl fmt::Display for Issue {
                 f,
                 "preset '{preset}': more than one [macros] table is called '{name}' (macro names \
                  are matched ignoring case, so one would shadow the other)"
+            ),
+            Issue::SharedMacroTrigger {
+                preset,
+                key,
+                macros,
+            } => write!(
+                f,
+                "preset '{preset}': key '{key}' starts {} macros ({}) — they all run at once, so \
+                 the game reads their SUPERPOSITION, which can hold directions no single one of \
+                 them has, and it keeps repeating if ANY of them says `repeat = \"while-held\"` \
+                 or `\"turbo\"`. If only one of them is wanted, delete the other \
+                 `{MACRO_PREFIX}<name> = \"{key}\"` rows or move them to their own keys",
+                macros.len(),
+                macros.join(", "),
             ),
             Issue::MacroStepRaised {
                 preset,
@@ -1079,6 +1111,43 @@ fn validate_macros(preset: &PresetFile, pairs: &[(String, Flat<'_>)], issues: &m
                     step: i,
                     ms,
                 }
+            });
+        }
+    }
+
+    // One key, several macros. Native (a trigger is multi-bind like any other
+    // row) and never what a reader assumes, because the evidence for it is
+    // spread across as many `macro.<name>` rows as there are macros — the one
+    // shape you cannot see by reading the macro you are debugging. Grouped by
+    // key so it is reported once per key rather than once per row.
+    let mut by_key: Vec<(String, Vec<String>)> = Vec::new();
+    for (function, flat) in pairs {
+        let Some(target) = macro_name(function) else {
+            continue;
+        };
+        let key = match flat {
+            Flat::Plain(key) => *key,
+            Flat::Guard(guard) => guard.key.as_str(),
+        };
+        // An inert placeholder row starts nothing and shares nothing.
+        if key.eq_ignore_ascii_case("None") {
+            continue;
+        }
+        match by_key.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+            Some((_, names)) => {
+                if !names.iter().any(|n| n.eq_ignore_ascii_case(target)) {
+                    names.push(target.to_owned());
+                }
+            }
+            None => by_key.push((key.to_owned(), vec![target.to_owned()])),
+        }
+    }
+    for (key, names) in by_key {
+        if names.len() > 1 {
+            issues.push(Issue::SharedMacroTrigger {
+                preset: name(),
+                key,
+                macros: names,
             });
         }
     }
@@ -1736,6 +1805,48 @@ preset = "default"
             name: String::new()
         }
         .is_advisory());
+    }
+
+    /// The 2026-08-06 cabinet shape: THREE macros on one key. Legal, and
+    /// invisible from any one of them, so it is said out loud — it is what makes
+    /// a motion grow steps it does not have and a `repeat = "once"` macro look
+    /// like it never stops.
+    #[test]
+    fn several_macros_on_one_key_are_reported_once_per_key() {
+        let presets = vec![macro_preset(
+            "[bindings]\nmacro.op = \"Q\"\nmacro.ppp = \"Q\"\nmacro.test = \"Q\"\n\
+             macro.solo = \"R\"\nmacro.inert = \"None\"\n\
+             [macros.op]\nrepeat = \"turbo\"\nturbo_hz = 10\n\
+             steps = [{ hold = [\"ly.min\"], ms = 50 }]\n\
+             [macros.ppp]\nsteps = [{ hold = [\"ly.min\"], ms = 50 }]\n\
+             [macros.test]\nsteps = [{ hold = [\"ly.min\"], ms = 50 }]\n\
+             [macros.solo]\nsteps = [{ hold = [\"A\"], ms = 50 }]\n\
+             [macros.inert]\nsteps = [{ hold = [\"A\"], ms = 50 }]\n",
+        )];
+        let issues = validate(&ConfigFile::default(), &presets);
+        let shared: Vec<&Issue> = issues
+            .iter()
+            .filter(|i| matches!(i, Issue::SharedMacroTrigger { .. }))
+            .collect();
+        // ONE issue, for the one key that is shared — not one per row, and
+        // nothing at all for the key that starts a single macro or for the
+        // inert `"None"` placeholder.
+        assert_eq!(shared.len(), 1, "{issues:?}");
+        assert_eq!(
+            *shared[0],
+            Issue::SharedMacroTrigger {
+                preset: "m".into(),
+                key: "Q".into(),
+                macros: vec!["op".into(), "ppp".into(), "test".into()],
+            }
+        );
+        // Advice, not an error: several macros on one key is a real thing to
+        // want. The text has to name all three, and say what it does.
+        assert!(shared[0].is_advisory());
+        let text = shared[0].to_string();
+        for part in ["Q", "op", "ppp", "test", "SUPERPOSITION", "repeat"] {
+            assert!(text.contains(part), "{text}");
+        }
     }
 
     /// Macro names are matched ignoring case, so two tables differing only in

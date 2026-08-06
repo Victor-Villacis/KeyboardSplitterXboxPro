@@ -267,6 +267,23 @@ struct Loaded {
     mac: Macro,
     trigger: Key,
     root: PathBuf,
+    /// Every OTHER macro the same trigger key starts, with how long a run of it
+    /// takes and whether it repeats.
+    ///
+    /// A trigger is multi-bind like any other row, so one key may start several
+    /// sequences — and then the engine publishes their SUPERPOSITION, which can
+    /// hold directions no single one of them has and can keep repeating after
+    /// the traced macro is done. The trace plays the real preset through the
+    /// real engine, so it plays those too; reporting the named macro alone would
+    /// be blaming it for their states, which is exactly the misreading that
+    /// produced the 2026-08-06 cabinet reports.
+    also: Vec<Companion>,
+}
+
+struct Companion {
+    name: String,
+    total_ms: u64,
+    repeat: ksx_core::Repeat,
 }
 
 fn load(options: &Options) -> anyhow::Result<Loaded> {
@@ -329,6 +346,10 @@ fn load(options: &Options) -> anyhow::Result<Loaded> {
         }
     };
 
+    // Who else this key starts. Read from the RESOLVED trigger list, so it is
+    // the same answer the engine will act on rather than a re-parse of the file.
+    let also = companions(&preset.macros, trigger, index);
+
     let device = DeviceId::new(TRACE_DEVICE);
     let spec =
         SlotSpec::new(1, Some(device), None, preset.name.clone())?.with_persona(options.persona);
@@ -337,7 +358,53 @@ fn load(options: &Options) -> anyhow::Result<Loaded> {
         mac,
         trigger,
         root: root.dir().to_path_buf(),
+        also,
     })
+}
+
+/// Every OTHER macro `trigger` starts, in macro order and without repeats.
+///
+/// A trigger row is multi-bind like any other, so several `macro.<name>` rows
+/// may name one key; the engine then starts all of them from the same press.
+fn companions(macros: &ksx_core::Macros, trigger: Key, index: u16) -> Vec<Companion> {
+    let mut seen: Vec<usize> = Vec::new();
+    for t in &macros.triggers {
+        let i = usize::from(t.index);
+        if t.key != trigger || t.index == index || i >= macros.defs.len() || seen.contains(&i) {
+            continue;
+        }
+        seen.push(i);
+    }
+    seen.sort_unstable();
+    seen.into_iter()
+        .map(|i| Companion {
+            name: macros.defs[i].name.clone(),
+            total_ms: macros.defs[i].total_ms(),
+            repeat: macros.defs[i].repeat,
+        })
+        .collect()
+}
+
+impl Loaded {
+    /// The longest single run any macro this key starts will take — what the
+    /// sampler and the run budget must cover, so a trace of a short macro
+    /// sharing a key with a long one is not cut off half way.
+    fn run_ms(&self) -> u64 {
+        run_ms(self.mac.total_ms(), &self.also)
+    }
+
+    /// Does anything this key starts keep going while the key is held?
+    fn anything_repeats(&self) -> bool {
+        self.mac.repeat.repeats() || self.also.iter().any(|c| c.repeat.repeats())
+    }
+}
+
+fn run_ms(mac_total_ms: u64, also: &[Companion]) -> u64 {
+    also.iter()
+        .map(|c| c.total_ms)
+        .chain(std::iter::once(mac_total_ms))
+        .max()
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +439,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
         Arc::clone(&published),
         t0,
         sample_hz,
-        loaded.mac.total_ms() + options.hold_ms + TAIL.as_millis() as u64,
+        loaded.run_ms() + options.hold_ms + TAIL.as_millis() as u64,
     );
 
     let mut rec = Recorder {
@@ -441,7 +508,7 @@ fn play(rec: &mut Recorder, loaded: &Loaded, options: &Options) -> anyhow::Resul
     let clock = move || t0.elapsed().as_millis() as u64;
     // A run that never ends (a `while-held` macro whose trigger we are holding,
     // or a wedged deadline) must still produce a trace rather than hang.
-    let budget = loaded.mac.total_ms().saturating_mul(4) + options.hold_ms + 2_000;
+    let budget = loaded.run_ms().saturating_mul(4) + options.hold_ms + 2_000;
 
     let press = KeyEvent {
         device: device.clone(),
@@ -593,6 +660,14 @@ fn report(
                     "total_ms": loaded.mac.total_ms(),
                     "repeat": loaded.mac.repeat.as_str(),
                 },
+                // Every OTHER macro the same key starts. A non-empty list means
+                // the states below are a superposition, not this macro's alone.
+                "also_triggered": loaded.also.iter().map(|c| serde_json::json!({
+                    "name": c.name,
+                    "total_ms": c.total_ms,
+                    "repeat": c.repeat.as_str(),
+                })).collect::<Vec<_>>(),
+                "trigger": loaded.trigger.name(),
                 "config_dir": loaded.root.display().to_string(),
                 "persona": options.persona.to_string(),
                 "dry_run": options.dry_run,
@@ -641,6 +716,28 @@ fn report(
         if options.dry_run { "mock" } else { "ViGEm" },
         user_index.map_or("none".to_owned(), |i| i.to_string()),
     );
+    // The one thing a reader cannot see by looking at the macro they asked
+    // about — and the difference between "the engine invented a step" and "you
+    // are running three sequences at once".
+    if !loaded.also.is_empty() {
+        println!(
+            "\nSHARED TRIGGER — key '{}' also starts {} other macro(s), which run at the SAME time",
+            loaded.trigger.name(),
+            loaded.also.len()
+        );
+        for c in &loaded.also {
+            println!(
+                "  {} — {} ms a run, repeat {}",
+                c.name, c.total_ms, c.repeat
+            );
+        }
+        println!(
+            "  Every state below is their SUPERPOSITION, not \"{}\" alone: it can hold directions \
+             no single one of them has, and it keeps going while the key is down if ANY of them \
+             repeats. Give them separate keys to trace one on its own.",
+            loaded.mac.name
+        );
+    }
 
     println!("\nSUBMITTED — every state ksx handed the driver");
     println!(
@@ -704,6 +801,27 @@ fn report(
             );
         }
     }
+    if !loaded.also.is_empty() {
+        println!(
+            "  {} other macro(s) on the same key ({}) contributed to those states — do not read \
+             this trace as \"{}\"",
+            loaded.also.len(),
+            loaded
+                .also
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            loaded.mac.name,
+        );
+        if loaded.anything_repeats() && !loaded.mac.repeat.repeats() {
+            println!(
+                "  \"{}\" is repeat {}, but something on this key repeats — that, and not \"{}\", \
+                 is what keeps firing while the key is held",
+                loaded.mac.name, loaded.mac.repeat, loaded.mac.name,
+            );
+        }
+    }
     if diag_submitted == 0 {
         println!("  no diagonal in this macro (no state deflects two perpendicular directions)");
     } else {
@@ -725,7 +843,7 @@ fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ksx_core::{Axis, Binding, DpadDirection, AXIS_MAX};
+    use ksx_core::{Axis, Binding, DpadDirection, MacroStep, AXIS_MAX};
 
     fn axis_state(lx: i16, ly: i16) -> PadState {
         PadState {
@@ -804,6 +922,73 @@ mod tests {
         let observed = observe(&samples);
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].samples, 10);
+    }
+
+    /// The finding of 2026-08-06: his key `Q` started THREE macros, and a trace
+    /// that names only the one asked for blames it for two other macros' states.
+    /// So the instrument has to see them — from the same resolved trigger list
+    /// the engine acts on, deduped, and with the repeat policy that explains why
+    /// a `once` macro looked like it never stopped.
+    #[test]
+    fn a_trace_sees_every_other_macro_the_same_key_starts() {
+        let mut turbo = Macro::new(
+            "op",
+            vec![MacroStep::new(
+                vec![Binding::Button(ksx_core::XButton::A)],
+                50,
+            )],
+        );
+        turbo.repeat = ksx_core::Repeat::Turbo;
+        let macros = ksx_core::Macros {
+            defs: vec![
+                turbo,
+                Macro::new(
+                    "ppp",
+                    vec![MacroStep::frames(
+                        vec![Binding::Dpad(DpadDirection::Down)],
+                        7,
+                    )],
+                ),
+                Macro::new(
+                    "solo",
+                    vec![MacroStep::new(vec![Binding::Dpad(DpadDirection::Up)], 50)],
+                ),
+            ],
+            triggers: vec![
+                MacroTrigger::new(Key::Q, 0),
+                MacroTrigger::new(Key::Q, 1),
+                // A duplicate row, and a dangling index: neither may show up
+                // twice or panic.
+                MacroTrigger::new(Key::Q, 0),
+                MacroTrigger::new(Key::Q, 9),
+                MacroTrigger::new(Key::R, 2),
+            ],
+        };
+
+        // Tracing `ppp` (index 1) has to name `op`, and only `op`.
+        let also = companions(&macros, Key::Q, 1);
+        assert_eq!(also.len(), 1);
+        assert_eq!(also[0].name, "op");
+        assert_eq!(also[0].repeat, ksx_core::Repeat::Turbo);
+        // The sampling window covers the LONGEST run on the key, not the traced
+        // macro's — 7 frames is 117 ms, `op` is 50.
+        assert_eq!(run_ms(117, &also), 117);
+        assert_eq!(
+            run_ms(
+                50,
+                &[Companion {
+                    name: "x".into(),
+                    total_ms: 400,
+                    repeat: ksx_core::Repeat::Once
+                }]
+            ),
+            400
+        );
+
+        // A key that starts exactly one macro has no companions, and neither
+        // does a key that starts none.
+        assert!(companions(&macros, Key::R, 2).is_empty());
+        assert!(companions(&macros, Key::Z, 0).is_empty());
     }
 
     /// The tracer must not care which mechanism a preset uses: a stick binding

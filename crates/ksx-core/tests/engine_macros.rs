@@ -1069,3 +1069,310 @@ fn the_default_is_still_one_run_per_press() {
     assert_eq!(state(&engine), PadState::default());
     assert_eq!(engine.next_deadline(), None);
 }
+
+// ---------------------------------------------------------------------------
+// The two cabinet reports, as tests (2026-08-06)
+// ---------------------------------------------------------------------------
+//
+// Both arrived as "the engine is doing something my macro does not say", and
+// `ksx macro trace` on his own preset showed what was really happening: his key
+// `Q` starts THREE macros (`op`, `ppp`, `test`), so what a poller reads is their
+// SUPERPOSITION, and one of the three is a `repeat = "turbo"`. The tests below
+// pin both halves — the engine's own guarantees, which hold, and the shape that
+// produced the report, which is a configuration nobody was told about.
+
+/// **Report A: "a phantom down between the diagonal and forward".**
+///
+/// The engine's half of it, stated exactly: a step transition publishes ONE
+/// state, and a binding both steps hold is never released and re-pressed. The
+/// assertion is the whole published sequence, so ANY intermediate state — a
+/// phantom direction, a phantom neutral, a re-press — fails it.
+#[test]
+fn a_step_transition_publishes_exactly_one_state_with_no_intermediate() {
+    fn qcf() -> Macro {
+        Macro::new(
+            "qcf",
+            vec![
+                MacroStep::frames(vec![DOWN_AX], 7),
+                MacroStep::frames(vec![DOWN_AX, RIGHT_AX], 7),
+                MacroStep::frames(vec![RIGHT_AX], 7),
+            ],
+        )
+    }
+    let mut engine = engine_with_entries(qcf(), axis_entries());
+
+    let mut published: Vec<(i16, i16)> = Vec::new();
+    for delta in engine.handle_at(&ev(&ipac_device(), Key::P, true), 0) {
+        published.push((delta.state.lx, delta.state.ly));
+    }
+    for t in 1..=400 {
+        for delta in engine.tick(t) {
+            published.push((delta.state.lx, delta.state.ly));
+        }
+    }
+
+    // Four states for three steps plus the release. Nothing between them: no
+    // (0, AXIS_MIN) after the diagonal (the phantom down), and no (0, 0)
+    // either (the phantom neutral).
+    assert_eq!(
+        published,
+        vec![
+            (0, ksx_core::AXIS_MIN),
+            (AXIS_MAX, ksx_core::AXIS_MIN),
+            (AXIS_MAX, 0),
+            (0, 0),
+        ],
+        "a step transition published more than one state"
+    );
+
+    // ...and said the other way, per millisecond: 7 frames is 117 ms, so lx is
+    // handed from step 1 to step 2 at t=234 and must not blink across it.
+    let mut engine = engine_with_entries(qcf(), axis_entries());
+    press(&mut engine, Key::P, 0);
+    for t in 1..=350 {
+        engine.tick(t);
+        if t >= 117 {
+            assert_eq!(state(&engine).lx, AXIS_MAX, "lx blinked at t={t}");
+        }
+    }
+}
+
+/// The same guarantee for a BUTTON carried across steps, which is the case
+/// where a re-press is not cosmetic: a game reading the press EDGE would fire
+/// the move twice.
+#[test]
+fn a_button_held_across_steps_is_pressed_once_and_never_re_pressed() {
+    let mut engine = engine_with(Macro::new(
+        "hold-through",
+        vec![
+            MacroStep::new(vec![PUNCH, DOWN], 50),
+            MacroStep::new(vec![PUNCH], 50),
+            MacroStep::new(vec![PUNCH, RIGHT], 50),
+        ],
+    ));
+
+    let mut published: Vec<XButtons> = Vec::new();
+    for delta in engine.handle_at(&ev(&ipac_device(), Key::P, true), 0) {
+        published.push(delta.state.buttons);
+    }
+    for t in 1..=200 {
+        for delta in engine.tick(t) {
+            published.push(delta.state.buttons);
+        }
+    }
+    assert_eq!(
+        published,
+        vec![
+            XButtons::A | XButtons::DPAD_DOWN,
+            XButtons::A,
+            XButtons::A | XButtons::DPAD_RIGHT,
+            XButtons::empty(),
+        ]
+    );
+    // The A bit is set in every state but the last: it was pressed once, at the
+    // start, and released once, at the end.
+    assert!(published[..3].iter().all(|b| b.contains(XButtons::A)));
+}
+
+/// **What actually produced report A.** Two macros on ONE key superimpose, and
+/// the superposition contains states neither macro's step list has. This is
+/// documented multi-bind (`triggers_fan_out_in_both_directions`), not a bug —
+/// but it is exactly what "the engine invented a direction my macro does not
+/// have" looks like from the cabinet, so it gets a test that says so.
+#[test]
+fn two_macros_on_one_key_superimpose_into_states_neither_one_holds() {
+    // His shapes: both are down / forward, one at 50 ms a step and one at 7
+    // frames (117 ms), both started by the same key.
+    let defs = vec![
+        Macro::new(
+            "fast",
+            vec![
+                MacroStep::new(vec![DOWN_AX], 50),
+                MacroStep::new(vec![RIGHT_AX], 50),
+            ],
+        ),
+        Macro::new(
+            "slow",
+            vec![
+                MacroStep::frames(vec![DOWN_AX], 7),
+                MacroStep::frames(vec![RIGHT_AX], 7),
+            ],
+        ),
+    ];
+    let p = preset_with_macros(
+        "shared-trigger",
+        axis_entries(),
+        macros(
+            defs,
+            vec![MacroTrigger::new(Key::P, 0), MacroTrigger::new(Key::P, 1)],
+        ),
+    );
+    let mut engine = Engine::new(vec![ResolvedSlot {
+        spec: SlotSpec::new(1, Some(ipac_device()), None, p.name.clone()).expect("valid slot"),
+        preset: p,
+    }]);
+
+    press(&mut engine, Key::P, 0);
+    assert_eq!(
+        (state(&engine).lx, state(&engine).ly),
+        (0, ksx_core::AXIS_MIN)
+    );
+    // t=50: `fast` moved to forward, `slow` is still down. Neither macro has a
+    // diagonal step; together they publish one anyway.
+    engine.tick(50);
+    assert_eq!(
+        (state(&engine).lx, state(&engine).ly),
+        (AXIS_MAX, ksx_core::AXIS_MIN),
+        "the two macros did not superimpose"
+    );
+    // t=100: `fast` is done and lets go of forward; `slow` is still on down, so
+    // the "phantom down after the diagonal" is simply the slower macro, still
+    // running.
+    engine.tick(100);
+    assert_eq!(
+        (state(&engine).lx, state(&engine).ly),
+        (0, ksx_core::AXIS_MIN)
+    );
+    engine.tick(117);
+    assert_eq!((state(&engine).lx, state(&engine).ly), (AXIS_MAX, 0));
+}
+
+/// **Report B: "`repeat = once` still repeats while I hold the key".**
+///
+/// The trigger is pressed and HELD for ten run-lengths of virtual time, and the
+/// number of RUNS is counted off the published states. `once` runs exactly one,
+/// whatever the key does afterwards; `while-held` runs one per run-length; and
+/// `turbo` runs one per cycle, which is the run PLUS its gap.
+#[test]
+fn holding_the_trigger_repeats_exactly_as_the_policy_says() {
+    // A run is 100 ms and ends released, so every re-run is a visible press
+    // EDGE of A — which is what a game counts, and therefore what this counts.
+    fn cycle_macro() -> Macro {
+        Macro::new(
+            "cycle",
+            vec![MacroStep::new(vec![PUNCH], 50), MacroStep::new(vec![], 50)],
+        )
+    }
+
+    // Press, hold for `hold_ms` of virtual time, and count press edges of A.
+    fn runs_while_held(mac: Macro, hold_ms: u64) -> usize {
+        let mut engine = engine_with(mac);
+        press(&mut engine, Key::P, 0);
+        let mut down = state(&engine).buttons.contains(XButtons::A);
+        let mut runs = usize::from(down);
+        for t in 1..=hold_ms {
+            engine.tick(t);
+            let now = state(&engine).buttons.contains(XButtons::A);
+            runs += usize::from(now && !down);
+            down = now;
+        }
+        runs
+    }
+
+    // `once`: ONE run in ten run-lengths of holding. This is the report.
+    let mut once = cycle_macro();
+    once.repeat = Repeat::Once;
+    assert_eq!(runs_while_held(once, 1_000), 1);
+    // ...and nothing is left armed, so no later wake can start another.
+    let mut engine = engine_with(cycle_macro());
+    press(&mut engine, Key::P, 0);
+    for t in 1..=1_000 {
+        engine.tick(t);
+    }
+    assert_eq!(engine.next_deadline(), None);
+    assert_eq!(state(&engine), PadState::default());
+
+    // `while-held`: a run per 100 ms run-length — t=0, 100, ... 1000.
+    let mut held = cycle_macro();
+    held.repeat = Repeat::WhileHeld;
+    assert_eq!(runs_while_held(held, 1_000), 11);
+
+    // `turbo`: a run per CYCLE, and the cycle is the run plus the gap it asked
+    // for — 100 + 50 = 150 ms, so t=0, 150, ... 900.
+    let mut turbo = cycle_macro();
+    turbo.repeat = Repeat::Turbo;
+    turbo.turbo = Some(TurboRate::GapMs(50));
+    assert_eq!(turbo.turbo_cycle_ms(), 150);
+    assert_eq!(runs_while_held(turbo, 1_000), 7);
+}
+
+/// The other half of report B, said as an invariant: NOTHING re-arms a `once`
+/// macro whose run has ended. Not the trigger still being down, not the
+/// keyboard repeating it, and not another key on the same slot moving.
+#[test]
+fn nothing_re_arms_a_once_macro_while_its_trigger_is_still_down() {
+    let mut engine = engine_with_entries(tap(), vec![(Key::G, Binding::Button(XButton::B))]);
+    press(&mut engine, Key::P, 0);
+    engine.tick(50);
+    assert_eq!(engine.next_deadline(), None);
+
+    for t in 51..=1_000 {
+        // Autorepeat of the trigger, of another bound key, and that key going
+        // genuinely up and down — none of it is a new press of P.
+        if t % 33 == 0 {
+            press(&mut engine, Key::P, t);
+        }
+        if t % 50 == 0 {
+            press(&mut engine, Key::G, t);
+        }
+        if t % 70 == 0 {
+            release(&mut engine, Key::G, t);
+        }
+        engine.tick(t);
+        assert_eq!(engine.next_deadline(), None, "something re-armed at t={t}");
+        assert!(
+            !state(&engine).buttons.contains(XButtons::A),
+            "the macro ran again at t={t}"
+        );
+    }
+}
+
+/// **What actually produced report B.** A `once` macro whose key ALSO starts a
+/// `turbo` macro: the `once` one runs once, exactly as it says, and the turbo
+/// one keeps going for as long as the key is down — which from the cabinet is
+/// indistinguishable from "once still repeats".
+#[test]
+fn a_turbo_macro_on_the_same_key_is_what_keeps_repeating() {
+    let mut turbo = Macro::new(
+        "op",
+        vec![MacroStep::new(vec![Binding::Trigger(Trigger::Right)], 50)],
+    );
+    turbo.repeat = Repeat::Turbo;
+    turbo.turbo = Some(TurboRate::GapMs(50));
+    let p = preset_with_macros(
+        "shared-trigger-turbo",
+        Vec::new(),
+        macros(
+            vec![tap(), turbo],
+            vec![MacroTrigger::new(Key::P, 0), MacroTrigger::new(Key::P, 1)],
+        ),
+    );
+    let mut engine = Engine::new(vec![ResolvedSlot {
+        spec: SlotSpec::new(1, Some(ipac_device()), None, p.name.clone()).expect("valid slot"),
+        preset: p,
+    }]);
+
+    press(&mut engine, Key::P, 0);
+    let mut a_runs = 0usize;
+    let mut rt_runs = 0usize;
+    let (mut a_down, mut rt_down) = (false, false);
+    for t in 0..=1_000 {
+        engine.tick(t);
+        let s = state(&engine);
+        let (a, rt) = (s.buttons.contains(XButtons::A), s.rt != 0);
+        a_runs += usize::from(a && !a_down);
+        rt_runs += usize::from(rt && !rt_down);
+        (a_down, rt_down) = (a, rt);
+    }
+    // The `once` macro obeyed its policy...
+    assert_eq!(a_runs, 1);
+    // ...and the turbo on the same key is the thing that never stopped.
+    assert!(rt_runs > 5, "the turbo macro stopped repeating: {rt_runs}");
+
+    // Both still go out the same door: one cancel releases everything and
+    // disarms everything, turbo gap included.
+    engine.cancel_macros();
+    assert_eq!(engine.next_deadline(), None);
+    assert_eq!(state(&engine), PadState::default());
+    assert!(engine.tick(10_000).is_empty());
+}

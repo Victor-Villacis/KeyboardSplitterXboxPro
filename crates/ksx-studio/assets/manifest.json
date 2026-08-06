@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "build_hash": "60d8c54da930a425c099790aa1072e50612c4198226cedc2ab3b845f20a2fc2f",
+  "build_hash": "182cf37b848a0d855e672c6ceb98c27dc5411a2b80f370ae6c2132f7a35e28aa",
   "assets": {
     "map.ir": "map.2e4f927e.ir",
-    "map.js": "map.9adc22f9.js",
+    "map.js": "map.cb87b2a4.js",
     "status.ir": "status.414220c5.ir",
     "status.js": "status.5093d774.js",
     "studio.css": "studio.883bca0d.css"
@@ -23,13 +23,13 @@
     },
     "/map": {
       "js": [
-        "map.9adc22f9.js"
+        "map.cb87b2a4.js"
       ],
       "css": [
         "studio.883bca0d.css"
       ],
       "fonts": [],
-      "total_size_br": 43561,
+      "total_size_br": 43784,
       "budget_warn_threshold": 200000,
       "ir": "map.2e4f927e.ir"
     }
