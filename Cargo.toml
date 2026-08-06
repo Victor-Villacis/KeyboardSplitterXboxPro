@@ -6,6 +6,7 @@ members = ["crates/*"]
 default-members = [
     "crates/ksx-core",
     "crates/ksx-config",
+    "crates/ksx-api",
     "crates/ksx-legacy-import",
     "crates/ksx-capture",
     "crates/ksx-output",
@@ -28,6 +29,7 @@ rust-version = "1.85"
 # internal
 ksx-core = { path = "crates/ksx-core" }
 ksx-config = { path = "crates/ksx-config" }
+ksx-api = { path = "crates/ksx-api" }
 ksx-legacy-import = { path = "crates/ksx-legacy-import" }
 ksx-capture = { path = "crates/ksx-capture" }
 ksx-output = { path = "crates/ksx-output" }

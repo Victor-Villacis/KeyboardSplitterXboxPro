@@ -317,12 +317,14 @@ fallback until `ksx` passes the full cabinet test matrix.
 ```
 crates/ksx-core           pure mapping engine (CI-tested, proptest)
 crates/ksx-config         TOML config + presets
+crates/ksx-api            the typed control API every front end consumes (no HTTP, no async)
 crates/ksx-legacy-import  legacy UTF-16 XML → TOML importer
 crates/ksx-capture        CaptureBackend: interception / winusb / rawinput-identify
 crates/ksx-output         VirtualPadBackend: ViGEmBus
 crates/ksx-platform       driver health, install, autostart, WinUSB rebind, SendInput
 crates/ksx-games          game launch + exit detection (launcher hand-off)
 crates/ksx-app            the `ksx` binary
+crates/ksx-studio         ksx Studio, the optional localhost UI (feature `studio`)
 crates/vigem-client       vendored CasualX/vigem-client (MIT)
 legacy/                   original C# solution (frozen, reference only)
 examples/                 frontend wrapper scripts

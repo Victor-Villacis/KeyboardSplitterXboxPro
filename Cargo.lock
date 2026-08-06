@@ -725,6 +725,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ksx-api"
+version = "0.1.0"
+dependencies = [
+ "ksx-config",
+ "ksx-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "ksx-app"
 version = "0.1.0"
 dependencies = [
@@ -733,6 +745,7 @@ dependencies = [
  "crossbeam-channel",
  "hdrhistogram",
  "insta",
+ "ksx-api",
  "ksx-capture",
  "ksx-config",
  "ksx-core",
@@ -867,6 +880,7 @@ dependencies = [
  "axum",
  "forma-ir",
  "forma-server",
+ "ksx-api",
  "ksx-config",
  "ksx-core",
  "rust-embed",

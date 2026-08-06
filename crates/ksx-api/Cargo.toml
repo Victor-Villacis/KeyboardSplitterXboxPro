@@ -1,0 +1,23 @@
+[package]
+name = "ksx-api"
+description = "ksx-api — the typed, transport-free control API every ksx front end consumes (docs/M9-DECISION.md §6)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# The dependency list IS the boundary (docs/M9-DECISION.md §6): serde for the
+# wire shapes, thiserror for the transport error, and the two ksx crates whose
+# types this layer names. No axum, no forma, no tokio, no HTTP types, no
+# `async` — not even behind a feature. If this crate ever grows a dependency
+# that can open a socket, the M9 decision has been undone by accident.
+[dependencies]
+ksx-core.workspace = true
+ksx-config.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

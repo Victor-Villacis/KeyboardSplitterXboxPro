@@ -42,8 +42,9 @@ use crossbeam_channel::Sender;
 use super::{DaemonCommand, DaemonState, RunState, SharedState};
 
 /// The one well-known name. Tests use throwaway names; everything else uses
-/// this.
-pub const PIPE_NAME: &str = r"\\.\pipe\ksx-daemon";
+/// this. It is defined with the rest of the protocol in `ksx-api`: the name a
+/// client dials is as much a part of the contract as the verbs it carries.
+pub const PIPE_NAME: &str = ksx_api::PIPE_NAME;
 
 /// `(title, detail)` rows from games.toml, read on demand so `status` reflects
 /// what is on disk now — the same freshness rule as `Reload`.
@@ -503,78 +504,32 @@ fn handle_map_backups(request: &serde_json::Value, deps: &PipeDeps) -> serde_jso
 /// invariant). With nothing running there is nothing to bounce: the next
 /// start reads the file.
 fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) -> serde_json::Value {
-    let field = |name: &str| {
-        request
-            .get(name)
-            .and_then(|v| v.as_str())
-            .filter(|v| !v.trim().is_empty())
-            .map(str::to_owned)
-    };
-    let Some(preset) = field("preset") else {
-        return err_msg(r#"map needs a "preset""#);
-    };
-    let Some(function) = field("function") else {
-        return err_msg(r#"map needs a "function""#);
-    };
-    let clear = request
-        .get("clear")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    // CHORD guards, optional and absent from every pre-chord caller:
-    // "when": ["B"] / "unless": ["LeftShift"] (docs/INPUT-TRANSFORMS.md §1b).
-    let list = |name: &str| -> Vec<String> {
-        request
-            .get(name)
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .filter(|v| !v.trim().is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    // MANY KEYS → ONE CONTROL: "keys": ["S","Enter"] is the whole list the
-    // control should hold, written in ONE call (so Studio's "add another key"
-    // is atomic instead of read-modify-write). "key" is the one-key spelling
-    // of the same field, so both together is refused, never merged.
-    let keys = list("keys");
-    let key = field("key");
-    if key.is_some() && !keys.is_empty() {
-        return err_msg(r#"map takes either "key" or "keys", not both"#);
-    }
-    if key.is_none() && keys.is_empty() && !clear {
-        return err_msg(r#"map needs a "key" (or "keys", or "clear": true)"#);
-    }
-    if (key.is_some() || !keys.is_empty()) && clear {
-        return err_msg(r#"map takes either "key"/"keys" or "clear", not both"#);
-    }
-    let spec = crate::mapping::MapSpec {
-        preset,
-        function,
-        key,
-        keys,
-        // "force" is now ONLY about a cross-slot duplicate (another slot's
-        // preset in a profile that uses this one). It removes nothing: a key
-        // already used by another control of THIS preset is a multi-bind and
-        // needs no flag at all (docs/INPUT-TRANSFORMS.md §1a).
-        force: request
-            .get("force")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        // "move_from": "B" — the explicit move, the one way this verb unbinds
-        // a function the caller did not name in "function".
-        move_from: field("move_from"),
-        when: list("when"),
-        unless: list("unless"),
-        // AUTO-FIRE: absent means "not asked about" and leaves the rate alone;
-        // 0 clears it (docs/INPUT-TRANSFORMS.md §3).
-        turbo_hz: request
-            .get("turbo_hz")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|hz| u32::try_from(hz).ok()),
+    // ONE reader, shared with every client (`ksx_api::MapRequest`): which
+    // combinations of "key" / "keys" / "clear" are legal, and what each field
+    // is called, is answered in the crate both sides link — so a caller can be
+    // refused before a round trip, in these exact words, and a field added to
+    // the verb cannot reach only one side of it.
+    let spec = match ksx_api::MapRequest::from_json(request) {
+        Ok(map) => crate::mapping::MapSpec {
+            preset: map.preset,
+            function: map.function,
+            key: map.key,
+            keys: map.keys,
+            // "force" is now ONLY about a cross-slot duplicate (another slot's
+            // preset in a profile that uses this one). It removes nothing: a key
+            // already used by another control of THIS preset is a multi-bind and
+            // needs no flag at all (docs/INPUT-TRANSFORMS.md §1a).
+            force: map.force,
+            // "move_from": "B" — the explicit move, the one way this verb unbinds
+            // a function the caller did not name in "function".
+            move_from: map.move_from,
+            when: map.when,
+            unless: map.unless,
+            // AUTO-FIRE: absent means "not asked about" and leaves the rate alone;
+            // 0 clears it (docs/INPUT-TRANSFORMS.md §3).
+            turbo_hz: map.turbo_hz,
+        },
+        Err(refusal) => return err_msg(refusal.message),
     };
     match (deps.map)(&spec) {
         Ok(applied) => {
@@ -667,100 +622,26 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
 /// the control loop hot-swaps it with the pads left plugged — the same
 /// [`super::DaemonCommand::ApplyBindings`] path `map` takes, through the same
 /// [`apply_after_write`].
-/// EVERY field of a `[macros.<name>]` table that travels on the `map-macro`
-/// wire — i.e. every field of [`ksx_config::MacroFile`] except the ones the
-/// envelope owns (`verb`, `preset`, `name`, `delete`, `reload`).
-///
-/// This list is an ALLOWLIST on purpose (the envelope's keys must not collide
-/// with the body's), which makes forgetting an entry a SILENT field drop: the
-/// value never reaches `MacroFile`, serde fills the default, and the editor
-/// gets a cheerful "saved" for a value that was thrown away on the way in.
-/// That is exactly what happened to `repeat` (and its `turbo_hz`/`gap_ms`
-/// rate) — a card that set `while-held` saved `once`. `macro_body_is_every_
-/// macro_file_field` pins the list against `MacroFile`'s own serde shape so a
-/// field added there cannot be forgotten here.
-const MACRO_BODY_FIELDS: &[&str] = &[
-    "steps",
-    "on_release",
-    "retrigger",
-    "interrupt",
-    "repeat",
-    "turbo_hz",
-    "gap_ms",
-    "enabled",
-];
-
-/// The `[macros.<name>]` table a `map-macro` request carries, in the preset
-/// file's own vocabulary, or the sentence to refuse it with.
-pub(crate) fn macro_body(request: &serde_json::Value) -> Result<ksx_config::MacroFile, String> {
-    let mut object = serde_json::Map::new();
-    for key in MACRO_BODY_FIELDS {
-        if let Some(value) = request.get(*key) {
-            object.insert((*key).to_owned(), value.clone());
-        }
-    }
-    serde_json::from_value(object.into()).map_err(|err| {
-        format!(
-            "map-macro could not read the macro body: {err} — steps are \
-             [{{\"hold\":[\"dpad.down\"],\"ms\":50}}] (exactly one of \"ms\"/\"frames\", \
-             optional \"allow_short\"), the policies are \"finish\"|\"abort\", \
-             \"ignore\"|\"restart\", \"none\"|\"any-input\"|\"opposing\", and the repeat \
-             policy is \"once\"|\"while-held\"|\"turbo\" (a turbo gives exactly one of \
-             \"turbo_hz\"/\"gap_ms\")"
-        )
-    })
-}
-
 fn handle_map_macro(
     request: &serde_json::Value,
     deps: &PipeDeps,
     settle: Duration,
 ) -> serde_json::Value {
-    let field = |name: &str| {
-        request
-            .get(name)
-            .and_then(|v| v.as_str())
-            .filter(|v| !v.trim().is_empty())
-            .map(str::to_owned)
-    };
-    let Some(preset) = field("preset") else {
-        return err_msg(r#"map-macro needs a "preset""#);
-    };
-    let Some(name) = field("name") else {
-        return err_msg(r#"map-macro needs a "name" (the [macros.<name>] table)"#);
-    };
-    let delete = request
-        .get("delete")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    // A bare `"enabled"` with no body is the TOGGLE spelling; with a body it is
-    // just another field of the table being written.
-    let toggle = match (delete, request.get("steps"), request.get("enabled")) {
-        (false, None, Some(value)) => match value.as_bool() {
-            Some(enabled) => Some(enabled),
-            None => return err_msg(r#"map-macro "enabled" is true or false"#),
+    // ONE reader again (`ksx_api::MapMacroRequest`), and here it is not just
+    // tidiness: the body half IS `ksx_config::MacroFile`, so every field of a
+    // macro table travels by construction. The reader this replaced carried an
+    // ALLOWLIST of body fields, `repeat` was missing from it, and a card that
+    // set `while-held` saved `once` under a "saved" toast. A list that has to
+    // be remembered is a bug with a delay on it; there is no list now.
+    let spec = match ksx_api::MapMacroRequest::from_json(request) {
+        Ok(macro_request) => crate::mapping::MacroSpec {
+            preset: macro_request.preset.clone(),
+            name: macro_request.name.clone(),
+            body: macro_request.body(),
+            delete: macro_request.is_delete(),
+            set_enabled: macro_request.set_enabled(),
         },
-        _ => None,
-    };
-    if !delete && toggle.is_none() && request.get("steps").is_none() {
-        return err_msg(
-            "map-macro needs \"steps\" (or \"delete\": true, or \"enabled\": true/false to \
-             switch an existing macro on or off without touching it) — an absent step list \
-             is a misspelled field far more often than an intended deletion, and deleting a \
-             macro is its own word",
-        );
-    }
-    let body = match macro_body(request) {
-        Ok(body) => body,
-        Err(err) => return err_msg(err),
-    };
-
-    let spec = crate::mapping::MacroSpec {
-        preset,
-        name,
-        body,
-        delete,
-        set_enabled: toggle,
+        Err(refusal) => return err_msg(refusal.message),
     };
     match (deps.save_macro)(&spec) {
         Ok(applied) => {
@@ -905,6 +786,19 @@ fn await_apply(state: &SharedState, baseline: u64, settle: Duration) -> Option<s
     }
 }
 
+/// The api's restore destination as the WRITER's own enum. Two enums, one set
+/// of words: `ksx-api` names what a caller may ask for, `mapping::RestoreKind`
+/// names what the writer does, and this is the one place they meet — so a
+/// destination that a typed caller can express and this daemon cannot is a
+/// compile error rather than a refusal in the field.
+fn restore_kind(mode: ksx_api::RestoreMode) -> crate::mapping::RestoreKind {
+    match mode {
+        ksx_api::RestoreMode::Defaults => crate::mapping::RestoreKind::Defaults,
+        ksx_api::RestoreMode::SessionBackup => crate::mapping::RestoreKind::SessionBackup,
+        ksx_api::RestoreMode::LatestBackup => crate::mapping::RestoreKind::LatestBackup,
+    }
+}
+
 /// The pipe `map-restore` verb: `{"verb":"map-restore","preset":…,"mode":
 /// "defaults"|"session-backup"|"latest-backup"}` plus the same optional
 /// `"reload"` as `map`.
@@ -932,7 +826,8 @@ fn handle_map_restore(
     let Some(kind) = request
         .get("mode")
         .and_then(|v| v.as_str())
-        .and_then(crate::mapping::RestoreKind::parse)
+        .and_then(ksx_api::RestoreMode::parse)
+        .map(restore_kind)
     else {
         return err_msg(
             r#"map-restore needs a "mode": "defaults" | "session-backup" | "latest-backup""#,
@@ -964,101 +859,19 @@ fn handle_map_restore(
 }
 
 // ---------------------------------------------------------------------------
-// Client — plain std file I/O. `\\.\pipe\...` opens through CreateFileW under
-// std, so the client needs no FFI and compiles everywhere (a non-Windows open
-// simply fails NotFound, which is the truthful "no daemon here" answer).
+// Client — moved to `ksx-api` (docs/M9-DECISION.md §6).
+//
+// The transport was never the daemon's: `ksx session`, Studio and any future
+// shell all dial the same pipe, and the crate that owns the request types owns
+// the line they travel on. What stays here is the NAME, so every existing
+// `pipe::client::request(pipe::PIPE_NAME, …)` call site still reads the way it
+// always did — and so a caller that wants the TYPED client asks for
+// `ksx_api::Client::new(ksx_api::PipeTransport::new())` instead of hand-rolling
+// a second one.
 // ---------------------------------------------------------------------------
 
 pub mod client {
-    use std::io::{BufRead as _, BufReader, Write as _};
-    use std::time::{Duration, Instant};
-
-    /// Why a request produced no response.
-    #[derive(Debug)]
-    pub enum ClientError {
-        /// The pipe does not exist: no daemon is running — or the one that is
-        /// predates the control channel. `ksx session` maps this to exit 2.
-        NotRunning,
-        Io(std::io::Error),
-        Protocol(String),
-    }
-
-    impl std::fmt::Display for ClientError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::NotRunning => write!(
-                    f,
-                    "no ksx daemon control channel at the pipe (the daemon is \
-                     not running, or it predates `ksx session`) — start one \
-                     with `ksx daemon`"
-                ),
-                Self::Io(err) => write!(f, "control pipe I/O failed: {err}"),
-                Self::Protocol(what) => write!(f, "control pipe protocol error: {what}"),
-            }
-        }
-    }
-
-    impl std::error::Error for ClientError {}
-
-    /// WinError 231: every instance is mid-conversation. The daemon is alive.
-    const ERROR_PIPE_BUSY: i32 = 231;
-    /// Total budget for open retries (busy server, instance-rotation races).
-    const CONNECT_BUDGET: Duration = Duration::from_secs(2);
-    const RETRY_PAUSE: Duration = Duration::from_millis(50);
-    /// FILE_NOT_FOUND is definitive after this many looks — the retries only
-    /// paper over the daemon's instance rotation, which is sub-millisecond.
-    const NOT_FOUND_TRIES: u32 = 3;
-
-    fn open(pipe_path: &str) -> Result<std::fs::File, ClientError> {
-        let deadline = Instant::now() + CONNECT_BUDGET;
-        let mut not_found = 0;
-        loop {
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(pipe_path)
-            {
-                Ok(file) => return Ok(file),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    not_found += 1;
-                    if not_found >= NOT_FOUND_TRIES {
-                        return Err(ClientError::NotRunning);
-                    }
-                }
-                Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
-                    if Instant::now() >= deadline {
-                        return Err(ClientError::Io(err));
-                    }
-                }
-                Err(err) => return Err(ClientError::Io(err)),
-            }
-            std::thread::sleep(RETRY_PAUSE);
-        }
-    }
-
-    /// One request line in, one response line out.
-    pub fn request(
-        pipe_path: &str,
-        request: &serde_json::Value,
-    ) -> Result<serde_json::Value, ClientError> {
-        let mut pipe = open(pipe_path)?;
-        let mut line = request.to_string();
-        line.push('\n');
-        pipe.write_all(line.as_bytes()).map_err(ClientError::Io)?;
-        pipe.flush().map_err(ClientError::Io)?;
-
-        let mut response = String::new();
-        BufReader::new(pipe)
-            .read_line(&mut response)
-            .map_err(ClientError::Io)?;
-        if response.trim().is_empty() {
-            return Err(ClientError::Protocol(
-                "the daemon closed the connection without a response".into(),
-            ));
-        }
-        serde_json::from_str(response.trim())
-            .map_err(|err| ClientError::Protocol(format!("unparsable response: {err}")))
-    }
+    pub use ksx_api::pipe::{request_json as request, TransportError as ClientError};
 }
 
 // ---------------------------------------------------------------------------
@@ -1276,16 +1089,59 @@ mod tests {
 
     use crossbeam_channel::unbounded;
 
-    /// The `map-macro` body allowlist is EVERY field `MacroFile` serializes.
+    /// THE REGRESSION, pinned where it happened: a `map-macro` request that
+    /// SAYS `repeat`/`turbo_hz` produces a spec that HAS them.
     ///
-    /// The allowlist exists so the envelope's keys (verb/preset/name/…) cannot
-    /// collide with the body's, but a missing entry is a SILENT field drop —
-    /// which is exactly how `repeat = "while-held"` saved as `once` while the
-    /// page said "saved". Pinned against `MacroFile`'s own serde shape, with
-    /// every field set to a NON-default so nothing is skipped on write: adding
-    /// a field to the table without adding it here fails right here.
+    /// What this used to test was an ALLOWLIST of body fields kept in this
+    /// file. `repeat` was missing from it, so a macro card that set
+    /// `while-held` saved `once` — with a "saved" toast, because a dropped
+    /// field looks exactly like a field the user never set. The list is gone:
+    /// the body half of the request IS `ksx_config::MacroFile`
+    /// (`ksx_api::MapMacroRequest`), so a field added to the table is on the
+    /// wire and in this spec the moment it compiles, and the only list left is
+    /// the ENVELOPE's — a closed set, whose failure mode is a loud refusal
+    /// rather than a silent drop.
     #[test]
-    fn the_macro_body_allowlist_is_every_macro_file_field() {
+    fn a_macro_request_carries_every_field_of_the_table_into_the_spec() {
+        let request = serde_json::json!({
+            "verb": "map-macro",
+            "preset": "IPAC P1",
+            "name": "hadouken",
+            "steps": [{"hold": ["A"], "ms": 50, "allow_short": true},
+                      {"hold": ["dpad.down"], "frames": 2}],
+            "on_release": "abort",
+            "retrigger": "restart",
+            "interrupt": "opposing",
+            "repeat": "turbo",
+            "turbo_hz": 10,
+            "enabled": false,
+            "reload": true,
+        });
+        let parsed = ksx_api::MapMacroRequest::from_json(&request).expect("a whole-table write");
+        let body = parsed.body();
+        assert_eq!(body.repeat, ksx_core::Repeat::Turbo);
+        assert_eq!(body.turbo_hz, Some(10));
+        assert_eq!(body.gap_ms, None, "the other unit is not invented");
+        assert_eq!(body.on_release, ksx_core::OnRelease::Abort);
+        assert_eq!(body.retrigger, ksx_core::Retrigger::Restart);
+        assert_eq!(body.interrupt, ksx_core::Interrupt::Opposing);
+        assert!(!body.enabled, "a write may land disabled");
+        assert!(body.steps[0].allow_short);
+        // A duration authored in frames survives the wire as frames.
+        assert_eq!(body.steps[1].frames, Some(2));
+        assert_eq!(body.steps[1].ms, None);
+        // ...and a body write is not a toggle, whatever `enabled` says.
+        assert_eq!(parsed.set_enabled(), None);
+        assert!(!parsed.is_delete());
+        assert!(parsed.reload);
+    }
+
+    /// Every field `MacroFile` will EVER serialize reaches the spec, because
+    /// nothing in this daemon enumerates them. Pinned against the type's own
+    /// serde shape, with every field set to a non-default so nothing is
+    /// skipped on write.
+    #[test]
+    fn no_field_of_a_macro_table_can_be_dropped_on_the_way_in() {
         let full: ksx_config::MacroFile = toml::from_str(
             r#"
 on_release = "abort"
@@ -1293,67 +1149,290 @@ retrigger = "restart"
 interrupt = "opposing"
 repeat = "turbo"
 turbo_hz = 10
+enabled = false
 steps = [{ hold = ["A"], ms = 50, allow_short = true }]
 "#,
         )
         .unwrap();
-        let serde_json::Value::Object(shape) = serde_json::to_value(&full).unwrap() else {
-            panic!("a macro table is an object");
-        };
-        for key in shape.keys() {
-            assert!(
-                MACRO_BODY_FIELDS.contains(&key.as_str()),
-                "MacroFile has a `{key}` field the map-macro body reader drops on the floor — \
-                 add it to MACRO_BODY_FIELDS, or a save of it is a silent no-op"
-            );
-        }
-        // `gap_ms` is the other spelling of the rate, so it never coexists
-        // with `turbo_hz` in one file and cannot appear above.
-        assert!(MACRO_BODY_FIELDS.contains(&"gap_ms"));
+        let mut request = serde_json::to_value(&full).expect("a macro table is an object");
+        request["verb"] = serde_json::json!("map-macro");
+        request["preset"] = serde_json::json!("IPAC P1");
+        request["name"] = serde_json::json!("hadouken");
+        let parsed = ksx_api::MapMacroRequest::from_json(&request).expect("a whole-table write");
+        assert_eq!(
+            parsed.body(),
+            full,
+            "a field of the macro table did not survive the request reader"
+        );
     }
 
-    /// The regression, at the hop it happened: a request that SAYS
-    /// `repeat`/`turbo_hz` must produce a body that HAS them.
+    /// The toggle and the delete are still told apart by what is ABSENT, and
+    /// still refuse rather than guess.
     #[test]
-    fn the_macro_body_carries_the_repeat_policy_and_its_rate() {
-        let body = macro_body(&serde_json::json!({
-            "verb": "map-macro",
-            "preset": "IPAC P1",
-            "name": "hadouken",
-            "steps": [{"hold": ["A"], "ms": 50}],
-            "on_release": "finish",
-            "retrigger": "ignore",
-            "interrupt": "none",
-            "repeat": "while-held",
+    fn a_macro_request_without_steps_is_a_toggle_a_delete_or_a_refusal() {
+        let toggle = ksx_api::MapMacroRequest::from_json(&serde_json::json!({
+            "verb": "map-macro", "preset": "P", "name": "m", "enabled": false
         }))
-        .expect("body");
-        assert_eq!(body.repeat, ksx_core::Repeat::WhileHeld);
+        .expect("a toggle");
+        assert_eq!(toggle.set_enabled(), Some(false));
 
-        let turbo = macro_body(&serde_json::json!({
-            "steps": [{"hold": ["A"], "frames": 2}],
-            "repeat": "turbo",
-            "gap_ms": 50,
+        let deleted = ksx_api::MapMacroRequest::from_json(&serde_json::json!({
+            "verb": "map-macro", "preset": "P", "name": "m", "delete": true
         }))
-        .expect("body");
-        assert_eq!(turbo.repeat, ksx_core::Repeat::Turbo);
-        assert_eq!(turbo.gap_ms, Some(50));
-        assert_eq!(turbo.turbo_hz, None);
-        // ...and the step's unit is the one that was written.
-        assert_eq!(turbo.steps[0].frames, Some(2));
-        assert_eq!(turbo.steps[0].ms, None);
+        .expect("a delete");
+        assert!(deleted.is_delete());
 
-        // An omitted policy is still the file's own default, not a refusal.
-        let plain =
-            macro_body(&serde_json::json!({"steps": [{"hold": ["A"], "ms": 50}]})).expect("body");
-        assert_eq!(plain.repeat, ksx_core::Repeat::Once);
-
-        // A typo is still refused, in words that name the options.
-        let err = macro_body(&serde_json::json!({
-            "steps": [{"hold": ["A"], "ms": 50}],
-            "repeat": "sometimes",
+        let refused = ksx_api::MapMacroRequest::from_json(&serde_json::json!({
+            "verb": "map-macro", "preset": "P", "name": "m"
         }))
         .unwrap_err();
-        assert!(err.contains("while-held"), "{err}");
+        assert!(refused.message.contains("map-macro needs"), "{refused}");
+    }
+
+    /// Every destination a typed caller can ask for is one this daemon writes.
+    #[test]
+    fn every_api_restore_destination_maps_onto_a_writer_destination() {
+        for mode in ksx_api::RestoreMode::ALL {
+            assert_eq!(restore_kind(mode).as_str(), mode.as_str());
+        }
+    }
+
+    // -- the drift pin --------------------------------------------------------
+
+    /// Every field the daemon SAYS, `ksx-api` reads. Recursive, and a missing
+    /// key is the failure: a client that cannot see a field is a client that
+    /// silently loses it, which is the exact shape of the `repeat` bug in the
+    /// other direction.
+    ///
+    /// A `null` the daemon emits and the type omits is not information lost —
+    /// absent and null are the same fact here — so that one case passes.
+    fn assert_nothing_dropped(
+        verb: &str,
+        path: &str,
+        said: &serde_json::Value,
+        read_back: &serde_json::Value,
+    ) {
+        match said {
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields {
+                    match read_back.get(key) {
+                        Some(mirror) => {
+                            assert_nothing_dropped(verb, &format!("{path}/{key}"), value, mirror);
+                        }
+                        None if value.is_null() => {}
+                        None => panic!(
+                            "the daemon answers `{verb}` with `{path}/{key}` and ksx-api's \
+                             response type does not model it — every client reading that answer \
+                             loses the field silently. Add it to the response type in \
+                             ksx-api/src/wire.rs."
+                        ),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                let mirror = read_back.as_array().unwrap_or_else(|| {
+                    panic!("`{verb}` answers `{path}` with an array; the type reads {read_back}")
+                });
+                assert_eq!(items.len(), mirror.len(), "`{verb}` {path}: row count");
+                for (i, (said, mirror)) in items.iter().zip(mirror).enumerate() {
+                    assert_nothing_dropped(verb, &format!("{path}/{i}"), said, mirror);
+                }
+            }
+            scalar => assert_eq!(scalar, read_back, "`{verb}` {path}"),
+        }
+    }
+
+    /// **THE DRIFT PIN.** Every verb, both directions, against the REAL
+    /// dispatch — no pipe, no daemon, no mocks of the thing under test.
+    ///
+    /// For each verb: build the TYPED request (`ksx_api::Request`), serialize
+    /// it exactly as a client would, hand the line to `handle_request`, then
+    /// read the daemon's answer back through the TYPED response and check that
+    /// nothing the daemon said was dropped on the way in.
+    ///
+    /// This is the test the `repeat` regression needed. That bug was a client
+    /// and a daemon holding two descriptions of one message, 3,000 lines
+    /// apart, and nothing that failed when they disagreed. Now there is one
+    /// description — and this asserts the daemon is still answering it.
+    #[test]
+    fn every_typed_request_is_answered_by_a_response_ksx_api_models_completely() {
+        use ksx_api::{Request, Response};
+
+        let dir = std::env::temp_dir().join(format!(
+            "ksx-pipe-drift-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = ksx_config::ConfigRoot::at(&dir);
+        let store = ksx_config::Store::new(root.clone());
+        let file: ksx_config::PresetFile = toml::from_str(
+            r#"
+name = "IPAC P1"
+[bindings]
+A = "S"
+B = "D"
+macro.hadouken = "P"
+
+[macros.hadouken]
+steps = [{ hold = ["A"], ms = 50 }]
+"#,
+        )
+        .unwrap();
+        store.save_preset(&file).unwrap();
+
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let mut d = deps(tx, state, fixed_profiles());
+        let (map, save_macro) = preset_writers(root.clone());
+        d.map = map;
+        d.save_macro = save_macro;
+        d.restore = restore_fn(root.clone());
+        d.clear_all = clear_all_fn(root.clone());
+        d.backups = backups_fn(root);
+
+        // Every verb, in an order that leaves real data behind for the ones
+        // that read it (the restores take timestamped backups, so `map-backups`
+        // answers with rows rather than an empty list).
+        let requests = vec![
+            Request::Status,
+            // Both ACTION shapes: one that enqueues and settles into an honest
+            // "requested", one the daemon refuses outright.
+            Request::Start { profile: None },
+            Request::Stop,
+            Request::Map(ksx_api::MapRequest {
+                preset: "IPAC P1".into(),
+                function: "A".into(),
+                keys: vec!["S".into(), "Enter".into()],
+                ..ksx_api::MapRequest::default()
+            }),
+            // A chord, so `when` / `flash` are exercised too.
+            Request::Map(ksx_api::MapRequest {
+                preset: "IPAC P1".into(),
+                function: "rt".into(),
+                key: Some("D".into()),
+                when: vec!["S".into()],
+                ..ksx_api::MapRequest::default()
+            }),
+            Request::MapMacro(ksx_api::MapMacroRequest {
+                preset: "IPAC P1".into(),
+                name: "hadouken".into(),
+                write: ksx_api::MacroWriteKind::Body(Box::new(
+                    toml::from_str(
+                        r#"
+repeat = "turbo"
+turbo_hz = 10
+steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
+"#,
+                    )
+                    .unwrap(),
+                )),
+                reload: false,
+            }),
+            // The toggle and the delete are the same verb with a different
+            // meaning, and both answer with the same shape.
+            Request::MapMacro(ksx_api::MapMacroRequest {
+                preset: "IPAC P1".into(),
+                name: "hadouken".into(),
+                write: ksx_api::MacroWriteKind::Toggle(false),
+                reload: false,
+            }),
+            Request::MapRestore(ksx_api::RestoreRequest {
+                preset: "IPAC P1".into(),
+                mode: ksx_api::RestoreMode::Defaults,
+                reload: false,
+            }),
+            Request::MapClearAll(ksx_api::ClearAllRequest {
+                preset: "IPAC P1".into(),
+                reload: false,
+            }),
+            Request::MapBackups(ksx_api::BackupsRequest {
+                preset: "IPAC P1".into(),
+            }),
+            Request::LearnKey,
+            Request::LearnPoll,
+            Request::LearnCancel,
+        ];
+
+        for request in requests {
+            let verb = request.verb();
+            // The line a client actually sends — serialized from the shared
+            // type, not hand-written here.
+            let line = request.to_line();
+            let said = handle_request(&line, &d, FAST);
+            assert!(
+                said.get("ok").is_some(),
+                "`{verb}` answered without an `ok`: {said}"
+            );
+            let typed = Response::parse(&request, said.clone())
+                .unwrap_or_else(|err| panic!("`{verb}` → {said}\n  unreadable: {err}"));
+            assert_nothing_dropped(verb, "", &said, &typed.to_json());
+
+            // ...and the answer is the SHAPE this verb promises, not merely a
+            // parseable object.
+            let right_shape = matches!(
+                (&request, &typed),
+                (Request::Status, Response::Status(_))
+                    | (
+                        Request::Start { .. } | Request::Stop | Request::Reload,
+                        Response::Action(_)
+                    )
+                    | (Request::Map(_), Response::Map(_))
+                    | (Request::MapMacro(_), Response::Macro(_))
+                    | (
+                        Request::MapRestore(_) | Request::MapClearAll(_),
+                        Response::Restore(_)
+                    )
+                    | (Request::MapBackups(_), Response::Backups(_))
+                    | (
+                        Request::LearnKey | Request::LearnPoll | Request::LearnCancel,
+                        Response::Learn(_)
+                    )
+            );
+            assert!(right_shape, "`{verb}` was read as the wrong response kind");
+
+            // The verbs whose answers a surface RENDERS get their content
+            // checked, so "modelled" cannot mean "modelled as all defaults".
+            match (&request, &typed) {
+                (_, Response::Status(status)) => {
+                    assert_eq!(status.run, "stopped");
+                    assert_eq!(status.profiles.len(), 2, "games.toml rows");
+                    assert!(status.tooltip.is_some());
+                }
+                (Request::Map(map), Response::Map(answer)) => {
+                    assert!(answer.ok, "{said}");
+                    assert_eq!(answer.keys, map.key_list());
+                    assert_eq!(answer.preset.as_deref(), Some("IPAC P1"));
+                    assert!(answer.path.is_some());
+                }
+                (_, Response::Macro(answer)) => {
+                    assert!(answer.ok, "{said}");
+                    assert_eq!(answer.name.as_deref(), Some("hadouken"));
+                    assert!(answer.backup.is_some(), "every macro write leaves an undo");
+                }
+                (_, Response::Restore(answer)) => {
+                    assert!(answer.ok, "{said}");
+                    assert!(answer.mode.is_some() && answer.wrote.is_some());
+                }
+                (_, Response::Backups(answer)) => {
+                    assert!(answer.ok, "{said}");
+                    assert!(
+                        !answer.backups.is_empty(),
+                        "the restores above each left one: {said}"
+                    );
+                    assert!(!answer.backups[0].label.is_empty());
+                }
+                (_, Response::Learn(answer)) => {
+                    assert!(answer.ok, "{said}");
+                    assert!(!answer.state.is_empty());
+                }
+                // Every other pairing was refused by `right_shape` above.
+                _ => {}
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn shared(run: RunState) -> SharedState {

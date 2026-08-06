@@ -8,6 +8,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# The typed control API (docs/M9-DECISION.md §6). This crate RENDERS and
+# ROUTES; every fact it shows and every verb it performs arrives through
+# ksx-api's traits, which link no axum, no forma and no tokio. It is the only
+# ksx crate this one depends on, and that is the boundary: nothing here can
+# reach capture, output, or a live session.
+ksx-api.workspace = true
 axum.workspace = true
 forma-ir.workspace = true
 forma-server.workspace = true

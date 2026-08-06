@@ -60,11 +60,19 @@
 //!   before.
 //! - **Own tokio runtime, normal priority** — created inside [`serve`], never
 //!   shared with (or visible to) anything session- or pipeline-related.
-//! - This crate depends on **no other ksx crate**. Data arrives through the
-//!   [`StatusSource`] and [`ControlSource`] traits; ksx-app implements both
-//!   (collectors and pipe client respectively). Nothing here can touch
-//!   capture, output, or a live session — a control implementation is a
-//!   client of the daemon's pipe, never a second control loop.
+//! - This crate depends on **exactly one other ksx crate: `ksx-api`**, the
+//!   typed control API every ksx front end consumes (docs/M9-DECISION.md §6).
+//!   Data arrives through its [`StatusSource`] and [`ControlSource`] traits;
+//!   ksx-app supplies the implementations (collectors and pipe client
+//!   respectively). Nothing here can touch capture, output, or a live session
+//!   — a control implementation is a client of the daemon's pipe, never a
+//!   second control loop. `ksx-api` links no axum, no forma and no tokio, so
+//!   the default build is unaffected by this crate existing.
+//!
+//!   The traits used to live HERE, which was wrong in one specific way: a
+//!   contract cannot be owned by the surface that happens to have been written
+//!   first. `ksx session` performs the same verbs with no HTTP anywhere, and a
+//!   native shell would too.
 
 // The mapper's scalar-slot object is one `serde_json::json!` literal per page
 // (render_map.rs `scalar_slots`), and that macro recurses once per field. The
@@ -81,7 +89,7 @@ mod snapshot;
 
 pub use control::{
     BindConflict, BindOutcome, BindRequest, ControlSource, LearnView, MacroOutcome, MacroWrite,
-    SessionView,
+    RestoreMode, SessionView,
 };
 pub use error::StudioError;
 pub use server::serve;

@@ -159,9 +159,11 @@ performance and it is never required for the product to work.
 - **⚠️ Windows untested upstream** (forma CI is `ubuntu-latest` only).
 
 ### Three surfaces, one engine
-1. **Native primary (non-negotiable)** — CLI + tray daemon (M5) + native config UI (M9).
-   Zero HTTP, zero web deps in the default build. The cabinet works perfectly with no
-   browser in existence.
+1. **Native primary (non-negotiable)** — CLI + tray daemon (M5) + ~~native config UI
+   (M9)~~ **native app identity + launcher (M9, revised 2026-08-06 — see Sequencing
+   below and `docs/M9-DECISION.md`)**. Zero HTTP, zero web deps in the default build.
+   The cabinet works perfectly with no browser in existence — **as a CLI + tray**;
+   the graphical mapper is Studio's, and needs a web engine present.
 2. **`ksx-api` (M10a)** — one typed surface for Studio *and* the MCP server (E5). The
    native UI does **not** go through it: in-process calls straight to the supervisor, so
    the primary path pays no serialization tax.
@@ -191,9 +193,48 @@ validation** (first real Windows consumer), and **FMIR version alignment**.
 → mash the arcade panel → buttons light up instantly with real latency numbers → remap
 a button from the phone and it works. One demo, two products.
 
-### Sequencing
-M6 WinUSB → M6.5 DS4 spike → M7 GA → M8 HIDMaestro → **M9 native UI** → **M10 Studio**.
-**Nothing web-related precedes M6** — the driver deadline outranks the showcase.
+### Sequencing — REVISED 2026-08-06 (see `docs/M9-DECISION.md`)
+
+As planned: M6 WinUSB → M6.5 DS4 spike → M7 GA → M8 HIDMaestro. **Nothing
+web-related preceded M6** — the driver deadline outranked the showcase, and it
+held.
+
+What changed after that: **M9 is no longer an egui/eframe config UI.** When this
+section was written (2026-08-04) ksx Studio was a status page a few hours old,
+so the native UI was the only plan for a mapper and making it non-negotiable cost
+nothing. Studio then shipped ~23k lines and 139 tests of finished mapper — art,
+identities, multi-bind, first-class diagonals, the 37-column macro piano roll,
+toasts+undo, a documented design system — and rebuilding that in egui would buy
+one thing E7 asked for (in-process, no serialization tax) that **the pipe already
+delivers**: `tray.rs` deliberately rejected in-process for UI, CONTROL-SURFACE
+grants the pipe exactly the tray's reach, and the "tax" is one JSON line per
+human click, nowhere near the capture thread's p99 budget. The full reasoning,
+the per-option engineer-day costs, the honest losses and the reversal triggers
+are in **`docs/M9-DECISION.md`**.
+
+Revised: **M9 = "ksx is a real Windows application"** — an owned icon (the tray
+still uses `IDI_APPLICATION` today), a Start Menu entry, a tray "Open ksx" item,
+and an `ksx open` launcher that starts the daemon, waits for the port, and *then*
+opens a chrome-less application window (`--app=` + a ksx-owned `--user-data-dir`,
+launched via App Paths). ~700–1,000 lines. → **M10a `ksx-api`** — the typed,
+transport-free, in-process API both Studio and any future native shell consume;
+it is 80% written already as `ksx-studio`'s `StatusSource`/`ControlSource` and
+wants extracting into its own crate with an `InProcess` implementation beside the
+`PipeClient` one. It is the one item worth building under every option and it
+should land before Mapper Build B. → **M10b Studio** continues as the UI.
+
+Held in reserve, priced, not cancelled: a native WebView2 shell (`webview2-com`
+directly — not wry, not Tauri) that hosts the same UI with zero HTTP via
+`WebResourceRequested`. 12–16 days on top of `ksx-api`, to be spent only when one
+of M9-DECISION §7's triggers fires.
+
+**Scope of "zero web deps", stated honestly.** The rule is unchanged for the
+*default build*: no axum, no forma, no tokio, `--features studio`, provable with
+`cargo tree`. What is no longer promised is a GUI on a machine with **no web
+engine at all** (LTSC/IoT with Edge stripped, a hardened image). There, ksx still
+works completely — the CLI is a complete surface by CONTROL-SURFACE's standing
+rule, and the tray is native Win32 — but there is no graphical mapper. That is a
+real, bounded loss and M9-DECISION §5 does not argue it away.
 
 ### Using kmd today
 `npx @getforma/kmd` in this repo browses `docs/` (6 design docs + 9 research reports)

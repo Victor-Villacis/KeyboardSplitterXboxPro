@@ -8,11 +8,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Refusals are typed now (docs/M9-DECISION.md §6): a fake daemon refuses with
+/// the same `Refusal` a real one does, so what the page renders here is what it
+/// renders in the field.
+use ksx_api::Refusal;
 use ksx_studio::{
     BindConflict, BindOutcome, BindRequest, ControlSource, LearnView, MacroOutcome, MacroSnapshot,
     MacroStepView, MacroView, MacroWrite, MapperSlot, MapperSnapshot, PadRow, ProfileRow,
-    SessionView, StatusSnapshot, StatusSource,
+    RestoreMode, SessionView, StatusSnapshot, StatusSource,
 };
+
+/// The "nothing answers the pipe" refusal a real `PipeTransport` produces —
+/// code, sentence and the way out, so the page under test sees exactly what a
+/// cabinet sees.
+fn no_channel(message: &str) -> Refusal {
+    Refusal::with_remedy(ksx_api::codes::NO_CHANNEL, message, "ksx daemon")
+}
 
 struct FixedStatus;
 
@@ -175,25 +186,25 @@ impl ControlSource for ScriptedControl {
         }
     }
 
-    fn start(&self, profile: Option<&str>) -> Result<String, String> {
+    fn start(&self, profile: Option<&str>) -> Result<String, Refusal> {
         *self.started_with.lock().unwrap() = Some(profile.map(str::to_owned));
         if self.refuse_start {
-            Err("no ksx daemon control channel at the pipe".into())
+            Err(no_channel("no ksx daemon control channel at the pipe"))
         } else {
             self.running.store(true, Ordering::SeqCst);
             Ok("running (4 slot(s))".into())
         }
     }
 
-    fn stop(&self) -> Result<String, String> {
+    fn stop(&self) -> Result<String, Refusal> {
         if self.no_daemon {
-            return Err(NO_CHANNEL.to_owned());
+            return Err(no_channel(NO_CHANNEL));
         }
         self.running.store(false, Ordering::SeqCst);
         Ok("stopped".into())
     }
 
-    fn reload(&self) -> Result<String, String> {
+    fn reload(&self) -> Result<String, Refusal> {
         Ok("running (4 slot(s))".into())
     }
 
@@ -243,13 +254,16 @@ impl ControlSource for ScriptedControl {
         }
     }
 
-    fn restore(&self, preset: &str, mode: &str) -> Result<String, String> {
-        *self.restored_with.lock().unwrap() = Some((preset.to_owned(), mode.to_owned()));
+    fn restore(&self, preset: &str, mode: RestoreMode) -> Result<String, Refusal> {
+        *self.restored_with.lock().unwrap() = Some((preset.to_owned(), mode.as_str().to_owned()));
         if self.no_daemon {
-            return Err(NO_CHANNEL.to_owned());
+            return Err(no_channel(NO_CHANNEL));
         }
-        match mode {
-            "session-backup" => Err(format!("no session backup for \"{preset}\"")),
+        match mode.as_str() {
+            "session-backup" => Err(Refusal::new(
+                ksx_api::codes::UNKNOWN_PRESET,
+                format!("no session backup for \"{preset}\""),
+            )),
             "latest-backup" => Ok(format!(
                 "\"{preset}\": bindings restored from the newest timestamped backup"
             )),
@@ -259,10 +273,10 @@ impl ControlSource for ScriptedControl {
         }
     }
 
-    fn clear_all(&self, preset: &str) -> Result<String, String> {
+    fn clear_all(&self, preset: &str) -> Result<String, Refusal> {
         *self.cleared.lock().unwrap() = Some(preset.to_owned());
         if self.no_daemon {
-            return Err(NO_CHANNEL.to_owned());
+            return Err(no_channel(NO_CHANNEL));
         }
         Ok(format!("\"{preset}\": every binding cleared"))
     }
@@ -361,13 +375,13 @@ fn start_server(control: Arc<ScriptedControl>) -> SocketAddr {
         fn session(&self) -> SessionView {
             self.0.session()
         }
-        fn start(&self, profile: Option<&str>) -> Result<String, String> {
+        fn start(&self, profile: Option<&str>) -> Result<String, Refusal> {
             self.0.start(profile)
         }
-        fn stop(&self) -> Result<String, String> {
+        fn stop(&self) -> Result<String, Refusal> {
             self.0.stop()
         }
-        fn reload(&self) -> Result<String, String> {
+        fn reload(&self) -> Result<String, Refusal> {
             self.0.reload()
         }
         fn learn_start(&self) -> LearnView {
@@ -382,10 +396,10 @@ fn start_server(control: Arc<ScriptedControl>) -> SocketAddr {
         fn bind(&self, request: &BindRequest) -> BindOutcome {
             self.0.bind(request)
         }
-        fn restore(&self, preset: &str, mode: &str) -> Result<String, String> {
+        fn restore(&self, preset: &str, mode: RestoreMode) -> Result<String, Refusal> {
             self.0.restore(preset, mode)
         }
-        fn clear_all(&self, preset: &str) -> Result<String, String> {
+        fn clear_all(&self, preset: &str) -> Result<String, Refusal> {
             self.0.clear_all(preset)
         }
         fn save_macro(&self, request: &MacroWrite) -> MacroOutcome {

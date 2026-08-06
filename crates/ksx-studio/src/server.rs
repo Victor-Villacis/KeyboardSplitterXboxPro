@@ -452,7 +452,7 @@ async fn api_preset_restore(
     State(state): State<Arc<AppState>>,
     axum::Json(request): axum::Json<RestoreRequest>,
 ) -> Response {
-    if !crate::control::RESTORE_MODES.contains(&request.mode.as_str()) {
+    let Some(mode) = crate::control::RestoreMode::parse(&request.mode) else {
         return (
             [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
             axum::Json(serde_json::json!({
@@ -465,11 +465,11 @@ async fn api_preset_restore(
             })),
         )
             .into_response();
-    }
+    };
     control_json(state, move |control| {
-        match control.restore(&request.preset, &request.mode) {
+        match control.restore(&request.preset, mode) {
             Ok(message) => serde_json::json!({ "ok": true, "message": message }),
-            Err(error) => serde_json::json!({ "ok": false, "error": error }),
+            Err(refusal) => serde_json::json!({ "ok": false, "error": refusal.message }),
         }
     })
     .await
@@ -490,7 +490,7 @@ async fn api_preset_clear_all(
     control_json(state, move |control| {
         match control.clear_all(&request.preset) {
             Ok(message) => serde_json::json!({ "ok": true, "message": message }),
-            Err(error) => serde_json::json!({ "ok": false, "error": error }),
+            Err(refusal) => serde_json::json!({ "ok": false, "error": refusal.message }),
         }
     })
     .await
@@ -506,7 +506,7 @@ struct SessionRequest {
 async fn api_session_stop(State(state): State<Arc<AppState>>) -> Response {
     control_json(state, |control| match control.stop() {
         Ok(message) => serde_json::json!({ "ok": true, "message": message }),
-        Err(error) => serde_json::json!({ "ok": false, "error": error }),
+        Err(refusal) => serde_json::json!({ "ok": false, "error": refusal.message }),
     })
     .await
 }
@@ -526,7 +526,7 @@ async fn api_session_start(
     control_json(state, move |control| {
         match control.start(profile.as_deref()) {
             Ok(message) => serde_json::json!({ "ok": true, "message": message }),
-            Err(error) => serde_json::json!({ "ok": false, "error": error }),
+            Err(refusal) => serde_json::json!({ "ok": false, "error": refusal.message }),
         }
     })
     .await
@@ -894,7 +894,7 @@ async fn map_form_restore(
     Form(form): Form<MapRestoreForm>,
 ) -> Response {
     let mode = form.mode.trim().to_owned();
-    if !crate::control::RESTORE_MODES.contains(&mode.as_str()) {
+    let Some(mode) = crate::control::RestoreMode::parse(&mode) else {
         return map_redirect(
             form.slot.unwrap_or(0),
             Err(format!(
@@ -902,9 +902,9 @@ async fn map_form_restore(
                 crate::control::RESTORE_MODES.join(" | ")
             )),
         );
-    }
+    };
     map_act(state, form.slot, move |control, preset| {
-        control.restore(preset, &mode)
+        control.restore(preset, mode).map_err(flash_of)
     })
     .await
 }
@@ -915,7 +915,7 @@ async fn map_form_clear_all(
     Form(form): Form<MapSlotForm>,
 ) -> Response {
     map_act(state, form.slot, move |control, preset| {
-        control.clear_all(preset)
+        control.clear_all(preset).map_err(flash_of)
     })
     .await
 }
@@ -930,7 +930,7 @@ async fn map_form_session_stop(
     Form(form): Form<MapSlotForm>,
 ) -> Response {
     let slot = form.slot.unwrap_or(0);
-    let outcome = tokio::task::spawn_blocking(move || state.control.stop())
+    let outcome = tokio::task::spawn_blocking(move || state.control.stop().map_err(flash_of))
         .await
         .unwrap_or_else(|_| Err("the control call panicked".to_owned()));
     map_redirect(slot, outcome)
@@ -952,15 +952,28 @@ async fn session_start(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(str::to_owned);
-    act(state, move |control| control.start(profile.as_deref())).await
+    act(state, move |control| {
+        control.start(profile.as_deref()).map_err(flash_of)
+    })
+    .await
 }
 
 async fn session_stop(State(state): State<Arc<AppState>>) -> Response {
-    act(state, |control| control.stop()).await
+    act(state, |control| control.stop().map_err(flash_of)).await
 }
 
 async fn config_reload(State(state): State<Arc<AppState>>) -> Response {
-    act(state, |control| control.reload()).await
+    act(state, |control| control.reload().map_err(flash_of)).await
+}
+
+/// One [`ksx_api::Refusal`] as the sentence this page flashes.
+///
+/// The flash is one line, so it carries the MESSAGE and nothing else — the
+/// refusal's `remedy` is a second line, and the page already has a place for
+/// it that a query string does not: the no-daemon banner, which prints the
+/// exact `ksx daemon` command for this cabinet above every disabled control.
+fn flash_of(refusal: ksx_api::Refusal) -> String {
+    refusal.message
 }
 
 /// Run one control verb off the async workers (the pipe client blocks), then
@@ -1040,14 +1053,14 @@ mod tests {
         fn session(&self) -> SessionView {
             SessionView::unreachable("test")
         }
-        fn start(&self, _profile: Option<&str>) -> Result<String, String> {
-            Err("test".into())
+        fn start(&self, _profile: Option<&str>) -> Result<String, ksx_api::Refusal> {
+            Err(ksx_api::Refusal::new(ksx_api::codes::REFUSED, "test"))
         }
-        fn stop(&self) -> Result<String, String> {
-            Err("test".into())
+        fn stop(&self) -> Result<String, ksx_api::Refusal> {
+            Err(ksx_api::Refusal::new(ksx_api::codes::REFUSED, "test"))
         }
-        fn reload(&self) -> Result<String, String> {
-            Err("test".into())
+        fn reload(&self) -> Result<String, ksx_api::Refusal> {
+            Err(ksx_api::Refusal::new(ksx_api::codes::REFUSED, "test"))
         }
     }
 

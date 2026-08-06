@@ -1,395 +1,55 @@
 //! `ksx studio` — the localhost control room (feature `studio`).
 //!
-//! Two providers, both thin:
+//! Two providers, both thin, and neither of them Studio's:
 //!
-//! - [`StatusSource`] from the EXISTING collectors — `ksx-platform`'s driver
-//!   report (which includes the bus's current children), the autostart query,
-//!   the games store, and a tasklist-style process check. Fresh point-in-time
-//!   snapshot per page load.
-//! - [`ksx_studio::ControlSource`] over the daemon's control pipe
-//!   (`crate::daemon::pipe`): the session panel's state and its Start / Stop
-//!   / Reload buttons are each one pipe request, which enqueues the same
-//!   `DaemonCommand` a tray click would (docs/CONTROL-SURFACE.md — no
-//!   GUI-only code paths). No daemon on the pipe → the panel says so and the
-//!   controls render disabled; this process never becomes a daemon itself.
+//! - [`ksx_api::StatusSource`] from the EXISTING collectors — `ksx-platform`'s
+//!   driver report (which includes the bus's current children), the autostart
+//!   query, the games store, and a tasklist-style process check. Fresh
+//!   point-in-time snapshot per page load, and satisfiable with NO daemon
+//!   running, which is what keeps the read-only mapper alive behind the "No
+//!   daemon" banner.
+//! - [`ksx_api::ControlSource`] as [`ksx_api::Client`] over
+//!   [`ksx_api::PipeTransport`]: the session panel's state and its Start /
+//!   Stop / Reload buttons are each one pipe request, which enqueues the same
+//!   `DaemonCommand` a tray click would (docs/CONTROL-SURFACE.md — no GUI-only
+//!   code paths). No daemon on the pipe → the panel says so and the controls
+//!   render disabled; this process never becomes a daemon itself.
+//!
+//! **The control implementation used to live here**, as ~250 lines that built
+//! each request with `serde_json::json!` and read each answer with
+//! `response["field"]`. It is `ksx-api`'s now (docs/M9-DECISION.md §6), for
+//! the reason that layer exists: `ksx session` dials the same pipe with no
+//! HTTP anywhere, a native shell would too, and a hand-written request at each
+//! caller is how a field gets dropped between two descriptions of one message.
+//! What is left here is what genuinely belongs to this machine — the
+//! collectors, and the config read that tells the no-daemon banner which
+//! profile to name.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use crate::daemon::pipe::{self, client};
-use ksx_platform::autostart;
-use ksx_platform::{BusDriverReport, InterceptionReport, ServiceState};
-use ksx_studio::{
-    BindConflict, BindOutcome, BindRequest, LearnView, MacroOutcome, MacroSnapshot, MacroStepView,
-    MacroView, MacroWrite, MapperSlot, MapperSnapshot, PadRow, ProfileRow, SessionView,
+use ksx_api::{
+    MacroSnapshot, MacroStepView, MacroView, MapperSlot, MapperSnapshot, PadRow, ProfileRow,
     StatusSnapshot, StatusSource,
 };
+use ksx_platform::autostart;
+use ksx_platform::{BusDriverReport, InterceptionReport, ServiceState};
 
 pub fn run(port: u16) -> anyhow::Result<()> {
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     println!("ksx Studio: http://{bind}/  (localhost only; Ctrl+C or close the window to stop)");
     println!("Session controls talk to a running `ksx daemon` over its control pipe.");
-    ksx_studio::serve(bind, Box::new(CollectorSource), Box::new(PipeControlSource))?;
+    ksx_studio::serve(bind, Box::new(CollectorSource), Box::new(control_source()))?;
     Ok(())
 }
 
-/// What the panel says when nothing answers the pipe — state and remedy in
-/// one line, because the disabled controls point at it.
-const NO_CHANNEL: &str = "no daemon control channel — start the daemon (tray, or `ksx daemon`)";
-
-/// The real [`ksx_studio::ControlSource`]: one pipe request per method,
-/// nothing cached, nothing owned.
-struct PipeControlSource;
-
-impl ksx_studio::ControlSource for PipeControlSource {
-    fn session(&self) -> SessionView {
-        match client::request(pipe::PIPE_NAME, &serde_json::json!({ "verb": "status" })) {
-            Ok(status) => session_view(&status),
-            // No daemon: the page's banner still has to print the command that
-            // would START one, and on a games.toml cabinet that command needs
-            // its --game flag or it refuses. So the profile comes from the
-            // CONFIG here, not from the pipe that just failed to answer.
-            Err(client::ClientError::NotRunning) => SessionView {
-                profile: configured_profile(),
-                ..SessionView::unreachable(NO_CHANNEL)
-            },
-            Err(err) => SessionView {
-                profile: configured_profile(),
-                ..SessionView::unreachable(err.to_string())
-            },
-        }
-    }
-
-    fn start(&self, profile: Option<&str>) -> Result<String, String> {
-        action(match profile {
-            Some(profile) => serde_json::json!({ "verb": "start", "profile": profile }),
-            None => serde_json::json!({ "verb": "start" }),
-        })
-    }
-
-    fn stop(&self) -> Result<String, String> {
-        action(serde_json::json!({ "verb": "stop" }))
-    }
-
-    fn reload(&self) -> Result<String, String> {
-        action(serde_json::json!({ "verb": "reload" }))
-    }
-
-    // The mapper verbs: each one pipe request. A daemon that is missing, or
-    // that predates the verbs ("unknown verb …"), comes back as the honest
-    // "unavailable" LearnView — which is exactly what flips the mapper page
-    // read-only with the reason on screen.
-
-    fn learn_start(&self) -> LearnView {
-        learn_request(serde_json::json!({ "verb": "learn-key" }))
-    }
-
-    fn learn_poll(&self) -> LearnView {
-        learn_request(serde_json::json!({ "verb": "learn-poll" }))
-    }
-
-    fn learn_cancel(&self) -> LearnView {
-        learn_request(serde_json::json!({ "verb": "learn-cancel" }))
-    }
-
-    fn restore(&self, preset: &str, mode: &str) -> Result<String, String> {
-        action(serde_json::json!({
-            "verb": "map-restore",
-            "preset": preset,
-            "mode": mode,
-            "reload": true,
-        }))
-    }
-
-    fn clear_all(&self, preset: &str) -> Result<String, String> {
-        action(serde_json::json!({
-            "verb": "map-clear-all",
-            "preset": preset,
-            "reload": true,
-        }))
-    }
-
-    fn bind(&self, request: &BindRequest) -> BindOutcome {
-        // One key or none — the single-key spelling of a key list.
-        let keys: Vec<String> = request.key.clone().into_iter().collect();
-        map_request(map_wire(
-            &request.preset,
-            &request.function,
-            &keys,
-            request.force,
-            request.reload,
-            // `bind` edits keys, never the turbo rate: None leaves whatever
-            // rate the binding already has alone.
-            None,
-        ))
-    }
-
-    /// The control's WHOLE key list in ONE pipe call — the override the
-    /// contract in `ksx-studio/src/control.rs` asks for. The default
-    /// implementation composes `bind` calls and can only express nothing or
-    /// one key; the daemon's `map` verb takes a `"keys"` list, so "add another
-    /// key" and the per-key ✕ become a single atomic write (no
-    /// read-modify-write, no half-applied list if the write is refused).
-    fn bind_keys(
-        &self,
-        preset: &str,
-        function: &str,
-        keys: &[String],
-        force: bool,
-        reload: bool,
-        turbo_hz: Option<u32>,
-    ) -> BindOutcome {
-        map_request(map_wire(preset, function, keys, force, reload, turbo_hz))
-    }
-
-    /// The macro editor's save: ONE `map-macro` request carrying the whole
-    /// `[macros.<name>]` table. The steps go over the wire in the preset
-    /// FILE's own field names, so the daemon hands them straight to the same
-    /// serde types the file uses — no translation layer, and `frames` stays
-    /// `frames`.
-    fn save_macro(&self, request: &MacroWrite) -> MacroOutcome {
-        macro_request(macro_wire(request))
-    }
-}
-
-/// The `map-macro` request body for one whole macro table.
+/// The daemon control surface: the typed api client, over the pipe.
 ///
-/// The three policies are normalized here rather than on the daemon: a blank
-/// select is the FILE's own "field omitted" case, which means the default, and
-/// spelling that out at the edge keeps the daemon's parser strict (a genuine
-/// typo is still refused, in words that name the options).
-fn macro_wire(request: &MacroWrite) -> serde_json::Value {
-    let policy = |value: &str, default: &'static str| {
-        let value = value.trim();
-        if value.is_empty() {
-            default.to_owned()
-        } else {
-            value.to_owned()
-        }
-    };
-    let mut wire = serde_json::json!({
-        "verb": "map-macro",
-        "preset": request.preset,
-        "name": request.name,
-        "delete": request.delete,
-        "reload": request.reload,
-        "on_release": policy(&request.on_release, "finish"),
-        "retrigger": policy(&request.retrigger, "ignore"),
-        "interrupt": policy(&request.interrupt, "none"),
-        "repeat": policy(&request.repeat, "once"),
-    });
-    // The RATE is only sent when the file would carry one. Two spellings of
-    // one number, so exactly one goes on the wire; the daemon refuses both,
-    // and sending a stale companion field would turn an editor slip into that
-    // refusal.
-    if let Some(hz) = request.turbo_hz {
-        wire["turbo_hz"] = serde_json::json!(hz);
-    } else if let Some(ms) = request.gap_ms {
-        wire["gap_ms"] = serde_json::json!(ms);
-    }
-    // `enabled`: a FIELD when a body goes with it, and the whole request when
-    // one does not (the toggle). The daemon reads it exactly that way, so the
-    // editor's per-macro switch is one small request rather than a rewrite of
-    // a table it might be showing stale.
-    if let Some(enabled) = request.enabled {
-        wire["enabled"] = serde_json::json!(enabled);
-    }
-    // A delete carries no body at all — the verb's own refusal for a missing
-    // step list is what protects a WRITE from an editor that lost its grid.
-    // Neither does a pure TOGGLE (`enabled` and no steps): sending `"steps":
-    // []` alongside it would be a whole-table write with an empty grid, which
-    // is exactly the refusal that protection exists for.
-    let toggle = request.enabled.is_some() && request.steps.is_empty();
-    if !request.delete && !toggle {
-        wire["steps"] = serde_json::to_value(&request.steps)
-            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
-    }
-    wire
-}
-
-/// One `map-macro` pipe request → [`MacroOutcome`].
-fn macro_request(wire: serde_json::Value) -> MacroOutcome {
-    let strings = |value: &serde_json::Value| -> Vec<String> {
-        value
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|row| row.as_str())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    match client::request(pipe::PIPE_NAME, &wire) {
-        Ok(response) => MacroOutcome {
-            ok: response["ok"] == true,
-            message: response["message"].as_str().map(str::to_owned),
-            error: response["error"].as_str().map(str::to_owned),
-            code: response["code"].as_str().map(str::to_owned),
-            problems: strings(&response["problems"]),
-            warnings: strings(&response["warnings"]),
-            deleted: response["deleted"] == true,
-            // Defaulted to "it runs" for a daemon that predates the flag: an
-            // older answer never means "disabled".
-            enabled: response["enabled"].as_bool().unwrap_or(true),
-            toggled: response["toggled"] == true,
-            backup: response["backup"]["label"].as_str().map(str::to_owned),
-            reloaded: response["reloaded"] == true,
-        },
-        Err(client::ClientError::NotRunning) => MacroOutcome::failed(NO_CHANNEL),
-        Err(err) => MacroOutcome::failed(err.to_string()),
-    }
-}
-
-/// The `map` request body for a control's whole key list. An EMPTY list is a
-/// clear (`"clear": true`) — the honest wire shape for "this control now holds
-/// nothing", same as `bind(None)`. One key sends `"key"`, so a single-key
-/// write is byte-for-byte the request it always was; two or more send
-/// `"keys"`.
-fn map_wire(
-    preset: &str,
-    function: &str,
-    keys: &[String],
-    force: bool,
-    reload: bool,
-    turbo_hz: Option<u32>,
-) -> serde_json::Value {
-    let mut wire = serde_json::json!({
-        "verb": "map",
-        "preset": preset,
-        "function": function,
-        "force": force,
-        "reload": reload,
-    });
-    match keys {
-        [] => wire["clear"] = serde_json::json!(true),
-        [only] => wire["key"] = serde_json::json!(only),
-        many => wire["keys"] = serde_json::json!(many),
-    }
-    // AUTO-FIRE (docs/INPUT-TRANSFORMS.md §3). ABSENT means "not asked about",
-    // which is what leaves an existing rate alone — so the field is only put
-    // on the wire when the caller actually said something about it.
-    if let Some(hz) = turbo_hz {
-        wire["turbo_hz"] = serde_json::json!(hz);
-    }
-    wire
-}
-
-/// One `map` pipe request → [`BindOutcome`].
-fn map_request(wire: serde_json::Value) -> BindOutcome {
-    match client::request(pipe::PIPE_NAME, &wire) {
-        Ok(response) => BindOutcome {
-            ok: response["ok"] == true,
-            message: response["message"].as_str().map(str::to_owned),
-            error: response["error"].as_str().map(str::to_owned),
-            code: response["code"].as_str().map(str::to_owned),
-            conflicts: response["conflicts"]
-                .as_array()
-                .map(|rows| {
-                    rows.iter()
-                        .map(|row| BindConflict {
-                            scope: row["scope"].as_str().unwrap_or("").to_owned(),
-                            preset: row["preset"].as_str().unwrap_or("").to_owned(),
-                            function: row["function"].as_str().unwrap_or("").to_owned(),
-                            profile: row["profile"].as_str().map(str::to_owned),
-                            slot: row["slot"].as_u64().and_then(|n| u8::try_from(n).ok()),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            // Multi-bind information (absent from a pre-multi-bind daemon,
-            // which is exactly an empty list: it had no co-bindings to
-            // report because it moved the key instead).
-            also_drives: response["also_drives"]
-                .as_array()
-                .map(|rows| {
-                    rows.iter()
-                        .filter_map(|row| row.as_str())
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            turbo_hz: response["turbo_hz"]
-                .as_u64()
-                .and_then(|hz| u32::try_from(hz).ok()),
-            turbo_effective_hz: response["turbo_effective_hz"]
-                .as_u64()
-                .and_then(|hz| u32::try_from(hz).ok()),
-            reloaded: response["reloaded"] == true,
-        },
-        Err(client::ClientError::NotRunning) => BindOutcome::failed(NO_CHANNEL),
-        Err(err) => BindOutcome::failed(err.to_string()),
-    }
-}
-
-/// One learn-verb pipe request → [`LearnView`]. An `ok:false` response (the
-/// gate refusal, or an old daemon's "unknown verb") maps to `unavailable`
-/// with the daemon's own words.
-fn learn_request(request: serde_json::Value) -> LearnView {
-    match client::request(pipe::PIPE_NAME, &request) {
-        Ok(response) => {
-            if response["ok"] == true {
-                LearnView {
-                    ok: true,
-                    state: response["state"].as_str().unwrap_or("unknown").to_owned(),
-                    remaining_ms: response["remaining_ms"].as_u64(),
-                    device: response["device"].as_str().map(str::to_owned),
-                    key: response["key"].as_str().map(str::to_owned),
-                    error: response["error"].as_str().map(str::to_owned),
-                }
-            } else {
-                LearnView::unavailable(response["error"].as_str().unwrap_or("the daemon refused"))
-            }
-        }
-        Err(client::ClientError::NotRunning) => LearnView::unavailable(NO_CHANNEL),
-        Err(err) => LearnView::unavailable(err.to_string()),
-    }
-}
-
-fn action(request: serde_json::Value) -> Result<String, String> {
-    match client::request(pipe::PIPE_NAME, &request) {
-        Ok(response) if response["ok"] == true => {
-            Ok(response["message"].as_str().unwrap_or("done").to_owned())
-        }
-        Ok(response) => Err(response["error"]
-            .as_str()
-            .unwrap_or("the daemon refused")
-            .to_owned()),
-        Err(client::ClientError::NotRunning) => Err(NO_CHANNEL.to_owned()),
-        Err(err) => Err(err.to_string()),
-    }
-}
-
-/// One presentation line from the pipe's status response.
-fn session_view(status: &serde_json::Value) -> SessionView {
-    let run = status["run"].as_str().unwrap_or("unknown");
-    let game = status["game"].as_str();
-    let running = matches!(run, "running" | "starting");
-    let line = match run {
-        "running" => {
-            let slots = status["slots"].as_u64().unwrap_or(0);
-            match game {
-                Some(game) => format!("running — {game} — {slots} pad(s)"),
-                None => format!("running — {slots} pad(s)"),
-            }
-        }
-        "starting" => "starting…".to_owned(),
-        "stopped" => match game {
-            Some(game) => format!("idle — profile: {game}"),
-            None => "idle".to_owned(),
-        },
-        "failed" => format!(
-            "stopped: {}",
-            status["message"].as_str().unwrap_or("last session failed")
-        ),
-        "quitting" => "daemon shutting down…".to_owned(),
-        other => format!("daemon state: {other}"),
-    };
-    SessionView {
-        reachable: true,
-        running,
-        line,
-        profile: game.map(str::to_owned),
-    }
+/// The one thing supplied on top of the transport is the OFFLINE PROFILE — the
+/// games.toml title the "No daemon" banner has to name, read from the config
+/// because the pipe is the thing that just failed to answer. Everything else
+/// about talking to a daemon is `ksx-api`'s and is identical for every surface.
+fn control_source() -> ksx_api::Client<ksx_api::PipeTransport> {
+    ksx_api::Client::new(ksx_api::PipeTransport::new()).with_offline_profile(configured_profile)
 }
 
 /// The games.toml profile `ksx daemon` would need to start on this machine —
@@ -817,48 +477,22 @@ fn load_profiles() -> (Vec<ProfileRow>, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ksx_api::MacroWrite;
 
-    /// The `bind_keys` OVERRIDE: Studio's whole-key-list edit is ONE `map`
-    /// request carrying `"keys"`, not N single-key writes and not a refusal.
-    /// Empty is an honest clear, one key is the request the verb always got
-    /// (`"key"`, so a pre-list daemon still understands it), and two or more
-    /// is the list the engine runs as an OR-chain.
+    /// A pointer, not a test: the request SHAPES this file used to pin
+    /// (`map` with `"key"` / `"keys"` / `"clear"`, `map-macro` with the whole
+    /// table) are `ksx-api`'s now, and pinned there — once, against the type
+    /// both this daemon and every client use. What is still pinned HERE is the
+    /// part that is genuinely this machine's: what the collectors read off
+    /// disk, and that an edit survives the WHOLE path back to it.
     #[test]
-    fn bind_keys_sends_the_whole_list_in_one_map_request() {
-        let two = vec!["S".to_owned(), "Enter".to_owned()];
-        let wire = map_wire("IPAC P1", "A", &two, false, true, None);
-        assert_eq!(wire["verb"], "map");
-        assert_eq!(wire["preset"], "IPAC P1");
-        assert_eq!(wire["function"], "A");
-        assert_eq!(wire["keys"], serde_json::json!(["S", "Enter"]));
-        assert!(wire.get("key").is_none(), "{wire}");
-        assert!(wire.get("clear").is_none(), "{wire}");
-        assert_eq!(wire["reload"], true);
-
-        // One key: the single-key request, unchanged.
-        let one = map_wire("IPAC P1", "A", &["G".to_owned()], true, false, None);
-        assert_eq!(one["key"], "G");
-        assert!(one.get("keys").is_none(), "{one}");
-        assert_eq!(one["force"], true);
-
-        // The empty list is the clear — removing a control's last key must
-        // leave the inert "None" placeholder, not a silently missing row.
-        let none = map_wire("IPAC P1", "A", &[], false, true, None);
-        assert_eq!(none["clear"], true);
-        assert!(none.get("key").is_none(), "{none}");
-        assert!(none.get("keys").is_none(), "{none}");
-
-        // And `bind` composes to exactly the same body, so the two entry
-        // points cannot drift.
-        let via_bind = map_wire(
-            "IPAC P1",
-            "A",
-            &Some("G".to_owned()).into_iter().collect::<Vec<_>>(),
-            true,
-            false,
-            None,
+    fn the_wire_shapes_are_pinned_in_the_crate_that_owns_them() {
+        // The one assertion worth keeping at this end: the client this process
+        // hands Studio is the shared one, dialling the well-known name.
+        assert_eq!(
+            control_source().sink().path(),
+            crate::daemon::pipe::PIPE_NAME
         );
-        assert_eq!(via_bind, one);
     }
 
     /// The macro editor's WHOLE read side, against a real store: the file's
@@ -1137,8 +771,10 @@ steps = [{ hold = ["A"], ms = 50 }]
             // ── edit: the one field this case is about.
             (case.edit)(&mut draft);
 
-            // ── save: the editor's own path, hop for hop.
-            let wire = macro_wire(&MacroWrite {
+            // ── save: the editor's own path, hop for hop — the surface's
+            // draft, the typed request, the LINE it serializes to, the
+            // daemon's reader, the one writer.
+            let request = MacroWrite {
                 preset: "IPAC P1".into(),
                 name: draft.name.clone(),
                 steps: draft.steps.clone(),
@@ -1151,17 +787,21 @@ steps = [{ hold = ["A"], ms = 50 }]
                 delete: false,
                 enabled: Some(!draft.disabled),
                 reload: true,
-            });
-            let body = crate::daemon::pipe::macro_body(&wire)
+            }
+            .to_request()
+            .unwrap_or_else(|err| panic!("{}: the draft was refused: {err}", case.what));
+            let wire = serde_json::to_value(ksx_api::Request::MapMacro(request))
+                .unwrap_or_else(|err| panic!("{}: unserializable: {err}", case.what));
+            let read = ksx_api::MapMacroRequest::from_json(&wire)
                 .unwrap_or_else(|err| panic!("{}: the wire body was refused: {err}", case.what));
             crate::mapping::save_macro(
                 &store,
                 &crate::mapping::MacroSpec {
                     preset: "IPAC P1".into(),
                     name: draft.name.clone(),
-                    body,
-                    delete: false,
-                    set_enabled: None,
+                    body: read.body(),
+                    delete: read.is_delete(),
+                    set_enabled: read.set_enabled(),
                 },
             )
             .unwrap_or_else(|err| panic!("{}: the write was refused: {err}", case.what));
@@ -1191,6 +831,10 @@ steps = [{ hold = ["A"], ms = 50 }]
     /// The macro editor's SAVE is one `map-macro` request carrying the whole
     /// table, in the preset FILE's own field names — and a delete carries no
     /// body at all, so the verb's missing-steps refusal still protects a write.
+    ///
+    /// Kept at this end (as well as in `ksx-api`) because the thing under test
+    /// is the SURFACE's draft: blank selects, a rate in one of two units, and
+    /// the `enabled` flag that means two different things.
     #[test]
     fn save_macro_sends_the_whole_table_in_one_map_macro_request() {
         let write = MacroWrite {
@@ -1221,25 +865,34 @@ steps = [{ hold = ["A"], ms = 50 }]
             enabled: None,
             reload: true,
         };
-        let wire = macro_wire(&write);
+        let wire = serde_json::to_value(ksx_api::Request::MapMacro(
+            write.to_request().expect("a valid draft"),
+        ))
+        .expect("serializable");
         assert_eq!(wire["verb"], "map-macro");
         assert_eq!(wire["preset"], "IPAC P1");
         assert_eq!(wire["name"], "hadouken");
-        assert_eq!(wire["delete"], false);
         assert_eq!(wire["reload"], true);
         assert_eq!(wire["on_release"], "abort");
-        assert_eq!(wire["retrigger"], "ignore");
-        assert_eq!(wire["interrupt"], "none");
+        // A blank select is the file's own omitted field — the default, which
+        // the file does not spell either.
+        assert!(wire.get("retrigger").is_none(), "{wire}");
+        assert!(wire.get("interrupt").is_none(), "{wire}");
         assert_eq!(wire["repeat"], "while-held");
         assert_eq!(wire["steps"][0]["hold"][0], "dpad.down");
         assert_eq!(wire["steps"][0]["ms"], 50);
         assert_eq!(wire["steps"][1]["frames"], 3, "frames stay frames: {wire}");
-        assert_eq!(wire["steps"][1]["ms"], serde_json::Value::Null);
+        assert!(wire["steps"][1].get("ms").is_none(), "{wire}");
 
-        let deleted = macro_wire(&MacroWrite {
-            delete: true,
-            ..write
-        });
+        let deleted = serde_json::to_value(ksx_api::Request::MapMacro(
+            MacroWrite {
+                delete: true,
+                ..write
+            }
+            .to_request()
+            .expect("a delete needs no body"),
+        ))
+        .expect("serializable");
         assert_eq!(deleted["delete"], true);
         assert!(deleted.get("steps").is_none(), "{deleted}");
     }
@@ -1284,27 +937,5 @@ steps = [{ hold = ["A"], ms = 50 }]
         // must always disclose the mechanism's limit and point at the pipe.
         let (_, detail) = daemon_check();
         assert!(detail.contains("Session panel"), "{detail}");
-    }
-
-    #[test]
-    fn session_view_composes_the_state_line_from_the_pipe_status() {
-        let running = session_view(&serde_json::json!({
-            "run": "running", "slots": 4, "game": "Street Fighter"
-        }));
-        assert!(running.reachable && running.running);
-        assert_eq!(running.line, "running — Street Fighter — 4 pad(s)");
-
-        let idle = session_view(&serde_json::json!({ "run": "stopped", "game": null }));
-        assert!(idle.reachable && !idle.running);
-        assert_eq!(idle.line, "idle");
-
-        let failed = session_view(&serde_json::json!({
-            "run": "failed", "message": "refusing to start: bad config"
-        }));
-        assert!(!failed.running);
-        assert!(failed.line.contains("bad config"));
-
-        let starting = session_view(&serde_json::json!({ "run": "starting" }));
-        assert!(starting.running, "starting must offer Stop, not Start");
     }
 }

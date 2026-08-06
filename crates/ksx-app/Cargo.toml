@@ -14,6 +14,13 @@ path = "src/main.rs"
 [dependencies]
 ksx-core.workspace = true
 ksx-config.workspace = true
+# The typed control API (docs/M9-DECISION.md §6): the daemon READS the control
+# protocol through the same types Studio, `ksx session` and any future shell
+# WRITE it with, so the two descriptions of a message cannot drift. Not
+# optional and not web-adjacent — ksx-api links serde and ksx-config, nothing
+# that can open a socket, so E7 rule A (no tokio/axum/forma in the default
+# build) is unaffected.
+ksx-api.workspace = true
 ksx-legacy-import.workspace = true
 ksx-capture.workspace = true
 ksx-output.workspace = true

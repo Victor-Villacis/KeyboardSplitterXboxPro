@@ -1,8 +1,9 @@
 # ksx Control Surface
 
-The contract the future GUI builds against — M9 (native config UI) and M10
-(Studio, over `ksx-api`). See `ENHANCEMENTS.md` E5/E7 for the milestones and
-`ARCHITECTURE.md` for the thread model everything below defers to.
+The contract every ksx front end builds against. See `ENHANCEMENTS.md` E5/E7
+for the milestones, `M9-DECISION.md` for why the GUI is Studio rather than an
+egui window, and `ARCHITECTURE.md` for the thread model everything below defers
+to.
 
 **The standing rule: every front-door action must map to an existing backend
 verb — no GUI-only code paths.** A button in the native UI is a `DaemonCommand`
@@ -11,6 +12,77 @@ in-process; a button in Studio is a `ksx-api` call wrapping the same verb. If
 an operation has no verb, the GUI does not get the operation until the verb
 exists — which makes the gap list below the GUI's dependency list, not a wish
 list.
+
+## `ksx-api` — the typed surface every front end consumes (2026-08-06)
+
+**One Rust crate holds the control API, and the JSON on the wire is derived
+from it at both ends.** `crates/ksx-api` (docs/M9-DECISION.md §6) is what
+Studio's server, `ksx session`, the daemon's own pipe reader and the future E5
+MCP server all speak. It links `serde`, `thiserror`, `ksx-core` and
+`ksx-config` — no axum, no forma, no tokio, no HTTP types, no `async`, not even
+behind a feature. A dependency here that could open a socket would undo the M9
+decision by accident, so the dependency list is part of the contract.
+
+| module | what it owns |
+|---|---|
+| `wire` | `Request` / `Response` — one type per verb, and the ONE description of every field on the pipe |
+| `control` | `ControlSource`: the write side, with **exactly the tray's reach** — session start/stop/reload, learn, `bind_keys`, restore, clear-all, backups, `save_macro` |
+| `status` | `StatusSource`: the read side, satisfiable with **no daemon running** (config store + platform collectors) |
+| `machine` | `MachineSource`: devices, presets, autostart, doctor, WinUSB — the typed calls, **not yet implemented by anything**; every default REFUSES in words and names the CLI verb that works, which is what the table below already says about these rows |
+| `client` | `VerbSink` → `ControlSource`, so a surface is written once and hosted either way |
+| `pipe` | the `\\.\pipe\ksx-daemon` transport |
+| `refusal` | `Refusal { code, message, remedy }` |
+
+**Two transports, one trait.** `VerbSink::call(&Request) -> Result<Response,
+Refusal>` is the whole seam. `PipeTransport` serializes the request to one JSON
+line; a process that HOSTS the supervisor implements the same trait against the
+daemon's own dispatch — no line, no parse. That is E7's "no serialization tax,
+mapping 1:1 to `DaemonCommand`", kept available as an implementation of a
+shared trait rather than as a second copy of every verb: if a native shell is
+ever built, it is written against `ControlSource` like everything else and
+chooses its sink at construction.
+
+**Refusals are typed, and a refusal owes a way out.** `Refusal.code` is the
+same stable word the pipe answers with and the CLI's `--json` prints
+(`conflict`, `unknown-preset`, `macro-invalid`, `no-channel`…);
+`Refusal.remedy` is the command that works anyway. That field is how the
+invariant below — *a surface that cannot act must SAY so, per click* — became a
+type obligation instead of a review checklist item. `Display` is the message
+alone, so attaching a remedy can never rewrite a sentence a test pinned.
+
+**Why it is the crate and not the page.** The traits lived in `ksx-studio`
+while Studio was the only surface that had them, which meant the contract could
+not be consumed by a build that excludes Studio — and the default build does
+(`--features studio`). `ksx session` performs the same verbs with no HTTP
+anywhere. A contract cannot be owned by whichever surface was written first.
+
+### The drift this closes, and the test that keeps it closed
+
+On 2026-08-06 a macro field was dropped in flight: the daemon's `map-macro`
+body reader carried an ALLOWLIST of body field names, `repeat` (and its
+`turbo_hz`/`gap_ms` rate) was not on it, and a macro card that set `while-held`
+saved `once` — under a "saved" toast, because a dropped field looks exactly
+like a field nobody set. Two descriptions of one message, 3,000 lines apart,
+and nothing that failed when they disagreed.
+
+Both halves are now structural:
+
+- **The body of a `map-macro` request IS `ksx_config::MacroFile`.** There is no
+  list of body fields anywhere; a field added to the macro table is on the wire
+  the moment it compiles. What remains is the ENVELOPE's closed set (`verb`,
+  `preset`, `name`, `delete`, `reload`), and getting THAT wrong is loud —
+  `MacroFile` is `deny_unknown_fields`, so a stray envelope key comes back as a
+  refusal that names it, never a silent drop.
+- **`every_typed_request_is_answered_by_a_response_ksx_api_models_completely`**
+  (`ksx-app/src/daemon/pipe.rs`) walks every verb against the REAL dispatch: it
+  serializes the typed request exactly as a client would, hands the line to
+  `handle_request`, reads the answer back through the typed response, and fails
+  if the daemon said any field the API does not model. Adding a field to a
+  daemon answer without adding it to `ksx-api` fails there.
+
+`ksx-studio`'s routes are adapters over this API, and that is the rule that
+keeps them adapters: **no route may contain a decision a non-HTTP caller would
+have to re-implement.** Violating it is how Studio gets forked.
 
 ## Operation → surface map
 

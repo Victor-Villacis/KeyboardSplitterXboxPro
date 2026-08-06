@@ -164,15 +164,15 @@ impl ControlSource for Store {
         }
     }
 
-    fn start(&self, _profile: Option<&str>) -> Result<String, String> {
+    fn start(&self, _profile: Option<&str>) -> Result<String, ksx_api::Refusal> {
         Ok("running (1 slot(s))".into())
     }
 
-    fn stop(&self) -> Result<String, String> {
+    fn stop(&self) -> Result<String, ksx_api::Refusal> {
         Ok("stopped".into())
     }
 
-    fn reload(&self) -> Result<String, String> {
+    fn reload(&self) -> Result<String, ksx_api::Refusal> {
         Ok("running (1 slot(s))".into())
     }
 

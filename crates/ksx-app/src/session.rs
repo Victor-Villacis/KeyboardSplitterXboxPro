@@ -12,6 +12,12 @@
 
 use crate::daemon::pipe::{client, PIPE_NAME};
 
+/// The verbs `ksx session` offers, as the ONE request type every ksx surface
+/// builds (docs/M9-DECISION.md §6). This file used to spell the four request
+/// bodies itself with `serde_json::json!`, which is how a CLI and a page end
+/// up disagreeing about a field name that only one of them ever exercises.
+use ksx_api::Request;
+
 pub const EXIT_ERROR: i32 = 1;
 pub const EXIT_DAEMON_NOT_RUNNING: i32 = 2;
 
@@ -23,16 +29,24 @@ pub enum Verb {
 }
 
 impl Verb {
-    fn request(&self) -> serde_json::Value {
+    /// The typed request this verb is.
+    fn typed(&self) -> Request {
         match self {
-            Self::Status => serde_json::json!({ "verb": "status" }),
-            Self::Start { game: None } => serde_json::json!({ "verb": "start" }),
-            Self::Start { game: Some(game) } => {
-                serde_json::json!({ "verb": "start", "profile": game })
-            }
-            Self::Stop => serde_json::json!({ "verb": "stop" }),
-            Self::Reload => serde_json::json!({ "verb": "reload" }),
+            Self::Status => Request::Status,
+            Self::Start { game } => Request::Start {
+                profile: game.clone(),
+            },
+            Self::Stop => Request::Stop,
+            Self::Reload => Request::Reload,
         }
+    }
+
+    /// The request as it goes on the wire. Serialized from [`Verb::typed`], so
+    /// the line this CLI sends is the line the daemon's own reader is written
+    /// against — byte for byte the one docs/CONTROL-SURFACE.md documents.
+    fn request(&self) -> serde_json::Value {
+        serde_json::to_value(self.typed())
+            .unwrap_or_else(|err| unreachable!("a control request is always serializable: {err}"))
     }
 }
 
@@ -125,6 +139,10 @@ fn print_status(response: &serde_json::Value) {
 mod tests {
     use super::*;
 
+    /// The four lines this CLI puts on the pipe, unchanged by the move to the
+    /// shared type — which is the point of pinning them here as well as in
+    /// `ksx-api`: the two tests together say "the type serializes to this" and
+    /// "this CLI sends that".
     #[test]
     fn each_verb_builds_the_documented_request_line() {
         assert_eq!(Verb::Status.request().to_string(), r#"{"verb":"status"}"#);
