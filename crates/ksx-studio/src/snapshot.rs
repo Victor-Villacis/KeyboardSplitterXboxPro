@@ -16,6 +16,21 @@ pub trait StatusSource: Send + Sync {
     fn mapper(&self) -> MapperSnapshot {
         MapperSnapshot::unavailable("this status source supplies no mapper data")
     }
+
+    /// One preset's `[macros]` tables — the macro editor's whole read side
+    /// (docs/INPUT-TRANSFORMS.md §1c).
+    ///
+    /// A separate method rather than a field on [`MapperSlot`] for one
+    /// deliberate reason: [`MapperSlot`] is built by the CALLER (ksx-app's
+    /// `collect_mapper`), so a new required field would be a compile break in
+    /// a crate this seam is not allowed to reach into. A defaulted trait
+    /// method is the same shape [`StatusSource::mapper`] itself used to grow
+    /// in, and it lets the page say — in words, on screen — exactly which
+    /// provider call is still missing instead of rendering an empty grid that
+    /// looks like "this preset has no macros".
+    fn macros(&self, _preset: &str) -> MacroSnapshot {
+        MacroSnapshot::unavailable("this status source supplies no macro data")
+    }
 }
 
 /// Everything the cabinet status sections show. Point-in-time by design: a
@@ -133,6 +148,88 @@ pub struct MapperSlot {
     pub backup: Option<String>,
 }
 
+/// The macro editor's read side: every `[macros.<name>]` table of ONE preset,
+/// in the shape the file spells them.
+///
+/// Deliberately the FILE's shape (`ms` / `frames` kept apart, `allow_short` as
+/// written) rather than a resolved one: the page's whole job here is to show
+/// the author what the file says and to emit a TOML block they can paste back,
+/// so a duration authored in frames has to survive the round trip as frames
+/// (`ksx_config::MacroStepFile`, and `ksx_core::StepDuration::Frames`'s "an
+/// ergonomic unit, and only that").
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacroSnapshot {
+    /// The provider actually read a preset. `false` means "nobody has told
+    /// this page anything about macros" — which the editor says out loud,
+    /// because it is NOT the same fact as "this preset defines none".
+    pub available: bool,
+    /// Why not, when [`available`](Self::available) is false. Rendered.
+    pub reason: String,
+    /// The preset these came from — the `--preset` of every CLI line the page
+    /// prints.
+    pub preset: String,
+    pub macros: Vec<MacroView>,
+}
+
+impl MacroSnapshot {
+    /// No macro data at all; `reason` renders where the macro list would be.
+    pub fn unavailable(reason: &str) -> Self {
+        Self {
+            available: false,
+            reason: reason.to_owned(),
+            preset: String::new(),
+            macros: Vec::new(),
+        }
+    }
+
+    /// A preset that was read successfully — `macros` may still be empty, and
+    /// that emptiness is now a FACT rather than an absence of information.
+    pub fn read(preset: &str, macros: Vec<MacroView>) -> Self {
+        Self {
+            available: true,
+            reason: String::new(),
+            preset: preset.to_owned(),
+            macros,
+        }
+    }
+}
+
+/// One `[macros.<name>]` table.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacroView {
+    /// The table name, which is also half of the `macro.<name>` function.
+    pub name: String,
+    pub steps: Vec<MacroStepView>,
+    /// `"finish"` | `"abort"` — as `ksx_core::OnRelease::as_str` spells it.
+    pub on_release: String,
+    /// `"ignore"` | `"restart"`.
+    pub retrigger: String,
+    /// `"none"` | `"any-input"` | `"opposing"`.
+    pub interrupt: String,
+    /// Key names that START this macro (the `macro.<name>` rows in
+    /// `[bindings]`). Many keys → one macro is native, like any binding.
+    #[serde(default)]
+    pub triggers: Vec<String>,
+}
+
+/// One step: what it HOLDS, and for how long, in the unit the file used.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacroStepView {
+    /// Canonical function names (`"dpad.down"`, `"A"`). Empty is legal and
+    /// means a deliberate neutral gap.
+    #[serde(default)]
+    pub hold: Vec<String>,
+    /// Exactly one of these two is `Some` in a valid file; both, or neither,
+    /// is a fault the editor flags rather than resolves.
+    #[serde(default)]
+    pub ms: Option<u32>,
+    #[serde(default)]
+    pub frames: Option<u32>,
+    /// "I know this is shorter than a 60 Hz poller can see."
+    #[serde(default)]
+    pub allow_short: bool,
+}
+
 /// What `GET /api/map` serves AND what the mapper island's props carry — the
 /// same one-struct-one-serializer rule as [`StatusPayload`], parity pinned in
 /// `render_map.rs`.
@@ -146,6 +243,16 @@ pub struct MapPayload {
     /// Slot number selected for the SSR paint (`/map?slot=N`, defaulting to
     /// the first slot). The client keeps its own selection afterwards.
     pub selected: u8,
+    /// The selected slot's macros, read per request like everything else.
+    #[serde(default)]
+    pub macros: MacroSnapshot,
+    /// Macro name selected for the SSR paint (`/map?macro=NAME`), empty for
+    /// "the first one". Same contract as [`selected`](Self::selected): it
+    /// drives the server paint, the client keeps its own choice afterwards —
+    /// and because the macro tabs are anchors, a page with no JavaScript can
+    /// still walk through every macro the preset defines.
+    #[serde(default)]
+    pub macro_selected: String,
 }
 
 /// One virtual pad currently exposed by ViGEmBus.

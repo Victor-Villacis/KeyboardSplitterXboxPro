@@ -288,6 +288,27 @@ export function MapPage() {
   // The preset-actions card renders inert until a payload proves the daemon
   // reachable (a class string, not a show — ledger #13).
   const [actionsCls] = createSignal("card pactions off");
+  // v11, the MACRO EDITOR (the piano roll). Thirteen scalars and not one new
+  // createShow: every state it has is a class string on an element that is
+  // always in the DOM, so MAP_SHOW_ORDER does not move (ledger #4/#14 — shows
+  // are positional, and one inserted in the middle silently shifts every panel
+  // after it). Defaults are the honest "nothing read yet" values.
+  const [macroHead] = createSignal("no macro selected");
+  const [macroRuleLine] = createSignal("");
+  const [macroPolicyLine] = createSignal("on release: finish · retrigger: ignore · interrupt: none");
+  const [macroNote] = createSignal("");
+  const [macroTriggerLine] = createSignal("no trigger key yet — nothing starts this macro");
+  const [macroFnName] = createSignal("macro.my-macro");
+  const [macroName] = createSignal("my-macro");
+  const [macroCliLine] = createSignal(
+    "ksx map --preset <NAME> --function macro.<NAME> --key <KEY>",
+  );
+  const [macroToml] = createSignal("");
+  const [macroCardCls] = createSignal("card macrocard off");
+  const [macroGridCls] = createSignal("macgrid empty");
+  const [macroDirtyLine] = createSignal("");
+  const [macroStepLine] = createSignal("click a step's ⏱ to edit its duration");
+  const [macroDurValue] = createSignal("50");
   // Booleans behind the createShow pairs (positional show:createShow slots —
   // render_map.rs MAP_SHOW_ORDER pins the document order). Default false:
   // nothing renders until the server says otherwise.

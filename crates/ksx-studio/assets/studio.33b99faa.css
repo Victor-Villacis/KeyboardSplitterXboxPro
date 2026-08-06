@@ -1696,3 +1696,413 @@ footer p {
 .pactform {
   display: contents;
 }
+
+/* ── v11: THE MACRO EDITOR — the piano roll ─────────────────────────────────
+   docs/INPUT-TRANSFORMS.md §6.2 (TAStudio, adopted): rows are steps, columns
+   are this pad's controls, a cell is held or not. The layout is two aligned
+   columns — a row bar and a horizontally scrollable matrix — because a step
+   list is short and a control list is 25 wide. Row heights are FIXED so the
+   two line up without being one DOM grid (they are two lists, and a
+   `createList` inside a list item has no seam — ledger #17's neighbour).
+
+   Everything that EDITS is JavaScript-only, and hidden until map.ts marks the
+   island `.js`: the grid writes a local draft whose output is a TOML block
+   (§1c keeps step authoring in TOML — no daemon verb writes a step list), so
+   without scripting there is nothing for those controls to do, and this page
+   never renders a control that does nothing. What stays for everyone is the
+   READ: the grid, the durations, the amber flags, the policies, the trigger
+   form, and the block to paste. */
+
+.macrocard {
+  --macrow: 1.85rem;
+  --maccol: 1.6rem;
+}
+
+.macrocard.off {
+  opacity: 0.75;
+}
+
+.macdirty {
+  font-size: 0.72rem;
+  color: var(--warn);
+}
+
+.mactabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.6rem;
+}
+
+.mactab {
+  font: 600 0.74rem/1 var(--mono);
+  color: var(--muted);
+  text-decoration: none;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+}
+
+.mactab:hover {
+  color: var(--text);
+  border-color: var(--accent-line);
+}
+
+.mactab.active {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+}
+
+.machead {
+  margin: 0 0 0.15rem;
+  font: 700 0.95rem/1.3 var(--mono);
+  color: var(--cool);
+}
+
+.macpolicy {
+  margin: 0 0 0.7rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+/* The grid: row bar + scrollable matrix, aligned on --macrow. */
+.macgrid {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  padding: 0.5rem;
+  overflow: hidden;
+}
+
+/* No steps is a STATE, not a blank box: say what to do about it. */
+.macgrid.empty {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.macgrid.empty::after {
+  content: "no steps yet — add one with “Add step at end”, or paste a [macros] block into the preset file";
+}
+
+.macrowbar {
+  flex: 0 0 auto;
+  min-width: 0;
+  max-width: 60%;
+}
+
+.macrowhead,
+.maccols {
+  height: var(--macrow);
+  display: flex;
+  align-items: center;
+  font: 600 0.66rem/1 var(--mono);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.macrow {
+  height: var(--macrow);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0 0.3rem;
+  border-radius: 6px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.macrow:nth-child(even) {
+  background: rgba(127, 127, 127, 0.05);
+}
+
+.macrow.sel {
+  background: var(--accent-dim);
+  box-shadow: inset 0 0 0 1px var(--accent-line);
+}
+
+.macnum {
+  flex: 0 0 1.4rem;
+  text-align: right;
+  font: 700 0.72rem/1 var(--mono);
+  color: var(--muted);
+}
+
+.macdur {
+  flex: 0 0 auto;
+  font: 700 0.72rem/1 var(--mono);
+  color: var(--accent);
+}
+
+/* The sampling rule, made visible (§0.2). Amber, inline, with the reason —
+   never a silent accept and never a silent rewrite. */
+.macwarn {
+  flex: 0 1 auto;
+  min-width: 0;
+  font: 600 0.68rem/1 var(--mono);
+  color: var(--warn);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.macwarn::before {
+  content: "⚠ ";
+}
+
+.macwarn.off {
+  display: none;
+}
+
+.macrow.short .macnum {
+  color: var(--warn);
+}
+
+.machold {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.7rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.macbtns {
+  display: none;
+  flex: 0 0 auto;
+  gap: 0.1rem;
+}
+
+.studio.js .macbtns {
+  display: inline-flex;
+}
+
+.macbtn {
+  font: 600 0.68rem/1 var(--mono);
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  padding: 0.15rem 0.25rem;
+  cursor: pointer;
+}
+
+.macbtn:hover {
+  color: var(--text);
+  border-color: var(--line);
+  background: var(--panel);
+}
+
+.macbtn.macdel:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* An end-of-list move is inert, and looks it — never removed, so the row's
+   button geometry does not shuffle as steps move. */
+.macbtn.off {
+  opacity: 0.25;
+  pointer-events: none;
+}
+
+.macscroll {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.maccols,
+.macmatrix {
+  display: grid;
+  grid-template-columns: repeat(25, var(--maccol));
+  width: max-content;
+}
+
+.maccolid {
+  height: var(--macrow);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font: 700 0.62rem/1 var(--mono);
+  overflow: hidden;
+}
+
+.macmatrix {
+  grid-auto-rows: var(--macrow);
+}
+
+/* A cell is a real button so keyboard and AT users can reach it with
+   JavaScript on; without it there is nothing to press, so it is inert rather
+   than a lie. */
+.maccell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font: 700 0.7rem/1 var(--mono);
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--line-soft);
+  margin: -0.5px;
+  padding: 0;
+  pointer-events: none;
+}
+
+.studio.js .maccell {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.studio.js .maccell:hover {
+  background: var(--accent-glow);
+}
+
+.maccell.on {
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+}
+
+.maccell.inrow {
+  border-top-color: var(--accent-line);
+  border-bottom-color: var(--accent-line);
+}
+
+.macrule {
+  margin: 0.5rem 0 0.8rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+/* The draft controls. Hidden until `.js` — see the note at the top. */
+.macedit {
+  display: none;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.6rem;
+  margin-bottom: 0.8rem;
+}
+
+.studio.js .macedit {
+  display: flex;
+}
+
+/* The same switch for a single element that brings its OWN layout (the policy
+   labels are `.bindlabel`, a flex column) — `.macedit`'s row layout would
+   fight it, so js-only-ness is a class of its own. */
+.macjs {
+  display: none;
+}
+
+.studio.js .macjs {
+  display: flex;
+}
+
+.macsteplbl {
+  flex-basis: 100%;
+  font: 600 0.74rem/1.4 var(--mono);
+  color: var(--cool);
+}
+
+.macdurin {
+  width: 5.5rem;
+}
+
+.macnamein {
+  width: 10rem;
+}
+
+.macshortlbl {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.76rem;
+  color: var(--muted);
+}
+
+.macnew,
+.maccopy,
+.mactriglearn {
+  display: none;
+}
+
+.studio.js .macnew,
+.studio.js .maccopy {
+  display: inline-flex;
+}
+
+.studio.js .mactriglearn {
+  display: inline-block;
+}
+
+.macpolicies {
+  display: grid;
+  gap: 0.6rem;
+  margin-bottom: 0.9rem;
+}
+
+.macpol {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+
+.machint {
+  flex: 1 1 16rem;
+  min-width: 0;
+  font-size: 0.76rem;
+  color: var(--muted);
+}
+
+.mactrigger h3,
+.mactomlbox h3 {
+  margin: 0 0 0.35rem;
+  font-size: 0.9rem;
+}
+
+.mactrigline {
+  margin: 0 0 0.5rem;
+  font: 700 0.8rem/1.3 var(--mono);
+  color: var(--accent);
+}
+
+.macbind {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.5rem;
+}
+
+.macbind .keysel {
+  max-width: 14rem;
+}
+
+.mactomlbox {
+  margin-top: 0.9rem;
+}
+
+.mactoml {
+  margin: 0 0 0.5rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  font-size: 0.76rem;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-x: auto;
+  white-space: pre;
+}
+
+@media (max-width: 720px) {
+  .macrowbar {
+    max-width: 45%;
+  }
+  .machold {
+    display: none;
+  }
+}

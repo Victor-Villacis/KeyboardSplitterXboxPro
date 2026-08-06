@@ -87,6 +87,39 @@ export interface LearnView {
   error: string | null;
 }
 
+/** One `[macros.<name>]` step, in the shape the FILE spells it — `ms` and
+ *  `frames` kept apart so a sequence authored in frames round-trips as frames
+ *  (docs/INPUT-TRANSFORMS.md §1c). */
+export interface MacroStepView {
+  hold: string[];
+  ms: number | null;
+  frames: number | null;
+  allow_short: boolean;
+}
+
+export interface MacroView {
+  name: string;
+  steps: MacroStepView[];
+  /** "finish" | "abort" */
+  on_release: string;
+  /** "ignore" | "restart" */
+  retrigger: string;
+  /** "none" | "any-input" | "opposing" */
+  interrupt: string;
+  /** Key names that START this macro. */
+  triggers: string[];
+}
+
+export interface MacroSnapshot {
+  /** The provider read a preset at all. `false` is NOT "this preset has no
+   *  macros" — the editor says which, because only one of them is a fact
+   *  about the user's file. */
+  available: boolean;
+  reason: string;
+  preset: string;
+  macros: MacroView[];
+}
+
 /** What GET /api/map serves and what the island props carry — `MapPayload`
  *  in snapshot.rs; parity pinned there. */
 export interface MapPayload {
@@ -94,6 +127,57 @@ export interface MapPayload {
   session: SessionView;
   learn: LearnView;
   selected: number;
+  macros: MacroSnapshot;
+  /** Which macro the SSR paint chose (`/map?macro=NAME`). */
+  macro_selected: string;
+}
+
+/** v11's grid rows. One list item per STEP: its number, its duration in the
+ *  unit it was authored in, the inline amber flag, and the five step verbs
+ *  (each a bare `param.field` attribute — ledger #11). */
+interface MacroRow {
+  n: string;
+  cls: string;
+  dur: string;
+  durtitle: string;
+  hold: string;
+  /** Short enough to always fit; `warntitle` carries the whole sentence. */
+  warn: string;
+  warntitle: string;
+  warncls: string;
+  selact: string;
+  upact: string;
+  dnact: string;
+  iaact: string;
+  ibact: string;
+  delact: string;
+  upcls: string;
+  dncls: string;
+}
+
+/** One cell of the flat `steps × controls` matrix. Flat because a
+ *  `createList` inside a list item has no seam (ledger #17's neighbour), so
+ *  the matrix is one list laid out by a 25-column CSS grid. */
+interface MacroCell {
+  cls: string;
+  /** `stepIndex|function` — what the click delegation toggles. */
+  cell: string;
+  mark: string;
+  title: string;
+}
+
+interface MacroCol {
+  fn: string;
+  id: string;
+  idcls: string;
+  title: string;
+}
+
+interface MacroTab {
+  name: string;
+  label: string;
+  cls: string;
+  href: string;
 }
 
 export interface BindConflict {
@@ -348,6 +432,34 @@ const [toasts, setToasts] = createSignal<ToastRow[]>([]);
  *  not. A class string, not a show — the card never unmounts. */
 const [actionsCls, setActionsCls] = createSignal("card pactions off");
 
+// ── v11: the macro editor's own signals (twins in MapPage.ts) ──────────────
+const [macroHead, setMacroHead] = createSignal("no macro selected");
+const [macroRuleLine, setMacroRuleLine] = createSignal("");
+const [macroPolicyLine, setMacroPolicyLine] = createSignal(
+  "on release: finish · retrigger: ignore · interrupt: none",
+);
+const [macroNote, setMacroNote] = createSignal("");
+const [macroTriggerLine, setMacroTriggerLine] = createSignal(
+  "no trigger key yet — nothing starts this macro",
+);
+const [macroFnName, setMacroFnName] = createSignal("macro.my-macro");
+const [macroName, setMacroName] = createSignal("my-macro");
+const [macroCliLine, setMacroCliLine] = createSignal(
+  "ksx map --preset <NAME> --function macro.<NAME> --key <KEY>",
+);
+const [macroToml, setMacroToml] = createSignal("");
+const [macroCardCls, setMacroCardCls] = createSignal("card macrocard off");
+const [macroGridCls, setMacroGridCls] = createSignal("macgrid empty");
+const [macroDirtyLine, setMacroDirtyLine] = createSignal("");
+const [macroStepLine, setMacroStepLine] = createSignal(
+  "click a step's ⏱ to edit its duration",
+);
+const [macroDurValue, setMacroDurValue] = createSignal("50");
+const [macroTabs, setMacroTabs] = createSignal<MacroTab[]>([]);
+const [macroCols, setMacroCols] = createSignal<MacroCol[]>([]);
+const [macroRows, setMacroRows] = createSignal<MacroRow[]>([]);
+const [macroCells, setMacroCells] = createSignal<MacroCell[]>([]);
+
 // ── Client-side selection state (map.ts drives it) ─────────────────────────
 
 let lastPayload: MapPayload | null = null;
@@ -413,8 +525,11 @@ export function isMultiMode(): boolean {
   return multiMode;
 }
 
-/** "A", "✕", "D-pad ▲" — how this persona names a control, for prompts. */
+/** "A", "✕", "D-pad ▲" — how this persona names a control, for prompts.
+ *  A `macro.<name>` function is not on the pad at all; it is named as what it
+ *  is, so a toast about a trigger never reads like a button rebind. */
 export function identityLabel(fn: string): string {
+  if (fn.startsWith("macro.")) return `the “${fn.slice("macro.".length)}” macro trigger`;
   const def = zoneTable().find((z) => z[0] === fn);
   return def ? legendLabel(def[0], def[1]) : fn;
 }
@@ -461,9 +576,11 @@ export function currentSlot(): MapperSlot | null {
 export function selectSlot(num: number): void {
   selectedSlot = num;
   // A selection belongs to ONE preset — carrying it across slots would apply
-  // an action to controls the user is no longer looking at.
+  // an action to controls the user is no longer looking at. So does a macro
+  // draft: it is a sequence over THIS pad's controls.
   selection.clear();
   setSelBar(false);
+  resetMacroDraft();
   if (lastPayload) applyMap(lastPayload);
 }
 
@@ -766,6 +883,20 @@ export function applyMap(p: MapPayload): void {
   setHasBackup(slot !== null && slot.backup !== null);
   setBackupLine(slot?.backup ? `Restore backup from ${slot.backup}` : "Restore backup");
 
+  // v11: seed the macro draft from the file, but never over an edit in
+  // flight — a 2 s poll that ate a half-painted sequence would be the exact
+  // silent data loss this page bans. The TRIGGER is re-read either way: that
+  // half IS saved, and a draft has no business remembering a stale copy of it.
+  if (macroDraft === null || !macroDirty) {
+    seedMacro(null);
+  } else {
+    const fresh = p.macros.macros.find(
+      (m) => m.name.toLowerCase() === macroDraft?.name.toLowerCase(),
+    );
+    if (fresh && macroDraft) macroDraft.triggers = [...fresh.triggers];
+    refreshMacro();
+  }
+
   const running = p.session.reachable && p.session.running;
   const idle = p.session.reachable && !p.session.running;
   setPillRunning(running);
@@ -836,7 +967,7 @@ export function currentPreset(): string | null {
 export function currentBinding(fn: string): string | null {
   const slot = currentSlot();
   if (!slot) return null;
-  const keys = keysOf(slot, fn);
+  const keys = fn.startsWith("macro.") ? macroTriggersOf(fn) : keysOf(slot, fn);
   return keys.length > 0 ? keys.join(KEY_SEP) : null;
 }
 
@@ -844,6 +975,10 @@ export function currentBinding(fn: string): string | null {
  *  against (add = ∪ {k}, per-key ✕ = ∖ {k}) and what an UNDO has to put back.
  *  Kept separate from [`currentBinding`], which joins it for display. */
 export function previousKeys(fn: string): string[] {
+  // A macro TRIGGER lives in the preset's `[macros]` triggers, not in the
+  // bindings map — so an undo of a trigger write has to read it from there, or
+  // it would offer to put back "nothing" over a key that was really set.
+  if (fn.startsWith("macro.")) return macroTriggersOf(fn);
   return currentSlot()?.bindings[fn]?.slice() ?? [];
 }
 
@@ -1157,6 +1292,549 @@ export async function runUndo(id: string | null): Promise<void> {
   t.remaining = TOAST_MS;
   armToast(t);
   syncToasts();
+}
+
+// ── v11: THE MACRO EDITOR — the piano roll ─────────────────────────────────
+// docs/INPUT-TRANSFORMS.md §6.2 (TAStudio, adopted): rows = steps, columns =
+// the slot's controls, cells = held or not. A timed sequence is a SHAPE, and
+// an "add step" form hides it.
+//
+// READ-ONLY against disk, and it says so in every state. §1c: "authoring the
+// sequence itself stays TOML-only" — the daemon's `map` verb writes the key
+// that STARTS a macro (mapping.rs `apply_macro_trigger`) and has no shape for
+// a step list at all. So the grid edits a local DRAFT seeded from the file,
+// and its output is a `[macros.<name>]` block to paste. The trigger is the one
+// real write, through that same verb.
+//
+// Every derivation here mirrors render_map.rs; the Rust unit tests pin that
+// side, including the sampling floor against ksx-core's own MIN_STEP_MS.
+
+/** Mirror of `ksx_core::MIN_STEP_MS` (§0.2: ~16.7 ms per 60 Hz sample, so ~33
+ *  ms is two of them). Pinned against the real constant in render_map.rs. */
+const MIN_STEP_MS = 33;
+
+/** 60 Hz frames → ms, rounded to nearest ONCE (3 frames is 50 ms, not 51). */
+function framesMs(frames: number): number {
+  return Math.floor((frames * 1000 + 30) / 60);
+}
+
+function requestedMs(step: MacroStepView): number | null {
+  if (step.ms !== null && step.frames === null) return step.ms;
+  if (step.ms === null && step.frames !== null) return framesMs(step.frames);
+  return null; // both, or neither — a fault the editor names, never resolves
+}
+
+function effectiveMs(step: MacroStepView): number {
+  const ms = requestedMs(step);
+  if (ms === null) return 0;
+  return step.allow_short || ms >= MIN_STEP_MS ? ms : MIN_STEP_MS;
+}
+
+function durationText(step: MacroStepView): string {
+  if (step.ms !== null && step.frames === null) return `${step.ms} ms`;
+  if (step.ms === null && step.frames !== null) {
+    return `${step.frames} fr · ${framesMs(step.frames)} ms`;
+  }
+  return "—";
+}
+
+/** The INLINE flag — short enough to always fit beside the duration. */
+function stepWarning(step: MacroStepView): string {
+  if (step.ms !== null && step.frames !== null) return "two units";
+  if (step.ms === null && step.frames === null) return "no duration";
+  const ms = requestedMs(step);
+  if (ms === null || ms >= MIN_STEP_MS) return "";
+  return step.allow_short
+    ? `${ms} ms — may be missed`
+    : `${ms} ms — raised to ${MIN_STEP_MS} ms`;
+}
+
+/** The same flag in full, for the row's title. */
+function stepWarningLong(step: MacroStepView): string {
+  if (step.ms !== null && step.frames !== null) {
+    return "says both ms and frames — exactly one, or the file is refused";
+  }
+  if (step.ms === null && step.frames === null) {
+    return "no duration — give it ms or frames (a step with none is refused)";
+  }
+  const ms = requestedMs(step);
+  if (ms === null || ms >= MIN_STEP_MS) return "";
+  return step.allow_short
+    ? `${ms} ms is shorter than ~2 poll intervals (${MIN_STEP_MS} ms) — allow_short is on, ` +
+        "so it runs as written and the game may never see it"
+    : `${ms} ms is shorter than ~2 poll intervals (${MIN_STEP_MS} ms) — the game may never ` +
+        `see it, so ksx raises this step to ${MIN_STEP_MS} ms`;
+}
+
+function macroTotalMs(mac: MacroView): number {
+  return mac.steps.reduce((sum, s) => sum + effectiveMs(s), 0);
+}
+
+const MACRO_RULE_LINE =
+  "Amber steps are shorter than ~2 poll intervals (33 ms at 60 Hz), which is the shortest " +
+  "thing a game can be relied on to see — a 5 ms step is not unreliable, it is invisible. " +
+  "ksx raises a short step to 33 ms so it lands; a step marked allow_short runs exactly as " +
+  "written and can be missed entirely. Neither is ever silent.";
+
+export function starterMacro(): MacroView {
+  return {
+    name: "my-macro",
+    steps: [{ hold: ["dpad.down"], ms: 50, frames: null, allow_short: false }],
+    on_release: "finish",
+    retrigger: "ignore",
+    interrupt: "none",
+    triggers: [],
+  };
+}
+
+function cloneMacro(mac: MacroView): MacroView {
+  return {
+    ...mac,
+    steps: mac.steps.map((s) => ({ ...s, hold: [...s.hold] })),
+    triggers: [...mac.triggers],
+  };
+}
+
+// ── Draft state (client-only) ──────────────────────────────────────────────
+// The draft belongs to ONE preset and ONE macro. A poll re-seeds it only while
+// it is untouched, so a 2 s refresh can never eat an edit in progress — but
+// the TRIGGER is always re-read from the file, because that half really is
+// saved and the draft has no business remembering a stale version of it.
+
+let macroDraft: MacroView | null = null;
+/** The draft came from a `[macros]` table that exists on disk. */
+let macroOnDisk = false;
+/** The name it was seeded FROM — what "Revert to file" goes back to, which a
+ *  rename must not lose. */
+let macroSeedName: string | null = null;
+/** Something in the grid has been changed and not pasted anywhere. */
+let macroDirty = false;
+/** Which step the duration editor is pointed at. */
+let macroStep: number | null = null;
+
+export function currentMacro(): MacroView | null {
+  return macroDraft;
+}
+
+export function currentMacroStep(): number | null {
+  return macroStep;
+}
+
+export function macroIsDirty(): boolean {
+  return macroDirty;
+}
+
+/** The key(s) that start `macro.<name>` right now, from the FILE. */
+export function macroTriggersOf(fn: string): string[] {
+  const name = fn.startsWith("macro.") ? fn.slice("macro.".length) : fn;
+  const found = lastPayload?.macros.macros.find(
+    (m) => m.name.toLowerCase() === name.toLowerCase(),
+  );
+  return found ? [...found.triggers] : [];
+}
+
+/** Point the editor at one macro (or at a fresh sequence when `name` names
+ *  nothing), discarding whatever draft was open. */
+export function seedMacro(name: string | null): void {
+  const list = lastPayload?.macros.macros ?? [];
+  const want = (name ?? lastPayload?.macro_selected ?? "").toLowerCase();
+  const found =
+    list.find((m) => m.name.toLowerCase() === want) ?? (name === null ? list[0] : undefined);
+  macroDraft = found ? cloneMacro(found) : starterMacro();
+  macroOnDisk = found !== undefined;
+  macroSeedName = found ? found.name : null;
+  macroDirty = false;
+  macroStep = null;
+  refreshMacro();
+}
+
+/** The `[macros]` table this draft came from — "Revert to file"'s target,
+ *  which a rename must not lose. `null` = it came from nothing. */
+export function macroSeededFrom(): string | null {
+  return macroSeedName;
+}
+
+/** A draft belongs to one preset, so a slot switch drops it — the same rule
+ *  the multi-select follows. */
+export function resetMacroDraft(): void {
+  macroDraft = null;
+  macroOnDisk = false;
+  macroSeedName = null;
+  macroDirty = false;
+  macroStep = null;
+}
+
+/** Every mutation lands here: mark the draft edited and repaint. */
+function macroEdited(): void {
+  macroDirty = true;
+  refreshMacro();
+}
+
+export function macroSelectStep(index: number): void {
+  const mac = macroDraft;
+  if (!mac || index < 0 || index >= mac.steps.length) return;
+  macroStep = index;
+  refreshMacro();
+}
+
+/** Paint (or clear) one cell of the roll — the whole point of the shape. */
+export function macroToggleCell(index: number, fn: string): void {
+  const step = macroDraft?.steps[index];
+  if (!step) return;
+  const at = step.hold.findIndex((f) => f.toLowerCase() === fn.toLowerCase());
+  if (at >= 0) step.hold.splice(at, 1);
+  else step.hold.push(fn);
+  macroStep = index;
+  macroEdited();
+}
+
+function newStep(): MacroStepView {
+  return { hold: [], ms: 50, frames: null, allow_short: false };
+}
+
+/** add / insert above / insert below / delete / move up / move down. */
+export function macroStepVerb(verb: string, index: number): void {
+  const mac = macroDraft;
+  if (!mac) return;
+  const n = mac.steps.length;
+  switch (verb) {
+    case "add":
+      mac.steps.push(newStep());
+      macroStep = mac.steps.length - 1;
+      break;
+    case "insa":
+      if (index < 0 || index > n) return;
+      mac.steps.splice(index, 0, newStep());
+      macroStep = index;
+      break;
+    case "insb":
+      if (index < 0 || index >= n) return;
+      mac.steps.splice(index + 1, 0, newStep());
+      macroStep = index + 1;
+      break;
+    case "del": {
+      if (index < 0 || index >= n) return;
+      mac.steps.splice(index, 1);
+      macroStep = mac.steps.length === 0 ? null : Math.min(index, mac.steps.length - 1);
+      break;
+    }
+    case "up": {
+      if (index <= 0 || index >= n) return;
+      const [moved] = mac.steps.splice(index, 1);
+      mac.steps.splice(index - 1, 0, moved);
+      macroStep = index - 1;
+      break;
+    }
+    case "down": {
+      if (index < 0 || index >= n - 1) return;
+      const [moved] = mac.steps.splice(index, 1);
+      mac.steps.splice(index + 1, 0, moved);
+      macroStep = index + 1;
+      break;
+    }
+    case "sel":
+      macroSelectStep(index);
+      return;
+    default:
+      return;
+  }
+  macroEdited();
+}
+
+/** The selected step's duration, in whichever unit is asked for. `value <= 0`
+ *  is ignored rather than written — a zero-length step is not a shorter step,
+ *  it is a step the loader refuses. */
+export function macroSetDuration(value: number, unit: string): void {
+  const step = macroStep === null ? undefined : macroDraft?.steps[macroStep];
+  if (!step || !Number.isFinite(value) || value <= 0) return;
+  const n = Math.round(value);
+  if (unit === "frames") {
+    step.frames = n;
+    step.ms = null;
+  } else {
+    step.ms = n;
+    step.frames = null;
+  }
+  macroEdited();
+}
+
+/** Switch the selected step between `ms` and `frames`, CONVERTING rather than
+ *  reinterpreting: 50 ms picked as frames is 3 frames, not 50 of them. The
+ *  unit is an authoring convenience (§1c — it buys readability and nothing
+ *  else), so changing it must not change how long the step runs. */
+export function macroSetUnit(unit: string): void {
+  const step = macroStep === null ? undefined : macroDraft?.steps[macroStep];
+  if (!step) return;
+  if (unit === "frames") {
+    if (step.frames !== null) return;
+    step.frames = Math.max(1, Math.round(((step.ms ?? 50) * 60) / 1000));
+    step.ms = null;
+  } else {
+    if (step.ms !== null) return;
+    step.ms = framesMs(step.frames ?? 1);
+    step.frames = null;
+  }
+  macroEdited();
+}
+
+export function macroSetAllowShort(on: boolean): void {
+  const step = macroStep === null ? undefined : macroDraft?.steps[macroStep];
+  if (!step) return;
+  step.allow_short = on;
+  macroEdited();
+}
+
+/** One of the three macro-level policies. Unknown words are refused here, not
+ *  written into a block that would then fail to load. */
+export function macroSetPolicy(field: string, value: string): void {
+  const mac = macroDraft;
+  if (!mac) return;
+  if (field === "on_release" && (value === "finish" || value === "abort")) {
+    mac.on_release = value;
+  } else if (field === "retrigger" && (value === "ignore" || value === "restart")) {
+    mac.retrigger = value;
+  } else if (
+    field === "interrupt" &&
+    (value === "none" || value === "any-input" || value === "opposing")
+  ) {
+    mac.interrupt = value;
+  } else {
+    return;
+  }
+  macroEdited();
+}
+
+export function macroRename(name: string): void {
+  const mac = macroDraft;
+  const clean = name.trim();
+  if (!mac || clean === "" || clean === mac.name) return;
+  mac.name = clean;
+  // A renamed draft is no longer the table it came from.
+  macroOnDisk = false;
+  macroEdited();
+}
+
+export function macroTomlText(): string {
+  return macroDraft === null ? "" : macroTomlFor(macroDraft);
+}
+
+// ── Derivations (mirror render_map.rs) ─────────────────────────────────────
+
+function macroColsFor(slot: MapperSlot | null): MacroCol[] {
+  const table = slot && isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
+  return table.map(([fn, label, idk]) => ({
+    fn,
+    id: label,
+    idcls: `maccolid id-${idk}`,
+    title: `${legendLabel(fn, label)} (${fn})`,
+  }));
+}
+
+function holdText(slot: MapperSlot | null, hold: string[]): string {
+  if (hold.length === 0) return "nothing — a neutral gap";
+  const table = slot && isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
+  return hold
+    .map((f) => {
+      const def = table.find(([fn]) => fn.toLowerCase() === f.toLowerCase());
+      return def ? legendLabel(def[0], def[1]) : f;
+    })
+    .join(" + ");
+}
+
+function macroRowsFor(mac: MacroView, slot: MapperSlot | null): MacroRow[] {
+  const last = mac.steps.length - 1;
+  return mac.steps.map((step, i) => {
+    const warn = stepWarning(step);
+    return {
+      n: String(i + 1),
+      cls: `macrow${warn === "" ? "" : " short"}${macroStep === i ? " sel" : ""}`,
+      dur: durationText(step),
+      durtitle:
+        `step ${i + 1} holds ${holdText(slot, step.hold)} for ${durationText(step)} ` +
+        `(the engine runs it for ${effectiveMs(step)} ms)`,
+      hold: holdText(slot, step.hold),
+      warn,
+      warntitle: stepWarningLong(step),
+      warncls: warn === "" ? "macwarn off" : "macwarn",
+      selact: `sel|${i}`,
+      upact: `up|${i}`,
+      dnact: `down|${i}`,
+      iaact: `insa|${i}`,
+      ibact: `insb|${i}`,
+      delact: `del|${i}`,
+      upcls: i === 0 ? "macbtn off" : "macbtn",
+      dncls: i === last ? "macbtn off" : "macbtn",
+    };
+  });
+}
+
+function macroCellsFor(mac: MacroView, slot: MapperSlot | null): MacroCell[] {
+  const table = slot && isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
+  const cells: MacroCell[] = [];
+  mac.steps.forEach((step, i) => {
+    for (const [fn, label] of table) {
+      const held = step.hold.some((f) => f.toLowerCase() === fn.toLowerCase());
+      cells.push({
+        cls: `maccell${held ? " on" : ""}${macroStep === i ? " inrow" : ""}`,
+        cell: `${i}|${fn}`,
+        mark: held ? "●" : "",
+        title:
+          `step ${i + 1} ${held ? "holds" : "does not hold"} ` +
+          `${legendLabel(fn, label)} (${fn})`,
+      });
+    }
+  });
+  return cells;
+}
+
+function macroTabsFor(p: MapPayload, mac: MacroView, slotNumber: number): MacroTab[] {
+  return p.macros.macros.map((m) => ({
+    name: m.name,
+    label: `${m.name} · ${m.steps.length} steps`,
+    href: `/map?slot=${slotNumber}&macro=${encodeURIComponent(m.name)}`,
+    cls: m.name.toLowerCase() === mac.name.toLowerCase() ? "mactab active" : "mactab",
+  }));
+}
+
+function tomlStr(text: string): string {
+  return `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n")}"`;
+}
+
+/** The block you paste — `ksx_config::MacroFile`'s own spelling, defaults
+ *  omitted, the duration in the unit it was authored in, and the trigger row
+ *  underneath (COMMENTED when there is none, because a pasted
+ *  `macro.x = "<KEY>"` would not load). */
+function macroTomlFor(mac: MacroView): string {
+  let out = `[macros.${mac.name}]\n`;
+  if (mac.on_release !== "finish") out += `on_release = ${tomlStr(mac.on_release)}\n`;
+  if (mac.retrigger !== "ignore") out += `retrigger = ${tomlStr(mac.retrigger)}\n`;
+  if (mac.interrupt !== "none") out += `interrupt = ${tomlStr(mac.interrupt)}\n`;
+  out += "steps = [\n";
+  for (const step of mac.steps) {
+    const hold = step.hold.map(tomlStr).join(", ");
+    let duration: string;
+    if (step.ms !== null && step.frames !== null) {
+      duration = `ms = ${step.ms}, frames = ${step.frames}`;
+    } else if (step.ms !== null) {
+      duration = `ms = ${step.ms}`;
+    } else if (step.frames !== null) {
+      duration = `frames = ${step.frames}`;
+    } else {
+      duration = "ms = ";
+    }
+    out += `  { hold = [${hold}], ${duration}${step.allow_short ? ", allow_short = true" : ""} },\n`;
+  }
+  out += "]\n\n[bindings]\n";
+  if (mac.triggers.length === 0) {
+    out +=
+      `# macro.${mac.name} = "<KEY>"   # no trigger yet — bind one above, ` +
+      "or with the line below\n";
+  } else if (mac.triggers.length === 1) {
+    out += `macro.${mac.name} = ${tomlStr(mac.triggers[0])}\n`;
+  } else {
+    out += `macro.${mac.name} = [${mac.triggers.map(tomlStr).join(", ")}]\n`;
+  }
+  return out;
+}
+
+function macroTriggerLineFor(mac: MacroView): string {
+  if (mac.triggers.length === 0) return "no trigger key yet — nothing starts this macro";
+  if (mac.triggers.length === 1) return `started by ${mac.triggers[0]}`;
+  return `started by ${mac.triggers.join(KEY_SEP)} — any one of them (${mac.triggers.length} keys)`;
+}
+
+function macroNoteFor(p: MapPayload | null, mac: MacroView): string {
+  if (!p || !p.macros.available) {
+    return (
+      `This preset's macros could not be read (${p?.macros.reason ?? "no snapshot yet"}), so ` +
+      "the grid starts from a blank sequence rather than from your file. Everything below " +
+      "still composes a valid [macros] block — but check it against the preset before pasting."
+    );
+  }
+  if (p.macros.macros.length === 0) {
+    return (
+      "This preset defines no macros yet. The grid below is a NEW sequence — paint the " +
+      "cells, then paste the TOML block into the preset file. (Step lists are authored in " +
+      "TOML on purpose: the daemon's map verb writes the key that STARTS a macro, and has " +
+      "no shape for a step list at all.)"
+    );
+  }
+  if (!macroOnDisk) {
+    return (
+      "This is a NEW sequence, not one of the preset's — paste the TOML block below to add it."
+    );
+  }
+  return (
+    "Steps are read from the preset file and edited here as a DRAFT: nothing in this grid " +
+    "is saved. Copy the TOML block below into the preset (docs/INPUT-TRANSFORMS.md §1c " +
+    "keeps step authoring in TOML — the daemon's map verb writes the key that STARTS a " +
+    "macro, and has no shape for a step list). The trigger below IS a real write, through " +
+    "that same verb."
+  );
+}
+
+/** One place where the whole macro card reaches the screen. */
+function refreshMacro(): void {
+  const p = lastPayload;
+  const slot = currentSlot();
+  const mac = macroDraft;
+  if (!mac) {
+    setMacroTabs([]);
+    setMacroRows([]);
+    setMacroCells([]);
+    setMacroGridCls("macgrid empty");
+    setMacroNote(macroNoteFor(p, starterMacro()));
+    return;
+  }
+  const preset = p && p.macros.preset !== "" ? p.macros.preset : (slot?.preset ?? "<PRESET>");
+  setMacroCols(macroColsFor(slot));
+  setMacroRows(macroRowsFor(mac, slot));
+  setMacroCells(macroCellsFor(mac, slot));
+  setMacroTabs(p ? macroTabsFor(p, mac, slot ? slot.number : p.selected) : []);
+  setMacroHead(
+    `${mac.name} — ${mac.steps.length} step${mac.steps.length === 1 ? "" : "s"} · ` +
+      `${macroTotalMs(mac)} ms total`,
+  );
+  setMacroRuleLine(MACRO_RULE_LINE);
+  setMacroPolicyLine(
+    `on release: ${mac.on_release} · retrigger: ${mac.retrigger} · interrupt: ${mac.interrupt}`,
+  );
+  setMacroNote(macroNoteFor(p, mac));
+  setMacroTriggerLine(macroTriggerLineFor(mac));
+  setMacroFnName(`macro.${mac.name}`);
+  setMacroName(mac.name);
+  setMacroCliLine(
+    `ksx map --preset "${preset}" --function macro.${mac.name} --key ` +
+      `${mac.triggers[0] ?? "<KEY>"}`,
+  );
+  setMacroToml(macroTomlFor(mac));
+  setMacroCardCls(p?.macros.available ? "card macrocard" : "card macrocard off");
+  setMacroGridCls(mac.steps.length === 0 ? "macgrid empty" : "macgrid");
+  setMacroDirtyLine(
+    macroDirty ? "edited — not saved; copy the TOML block below into the preset" : "",
+  );
+  const step = macroStep === null ? undefined : mac.steps[macroStep];
+  setMacroStepLine(
+    step === undefined
+      ? "click a step's ⏱ to edit its duration"
+      : `step ${(macroStep ?? 0) + 1} of ${mac.steps.length} — ${durationText(step)}` +
+        (stepWarningLong(step) === "" ? "" : ` · ${stepWarningLong(step)}`),
+  );
+  setMacroDurValue(
+    step === undefined ? "50" : String(step.frames ?? step.ms ?? 50),
+  );
+}
+
+/** The unit the duration editor should show for the selected step. map.ts
+ *  writes it onto the <select>, which an attribute binding cannot do. */
+export function macroStepUnit(): string {
+  const step = macroStep === null ? undefined : macroDraft?.steps[macroStep];
+  return step?.frames !== null && step?.frames !== undefined ? "frames" : "ms";
+}
+
+export function macroStepAllowShort(): boolean {
+  const step = macroStep === null ? undefined : macroDraft?.steps[macroStep];
+  return step?.allow_short ?? false;
 }
 
 // ── The screen ─────────────────────────────────────────────────────────────
@@ -1617,6 +2295,363 @@ export function MapIsland() {
                   ),
                 ),
               ),
+          ),
+        ),
+      ),
+      // ── v11: THE MACRO EDITOR — the piano roll ────────────────────────
+      // rows = steps, columns = this pad's controls, a cell is held or not
+      // (docs/INPUT-TRANSFORMS.md §6.2). NOT a createShow anywhere in here:
+      // every state is a class string on an element that is always in the
+      // DOM, so MAP_SHOW_ORDER does not move (ledger #4/#14).
+      h(
+        "section",
+        { class: () => macroCardCls() },
+        h(
+          "div",
+          { class: "phead" },
+          h("h2", null, "Macros"),
+          h("span", { class: "macdirty mono" }, () => macroDirtyLine()),
+        ),
+        h("p", { class: "savenote" }, () => macroNote()),
+        h(
+          "div",
+          { class: "mactabs" },
+          createList(
+            () => macroTabs(),
+            (t) => t.name + "|" + t.cls + "|" + t.label,
+            // An ANCHOR, like the slot tabs: `/map?slot=N&macro=NAME` is a
+            // route, so a page with no JavaScript can still walk every macro
+            // the preset defines. map.ts intercepts and switches in place.
+            (t) => h("a", { class: t.cls, href: t.href, "data-macro": t.name }, t.label),
+          ),
+          h(
+            "button",
+            {
+              class: "btn btn-mini macnew",
+              "data-act": "macro-new",
+              type: "button",
+              title: "start a new sequence from scratch",
+            },
+            "＋ New",
+          ),
+        ),
+        h("p", { class: "machead" }, () => macroHead()),
+        h("p", { class: "macpolicy mono" }, () => macroPolicyLine()),
+        // The grid. Two aligned columns: the row bar (step number, duration,
+        // amber flag, the five step verbs) and the scrollable matrix with its
+        // control headers. Row heights are fixed in CSS so the two line up.
+        h(
+          "div",
+          { class: () => macroGridCls() },
+          h(
+            "div",
+            { class: "macrowbar" },
+            h("div", { class: "macrowhead" }, "step"),
+            createList(
+              () => macroRows(),
+              (r) => r.n + "|" + r.cls + "|" + r.dur + "|" + r.warn + "|" + r.hold,
+              (r) =>
+                h(
+                  "div",
+                  { class: r.cls, title: r.durtitle },
+                  h("span", { class: "macnum" }, r.n),
+                  h("span", { class: "macdur" }, r.dur),
+                  // FLAGGED INLINE, in amber, with the reason — never a
+                  // silent accept and never a silent rewrite (§0.2). The
+                  // short form always fits; the whole sentence is the title,
+                  // and the rule behind it is stated once below the grid.
+                  h("span", { class: r.warncls, title: r.warntitle }, r.warn),
+                  h("span", { class: "machold" }, r.hold),
+                  h(
+                    "span",
+                    { class: "macbtns" },
+                    h(
+                      "button",
+                      { class: r.upcls, "data-macact": r.upact, type: "button", title: "move this step up" },
+                      "▲",
+                    ),
+                    h(
+                      "button",
+                      { class: r.dncls, "data-macact": r.dnact, type: "button", title: "move this step down" },
+                      "▼",
+                    ),
+                    h(
+                      "button",
+                      { class: "macbtn", "data-macact": r.iaact, type: "button", title: "insert a step above this one" },
+                      "＋↑",
+                    ),
+                    h(
+                      "button",
+                      { class: "macbtn", "data-macact": r.ibact, type: "button", title: "insert a step below this one" },
+                      "＋↓",
+                    ),
+                    h(
+                      "button",
+                      { class: "macbtn", "data-macact": r.selact, type: "button", title: "edit this step's duration" },
+                      "⏱",
+                    ),
+                    h(
+                      "button",
+                      { class: "macbtn macdel", "data-macact": r.delact, type: "button", title: "delete this step" },
+                      "✕",
+                    ),
+                  ),
+                ),
+            ),
+          ),
+          h(
+            "div",
+            { class: "macscroll" },
+            h(
+              "div",
+              { class: "maccols" },
+              createList(
+                () => macroCols(),
+                (c) => c.fn + "|" + c.id,
+                (c) => h("span", { class: c.idcls, title: c.title }, c.id),
+              ),
+            ),
+            h(
+              "div",
+              { class: "macmatrix" },
+              createList(
+                () => macroCells(),
+                (c) => c.cell + "|" + c.cls,
+                (c) =>
+                  h(
+                    "button",
+                    { class: c.cls, "data-cell": c.cell, type: "button", title: c.title },
+                    c.mark,
+                  ),
+              ),
+            ),
+          ),
+        ),
+        h("p", { class: "macrule" }, () => macroRuleLine()),
+        // The step editor: everything here writes the DRAFT, so it only
+        // exists with JavaScript (`.macedit` is display:none until map.ts
+        // marks the island `.js`) — a control that cannot do anything is the
+        // one thing this page never renders.
+        h(
+          "div",
+          { class: "macedit" },
+          h("span", { class: "macsteplbl" }, () => macroStepLine()),
+          h(
+            "label",
+            { class: "bindlabel" },
+            "duration",
+            h("input", {
+              class: "macdurin",
+              type: "number",
+              min: "1",
+              step: "1",
+              value: () => macroDurValue(),
+            }),
+          ),
+          h(
+            "label",
+            { class: "bindlabel" },
+            "unit",
+            h(
+              "select",
+              { class: "macunit" },
+              h("option", null, "ms"),
+              h("option", null, "frames"),
+            ),
+          ),
+          h(
+            "label",
+            { class: "macshortlbl" },
+            h("input", { class: "macshortin", type: "checkbox" }),
+            "allow short (run it as written even below 33 ms)",
+          ),
+          h(
+            "button",
+            { class: "btn btn-mini", "data-act": "macro-addstep", type: "button" },
+            "Add step at end",
+          ),
+          h(
+            "button",
+            { class: "btn btn-mini", "data-act": "macro-revert", type: "button" },
+            "Revert to file",
+          ),
+          h(
+            "label",
+            { class: "bindlabel" },
+            "name",
+            h("input", { class: "macnamein", type: "text", value: () => macroName() }),
+          ),
+        ),
+        // The three interruption policies. The SELECTS are draft controls, so
+        // they live in `.macedit` too; the one-line explanations and the
+        // current values (the `macpolicy` line above) are there for everyone.
+        h(
+          "div",
+          { class: "macpolicies" },
+          h(
+            "div",
+            { class: "macpol" },
+            h(
+              "label",
+              { class: "bindlabel macjs" },
+              "on release",
+              h(
+                "select",
+                { class: "macsel", "data-macpol": "on_release" },
+                h("option", null, "finish"),
+                h("option", null, "abort"),
+              ),
+            ),
+            h(
+              "span",
+              { class: "machint" },
+              "letting go of the trigger mid-run: finish runs the sequence out (the ",
+              "fighting-game expectation — you tap the button and the quarter-circle ",
+              "comes out whole), abort stops it and releases everything in one batch.",
+            ),
+          ),
+          h(
+            "div",
+            { class: "macpol" },
+            h(
+              "label",
+              { class: "bindlabel macjs" },
+              "retrigger",
+              h(
+                "select",
+                { class: "macsel", "data-macpol": "retrigger" },
+                h("option", null, "ignore"),
+                h("option", null, "restart"),
+              ),
+            ),
+            h(
+              "span",
+              { class: "machint" },
+              "pressing the trigger again mid-run: ignore swallows the press (the ",
+              "default, because restart stutters the sequence back to step 0 on any ",
+              "switch bounce a real panel has), restart starts over from step 1.",
+            ),
+          ),
+          h(
+            "div",
+            { class: "macpol" },
+            h(
+              "label",
+              { class: "bindlabel macjs" },
+              "interrupt",
+              h(
+                "select",
+                { class: "macsel", "data-macpol": "interrupt" },
+                h("option", null, "none"),
+                h("option", null, "any-input"),
+                h("option", null, "opposing"),
+              ),
+            ),
+            h(
+              "span",
+              { class: "machint" },
+              "doing something ELSE mid-run: none never interrupts, any-input aborts ",
+              "on any other bound key of this slot going down, opposing aborts only on ",
+              "input that contradicts the macro — a direction against one the current ",
+              "step holds, or a key that starts a different macro.",
+            ),
+          ),
+        ),
+        // ── The trigger: the ONE macro edit that is a real write ─────────
+        // `macro.<name>` is a function name the `map` verb already takes
+        // (mapping.rs `apply_macro_trigger`), so this goes through the same
+        // writer as every other binding on the page — learn flow with
+        // JavaScript, a plain form without it. No second writer, no fake one.
+        h(
+          "div",
+          { class: "mactrigger" },
+          h("h3", null, "Trigger"),
+          h("p", { class: "mactrigline" }, () => macroTriggerLine()),
+          h(
+            "button",
+            {
+              class: "btn btn-row mactriglearn",
+              "data-fn": () => macroFnName(),
+              type: "button",
+              title: "click, then press the panel key that should start this macro",
+            },
+            "Set trigger — press a panel key",
+          ),
+          // The no-JS twin. Bind REPLACES this macro's trigger keys and Clear
+          // removes them; there is deliberately no Add/Remove-one here,
+          // because the mapper payload's `bindings` map carries pad functions
+          // only — the server's read-modify-write would compute the new set
+          // against an empty list and quietly drop the triggers it never saw.
+          // With JavaScript the page reads them from `[macros]` and can add.
+          h(
+            "form",
+            { class: "macbind nojs", method: "post", action: "/map/bind" },
+            h("input", { type: "hidden", name: "slot", value: () => slotNum() }),
+            h("input", { type: "hidden", name: "function", value: () => macroFnName() }),
+            h(
+              "select",
+              {
+                class: "keysel",
+                name: "key",
+                title: "the panel key that starts this macro",
+                "aria-label": "the panel key that starts this macro",
+              },
+              h("option", { value: "" }, "key…"),
+              h("optgroup", { label: "Letters" }, ...KEYS_LETTER.map((ko) => h("option", null, ko.k))),
+              h(
+                "optgroup",
+                { label: "Digits (One = the 1 key)" },
+                ...KEYS_DIGIT.map((ko) => h("option", null, ko.k)),
+              ),
+              h("optgroup", { label: "Arrows" }, ...KEYS_ARROW.map((ko) => h("option", null, ko.k))),
+              h("optgroup", { label: "Numpad" }, ...KEYS_NUMPAD.map((ko) => h("option", null, ko.k))),
+              h("optgroup", { label: "Function keys" }, ...KEYS_FN.map((ko) => h("option", null, ko.k))),
+              h("optgroup", { label: "Editing" }, ...KEYS_EDIT.map((ko) => h("option", null, ko.k))),
+              h("optgroup", { label: "Navigation" }, ...KEYS_NAV.map((ko) => h("option", null, ko.k))),
+              h("optgroup", { label: "Modifiers" }, ...KEYS_MOD.map((ko) => h("option", null, ko.k))),
+              h(
+                "optgroup",
+                { label: "Symbols (DashUnderscore = the - key)" },
+                ...KEYS_SYMBOL.map((ko) => h("option", null, ko.k)),
+              ),
+              h(
+                "optgroup",
+                { label: "Media and system" },
+                ...KEYS_MEDIA.map((ko) => h("option", null, ko.k)),
+              ),
+              h("optgroup", { label: "OEM / regional" }, ...KEYS_OEM.map((ko) => h("option", null, ko.k))),
+            ),
+            h("button", { class: "btn btn-mini", type: "submit" }, "Bind trigger"),
+            h(
+              "button",
+              { class: "btn btn-mini", type: "submit", formaction: "/map/clear" },
+              "Clear trigger",
+            ),
+          ),
+          h("p", { class: "clifall" }, h("code", { class: "mono copyable" }, () => macroCliLine())),
+        ),
+        // ── The output: the block you paste ──────────────────────────────
+        h(
+          "div",
+          { class: "mactomlbox" },
+          h(
+            "div",
+            { class: "phead" },
+            h("h3", null, "TOML to paste"),
+            h(
+              "button",
+              { class: "btn btn-mini maccopy", "data-act": "macro-copy", type: "button" },
+              "Copy",
+            ),
+          ),
+          h("pre", { class: "mono mactoml" }, () => macroToml()),
+          h(
+            "p",
+            { class: "savenote" },
+            "Paste this into the preset file (Preset card above names the config root; ",
+            "the file is presets\\<preset>.toml). A [macros] table already there keeps ",
+            "its other macros — replace only the one with this name. Reload the daemon ",
+            "afterwards and the sequence is live.",
           ),
         ),
       ),

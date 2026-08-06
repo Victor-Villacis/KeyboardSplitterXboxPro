@@ -77,5 +77,6 @@ pub use control::{BindConflict, BindOutcome, BindRequest, ControlSource, LearnVi
 pub use error::StudioError;
 pub use server::serve;
 pub use snapshot::{
-    MapPayload, MapperSlot, MapperSnapshot, PadRow, ProfileRow, StatusSnapshot, StatusSource,
+    MacroSnapshot, MacroStepView, MacroView, MapPayload, MapperSlot, MapperSnapshot, PadRow,
+    ProfileRow, StatusSnapshot, StatusSource,
 };

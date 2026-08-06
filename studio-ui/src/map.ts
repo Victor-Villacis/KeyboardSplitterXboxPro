@@ -31,11 +31,26 @@ import {
   keyList,
   learnAllowed,
   liveProfile,
+  macroIsDirty,
+  macroRename,
+  macroSeededFrom,
+  macroSetAllowShort,
+  macroSetDuration,
+  macroSetPolicy,
+  macroSetUnit,
+  macroStepAllowShort,
+  macroStepUnit,
+  macroStepVerb,
+  macroToggleCell,
+  macroTomlText,
   markPaused,
   markSaved,
   modalIsOpen,
   newestUndoable,
   previousKeys,
+  currentMacro,
+  currentMacroStep,
+  seedMacro,
   profileToResume,
   pushToast,
   releaseToasts,
@@ -85,6 +100,7 @@ async function poll(): Promise<void> {
   } catch {
     applyMapUnreachable();
   }
+  syncMacroControls();
 }
 
 /** One JSON verb → its outcome, with transport failure folded into the same
@@ -921,9 +937,95 @@ async function submitNoJsForm(
   void poll();
 }
 
+// ── v11: the macro editor's controls ───────────────────────────────────────
+// The grid edits a DRAFT (docs/INPUT-TRANSFORMS.md §1c keeps step authoring in
+// TOML — no daemon verb writes a step list), so nothing here calls a write
+// verb. What it does call is `syncMacroControls`: three <select>s, a number
+// input, a checkbox and a text input whose VALUES cannot come from an
+// attribute binding once the user has touched them (a dirty form control
+// ignores its attribute), so the island exposes the draft's truth and this
+// writes it onto the DOM after every edit and every poll.
+
+let islandRoot: HTMLElement | null = null;
+
+function syncMacroControls(): void {
+  const root = islandRoot;
+  const mac = currentMacro();
+  if (!root || !mac) return;
+  const set = (sel: string, value: string): void => {
+    const el = root.querySelector<HTMLInputElement | HTMLSelectElement>(sel);
+    if (el && el.value !== value) el.value = value;
+  };
+  set(".macdurin", String(macroDurationValue()));
+  set(".macunit", macroStepUnit());
+  set(".macnamein", mac.name);
+  set('.macsel[data-macpol="on_release"]', mac.on_release);
+  set('.macsel[data-macpol="retrigger"]', mac.retrigger);
+  set('.macsel[data-macpol="interrupt"]', mac.interrupt);
+  const short = root.querySelector<HTMLInputElement>(".macshortin");
+  if (short) short.checked = macroStepAllowShort();
+}
+
+/** The number the duration box should show for the selected step, in the unit
+ *  it was authored in. */
+function macroDurationValue(): number {
+  const at = currentMacroStep();
+  const step = at === null ? undefined : currentMacro()?.steps[at];
+  if (!step) return 50;
+  return step.frames ?? step.ms ?? 50;
+}
+
+function macroCurrentUnit(): string {
+  const el = islandRoot?.querySelector<HTMLSelectElement>(".macunit");
+  return el?.value === "frames" ? "frames" : "ms";
+}
+
+/** One `verb|index` payload from a row button. */
+function macroAct(payload: string): void {
+  const at = payload.indexOf("|");
+  if (at <= 0) return;
+  macroStepVerb(payload.slice(0, at), Number(payload.slice(at + 1)));
+  syncMacroControls();
+}
+
+/** One `stepIndex|function` payload from a grid cell. */
+function macroCell(payload: string): void {
+  const at = payload.indexOf("|");
+  if (at < 0) return;
+  macroToggleCell(Number(payload.slice(0, at)), payload.slice(at + 1));
+  syncMacroControls();
+}
+
+/** Switch the editor to another macro — or to a fresh sequence. A draft with
+ *  unsaved edits is not silently thrown away: it says so, and the TOML block
+ *  it produced was on screen the whole time. */
+function macroSwitch(name: string | null): void {
+  if (macroIsDirty()) {
+    pushToast(
+      "That draft was not saved anywhere — macro steps are pasted into the preset as TOML, " +
+        "and this one is gone. (Nothing on disk changed.)",
+      { kind: "warn" },
+    );
+  }
+  seedMacro(name);
+  syncMacroControls();
+}
+
+async function macroCopy(): Promise<void> {
+  const text = macroTomlText();
+  if (text === "") return;
+  try {
+    await navigator.clipboard.writeText(text);
+    pushToast("The [macros] block is on the clipboard — paste it into the preset file.");
+  } catch {
+    oops("Could not reach the clipboard — select the block and copy it by hand.");
+  }
+}
+
 // ── Wiring: delegated events on the island root ────────────────────────────
 
 function wire(root: HTMLElement): void {
+  islandRoot = root;
   // Multi-select is a JS enhancement: the "Select multiple" toggle stays
   // hidden until this class exists, so a no-JS page never shows a control that
   // cannot do anything (the whole page's standing rule — FIX 1).
@@ -963,6 +1065,35 @@ function wire(root: HTMLElement): void {
         if (learnAllowed()) void removeKey(fn, key);
         else refuse(fn);
       }
+      return;
+    }
+
+    // ── v11: the macro grid. Checked before `data-fn`, because the macro
+    // card's Trigger button carries one and nothing else in here does. ────
+    const cell = target.closest<HTMLElement>("[data-cell]")?.dataset.cell;
+    if (cell) {
+      ev.preventDefault();
+      macroCell(cell);
+      return;
+    }
+    const macact = target.closest<HTMLElement>("[data-macact]")?.dataset.macact;
+    if (macact) {
+      ev.preventDefault();
+      macroAct(macact);
+      return;
+    }
+    const macro = target.closest<HTMLElement>("[data-macro]")?.dataset.macro;
+    if (macro) {
+      // The tab is an <a href="/map?slot=N&macro=NAME"> so it works with JS
+      // off; with JS on we switch in place and keep the URL honest.
+      ev.preventDefault();
+      macroSwitch(macro);
+      const slot = currentSlot();
+      window.history.replaceState(
+        null,
+        "",
+        `/map?slot=${slot ? slot.number : 1}&macro=${encodeURIComponent(macro)}`,
+      );
       return;
     }
 
@@ -1040,6 +1171,27 @@ function wire(root: HTMLElement): void {
       setMultiMode(false);
       return;
     }
+    // ── v11: macro-card verbs. None of them writes anything — the output is
+    // the TOML block (§1c: step authoring stays TOML-only). ───────────────
+    if (act === "macro-new") {
+      macroSwitch(null);
+      return;
+    }
+    if (act === "macro-addstep") {
+      macroAct("add|0");
+      return;
+    }
+    if (act === "macro-revert") {
+      // Back to the TABLE it was seeded from, not to the draft's current name
+      // — a rename must not become a one-way door.
+      seedMacro(macroSeededFrom());
+      syncMacroControls();
+      return;
+    }
+    if (act === "macro-copy") {
+      void macroCopy();
+      return;
+    }
     if (act === "restore-defaults" || act === "restore-backup" || act === "restore-latest") {
       const mode: RestoreMode =
         act === "restore-defaults"
@@ -1074,8 +1226,12 @@ function wire(root: HTMLElement): void {
       const fn = zone.dataset.fn;
       // Victor's file-explorer analogy: Ctrl/Shift/⌘-click ADDS to a
       // selection — and on touch, where no modifier exists, the header's
-      // "Select multiple" toggle makes every plain tap do the same.
-      const additive = ev.ctrlKey || ev.metaKey || ev.shiftKey || isMultiMode();
+      // "Select multiple" toggle makes every plain tap do the same. A macro
+      // TRIGGER is never part of that selection: "map all to one key" is
+      // about pad controls on the art, and a sequence's start key is not one.
+      const additive =
+        !fn.startsWith("macro.") &&
+        (ev.ctrlKey || ev.metaKey || ev.shiftKey || isMultiMode());
       if (additive) {
         ev.preventDefault();
         if (!learnAllowed()) {
@@ -1118,6 +1274,43 @@ function wire(root: HTMLElement): void {
     if (form.querySelector("[data-act]")) return;
     void submitNoJsForm(form, (ev as SubmitEvent).submitter);
   });
+
+  // ── v11: the macro editor's form controls ──────────────────────────────
+  // Every one of them moves the DRAFT and nothing else; the TOML block below
+  // the grid is the output, and it re-renders on the same tick.
+  const macroInput = (ev: Event): void => {
+    const el = ev.target as HTMLElement | null;
+    if (!(el instanceof HTMLInputElement) && !(el instanceof HTMLSelectElement)) return;
+    // The two TEXT boxes commit on `change` (blur / Enter / spinner), never on
+    // `input`: a repaint mid-keystroke rewrites the very field being typed
+    // into, and a caret that jumps to the end on every character is not an
+    // editor. The selects and the checkbox have no caret, so they are live.
+    const committed = ev.type === "change";
+    if (el.classList.contains("macdurin")) {
+      if (committed) macroSetDuration(Number(el.value), macroCurrentUnit());
+      return;
+    }
+    if (el.classList.contains("macunit")) {
+      // CONVERTS, never reinterprets: 50 ms picked as frames is 3 frames, not
+      // 50 of them. The unit is an authoring convenience, so changing it must
+      // not change how long the step runs.
+      macroSetUnit(el.value);
+      syncMacroControls();
+      return;
+    }
+    if (el instanceof HTMLInputElement && el.classList.contains("macshortin")) {
+      macroSetAllowShort(el.checked);
+      return;
+    }
+    if (el.classList.contains("macnamein")) {
+      if (committed) macroRename(el.value);
+      return;
+    }
+    const field = el.dataset.macpol;
+    if (field) macroSetPolicy(field, el.value);
+  };
+  root.addEventListener("input", macroInput);
+  root.addEventListener("change", macroInput);
 
   // Right-click on a zone or legend row is a DESKTOP BONUS path to clear —
   // never the only one (this page is meant for a phone at the cabinet, where
@@ -1218,6 +1411,10 @@ activateIslands({
       const query = new URLSearchParams(window.location.search);
       const fromQuery = query.get("slot");
       if (fromQuery) seed.selected = Number(fromQuery) || seed.selected;
+      // …and `?macro=NAME` the same way, so a reload (or a no-JS tab click
+      // that came back with JavaScript on) lands on the same sequence.
+      const macroQuery = query.get("macro");
+      if (macroQuery) seed.macro_selected = macroQuery;
       selectSlot(seed.selected);
       applyMap(seed);
       // v9: we landed on a no-JS POST's redirect (JS came back, or the user
@@ -1236,6 +1433,9 @@ activateIslands({
       }
     }
     wire(el);
+    // The macro editor's form controls carry values an attribute binding
+    // cannot keep once they are dirty; seed them from the draft right away.
+    syncMacroControls();
     window.setInterval(() => void poll(), POLL_MS);
     return MapIsland();
   },

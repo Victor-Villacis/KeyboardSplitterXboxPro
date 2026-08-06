@@ -54,7 +54,7 @@ use forma_ir::slot::{SlotData, SlotValue};
 use forma_server::{render_page, PageConfig, PageOutput, RenderMode};
 
 use crate::render::{art_for, body_prefix, daemon_command, EmbeddedPage};
-use crate::snapshot::{MapPayload, MapperSlot};
+use crate::snapshot::{MacroStepView, MacroView, MapPayload, MapperSlot};
 
 /// List slot names (binding-derived, compiler 0.2.0). The zones list appears
 /// TWICE — once inside each stage show (xbox / ds4) — so the second
@@ -73,6 +73,13 @@ const LIST_SLOT_LEGEND: &str = "list:legendRows:array";
 /// `createShow` (ledger #4/#14), because the stack is a list inside a plain
 /// container rather than a conditional panel.
 const LIST_SLOT_TOASTS: &str = "list:toasts:array";
+/// v11's macro editor. Four lists, all binding-derived like the rest: the tab
+/// strip, the grid's column headers, the row bar (step number + duration +
+/// flag + the five step verbs) and the FLAT `steps × controls` cell matrix.
+const LIST_SLOT_MACRO_TABS: &str = "list:macroTabs:array";
+const LIST_SLOT_MACRO_COLS: &str = "list:macroCols:array";
+const LIST_SLOT_MACRO_ROWS: &str = "list:macroRows:array";
+const LIST_SLOT_MACRO_CELLS: &str = "list:macroCells:array";
 
 #[cfg(test)]
 const ISLAND_COMPONENT: &str = "MapIsland";
@@ -798,9 +805,559 @@ fn backup_line(selected: Option<&MapperSlot>) -> String {
 const SEL_TOGGLE_OFF: &str = "btn btn-row seltoggle";
 const SEL_TOGGLE_LABEL_OFF: &str = "Select multiple";
 
+// ── v11: THE MACRO EDITOR — the piano roll ─────────────────────────────────
+// docs/INPUT-TRANSFORMS.md §6.2, adopted from TAStudio: "rows = steps,
+// columns = the slot's controls, cells = held or not". That beats a form with
+// an "add step" button because a timed sequence is a SHAPE — you have to see
+// ↓, ↘, → as three rows with the diagonal overlapping to know you wrote a
+// quarter-circle rather than three unrelated presses.
+//
+// It is READ-ONLY against disk, and says so everywhere. §1c is explicit that
+// "authoring the sequence itself stays TOML-only": `ksx map` binds the key
+// that STARTS a macro (mapping.rs `apply_macro_trigger`) and there is no
+// daemon verb that writes a step list at all. So this editor is a COMPOSER —
+// it seeds from the file, every edit moves a local draft, and the output is a
+// TOML block to paste plus the exact `ksx map` line for the trigger. What IS
+// a real write is the trigger, and it goes through the same `map` verb every
+// other binding on this page uses — no second writer, no faked one.
+//
+// Every derivation below is mirrored in MapIsland.ts (server derives the SSR
+// paint, the client re-derives per edit and per poll), the established rule
+// for this page.
+
+/// The shortest step a 60 Hz poller can be relied on to see, in ms.
+///
+/// A MIRROR of `ksx_core::MIN_STEP_MS` (§0.2: ~16.7 ms per sample, so ~33 ms
+/// is two of them). This crate depends on no other ksx crate at runtime, so
+/// the number is repeated here and pinned against the real one by
+/// `the_sampling_floor_matches_ksx_core`.
+pub(crate) const MIN_STEP_MS: u32 = 33;
+
+/// 60 Hz frames → ms, rounded to nearest ONCE — `ksx_core::StepDuration::ms`.
+/// Rounded once so three frames is 50 ms and not 3 × 17 = 51.
+fn frames_ms(frames: u32) -> u32 {
+    (frames.saturating_mul(1000) + 30) / 60
+}
+
+/// The duration a step ASKS for, in ms. `None` when the file says both units
+/// or neither — which is a fault, not a number to guess (`MacroStepFile::
+/// duration`), and is reported as one.
+fn requested_ms(step: &MacroStepView) -> Option<u32> {
+    match (step.ms, step.frames) {
+        (Some(ms), None) => Some(ms),
+        (None, Some(frames)) => Some(frames_ms(frames)),
+        _ => None,
+    }
+}
+
+/// What the engine would actually hold this step for: below the floor is
+/// RAISED unless the author opted out (`MacroStep::effective_ms`).
+fn effective_ms(step: &MacroStepView) -> u32 {
+    match requested_ms(step) {
+        Some(ms) if step.allow_short || ms >= MIN_STEP_MS => ms,
+        Some(_) => MIN_STEP_MS,
+        None => 0,
+    }
+}
+
+/// "50 ms" / "3 fr · 50 ms" / "—" — the row's own duration, in the unit it was
+/// authored in (a sequence written in frames must still read in frames).
+fn duration_text(step: &MacroStepView) -> String {
+    match (step.ms, step.frames) {
+        (Some(ms), None) => format!("{ms} ms"),
+        (None, Some(frames)) => format!("{frames} fr · {} ms", frames_ms(frames)),
+        _ => "—".to_owned(),
+    }
+}
+
+/// The INLINE amber flag — short enough to always fit on the row beside the
+/// duration, because a truncated warning is a warning nobody reads. The rule
+/// it is short for is stated once, in full, in the card's own note; the whole
+/// sentence rides the row's `title` ([`step_warning_long`]).
+fn step_warning(step: &MacroStepView) -> String {
+    match (step.ms, step.frames) {
+        (Some(_), Some(_)) => "two units".to_owned(),
+        (None, None) => "no duration".to_owned(),
+        _ => match requested_ms(step) {
+            Some(ms) if ms < MIN_STEP_MS && step.allow_short => {
+                format!("{ms} ms — may be missed")
+            }
+            Some(ms) if ms < MIN_STEP_MS => format!("{ms} ms — raised to {MIN_STEP_MS} ms"),
+            _ => String::new(),
+        },
+    }
+}
+
+/// The same flag, in full — never a silent acceptance and never a silent
+/// rewrite (§1c "the sampling rule, enforced": both outcomes are advisories,
+/// and neither is ever quiet). Empty = nothing to say.
+fn step_warning_long(step: &MacroStepView) -> String {
+    match (step.ms, step.frames) {
+        (Some(_), Some(_)) => {
+            "says both ms and frames — exactly one, or the file is refused".to_owned()
+        }
+        (None, None) => {
+            "no duration — give it ms or frames (a step with none is refused)".to_owned()
+        }
+        _ => {
+            let Some(ms) = requested_ms(step) else {
+                return String::new();
+            };
+            if ms >= MIN_STEP_MS {
+                return String::new();
+            }
+            if step.allow_short {
+                format!(
+                    "{ms} ms is shorter than ~2 poll intervals ({MIN_STEP_MS} ms) — allow_short \
+                     is on, so it runs as written and the game may never see it"
+                )
+            } else {
+                format!(
+                    "{ms} ms is shorter than ~2 poll intervals ({MIN_STEP_MS} ms) — the game may \
+                     never see it, so ksx raises this step to {MIN_STEP_MS} ms"
+                )
+            }
+        }
+    }
+}
+
+/// The sampling rule, stated ONCE, where the amber rows can point at it (§0.2).
+/// The per-row flag is short so it always fits; this is what it means.
+pub(crate) const MACRO_RULE_LINE: &str =
+    "Amber steps are shorter than ~2 poll intervals (33 ms at 60 Hz), which is the shortest \
+     thing a game can be relied on to see — a 5 ms step is not unreliable, it is invisible. \
+     ksx raises a short step to 33 ms so it lands; a step marked allow_short runs exactly as \
+     written and can be missed entirely. Neither is ever silent.";
+
+/// A macro's run length at the durations the engine will use.
+fn total_ms(mac: &MacroView) -> u32 {
+    mac.steps.iter().map(effective_ms).sum()
+}
+
+/// The macro the page paints: the payload's `macro_selected` if the preset has
+/// it (case-insensitively, like every function name), else the first one, else
+/// the starter draft.
+fn selected_macro(payload: &MapPayload) -> MacroView {
+    payload
+        .macros
+        .macros
+        .iter()
+        .find(|m| m.name.eq_ignore_ascii_case(&payload.macro_selected))
+        .or_else(|| payload.macros.macros.first())
+        .cloned()
+        .unwrap_or_else(starter_macro)
+}
+
+/// The macro a preset with none starts from — a real, valid one-step sequence,
+/// so the grid, the warnings and the TOML block are the same code path whether
+/// you are reading a macro or writing your first.
+pub(crate) fn starter_macro() -> MacroView {
+    MacroView {
+        name: "my-macro".to_owned(),
+        steps: vec![MacroStepView {
+            hold: vec!["dpad.down".to_owned()],
+            ms: Some(50),
+            frames: None,
+            allow_short: false,
+        }],
+        on_release: "finish".to_owned(),
+        retrigger: "ignore".to_owned(),
+        interrupt: "none".to_owned(),
+        triggers: Vec::new(),
+    }
+}
+
+/// Is this macro one the preset actually holds (rather than the starter draft)?
+fn is_on_disk(payload: &MapPayload, mac: &MacroView) -> bool {
+    payload
+        .macros
+        .macros
+        .iter()
+        .any(|m| m.name.eq_ignore_ascii_case(&mac.name))
+}
+
+/// `macro.<name>` — the function name the `map` verb takes for a TRIGGER.
+/// Same spelling `ksx_config::macro_function_name` writes into the file.
+fn macro_function(name: &str) -> String {
+    format!("macro.{name}")
+}
+
+/// The macro tab strip: one anchor per macro the preset defines, so switching
+/// works with JavaScript off (`/map?slot=N&macro=NAME` is a route).
+fn macro_tabs(payload: &MapPayload, current: &MacroView) -> SlotValue {
+    SlotValue::Array(
+        payload
+            .macros
+            .macros
+            .iter()
+            .map(|m| {
+                let active = m.name.eq_ignore_ascii_case(&current.name);
+                SlotValue::Object(vec![
+                    ("name".to_owned(), SlotValue::Text(m.name.clone())),
+                    (
+                        "label".to_owned(),
+                        SlotValue::Text(format!("{} · {} steps", m.name, m.steps.len())),
+                    ),
+                    (
+                        "href".to_owned(),
+                        SlotValue::Text(format!(
+                            "/map?slot={}&macro={}",
+                            payload.selected,
+                            urlencode_value(&m.name)
+                        )),
+                    ),
+                    (
+                        "cls".to_owned(),
+                        SlotValue::Text(if active { "mactab active" } else { "mactab" }.to_owned()),
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// Percent-encode a macro name for the tab's href. Names come from a file and
+/// are otherwise unconstrained, so this is not optional.
+fn urlencode_value(text: &str) -> String {
+    let mut out = String::new();
+    let mut utf8 = [0u8; 4];
+    for c in text.chars().take(120) {
+        for byte in c.encode_utf8(&mut utf8).bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(byte as char);
+                }
+                _ => out.push_str(&format!("%{byte:02X}")),
+            }
+        }
+    }
+    out
+}
+
+/// The grid's COLUMN HEADERS: the slot's controls, in pad-reading order, with
+/// the same identity glyphs and palette the art and the legend already use —
+/// so a column is recognisably the button it is (persona-aware: `A` on Xbox,
+/// `✕` on a DualShock).
+fn macro_cols(slot: Option<&MapperSlot>) -> SlotValue {
+    let persona = slot.map_or("xbox360", |s| s.persona.as_str());
+    SlotValue::Array(
+        zones_for(persona)
+            .iter()
+            .map(|z| {
+                SlotValue::Object(vec![
+                    ("fn".to_owned(), SlotValue::Text(z.fn_name.to_owned())),
+                    ("id".to_owned(), SlotValue::Text(z.label.to_owned())),
+                    (
+                        "idcls".to_owned(),
+                        SlotValue::Text(format!("maccolid id-{}", z.idk)),
+                    ),
+                    (
+                        "title".to_owned(),
+                        SlotValue::Text(format!("{} ({})", legend_label(z), z.fn_name)),
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// What one step holds, named the way this pad names it: "D-pad ▼ + D-pad ▶".
+fn hold_text(slot: Option<&MapperSlot>, hold: &[String]) -> String {
+    if hold.is_empty() {
+        return "nothing — a neutral gap".to_owned();
+    }
+    let persona = slot.map_or("xbox360", |s| s.persona.as_str());
+    let zones = zones_for(persona);
+    hold.iter()
+        .map(|f| {
+            zones
+                .iter()
+                .find(|z| z.fn_name.eq_ignore_ascii_case(f))
+                .map_or_else(|| f.clone(), legend_label)
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// The ROW BAR beside the grid: step number, its duration, the amber flag, and
+/// the five step verbs. One list, because the row's controls and the row's
+/// label are the same row — the matrix beside it aligns on a fixed row height.
+///
+/// `selected` is the step the duration editor is pointed at (client-only: an
+/// SSR paint has selected nothing, so it passes `None`).
+fn macro_rows(mac: &MacroView, slot: Option<&MapperSlot>, selected: Option<usize>) -> SlotValue {
+    let last = mac.steps.len().saturating_sub(1);
+    SlotValue::Array(
+        mac.steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| {
+                let warn = step_warning(step);
+                let mut cls = String::from("macrow");
+                if !warn.is_empty() {
+                    cls.push_str(" short");
+                }
+                if selected == Some(i) {
+                    cls.push_str(" sel");
+                }
+                SlotValue::Object(vec![
+                    ("n".to_owned(), SlotValue::Text((i + 1).to_string())),
+                    ("cls".to_owned(), SlotValue::Text(cls)),
+                    ("dur".to_owned(), SlotValue::Text(duration_text(step))),
+                    (
+                        "durtitle".to_owned(),
+                        SlotValue::Text(format!(
+                            "step {} holds {} for {} (the engine runs it for {} ms)",
+                            i + 1,
+                            hold_text(slot, &step.hold),
+                            duration_text(step),
+                            effective_ms(step)
+                        )),
+                    ),
+                    (
+                        "hold".to_owned(),
+                        SlotValue::Text(hold_text(slot, &step.hold)),
+                    ),
+                    ("warn".to_owned(), SlotValue::Text(warn.clone())),
+                    (
+                        "warntitle".to_owned(),
+                        SlotValue::Text(step_warning_long(step)),
+                    ),
+                    (
+                        "warncls".to_owned(),
+                        SlotValue::Text(
+                            if warn.is_empty() {
+                                "macwarn off"
+                            } else {
+                                "macwarn"
+                            }
+                            .to_owned(),
+                        ),
+                    ),
+                    // The five step verbs, each carrying `verb|index`. Same
+                    // delegation shape as the legend's `data-rmkey`.
+                    ("selact".to_owned(), SlotValue::Text(format!("sel|{i}"))),
+                    ("upact".to_owned(), SlotValue::Text(format!("up|{i}"))),
+                    ("dnact".to_owned(), SlotValue::Text(format!("down|{i}"))),
+                    ("iaact".to_owned(), SlotValue::Text(format!("insa|{i}"))),
+                    ("ibact".to_owned(), SlotValue::Text(format!("insb|{i}"))),
+                    ("delact".to_owned(), SlotValue::Text(format!("del|{i}"))),
+                    (
+                        "upcls".to_owned(),
+                        SlotValue::Text(if i == 0 { "macbtn off" } else { "macbtn" }.to_owned()),
+                    ),
+                    (
+                        "dncls".to_owned(),
+                        SlotValue::Text(if i == last { "macbtn off" } else { "macbtn" }.to_owned()),
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// The matrix itself, FLAT: `steps × 25` cells in row-major order, laid out by
+/// a 25-column CSS grid.
+///
+/// Flat because the compiled list item body has no inner `createList` seam
+/// (dogfood ledger #17's neighbour — the same constraint that made the legend's
+/// key chips fixed fields). One list of `rows × columns` cells and a
+/// `grid-template-columns` is the shape that survives it, and it reconciles
+/// exactly as well as a nested one would.
+fn macro_cells(mac: &MacroView, slot: Option<&MapperSlot>, selected: Option<usize>) -> SlotValue {
+    let persona = slot.map_or("xbox360", |s| s.persona.as_str());
+    let zones = zones_for(persona);
+    let mut cells = Vec::with_capacity(mac.steps.len() * zones.len());
+    for (i, step) in mac.steps.iter().enumerate() {
+        for z in zones.iter() {
+            let held = step.hold.iter().any(|f| f.eq_ignore_ascii_case(z.fn_name));
+            let mut cls = String::from("maccell");
+            if held {
+                cls.push_str(" on");
+            }
+            if selected == Some(i) {
+                cls.push_str(" inrow");
+            }
+            cells.push(SlotValue::Object(vec![
+                ("cls".to_owned(), SlotValue::Text(cls)),
+                (
+                    "cell".to_owned(),
+                    SlotValue::Text(format!("{i}|{}", z.fn_name)),
+                ),
+                (
+                    "mark".to_owned(),
+                    SlotValue::Text(if held { "●" } else { "" }.to_owned()),
+                ),
+                (
+                    "title".to_owned(),
+                    SlotValue::Text(format!(
+                        "step {} {} {} ({})",
+                        i + 1,
+                        if held { "holds" } else { "does not hold" },
+                        legend_label(z),
+                        z.fn_name
+                    )),
+                ),
+            ]));
+        }
+    }
+    SlotValue::Array(cells)
+}
+
+/// TOML string escaping — macro names and key names come from a file.
+fn toml_str(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The whole point of a read-only editor: the block you paste.
+///
+/// Emitted exactly as `ksx_config::MacroFile` spells it — defaults omitted (a
+/// macro-free-looking file stays macro-free-looking), the duration in the unit
+/// it was authored in, and the trigger row underneath so the macro arrives with
+/// the key that starts it. When there is no trigger yet the row is COMMENTED
+/// OUT rather than filled with a placeholder, because a pasted
+/// `macro.x = "<KEY>"` would not load.
+fn macro_toml(mac: &MacroView) -> String {
+    let mut out = format!("[macros.{}]\n", mac.name);
+    if mac.on_release != "finish" {
+        out.push_str(&format!("on_release = {}\n", toml_str(&mac.on_release)));
+    }
+    if mac.retrigger != "ignore" {
+        out.push_str(&format!("retrigger = {}\n", toml_str(&mac.retrigger)));
+    }
+    if mac.interrupt != "none" {
+        out.push_str(&format!("interrupt = {}\n", toml_str(&mac.interrupt)));
+    }
+    out.push_str("steps = [\n");
+    for step in &mac.steps {
+        let hold = step
+            .hold
+            .iter()
+            .map(|f| toml_str(f))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let duration = match (step.ms, step.frames) {
+            (Some(ms), None) => format!("ms = {ms}"),
+            (None, Some(frames)) => format!("frames = {frames}"),
+            (Some(ms), Some(frames)) => format!("ms = {ms}, frames = {frames}"),
+            (None, None) => "ms = ".to_owned(),
+        };
+        out.push_str(&format!("  {{ hold = [{hold}], {duration}"));
+        if step.allow_short {
+            out.push_str(", allow_short = true");
+        }
+        out.push_str(" },\n");
+    }
+    out.push_str("]\n\n[bindings]\n");
+    match mac.triggers.as_slice() {
+        [] => out.push_str(&format!(
+            "# macro.{} = \"<KEY>\"   # no trigger yet — bind one above, or with the line below\n",
+            mac.name
+        )),
+        [one] => out.push_str(&format!("macro.{} = {}\n", mac.name, toml_str(one))),
+        many => out.push_str(&format!(
+            "macro.{} = [{}]\n",
+            mac.name,
+            many.iter()
+                .map(|k| toml_str(k))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+    out
+}
+
+/// The trigger's `ksx map` line — the ONE macro edit that is a real write, so
+/// the line is complete rather than a template when a key is already bound.
+fn macro_cli(preset: &str, mac: &MacroView) -> String {
+    let key = mac.triggers.first().map_or("<KEY>", String::as_str);
+    format!(
+        "ksx map --preset \"{preset}\" --function {} --key {key}",
+        macro_function(&mac.name)
+    )
+}
+
+/// Which keys start this macro, in words.
+fn macro_trigger_line(mac: &MacroView) -> String {
+    match mac.triggers.as_slice() {
+        [] => "no trigger key yet — nothing starts this macro".to_owned(),
+        [one] => format!("started by {one}"),
+        many => format!(
+            "started by {} — any one of them ({} keys)",
+            many.join(KEY_SEP),
+            many.len()
+        ),
+    }
+}
+
+/// The one-line summary above the grid.
+fn macro_head(mac: &MacroView) -> String {
+    format!(
+        "{} — {} step{} · {} ms total",
+        mac.name,
+        mac.steps.len(),
+        if mac.steps.len() == 1 { "" } else { "s" },
+        total_ms(mac)
+    )
+}
+
+/// The three policies, as the file holds them right now — the READABLE half of
+/// the three selects beside them (those are draft controls and are hidden
+/// without JavaScript, this line never is).
+fn macro_policy_line(mac: &MacroView) -> String {
+    format!(
+        "on release: {} · retrigger: {} · interrupt: {}",
+        mac.on_release, mac.retrigger, mac.interrupt
+    )
+}
+
+/// The honest sentence about what this panel can and cannot do — the whole
+/// §1c "authoring stays TOML-only" fact, plus whatever the provider could not
+/// tell us, worst problem first. It is never empty: a read-only editor that
+/// does not say it is read-only is the silent no-op this page bans.
+fn macro_note(payload: &MapPayload, mac: &MacroView) -> String {
+    if !payload.macros.available {
+        return format!(
+            "This preset's macros could not be read ({}), so the grid starts from a blank \
+             sequence rather than from your file. Everything below still composes a valid \
+             [macros] block — but check it against the preset before pasting.",
+            payload.macros.reason
+        );
+    }
+    if payload.macros.macros.is_empty() {
+        return "This preset defines no macros yet. The grid below is a NEW sequence — paint \
+                the cells, then paste the TOML block into the preset file. (Step lists are \
+                authored in TOML on purpose: the daemon's map verb writes the key that STARTS \
+                a macro, and has no shape for a step list at all.)"
+            .to_owned();
+    }
+    if !is_on_disk(payload, mac) {
+        return "This is a NEW sequence, not one of the preset's — paste the TOML block below \
+                to add it."
+            .to_owned();
+    }
+    "Steps are read from the preset file and edited here as a DRAFT: nothing in this grid is \
+     saved. Copy the TOML block below into the preset (docs/INPUT-TRANSFORMS.md §1c keeps \
+     step authoring in TOML — the daemon's map verb writes the key that STARTS a macro, and \
+     has no shape for a step list). The trigger below IS a real write, through that same verb."
+        .to_owned()
+}
+
 fn scalar_slots(
     payload: &MapPayload,
     selected: Option<&MapperSlot>,
+    mac: &MacroView,
     flash: Option<&str>,
 ) -> serde_json::Value {
     let slot_line = match selected {
@@ -847,6 +1404,43 @@ fn scalar_slots(
         } else {
             "card pactions off"
         },
+        // ── v11: the macro editor ──────────────────────────────────────
+        // Not one new `createShow` between them: every state here is a class
+        // string on an element that is always in the DOM (ledger #13/#14 —
+        // shows are POSITIONAL, so a new one in the middle of the document
+        // silently shifts every panel after it). The card dims when there is
+        // no macro data rather than vanishing, exactly like the preset card.
+        "macroHead": macro_head(mac),
+        "macroRuleLine": MACRO_RULE_LINE,
+        "macroPolicyLine": macro_policy_line(mac),
+        "macroNote": macro_note(payload, mac),
+        "macroTriggerLine": macro_trigger_line(mac),
+        "macroFnName": macro_function(&mac.name),
+        "macroName": mac.name.clone(),
+        "macroCliLine": macro_cli(
+            if payload.macros.preset.is_empty() {
+                selected.map_or("<PRESET>", |s| s.preset.as_str())
+            } else {
+                payload.macros.preset.as_str()
+            },
+            mac,
+        ),
+        "macroToml": macro_toml(mac),
+        "macroCardCls": if payload.macros.available {
+            "card macrocard"
+        } else {
+            "card macrocard off"
+        },
+        "macroGridCls": if mac.steps.is_empty() {
+            "macgrid empty"
+        } else {
+            "macgrid"
+        },
+        // Client-only, both of them: an SSR paint has edited nothing and has
+        // no step selected for the duration editor.
+        "macroDirtyLine": "",
+        "macroStepLine": "click a step's ⏱ to edit its duration",
+        "macroDurValue": "50",
     })
 }
 
@@ -899,7 +1493,8 @@ fn named_slot_ids(module: &IrModule, name: &str) -> Vec<u16> {
 
 fn build_slots(module: &IrModule, payload: &MapPayload, flash: Option<&str>) -> SlotData {
     let selected = selected_slot(payload);
-    let scalars = scalar_slots(payload, selected, flash).to_string();
+    let mac = selected_macro(payload);
+    let scalars = scalar_slots(payload, selected, &mac, flash).to_string();
     let mut slots = SlotData::from_json(&scalars, module)
         .unwrap_or_else(|_| SlotData::new_from_defaults(&module.slots));
 
@@ -919,6 +1514,12 @@ fn build_slots(module: &IrModule, payload: &MapPayload, flash: Option<&str>) -> 
         (LIST_SLOT_LEGEND, legend),
         // Explicitly empty, so the toast stack can never SSR a stale report.
         (LIST_SLOT_TOASTS, SlotValue::Array(Vec::new())),
+        // v11's piano roll. `None` for the selected step: an SSR paint has
+        // pointed the duration editor at nothing.
+        (LIST_SLOT_MACRO_TABS, macro_tabs(payload, &mac)),
+        (LIST_SLOT_MACRO_COLS, macro_cols(selected)),
+        (LIST_SLOT_MACRO_ROWS, macro_rows(&mac, selected, None)),
+        (LIST_SLOT_MACRO_CELLS, macro_cells(&mac, selected, None)),
     ] {
         if let Some(id) = named_slot_ids(module, name).into_iter().next() {
             slots.set(id, value);
@@ -967,8 +1568,40 @@ pub(crate) fn render_map(
 mod tests {
     use super::*;
     use crate::control::{LearnView, SessionView};
-    use crate::snapshot::MapperSnapshot;
+    use crate::snapshot::{MacroSnapshot, MapperSnapshot};
     use std::collections::BTreeMap;
+
+    fn step(
+        hold: &[&str],
+        ms: Option<u32>,
+        frames: Option<u32>,
+        allow_short: bool,
+    ) -> MacroStepView {
+        MacroStepView {
+            hold: hold.iter().map(|f| (*f).to_owned()).collect(),
+            ms,
+            frames,
+            allow_short,
+        }
+    }
+
+    /// The documented hadouken (docs/INPUT-TRANSFORMS.md §1c), as the file
+    /// spells it.
+    fn hadouken() -> MacroView {
+        MacroView {
+            name: "hadouken".to_owned(),
+            steps: vec![
+                step(&["dpad.down"], Some(50), None, false),
+                step(&["dpad.down", "dpad.right"], Some(50), None, false),
+                step(&["dpad.right"], None, Some(3), false),
+                step(&["A"], Some(50), None, false),
+            ],
+            on_release: "finish".to_owned(),
+            retrigger: "ignore".to_owned(),
+            interrupt: "none".to_owned(),
+            triggers: vec!["P".to_owned()],
+        }
+    }
 
     fn slot(number: u8, persona: &str, preset: &str) -> MapperSlot {
         let mut bindings = BTreeMap::new();
@@ -1015,6 +1648,8 @@ mod tests {
                 ..LearnView::default()
             },
             selected: 1,
+            macros: MacroSnapshot::read("IPAC P1", vec![hadouken()]),
+            macro_selected: String::new(),
         }
     }
 
@@ -1118,7 +1753,7 @@ mod tests {
             .filter_map(|e| module.strings.get(e.name_str_idx).ok())
             .collect();
 
-        let scalars = scalar_slots(&sample(), None, None);
+        let scalars = scalar_slots(&sample(), None, &hadouken(), None);
         for key in scalars.as_object().unwrap().keys() {
             assert!(
                 names.contains(&key.as_str()),
@@ -1137,6 +1772,12 @@ mod tests {
                 LIST_SLOT_ZONES,
                 LIST_SLOT_ZONES_2,
                 LIST_SLOT_LEGEND,
+                // Document order: the row bar precedes the scroller that
+                // holds the column headers and the matrix.
+                LIST_SLOT_MACRO_TABS,
+                LIST_SLOT_MACRO_ROWS,
+                LIST_SLOT_MACRO_COLS,
+                LIST_SLOT_MACRO_CELLS,
                 LIST_SLOT_TOASTS
             ],
             "mapper list slot names drifted; slots: {names:?}"
@@ -1704,7 +2345,7 @@ mod tests {
         // The server-rendered flash channel (savedLine + its two shows) is
         // still part of the seam — that is the no-JS page's only feedback.
         assert!(
-            scalar_slots(&sample(), None, None)
+            scalar_slots(&sample(), None, &hadouken(), None)
                 .as_object()
                 .unwrap()
                 .contains_key("savedLine"),
@@ -1774,8 +2415,8 @@ mod tests {
         );
         assert_eq!(
             html.matches(r#"action="/map/bind""#).count(),
-            26,
-            "25 row forms + the bind-by-name panel: {html}"
+            27,
+            "25 row forms + the bind-by-name panel + v11's macro trigger: {html}"
         );
         // The row form carries the slot (the server resolves the preset from
         // it), the function, a key select and both verbs. Clear rides the
@@ -1794,8 +2435,11 @@ mod tests {
         );
         assert_eq!(
             html.matches(r#"formaction="/map/clear""#).count(),
-            26,
-            "every bind form offers Clear without JavaScript: {html}"
+            27,
+            "every bind form offers Clear without JavaScript — the macro trigger included, \
+             which is why it is 27 and the add/remove pair below is 26: those two are
+             read-modify-write against the `bindings` map, and macro triggers do not live \
+             there: {html}"
         );
         // v10: the same form, two more verbs — ADD the picked key to what the
         // control has, or REMOVE just that one. Removing one key of several
@@ -1942,6 +2586,397 @@ mod tests {
             "the form itself must survive: {}",
             out.html
         );
+    }
+
+    // ── v11: the macro editor ──────────────────────────────────────────────
+
+    /// The sampling rule is ksx-core's, not this crate's. ksx-studio depends
+    /// on no ksx crate at runtime, so the floor and the frame conversion are
+    /// MIRRORED here — and a mirror that drifts is exactly the bug this test
+    /// exists to prevent (a grid that says "fine" about a step the engine
+    /// raises, or vice versa).
+    #[test]
+    fn the_sampling_floor_and_frame_maths_match_ksx_core() {
+        use ksx_core::macros::{MacroStep, StepDuration, MIN_STEP_MS as CORE_MIN};
+        assert_eq!(MIN_STEP_MS, CORE_MIN);
+        for frames in [1u32, 2, 3, 4, 60] {
+            assert_eq!(
+                frames_ms(frames),
+                StepDuration::Frames(frames).ms(),
+                "{frames}"
+            );
+        }
+        for (ms, allow_short) in [(5u32, false), (5, true), (33, false), (500, false)] {
+            let mine = step(&[], Some(ms), None, allow_short);
+            let theirs = if allow_short {
+                MacroStep::short(Vec::new(), ms)
+            } else {
+                MacroStep::new(Vec::new(), ms)
+            };
+            assert_eq!(
+                effective_ms(&mine),
+                theirs.effective_ms(),
+                "{ms}/{allow_short}"
+            );
+            assert_eq!(step_warning(&mine).is_empty(), !theirs.is_short());
+            assert_eq!(step_warning_long(&mine).is_empty(), !theirs.is_short());
+        }
+        // A frames-authored step goes through the same floor.
+        assert_eq!(effective_ms(&step(&[], None, Some(1), false)), MIN_STEP_MS);
+        assert_eq!(effective_ms(&step(&[], None, Some(3), false)), 50);
+        // Total run length is the sum of the EFFECTIVE durations, like
+        // `Macro::total_ms` — a raised step moves everything after it.
+        assert_eq!(total_ms(&hadouken()), 200);
+    }
+
+    /// The three policy selects offer exactly what ksx-core accepts, spelled
+    /// the way a config file stores it. A word this page invents is a select
+    /// that writes a preset the loader refuses.
+    #[test]
+    fn the_policy_vocabularies_match_ksx_core() {
+        use ksx_core::macros::{Interrupt, OnRelease, Retrigger};
+        let out = render_map(&page(), &sample(), None);
+        for word in OnRelease::ALL.iter().map(|p| p.as_str()) {
+            assert!(
+                out.html.contains(&format!("<option>{word}</option>")),
+                "{word}"
+            );
+        }
+        for word in Retrigger::ALL.iter().map(|p| p.as_str()) {
+            assert!(
+                out.html.contains(&format!("<option>{word}</option>")),
+                "{word}"
+            );
+        }
+        for word in Interrupt::ALL.iter().map(|p| p.as_str()) {
+            assert!(
+                out.html.contains(&format!("<option>{word}</option>")),
+                "{word}"
+            );
+        }
+        // Defaults FIRST in each list: the select is a draft control, and an
+        // SSR paint cannot mark an option selected, so the resting value has
+        // to be the one a macro has when it says nothing.
+        assert_eq!(OnRelease::ALL[0].as_str(), "finish");
+        assert_eq!(Retrigger::ALL[0].as_str(), "ignore");
+        assert_eq!(Interrupt::ALL[0].as_str(), "none");
+    }
+
+    /// THE SHAPE (docs/INPUT-TRANSFORMS.md §6.2): rows are steps, columns are
+    /// the slot's controls, a cell is held or not. You SEE the sequence.
+    #[test]
+    fn the_piano_roll_puts_steps_on_rows_and_controls_on_columns() {
+        let out = render_map(&page(), &sample(), None);
+        let html = &out.html;
+
+        // 4 steps × 25 controls, every cell addressable as `step|function`.
+        assert_eq!(
+            html.matches(r#"class="maccell"#).count(),
+            4 * 25,
+            "one cell per (step, control): {html}"
+        );
+        assert!(html.contains(r#"data-cell="0|dpad.down""#), "{html}");
+        assert!(html.contains(r#"data-cell="3|A""#), "{html}");
+        // Held cells carry the mark AND the class; the diagonal step holds two.
+        assert_eq!(
+            html.matches(r#"class="maccell on""#).count(),
+            5,
+            "↓, ↓+→, →, A = five held cells: {html}"
+        );
+        assert!(
+            html.contains("step 2 holds D-pad ▼"),
+            "the cell says what it means in the pad's own words: {html}"
+        );
+        assert!(html.contains("step 1 does not hold"), "{html}");
+        // Rows: numbered, in order, wearing their duration — including the one
+        // authored in frames, which must still READ as frames.
+        assert_eq!(
+            html.matches(r#"class="macnum""#).count(),
+            4,
+            "one numbered row per step: {html}"
+        );
+        assert_eq!(text_in(html, "macnum").as_deref(), Some("1"), "{html}");
+        assert_eq!(text_in(html, "macdur").as_deref(), Some("50 ms"), "{html}");
+        assert!(
+            html.contains("3 fr · 50 ms"),
+            "the authored unit survives: {html}"
+        );
+        // Columns: the persona's identity glyphs, the same ones the art wears.
+        assert!(html.contains(r#"class="maccolid id-xa""#), "{html}");
+        assert!(html.contains("D-pad ▼ (dpad.down)"), "{html}");
+        // The head line and the policies, in words.
+        assert_eq!(
+            text_in(html, "machead").as_deref(),
+            Some("hadouken — 4 steps · 200 ms total"),
+            "{html}"
+        );
+        assert!(
+            html.contains("on release: finish · retrigger: ignore · interrupt: none"),
+            "{html}"
+        );
+        // Step verbs, one payload per row.
+        for act in ["up|1", "down|1", "insa|1", "insb|1", "del|1", "sel|1"] {
+            assert!(
+                html.contains(&format!(r#"data-macact="{act}""#)),
+                "{act}: {html}"
+            );
+        }
+        // The ends of the list cannot move further out.
+        assert!(html.contains(r#"class="macbtn off""#), "{html}");
+    }
+
+    /// The sampling rule, VISIBLE (§0.2). A step below ~2 poll intervals is
+    /// flagged inline with the reason — never silently accepted, and never
+    /// silently rewritten either: the flag says which of the two happened.
+    #[test]
+    fn a_step_shorter_than_the_sampling_floor_is_flagged_with_the_reason() {
+        let mut payload = sample();
+        payload.macros.macros[0].steps[0] = step(&["dpad.down"], Some(5), None, false);
+        payload.macros.macros[0].steps[1] = step(&["A"], Some(5), None, true);
+        let out = render_map(&page(), &payload, None);
+        let html = &out.html;
+        assert!(html.contains("macrow short"), "the amber row class: {html}");
+        assert!(
+            html.contains(
+                "5 ms is shorter than ~2 poll intervals (33 ms) — the game may never \
+                           see it, so ksx raises this step to 33 ms"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("allow_short is on, so it runs as written and the game may never see it"),
+            "the opt-out is flagged too, differently: {html}"
+        );
+        // A step at or above the floor says nothing at all.
+        assert!(html.contains(r#"class="macwarn off""#), "{html}");
+
+        // The inline flag is short enough to fit beside the duration; the rule
+        // it stands for is stated once, in full, in the card.
+        assert!(html.contains(">5 ms — raised to 33 ms<"), "{html}");
+        assert!(html.contains(">5 ms — may be missed<"), "{html}");
+        assert!(
+            html.contains("ksx raises a short step to 33 ms"),
+            "the rule, stated once: {html}"
+        );
+
+        // Both units, or neither, is a fault the editor NAMES rather than
+        // resolving — `MacroStepFile::duration` refuses both.
+        assert_eq!(
+            step_warning(&step(&[], Some(50), Some(3), false)),
+            "two units"
+        );
+        assert_eq!(
+            step_warning_long(&step(&[], Some(50), Some(3), false)),
+            "says both ms and frames — exactly one, or the file is refused"
+        );
+        assert!(step_warning_long(&step(&[], None, None, false)).contains("no duration"));
+    }
+
+    /// The whole output of a read-only editor: the block you paste. It has to
+    /// PARSE — so this feeds it to the real loader and checks the macro that
+    /// comes back is the one the grid drew, trigger row included.
+    #[test]
+    fn the_generated_toml_block_parses_back_into_the_same_macro() {
+        let mac = MacroView {
+            on_release: "abort".to_owned(),
+            interrupt: "opposing".to_owned(),
+            steps: vec![
+                step(&["dpad.down"], Some(50), None, false),
+                step(&[], Some(20), None, true),
+                step(&["dpad.right"], None, Some(3), false),
+            ],
+            triggers: vec!["P".to_owned(), "Q".to_owned()],
+            ..hadouken()
+        };
+        let block = macro_toml(&mac);
+        let file: ksx_config::PresetFile =
+            toml::from_str(&format!("name = \"round trip\"\n{block}")).unwrap_or_else(|e| {
+                panic!("the block we tell users to paste must parse: {e}\n{block}")
+            });
+        let core = file.to_core().expect("…and must load");
+        assert_eq!(core.macros.defs.len(), 1);
+        let loaded = &core.macros.defs[0];
+        assert_eq!(loaded.name, "hadouken");
+        assert_eq!(loaded.on_release, ksx_core::macros::OnRelease::Abort);
+        assert_eq!(loaded.retrigger, ksx_core::macros::Retrigger::Ignore);
+        assert_eq!(loaded.interrupt, ksx_core::macros::Interrupt::Opposing);
+        assert_eq!(loaded.steps.len(), 3);
+        // The unit survives the round trip: frames stay frames (§1c).
+        assert_eq!(
+            loaded.steps[2].duration,
+            ksx_core::macros::StepDuration::Frames(3)
+        );
+        assert!(loaded.steps[1].allow_short && loaded.steps[1].hold.is_empty());
+        // Two triggers, because many keys → one macro is ordinary multi-bind.
+        assert_eq!(core.macros.triggers.len(), 2);
+
+        // A macro with default policies emits none of them — a file that says
+        // nothing must keep saying nothing.
+        let plain = macro_toml(&hadouken());
+        assert!(!plain.contains("on_release"), "{plain}");
+        assert!(!plain.contains("retrigger"), "{plain}");
+        assert!(!plain.contains("interrupt"), "{plain}");
+
+        // No trigger yet: the row is COMMENTED, never a placeholder key that
+        // would refuse to load.
+        let untriggered = MacroView {
+            triggers: Vec::new(),
+            ..hadouken()
+        };
+        let block = macro_toml(&untriggered);
+        assert!(block.contains("# macro.hadouken = \"<KEY>\""), "{block}");
+        let file: ksx_config::PresetFile =
+            toml::from_str(&format!("name = \"p\"\n{block}")).expect("still parses");
+        assert!(file.to_core().expect("loads").macros.triggers.is_empty());
+    }
+
+    /// The trigger is the ONE macro edit that is a real write, and it goes
+    /// through the binding path that already exists: `macro.<name>` is a
+    /// function name the `map` verb takes (mapping.rs `apply_macro_trigger`).
+    /// So the page offers it as a learnable control AND as a no-JS form —
+    /// Bind and Clear only, because add/remove-one would have to read a key
+    /// list the mapper payload's `bindings` map does not carry for macros.
+    #[test]
+    fn the_trigger_is_bound_through_the_existing_map_verb() {
+        let out = render_map(&page(), &sample(), None);
+        let html = &out.html;
+        assert!(html.contains(r#"data-fn="macro.hadouken""#), "{html}");
+        assert!(html.contains("started by P"), "{html}");
+        assert!(
+            html.contains(r#"<input type="hidden" name="function" value="macro.hadouken">"#),
+            "the no-JS form names the macro function: {html}"
+        );
+        assert!(
+            html.contains(r#"class="macbind nojs" method="post" action="/map/bind""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"formaction="/map/clear""#), "{html}");
+        assert!(
+            html.contains(r#"ksx map --preset "IPAC P1" --function macro.hadouken --key P"#),
+            "the exact CLI line, with the key it already has: {html}"
+        );
+        // …and a macro with no trigger prints the template, not a lie.
+        let mut payload = sample();
+        payload.macros.macros[0].triggers.clear();
+        let out = render_map(&page(), &payload, None);
+        assert!(out.html.contains("no trigger key yet"), "{}", out.html);
+        assert!(
+            out.html
+                .contains("--function macro.hadouken --key &lt;KEY&gt;")
+                || out.html.contains("--function macro.hadouken --key <KEY>"),
+            "{}",
+            out.html
+        );
+    }
+
+    /// Read-only is stated, always, and the three cases are told apart: the
+    /// provider could not read macros / the preset has none / this is a draft.
+    /// "No macros" and "nobody told us" look identical on screen unless the
+    /// page says which, and only one of them is the user's fault.
+    #[test]
+    fn the_editor_says_what_it_cannot_do_and_why() {
+        let out = render_map(&page(), &sample(), None);
+        assert!(
+            out.html.contains("nothing in this grid is saved"),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains("The trigger below IS a real write"),
+            "{}",
+            out.html
+        );
+
+        let mut empty = sample();
+        empty.macros = crate::snapshot::MacroSnapshot::read("IPAC P1", Vec::new());
+        let out = render_map(&page(), &empty, None);
+        assert!(
+            out.html.contains("This preset defines no macros yet"),
+            "{}",
+            out.html
+        );
+        // The starter draft is a REAL macro, so the grid is never a blank slate
+        // with no way in.
+        assert!(
+            out.html.contains(r#"data-cell="0|dpad.down""#),
+            "{}",
+            out.html
+        );
+
+        let mut blind = sample();
+        blind.macros = crate::snapshot::MacroSnapshot::unavailable("this daemon predates macros");
+        let out = render_map(&page(), &blind, None);
+        assert!(out.html.contains("could not be read"), "{}", out.html);
+        assert!(
+            out.html.contains("this daemon predates macros"),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains(r#"class="card macrocard off""#),
+            "{}",
+            out.html
+        );
+    }
+
+    /// `?macro=NAME` picks the table, and the tabs are anchors — so a page
+    /// with no JavaScript can walk every macro a preset defines, exactly like
+    /// `?slot=N` walks its slots.
+    #[test]
+    fn the_macro_tabs_are_links_and_the_query_picks_one() {
+        let mut payload = sample();
+        payload.macros.macros.push(MacroView {
+            name: "shoryuken".to_owned(),
+            steps: vec![step(&["dpad.right"], Some(50), None, false)],
+            ..hadouken()
+        });
+        let out = render_map(&page(), &payload, None);
+        assert!(
+            out.html
+                .contains(r#"href="/map?slot=1&amp;macro=shoryuken""#),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains(r#"class="mactab active""#),
+            "{}",
+            out.html
+        );
+        assert!(out.html.contains("hadouken · 4 steps"), "{}", out.html);
+
+        payload.macro_selected = "shoryuken".to_owned();
+        let out = render_map(&page(), &payload, None);
+        assert!(
+            out.html.contains("shoryuken — 1 step · 50 ms total"),
+            "{}",
+            out.html
+        );
+        assert_eq!(
+            out.html.matches(r#"class="maccell"#).count(),
+            25,
+            "one step = one row of cells: {}",
+            out.html
+        );
+    }
+
+    /// The columns follow the PERSONA, like every other reader on this page:
+    /// the same control is `A` on an Xbox slot and `✕` on a DualShock one.
+    #[test]
+    fn the_grid_columns_are_persona_aware() {
+        let mut payload = sample();
+        payload.selected = 3; // the PlayStation slot
+        let out = render_map(&page(), &payload, None);
+        assert!(
+            out.html.contains(r#"class="maccolid id-pc""#),
+            "{}",
+            out.html
+        );
+        assert!(
+            !out.html.contains(r#"class="maccolid id-xa""#),
+            "{}",
+            out.html
+        );
+        assert!(out.html.contains("step 4 holds ✕ (A)"), "{}", out.html);
     }
 
     /// Hostile bindings render escaped, not injected.

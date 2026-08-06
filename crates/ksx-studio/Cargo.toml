@@ -29,3 +29,11 @@ serde_json.workspace = true
 # key added to ksx-core and not to the page is a test failure, not a control
 # nobody can bind without a shell.
 ksx-core.workspace = true
+# TEST-ONLY, same rule and the same reason: v11's macro editor is READ-ONLY
+# against disk and its whole output is a `[macros.<name>]` block the user
+# pastes into a preset. A block that does not parse would be worse than no
+# block at all, so the test feeds it to the real loader
+# (`ksx_config::PresetFile`) and checks that the macro it round-trips to is the
+# one the grid drew. Nothing here is linked at runtime.
+ksx-config.workspace = true
+toml.workspace = true

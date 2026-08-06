@@ -236,7 +236,11 @@ async fn api_status(State(state): State<Arc<AppState>>) -> Response {
 
 /// One fresh mapper payload. Blocking work (config store reads + up to two
 /// pipe requests) off the async workers, like [`collect`].
-async fn collect_map(state: &Arc<AppState>, selected: Option<u8>) -> MapPayload {
+async fn collect_map(
+    state: &Arc<AppState>,
+    selected: Option<u8>,
+    macro_selected: Option<String>,
+) -> MapPayload {
     let map_state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
         let mapper = map_state.source.mapper();
@@ -246,11 +250,21 @@ async fn collect_map(state: &Arc<AppState>, selected: Option<u8>) -> MapPayload 
             .filter(|n| mapper.slots.iter().any(|s| s.number == *n))
             .or_else(|| mapper.slots.first().map(|s| s.number))
             .unwrap_or(0);
+        // v11: the macro editor reads ONE preset — the selected slot's, since
+        // that is the pad whose controls are the grid's columns.
+        let macros = match mapper.slots.iter().find(|s| s.number == selected) {
+            Some(slot) => map_state.source.macros(&slot.preset),
+            None => crate::snapshot::MacroSnapshot::unavailable(
+                "no slot is selected, so there is no preset to read macros from",
+            ),
+        };
         MapPayload {
             mapper,
             session,
             learn,
             selected,
+            macros,
+            macro_selected: macro_selected.unwrap_or_default(),
         }
     })
     .await
@@ -259,19 +273,26 @@ async fn collect_map(state: &Arc<AppState>, selected: Option<u8>) -> MapPayload 
         session: SessionView::unreachable("mapper collection panicked"),
         learn: crate::control::LearnView::unavailable("mapper collection panicked"),
         selected: 0,
+        macros: crate::snapshot::MacroSnapshot::unavailable("mapper collection panicked"),
+        macro_selected: String::new(),
     })
 }
 
 #[derive(Deserialize)]
 struct MapQuery {
     slot: Option<u8>,
+    /// v11: which `[macros.<name>]` table the macro editor paints. The tabs
+    /// are anchors, so this is how a page with no JavaScript walks a preset's
+    /// macros — exactly like `slot=` walks its slots.
+    #[serde(rename = "macro")]
+    macro_name: Option<String>,
     /// v9: the outcome of the no-JS form POST that redirected here. Same
     /// post-redirect-get channel `/` has always used for its session forms.
     flash: Option<String>,
 }
 
 async fn map_page(State(state): State<Arc<AppState>>, Query(query): Query<MapQuery>) -> Response {
-    let payload = collect_map(&state, query.slot).await;
+    let payload = collect_map(&state, query.slot, query.macro_name.clone()).await;
     let flash = query.flash.as_deref().filter(|f| !f.trim().is_empty());
     let out = render_map(&state.map_page, &payload, flash);
     (
@@ -295,7 +316,7 @@ async fn map_page(State(state): State<Arc<AppState>>, Query(query): Query<MapQue
 /// The mapper poller's endpoint — the same [`MapPayload`] shape the /map page
 /// embeds as island props (parity unit-tested in render_map.rs).
 async fn api_map(State(state): State<Arc<AppState>>, Query(query): Query<MapQuery>) -> Response {
-    let payload = collect_map(&state, query.slot).await;
+    let payload = collect_map(&state, query.slot, query.macro_name.clone()).await;
     (
         [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
         axum::Json(payload),

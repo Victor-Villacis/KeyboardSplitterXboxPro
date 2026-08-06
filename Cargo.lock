@@ -856,12 +856,14 @@ dependencies = [
  "axum",
  "forma-ir",
  "forma-server",
+ "ksx-config",
  "ksx-core",
  "rust-embed",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
 ]
 
