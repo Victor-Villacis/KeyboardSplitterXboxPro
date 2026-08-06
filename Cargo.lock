@@ -812,6 +812,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ksx-hidmaestro"
+version = "0.1.0"
+dependencies = [
+ "ksx-core",
+ "thiserror",
+ "tracing",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "ksx-legacy-import"
 version = "0.1.0"
 dependencies = [
@@ -829,6 +839,7 @@ name = "ksx-output"
 version = "0.1.0"
 dependencies = [
  "ksx-core",
+ "ksx-hidmaestro",
  "rusty-xinput",
  "thiserror",
  "tracing",

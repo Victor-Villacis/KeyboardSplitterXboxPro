@@ -75,6 +75,12 @@ fn map_target_err(err: vigem_client::Error) -> OutputError {
     OutputError::TargetError(err)
 }
 
+/// `ERROR_INVALID_PARAMETER`. Only used for the unreachable persona arm in
+/// [`VigemBackend::plug_with_timeout`], which the guard above it makes dead.
+fn windows_error_invalid_parameter() -> u32 {
+    87
+}
+
 /// The plugged target, one variant per [`Persona`] ViGEmBus can emulate.
 ///
 /// These are separate types in the vendored client with no shared trait (their
@@ -184,6 +190,14 @@ impl VigemBackend {
     /// `plugin() + wait_ready()` under a deadline (see module docs for why this
     /// needs a helper thread).
     fn plug_with_timeout(&self, persona: Persona) -> Result<Target, OutputError> {
+        // Refused here as well as in `plug_persona`, because this function is
+        // where a target type would have to be *chosen*: there is no ViGEmBus
+        // target for a DualSense, Switch Pro or Xbox Series pad, and inventing
+        // a "closest" one is precisely the silent downgrade the persona system
+        // exists to prevent (see `VirtualPadBackend::plug_persona`).
+        if persona.backend() != ksx_core::PadBackend::Vigem {
+            return Err(OutputError::PersonaUnsupported(persona));
+        }
         let client = self.client.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -204,6 +218,13 @@ impl VigemBackend {
                         .and_then(|()| target.wait_ready())
                         .map(|()| Target::Ds4(target))
                 }
+                // Unreachable: the guard above returns before the thread is
+                // spawned. Stated as an explicit arm rather than a wildcard so
+                // that adding a persona to ksx-core fails to compile here until
+                // someone decides, in writing, which stack it belongs on.
+                Persona::DualSense | Persona::SwitchPro | Persona::XboxSeries => Err(
+                    vigem_client::Error::WinError(windows_error_invalid_parameter()),
+                ),
             };
             let _ = tx.send(result);
         });
@@ -340,7 +361,14 @@ impl VirtualPadBackend for VigemBackend {
     }
 
     fn plug_persona(&mut self, persona: Persona) -> Result<PadHandle, OutputError> {
-        // ViGEmBus emulates both personas natively, so nothing is refused here.
+        // ViGEmBus emulates X360 and DS4 natively and nothing else — the
+        // project is frozen, so it never will (docs/ENHANCEMENTS.md E1). The
+        // M8 personas are refused by name here; `RoutedBackend` is what sends
+        // them to HIDMaestro instead, so this is the honest floor rather than a
+        // dead end.
+        if persona.backend() != ksx_core::PadBackend::Vigem {
+            return Err(OutputError::PersonaUnsupported(persona));
+        }
         self.plug_inner(persona)
     }
 

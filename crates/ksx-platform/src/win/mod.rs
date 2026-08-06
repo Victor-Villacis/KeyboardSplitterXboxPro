@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use crate::parse::{ci_mode_from_name, filetime_to_rfc3339, parse_cip_meta, resolve_image_path};
 use crate::report::{
     BusDriverReport, CiPolicyReport, ClassFilterReport, CodeIntegrityReport, DriverFileReport,
-    DriverReport, InterceptionReport, ServiceInfo, StartType, WhqlEvaluationReport,
+    DriverReport, HidMaestroReport, InterceptionReport, ServiceInfo, StartType,
+    WhqlEvaluationReport,
 };
 use crate::virtual_pads::{owner_candidates, VirtualPadReport};
 
@@ -32,6 +33,18 @@ const CROSS_CERT_POLICY_GUID: &str = "784C4414-79F4-4C32-A6A5-F0FB42A51D0D";
 /// ghost-pad devnode lookup go through.
 const VIGEMBUS_SERVICE: &str = "ViGEmBus";
 
+/// HIDMaestro's service name and UMDF driver binary.
+///
+/// HIDMaestro is UMDF2, so its driver is a DLL under `System32\drivers\UMDF`
+/// and **not** a `.sys` in `System32\drivers` — [`bus_driver`] would look in
+/// the wrong place, which is why this has its own collector.
+///
+/// Kept in sync with `ksx_hidmaestro::driver::PROBE_TARGETS`, which ksx-output
+/// consults at plug time. This crate deliberately depends on nothing, so the
+/// two lists are duplicated rather than shared.
+const HIDMAESTRO_SERVICE: &str = "HIDMaestro";
+const HIDMAESTRO_UMDF_DLL: &str = r"System32\drivers\UMDF\HIDMaestro.dll";
+
 /// Collect the full driver-health report from the live machine.
 pub fn collect() -> DriverReport {
     let windir = windir();
@@ -41,6 +54,24 @@ pub fn collect() -> DriverReport {
         interception: interception(&windir),
         code_integrity: code_integrity(&windir),
         virtual_pads: virtual_pads(),
+        hidmaestro: hidmaestro(&windir),
+    }
+}
+
+/// HIDMaestro install state. Never elevates, never errors: a machine without it
+/// is a normal machine that simply cannot mount three of the five personas.
+fn hidmaestro(windir: &str) -> HidMaestroReport {
+    let service_key = format!("{SERVICES}\\{HIDMAESTRO_SERVICE}");
+    let dll = PathBuf::from(format!("{windir}\\{HIDMAESTRO_UMDF_DLL}"));
+    let looked_for = vec![format!("HKLM\\{service_key}"), dll.display().to_string()];
+    HidMaestroReport {
+        // The DLL, not the service key: an uninstall can leave the key behind,
+        // and reporting that as "installed" would promise personas that fail
+        // later at plug time instead of now at doctor time.
+        installed: dll.is_file(),
+        service_key: registry::key_exists(&service_key),
+        driver_file: driver_file(dll),
+        looked_for,
     }
 }
 

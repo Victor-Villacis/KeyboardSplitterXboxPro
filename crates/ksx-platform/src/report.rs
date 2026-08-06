@@ -22,6 +22,48 @@ pub struct DriverReport {
     /// Pads ViGEmBus is exposing right now — children of the bus devnode, never
     /// a system-wide VID/PID match (see [`crate::virtual_pads`]).
     pub virtual_pads: VirtualPadReport,
+    /// HIDMaestro — the M8 backend, and the only route to the DualSense /
+    /// Switch Pro / Xbox Series personas.
+    pub hidmaestro: HidMaestroReport,
+}
+
+/// HIDMaestro's install state.
+///
+/// Reported even when absent, and absence is **not an error**: it costs exactly
+/// three personas and nothing else. A cabinet running Xbox 360 and PlayStation
+/// slots is fully functional with no HIDMaestro anywhere, which is why the
+/// verdict for this is [`crate::Severity::Info`] and never a warning.
+///
+/// `looked_for` is part of the report on purpose: "not installed" should be
+/// evidence a user can check, not a claim they have to take on faith.
+#[derive(Debug, Clone, Serialize)]
+pub struct HidMaestroReport {
+    /// The UMDF driver binary is present — the load-bearing artifact. A service
+    /// key alone is a leftover, not an install.
+    pub installed: bool,
+    /// Service key exists under `HKLM\SYSTEM\CurrentControlSet\Services`.
+    pub service_key: bool,
+    /// The UMDF driver DLL, when present.
+    pub driver_file: Option<DriverFileReport>,
+    /// Everything the probe checked, in order.
+    pub looked_for: Vec<String>,
+}
+
+impl HidMaestroReport {
+    /// The personas that are unavailable while this is not installed. Kept here
+    /// so the doctor text and the advice cannot drift apart.
+    pub const GATED_PERSONAS: &'static [&'static str] = &["dualsense", "switchpro", "xboxseries"];
+
+    /// A "nothing found" report — the shape every machine without HIDMaestro
+    /// produces, and what non-Windows builds return.
+    pub fn absent(looked_for: Vec<String>) -> Self {
+        Self {
+            installed: false,
+            service_key: false,
+            driver_file: None,
+            looked_for,
+        }
+    }
 }
 
 /// A kernel bus driver registered as a service.

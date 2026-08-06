@@ -42,7 +42,7 @@ pub use win::collect;
 pub use advice::{summarize, Advice, Severity};
 pub use report::{
     BusDriverReport, CiPolicyMode, CiPolicyReport, ClassFilterReport, CodeIntegrityReport,
-    DriverFileReport, DriverReport, InterceptionReport, ServiceInfo, ServiceState, SignatureInfo,
-    SignatureStatus, StartType, WhqlEvaluationReport,
+    DriverFileReport, DriverReport, HidMaestroReport, InterceptionReport, ServiceInfo,
+    ServiceState, SignatureInfo, SignatureStatus, StartType, WhqlEvaluationReport,
 };
 pub use virtual_pads::{OwnerProcess, PersonaGuess, VirtualPadInfo, VirtualPadReport};

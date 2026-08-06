@@ -158,6 +158,10 @@ pub fn render_human(report: &DriverReport, advice: &[Advice]) -> String {
     render_interception(&mut doc, report);
     doc.blank();
 
+    doc.line("HIDMaestro (M8 backend — DualSense / Switch Pro / Xbox Series personas)");
+    render_hidmaestro(&mut doc, &report.hidmaestro);
+    doc.blank();
+
     doc.line("Code integrity (2026 cross-signed-trust removal)");
     render_code_integrity(&mut doc, report);
     doc.blank();
@@ -286,6 +290,38 @@ fn render_interception(doc: &mut Doc, report: &DriverReport) {
     }
     render_filter(doc, "keyboard", keyboard);
     render_filter(doc, "mouse", &interception.mouse);
+}
+
+/// HIDMaestro's row.
+///
+/// Marked `[INFO]` when absent, never `[FAIL]`: unlike ViGEmBus, nothing on the
+/// cabinet stops working without it — it gates exactly three personas. The row
+/// prints what was looked for so "not installed" is checkable rather than
+/// assertive.
+fn render_hidmaestro(doc: &mut Doc, hm: &ksx_platform::HidMaestroReport) {
+    let gated = ksx_platform::HidMaestroReport::GATED_PERSONAS.join("/");
+    if !hm.installed {
+        if hm.service_key {
+            doc.line(format!(
+                "  [WARN] service key present but the UMDF driver is missing — \
+                 broken install; {gated} personas will not plug"
+            ));
+        } else {
+            doc.line(format!(
+                "  [INFO] not installed — {gated} personas unavailable \
+                 (xbox360/playstation are unaffected: they use ViGEmBus)"
+            ));
+        }
+        for target in &hm.looked_for {
+            doc.line(format!("  [INFO]   looked for {target}"));
+        }
+        return;
+    }
+    doc.line(format!("  [OK]   installed — {gated} personas available"));
+    match &hm.driver_file {
+        Some(file) => render_driver_file(doc, file),
+        None => doc.line("  [WARN] driver file present but unreadable"),
+    }
 }
 
 fn render_filter(doc: &mut Doc, name: &str, filter: &ClassFilterReport) {
@@ -464,6 +500,12 @@ mod tests {
                 }),
             },
             virtual_pads: VirtualPadReport::empty(),
+            // Probed live 2026-08-06 on this machine: no service key, no UMDF
+            // driver, no ROOT\HIDMAESTRO devnode, nothing in Program Files.
+            hidmaestro: ksx_platform::HidMaestroReport::absent(vec![
+                "HKLM\\SYSTEM\\CurrentControlSet\\Services\\HIDMaestro".into(),
+                "C:\\Windows\\System32\\drivers\\UMDF\\HIDMaestro.dll".into(),
+            ]),
         }
     }
 

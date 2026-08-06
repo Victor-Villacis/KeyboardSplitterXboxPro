@@ -53,7 +53,7 @@ pub use pad::{
     safe_axis, Axis, DpadDirection, PadState, Trigger, XButton, XButtons, AXIS_CENTER, AXIS_MAX,
     AXIS_MIN,
 };
-pub use persona::{Persona, UnknownPersona};
+pub use persona::{PadBackend, Persona, UnknownPersona};
 pub use preset::{Binding, Chord, Macros, Preset, TurboBinding};
 pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS, MAX_XINPUT_SLOTS};
 pub use socd::{OpposingPair, Socd, UnknownSocd};

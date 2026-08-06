@@ -113,9 +113,9 @@ pub fn run(
     json: bool,
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
-    use ksx_output::{VigemBackend, VirtualPadBackend as _};
+    use ksx_output::{RoutedBackend, VigemBackend, VirtualPadBackend as _};
 
-    let mut backend = match VigemBackend::connect() {
+    let vigem = match VigemBackend::connect() {
         Ok(backend) => backend,
         Err(err) if err.is_bus_missing() => {
             if json {
@@ -127,13 +127,31 @@ pub fn run(
         }
         Err(err) => return Err(err).context("connecting to ViGEmBus"),
     };
+    // Routed, so `ksx pads --persona dualsense` is a real test of the M8 path
+    // rather than a `PersonaUnsupported` from the wrong backend.
+    let mut backend = RoutedBackend::standard(Box::new(vigem));
 
     let mut handles = Vec::new();
     let mut rows = Vec::new();
     for slot in 1..=count {
-        let handle = backend
-            .plug_persona(persona)
-            .with_context(|| format!("plugging {persona} pad {slot} of {count}"))?;
+        let handle = match backend.plug_persona(persona) {
+            Ok(handle) => handle,
+            // A missing HIDMaestro is its own exit code path, not a generic
+            // failure: the fix is "install HIDMaestro", and the cabinet's own
+            // personas are unaffected.
+            Err(err) if err.is_hidmaestro_missing() => {
+                if json {
+                    println!("{}", error_json("hidmaestro-missing", &err.to_string()));
+                } else {
+                    eprintln!("error: {err}");
+                }
+                std::process::exit(EXIT_DRIVER_MISSING);
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("plugging {persona} pad {slot} of {count}"))
+            }
+        };
         let user_index = backend.user_index(handle);
         // Draining LED feedback on a persona with no feedback channel would
         // just burn the 600ms drain deadline per pad reporting nothing.
@@ -221,12 +239,10 @@ fn drain_led(
 /// Drives [`pattern_state`] on every pad until the hold expires or Ctrl+C.
 #[cfg(windows)]
 fn animate(
-    backend: &mut ksx_output::VigemBackend,
+    backend: &mut dyn ksx_output::VirtualPadBackend,
     handles: &[ksx_output::PadHandle],
     hold_secs: u64,
 ) {
-    use ksx_output::VirtualPadBackend as _;
-
     if !crate::ctrl_c::install() {
         tracing::warn!("SetConsoleCtrlHandler failed; the pattern runs the full hold time");
     }

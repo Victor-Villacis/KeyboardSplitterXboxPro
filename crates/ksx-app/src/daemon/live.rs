@@ -136,9 +136,12 @@ impl SessionRunner for LiveRunner {
         out: &mut dyn Write,
     ) -> anyhow::Result<SessionSummary> {
         use crate::run::supervisor::{self, RunOptions, SessionHook, Wiring};
-        use ksx_output::VigemBackend;
+        use ksx_output::{RoutedBackend, VigemBackend};
 
-        let pads = VigemBackend::connect()?;
+        // Same persona → backend routing as `ksx run`, from the same
+        // constructor: a daemon that selected stacks differently would be a
+        // second, untested output path.
+        let pads = RoutedBackend::standard(Box::new(VigemBackend::connect()?));
         // Same per-device backend selection as `ksx run`, from the same place:
         // a daemon that chose backends differently would be a second, untested
         // capture path (see `crate::capture`). The one difference is the claim:

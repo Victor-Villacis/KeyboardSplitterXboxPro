@@ -30,9 +30,52 @@ pub fn summarize(report: &DriverReport) -> Vec<Advice> {
     summarize_scpvbus(&report.scpvbus, &mut out);
     summarize_interception(report, &mut out);
     summarize_code_integrity(report, &mut out);
+    summarize_hidmaestro(report, &mut out);
 
     out.sort_by_key(|a| std::cmp::Reverse(a.severity));
     out
+}
+
+/// HIDMaestro's absence is **Info, never Warning**.
+///
+/// A cabinet running Xbox 360 and PlayStation slots — every configuration ksx
+/// ships today — works perfectly with no HIDMaestro installed. Raising a
+/// warning for it would train users to ignore the warning column, and would
+/// nudge people into installing a second driver they do not need. It is
+/// reported so the three gated personas have an explanation, and for no other
+/// reason.
+fn summarize_hidmaestro(report: &DriverReport, out: &mut Vec<Advice>) {
+    let hm = &report.hidmaestro;
+    if hm.installed {
+        return;
+    }
+    if hm.service_key {
+        // A service key with no driver binary IS worth a warning: an install
+        // half-happened, and a plug will fail with a driver error rather than a
+        // clean "not installed".
+        out.push(Advice {
+            severity: Severity::Warning,
+            code: "hidmaestro-partial",
+            message: format!(
+                "HIDMaestro's service key exists but its UMDF driver is missing \
+                 (checked {}): a broken or half-removed install. Reinstall or remove \
+                 it; the {} personas will not plug until then.",
+                hm.looked_for.join(", "),
+                crate::report::HidMaestroReport::GATED_PERSONAS.join("/"),
+            ),
+        });
+        return;
+    }
+    out.push(Advice {
+        severity: Severity::Info,
+        code: "hidmaestro-missing",
+        message: format!(
+            "HIDMaestro is not installed, so the {} personas are unavailable. This \
+             costs nothing else: xbox360 and playstation slots run on ViGEmBus and \
+             are unaffected.",
+            crate::report::HidMaestroReport::GATED_PERSONAS.join("/"),
+        ),
+    });
 }
 
 fn summarize_vigembus(v: &BusDriverReport, out: &mut Vec<Advice>) {
@@ -305,6 +348,11 @@ mod tests {
                 }),
             },
             virtual_pads: crate::virtual_pads::VirtualPadReport::empty(),
+            // Live state 2026-08-06: probed and absent.
+            hidmaestro: crate::report::HidMaestroReport::absent(vec![
+                "HKLM\\SYSTEM\\CurrentControlSet\\Services\\HIDMaestro".into(),
+                "C:\\Windows\\System32\\drivers\\UMDF\\HIDMaestro.dll".into(),
+            ]),
         }
     }
 
@@ -480,9 +528,15 @@ mod tests {
                 whql_evaluation: None,
             },
             virtual_pads: crate::VirtualPadReport::empty(),
+            hidmaestro: crate::report::HidMaestroReport::absent(vec!["<probe>".into()]),
         };
         let advice = summarize(&r);
-        assert_eq!(codes(&advice), vec!["interception-missing"]);
+        // Sorted most-severe-first, so the Info-level HIDMaestro note lands
+        // last — behind anything that is actually broken.
+        assert_eq!(
+            codes(&advice),
+            vec!["interception-missing", "hidmaestro-missing"]
+        );
         assert_eq!(advice[0].severity, Severity::Warning);
     }
 

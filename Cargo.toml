@@ -9,6 +9,7 @@ default-members = [
     "crates/ksx-legacy-import",
     "crates/ksx-capture",
     "crates/ksx-output",
+    "crates/ksx-hidmaestro",
     "crates/ksx-platform",
     "crates/ksx-games",
     "crates/ksx-app",
@@ -30,6 +31,7 @@ ksx-config = { path = "crates/ksx-config" }
 ksx-legacy-import = { path = "crates/ksx-legacy-import" }
 ksx-capture = { path = "crates/ksx-capture" }
 ksx-output = { path = "crates/ksx-output" }
+ksx-hidmaestro = { path = "crates/ksx-hidmaestro" }
 ksx-platform = { path = "crates/ksx-platform" }
 ksx-games = { path = "crates/ksx-games" }
 ksx-studio = { path = "crates/ksx-studio" }

@@ -188,17 +188,25 @@ fn run_live(
     json: bool,
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
-    use ksx_output::VigemBackend;
+    use ksx_output::{RoutedBackend, VigemBackend};
 
     // Pads first, even for the availability check: a missing bus must be found
     // before anything touches the keyboard stack.
-    let pads = match VigemBackend::connect() {
+    //
+    // Wrapped in a `RoutedBackend` so a slot's *persona* picks its driver stack
+    // (see `ksx_output::router`). ViGEmBus is still connected eagerly — it backs
+    // xbox360/playstation, which is every configuration ksx ships — while
+    // HIDMaestro is built only if some slot asks for a persona that needs it.
+    // A cabinet with no such slot never probes for it and cannot be broken by
+    // its absence.
+    let vigem = match VigemBackend::connect() {
         Ok(backend) => backend,
         Err(err) if err.is_bus_missing() => {
             refuse(json, "vigembus-missing", &err.to_string());
         }
         Err(err) => return Err(err).context("connecting to ViGEmBus"),
     };
+    let pads = RoutedBackend::standard(Box::new(vigem));
     // Backend selection is per device (`[[device]] backend = ...`). This claims
     // any WinUSB interfaces the plan names, and only creates an Interception
     // context if something still needs one — see `crate::capture`. Every

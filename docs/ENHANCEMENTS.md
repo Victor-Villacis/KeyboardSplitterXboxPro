@@ -21,6 +21,42 @@ requires a rewrite later.
   (every XInput game, 2006→today). Fancier personas matter only for games that check
   for newer pads. **Priority: low until a concrete game needs it.**
 
+### E1 status 2026-08-06 — M8 started, blocked on the driver being absent
+
+**Feasibility check first, and it failed the way the plan allowed for.** HIDMaestro is
+**not installed on this machine** and no installer is present: no `HIDMaestro` service
+key, no driver package in `pnputil /enum-drivers`, no `ROOT\HIDMAESTRO` devnode,
+nothing under `Program Files`. The only artifact anywhere is a bundled managed assembly
+(`HIDMaestro.Core.dll` 1.3.22) inside the read-only PadForge clone — a .NET library,
+not a driver.
+
+So M8 shipped the **client, honestly gated**, and nothing that pretends:
+
+- `crates/ksx-hidmaestro` — the protocol client written against
+  `research/padforge-code-audit.md` §3: seqlocked shared-memory latch, lifecycle in the
+  documented order (sweep → catalog → install; PID pool before enumeration), 16 ms
+  idle-dedup keepalive derived from the three driver watchdogs, axis routing **by role
+  through the profile's map** (never positional), trigger writes mirrored to two keys,
+  and the feedback decode table including the Bluetooth 547→257 length trap.
+- `ksx-output`: `HidMaestroBackend` (adapter) + `RoutedBackend` (persona → stack).
+- `ksx-core`: `Persona::{DualSense, SwitchPro, XboxSeries}` + `PadBackend`, with
+  `Persona::backend()` as the single statement of the routing rule.
+- `ksx doctor` reports HIDMaestro's absence at **Info** severity (`hidmaestro-missing`),
+  because a cabinet on xbox360/playstation loses nothing by not having it.
+
+**Verified vs written-to-spec** is stated in `ksx-hidmaestro`'s crate docs as a table.
+Short version: the seqlock discipline, keepalive cadence, axis-by-name routing and
+lifecycle order are tested (the seqlock with a real writer/reader thread race); the
+decode table is pinned to the audit's fixtures but unverified on bytes; **the shared
+section's name and byte layout are unknown** and are the one thing the protocol map
+does not contain — PadForge consumes the SDK in-process and never opens the section.
+Finishing M8 means transcribing that from HIDMaestro's own MIT sources
+(`driver.c` / `companion.c`); everything above it is already written.
+
+**Slots 1–4 never move.** `Persona::backend()` pins xbox360 and playstation to ViGEmBus
+permanently — HIDMaestro's XInput is a synthesis layer and the direct cause of its WGI
+double-input bug, and ViGEm's X360 target is Microsoft's own `xusb22.sys`.
+
 ## E2 — Lean into Steam Input?
 
 **Verdict: integrate WITH it, never build ON it.**

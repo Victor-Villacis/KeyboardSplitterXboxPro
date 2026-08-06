@@ -1,0 +1,27 @@
+[package]
+name = "ksx-hidmaestro"
+description = "HIDMaestro protocol client: seqlocked shared-memory latch, lifecycle, axis routing, feedback decode."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ksx-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+[features]
+# Touches a real HIDMaestro install (opens its named section, installs the
+# driver, creates devices). Never in CI — same contract as ksx-output's
+# `cab-tests`. Every test in this crate that is NOT behind this feature runs
+# against in-process fakes and needs no driver.
+cab-tests = []
