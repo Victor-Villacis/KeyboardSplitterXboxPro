@@ -507,10 +507,17 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
         preset,
         function,
         key,
+        // "force" is now ONLY about a cross-slot duplicate (another slot's
+        // preset in a profile that uses this one). It removes nothing: a key
+        // already used by another control of THIS preset is a multi-bind and
+        // needs no flag at all (docs/INPUT-TRANSFORMS.md §1a).
         force: request
             .get("force")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        // "move_from": "B" — the explicit move, the one way this verb unbinds
+        // a function the caller did not name in "function".
+        move_from: field("move_from"),
         when: list("when"),
         unless: list("unless"),
     };
@@ -527,7 +534,14 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
                 "key": applied.key,
                 "when": applied.when,
                 "unless": applied.unless,
-                "stolen_from": applied.stolen_from,
+                // MULTI-BIND: the other controls of this preset this key also
+                // drives. Studio renders it as the legend's "also A · B"
+                // badges (ksx-studio/src/render_map.rs `shared_labels`), which
+                // it re-derives from disk — this field is the same truth in
+                // the write's own answer.
+                "also_drives": applied.also_drives,
+                // What "move_from" unbound, or null.
+                "moved_from": crate::mapping::moved_from_json(applied.moved_from.as_ref()),
                 "conflicts": crate::mapping::conflicts_json(&applied.overridden),
                 "flash": crate::mapping::flash_json(&applied.flash),
                 "reloaded": outcome.reloaded,
@@ -1356,7 +1370,8 @@ mod tests {
             key: spec.key.clone(),
             when: spec.when.clone(),
             unless: spec.unless.clone(),
-            stolen_from: Vec::new(),
+            also_drives: Vec::new(),
+            moved_from: None,
             overridden: Vec::new(),
             flash: Vec::new(),
         })
@@ -1522,7 +1537,6 @@ mod tests {
             Err(crate::mapping::MapError::Conflicts {
                 key: "G".into(),
                 conflicts: vec![crate::mapping::MapConflict {
-                    scope: crate::mapping::ConflictScope::Profile,
                     preset: "IPAC P2".into(),
                     function: "A".into(),
                     profile: Some("Steam".into()),
@@ -1549,6 +1563,68 @@ mod tests {
             v["error"].as_str().unwrap().contains("\"IPAC P2\"'s A"),
             "{v}"
         );
+    }
+
+    /// The mapper's "Map all to one key", through the real writer over the
+    /// real verb: three ordinary `map` calls with one key, no `force`, and all
+    /// three stick. The response carries the co-bindings (`also_drives`) so
+    /// Studio can say what the key drives without waiting for its next poll.
+    #[test]
+    fn map_binds_one_key_to_several_functions_and_reports_the_co_bindings() {
+        let dir = std::env::temp_dir().join(format!(
+            "ksx-pipe-multibind-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = ksx_config::ConfigRoot::at(&dir);
+        let store = ksx_config::Store::new(root.clone());
+        let file: ksx_config::PresetFile =
+            toml::from_str("name = \"IPAC P1\"\n[bindings]\nA = \"S\"\nB = \"D\"\nrt = \"E\"\n")
+                .unwrap();
+        store.save_preset(&file).unwrap();
+
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let mut d = deps(tx, state, no_profiles());
+        d.map = map_fn(root);
+
+        let mut last = serde_json::Value::Null;
+        for function in ["A", "B", "rt"] {
+            let request =
+                format!(r#"{{"verb":"map","preset":"IPAC P1","function":"{function}","key":"P"}}"#);
+            last = handle_request(&request, &d, FAST);
+            assert_eq!(last["ok"], true, "{request} → {last}");
+            assert_eq!(last["moved_from"], serde_json::Value::Null, "{last}");
+        }
+        assert_eq!(last["also_drives"], serde_json::json!(["A", "B"]), "{last}");
+        assert!(
+            last["message"].as_str().unwrap().contains("P also drives"),
+            "{last}"
+        );
+
+        let on_disk = std::fs::read_to_string(store.preset_path("IPAC P1").unwrap()).unwrap();
+        for row in ["A = \"P\"", "B = \"P\"", "rt = \"P\""] {
+            assert!(on_disk.contains(row), "missing {row} in:\n{on_disk}");
+        }
+
+        // …and the explicit move is reachable over the same verb, naming what
+        // it unbound and leaving the other two alone.
+        let v = handle_request(
+            r#"{"verb":"map","preset":"IPAC P1","function":"X","key":"P","move_from":"rt"}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["moved_from"]["function"], "rt", "{v}");
+        assert_eq!(v["moved_from"]["unbound"], true, "{v}");
+        assert_eq!(v["also_drives"], serde_json::json!(["A", "B"]), "{v}");
+        let on_disk = std::fs::read_to_string(store.preset_path("IPAC P1").unwrap()).unwrap();
+        assert!(on_disk.contains("rt = \"None\""), "{on_disk}");
+        assert!(on_disk.contains("A = \"P\""), "{on_disk}");
+        assert!(on_disk.contains("X = \"P\""), "{on_disk}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- map-restore --------------------------------------------------------

@@ -1392,14 +1392,127 @@ footer p {
   }
 }
 
-/* The mapper's flash is the ANSWER to a click — including a click that could
-   not do anything (FIX 1). On a page this tall it has to stay in view, or the
-   answer scrolls off while the user is still looking at the control they
-   pressed. Sticky beats fixed here: it never covers the footer. */
-.mapper .flash {
-  position: sticky;
-  bottom: 0.6rem;
-  z-index: 5;
+/* ── The toast stack (v8) ───────────────────────────────────────────────────
+   Replaces the v7 sticky flash strip entirely. That strip stayed in view by
+   spanning the page's full width just above the fold, which meant it sat on
+   top of the bindings legend's first rows — it covered the answer it was
+   about. A toast column pinned to the BOTTOM-RIGHT corner is out of the
+   legend's way on a desktop, and full-width only on a phone, where the legend
+   is a single column and the toast rides above the selection bar.
+
+   `pointer-events: none` on the column so an empty (or expired) stack cannot
+   eat a click meant for the page; each toast turns them back on for itself.
+   The `flash` strip below the preset card stays for the no-JS page. */
+.toasts {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 9; /* above .selbar (8) — it is the newer message */
+  display: flex;
+  flex-direction: column; /* newest first in the array = top of the stack */
+  gap: 0.5rem;
+  width: min(27rem, 40vw);
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  padding: 0.6rem 0.7rem 0.6rem 0.85rem;
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
   backdrop-filter: blur(6px);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+}
+
+.toast-ok {
+  border-left-color: var(--accent);
+}
+
+.toast-warn {
+  border-left-color: var(--warn);
+  background: linear-gradient(var(--warn-dim), var(--warn-dim)), var(--panel);
+}
+
+.toast-err {
+  border-left-color: var(--danger);
+  background: linear-gradient(var(--danger-dim), var(--danger-dim)), var(--panel);
+}
+
+.tmsg {
+  margin: 0;
+  flex: 1 1 auto;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.toast-err .tmsg {
+  color: var(--danger);
+}
+
+.tbtns {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex: 0 0 auto;
+}
+
+/* The road home. Hidden by a CLASS, never `:empty` — a slot-rendered node
+   keeps marker comments inside it (dogfood ledger #13/#15). */
+.btn-undo {
+  padding: 0.25rem 0.7rem;
+  font-size: 0.78rem;
+  font-weight: 650;
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+  white-space: nowrap;
+}
+
+.btn-undo.off {
+  display: none;
+}
+
+.tclose {
+  padding: 0.1rem 0.3rem;
+  font: 0.9rem/1 var(--mono);
+  color: var(--muted);
+  background: none;
+  border: 0;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.tclose:hover,
+.tclose:focus-visible {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .toast {
+    animation: toast-in 140ms ease-out;
+  }
+
+  @keyframes toast-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+  }
+}
+
+@media (max-width: 560px) {
+  .toasts {
+    left: 0.5rem;
+    right: 0.5rem;
+    /* Above the multi-select bar, which owns the bottom edge on a phone. */
+    bottom: 4.75rem;
+    width: auto;
+  }
 }

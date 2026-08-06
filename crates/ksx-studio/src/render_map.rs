@@ -66,6 +66,13 @@ const LIST_SLOT_ZONES_2: &str = "list:zones#2:array";
 /// The legend reads its own signal (`() => legendRows()`), so it gets a
 /// binding-derived name of its own — no third `zones` occurrence.
 const LIST_SLOT_LEGEND: &str = "list:legendRows:array";
+/// v8's toast stack. Always injected EMPTY: a toast reports an action, and
+/// SSR has not taken one. The empty array still emits the list's
+/// `<!--f:lN-->` markers, which is exactly what the client's adoption path
+/// needs in order to insert toasts into it later — and it costs no new
+/// `createShow` (ledger #4/#14), because the stack is a list inside a plain
+/// container rather than a conditional panel.
+const LIST_SLOT_TOASTS: &str = "list:toasts:array";
 
 #[cfg(test)]
 const ISLAND_COMPONENT: &str = "MapIsland";
@@ -662,6 +669,8 @@ fn build_slots(module: &IrModule, payload: &MapPayload) -> SlotData {
         (LIST_SLOT_ZONES, zones.clone()),
         (LIST_SLOT_ZONES_2, zones),
         (LIST_SLOT_LEGEND, legend),
+        // Explicitly empty, so the toast stack can never SSR a stale report.
+        (LIST_SLOT_TOASTS, SlotValue::Array(Vec::new())),
     ] {
         if let Some(id) = named_slot_ids(module, name).into_iter().next() {
             slots.set(id, value);
@@ -872,7 +881,8 @@ mod tests {
                 LIST_SLOT_TABS,
                 LIST_SLOT_ZONES,
                 LIST_SLOT_ZONES_2,
-                LIST_SLOT_LEGEND
+                LIST_SLOT_LEGEND,
+                LIST_SLOT_TOASTS
             ],
             "mapper list slot names drifted; slots: {names:?}"
         );
@@ -1300,7 +1310,10 @@ mod tests {
         assert!(out.html.contains(r#"data-act="restore-defaults""#));
     }
 
-    /// Auto-save is only reassuring if the page says so in words.
+    /// Auto-save is only reassuring if the page says so in words — and since
+    /// v8 the same paragraph has to state the OTHER half of the bargain: no
+    /// action asks "are you sure?", because each one reports itself with an
+    /// Undo, and the restore options are the wider road home.
     #[test]
     fn the_preset_card_states_the_save_model_plainly() {
         let out = render_map(&page(), &sample());
@@ -1309,12 +1322,58 @@ mod tests {
             "{}",
             out.html
         );
+        assert!(out.html.contains("Undo"), "{}", out.html);
         assert!(
-            out.html.contains("use the restore options below to undo")
-                || out.html.contains("Use the restore options below to undo")
-                || out.html.contains("the restore options below to undo"),
-            "{}",
+            out.html.contains("restore options"),
+            "the wider road home went unmentioned: {}",
             out.html
+        );
+        assert!(
+            out.html.contains("timestamped backup"),
+            "the promise that makes an optimistic write safe: {}",
+            out.html
+        );
+    }
+
+    /// v8: the toast stack is CLIENT-only. Its container ships (with the
+    /// list's markers inside, which is what lets the adoption path insert
+    /// into it), but a server render has taken no action, so it must never
+    /// paint a toast — and the no-JS flash line it replaced still exists for
+    /// a page with no JavaScript at all.
+    #[test]
+    fn the_toast_stack_ships_empty_and_the_no_js_flash_line_survives() {
+        let out = render_map(&page(), &sample());
+        let at = out
+            .html
+            .find(r#"class="toasts""#)
+            .unwrap_or_else(|| panic!("the toast stack is missing: {}", out.html));
+        // The empty list still emits its `<!--f:lN-->` markers, and the
+        // client's adoption path inserts BEFORE the closing one. No markers =
+        // a stack that silently never shows a toast.
+        let container = &out.html[at..];
+        let container = &container[..container.find("</div>").unwrap_or(container.len())];
+        assert!(
+            container.contains("<!--f:l"),
+            "the toast list emitted no markers to adopt: {container}"
+        );
+        assert!(
+            !out.html.contains(r#"class="toast toast-"#),
+            "a toast SSR'd: {}",
+            out.html
+        );
+        assert!(
+            !out.html.contains(r#"data-undo="#),
+            "an Undo button SSR'd where nothing has happened: {}",
+            out.html
+        );
+        // The server-rendered flash channel (savedLine + its two shows) is
+        // still part of the seam — that is the no-JS page's only feedback.
+        assert!(
+            scalar_slots(&sample(), None)
+                .as_object()
+                .unwrap()
+                .contains_key("savedLine"),
+            "the SSR flash slot was dropped"
         );
     }
 

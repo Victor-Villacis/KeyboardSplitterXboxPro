@@ -44,10 +44,14 @@ complex tool with the simplest interface."
    feature; Synapse-4's silent wipe of binding A when saving B is the
    cardinal sin. In ksx this is doubly true: keyboard fan-out (one key
    driving several slots) is THE product. The v5 conflict dialog softens
-   accordingly: same-preset duplicate = flag + one-tap steal; CROSS-SLOT
-   duplicate = informational badge ("also P2's A — this is fan-out"), never
-   a blocking dialog. No save ever touches a binding other than the one
-   being edited without showing it first.
+   accordingly: same-preset duplicate = **not a conflict at all** — it is a
+   multi-bind, written with no dialog and then SHOWN ("also A · B");
+   CROSS-SLOT duplicate = informational badge ("also P2's A — this is
+   fan-out"), never a blocking dialog. No save ever touches a binding other
+   than the one being edited without showing it first — and since 2026-08-06
+   the WRITER cannot either: the only path that unbinds a control the caller
+   did not name is `--move-from`/`"move_from"`, which names it in the request
+   and again in the response (`moved_from`).
 8. **Player identity is static; the chain is visible.** I-PAC bakes P1–P4
    into scancodes and MAME never asks again; RetroArch's dynamic ports are
    a decade of cabinet forum grief. ksx slots are static by config, and one
@@ -73,11 +77,17 @@ key written to N controls; and commandment 7 finished for the same-preset
 case — a key already used by another control in the SAME preset is no longer
 offered a "Replace" dialog, it is written and then SHOWN as a group ("also
 A · B" badges on every co-bound legend row, cool-toned key tags on the art).
-Cross-slot duplicates keep their existing informational dialog. Note for the
-engine side: `ksx map --force` still STEALS a same-preset key (mapping.rs
-module docs), so until that verb learns multi-bind the page reports whatever
-the daemon says it did — the legend derives sharing from disk, never from
-what the UI assumed.
+Cross-slot duplicates keep their existing informational dialog.
+
+**Engine side: CLOSED (2026-08-06).** `ksx map` no longer moves a key between
+controls. A same-preset duplicate is written as a multi-bind, every other
+control keeps the key, and the response reports the co-bindings
+(`also_drives`) — so the multi-select arm's N sequential writes all stick and
+the page's honest report ("P now drives A · B · RT") is the one it prints.
+The old move survives as an explicit, singular `--move-from FUNCTION` /
+`"move_from"`, which names exactly what it unbound; `--force` now only means
+"bind here anyway despite ANOTHER SLOT's preset" and removes nothing. The
+legend still derives sharing from disk, never from what the UI assumed.
 
 **Build A — finish v5 to spec (now).** Layout fix (in flight: clean hover
 zones + legend) plus: press-to-select (panel press focuses the control on

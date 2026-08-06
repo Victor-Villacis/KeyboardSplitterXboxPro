@@ -7,7 +7,19 @@
 //! - **Replace per function.** `map --function A --key G` makes G the ONLY key
 //!   bound to A — the mapper's tile shows one tag per control, and the file
 //!   says what the tile says. (Multi-key fan-in stays expressible by hand;
-//!   this verb does not author it.)
+//!   this verb does not author it.) It replaces the KEYS OF ONE FUNCTION and
+//!   nothing else: the same key on OTHER functions is left exactly where it is
+//!   (see multi-bind, below).
+//! - **One key may drive many functions — that is a MULTI-BIND, not a
+//!   conflict.** The engine has no uniqueness constraint in either direction:
+//!   "many keys → one function and one key → many functions are both native"
+//!   (`ksx-core/src/preset.rs`, docs/INPUT-TRANSFORMS.md §1a) — one key
+//!   compiles to a `SmallVec` of targets and they all fire together. So
+//!   writing G to A when G is already this preset's B leaves B alone, writes
+//!   A, and REPORTS the co-binding (`also_drives: ["B"]`) as information.
+//!   That is what makes the mapper's "Map all to one key" work: N ordinary
+//!   writes of one key, and all N stick (MAPPER-UX commandment 7 — duplicates
+//!   are information, fan-out is the product).
 //! - **`--clear`** leaves the function in the file bound to the inert `"None"`
 //!   placeholder — the same convention as the built-in empty preset, so a
 //!   cleared control stays visible instead of silently vanishing. Guarded rows
@@ -24,16 +36,23 @@
 //!   chord completes. Guards that cannot mean anything (the trigger in its own
 //!   guard, a key required and forbidden at once, a guard with no key) are
 //!   refused before any write.
-//! - **Conflicts block, the caller decides** (the PadForge gap this closes —
-//!   docs/research/padforge-code-audit.md §1.2 "Conflict handling: none"). Two
-//!   scopes are checked: the key already bound to ANOTHER function in the same
-//!   preset, and the key bound in another slot's preset within any games.toml
-//!   profile that uses the target preset. `force` proceeds: same-preset
-//!   conflicts are stolen (the key is removed from the old function, which
-//!   keeps a `"None"` placeholder if emptied); **other presets are never
-//!   edited** — a cross-profile conflict under `force` is written anyway and
-//!   reported, because silently rewriting a file the caller did not name is
-//!   worse than a double binding the response spells out.
+//! - **`--move-from FUNCTION` is the only way this verb unbinds anything it
+//!   was not asked to bind**, and it names its victim out loud: it takes THIS
+//!   key away from THAT one function (which keeps a `"None"` placeholder if
+//!   that emptied it) and touches nothing else. Never implicit, never a side
+//!   effect of `force`. The response says exactly what it unbound
+//!   (`moved_from`).
+//! - **The one remaining conflict is CROSS-SLOT, and it blocks** (the PadForge
+//!   gap this closes — docs/research/padforge-code-audit.md §1.2 "Conflict
+//!   handling: none"): the key is also bound in ANOTHER slot's preset inside a
+//!   games.toml profile that uses the target preset. `force` is the caller
+//!   saying "yes, I mean both slots to see that key" — it writes the target,
+//!   keeps reporting the double binding, and **never edits the other preset**,
+//!   because silently rewriting a file the caller did not name is worse than a
+//!   double binding the response spells out. `force` therefore removes no
+//!   binding, anywhere, ever: it is an acknowledgement, not a hammer. (The
+//!   genuinely destructive verbs are their own: [`clear_all`] and [`restore`],
+//!   each of which takes a timestamped backup first.)
 //! - **Writes are canonical.** The store serializes `PresetFile` afresh:
 //!   bindings come back sorted with flat quoted dotted keys (`"dpad.up"`), and
 //!   hand-written comments do not survive. That is the documented trade for
@@ -54,8 +73,14 @@ pub struct MapSpec {
     pub function: String,
     /// `Some(key name)` binds, `None` clears.
     pub key: Option<String>,
-    /// Proceed despite conflicts (see module docs for exactly what that does).
+    /// Write anyway when the key is already bound in ANOTHER SLOT's preset
+    /// (the only conflict left). It removes nothing, anywhere: see module
+    /// docs. Same-preset duplicates never need it — they are multi-binds.
     pub force: bool,
+    /// Take this key away from exactly ONE other function of the same preset
+    /// (`--move-from B`). The old, explicit "move the key" behaviour; the
+    /// named function keeps a `"None"` placeholder if it is left with nothing.
+    pub move_from: Option<String>,
     /// CHORD: extra keys that must ALL be held for this binding to apply.
     /// Empty means an ordinary unguarded binding — exactly as before.
     pub when: Vec<String>,
@@ -63,47 +88,48 @@ pub struct MapSpec {
     pub unless: Vec<String>,
 }
 
-/// Where a conflicting binding lives.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConflictScope {
-    /// Another function in the SAME preset. `force` steals from it.
-    Preset,
-    /// A different slot's preset inside a games.toml profile that also uses
-    /// the target preset. Never auto-edited; reported for the caller.
-    Profile,
-}
-
-/// One conflicting binding.
+/// One conflicting binding — always CROSS-SLOT.
+///
+/// There is deliberately no "same preset" variant any more: a key on another
+/// function of the SAME preset is a multi-bind, reported as
+/// [`AppliedMap::also_drives`], not as a conflict. The wire keeps emitting
+/// `"scope": "profile"` (see [`conflicts_json`]) so existing readers that
+/// switch on it are unaffected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MapConflict {
-    pub scope: ConflictScope,
-    /// Preset holding the conflicting binding.
+    /// The OTHER slot's preset, which is never edited.
     pub preset: String,
     /// Canonical function name the key is bound to there.
     pub function: String,
-    /// Profile title (Profile scope only).
+    /// Profile title.
     pub profile: Option<String>,
-    /// Slot number inside that profile (Profile scope only).
+    /// Slot number inside that profile.
     pub slot: Option<u8>,
 }
 
 impl MapConflict {
     /// One human line, e.g. `G is "IPAC P2"'s A (slot 2 of "Steam")`.
     pub fn describe(&self, key: &str) -> String {
-        match self.scope {
-            ConflictScope::Preset => format!("{key} is already this preset's {}", self.function),
-            ConflictScope::Profile => format!(
-                "{key} is \"{}\"'s {}{}",
-                self.preset,
-                self.function,
-                match (&self.profile, self.slot) {
-                    (Some(profile), Some(slot)) => format!(" (slot {slot} of \"{profile}\")"),
-                    (Some(profile), None) => format!(" (\"{profile}\")"),
-                    _ => String::new(),
-                }
-            ),
-        }
+        format!(
+            "{key} is \"{}\"'s {}{}",
+            self.preset,
+            self.function,
+            match (&self.profile, self.slot) {
+                (Some(profile), Some(slot)) => format!(" (slot {slot} of \"{profile}\")"),
+                (Some(profile), None) => format!(" (\"{profile}\")"),
+                _ => String::new(),
+            }
+        )
     }
+}
+
+/// What `--move-from` unbound: the function the key was taken from, and the
+/// keys that function has LEFT. `remaining` empty = it now holds the inert
+/// `"None"` placeholder, exactly as `--clear` leaves one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MovedFrom {
+    pub function: String,
+    pub remaining: Vec<String>,
 }
 
 /// What a successful [`apply`] did.
@@ -120,10 +146,16 @@ pub struct AppliedMap {
     pub when: Vec<String>,
     /// Canonical `unless` key names — empty for an unguarded binding.
     pub unless: Vec<String>,
-    /// Same-preset functions the key was stolen from (`force`).
-    pub stolen_from: Vec<String>,
-    /// Cross-profile conflicts that were overridden by `force` — written
-    /// anyway, reported so the caller can say so.
+    /// The OTHER functions of this same preset that this key also drives now
+    /// that the write is done — INFORMATION, not a problem (the engine fires
+    /// all of them; docs/INPUT-TRANSFORMS.md §1a). Empty for a clear, for a
+    /// chord, and for a key that drives this control only.
+    pub also_drives: Vec<String>,
+    /// What `--move-from` unbound — `None` unless it was asked for.
+    pub moved_from: Option<MovedFrom>,
+    /// Cross-slot conflicts that were overridden by `force` — written
+    /// anyway, reported so the caller can say so. The other preset is
+    /// untouched.
     pub overridden: Vec<MapConflict>,
     /// The honest caveat, per constituent: `(key, the function it is also
     /// bound to on its own)`. ksx does not defer input, so that binding shows
@@ -155,10 +187,29 @@ impl AppliedMap {
             (Some(key), None) => format!("\"{}\": {} = {}", self.preset, self.function, key),
             (None, _) => format!("\"{}\": {} cleared", self.preset, self.function),
         };
-        if !self.stolen_from.is_empty() {
-            line.push_str(&format!(" (taken from {})", self.stolen_from.join(", ")));
+        if let Some(moved) = &self.moved_from {
+            line.push_str(&match moved.remaining.as_slice() {
+                [] => format!(
+                    " (taken from {} — {} is now unbound)",
+                    moved.function, moved.function
+                ),
+                keys => format!(
+                    " (taken from {} — {} still has {})",
+                    moved.function,
+                    moved.function,
+                    keys.join(", ")
+                ),
+            });
         }
         if let Some(key) = &self.key {
+            // Multi-bind: say what else the key drives, in the same words the
+            // mapper's legend uses ("G also drives A, B").
+            if !self.also_drives.is_empty() {
+                line.push_str(&format!(
+                    "; {key} also drives {}",
+                    self.also_drives.join(", ")
+                ));
+            }
             for conflict in &self.overridden {
                 line.push_str(&format!("; still {}", conflict.describe(key)));
             }
@@ -186,7 +237,13 @@ pub enum MapError {
     /// `--when`/`--unless` that cannot mean anything (the trigger guarding
     /// itself, a key required and forbidden at once, a guard with no key).
     InvalidGuard(String),
-    /// Conflicts found and `force` not given. The write did NOT happen.
+    /// A `--move-from` that would unbind something the caller did not mean:
+    /// the function being bound, a function that does not hold this key at
+    /// all, a clear, or a chord. Refused BEFORE any write — the one path that
+    /// removes a binding never guesses.
+    BadMoveFrom(String),
+    /// Cross-slot conflicts found and `force` not given. The write did NOT
+    /// happen.
     Conflicts {
         key: String,
         conflicts: Vec<MapConflict>,
@@ -234,6 +291,7 @@ impl std::fmt::Display for MapError {
                  (`ksx monitor` shows the name for any key you press)"
             ),
             MapError::InvalidGuard(reason) => write!(f, "refusing to write that chord: {reason}"),
+            MapError::BadMoveFrom(reason) => write!(f, "refusing that --move-from: {reason}"),
             MapError::Conflicts { key, conflicts } => {
                 write!(f, "refusing to bind {key}: ")?;
                 for (i, conflict) in conflicts.iter().enumerate() {
@@ -244,8 +302,9 @@ impl std::fmt::Display for MapError {
                 }
                 write!(
                     f,
-                    " — use --force to bind anyway (same-preset conflicts are \
-                     stolen; other presets are never edited)"
+                    " — that is another SLOT's preset; use --force to bind here \
+                     anyway (both slots then see {key}; other presets are never \
+                     edited)"
                 )
             }
             MapError::NoSessionBackup { preset } => write!(
@@ -302,6 +361,9 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         };
         check_guard(trigger, &when, &unless)?;
     }
+    // The only path that unbinds a function the caller did not name in
+    // `--function` is validated here, before a file is even read.
+    let move_from = resolve_move_from(spec, &canonical, key.is_some(), guarded)?;
 
     // The preset must exist; `ksx map` creates bindings, never presets.
     let file = load_preset_by_name(store, &spec.preset)?;
@@ -309,7 +371,8 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
     let mut entries = core.entries;
     let mut chords = core.chords;
 
-    let mut stolen_from = Vec::new();
+    let mut moved_from = None;
+    let mut also_drives = Vec::new();
     let mut overridden = Vec::new();
     // A chord deliberately does NOT run the conflict machinery: its whole
     // point is to reuse keys that already do something, so "G is already this
@@ -331,35 +394,52 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         Vec::new()
     };
     if let Some(key) = key.filter(|_| !guarded) {
-        let conflicts = find_conflicts(store, &spec.preset, &entries, key, &canonical);
+        // Same-preset duplicates are NOT checked here on purpose: one key
+        // driving several functions is a multi-bind the engine executes as
+        // written, so it is reported (`also_drives`, below) and never refused.
+        // The only conflict left is the one that crosses into a preset this
+        // writer refuses to edit.
+        let conflicts = find_profile_conflicts(store, &spec.preset, key);
         if !conflicts.is_empty() && !spec.force {
             return Err(MapError::Conflicts {
                 key: key.name().to_owned(),
                 conflicts,
             });
         }
-        for conflict in conflicts {
-            match conflict.scope {
-                ConflictScope::Preset => stolen_from.push(conflict.function.clone()),
-                ConflictScope::Profile => overridden.push(conflict),
-            }
-        }
-        // Steal (same preset only): drop the key wherever else it appears,
-        // leaving a "None" placeholder if a function would end up empty.
-        if !stolen_from.is_empty() {
-            let victims: Vec<ksx_core::Binding> = entries
+        overridden = conflicts;
+
+        // `--move-from B`: take THIS key off B, and nothing else off anybody.
+        if let Some(victim) = &move_from {
+            let Some(victim_binding) = entries
                 .iter()
-                .filter(|(k, b)| *k == key && ksx_config::function_name(b) != canonical)
+                .find(|(k, b)| *k == key && ksx_config::function_name(b) == *victim)
                 .map(|(_, b)| *b)
+            else {
+                return Err(MapError::BadMoveFrom(not_holding(
+                    &entries,
+                    victim,
+                    key.name(),
+                )));
+            };
+            entries.retain(|(k, b)| !(*k == key && ksx_config::function_name(b) == *victim));
+            let remaining: Vec<String> = entries
+                .iter()
+                .filter(|(k, b)| ksx_config::function_name(b) == *victim && *k != Key::None)
+                .map(|(k, _)| k.name().to_owned())
                 .collect();
-            entries.retain(|(k, b)| !(*k == key && ksx_config::function_name(b) != canonical));
-            for victim in victims {
-                if !entries.iter().any(|(_, b)| {
-                    ksx_config::function_name(b) == ksx_config::function_name(&victim)
-                }) {
-                    entries.push((Key::None, victim));
-                }
+            // Emptied? Keep the control visible as the inert placeholder —
+            // the same convention `--clear` uses, so nothing silently vanishes
+            // from the file or the mapper's legend.
+            if !entries
+                .iter()
+                .any(|(_, b)| ksx_config::function_name(b) == *victim)
+            {
+                entries.push((Key::None, victim_binding));
             }
+            moved_from = Some(MovedFrom {
+                function: victim.clone(),
+                remaining,
+            });
         }
     }
 
@@ -380,6 +460,19 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         entries.push((key.unwrap_or(Key::None), binding));
     }
 
+    // The co-binding report, read off the file as it is ABOUT TO BE WRITTEN —
+    // so it already excludes anything `--move-from` took away, and it says
+    // what the preset will really do rather than what the caller assumed.
+    if let Some(key) = key.filter(|_| !guarded) {
+        also_drives = entries
+            .iter()
+            .filter(|(k, b)| *k == key && ksx_config::function_name(b) != canonical)
+            .map(|(_, b)| ksx_config::function_name(b))
+            .collect();
+        also_drives.sort();
+        also_drives.dedup();
+    }
+
     let rewritten = PresetFile::from_core(&ksx_core::Preset {
         name: file.name.clone(),
         entries,
@@ -394,10 +487,65 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         key: key.map(|k| k.name().to_owned()),
         when: when.iter().map(|k| k.name().to_owned()).collect(),
         unless: unless.iter().map(|k| k.name().to_owned()).collect(),
-        stolen_from,
+        also_drives,
+        moved_from,
         overridden,
         flash,
     })
+}
+
+/// Validate `--move-from` before anything is read or written. Everything it
+/// can refuse is refused here except "that function does not hold this key",
+/// which needs the file ([`not_holding`]).
+fn resolve_move_from(
+    spec: &MapSpec,
+    canonical: &str,
+    has_key: bool,
+    guarded: bool,
+) -> Result<Option<String>, MapError> {
+    let Some(name) = spec.move_from.as_deref() else {
+        return Ok(None);
+    };
+    let victim = parse_function(name).map_err(|_| MapError::UnknownFunction(name.to_owned()))?;
+    let victim = ksx_config::function_name(&victim);
+    if victim == canonical {
+        return Err(MapError::BadMoveFrom(format!(
+            "{canonical} is the function being bound — a control cannot take a key from itself"
+        )));
+    }
+    if !has_key {
+        return Err(MapError::BadMoveFrom(
+            "it needs a --key (it takes THAT key away from the named function, and a clear \
+             takes nothing from anyone)"
+                .to_owned(),
+        ));
+    }
+    if guarded {
+        return Err(MapError::BadMoveFrom(format!(
+            "a chord layers over the keys it uses instead of taking them, so nothing is moved \
+             off {victim}; drop --when/--unless, or unbind {victim} yourself with --clear"
+        )));
+    }
+    Ok(Some(victim))
+}
+
+/// The refusal for `--move-from B` when B does not hold that key — it names
+/// what B actually has, because the alternative is unbinding a control the
+/// caller was not thinking about.
+fn not_holding(entries: &[(Key, ksx_core::Binding)], victim: &str, key: &str) -> String {
+    let held: Vec<String> = entries
+        .iter()
+        .filter(|(k, b)| ksx_config::function_name(b) == victim && *k != Key::None)
+        .map(|(k, _)| k.name().to_owned())
+        .collect();
+    match held.as_slice() {
+        [] => format!("{victim} is not bound to anything, so {key} cannot be taken from it"),
+        keys => format!(
+            "{victim} is not bound to {key} (it has {}) — refusing to unbind a control the \
+             write was not about",
+            keys.join(", ")
+        ),
+    }
 }
 
 /// Resolve a list of key names the same way [`resolve_key`] does one.
@@ -836,31 +984,14 @@ fn load_preset_by_name(store: &Store, name: &str) -> Result<PresetFile, MapError
         })
 }
 
-/// Both conflict scopes for `key` aimed at `canonical` in `preset_name`.
-fn find_conflicts(
-    store: &Store,
-    preset_name: &str,
-    entries: &[(Key, ksx_core::Binding)],
-    key: Key,
-    canonical: &str,
-) -> Vec<MapConflict> {
+/// The one conflict scope left: `key` bound in ANOTHER slot's preset, inside a
+/// games.toml profile that also uses `preset_name`.
+///
+/// The same key on another function of the SAME preset is deliberately not
+/// here — it is a multi-bind, reported as `also_drives`.
+fn find_profile_conflicts(store: &Store, preset_name: &str, key: Key) -> Vec<MapConflict> {
     let mut conflicts = Vec::new();
 
-    // Same preset: the key on any OTHER function.
-    for (k, b) in entries {
-        let function = ksx_config::function_name(b);
-        if *k == key && function != canonical {
-            conflicts.push(MapConflict {
-                scope: ConflictScope::Preset,
-                preset: preset_name.to_owned(),
-                function,
-                profile: None,
-                slot: None,
-            });
-        }
-    }
-
-    // Profiles that use this preset: the key in any OTHER slot's preset.
     // games.toml being unreadable is not a mapping error — the preset write
     // stands on its own; an unreadable profile list just cannot warn.
     let Ok(games) = store.load_games() else {
@@ -900,7 +1031,6 @@ fn find_conflicts(
                 }
                 seen.push(dedupe);
                 conflicts.push(MapConflict {
-                    scope: ConflictScope::Profile,
                     preset: slot.preset.clone(),
                     function: function.clone(),
                     profile: Some(game.title.clone()),
@@ -923,17 +1053,34 @@ pub fn flash_json(flash: &[(String, String)]) -> serde_json::Value {
     )
 }
 
+/// What `--move-from` unbound, as pipe/CLI JSON — one shape everywhere.
+/// `null` when nothing was moved (the normal multi-bind write), otherwise
+/// `{"function":"B","remaining":[],"unbound":true}`: `unbound` is the flag a
+/// UI needs (the control now shows the inert `"None"`), `remaining` is what it
+/// kept when the key was one of several.
+pub fn moved_from_json(moved: Option<&MovedFrom>) -> serde_json::Value {
+    match moved {
+        None => serde_json::Value::Null,
+        Some(moved) => serde_json::json!({
+            "function": moved.function,
+            "remaining": moved.remaining,
+            "unbound": moved.remaining.is_empty(),
+        }),
+    }
+}
+
 /// The conflicts as pipe/Studio JSON rows — one shape everywhere.
+///
+/// `scope` is the constant `"profile"`: every conflict this writer reports is
+/// cross-slot now, and the field stays on the wire so readers that switch on
+/// it (studio's `BindConflict`, studio-ui's dialog) keep working unchanged.
 pub fn conflicts_json(conflicts: &[MapConflict]) -> serde_json::Value {
     serde_json::Value::Array(
         conflicts
             .iter()
             .map(|c| {
                 serde_json::json!({
-                    "scope": match c.scope {
-                        ConflictScope::Preset => "preset",
-                        ConflictScope::Profile => "profile",
-                    },
+                    "scope": "profile",
                     "preset": c.preset,
                     "function": c.function,
                     "profile": c.profile,
@@ -992,6 +1139,17 @@ mod tests {
         }
     }
 
+    /// The explicit move: `--function F --key K --move-from VICTIM`.
+    fn move_spec(preset: &str, function: &str, key: &str, victim: &str) -> MapSpec {
+        MapSpec {
+            preset: preset.into(),
+            function: function.into(),
+            key: Some(key.to_owned()),
+            move_from: Some(victim.to_owned()),
+            ..MapSpec::default()
+        }
+    }
+
     /// The chord shape: `--function F --key K --when …`.
     fn chord_spec(preset: &str, function: &str, key: &str, when: &[&str]) -> MapSpec {
         MapSpec {
@@ -1012,7 +1170,8 @@ mod tests {
         let applied = apply(&store, &spec("P1", "a", Some("g"), false)).unwrap();
         assert_eq!(applied.function, "A", "function name canonicalized");
         assert_eq!(applied.key.as_deref(), Some("G"), "key name canonicalized");
-        assert!(applied.stolen_from.is_empty());
+        assert!(applied.moved_from.is_none());
+        assert!(applied.also_drives.is_empty());
         assert_eq!(applied.message(), "\"P1\": A = G");
 
         let on_disk = std::fs::read_to_string(&applied.path).unwrap();
@@ -1097,34 +1256,220 @@ mod tests {
         assert!(text.contains("IPAC P1"), "{text}");
     }
 
+    // ---- multi-bind: one key → many controls (docs/INPUT-TRANSFORMS.md §1a)
+
+    /// THE bug this replaced: writing a key that another control of the SAME
+    /// preset already holds used to be a conflict, and `force` MOVED the key.
+    /// It is a multi-bind — both controls keep it, no flag needed, and the
+    /// response says what else the key drives.
     #[test]
-    fn a_same_preset_conflict_blocks_without_force_and_steals_with_it() {
-        let root = TempRoot::new("steal");
+    fn a_same_preset_duplicate_is_a_multi_bind_not_a_conflict() {
+        let root = TempRoot::new("multibind");
         let store = root.store();
         preset(&store, "P1", "A = \"S\"\nB = \"G\"\n");
 
-        // Without force: refused, file untouched.
-        let err = apply(&store, &spec("P1", "A", Some("G"), false)).unwrap_err();
-        let MapError::Conflicts { key, conflicts } = &err else {
-            panic!("expected conflicts, got {err:?}");
-        };
-        assert_eq!(key, "G");
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].scope, ConflictScope::Preset);
-        assert_eq!(conflicts[0].function, "B");
-        assert!(err.to_string().contains("--force"), "{err}");
+        // No --force anywhere in sight.
+        let applied = apply(&store, &spec("P1", "A", Some("G"), false)).unwrap();
+        assert_eq!(applied.also_drives, vec!["B".to_owned()]);
+        assert!(applied.moved_from.is_none(), "nothing was unbound");
+        assert_eq!(applied.message(), "\"P1\": A = G; G also drives B");
 
-        // With force: stolen, and the victim keeps a "None" placeholder.
-        let applied = apply(&store, &spec("P1", "A", Some("G"), true)).unwrap();
-        assert_eq!(applied.stolen_from, vec!["B".to_owned()]);
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(on_disk.contains("A = \"G\""), "{on_disk}");
         assert!(
-            applied.message().contains("taken from B"),
+            on_disk.contains("B = \"G\""),
+            "the original binding must be untouched: {on_disk}"
+        );
+        assert!(!on_disk.contains("None"), "nothing was cleared: {on_disk}");
+    }
+
+    /// The acceptance test for the mapper's "Map all to one key": N sequential
+    /// ordinary writes of ONE key must all stick (v7's multi-select arm writes
+    /// exactly this, one `map` call per selected control).
+    #[test]
+    fn one_key_can_drive_three_controls_written_one_at_a_time() {
+        let root = TempRoot::new("map-all");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\nB = \"D\"\nrt = \"E\"\n");
+
+        let mut last = None;
+        for function in ["A", "B", "rt"] {
+            last = Some(apply(&store, &spec("P1", function, Some("P"), false)).unwrap());
+        }
+        let last = last.unwrap();
+        assert_eq!(
+            last.also_drives,
+            vec!["A".to_owned(), "B".to_owned()],
+            "the last write names the two controls already on P"
+        );
+
+        let on_disk = std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap();
+        for row in ["A = \"P\"", "B = \"P\"", "rt = \"P\""] {
+            assert!(on_disk.contains(row), "missing {row} in:\n{on_disk}");
+        }
+        // And the engine sees one key with three targets — the thing the file
+        // is FOR (many keys → one function and one key → many functions are
+        // both native, ksx-core/src/preset.rs).
+        let core = store
+            .load_preset("P1")
+            .unwrap()
+            .unwrap()
+            .value
+            .to_core()
+            .unwrap();
+        let on_p = core.entries.iter().filter(|(k, _)| *k == Key::P).count();
+        assert_eq!(on_p, 3, "{:?}", core.entries);
+    }
+
+    /// Re-binding the SAME control is still replace-per-function: the key it
+    /// used to hold goes, and the OTHER controls sharing that old key stay.
+    #[test]
+    fn rebinding_one_control_never_disturbs_the_others_sharing_its_key() {
+        let root = TempRoot::new("multibind-rebind");
+        let store = root.store();
+        preset(&store, "P1", "A = \"P\"\nB = \"P\"\nrt = \"P\"\n");
+
+        let applied = apply(&store, &spec("P1", "B", Some("Q"), false)).unwrap();
+        assert!(applied.also_drives.is_empty(), "Q drives B alone");
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(on_disk.contains("B = \"Q\""), "{on_disk}");
+        assert!(on_disk.contains("A = \"P\""), "{on_disk}");
+        assert!(on_disk.contains("rt = \"P\""), "{on_disk}");
+    }
+
+    // ---- the explicit move: --move-from ----------------------------------
+
+    /// `--move-from B` unbinds exactly B, and exactly of this key.
+    #[test]
+    fn move_from_unbinds_the_named_function_and_nothing_else() {
+        let root = TempRoot::new("move-from");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\nB = \"G\"\nX = \"G\"\nY = \"G\"\n");
+
+        let applied = apply(&store, &move_spec("P1", "A", "G", "b")).unwrap();
+        let moved = applied.moved_from.as_ref().expect("a move was requested");
+        assert_eq!(moved.function, "B", "the victim is named, canonically");
+        assert!(moved.remaining.is_empty(), "B had only G");
+        assert_eq!(
+            applied.also_drives,
+            vec!["X".to_owned(), "Y".to_owned()],
+            "the OTHER co-bindings are untouched and reported"
+        );
+        assert!(
+            applied
+                .message()
+                .contains("taken from B — B is now unbound"),
+            "{}",
+            applied.message()
+        );
+
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(on_disk.contains("A = \"G\""), "{on_disk}");
+        assert!(on_disk.contains("B = \"None\""), "{on_disk}");
+        assert!(on_disk.contains("X = \"G\""), "{on_disk}");
+        assert!(on_disk.contains("Y = \"G\""), "{on_disk}");
+    }
+
+    /// A victim with several keys keeps the others — the move takes ONE key,
+    /// not the control's whole binding — and the message says so.
+    #[test]
+    fn move_from_takes_only_that_key_when_the_victim_has_more() {
+        let root = TempRoot::new("move-from-multi");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\nB = [\"G\", \"H\"]\n");
+
+        let applied = apply(&store, &move_spec("P1", "A", "G", "B")).unwrap();
+        let moved = applied.moved_from.as_ref().unwrap();
+        assert_eq!(moved.remaining, vec!["H".to_owned()]);
+        assert!(
+            applied.message().contains("B still has H"),
             "{}",
             applied.message()
         );
         let on_disk = std::fs::read_to_string(&applied.path).unwrap();
-        assert!(on_disk.contains("A = \"G\""), "{on_disk}");
-        assert!(on_disk.contains("B = \"None\""), "{on_disk}");
+        assert!(on_disk.contains("B = \"H\""), "{on_disk}");
+        assert!(!on_disk.contains("None"), "{on_disk}");
+    }
+
+    /// Everything `--move-from` refuses, it refuses BEFORE writing: the one
+    /// path that removes a binding never guesses which one.
+    #[test]
+    fn move_from_refuses_anything_it_would_have_to_guess() {
+        let root = TempRoot::new("move-from-refuse");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\nB = \"G\"\nX = \"Q\"\n");
+        let before = std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap();
+
+        // A control that does not hold this key — moving would unbind
+        // something the write was not about.
+        let err = apply(&store, &move_spec("P1", "A", "G", "X")).unwrap_err();
+        assert!(matches!(err, MapError::BadMoveFrom(_)), "{err:?}");
+        assert!(err.to_string().contains("X is not bound to G"), "{err}");
+        assert!(err.to_string().contains("(it has Q)"), "{err}");
+
+        // A control that is not bound at all.
+        let err = apply(&store, &move_spec("P1", "A", "G", "Y")).unwrap_err();
+        assert!(
+            err.to_string().contains("Y is not bound to anything"),
+            "{err}"
+        );
+
+        // The function being bound.
+        let err = apply(&store, &move_spec("P1", "A", "G", "a")).unwrap_err();
+        assert!(err.to_string().contains("being bound"), "{err}");
+
+        // A clear takes nothing from anyone.
+        let err = apply(
+            &store,
+            &MapSpec {
+                preset: "P1".into(),
+                function: "A".into(),
+                key: None,
+                move_from: Some("B".into()),
+                ..MapSpec::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("needs a --key"), "{err}");
+
+        // A chord layers over its keys instead of taking them.
+        let err = apply(
+            &store,
+            &MapSpec {
+                preset: "P1".into(),
+                function: "rt".into(),
+                key: Some("G".into()),
+                when: vec!["F".into()],
+                move_from: Some("B".into()),
+                ..MapSpec::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("a chord layers over"), "{err}");
+
+        // An unknown victim is refused like any other function name.
+        let err = apply(&store, &move_spec("P1", "A", "G", "warp")).unwrap_err();
+        assert!(matches!(err, MapError::UnknownFunction(_)), "{err:?}");
+
+        assert_eq!(
+            before,
+            std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap(),
+            "no refusal may leave a changed file"
+        );
+    }
+
+    /// `force` is not a spelling of "move": it only concerns the cross-slot
+    /// case, and it removes nothing.
+    #[test]
+    fn force_never_takes_a_key_away_from_anyone() {
+        let root = TempRoot::new("force-harmless");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\nB = \"G\"\n");
+        let applied = apply(&store, &spec("P1", "A", Some("G"), true)).unwrap();
+        assert!(applied.moved_from.is_none());
+        assert_eq!(applied.also_drives, vec!["B".to_owned()]);
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(on_disk.contains("B = \"G\""), "{on_disk}");
     }
 
     #[test]
@@ -1153,12 +1498,12 @@ preset = "P2"
             panic!("expected conflicts, got {err:?}");
         };
         assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].scope, ConflictScope::Profile);
         assert_eq!(conflicts[0].preset, "P2");
         assert_eq!(conflicts[0].function, "A");
         assert_eq!(conflicts[0].profile.as_deref(), Some("Steam"));
         assert_eq!(conflicts[0].slot, Some(2));
         assert!(err.to_string().contains("\"P2\"'s A"), "{err}");
+        assert!(err.to_string().contains("another SLOT's preset"), "{err}");
 
         // Force writes the target, reports the override, leaves P2 alone.
         let p2_before = std::fs::read_to_string(store.preset_path("P2").unwrap()).unwrap();
@@ -1248,7 +1593,7 @@ preset = "Other"
         preset(&store, "P1", "X = \"A\"\nY = \"B\"\n");
 
         let applied = apply(&store, &chord_spec("P1", "rt", "A", &["B"])).unwrap();
-        assert!(applied.stolen_from.is_empty(), "a chord steals nothing");
+        assert!(applied.moved_from.is_none(), "a chord takes nothing");
         assert_eq!(
             applied.flash,
             vec![
@@ -1295,6 +1640,52 @@ preset = "Other"
             .to_core()
             .unwrap();
         assert!(core.chords.is_empty());
+    }
+
+    /// A plain multi-bind and a chord on the SAME key coexist, in both write
+    /// orders: the chord never joins the conflict machinery (it was already
+    /// exempt), and the plain write treats the key like any other shared key.
+    /// The engine's consumption rules decide what fires (§1b); the file just
+    /// has to hold both, and the flash advisory has to name the cost.
+    #[test]
+    fn a_plain_multi_bind_and_a_chord_share_one_key() {
+        let root = TempRoot::new("chord-multibind");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\n");
+
+        // Plain first, then the chord on top of the same trigger.
+        apply(&store, &spec("P1", "A", Some("D"), false)).unwrap();
+        apply(&store, &spec("P1", "B", Some("D"), false)).unwrap();
+        let applied = apply(&store, &chord_spec("P1", "rt", "D", &["F"])).unwrap();
+        assert!(applied.moved_from.is_none(), "a chord takes nothing");
+        assert!(
+            applied.also_drives.is_empty(),
+            "co-bindings are a PLAIN write's report; a chord reports the flash"
+        );
+        // The flash names the trigger's own binding — one row per constituent
+        // that is also individually bound, whichever function it is.
+        assert_eq!(applied.flash.len(), 1, "{:?}", applied.flash);
+        assert_eq!(applied.flash[0].0, "D");
+
+        // Then a THIRD plain control joins the same key: still no conflict,
+        // and the chord is still there afterwards.
+        let applied = apply(&store, &spec("P1", "X", Some("D"), false)).unwrap();
+        assert_eq!(applied.also_drives, vec!["A".to_owned(), "B".to_owned()]);
+        let core = store
+            .load_preset("P1")
+            .unwrap()
+            .unwrap()
+            .value
+            .to_core()
+            .unwrap();
+        assert_eq!(
+            core.entries.iter().filter(|(k, _)| *k == Key::D).count(),
+            3,
+            "{:?}",
+            core.entries
+        );
+        assert_eq!(core.chords.len(), 1, "{:?}", core.chords);
+        assert_eq!(core.chords[0].key, Key::D);
     }
 
     /// A chord on one function must not disturb another function's chord.
@@ -1645,7 +2036,6 @@ preset = "Other"
     #[test]
     fn conflicts_serialize_to_the_documented_rows() {
         let rows = conflicts_json(&[MapConflict {
-            scope: ConflictScope::Profile,
             preset: "P2".into(),
             function: "A".into(),
             profile: Some("Steam".into()),
@@ -1657,6 +2047,25 @@ preset = "Other"
                 "scope": "profile", "preset": "P2", "function": "A",
                 "profile": "Steam", "slot": 2
             }])
+        );
+    }
+
+    #[test]
+    fn a_move_serializes_to_the_documented_row() {
+        assert_eq!(moved_from_json(None), serde_json::Value::Null);
+        assert_eq!(
+            moved_from_json(Some(&MovedFrom {
+                function: "B".into(),
+                remaining: Vec::new(),
+            })),
+            serde_json::json!({ "function": "B", "remaining": [], "unbound": true })
+        );
+        assert_eq!(
+            moved_from_json(Some(&MovedFrom {
+                function: "B".into(),
+                remaining: vec!["H".into()],
+            })),
+            serde_json::json!({ "function": "B", "remaining": ["H"], "unbound": false })
         );
     }
 }

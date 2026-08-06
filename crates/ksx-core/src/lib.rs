@@ -18,6 +18,8 @@
 //! - [`preset`] — [`Binding`], [`Chord`] (guarded bindings), [`Preset`], and
 //!   the `default`/`empty` built-ins
 //! - [`slot`] — [`SlotSpec`] and the 13-variant [`InvalidationReason`] taxonomy
+//! - [`socd`] — [`Socd`]: SOCD cleaning, generated as chords rather than as a
+//!   new engine rule
 //! - [`persona`] — [`Persona`]: which controller a slot presents itself as
 //! - [`engine`] — the [`Engine`]: precompiled dispatch, per-device key state, diffing
 //! - [`escape`] — [`EscapeDetector`], emergency-escape detection (policy lives upstream)
@@ -30,6 +32,7 @@ pub mod pad;
 pub mod persona;
 pub mod preset;
 pub mod slot;
+pub mod socd;
 
 pub use device::{DeviceId, KeyEvent};
 pub use engine::{Deltas, Engine, EngineTables, PadDelta, ResolvedSlot};
@@ -41,3 +44,4 @@ pub use pad::{
 pub use persona::{Persona, UnknownPersona};
 pub use preset::{Binding, Chord, Preset};
 pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS, MAX_XINPUT_SLOTS};
+pub use socd::{OpposingPair, Socd, UnknownSocd};

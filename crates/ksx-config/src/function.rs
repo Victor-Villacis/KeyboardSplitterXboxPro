@@ -3,7 +3,10 @@
 //! Canonical names: buttons `A B X Y start back guide lb rb lthumb rthumb`,
 //! triggers `lt rt`, axes `lx ly rx ry` with a `.min` / `.max` / `.<i16>`
 //! suffix (custom axis values are first-class, e.g. `lx.-16384`), dpad
-//! `dpad.up` / `dpad.down` / `dpad.left` / `dpad.right`.
+//! `dpad.up` / `dpad.down` / `dpad.left` / `dpad.right`, plus the output-less
+//! [`CONSUME`] (`ksx_core::Binding::Consume`) that a consume-only chord lives
+//! under — the `[bindings]` table is keyed by function name, so "emit nothing"
+//! needs a name like everything else.
 //!
 //! Parsing is case-insensitive; emission is canonical (`-32768` emits as
 //! `min`, `32767` as `max`).
@@ -12,9 +15,14 @@ use ksx_core::{Axis, Binding, DpadDirection, Trigger, XButton, AXIS_MAX, AXIS_MI
 
 use crate::error::ConfigError;
 
+/// The function name of a consume-only chord: it drives nothing, and *that*
+/// is what it is called (docs/INPUT-TRANSFORMS.md §2.6).
+pub const CONSUME: &str = "consume";
+
 /// Canonical function name for a binding.
 pub fn function_name(binding: &Binding) -> String {
     match binding {
+        Binding::Consume => CONSUME.to_owned(),
         Binding::Button(button) => button_name(*button).to_owned(),
         Binding::Trigger(Trigger::Left) => "lt".to_owned(),
         Binding::Trigger(Trigger::Right) => "rt".to_owned(),
@@ -48,6 +56,7 @@ pub fn parse_function(name: &str) -> Result<Binding, ConfigError> {
         "rthumb" => Some(Binding::Button(XButton::RightThumb)),
         "lt" => Some(Binding::Trigger(Trigger::Left)),
         "rt" => Some(Binding::Trigger(Trigger::Right)),
+        CONSUME => Some(Binding::Consume),
         _ => None,
     };
     if let Some(binding) = simple {
@@ -133,6 +142,7 @@ mod tests {
         bindings.extend(XButton::ALL.iter().map(|b| Binding::Button(*b)));
         bindings.extend(Trigger::ALL.iter().map(|t| Binding::Trigger(*t)));
         bindings.extend(DpadDirection::ALL.iter().map(|d| Binding::Dpad(*d)));
+        bindings.push(Binding::Consume);
         for axis in Axis::ALL {
             for value in [AXIS_MIN, AXIS_MAX, -16384, 16384, 1000, -1, 0] {
                 bindings.push(Binding::Axis { axis: *axis, value });
@@ -211,6 +221,18 @@ mod tests {
             function_name(&Binding::Dpad(DpadDirection::Right)),
             "dpad.right"
         );
+    }
+
+    /// The consume-only chord's function name: canonical, case-insensitive,
+    /// and never produced by anything that actually drives an endpoint.
+    #[test]
+    fn consume_is_a_function_name() {
+        assert_eq!(parse_function("consume").unwrap(), Binding::Consume);
+        assert_eq!(parse_function("CONSUME").unwrap(), Binding::Consume);
+        assert_eq!(function_name(&Binding::Consume), "consume");
+        for button in XButton::ALL {
+            assert_ne!(function_name(&Binding::Button(*button)), CONSUME);
+        }
     }
 
     #[test]

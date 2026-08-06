@@ -107,7 +107,7 @@ pub struct BindRequest {
 
 /// The pipe `map` response, typed. `conflicts` is filled both on refusal
 /// (`ok: false`, `code: "conflict"` — the caller decides) and on a forced
-/// write (informational: cross-profile bindings that still exist).
+/// write (informational: cross-slot bindings that still exist).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BindOutcome {
     pub ok: bool,
@@ -115,6 +115,14 @@ pub struct BindOutcome {
     pub error: Option<String>,
     pub code: Option<String>,
     pub conflicts: Vec<BindConflict>,
+    /// MULTI-BIND: the other controls of the SAME preset this key drives now
+    /// that the write is done. Not a conflict and never was a refusal — the
+    /// engine fires all of them (docs/INPUT-TRANSFORMS.md §1a). The mapper
+    /// shows the same fact as the legend's "also A · B" badges, which
+    /// `render_map::shared_labels` re-derives from disk; this is the write's
+    /// own answer, so a caller can say it without waiting for the next poll.
+    #[serde(default)]
+    pub also_drives: Vec<String>,
     pub reloaded: bool,
 }
 
@@ -131,8 +139,10 @@ impl BindOutcome {
 /// One conflicting binding, as the pipe reports it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BindConflict {
-    /// `"preset"` (same preset — a force steals it) or `"profile"` (another
-    /// slot's preset — never auto-edited).
+    /// Always `"profile"` from a current daemon: another slot's preset, never
+    /// auto-edited. (`"preset"` was the same-preset case, which is now a
+    /// multi-bind reported as [`BindOutcome::also_drives`] instead of a
+    /// conflict; the field stays because the wire word is contract.)
     pub scope: String,
     pub preset: String,
     pub function: String,

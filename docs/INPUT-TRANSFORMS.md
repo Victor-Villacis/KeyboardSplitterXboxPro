@@ -51,11 +51,14 @@ rt  = "P"
 
 Press P → A, B and RT all go down together; release → all up together.
 That is Victor's "opposite" case, working today, no code needed. The gap
-is only that the MAPPER UI has no way to express it (it assigns one key
-per control and would overwrite). **Mapper work item**: allow a control to
-accept a key already used by another control in the same preset without
-treating it as a conflict to resolve — it is a multi-bind, and the legend
-should show it as one ("P → A · B · RT").
+was only that the MAPPER had no way to express it (it assigned one key per
+control and would overwrite). **Mapper work item — SHIPPED (2026-08-06)**:
+a control accepts a key already used by another control of the same preset
+without treating it as a conflict — the write goes through untouched, every
+co-binder keeps the key, and both the response (`also_drives`) and the
+legend ("also A · B") show the fan-out. `ksx map --move-from FUNCTION` is
+the explicit, singular way to take a key away instead; `--force` no longer
+moves anything (docs/CONTROL-SURFACE.md "Multi-bind").
 
 ### 1b. Chords — SHIPPED (2026-08-06)
 
@@ -226,10 +229,10 @@ Ordered by value on *this* machine, not by novelty.
    ramping over time (PadForge's "Ramp"), per-binding. Also the inverse:
    **4-way restriction** for games that break on diagonals (Pac-Man), and
    diagonal deadzone shaping.
-6. **SOCD policy, user-visible.** Left+Right → neutral / first-wins /
-   last-wins ("snap tap"), applied at submit for both dpad and stick. We
-   already have a fixed neutral rule inside the DS4 mapper; it should be
-   engine-level, configurable, and stated — tournaments legislate this.
+6. ~~**SOCD policy, user-visible.**~~ **SHIPPED** — see §2.6 below. It cost
+   *one* new primitive (a chord that outputs nothing) because
+   chord-with-consumption already was the mechanism. `last-wins` /
+   "snap tap" is the one mode still missing, and the reason is stated there.
 7. ~~**NOT / exclusion conditions.**~~ **SHIPPED with chords** (§1b): the
    `when` guard made `unless` fall out free, exactly as predicted. MAME's
    `NOT`, in the same row as the binding it qualifies.
@@ -254,7 +257,70 @@ Ordered by value on *this* machine, not by novelty.
     side. Doubles as the debugging tool for everything in this document
     and reuses the replay-corpus machinery from M3.
 
-## 3. The architecture this all implies
+### 2.6. SOCD cleaning — SHIPPED
+
+*Simultaneous Opposing Cardinal Directions*: a stick can only be left OR
+right, a panel can hold both, and what the pad then reports is a policy.
+Tournaments legislate it — Capcom-style rules regulate simultaneous
+opposing input, and **neutral** and **up-priority** are the compliant
+behaviors — so it has to be stated, configurable, and the same for the
+dpad and the stick.
+
+**The insight (Victor's): chord-with-consumption IS the SOCD mechanism.**
+A chord already suppresses its constituents; SOCD is only ever "swallow
+one or both of two keys". So no engine rule was added. We were one
+primitive short, and that primitive is *a chord that emits nothing*:
+
+```rust
+Binding::Consume        // output nothing; the value is the suppression
+Chord::consuming(key, when)
+```
+
+- **neutral** = `[Left+Right] → Consume`. Both keys suppressed, nothing
+  pressed in their place, so the axis falls to centre (via the existing
+  opposite-axis snap, which sees no held opposite) and both dpad bits
+  clear. Same for `[Up+Down]`.
+- **up-priority** = `[Down+Up] → whatever UP drove`. Consumption is
+  all-or-nothing per chord, so "keep Up" is said as "consume both and
+  re-emit Up" — and re-emit it *in full*, every binding that key had, or
+  its other outputs would vanish with it. Down is swallowed; Up survives.
+  Horizontal still cancels: the rule is asymmetric on purpose (down-back →
+  up-back must be a jump).
+
+#### Configuration — generated, never hand-written
+
+Per slot, in `config.toml` and `games.toml`:
+
+```toml
+[[slot]]
+number = 1
+preset = "street-fighter-p1"
+socd = "up-priority"      # "off" (default) | "neutral" | "up-priority"
+```
+
+`ksx_core::socd::generate` reads the preset and emits the chords at plan
+time (`run/plan.rs`), for **both** the dpad pair and the stick axes (lx/ly
+and rx/ry), covering multi-bind by generating one chord per key pair that
+can actually produce the opposition — `n × m` for `n` left keys and `m`
+right keys, which on a real panel is 1×1. Generation is idempotent, and
+`socd = "off"` generates *nothing*: the M3 replay corpus digest does not
+move, and no config file gains a byte.
+
+**A hand-written chord over a pair wins.** Generation skips any pair the
+preset already chords by hand, and validation says so
+(`SocdShadowedByChord`, advisory — the config works exactly as written).
+An unguarded `consume = "Left"` row is inert and reported too
+(`ConsumeWithoutGuard`): consumption is what a *chord* does.
+
+#### The one mode ksx cannot do yet: last-wins / "snap tap"
+
+Last-wins needs to know which direction was pressed **most recently** —
+that is input *history*, and the engine is deliberately a pure function of
+the currently-held key SET (§0.1), which is exactly what makes chords
+free of clocks, deferral and latency. Adding an ordering memory is the
+transform stage's job (§3), not a new binding shape, so it waits for it.
+Note that some tournament rulesets restrict last-wins anyway; the two
+modes that shipped are the ones those rules ask for.
 
 Everything above is one of two additions to a currently-stateless mapping:
 
@@ -294,8 +360,9 @@ Nothing here blocks M6/M7. Suggested order, cheapest-and-most-useful first:
    consumption needs context, not time, so it landed as a guard on a
    binding with no clock, no deferral and no latency. What is left for the
    transform stage is the genuinely time-based half: turbo, tap-hold,
-   double-tap, ramps — plus SOCD policy and analog shaping, which need
-   neither.
+   double-tap, ramps — plus analog shaping, which needs neither. **SOCD
+   cleaning also landed on top of chords** (§2.6), for the cost of one
+   consume-only binding; only its last-wins mode still waits for history.
 5. **Macros** last of the big ones — they need the scheduler, the
    interruption policy, and the sampling rule, and they are the easiest to
    get subtly wrong.

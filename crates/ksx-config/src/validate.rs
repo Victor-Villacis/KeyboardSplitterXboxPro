@@ -11,10 +11,11 @@ use serde::Serialize;
 
 use crate::config::ConfigFile;
 use crate::error::ConfigError;
-use crate::function::parse_function;
+use crate::function::{parse_function, CONSUME};
 use crate::games::GamesFile;
 use crate::preset::{BindingEntry, GuardedEntry, PresetFile};
-use ksx_core::{Key, Persona, Preset, MAX_SLOTS, MAX_XINPUT_SLOTS};
+use ksx_core::socd::{opposing_pairs, shadowing_chord};
+use ksx_core::{Binding, Key, Persona, Preset, Socd, MAX_SLOTS, MAX_XINPUT_SLOTS};
 
 /// One validation finding. All findings are non-fatal: the caller decides
 /// whether to refuse to start emulation (unknown preset ref) or just warn.
@@ -93,6 +94,20 @@ pub enum Issue {
         key: String,
         bound_to: String,
     },
+    /// Advisory: a `consume` row with no guard. Consumption is what a CHORD
+    /// does; an unguarded row consumes nothing and drives nothing, so it is
+    /// simply inert (docs/INPUT-TRANSFORMS.md §2.6).
+    ConsumeWithoutGuard { preset: String, key: String },
+    /// Advisory: a slot's `socd` policy would have generated a rule for a key
+    /// pair the preset already chords by hand. The hand-written one wins —
+    /// a deliberate statement beats a default — and this says so out loud.
+    SocdShadowedByChord {
+        slot: u8,
+        preset: String,
+        socd: String,
+        keys: String,
+        function: String,
+    },
     /// Game slot number outside 1..=[`MAX_SLOTS`].
     GameSlotNumberOutOfRange { game: String, number: u8 },
     /// See [`Issue::TooManyXinputSlots`], for one game's slot list.
@@ -114,13 +129,19 @@ impl Issue {
     ///
     /// Everything validation reports is worth saying, but not everything is
     /// worth refusing to start over. An advisory describes a configuration
-    /// that works exactly as written and merely has a cost the user should
-    /// know about — today that is only the chord flash
-    /// ([`Issue::ChordConstituentAlsoBound`]): binding a chord over keys that
-    /// already do something is a legitimate, deliberate choice, so it prints
-    /// as a warning and the session starts.
+    /// that works exactly as written and merely has a cost, or a consequence,
+    /// the user should know about: the chord flash
+    /// ([`Issue::ChordConstituentAlsoBound`] — binding a chord over keys that
+    /// already do something is a legitimate, deliberate choice), an inert
+    /// `consume` row, and a hand-written chord winning over a generated SOCD
+    /// rule. All three print as warnings and the session starts.
     pub fn is_advisory(&self) -> bool {
-        matches!(self, Issue::ChordConstituentAlsoBound { .. })
+        matches!(
+            self,
+            Issue::ChordConstituentAlsoBound { .. }
+                | Issue::ConsumeWithoutGuard { .. }
+                | Issue::SocdShadowedByChord { .. }
+        )
     }
 }
 
@@ -232,6 +253,24 @@ impl fmt::Display for Issue {
                  own to '{bound_to}' — ksx does not defer input, so pressing '{key}' first makes \
                  the game see '{bound_to}' for a moment before the chord takes over. Prefer a \
                  chord key with no individual binding (then consumption is free and instant)"
+            ),
+            Issue::ConsumeWithoutGuard { preset, key } => write!(
+                f,
+                "preset '{preset}': '{CONSUME}' is bound to '{key}' with no when/unless guard, \
+                 so it does nothing — consumption is what a chord does, and a chord needs a \
+                 guard (try `{CONSUME} = {{ key = \"{key}\", when = [\"<other key>\"] }}`)"
+            ),
+            Issue::SocdShadowedByChord {
+                slot,
+                preset,
+                socd,
+                keys,
+                function,
+            } => write!(
+                f,
+                "slot {slot}: socd = '{socd}' would clean '{keys}' in preset '{preset}', but a \
+                 chord on those keys is already written by hand ('{function}') — the hand-written \
+                 one wins and nothing is generated for that pair"
             ),
             Issue::GameSlotNumberOutOfRange { game, number } => {
                 write!(
@@ -345,6 +384,11 @@ pub fn validate(config: &ConfigFile, presets: &[PresetFile]) -> Vec<Issue> {
     for preset in presets {
         validate_preset(preset, &mut issues);
     }
+
+    let cores = core_presets(presets);
+    for slot in &config.slots {
+        socd_issues(&cores, slot.number, &slot.preset, slot.socd, &mut issues);
+    }
     issues
 }
 
@@ -352,6 +396,7 @@ pub fn validate(config: &ConfigFile, presets: &[PresetFile]) -> Vec<Issue> {
 pub fn validate_games(games: &GamesFile, presets: &[PresetFile]) -> Vec<Issue> {
     let mut issues = Vec::new();
     let known_presets = known_preset_names(presets);
+    let cores = core_presets(presets);
     for game in &games.games {
         let mut number_counts: BTreeMap<u8, usize> = BTreeMap::new();
         for slot in &game.slots {
@@ -379,6 +424,7 @@ pub fn validate_games(games: &GamesFile, presets: &[PresetFile]) -> Vec<Issue> {
                     preset: slot.preset.clone(),
                 });
             }
+            socd_issues(&cores, slot.number, &slot.preset, slot.socd, &mut issues);
             if let Some(value) = slot.user_index {
                 if !(1..=4).contains(&value) {
                     issues.push(Issue::GameUserIndexOutOfRange {
@@ -398,6 +444,52 @@ pub fn validate_games(games: &GamesFile, presets: &[PresetFile]) -> Vec<Issue> {
         }
     }
     issues
+}
+
+/// Every preset that can be resolved to the core model, by name — the
+/// built-ins included, because a slot may reference one. Files that fail to
+/// convert are skipped: their own issues already name the reason.
+fn core_presets(presets: &[PresetFile]) -> BTreeMap<String, Preset> {
+    let mut out: BTreeMap<String, Preset> = Preset::builtins()
+        .into_iter()
+        .map(|p| (p.name.clone(), p))
+        .collect();
+    for file in presets {
+        if let Ok(core) = file.to_core() {
+            out.insert(file.name.clone(), core);
+        }
+    }
+    out
+}
+
+/// The one thing a `socd` setting can be wrong about: it collides with a chord
+/// the user wrote by hand. Generation skips those pairs (see
+/// [`ksx_core::socd::generate`]); this is where that silence gets a voice.
+fn socd_issues(
+    cores: &BTreeMap<String, Preset>,
+    slot: u8,
+    preset_name: &str,
+    policy: Socd,
+    issues: &mut Vec<Issue>,
+) {
+    if !policy.is_active() {
+        return;
+    }
+    let Some(core) = cores.get(preset_name) else {
+        return; // an unknown preset ref is already reported
+    };
+    for pair in opposing_pairs(core) {
+        let Some(chord) = shadowing_chord(core, &pair) else {
+            continue;
+        };
+        issues.push(Issue::SocdShadowedByChord {
+            slot,
+            preset: preset_name.to_owned(),
+            socd: policy.to_string(),
+            keys: format!("{}+{}", pair.keys.0.name(), pair.keys.1.name()),
+            function: crate::function_name(&chord.binding),
+        });
+    }
 }
 
 fn known_preset_names(presets: &[PresetFile]) -> BTreeSet<&str> {
@@ -436,6 +528,18 @@ fn validate_preset(preset: &PresetFile, issues: &mut Vec<Issue>) {
             issues.push(Issue::UnknownKeyName {
                 preset: preset.name.clone(),
                 function: function.clone(),
+                key: key.to_owned(),
+            });
+        }
+        // `consume` only means something with a guard: it is a chord whose
+        // whole output is the suppression of its constituents.
+        let unguarded = match flat {
+            Flat::Plain(_) => true,
+            Flat::Guard(guard) => guard.when.is_empty() && guard.unless.is_empty(),
+        };
+        if unguarded && matches!(parse_function(function), Ok(Binding::Consume)) {
+            issues.push(Issue::ConsumeWithoutGuard {
+                preset: preset.name.clone(),
                 key: key.to_owned(),
             });
         }
@@ -634,6 +738,7 @@ preset = "default"
                     mouse: None,
                     preset: "missing".into(),
                     persona: Persona::default(),
+                    socd: Socd::default(),
                 },
                 SlotEntry {
                     number: 1,
@@ -641,6 +746,7 @@ preset = "default"
                     mouse: None,
                     preset: "default".into(),
                     persona: Persona::default(),
+                    socd: Socd::default(),
                 },
                 SlotEntry {
                     number: MAX_SLOTS + 1,
@@ -648,6 +754,7 @@ preset = "default"
                     mouse: None,
                     preset: "empty".into(),
                     persona: Persona::default(),
+                    socd: Socd::default(),
                 },
             ],
             ..ConfigFile::default()
@@ -676,6 +783,7 @@ preset = "default"
             mouse: None,
             preset: "default".into(),
             persona,
+            socd: Socd::default(),
         };
         // 5 Xbox slots: one more than Windows can ever show to a game.
         let cfg = ConfigFile {
@@ -717,6 +825,7 @@ preset = "default"
             mouse: None,
             preset: "default".into(),
             persona: Persona::Xbox360,
+            socd: Socd::default(),
         };
         let mut games: GamesFile =
             toml::from_str("[[game]]\ntitle = \"MAME 8P\"\npath = \"C:\\\\mame\\\\mame.exe\"\n")
@@ -906,6 +1015,142 @@ preset = "default"
             "rt = { key = \"A\", when = [\"B\"] }\nlb = { key = \"A\", unless = [\"B\"] }",
         )];
         assert_eq!(validate(&ConfigFile::default(), &exclusive), Vec::new());
+    }
+
+    // ---- socd (docs/INPUT-TRANSFORMS.md §2.6) -----------------------------
+
+    fn socd_only(issues: Vec<Issue>) -> Vec<Issue> {
+        issues
+            .into_iter()
+            .filter(|i| matches!(i, Issue::SocdShadowedByChord { .. }))
+            .collect()
+    }
+
+    fn socd_config(policy: &str) -> ConfigFile {
+        config(&format!(
+            "schema_version = 1\n\n[[slot]]\nnumber = 1\npreset = \"stick\"\nsocd = \"{policy}\"\n"
+        ))
+    }
+
+    fn stick_preset() -> PresetFile {
+        preset(
+            "stick",
+            "\"lx.min\" = \"Left\"\n\"lx.max\" = \"Right\"\n\
+             \"ly.max\" = \"Up\"\n\"ly.min\" = \"Down\"",
+        )
+    }
+
+    /// A plain SOCD slot is completely clean: the policy generates chords, and
+    /// generated chords are not something the user can get wrong.
+    #[test]
+    fn an_ordinary_socd_slot_reports_nothing() {
+        for policy in ["off", "neutral", "up-priority"] {
+            assert_eq!(
+                validate(&socd_config(policy), &[stick_preset()]),
+                Vec::new(),
+                "socd = {policy}"
+            );
+        }
+    }
+
+    /// The user wrote the pair by hand. Their chord wins — and the shadowing
+    /// is said out loud instead of being silently skipped.
+    #[test]
+    fn a_hand_written_chord_over_an_socd_pair_is_reported_as_shadowing() {
+        let mut file = stick_preset();
+        file.bindings.insert(
+            "rt".into(),
+            // Written the other way round on purpose: a pair is a SET.
+            BindingEntry::Guarded(GuardedEntry {
+                key: "Right".into(),
+                when: vec!["Left".into()],
+                unless: Vec::new(),
+            }),
+        );
+        // (The flash advisory fires too — a direction key is by definition
+        // bound on its own — so filter to the finding under test.)
+        let issues = socd_only(validate(&socd_config("neutral"), &[file]));
+        assert_eq!(
+            issues,
+            vec![Issue::SocdShadowedByChord {
+                slot: 1,
+                preset: "stick".into(),
+                socd: "neutral".into(),
+                keys: "Right+Left".into(),
+                function: "rt".into(),
+            }],
+            "{issues:?}"
+        );
+        // Advisory: the config works exactly as written, so the session starts.
+        assert!(issues[0].is_advisory());
+        let msg = issues[0].to_string();
+        assert!(msg.contains("by hand"), "{msg}");
+    }
+
+    /// `socd = "off"` generates nothing, so it can shadow nothing.
+    #[test]
+    fn socd_off_never_reports_shadowing() {
+        let mut file = stick_preset();
+        file.bindings.insert(
+            "rt".into(),
+            BindingEntry::Guarded(GuardedEntry {
+                key: "Right".into(),
+                when: vec!["Left".into()],
+                unless: Vec::new(),
+            }),
+        );
+        assert_eq!(
+            socd_only(validate(&socd_config("off"), &[file])),
+            Vec::new()
+        );
+    }
+
+    /// Game slots carry the policy too, and are checked the same way.
+    #[test]
+    fn game_slots_are_socd_checked() {
+        let mut file = stick_preset();
+        file.bindings.insert(
+            "rt".into(),
+            BindingEntry::Guarded(GuardedEntry {
+                key: "Down".into(),
+                when: vec!["Up".into()],
+                unless: Vec::new(),
+            }),
+        );
+        let games: GamesFile = toml::from_str(
+            "[[game]]\ntitle = \"SF\"\npath = 'C:\\sf.exe'\n\n\
+             [[game.slot]]\nnumber = 2\npreset = \"stick\"\nsocd = \"up-priority\"\n",
+        )
+        .unwrap();
+        let issues = socd_only(validate_games(&games, &[file]));
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(matches!(
+            issues[0],
+            Issue::SocdShadowedByChord { slot: 2, .. }
+        ));
+    }
+
+    /// `consume` without a guard consumes nothing — inert, and worth saying.
+    #[test]
+    fn an_unguarded_consume_row_is_reported() {
+        let presets = vec![preset("inert", "consume = \"Left\"")];
+        let issues = validate(&ConfigFile::default(), &presets);
+        assert_eq!(
+            issues,
+            vec![Issue::ConsumeWithoutGuard {
+                preset: "inert".into(),
+                key: "Left".into()
+            }]
+        );
+        assert!(issues[0].is_advisory());
+        assert!(issues[0].to_string().contains("does nothing"));
+
+        // With a guard it is the SOCD primitive, and perfectly clean.
+        let good = vec![preset(
+            "neutral",
+            "consume = { key = \"Left\", when = [\"Right\"] }",
+        )];
+        assert_eq!(validate(&ConfigFile::default(), &good), Vec::new());
     }
 
     #[test]

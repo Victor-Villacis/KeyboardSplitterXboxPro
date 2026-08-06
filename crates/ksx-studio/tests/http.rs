@@ -236,6 +236,7 @@ impl ControlSource for ScriptedControl {
                     profile: Some("Steam".into()),
                     slot: Some(2),
                 }],
+                also_drives: Vec::new(),
                 reloaded: false,
             }
         } else {
@@ -250,6 +251,12 @@ impl ControlSource for ScriptedControl {
                 error: None,
                 code: None,
                 conflicts: Vec::new(),
+                // A same-preset duplicate is a multi-bind, not a refusal: the
+                // write succeeds and names the controls the key also drives.
+                also_drives: match request.key.as_deref() {
+                    Some("P") => vec!["A".into(), "B".into()],
+                    _ => Vec::new(),
+                },
                 reloaded: request.reload,
             }
         }

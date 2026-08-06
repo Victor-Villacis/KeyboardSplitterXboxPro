@@ -16,8 +16,33 @@ use crate::pad::{Axis, DpadDirection, Trigger, XButton, AXIS_MAX, AXIS_MIN};
 pub enum Binding {
     Button(XButton),
     Trigger(Trigger),
-    Axis { axis: Axis, value: i16 },
+    Axis {
+        axis: Axis,
+        value: i16,
+    },
     Dpad(DpadDirection),
+    /// **Output nothing.** Only meaningful on a [`Chord`], where the chord's
+    /// value is entirely in its CONSUMPTION: the constituents are suppressed
+    /// and no endpoint is driven in their place. `[Left+Right] → Consume` is
+    /// SOCD-neutral (see [`crate::socd`]).
+    ///
+    /// Modeled as a `Binding` variant rather than `Option<Binding>` on
+    /// [`Chord`] for two reasons:
+    ///
+    /// 1. **The file format is keyed by function name.** `[bindings]` maps a
+    ///    function to its key(s), so a consume-only row needs a *name* to live
+    ///    under; as a variant it gets `consume` from the existing
+    ///    `function_name`/`parse_function` pair and round-trips with no new
+    ///    machinery. An `Option` would have needed a parallel spelling.
+    /// 2. **`Chord.binding` is public API constructed by struct literal in
+    ///    three crates.** A new variant is additive; changing the field type is
+    ///    not.
+    ///
+    /// The cost is that `Consume` is *representable* in [`Preset::entries`],
+    /// where it means nothing — an unguarded row consumes nothing by
+    /// definition. The engine ignores such rows exactly like a [`Key::None`]
+    /// placeholder, and validation reports them.
+    Consume,
 }
 
 /// A binding that only applies while other keys are (or are not) held — the
@@ -56,6 +81,17 @@ impl Chord {
             when,
             unless: Vec::new(),
         }
+    }
+
+    /// A chord that outputs NOTHING and exists purely to consume its
+    /// constituents ([`Binding::Consume`]) — the SOCD-neutral primitive.
+    pub fn consuming(key: Key, when: Vec<Key>) -> Self {
+        Self::new(key, Binding::Consume, when)
+    }
+
+    /// Does this chord drive an endpoint at all?
+    pub fn emits(&self) -> bool {
+        self.binding != Binding::Consume
     }
 
     /// Guard size: how many extra conditions this chord carries. A chord with

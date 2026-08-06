@@ -466,6 +466,55 @@ lb = { key = "A", when = ["B", "C"], unless = ["LeftShift"] }
         }
     }
 
+    // ---- consume-only chords (docs/INPUT-TRANSFORMS.md §2.6) --------------
+
+    /// The SOCD primitive as a file: a guarded row under the `consume`
+    /// function, which drives nothing and exists to suppress its keys.
+    #[test]
+    fn a_consume_only_chord_parses_and_round_trips() {
+        let file: PresetFile = toml::from_str(
+            r#"
+name = "neutral"
+[bindings]
+"lx.min" = "Left"
+"lx.max" = "Right"
+consume = { key = "Left", when = ["Right"] }
+"#,
+        )
+        .unwrap();
+        let core = file.to_core().unwrap();
+        assert_eq!(
+            core.chords,
+            vec![ksx_core::Chord::consuming(Key::Left, vec![Key::Right])]
+        );
+        assert!(!core.chords[0].emits());
+
+        let text = toml::to_string(&PresetFile::from_core(&core)).unwrap();
+        assert!(text.contains("consume"), "{text}");
+        let back: PresetFile = toml::from_str(&text).unwrap();
+        let again = back.to_core().unwrap();
+        assert_eq!(again.entries, core.entries, "{text}");
+        assert_eq!(again.chords, core.chords, "{text}");
+    }
+
+    /// Several consume-only chords share one function name, so they emit as a
+    /// list and must come back as separate chords.
+    #[test]
+    fn several_consume_chords_round_trip_as_a_list() {
+        let original = Preset {
+            name: "socd".into(),
+            entries: Vec::new(),
+            chords: vec![
+                ksx_core::Chord::consuming(Key::Left, vec![Key::Right]),
+                ksx_core::Chord::consuming(Key::Up, vec![Key::Down]),
+            ],
+            protected: false,
+        };
+        let text = toml::to_string(&PresetFile::from_core(&original)).unwrap();
+        let back: PresetFile = toml::from_str(&text).unwrap();
+        assert_eq!(back.to_core().unwrap().chords, original.chords, "{text}");
+    }
+
     #[test]
     fn unknown_guard_keys_are_errors() {
         let file: PresetFile = toml::from_str(

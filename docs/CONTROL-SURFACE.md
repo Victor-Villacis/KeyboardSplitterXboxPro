@@ -23,7 +23,7 @@ list.
 | List / identify devices | `ksx devices [--json]` (both backends, read-only); `ksx winusb status [--json]` for the USB/claim view | M9: same enumeration in-process — strictly read-only, safe mid-session. M10: api devices | exists |
 | Pad test | `ksx pads --count N --persona xbox360\|playstation [--json]` (plug, test pattern, unplug) | M9: same routine in-process, only while emulation is stopped (test pads compete for the four XInput slots). M10: api | exists |
 | Per-slot persona | TOML edit: `persona = "playstation"` on the `[[slot]]` (aliases `ds4`/`ps4` accepted) | M7 wizard / mapping verbs first; then GUI forms write the same TOML and issue `Reload` | gap — TOML-only **by design** until M7 |
-| Preset editing | `ksx map --preset "IPAC P1" --function A --key G [--clear] [--force] [--json]`; chords: `--when B[,C] [--unless K]`; whole-preset: `--restore defaults\|session-backup\|latest-backup`, `--clear-all`, `--list-backups`; pipe `map` / `map-restore` / `map-clear-all` / `map-backups` (same writers: `ksx-app/src/mapping.rs`); TOML edit still first-class | **Studio's `/map` mapper (live)**: click a control → pipe `learn-key` → pipe `map` — every write goes through the one shared writer, never a parallel editor. Conflict detection is server-side in that writer (see below). Studio does not yet DISPLAY chords (later pass) — the CLI/pipe author them and the engine runs them | exists — CLI + pipe + Studio live |
+| Preset editing | `ksx map --preset "IPAC P1" --function A --key G [--clear] [--force] [--move-from FUNCTION] [--json]`; chords: `--when B[,C] [--unless K]`; whole-preset: `--restore defaults\|session-backup\|latest-backup`, `--clear-all`, `--list-backups`; pipe `map` / `map-restore` / `map-clear-all` / `map-backups` (same writers: `ksx-app/src/mapping.rs`); TOML edit still first-class | **Studio's `/map` mapper (live)**: click a control → pipe `learn-key` → pipe `map` — every write goes through the one shared writer, never a parallel editor. Conflict detection is server-side in that writer (see below). Studio does not yet DISPLAY chords (later pass) — the CLI/pipe author them and the engine runs them | exists — CLI + pipe + Studio live |
 | Learn a key ("press the panel key for P1·A") | pipe `learn-key` / `learn-poll` / `learn-cancel` (asynchronous; see "learn-key semantics" below) | **Studio's mapper drives it (live)**: `/api/learn*` → the pipe verbs. No CLI face yet (`ksx map` takes the key by name; `ksx monitor` shows names) | exists — pipe + Studio |
 | Game profiles | TOML edit (`games.toml`); consumed by `ksx run --game`, `ksx daemon --game`, `ksx autostart --game` | Editing: M7 verbs (E5 `ksx slot assign` family), then GUI forms over them. Consuming: `DaemonCommand`/api as above | gap for editing; consuming exists |
 | WinUSB claim / release / status | `ksx winusb status` (read-only); `claim`/`release` are dry runs by default, act only with `--yes` + an admin token | M9: same verbs in-process, preserving dry-run-first and the explicit consent step. M10: `status` is safe over the api; `claim`/`release` stay local + elevated | exists |
@@ -72,8 +72,16 @@ The M7 mapper slice adds four verbs on the same channel:
    "force":false,"reload":true}          ("clear":true instead of "key" unbinds)
 ← {"ok":true,"message":"\"IPAC P1\": A = G — the next session start reads it",
    "path":"C:\\…\\presets\\IPAC P1.toml","preset":"IPAC P1","function":"A",
-   "key":"G","when":[],"unless":[],"stolen_from":[],"conflicts":[],
-   "flash":[],"reloaded":false}
+   "key":"G","when":[],"unless":[],"also_drives":[],"moved_from":null,
+   "conflicts":[],"flash":[],"reloaded":false}
+
+→ {"verb":"map","preset":"IPAC P1","function":"B","key":"G"}   (G is already A's)
+← {"ok":true,"message":"\"IPAC P1\": B = G; G also drives A", …,
+   "also_drives":["A"],"moved_from":null}    (a MULTI-BIND — see below)
+
+→ {"verb":"map","preset":"IPAC P1","function":"B","key":"G","move_from":"A"}
+← {"ok":true,"message":"\"IPAC P1\": B = G (taken from A — A is now unbound)", …,
+   "also_drives":[],"moved_from":{"function":"A","remaining":[],"unbound":true}}
 
 → {"verb":"map","preset":"IPAC P1","function":"rt","key":"D","when":["F"]}
 ← {"ok":true,"message":"\"IPAC P1\": rt = D+F", …,
@@ -158,8 +166,8 @@ it writes the `empty` built-in's SHAPE — all 25 functions present, each keyed
 control stays visible in the legend instead of vanishing.
 
 Refusal codes (`--json` `code`, stable): `unknown-preset`, `unknown-function`,
-`unknown-key`, `invalid-guard`, `conflict`, `no-session-backup`, `no-backup`,
-`bad-backup`, `config-error`. A corrupt backup is refused, never written.
+`unknown-key`, `invalid-guard`, `bad-move-from`, `conflict` (cross-slot only),
+`no-session-backup`, `no-backup`, `bad-backup`, `config-error`. A corrupt backup is refused, never written.
 
 ### Chords: `--when` / `--unless` (2026-08-06)
 
@@ -204,12 +212,46 @@ which one wins is never a build-order accident.
 `map` writes through the SAME `ksx-app/src/mapping.rs::apply` the CLI verb
 uses — replace-per-function, `"None"` placeholder on clear, canonical TOML
 rewrite (comments do not survive; the store's atomic-write trade), CONFLICT
-DETECTION server-side in the writer. Two scopes: the key on another function
-in the same preset (a `force` steals it, leaving a `"None"` placeholder), and
-the key bound in another slot's preset within any games.toml profile that
-uses the target preset (**never auto-edited** — `force` writes the target
-anyway and keeps reporting the double binding; silently rewriting a preset
-the caller did not name would be worse).
+DETECTION server-side in the writer.
+
+### Multi-bind: one key, many controls (2026-08-06)
+
+**A key already used by another control of the SAME preset is not a conflict —
+it is a multi-bind, and it is written.** The engine has no uniqueness
+constraint in either direction ("many keys → one function and one key → many
+functions are both native", `ksx-core/src/preset.rs`,
+docs/INPUT-TRANSFORMS.md §1a): one key compiles to a `SmallVec` of targets and
+they all fire together. So the write leaves every other control holding that
+key exactly as it was and REPORTS them:
+
+| field | meaning |
+|---|---|
+| `also_drives` | the other functions of THIS preset the key drives now that the write is done, sorted. Information, never a refusal (`["A","B"]`). Empty for a clear, for a chord, and for an exclusive key. Studio shows the same fact as the legend's "also A · B" badges, which `render_map.rs::shared_labels` re-derives from disk |
+| `moved_from` | `null` unless `"move_from"` was asked for; otherwise `{"function":"A","remaining":[],"unbound":true}` — the ONE control the key was taken from, what it kept, and whether it is now unbound |
+
+That is what makes the mapper's **"Map all to one key"** work: it is N ordinary
+`map` calls with one key, and all N stick (MAPPER-UX commandment 7 —
+duplicates are information, fan-out is the product). Re-binding one control
+still replaces only that control's keys; its co-binders keep theirs.
+
+**`"move_from":"A"` (CLI `--move-from A`) is the explicit hand-over**, and the
+only way this verb unbinds something it was not asked to bind: it takes THIS
+key off THAT one function (which keeps the inert `"None"` if that emptied it,
+and keeps its other keys if it had more) and touches nothing else. Never
+implicit, never a side effect of `force`. It is refused — before any write —
+if it names the function being bound, a function that does not hold that key
+(the refusal says what that control actually has), a clear, or a chord:
+`bad-move-from`, exit 2.
+
+**The one conflict left is CROSS-SLOT, and it still blocks**: the key bound in
+another slot's preset within any games.toml profile that uses the target
+preset. That preset is **never auto-edited** — `force` writes the target
+anyway and keeps reporting the double binding (`conflicts`, `scope` always
+`"profile"` now); silently rewriting a preset the caller did not name would be
+worse. So `force` means exactly one thing — "yes, both slots should see that
+key" — and it **removes no binding, anywhere, ever**. The genuinely
+destructive writes are their own verbs (`map-restore`, `map-clear-all`), each
+taking a timestamped backup first.
 
 ### `"reload":true` — the binding hot-swap (2026-08-05)
 

@@ -405,7 +405,12 @@ pub fn build_plan(
                 spec.number
             ));
         }
-        let preset = resolve_preset(presets, spec.number, &spec.preset)?;
+        let mut preset = resolve_preset(presets, spec.number, &spec.preset)?;
+        // SOCD cleaning is generated HERE, once, onto the resolved preset —
+        // it is chords, not an engine rule (docs/INPUT-TRANSFORMS.md §2.6).
+        // `socd = "off"` (the default) generates nothing, so this line is a
+        // no-op for every configuration that predates the feature.
+        preset.apply_socd(spec.socd);
         slots.push(ResolvedSlot { spec, preset });
     }
     slots.sort_by_key(|s| s.spec.number);

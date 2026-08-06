@@ -7,8 +7,11 @@
 //! `--list-backups` reads the timestamped backups every restore leaves behind.
 //!
 //! Exit codes: 0 = written, 1 = error (I/O, unreadable config),
-//! 2 = refused (unknown preset/function/key, a conflict without --force, or a
-//! restore with nothing to restore — nothing was written).
+//! 2 = refused (unknown preset/function/key, a CROSS-SLOT conflict without
+//! --force, a `--move-from` that would unbind something the caller did not
+//! mean, or a restore with nothing to restore — nothing was written). A key
+//! already used by another control of the SAME preset is not a refusal at all:
+//! it is a multi-bind, written and reported (`also_drives`).
 
 use crate::mapping::{self, MapError, MapSpec, RestoreKind};
 
@@ -20,7 +23,10 @@ pub enum Action {
         function: String,
         /// `None` = clear (clap guarantees `--clear` was given).
         key: Option<String>,
+        /// Bind anyway despite a CROSS-SLOT duplicate (removes nothing).
         force: bool,
+        /// `--move-from B`: take the key off exactly that one function.
+        move_from: Option<String>,
         /// CHORD: keys that must ALL be held too (`--when B,C`).
         when: Vec<String>,
         /// CHORD: keys that must NOT be held (`--unless LeftShift`).
@@ -54,6 +60,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
             function,
             key,
             force,
+            move_from,
             when,
             unless,
         } => mapping::apply(
@@ -63,6 +70,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                 function,
                 key,
                 force,
+                move_from,
                 when,
                 unless,
             },
@@ -79,7 +87,13 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                 "when": applied.when,
                 "unless": applied.unless,
                 "chord": applied.chord(),
-                "stolen_from": applied.stolen_from,
+                // MULTI-BIND: the other controls of this preset the key drives
+                // now. Information, never an error — the write succeeded and
+                // none of them was touched (docs/INPUT-TRANSFORMS.md §1a).
+                "also_drives": applied.also_drives,
+                // What --move-from unbound, or null. The ONLY field that can
+                // ever report a binding this verb removed on its own.
+                "moved_from": mapping::moved_from_json(applied.moved_from.as_ref()),
                 "conflicts": mapping::conflicts_json(&applied.overridden),
                 "flash": mapping::flash_json(&applied.flash),
             });
@@ -113,6 +127,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                     | MapError::UnknownFunction(_)
                     | MapError::UnknownKey(_)
                     | MapError::InvalidGuard(_)
+                    | MapError::BadMoveFrom(_)
                     | MapError::Conflicts { .. }
                     | MapError::NoSessionBackup { .. }
                     | MapError::NoBackup { .. }
@@ -172,6 +187,7 @@ pub fn error_code(err: &MapError) -> &'static str {
         MapError::UnknownFunction(_) => "unknown-function",
         MapError::UnknownKey(_) => "unknown-key",
         MapError::InvalidGuard(_) => "invalid-guard",
+        MapError::BadMoveFrom(_) => "bad-move-from",
         MapError::Conflicts { .. } => "conflict",
         MapError::NoSessionBackup { .. } => "no-session-backup",
         MapError::NoBackup { .. } => "no-backup",

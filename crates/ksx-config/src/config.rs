@@ -1,7 +1,7 @@
 //! Main config file schema: `%APPDATA%\ksx\config.toml`
 //! (`docs/research/design-architecture.md` §4.1).
 
-use ksx_core::{DeviceId, Persona, SlotSpec};
+use ksx_core::{DeviceId, Persona, SlotSpec, Socd};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
@@ -91,6 +91,15 @@ pub struct SlotEntry {
         skip_serializing_if = "crate::persona_serde::is_default"
     )]
     pub persona: Persona,
+    /// What this slot does with simultaneous opposing directions:
+    /// `"off"` (default — today's behavior, nothing generated), `"neutral"`,
+    /// or `"up-priority"`. See [`ksx_core::socd`].
+    #[serde(
+        default,
+        with = "crate::socd_serde",
+        skip_serializing_if = "crate::socd_serde::is_default"
+    )]
+    pub socd: Socd,
 }
 
 impl ConfigFile {
@@ -119,7 +128,7 @@ impl ConfigFile {
             .map(|m| self.resolve_device(m))
             .transpose()?;
         SlotSpec::new(slot.number, keyboard, mouse, slot.preset.clone())
-            .map(|spec| spec.with_persona(slot.persona))
+            .map(|spec| spec.with_persona(slot.persona).with_socd(slot.socd))
             .map_err(Into::into)
     }
 
@@ -139,6 +148,7 @@ impl ConfigFile {
             mouse: spec.mouse.as_ref().map(display),
             preset: spec.preset.clone(),
             persona: spec.persona,
+            socd: spec.socd,
         }
     }
 }
@@ -258,6 +268,7 @@ preset = "street-fighter-p1"
             mouse: None,
             preset: "p".into(),
             persona: Persona::default(),
+            socd: Socd::default(),
         };
         assert!(matches!(
             cfg.slot_spec(&slot),

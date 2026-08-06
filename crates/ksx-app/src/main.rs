@@ -322,10 +322,21 @@ enum Command {
     /// you press) — then rewrites exactly one preset file atomically.
     ///
     /// Binding REPLACES the function's keys (one key per control, what the
-    /// mapper shows); --clear leaves the inert "None" placeholder. The write
-    /// is canonical TOML: bindings come back sorted, dotted functions as
-    /// quoted literals ("dpad.up"), hand-written comments do not survive —
-    /// the trade for atomic, validated writes.
+    /// mapper shows) AND NOTHING ELSE; --clear leaves the inert "None"
+    /// placeholder. The write is canonical TOML: bindings come back sorted,
+    /// dotted functions as quoted literals ("dpad.up"), hand-written comments
+    /// do not survive — the trade for atomic, validated writes.
+    ///
+    /// MULTI-BIND: binding a key that already drives another control adds a
+    /// second driver; use --move-from to take it away instead. One key driving
+    /// several controls is native to the engine — press it and all of them
+    /// fire together — so `--function A --key P`, then `--function B --key P`,
+    /// then `--function rt --key P` leaves ALL THREE on P, and each write
+    /// reports the others ("P also drives A, B"). Nothing is stolen, no flag
+    /// is needed, and --force has nothing to do with it. To hand a key over
+    /// instead of sharing it, name the loser: `--function A --key P
+    /// --move-from B` binds A, takes P off B ONLY, and says so (B keeps the
+    /// inert "None" if that was its last key).
     ///
     /// CHORDS (--when / --unless): `--function rt --key A --when B` binds
     /// "A while B is held" to RT. While the chord is active its keys are
@@ -345,12 +356,13 @@ enum Command {
     /// already-bound key is allowed and does not conflict — the response names
     /// the flash instead.
     ///
-    /// CONFLICTS block by default: a key already on another function in the
-    /// same preset, or bound in another slot's preset within a games.toml
-    /// profile that uses this preset, is reported and nothing is written.
-    /// --force proceeds — same-preset conflicts are stolen (the old function
-    /// keeps a "None" placeholder); other presets are NEVER edited, the
-    /// response just keeps naming the double binding.
+    /// CROSS-SLOT CONFLICTS block by default, and they are the only ones
+    /// left: a key bound in ANOTHER slot's preset, inside a games.toml profile
+    /// that also uses this preset, is reported and nothing is written. --force
+    /// proceeds — it means "yes, both slots should see that key", writes this
+    /// preset only, and keeps naming the double binding; other presets are
+    /// NEVER edited, and --force removes no binding anywhere: the only flag
+    /// that unbinds anything is --move-from, which names its one victim.
     ///
     /// A running session picks the change up when Studio's mapper (or the pipe
     /// `map` verb with "reload") applies it: a binding-only edit is hot-swapped
@@ -370,8 +382,9 @@ enum Command {
     /// "<preset>.toml.bak-YYYYMMDD-HHMMSS" first; --list-backups shows them.
     ///
     /// Exit codes: 0 = written, 1 = error, 2 = refused (unknown
-    /// preset/function/key, conflicts without --force, or a restore with
-    /// nothing to restore; nothing written).
+    /// preset/function/key, a cross-slot conflict without --force, a
+    /// --move-from that would unbind a control the write was not about, or a
+    /// restore with nothing to restore; nothing written).
     Map {
         /// Preset name (the file's `name` field, e.g. "IPAC P1")
         #[arg(long, value_name = "NAME")]
@@ -413,9 +426,21 @@ enum Command {
             conflicts_with_all = ["clear", "restore", "list_backups", "clear_all"]
         )]
         unless: Vec<String>,
-        /// Proceed despite conflicts (same-preset conflicts are stolen)
+        /// Bind anyway when the key is already used by ANOTHER SLOT's preset
+        /// (cross-slot fan-out). Removes nothing, edits no other preset — a
+        /// same-preset duplicate is a multi-bind and never needs this
         #[arg(long)]
         force: bool,
+        /// Take the key away from exactly this one other control of the same
+        /// preset instead of sharing it with it (the explicit move; that
+        /// control keeps the inert "None" if it is left with nothing)
+        #[arg(
+            long,
+            value_name = "FUNCTION",
+            requires = "key",
+            conflicts_with_all = ["clear", "when", "unless", "restore", "list_backups", "clear_all"]
+        )]
+        move_from: Option<String>,
         /// Restore the whole preset instead of binding one function:
         /// "defaults" (the generic keyboard layout — read the note above),
         /// "session-backup" (the daemon's session-start snapshot) or
@@ -438,7 +463,11 @@ enum Command {
             conflicts_with_all = ["function", "key", "clear", "force", "restore", "list_backups"]
         )]
         clear_all: bool,
-        /// One JSON object {ok, path, preset, function, key, conflicts} on stdout
+        /// One JSON object on stdout: {ok, path, preset, function, key, when,
+        /// unless, chord, also_drives (the other controls this key drives now
+        /// — information, not an error), moved_from ({function, remaining,
+        /// unbound} or null), conflicts, flash}; on a refusal {ok:false, code,
+        /// error, conflicts}
         #[arg(long)]
         json: bool,
     },
@@ -728,6 +757,7 @@ fn main() -> anyhow::Result<()> {
             key,
             clear: _,
             force,
+            move_from,
             when,
             unless,
             restore,
@@ -750,6 +780,7 @@ fn main() -> anyhow::Result<()> {
                     function: function.expect("clap requires --function without --restore"),
                     key,
                     force,
+                    move_from,
                     when,
                     unless,
                 },
@@ -1470,6 +1501,7 @@ mod tests {
                 key,
                 clear,
                 force,
+                move_from,
                 when,
                 unless,
                 restore,
@@ -1482,6 +1514,8 @@ mod tests {
                 assert_eq!(key.as_deref(), Some("G"));
                 assert!(!clear && !force && json && !list_backups && !clear_all);
                 assert_eq!(restore, None);
+                // The default write shares a key rather than moving it.
+                assert_eq!(move_from, None);
                 // No guard given: an ordinary binding, byte for byte as before.
                 assert!(when.is_empty() && unless.is_empty());
             }
@@ -1506,6 +1540,80 @@ mod tests {
                 assert!(clear && force);
             }
             _ => panic!("parsed to the wrong subcommand"),
+        }
+    }
+
+    /// `--move-from` is the explicit move: it takes a FUNCTION, needs a
+    /// `--key` to move, and belongs to a plain bind only (a clear takes
+    /// nothing from anyone; a chord layers instead of taking).
+    #[test]
+    fn map_parses_move_from_and_keeps_it_to_a_plain_bind() {
+        let cli = Cli::try_parse_from([
+            "ksx",
+            "map",
+            "--preset",
+            "IPAC P1",
+            "--function",
+            "A",
+            "--key",
+            "P",
+            "--move-from",
+            "B",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Map {
+                move_from, force, ..
+            } => {
+                assert_eq!(move_from.as_deref(), Some("B"));
+                assert!(!force, "moving is never a spelling of --force");
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+        for junk in [
+            // no key to move
+            vec![
+                "ksx",
+                "map",
+                "--preset",
+                "P",
+                "--function",
+                "A",
+                "--clear",
+                "--move-from",
+                "B",
+            ],
+            // a chord
+            vec![
+                "ksx",
+                "map",
+                "--preset",
+                "P",
+                "--function",
+                "A",
+                "--key",
+                "P",
+                "--when",
+                "F",
+                "--move-from",
+                "B",
+            ],
+            // a whole-preset write
+            vec![
+                "ksx",
+                "map",
+                "--preset",
+                "P",
+                "--restore",
+                "defaults",
+                "--move-from",
+                "B",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(junk.clone()).is_err(),
+                "must not parse: {junk:?}"
+            );
         }
     }
 
@@ -1646,7 +1754,13 @@ mod tests {
         let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
         for needle in [
             "REPLACES the function's keys",
-            "CONFLICTS block by default",
+            // Multi-bind: the sentence a user needs before running it, in the
+            // words the brief asked for.
+            "binding a key that already drives another control adds a second \
+             driver; use --move-from to take it away instead",
+            "leaves ALL THREE on P",
+            "CROSS-SLOT CONFLICTS block by default",
+            "--force removes no binding anywhere",
             "other presets are NEVER edited",
             "canonical TOML",
             "comments do not survive",

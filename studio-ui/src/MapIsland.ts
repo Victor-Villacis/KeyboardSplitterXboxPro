@@ -133,6 +133,23 @@ interface LegendRow {
   cleartitle: string;
 }
 
+/** One toast in the stack (v8). Every field is a BARE per-item read in the
+ *  item body — ledger #11/#15 — so the whole stack costs ZERO new shows: the
+ *  Undo button is hidden by a class string (`… off`), never by a nested show
+ *  and never by `:empty` (which cannot work on a slot-rendered node). */
+interface ToastRow {
+  id: string;
+  /** "toast toast-ok" | "toast toast-warn" | "toast toast-err". */
+  cls: string;
+  /** The plain sentence: what just happened. */
+  text: string;
+  /** "btn btn-undo" while this toast can still be undone, "… off" once it
+   *  cannot (not undoable, mid-undo, or already undone). */
+  undocls: string;
+  undotitle: string;
+  dismisstitle: string;
+}
+
 // ── Zone tables — MIRROR of render_map.rs ZONE_XBOX / ZONE_DS4 ────────────
 // [fn, label, cx, cy, w, h, kind]; stage-percent boxes, art bottom-aligned
 // at 86% stage height (ART_SHARE). Rects are pairwise DISJOINT (pinned by
@@ -219,7 +236,10 @@ const [modalBinding, setModalBinding] = createSignal("");
 const [countdownText, setCountdownText] = createSignal("");
 const [barStyle, setBarStyle] = createSignal("width:100%");
 const [conflictLine, setConflictLine] = createSignal("");
-const [savedLine, setSavedLine] = createSignal("");
+/** The SERVER-RENDERED flash line (no-JS path). The client writes toasts
+ *  instead, so these three have no setters here on purpose — see the toast
+ *  stack below. */
+const [savedLine] = createSignal("");
 const [savedAt, setSavedAt] = createSignal("");
 const [generatedAt, setGeneratedAt] = createSignal("(no snapshot)");
 /** v7 multi-select: the header toggle's look/label, and the floating bar's
@@ -243,8 +263,8 @@ const [canLearn, setCanLearn] = createSignal(false);
 const [artXbox, setArtXbox] = createSignal(false);
 const [artDs4, setArtDs4] = createSignal(false);
 const [hasBackup, setHasBackup] = createSignal(false);
-const [savedOk, setSavedOk] = createSignal(false);
-const [savedErr, setSavedErr] = createSignal(false);
+const [savedOk] = createSignal(false);
+const [savedErr] = createSignal(false);
 const [modalOpen, setModalOpen] = createSignal(false);
 const [modalListening, setModalListening] = createSignal(false);
 const [modalBound, setModalBound] = createSignal(false);
@@ -254,6 +274,11 @@ const [selBar, setSelBar] = createSignal(false);
 const [slotTabs, setSlotTabs] = createSignal<SlotTab[]>([]);
 const [zones, setZones] = createSignal<ZoneRow[]>([]);
 const [legendRows, setLegendRows] = createSignal<LegendRow[]>([]);
+/** The toast stack, newest FIRST. Client-only: SSR paints an empty list (the
+ *  `<!--f:lN-->` markers are still emitted, which is what lets the adoption
+ *  path insert into it later), so no-JS users keep the server-rendered flash
+ *  line below the preset card and nothing else changes. */
+const [toasts, setToasts] = createSignal<ToastRow[]>([]);
 /** The preset-actions card's class: "card pactions" when the daemon can
  *  restore, "card pactions off" (inert look, clicks flash the reason) when
  *  not. A class string, not a show — the card never unmounts. */
@@ -658,6 +683,15 @@ export function currentBinding(fn: string): string | null {
   return keys && keys.length > 0 ? keys.join("+") : null;
 }
 
+/** The raw key list bound to `fn` right now — what an UNDO has to put back.
+ *  Kept separate from [`currentBinding`] (which joins for display) because
+ *  `/api/bind` takes ONE key: a control holding several keys cannot be
+ *  restored by a single call, so the toast for that edit is rendered without
+ *  an Undo button rather than offering one that would silently drop keys. */
+export function previousKeys(fn: string): string[] {
+  return currentSlot()?.bindings[fn]?.slice() ?? [];
+}
+
 /** Why a click cannot record right now — one clause, worst problem first.
  *  `null` means it can. This is what turns a dead click into a sentence. */
 export function blockedReason(): string | null {
@@ -742,17 +776,192 @@ export function modalIsOpen(): boolean {
   return modalOpen();
 }
 
-const FLASH_MS = 5000;
-let flashTimer: ReturnType<typeof setTimeout> | undefined;
+// ── The toast stack (v8): optimistic action + a road home ──────────────────
+// MAPPER-UX commandment 5 asked for a guaranteed road home; v7 spelled it
+// "are you sure?" before four different writes. A confirm dialog is a toll
+// paid by every correct action to insure against the rare wrong one, and on a
+// cabinet phone it is a modal you dismiss without reading. So: the action
+// fires IMMEDIATELY, and the report of what happened carries the way back.
+//
+// One toast = one plain sentence + (when the action can honestly be reversed)
+// an Undo button. Undo is single-level per toast: once it lands the toast
+// collapses to what it undid and the button goes. Undo is composed from the
+// verbs that already exist — `/api/bind` with the remembered previous key,
+// `/api/preset/restore latest-backup` for the whole-preset writes (which
+// snapshot a timestamped .bak before writing, so the newest backup IS the
+// pre-action state). Nothing new was added to the daemon for this.
+//
+// The signals below (savedLine/savedOk/savedErr) stay: they are the
+// SERVER-RENDERED flash channel for a no-JS page, and the SSR seam still
+// carries them (render_map.rs). The client no longer writes them — its
+// feedback is the stack.
 
-export function flashSaved(line: string, isError: boolean): void {
-  if (flashTimer !== undefined) clearTimeout(flashTimer);
-  setSavedLine(line);
-  setSavedOk(!isError && line !== "");
-  setSavedErr(isError && line !== "");
-  if (line !== "") {
-    flashTimer = setTimeout(() => flashSaved("", false), FLASH_MS);
+/** How long a toast lives when nobody touches it. Longer than the old 5 s
+ *  flash on purpose: it now carries an ACTION, so it has to outlive the
+ *  double-take that follows an unexpected result. */
+const TOAST_MS = 8000;
+/** Three at a time. The fourth pushes the oldest off the bottom — a stack
+ *  taller than this stops being feedback and becomes a wall. */
+const TOAST_MAX = 3;
+
+export type ToastKind = "ok" | "warn" | "err";
+
+export interface ToastOptions {
+  kind?: ToastKind;
+  /** Runs when the user hits Undo (or Ctrl+Z on the newest undoable toast).
+   *  Resolves `null` when the undo landed, or the REASON it did not — which
+   *  becomes an error toast, never a silent no-op. Absent/null = this action
+   *  has no honest undo, so no button is offered. */
+  undo?: (() => Promise<string | null>) | null;
+  /** The sentence the toast collapses to once the undo lands. */
+  undone?: string;
+}
+
+interface LiveToast {
+  id: string;
+  text: string;
+  kind: ToastKind;
+  undo: (() => Promise<string | null>) | null;
+  undone: string;
+  /** An undo is in flight: the button hides so it cannot be double-fired. */
+  busy: boolean;
+  /** Milliseconds left before auto-dismiss; frozen while hovered/focused. */
+  remaining: number;
+  deadline: number;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+let toastSeq = 0;
+let liveToasts: LiveToast[] = [];
+/** Pointer or focus is inside the stack: nothing may vanish under the hand
+ *  that is reaching for its Undo button. */
+let toastsHeld = false;
+
+function syncToasts(): void {
+  setToasts(
+    liveToasts.map((t) => ({
+      id: t.id,
+      cls: `toast toast-${t.kind}`,
+      text: t.text,
+      undocls: t.undo !== null && !t.busy ? "btn btn-undo" : "btn btn-undo off",
+      undotitle: "Undo this (Ctrl+Z)",
+      dismisstitle: "Dismiss",
+    })),
+  );
+}
+
+function armToast(t: LiveToast): void {
+  if (toastsHeld) return;
+  t.deadline = Date.now() + t.remaining;
+  t.timer = setTimeout(() => dismissToast(t.id), t.remaining);
+}
+
+function holdToast(t: LiveToast): void {
+  if (t.timer !== undefined) {
+    clearTimeout(t.timer);
+    t.timer = undefined;
   }
+  if (t.deadline > 0) t.remaining = Math.max(1200, t.deadline - Date.now());
+}
+
+/** Hover/focus pauses every timer in the stack — the stack is one target as
+ *  far as a hand is concerned. */
+export function holdToasts(): void {
+  if (toastsHeld) return;
+  toastsHeld = true;
+  for (const t of liveToasts) holdToast(t);
+}
+
+export function releaseToasts(): void {
+  if (!toastsHeld) return;
+  toastsHeld = false;
+  for (const t of liveToasts) if (!t.busy) armToast(t);
+}
+
+/** Report what just happened. Returns the toast id so a caller can replace a
+ *  progress line with its own result ([`replaceToast`]). */
+export function pushToast(text: string, opts: ToastOptions = {}): string {
+  const t: LiveToast = {
+    id: `t${++toastSeq}`,
+    text,
+    kind: opts.kind ?? "ok",
+    undo: opts.undo ?? null,
+    undone: opts.undone ?? "Undone.",
+    busy: false,
+    remaining: TOAST_MS,
+    deadline: 0,
+  };
+  liveToasts = [t, ...liveToasts];
+  while (liveToasts.length > TOAST_MAX) {
+    const gone = liveToasts.pop();
+    if (gone?.timer !== undefined) clearTimeout(gone.timer);
+  }
+  armToast(t);
+  syncToasts();
+  return t.id;
+}
+
+/** "binding 3 controls…" → the real answer, in the same toast. */
+export function replaceToast(id: string | null, text: string, opts: ToastOptions = {}): string {
+  const t = id === null ? undefined : liveToasts.find((x) => x.id === id);
+  if (!t) return pushToast(text, opts);
+  holdToast(t);
+  t.text = text;
+  t.kind = opts.kind ?? "ok";
+  t.undo = opts.undo ?? null;
+  t.undone = opts.undone ?? "Undone.";
+  t.busy = false;
+  t.remaining = TOAST_MS;
+  armToast(t);
+  syncToasts();
+  return t.id;
+}
+
+export function dismissToast(id: string): void {
+  const t = liveToasts.find((x) => x.id === id);
+  if (!t) return;
+  if (t.timer !== undefined) clearTimeout(t.timer);
+  liveToasts = liveToasts.filter((x) => x !== t);
+  syncToasts();
+}
+
+/** The newest toast that can still be undone — what Ctrl+Z means. */
+export function newestUndoable(): string | null {
+  return liveToasts.find((t) => t.undo !== null && !t.busy)?.id ?? null;
+}
+
+/** Run one toast's undo. Single-level: on success the button disappears and
+ *  the toast becomes the record of the reversal. On failure the toast turns
+ *  error-styled and NAMES the reason, keeping the button so it can be tried
+ *  again — a dead Undo would be exactly the silent no-op this page bans. */
+export async function runUndo(id: string | null): Promise<void> {
+  if (id === null) return;
+  const t = liveToasts.find((x) => x.id === id);
+  if (!t || t.undo === null || t.busy) return;
+  const original = t.text;
+  t.busy = true;
+  t.text = "undoing…";
+  holdToast(t);
+  syncToasts();
+  let failure: string | null;
+  try {
+    failure = await t.undo();
+  } catch {
+    failure = "the undo request failed — is ksx studio still running?";
+  }
+  if (!liveToasts.includes(t)) return; // dismissed while the write was in flight
+  t.busy = false;
+  if (failure === null) {
+    t.text = t.undone;
+    t.kind = "ok";
+    t.undo = null;
+  } else {
+    t.text = `${original} — undo FAILED: ${failure}`;
+    t.kind = "err";
+  }
+  t.remaining = TOAST_MS;
+  armToast(t);
+  syncToasts();
 }
 
 // ── The screen ─────────────────────────────────────────────────────────────
@@ -926,8 +1135,9 @@ export function MapIsland() {
             "Click a control, then press the panel key for it — Esc or a click ",
             "outside cancels, Delete clears. Ctrl-click (or “Select multiple”) ",
             "picks several controls and maps them all to ONE key. Saves are ",
-            "immediate, and a running session takes them live without ",
-            "unplugging the pads.",
+            "immediate — nothing asks “are you sure?”; every action reports ",
+            "itself with an Undo button (Ctrl-Z undoes the newest) — and a ",
+            "running session takes them live without unplugging the pads.",
           ),
       ),
       // ── THE CONTROLLER (huge). Art + zone layer per persona. ──────────
@@ -1087,9 +1297,11 @@ export function MapIsland() {
         h(
           "p",
           { class: "savenote" },
-          "Every binding saves immediately — there is no Save button. A running ",
-          "session takes binding changes live, without unplugging the pads. Use ",
-          "the restore options below to undo.",
+          "Every binding saves immediately — there is no Save button, and no ",
+          "action asks “are you sure?”. Each one reports what it did and offers ",
+          "Undo for a few seconds (Ctrl-Z takes the newest). The restore options ",
+          "below are the wider road home, and every one of them writes a ",
+          "timestamped backup first.",
         ),
         h(
           "div",
@@ -1237,6 +1449,51 @@ export function MapIsland() {
             "Cancel",
           ),
         ),
+    ),
+    // ── The toast stack (v8): every action's report, and its road back. ───
+    // NOT a show — the container is always in the DOM and the LIST inside it
+    // is empty until something happens, so this costs zero MAP_SHOW_ORDER
+    // entries (ledger #4/#14: a new show is a four-file edit that shifts
+    // every show after it). SSR renders the empty list's markers, which is
+    // exactly what the adoption path needs to insert into later.
+    // The container is `pointer-events: none` so an empty stack cannot eat a
+    // click meant for the page; each toast turns them back on.
+    h(
+      "div",
+      { class: "toasts", "aria-live": "polite", "aria-atomic": "false" },
+      createList(
+        () => toasts(),
+        (t) => t.id + "|" + t.cls + "|" + t.text + "|" + t.undocls,
+        (t) =>
+          h(
+            "div",
+            { class: t.cls, "data-toast": t.id },
+            h("p", { class: "tmsg" }, t.text),
+            h(
+              "div",
+              { class: "tbtns" },
+              // The label is a constant, so it is a literal child (no slot);
+              // whether the button EXISTS is the per-item class field —
+              // ledger #15's hide-by-class-string, never `:empty`.
+              h(
+                "button",
+                { class: t.undocls, "data-undo": t.id, type: "button", title: t.undotitle },
+                "Undo",
+              ),
+              h(
+                "button",
+                {
+                  class: "tclose",
+                  "data-dismiss": t.id,
+                  type: "button",
+                  title: t.dismisstitle,
+                  "aria-label": t.dismisstitle,
+                },
+                "✕",
+              ),
+            ),
+          ),
+      ),
     ),
     h(
       "footer",

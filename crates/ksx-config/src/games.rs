@@ -2,7 +2,7 @@
 //! `splitter_games.xml` (title, path, args, block flags, per-slot
 //! device-by-id + preset-by-name).
 
-use ksx_core::{DeviceId, Persona, SlotSpec};
+use ksx_core::{DeviceId, Persona, SlotSpec, Socd};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
@@ -88,6 +88,15 @@ pub struct GameSlotEntry {
         skip_serializing_if = "crate::persona_serde::is_default"
     )]
     pub persona: Persona,
+    /// See [`crate::config::SlotEntry::socd`]. Per-game, because SOCD is a
+    /// property of the game's rules (a fighter wants up-priority; a twin-stick
+    /// shooter wants nothing at all), not of the panel.
+    #[serde(
+        default,
+        with = "crate::socd_serde",
+        skip_serializing_if = "crate::socd_serde::is_default"
+    )]
+    pub socd: Socd,
 }
 
 impl GameSlotEntry {
@@ -98,7 +107,7 @@ impl GameSlotEntry {
             self.mouse.as_deref().map(DeviceId::new),
             self.preset.clone(),
         )
-        .map(|spec| spec.with_persona(self.persona))
+        .map(|spec| spec.with_persona(self.persona).with_socd(self.socd))
         .map_err(Into::into)
     }
 
@@ -108,6 +117,7 @@ impl GameSlotEntry {
             number: spec.number,
             user_index: None,
             persona: spec.persona,
+            socd: spec.socd,
             keyboard: spec.keyboard.as_ref().map(|d| d.as_str().to_owned()),
             mouse: spec.mouse.as_ref().map(|d| d.as_str().to_owned()),
             preset: spec.preset.clone(),
@@ -244,6 +254,7 @@ preset = "IPAC P2"
             mouse: None,
             preset: "p".into(),
             persona: Persona::default(),
+            socd: Socd::default(),
         };
         assert!(matches!(
             entry.to_spec(),

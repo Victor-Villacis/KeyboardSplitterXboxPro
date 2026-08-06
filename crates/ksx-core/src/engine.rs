@@ -123,6 +123,11 @@ impl SlotRuntime {
             Binding::Trigger(Trigger::Right) => self.current.rt = u8::MAX,
             Binding::Axis { axis, value } => *self.axis_field(axis) = value,
             Binding::Dpad(d) => self.current.buttons |= d.flag(),
+            // A consume-only chord drives no endpoint — its entire effect is
+            // the suppression of its constituents (docs/INPUT-TRANSFORMS.md
+            // §2.6). Unreachable in practice: `build` never registers it as a
+            // holder binding.
+            Binding::Consume => {}
         }
     }
 
@@ -158,6 +163,7 @@ impl SlotRuntime {
                 *self.axis_field(axis) = snap.unwrap_or(AXIS_CENTER);
             }
             Binding::Dpad(d) => self.current.buttons &= !d.flag(),
+            Binding::Consume => {}
         }
     }
 
@@ -419,8 +425,11 @@ impl EngineTables {
             let mut axis_entries = Vec::new();
 
             for &(key, binding) in &rs.preset.entries {
-                if key == Key::None {
-                    continue; // inert placeholder rows ("function present, unbound")
+                // Inert rows: placeholders ("function present, unbound"), and
+                // `Consume` outside a guard, which consumes nothing by
+                // definition (validation reports it).
+                if key == Key::None || binding == Binding::Consume {
+                    continue;
                 }
                 let dense = intern_key(&mut index, &mut targets, key);
                 targets[dense as usize].push(Target {
@@ -510,7 +519,7 @@ impl EngineTables {
                 let mut holder_bindings: Vec<SmallVec<[Binding; 2]>> =
                     vec![SmallVec::new(); holders];
                 for &(key, binding) in &rs.preset.entries {
-                    if key == Key::None {
+                    if key == Key::None || binding == Binding::Consume {
                         continue;
                     }
                     holder_bindings[index[&key] as usize].push(binding);
@@ -519,7 +528,12 @@ impl EngineTables {
                 for c in 0..runtimes[si].chords.len() {
                     let id = chord_base + c as u32;
                     let chord = &runtimes[si].chords[c];
-                    holder_bindings[id as usize].push(chord.binding);
+                    // A consume-only chord holds nothing: it never presses,
+                    // never releases, and never joins an endpoint's holder
+                    // list. It still consumes, which is the whole point.
+                    if chord.binding != Binding::Consume {
+                        holder_bindings[id as usize].push(chord.binding);
+                    }
                     for k in std::iter::once(chord.trigger).chain(chord.when.iter().copied()) {
                         if !chord_keys.contains(&k) {
                             chord_keys.push(k);
@@ -532,6 +546,9 @@ impl EngineTables {
                 for c in 0..runtimes[si].chords.len() {
                     let id = chord_base + c as u32;
                     let binding = runtimes[si].chords[c].binding;
+                    if binding == Binding::Consume {
+                        continue;
+                    }
                     runtimes[si]
                         .endpoint_keys
                         .entry(binding)
@@ -541,8 +558,10 @@ impl EngineTables {
                         runtimes[si].axis_entries.push((axis, value, id));
                     }
                 }
+                // Chords are always holders even when they drive nothing, so a
+                // full rescan (device yank) still clears their `held` bit.
                 let all_holders: Vec<u32> = (0..holders as u32)
-                    .filter(|h| !holder_bindings[*h as usize].is_empty())
+                    .filter(|h| *h >= chord_base || !holder_bindings[*h as usize].is_empty())
                     .collect();
 
                 // Which keys make this slot resync: anything it binds, plus

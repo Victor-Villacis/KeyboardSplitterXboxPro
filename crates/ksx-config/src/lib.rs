@@ -23,6 +23,7 @@ pub mod games;
 pub mod paths;
 pub mod persona_serde;
 pub mod preset;
+pub mod socd_serde;
 pub mod store;
 pub mod validate;
 
@@ -31,7 +32,7 @@ pub(crate) mod test_util;
 
 pub use config::{Backend, ConfigFile, DeviceEntry, Settings, SlotEntry, SCHEMA_VERSION};
 pub use error::ConfigError;
-pub use function::{function_name, parse_function};
+pub use function::{function_name, parse_function, CONSUME};
 pub use games::{GameEntry, GameSlotEntry, GamesFile};
 pub use paths::{installed_config_dir, ConfigRoot, PORTABLE_MARKER};
 pub use preset::{BindingEntry, PresetFile};

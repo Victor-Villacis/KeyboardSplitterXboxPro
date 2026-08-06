@@ -139,6 +139,18 @@ impl ksx_studio::ControlSource for PipeControlSource {
                             .collect()
                     })
                     .unwrap_or_default(),
+                // Multi-bind information (absent from a pre-multi-bind daemon,
+                // which is exactly an empty list: it had no co-bindings to
+                // report because it moved the key instead).
+                also_drives: response["also_drives"]
+                    .as_array()
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(|row| row.as_str())
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 reloaded: response["reloaded"] == true,
             },
             Err(client::ClientError::NotRunning) => BindOutcome::failed(NO_CHANNEL),

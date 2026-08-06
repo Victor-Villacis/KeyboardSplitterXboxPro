@@ -2,6 +2,7 @@
 
 use crate::device::DeviceId;
 use crate::persona::Persona;
+use crate::socd::Socd;
 
 /// Maximum slots ksx will configure.
 ///
@@ -47,6 +48,11 @@ pub struct SlotSpec {
     /// Which controller this slot presents itself as. Defaults to
     /// [`Persona::Xbox360`]; set with [`SlotSpec::with_persona`].
     pub persona: Persona,
+    /// What this slot does with simultaneous opposing directions. Defaults to
+    /// [`Socd::Off`] — no generated chords, no behavioral change at all — and
+    /// is applied by generating chords onto the resolved preset
+    /// ([`crate::socd`]), never by a special case in the engine.
+    pub socd: Socd,
 }
 
 impl SlotSpec {
@@ -70,6 +76,7 @@ impl SlotSpec {
             mouse,
             preset: preset.into(),
             persona: Persona::default(),
+            socd: Socd::default(),
         })
     }
 
@@ -77,6 +84,13 @@ impl SlotSpec {
     #[must_use]
     pub fn with_persona(mut self, persona: Persona) -> Self {
         self.persona = persona;
+        self
+    }
+
+    /// Sets the SOCD cleaning policy for this slot.
+    #[must_use]
+    pub fn with_socd(mut self, socd: Socd) -> Self {
+        self.socd = socd;
         self
     }
 }
@@ -194,6 +208,9 @@ mod tests {
         // The compatibility guarantee: a spec built the old way is an Xbox pad.
         let spec = SlotSpec::new(1, None, None, "p").unwrap();
         assert_eq!(spec.persona, Persona::Xbox360);
+        // Same guarantee for SOCD: absent means "behave exactly as before".
+        assert_eq!(spec.socd, Socd::Off);
+        assert_eq!(spec.clone().with_socd(Socd::Neutral).socd, Socd::Neutral);
         let ps = spec.clone().with_persona(Persona::PlayStation);
         assert_eq!(ps.persona, Persona::PlayStation);
         // …and changes nothing else about the slot.

@@ -505,6 +505,7 @@ mod tests {
                 mouse: None,
                 preset: "street-fighter-p1".into(),
                 persona: ksx_core::Persona::default(),
+                socd: ksx_core::Socd::default(),
             }],
         }
     }
@@ -557,6 +558,7 @@ mod tests {
                     mouse: None,
                     preset: "IPAC P1".into(),
                     persona: ksx_core::Persona::default(),
+                    socd: ksx_core::Socd::default(),
                 }],
             }],
         };
