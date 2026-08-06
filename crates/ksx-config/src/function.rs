@@ -8,10 +8,19 @@
 //! under — the `[bindings]` table is keyed by function name, so "emit nothing"
 //! needs a name like everything else.
 //!
-//! Parsing is case-insensitive; emission is canonical (`-32768` emits as
+//! Parsing is case-insensitive; emission is canonical (`-32767` emits as
 //! `min`, `32767` as `max`).
+//!
+//! `i16::MIN` never survives this boundary. It is a legal but hazardous axis
+//! value ([`ksx_core::AXIS_MIN`] explains why), and legacy XML, older presets,
+//! and hand edits all carry it. [`parse_function`] folds `lx.-32768` to
+//! [`AXIS_MIN`] on the way in, so it parses to exactly the binding `lx.min`
+//! parses to; [`function_name`] folds it on the way out, so nothing this crate
+//! writes can spell the minimum as a raw number. This is the one place the fold
+//! lives for configuration — [`ksx_core::safe_axis`] is the same rule at the
+//! wire boundary, for values that never pass through a file.
 
-use ksx_core::{Axis, Binding, DpadDirection, Trigger, XButton, AXIS_MAX, AXIS_MIN};
+use ksx_core::{safe_axis, Axis, Binding, DpadDirection, Trigger, XButton, AXIS_MAX, AXIS_MIN};
 
 use crate::error::ConfigError;
 
@@ -51,7 +60,7 @@ pub fn function_name(binding: &Binding) -> String {
         Binding::Trigger(Trigger::Left) => "lt".to_owned(),
         Binding::Trigger(Trigger::Right) => "rt".to_owned(),
         Binding::Axis { axis, value } => {
-            let suffix = match *value {
+            let suffix = match safe_axis(*value) {
                 AXIS_MIN => "min".to_owned(),
                 AXIS_MAX => "max".to_owned(),
                 custom => custom.to_string(),
@@ -112,9 +121,11 @@ pub fn parse_function(name: &str) -> Result<Binding, ConfigError> {
             let value = match rest {
                 "min" => AXIS_MIN,
                 "max" => AXIS_MAX,
-                custom => custom
-                    .parse::<i16>()
-                    .map_err(|_| ConfigError::InvalidAxisValue(custom.to_owned()))?,
+                custom => safe_axis(
+                    custom
+                        .parse::<i16>()
+                        .map_err(|_| ConfigError::InvalidAxisValue(custom.to_owned()))?,
+                ),
             };
             Ok(Binding::Axis { axis, value })
         }
@@ -276,6 +287,51 @@ mod tests {
             parse_function("macro.hadouken"),
             Err(ConfigError::UnknownFunction(_))
         ));
+    }
+
+    /// `i16::MIN` is accepted but never written back.
+    ///
+    /// Legacy XML stores `value="-32768"`, and hand-edited presets predate
+    /// [`AXIS_MIN`] being -32767, so `lx.-32768` must keep parsing — as the
+    /// *same* binding `lx.min` parses to, not as a second near-identical one.
+    /// Emission then folds it, so the minimum can never leave this crate in
+    /// raw numeric form (which is what a golden snapshot regression looked
+    /// like: `"lx.-32768" = "M"` where the cabinet presets say `"lx.min"`).
+    #[test]
+    fn i16_min_is_accepted_on_input_and_never_emitted() {
+        for (raw, canonical, axis) in [
+            ("lx.-32768", "lx.min", Axis::X),
+            ("ly.-32768", "ly.min", Axis::Y),
+            ("rx.-32768", "rx.min", Axis::Rx),
+            ("RY.-32768", "ry.min", Axis::Ry),
+        ] {
+            let binding = parse_function(raw).unwrap();
+            assert_eq!(binding, parse_function(canonical).unwrap());
+            assert_eq!(
+                binding,
+                Binding::Axis {
+                    axis,
+                    value: AXIS_MIN
+                }
+            );
+            // Naming an i16::MIN binding built in memory (never parsed) folds too.
+            assert_eq!(
+                function_name(&Binding::Axis {
+                    axis,
+                    value: i16::MIN
+                }),
+                canonical
+            );
+            assert_eq!(function_name(&binding), canonical);
+        }
+        // The fold is surgical: no other value moves.
+        for value in [AXIS_MIN, AXIS_MAX, -32766, -16384, -1, 0, 1] {
+            let binding = Binding::Axis {
+                axis: Axis::X,
+                value,
+            };
+            assert_eq!(parse_function(&function_name(&binding)).unwrap(), binding);
+        }
     }
 
     #[test]

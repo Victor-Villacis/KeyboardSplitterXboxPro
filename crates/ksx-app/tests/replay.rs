@@ -130,7 +130,16 @@ fn digest(transitions: &[(u8, PadState)]) -> u64 {
 /// It pins *current* behaviour, so it is a drift detector, not a proof of
 /// correctness-vs-legacy. If a deliberate mapping change lands, re-derive it and
 /// say why in the commit message — never "just update the number".
-const SESSION_DIGEST: u64 = 16_837_667_763_229_975_859;
+///
+/// Re-derived once, when `AXIS_MIN` became -32767 and `ksx-config` started
+/// folding a literal `-32768` to it at the file boundary (`ksx_core::AXIS_MIN`
+/// explains why `i16::MIN` is not wanted). The cabinet XML stores
+/// `value="-32768"`, so 76 of the 311 recorded transitions now carry -32767
+/// where they carried -32768. That is the *entire* delta: mapping -32767 back
+/// to `i16::MIN` across the sequence reproduces the previous digest
+/// (16_837_667_763_229_975_859) byte for byte — same transition count, same
+/// order, same buttons, same triggers. One LSB less deflection, nothing else.
+const SESSION_DIGEST: u64 = 1_218_103_173_477_976_965;
 const SESSION_TRANSITIONS: usize = 311;
 
 #[test]

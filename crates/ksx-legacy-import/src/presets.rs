@@ -450,6 +450,31 @@ fn custom_function_by_name(name: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
+    /// The live cabinet XML stores full negative deflection as
+    /// `value="-32768"`. That is `i16::MIN`, which ksx never puts in a preset
+    /// (see `ksx_core::AXIS_MIN`) — so an imported axis must come out spelled
+    /// `lx.min`, not as the raw number. The fold lives in `ksx-config`'s
+    /// function naming; this pins that the importer actually gets it.
+    #[test]
+    fn legacy_i16_min_axis_imports_as_min() {
+        // Verbatim shape of the live cab XML (tests/fixtures/splitter_presets.xml).
+        let xml = r#"<preset_data>
+            <preset name="Cab">
+                <axis id="1" value="-32768">M</axis>
+                <axis id="2" value="-32768">K</axis>
+                <axis id="1" value="32767">N</axis>
+            </preset>
+        </preset_data>"#;
+        let parsed = parse_presets(xml, "splitter_presets.xml");
+        assert!(parsed.warnings.is_empty(), "{:#?}", parsed.warnings);
+
+        let rendered = toml::to_string(&parsed.presets[0]).expect("render");
+        assert!(rendered.contains(r#""lx.min" = "M""#), "{rendered}");
+        assert!(rendered.contains(r#""ly.min" = "K""#), "{rendered}");
+        assert!(rendered.contains(r#""lx.max" = "N""#), "{rendered}");
+        assert!(!rendered.contains("-32768"), "{rendered}");
+    }
+
     #[test]
     fn custom_expansion_is_bit_exact() {
         // Every XboxCustomFunction value, verbatim from the legacy enum.
