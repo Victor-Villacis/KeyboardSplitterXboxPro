@@ -113,6 +113,50 @@ The old move survives as an explicit, singular `--move-from FUNCTION` /
 "bind here anyway despite ANOTHER SLOT's preset" and removes nothing. The
 legend still derives sharing from disk, never from what the UI assumed.
 
+**Diagonals: SHIPPED (v16, 2026-08-06).** The macro grid's direction groups
+are eight columns each — `↑ ↖ ← ↙ ↓ ↘ → ↗`, in ring order, 25 zones → 37
+columns — so a diagonal is a thing you point at instead of a thing you have
+to know how to build. Ticking `↘` stores `dpad.down + dpad.right` on the
+mechanism whose column you hit; a step that already holds a pair (hand-written,
+imported, or from a motion helper) DISPLAYS as `↘`, including when it is
+spelled at a partial deflection (`ly.-16384 + lx.max`, shown dashed) and when
+a button rides along with it. The stored model is untouched — this is a
+presentation layer over `ksx_core::diagonal::fold`, and every row spells out
+the pair it wrote beside its name so the file is never a mystery.
+
+**All four, because of the full circle.** `↘` alone would miss the point: a
+half-circle needs `↙` as well, a dragon punch needs `↘` specifically, and a
+360 (the spinning piledriver) walks all eight positions of the gate — four of
+its eight steps are diagonals. So every diagonal is recognized on read-back
+and expanded on write on all three mechanisms, and the motion helpers now
+offer the full family: quarter-circle and half-circle both facings, dragon
+punch both facings, and **360 both facings** (`→ ↘ ↓ ↙ ← ↖ ↑ ↗` and its
+mirror). Each inserted step displaying as its own diagonal is the proof that
+recognition and expansion agree. ⚠ *The sign*: "up" on a stick is `ly.max`,
+not `ly.min` — a mirrored sign gives an `↖` that reads back perfectly in every
+reader on the page and does nothing in the game, so all twelve
+(mechanism × diagonal) pairs are asserted name by name in ksx-core, in
+`render_map.rs`, and in the browser suite against the TOML the file will
+carry.
+
+*Why nobody else has it, and why the ordering is what it is.* Steam Input's
+D-pad is "4 binding slots in the cardinal directions"; 8-Way (Overlap) only
+widens the wedge. reWASD's own support answer to "map a diagonal" is *build a
+Shortcut out of two zones*. MAME's input map is four cardinals. GP2040-CE
+treats diagonals purely as cardinal pairs and spends its whole SOCD feature on
+what happens when the pair is illegal. Steam Deck's eight-direction D-pad
+binding is still an open feature request. So ksx's storage model is the model
+the entire field uses — the gap was the lens, not the data. Ring order
+(numpad 8 7 4 1 2 3 6 9) rather than numpad-ascending because a piano roll is
+read as a picture: a quarter-circle becomes a staircase, a half-circle a
+straight 45° line, a dragon punch a hook. Notation follows the field split —
+**arrows on screen** (SF6's input history, every Capcom move list), **words
+for the name** (compass, not `d/f`: player 2 is not an edge case), **numpad in
+the tooltip** as the lookup key for anyone who read it on Dustloop or typed it
+into MAME's `joystick_map`. Direction glyphs are unified on arrows everywhere,
+including the art's zone labels: a diagonal that did not look like the same
+family as its two parents would defeat the lens.
+
 **Build A — finish v5 to spec (now).** Layout fix (in flight: clean hover
 zones + legend) plus: press-to-select (panel press focuses the control on
 the open mapper — reuses the learn observer in a passive "select" mode,

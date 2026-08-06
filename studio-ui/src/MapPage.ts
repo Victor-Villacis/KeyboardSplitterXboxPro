@@ -299,6 +299,10 @@ export function MapPage() {
   // after it). Defaults are the honest "nothing read yet" values.
   const [macroHead] = createSignal("no macro loaded yet");
   const [macroRuleLine] = createSignal("");
+  // v16: the direction RING, and what ticking a diagonal writes. SSR'd like
+  // every other explainer — a page with no JavaScript cannot tick a cell, but
+  // it can read what the columns mean and hand-write the pair.
+  const [macroRingLine] = createSignal("");
   const [macroPolicyLine] = createSignal("on release: finish · retrigger: ignore · interrupt: none");
   const [macroNote] = createSignal("");
   const [macroTriggerLine] = createSignal("no trigger key yet — nothing starts this macro");

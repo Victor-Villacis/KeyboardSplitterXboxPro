@@ -2788,7 +2788,10 @@ a.strow:hover {
 
 .macrocard {
   --macrow: 1.9rem;
-  --maccol: 1.65rem;
+  /* v16: the ring made every direction group eight columns wide (37 in all), so
+     the cell narrows a little and the matrix keeps its share of the card. It
+     still scrolls — `.macscroll` — but a whole persona now fits on a desktop. */
+  --maccol: 1.5rem;
   background: var(--surface-sunken);
   border-color: var(--border-subtle);
   box-shadow: none;
@@ -2981,7 +2984,10 @@ a.strow:hover {
 .macrowbar {
   flex: 0 0 auto;
   min-width: 0;
-  max-width: 60%;
+  /* The MATRIX is the instrument; the bar beside it is the label. v16 added the
+     ledger column to the bar, so the cap comes down to keep the balance the
+     other way round. */
+  max-width: 52%;
 }
 
 .macrowhead,
@@ -3079,7 +3085,7 @@ a.strow:hover {
 /* FIX 1 — WHAT THE ROW HOLDS, in words. First-class text: this is the row's
    MEANING, and it used to be tertiary-grey filler at the end of the line. */
 .machold {
-  flex: 0 0 12rem;
+  flex: 0 0 10rem;
   min-width: 0;
   font-size: var(--fs-xs);
   font-weight: var(--fw-semibold);
@@ -3157,20 +3163,57 @@ a.strow:hover {
   overflow-x: auto;
 }
 
+.macgrps,
 .maccols,
 .macmatrix {
   display: grid;
-  grid-template-columns: repeat(25, var(--maccol));
+  /* 37, not 25: every direction group is now its whole ring — ↑ ↖ ← ↙ ↓ ↘ → ↗ —
+     so the four diagonals are things you point at rather than things you have
+     to know how to build. */
+  grid-template-columns: repeat(37, var(--maccol));
   width: max-content;
 }
+
+/* THE GROUP BAND. Not decoration: without it the header carries three
+   identical eight-arrow runs told apart only by a tooltip. */
+.macgrps {
+  height: calc(var(--macrow) * 0.8);
+  align-items: end;
+}
+
+.macgrp {
+  grid-column: span 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-bold);
+  letter-spacing: var(--track-eyebrow);
+  color: var(--text-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
+  padding-bottom: 0.1rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.macgrp.g3 { grid-column: span 3; }
+.macgrp.g4 { grid-column: span 4; }
+.macgrp.g8 { grid-column: span 8; }
+.macgrp.g9 { grid-column: span 9; }
 
 /* UNIFORM by design: the identity colours earn their place on the art and in
    the legend; here the column is NAMED, in one type treatment. */
 .maccolid {
   height: var(--macrow);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  /* BLOCK, not flex: `text-overflow: ellipsis` does nothing on a flex
+     container, so the long text chips (guide / view / menu) used to clip
+     mid-glyph with no sign that anything was missing. */
+  display: block;
+  line-height: var(--macrow);
+  text-align: center;
   font-family: var(--mono);
   font-size: var(--fs-micro);
   font-weight: var(--fw-bold);
@@ -3218,9 +3261,70 @@ a.strow:hover {
   border-color: var(--accent-line);
 }
 
+/* A cardinal that is HALF of a folded diagonal. Subordinate on purpose: the
+   diagonal's own cell carries the filled mark and is what the row reads as —
+   but the cardinal really is in the file, and a lens that hid it would be
+   lying about the storage it exists to explain. */
+.maccell.part {
+  color: var(--text-tertiary);
+  background: var(--sel-tint);
+}
+
+/* A diagonal whose members are not the canonical extremes (a hand-written
+   `ly.-16384 + lx.max`). It IS the diagonal — this is a label, never a
+   rewrite, and the title says what the file actually holds. */
+.maccell.on.approx {
+  border-style: dashed;
+}
+
+/* The four picks read one notch stronger than the cardinals between them:
+   they are the columns nobody has had before. */
+.maccell.isdiag {
+  border-left-color: var(--border-default);
+  border-right-color: var(--border-default);
+}
+
 .maccell.inrow {
   border-top-color: var(--accent-line);
   border-bottom-color: var(--accent-line);
+}
+
+/* The four diagonal HEADERS, same one notch. */
+.maccolid.diag {
+  color: var(--text-primary);
+}
+
+.maccolid.card {
+  color: var(--text-secondary);
+}
+
+/* THE LEDGER: the pair a diagonal on this row is stored as. Mono, quiet, and
+   right beside the words — "↘" and "dpad.down + dpad.right" are the same fact
+   said twice, which is the only way the presentation stays honest. */
+.macexp {
+  /* Takes whatever the bar has left: the pair is the point, and a column that
+     always truncated would be a ledger nobody could read. Its own `title`
+     carries the whole line when the bar is narrow anyway. */
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.macexp.off {
+  display: none;
+}
+
+.macring {
+  margin: var(--sp-3) 0 0;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  color: var(--text-tertiary);
+  max-width: 82ch;
 }
 
 .macrule {

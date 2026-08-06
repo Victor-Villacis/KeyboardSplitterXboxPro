@@ -16,7 +16,7 @@ use crate::games::GamesFile;
 use crate::preset::{BindingEntry, GuardedEntry, MacroFile, PresetFile};
 use ksx_core::socd::{opposing_pairs, shadowing_chord};
 use ksx_core::{
-    Axis, Binding, Key, MacroSwitch, Persona, Preset, Repeat, Socd, TurboBinding, MAX_SLOTS,
+    Binding, Key, MacroSwitch, Persona, Preset, Repeat, Socd, TurboBinding, MAX_SLOTS,
     MAX_XINPUT_SLOTS, MIN_STEP_MS, TURBO_MAX_HZ,
 };
 
@@ -1021,39 +1021,15 @@ fn validate_binding_turbo(
 /// A pad has three ways to say "right", and a game reads whichever one it was
 /// written for. Buttons and triggers have no mechanism — they are read the same
 /// way whatever the preset does — so they never produce a mismatch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mechanism {
-    Dpad,
-    LeftStick,
-    RightStick,
-}
-
-impl Mechanism {
-    fn of(binding: Binding) -> Option<Self> {
-        match binding {
-            Binding::Dpad(_) => Some(Mechanism::Dpad),
-            // A centred axis points nowhere; it is not a direction.
-            Binding::Axis { value: 0, .. } => None,
-            Binding::Axis {
-                axis: Axis::X | Axis::Y,
-                ..
-            } => Some(Mechanism::LeftStick),
-            Binding::Axis {
-                axis: Axis::Rx | Axis::Ry,
-                ..
-            } => Some(Mechanism::RightStick),
-            Binding::Button(_) | Binding::Trigger(_) | Binding::Consume => None,
-        }
-    }
-
-    const fn describe(self) -> &'static str {
-        match self {
-            Mechanism::Dpad => "the dpad",
-            Mechanism::LeftStick => "the left stick (lx/ly)",
-            Mechanism::RightStick => "the right stick (rx/ry)",
-        }
-    }
-}
+///
+/// ONE DEFINITION, re-exported: this used to be a private copy that decided
+/// "which control" separately from `socd::pointing`, which decides "which
+/// direction". They can no longer drift — a centred axis points nowhere, so it
+/// has no mechanism, so it is never half of a diagonal
+/// (`ksx_core::diagonal::fold`) and never an opposing pair either.
+/// `describe()`'s wording is contractual: it is inside
+/// [`Issue::MacroHoldsOtherMechanism`]'s message.
+use ksx_core::DirMechanism as Mechanism;
 
 fn describe_all(mechanisms: &[Mechanism]) -> String {
     let names: Vec<&str> = mechanisms.iter().map(|m| m.describe()).collect();

@@ -19,6 +19,13 @@
 //! itself: a persona-aware glyph in the canonical colours (A green, B red,
 //! X blue, Y amber; ✕ blue, ○ red, △ green, □ pink), LB/RB/LT/RT and
 //! view/menu/guide as text chips, arrows for the dpad and the stick wedges.
+//!
+//! v16 — direction glyphs are UNIFIED ON ARROWS (`↑ ↓ ← →`, not `▲ ▼ ◀ ▶`)
+//! everywhere, art included. The macro grid gives every direction group its
+//! own eight-position ring (`↑ ↖ ← ↙ ↓ ↘ → ↗`), so ALL FOUR diagonals are
+//! columns you can point at — a 360 walks every one of them — and `◤◥◣◢` are
+//! corner *blocks*, not directions: a diagonal that did not look like the same
+//! family as its two parents would defeat the whole lens (see `fold`, below).
 //! The bound key rides UNDER the identity as the small mono `ztag` — identity
 //! always, key tag whenever the stage is wide enough for it (a container query
 //! drops the tag on a phone; the legend still carries every key). An unbound
@@ -82,6 +89,9 @@ const LIST_SLOT_TOASTS: &str = "list:toasts:array";
 /// strip, the grid's column headers, the row bar (step number + duration +
 /// flag + the five step verbs) and the FLAT `steps × controls` cell matrix.
 const LIST_SLOT_MACRO_TABS: &str = "list:macroTabs:array";
+/// v16: the group band above the glyph row. Document order puts it first
+/// inside `.macscroll`, so it lands between the row bar and the columns.
+const LIST_SLOT_MACRO_GROUPS: &str = "list:macroGroups:array";
 const LIST_SLOT_MACRO_COLS: &str = "list:macroCols:array";
 const LIST_SLOT_MACRO_ROWS: &str = "list:macroRows:array";
 const LIST_SLOT_MACRO_CELLS: &str = "list:macroCells:array";
@@ -204,21 +214,21 @@ pub(crate) const ZONE_XBOX: [Zone; 25] = [
     zone("start", "menu", "txt", [56.0, 39.0, 6.5, 8.0], "chip"),
     // Left stick: L3 hub + four ring wedges hugging it.
     zone("lthumb", "L3", "hub", [24.0, 39.7, 8.0, 10.0], "round"),
-    zone("ly.max", "▲", "dir", [24.0, 31.7, 7.0, 6.0], "chip"),
-    zone("ly.min", "▼", "dir", [24.0, 47.7, 7.0, 6.0], "chip"),
-    zone("lx.min", "◀", "dir", [17.25, 39.7, 5.5, 7.0], "chip"),
-    zone("lx.max", "▶", "dir", [30.75, 39.7, 5.5, 7.0], "chip"),
+    zone("ly.max", "↑", "dir", [24.0, 31.7, 7.0, 6.0], "chip"),
+    zone("ly.min", "↓", "dir", [24.0, 47.7, 7.0, 6.0], "chip"),
+    zone("lx.min", "←", "dir", [17.25, 39.7, 5.5, 7.0], "chip"),
+    zone("lx.max", "→", "dir", [30.75, 39.7, 5.5, 7.0], "chip"),
     // Dpad cross.
-    zone("dpad.up", "▲", "dir", [36.4, 50.6, 7.0, 9.0], "chip"),
-    zone("dpad.down", "▼", "dir", [36.4, 69.2, 7.0, 9.0], "chip"),
-    zone("dpad.left", "◀", "dir", [29.2, 59.9, 7.0, 9.0], "chip"),
-    zone("dpad.right", "▶", "dir", [43.6, 59.9, 7.0, 9.0], "chip"),
+    zone("dpad.up", "↑", "dir", [36.4, 50.6, 7.0, 9.0], "chip"),
+    zone("dpad.down", "↓", "dir", [36.4, 69.2, 7.0, 9.0], "chip"),
+    zone("dpad.left", "←", "dir", [29.2, 59.9, 7.0, 9.0], "chip"),
+    zone("dpad.right", "→", "dir", [43.6, 59.9, 7.0, 9.0], "chip"),
     // Right stick: R3 hub + ring wedges.
     zone("rthumb", "R3", "hub", [62.5, 58.4, 8.0, 10.0], "round"),
-    zone("ry.max", "▲", "dir", [62.5, 50.4, 7.0, 6.0], "chip"),
-    zone("ry.min", "▼", "dir", [62.5, 66.4, 7.0, 6.0], "chip"),
-    zone("rx.min", "◀", "dir", [55.75, 58.4, 5.5, 7.0], "chip"),
-    zone("rx.max", "▶", "dir", [69.25, 58.4, 5.5, 7.0], "chip"),
+    zone("ry.max", "↑", "dir", [62.5, 50.4, 7.0, 6.0], "chip"),
+    zone("ry.min", "↓", "dir", [62.5, 66.4, 7.0, 6.0], "chip"),
+    zone("rx.min", "←", "dir", [55.75, 58.4, 5.5, 7.0], "chip"),
+    zone("rx.max", "→", "dir", [69.25, 58.4, 5.5, 7.0], "chip"),
 ];
 
 /// DualShock 4 pad (art: `pad-ds4.svg`, viewBox 112.69×72.53; anchors:
@@ -246,21 +256,21 @@ pub(crate) const ZONE_DS4: [Zone; 25] = [
     zone("guide", "PS", "txt", [50.0, 63.0, 8.0, 10.0], "round"),
     // Left stick: L3 hub + ring wedges.
     zone("lthumb", "L3", "hub", [33.8, 56.8, 8.0, 10.0], "round"),
-    zone("ly.max", "▲", "dir", [33.8, 48.8, 7.0, 6.0], "chip"),
-    zone("ly.min", "▼", "dir", [33.8, 64.8, 7.0, 6.0], "chip"),
-    zone("lx.min", "◀", "dir", [27.05, 56.8, 5.5, 7.0], "chip"),
-    zone("lx.max", "▶", "dir", [40.55, 56.8, 5.5, 7.0], "chip"),
+    zone("ly.max", "↑", "dir", [33.8, 48.8, 7.0, 6.0], "chip"),
+    zone("ly.min", "↓", "dir", [33.8, 64.8, 7.0, 6.0], "chip"),
+    zone("lx.min", "←", "dir", [27.05, 56.8, 5.5, 7.0], "chip"),
+    zone("lx.max", "→", "dir", [40.55, 56.8, 5.5, 7.0], "chip"),
     // Dpad arrows.
-    zone("dpad.up", "▲", "dir", [18.5, 31.5, 5.4, 7.2], "chip"),
-    zone("dpad.down", "▼", "dir", [18.5, 46.6, 5.4, 7.2], "chip"),
-    zone("dpad.left", "◀", "dir", [12.9, 39.2, 5.4, 7.2], "chip"),
-    zone("dpad.right", "▶", "dir", [23.9, 39.2, 5.4, 7.2], "chip"),
+    zone("dpad.up", "↑", "dir", [18.5, 31.5, 5.4, 7.2], "chip"),
+    zone("dpad.down", "↓", "dir", [18.5, 46.6, 5.4, 7.2], "chip"),
+    zone("dpad.left", "←", "dir", [12.9, 39.2, 5.4, 7.2], "chip"),
+    zone("dpad.right", "→", "dir", [23.9, 39.2, 5.4, 7.2], "chip"),
     // Right stick: R3 hub + ring wedges.
     zone("rthumb", "R3", "hub", [66.1, 56.8, 8.0, 10.0], "round"),
-    zone("ry.max", "▲", "dir", [66.1, 48.8, 7.0, 6.0], "chip"),
-    zone("ry.min", "▼", "dir", [66.1, 64.8, 7.0, 6.0], "chip"),
-    zone("rx.min", "◀", "dir", [59.35, 56.8, 5.5, 7.0], "chip"),
-    zone("rx.max", "▶", "dir", [72.85, 56.8, 5.5, 7.0], "chip"),
+    zone("ry.max", "↑", "dir", [66.1, 48.8, 7.0, 6.0], "chip"),
+    zone("ry.min", "↓", "dir", [66.1, 64.8, 7.0, 6.0], "chip"),
+    zone("rx.min", "←", "dir", [59.35, 56.8, 5.5, 7.0], "chip"),
+    zone("rx.max", "→", "dir", [72.85, 56.8, 5.5, 7.0], "chip"),
 ];
 
 pub(crate) fn zones_for(persona: &str) -> &'static [Zone; 25] {
@@ -1092,6 +1102,22 @@ pub(crate) const MACRO_RULE_LINE: &str =
      marked allow_short runs exactly as written and can be missed entirely. Neither is ever \
      silent, and Save asks before it writes either one.";
 
+/// THE RING, stated once, under the grid: what the eight columns of a direction
+/// group are, what each is called, and — for the four that are picks rather than
+/// stored names — exactly what ksx writes when you tick one.
+///
+/// The numpad digits live HERE and in the tooltips, never in the glyph row: a
+/// second line of digits under only 24 of 37 columns makes the header ragged,
+/// and the digit is a lookup key (for somebody who read "3" on Dustloop or typed
+/// digits into MAME's `joystick_map`), not a label.
+pub(crate) const MACRO_RING_LINE: &str =
+    "Each direction group runs ↑ ↖ ← ↙ ↓ ↘ → ↗ (numpad 8 7 4 1 2 3 6 9), so a motion is a \
+     SHAPE: a quarter-circle forward is a staircase, a half-circle a straight line, a dragon \
+     punch a hook. The four diagonals are picks, not new bindings — ticking ↘ (down-right, d/f, \
+     numpad 3) stores dpad.down + dpad.right on that step, which is what a diagonal has always \
+     been in this file. Tick it on the group your preset's own direction keys drive; each row \
+     spells the pair it wrote beside its name.";
+
 /// A macro's run length at the durations the engine will use.
 fn total_ms(mac: &MacroView) -> u32 {
     mac.steps.iter().map(effective_ms).sum()
@@ -1284,63 +1310,153 @@ fn urlencode_value(text: &str) -> String {
 }
 
 /// The grid's COLUMN HEADERS: the slot's controls, in pad-reading order, with
-/// the same identity glyphs and palette the art and the legend already use —
-/// so a column is recognisably the button it is (persona-aware: `A` on Xbox,
-/// `✕` on a DualShock).
+/// the same identity glyphs the art and the legend already use — so a column is
+/// recognisably the button it is (persona-aware: `A` on Xbox, `✕` on a
+/// DualShock) — and every direction group as its eight-position ring.
+///
+/// The glyph row is ARROWS ONLY, one line, no digits: it is a screen, and
+/// screens speak arrows in this genre. The numpad digit lives in the tooltip
+/// and the ring line, where it is a lookup key for somebody who read "3" on
+/// Dustloop or typed digits into `joystick_map`.
 fn macro_cols(slot: Option<&MapperSlot>) -> SlotValue {
     let persona = slot.map_or("xbox360", |s| s.persona.as_str());
     SlotValue::Array(
-        zones_for(persona)
-            .iter()
-            .map(|z| {
+        macro_columns(persona)
+            .into_iter()
+            .map(|c| {
                 SlotValue::Object(vec![
-                    ("fn".to_owned(), SlotValue::Text(z.fn_name.to_owned())),
-                    ("id".to_owned(), SlotValue::Text(z.label.to_owned())),
-                    // UNIFORM, deliberately: the grid header carries one of
-                    // these per control at column width, and a row of coloured
-                    // discs that narrow is noise rather than information. The
-                    // identity colours earn their place on the controller art,
-                    // where they map to physical buttons, and in the legend
-                    // beside it — here the column is NAMED, not badged.
-                    ("idcls".to_owned(), SlotValue::Text("maccolid".to_owned())),
-                    (
-                        "title".to_owned(),
-                        SlotValue::Text(format!("{} ({})", legend_label(z), z.fn_name)),
-                    ),
+                    ("fn".to_owned(), SlotValue::Text(c.token)),
+                    ("id".to_owned(), SlotValue::Text(c.glyph)),
+                    // UNIFORM colour, deliberately: the grid header carries one
+                    // of these per control at column width, and a row of
+                    // coloured discs that narrow is noise rather than
+                    // information. The identity colours earn their place on the
+                    // controller art, where they map to physical buttons, and in
+                    // the legend beside it — here the column is NAMED, not
+                    // badged. `card`/`diag` are TYPE, not palette: the cardinals
+                    // carry the stronger column rule so each block reads as a
+                    // compass.
+                    ("idcls".to_owned(), SlotValue::Text(c.idcls.to_owned())),
+                    ("title".to_owned(), SlotValue::Text(c.title)),
                 ])
             })
             .collect(),
     )
 }
 
-/// What one step holds, named the way this pad names it: "D-pad ▼ + D-pad ▶".
+/// The GROUP BAND above the glyph row — one cell per run of columns belonging
+/// to the same part of the pad, spanning it.
 ///
-/// FIX 1 — the piano roll's one unteachable fact is that a row is a CHORD:
-/// everything ticked in it is held together, for that step's duration. A
-/// diagonal is not a thing you bind, it IS down+forward at once — one row, two
-/// cells lit. Lit cells 12 columns apart do not say that; this line does, on
-/// every row, without being asked.
+/// Not decoration: without it the header carries three identical `↑ ↖ ← ↙ ↓ ↘ →
+/// ↗` runs told apart only by a tooltip (the same defect the old four-column
+/// layout had with `▲ ▼ ◀ ▶`).
+fn macro_groups(slot: Option<&MapperSlot>) -> SlotValue {
+    let persona = slot.map_or("xbox360", |s| s.persona.as_str());
+    let mut runs: Vec<(&'static str, usize)> = Vec::new();
+    for column in macro_columns(persona) {
+        match runs.last_mut() {
+            Some((band, n)) if *band == column.band => *n += 1,
+            _ => runs.push((column.band, 1)),
+        }
+    }
+    SlotValue::Array(
+        runs.into_iter()
+            .map(|(band, span)| {
+                SlotValue::Object(vec![
+                    ("label".to_owned(), SlotValue::Text(band.to_owned())),
+                    // A CLASS, never an inline `grid-column` — forma's CSP
+                    // nonce-locks style-src (ledger #13), and a span of 3/4/8/9
+                    // is a closed set anyway.
+                    ("cls".to_owned(), SlotValue::Text(format!("macgrp g{span}"))),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// How one PRESENTED control is named on this pad.
+fn held_label(zones: &[Zone], hold: &[String], held: &Held) -> String {
+    match held {
+        Held::Diagonal {
+            diag, mechanisms, ..
+        } => format!(
+            "{}{}",
+            mechanisms
+                .iter()
+                .map(|m| m.group().trim_end())
+                .collect::<Vec<_>>()
+                .join(" + "),
+            format_args!(" {}", diag.glyph()),
+        ),
+        Held::Plain { member } => {
+            let f = &hold[*member];
+            zones
+                .iter()
+                .find(|z| z.fn_name.eq_ignore_ascii_case(f))
+                .map_or_else(|| f.clone(), legend_label)
+        }
+    }
+}
+
+/// What one step holds, named the way this pad names it: "D-pad ↘ + A".
+///
+/// The row readout is where the model is TAUGHT. A diagonal reads as one
+/// control — because that is what the player picked and what the player means —
+/// and [`hold_expand`] says, beside it, exactly which two names the file
+/// carries. Nothing is hidden and nothing has to be decoded from lit cells
+/// twelve columns apart.
 fn hold_text(slot: Option<&MapperSlot>, hold: &[String]) -> String {
     if hold.is_empty() {
         return "(nothing — neutral gap)".to_owned();
     }
     let persona = slot.map_or("xbox360", |s| s.persona.as_str());
     let zones = zones_for(persona);
-    hold.iter()
-        .map(|f| {
-            zones
-                .iter()
-                .find(|z| z.fn_name.eq_ignore_ascii_case(f))
-                .map_or_else(|| f.clone(), legend_label)
-        })
+    fold(hold)
+        .iter()
+        .map(|h| held_label(zones, hold, h))
         .collect::<Vec<_>>()
         .join(" + ")
 }
 
-/// The hold readout's own class. A row holding TWO OR MORE controls is the
-/// shape the grid cannot teach, so it is the one that gets the accent.
+/// THE LEDGER LINE: every diagonal in this step, spelled as the pair the file
+/// actually stores — `↘ = dpad.down + dpad.right`.
+///
+/// This is what keeps the lens honest. The presentation says "one control"; the
+/// storage says "two holds"; this line says both at once, on the row itself, so
+/// nobody has to open the TOML to find out what a pick wrote. Empty when the
+/// step holds no diagonal.
+fn hold_expand(hold: &[String]) -> String {
+    fold(hold)
+        .iter()
+        .filter_map(|h| match h {
+            Held::Diagonal { diag, members, .. } => Some(format!(
+                "{} = {}",
+                diag.glyph(),
+                members
+                    .iter()
+                    .map(|&i| hold[i].as_str())
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            )),
+            Held::Plain { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn hold_expand_cls(hold: &[String]) -> &'static str {
+    if hold_expand(hold).is_empty() {
+        "macexp off"
+    } else {
+        "macexp"
+    }
+}
+
+/// The hold readout's own class, over PRESENTED controls rather than stored
+/// ones: a diagonal is one control, so `↓ + →` no longer reads as two.
+/// The accent is for a row that really does hold several things at once.
 fn hold_cls(hold: &[String]) -> &'static str {
-    match hold.len() {
+    match fold(hold).len() {
         0 => "machold none",
         1 => "machold",
         _ => "machold both",
@@ -1398,6 +1514,14 @@ fn macro_rows(
                         "holdcls".to_owned(),
                         SlotValue::Text(hold_cls(&step.hold).to_owned()),
                     ),
+                    // The ledger: which two names the file carries for each
+                    // diagonal on this row. The lens is only honest if the
+                    // storage is visible without opening the TOML.
+                    ("exp".to_owned(), SlotValue::Text(hold_expand(&step.hold))),
+                    (
+                        "expcls".to_owned(),
+                        SlotValue::Text(hold_expand_cls(&step.hold).to_owned()),
+                    ),
                     ("warn".to_owned(), SlotValue::Text(warn.clone())),
                     (
                         "warntitle".to_owned(),
@@ -1436,14 +1560,30 @@ fn macro_rows(
     )
 }
 
-/// The matrix itself, FLAT: `steps × 25` cells in row-major order, laid out by
-/// a 25-column CSS grid.
+/// What one column says about one step.
+enum CellState {
+    /// Not held.
+    Off,
+    /// Held, and this column is the whole of it.
+    On,
+    /// Held as HALF of a folded diagonal. The diagonal's own cell carries the
+    /// filled mark; this one carries a subordinate tick, because pretending the
+    /// cardinal is not in the file would be the lens lying about the storage.
+    Part(Diag),
+}
+
+/// The matrix itself, FLAT: `steps × 37` cells in row-major order, laid out by
+/// a 37-column CSS grid.
 ///
 /// Flat because the compiled list item body has no inner `createList` seam
 /// (dogfood ledger #17's neighbour — the same constraint that made the legend's
 /// key chips fixed fields). One list of `rows × columns` cells and a
 /// `grid-template-columns` is the shape that survives it, and it reconciles
 /// exactly as well as a nested one would.
+///
+/// A step holding `ly.min` + `lx.max` lights the LS `↘` cell — not two stray
+/// ticks eight columns apart. That is the whole point, and it works on a
+/// hand-written step nobody made through this page.
 fn macro_cells(
     mac: Option<&MacroView>,
     slot: Option<&MapperSlot>,
@@ -1453,42 +1593,160 @@ fn macro_cells(
         return SlotValue::Array(Vec::new());
     };
     let persona = slot.map_or("xbox360", |s| s.persona.as_str());
+    let columns = macro_columns(persona);
     let zones = zones_for(persona);
-    let mut cells = Vec::with_capacity(mac.steps.len() * zones.len());
+    let mut cells = Vec::with_capacity(mac.steps.len() * columns.len());
     for (i, step) in mac.steps.iter().enumerate() {
-        for z in zones.iter() {
-            let held = step.hold.iter().any(|f| f.eq_ignore_ascii_case(z.fn_name));
+        let view = fold(&step.hold);
+        // Which diagonal (if any) each held entry was folded into, and which
+        // (mechanism, diagonal) pairs are lit.
+        let mut member_of: Vec<Option<Diag>> = vec![None; step.hold.len()];
+        let mut lit: Vec<(Mechanism, Diag, bool)> = Vec::new();
+        for held in &view {
+            if let Held::Diagonal {
+                diag,
+                mechanisms,
+                members,
+                exact,
+            } = held
+            {
+                for &m in members {
+                    member_of[m] = Some(*diag);
+                }
+                for &mechanism in mechanisms {
+                    lit.push((mechanism, *diag, *exact));
+                }
+            }
+        }
+        for column in &columns {
+            let state = match parse_diag_token(&column.token) {
+                Some((mechanism, diag)) => lit
+                    .iter()
+                    .find(|(m, d, _)| *m == mechanism && *d == diag)
+                    .map_or(CellState::Off, |_| CellState::On),
+                // A direction column matches by WHERE IT POINTS, not by
+                // spelling: `ly.-16384` is the down half of this pad's left
+                // stick however the file spells it.
+                None => match pointing(&column.token) {
+                    Some(want) => step
+                        .hold
+                        .iter()
+                        .position(|f| points_same_way(f, want))
+                        .map_or(CellState::Off, |at| match member_of[at] {
+                            Some(diag) => CellState::Part(diag),
+                            None => CellState::On,
+                        }),
+                    None => {
+                        if step
+                            .hold
+                            .iter()
+                            .any(|f| f.eq_ignore_ascii_case(&column.token))
+                        {
+                            CellState::On
+                        } else {
+                            CellState::Off
+                        }
+                    }
+                },
+            };
+            let approx = matches!(state, CellState::On)
+                && lit
+                    .iter()
+                    .any(|(m, d, exact)| !exact && diag_token(*m, *d) == column.token);
             let mut cls = String::from("maccell");
-            if held {
-                cls.push_str(" on");
+            match state {
+                CellState::On => cls.push_str(" on"),
+                CellState::Part(_) => cls.push_str(" part"),
+                CellState::Off => {}
+            }
+            if approx {
+                cls.push_str(" approx");
+            }
+            if column.idcls.ends_with("diag") {
+                cls.push_str(" isdiag");
             }
             if selected == Some(i) {
                 cls.push_str(" inrow");
             }
+            let name = column_name(zones, column);
+            let title = match &state {
+                CellState::On if approx => format!(
+                    "step {} holds {name} — as written, not at full deflection ({})",
+                    i + 1,
+                    step.hold.join(" + ")
+                ),
+                CellState::On => format!("step {} holds {name}", i + 1),
+                CellState::Part(diag) => format!(
+                    "step {} holds {name} as half of {} — the {} column beside it is the pick",
+                    i + 1,
+                    diag.glyph(),
+                    diag.glyph()
+                ),
+                CellState::Off => format!("step {} does not hold {name}", i + 1),
+            };
             cells.push(SlotValue::Object(vec![
                 ("cls".to_owned(), SlotValue::Text(cls)),
                 (
                     "cell".to_owned(),
-                    SlotValue::Text(format!("{i}|{}", z.fn_name)),
+                    SlotValue::Text(format!("{i}|{}", column.token)),
                 ),
                 (
                     "mark".to_owned(),
-                    SlotValue::Text(if held { "●" } else { "" }.to_owned()),
+                    SlotValue::Text(
+                        match state {
+                            CellState::On => "●",
+                            CellState::Part(_) => "·",
+                            CellState::Off => "",
+                        }
+                        .to_owned(),
+                    ),
                 ),
-                (
-                    "title".to_owned(),
-                    SlotValue::Text(format!(
-                        "step {} {} {} ({})",
-                        i + 1,
-                        if held { "holds" } else { "does not hold" },
-                        legend_label(z),
-                        z.fn_name
-                    )),
-                ),
+                ("title".to_owned(), SlotValue::Text(title)),
             ]));
         }
     }
     SlotValue::Array(cells)
+}
+
+/// Does `function` point the same way as `want`, whatever it is spelled?
+///
+/// `exact` is deliberately NOT compared: `ly.-16384` is the down half of the
+/// left stick just as `ly.min` is, and a grid that only lit the canonical
+/// spelling would leave a hand-written step looking unheld. Mirrored in
+/// MapIsland.ts `pointsSameWay`.
+fn points_same_way(function: &str, want: Pointing) -> bool {
+    pointing(function).is_some_and(|p| {
+        p.mechanism == want.mechanism && p.vertical == want.vertical && p.positive == want.positive
+    })
+}
+
+/// `diag:<mech>:<diag>` back into its two halves, or `None` for a function name.
+fn parse_diag_token(token: &str) -> Option<(Mechanism, Diag)> {
+    let rest = token.strip_prefix("diag:")?;
+    let (mech, diag) = rest.split_once(':')?;
+    let mechanism = Mechanism::ALL.into_iter().find(|m| m.token() == mech)?;
+    let diag = Diag::ALL.into_iter().find(|d| d.token() == diag)?;
+    Some((mechanism, diag))
+}
+
+/// What a column is called in a sentence — "D-pad ↘ (down-right)", "LS ↓",
+/// "✕ (A)".
+fn column_name(zones: &[Zone], column: &MacroColumn) -> String {
+    match parse_diag_token(&column.token) {
+        Some((mechanism, diag)) => {
+            format!("{}{} ({})", mechanism.group(), diag.glyph(), diag.words())
+        }
+        None => match Mechanism::of(&column.token) {
+            Some(mechanism) => format!("{}{} ({})", mechanism.group(), column.glyph, column.token),
+            None => zones
+                .iter()
+                .find(|z| z.fn_name.eq_ignore_ascii_case(&column.token))
+                .map_or_else(
+                    || column.token.clone(),
+                    |z| format!("{} ({})", legend_label(z), z.fn_name),
+                ),
+        },
+    }
 }
 
 /// TOML string escaping — macro names and key names come from a file.
@@ -1622,15 +1880,20 @@ fn macro_trigger_line(mac: Option<&MacroView>) -> String {
 // which mechanism their preset drives, which is the fact, not the affordance.
 
 /// Which control a preset's direction keys drive. Mirror of
-/// `ksx_config::validate::Mechanism`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mechanism {
+/// `ksx_core::socd::DirMechanism` (= `ksx_config::validate::Mechanism`, which
+/// is now a re-export of it). Pinned by `the_diagonal_lens_matches_ksx_core`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mechanism {
     Dpad,
     LeftStick,
     RightStick,
 }
 
 impl Mechanism {
+    /// Canonical order — the order a coalesced diagonal lists its mechanisms in
+    /// and the order the grid draws its direction groups in.
+    const ALL: [Mechanism; 3] = [Mechanism::Dpad, Mechanism::LeftStick, Mechanism::RightStick];
+
     fn of(function: &str) -> Option<Self> {
         let f = function.to_ascii_lowercase();
         if f.starts_with("dpad.") {
@@ -1651,6 +1914,505 @@ impl Mechanism {
             Mechanism::RightStick => "the right stick (rx/ry)",
         }
     }
+
+    /// The prefix a flat list needs to keep three identical arrow runs apart —
+    /// the same one [`legend_group`] writes.
+    const fn group(self) -> &'static str {
+        match self {
+            Mechanism::Dpad => "D-pad ",
+            Mechanism::LeftStick => "LS ",
+            Mechanism::RightStick => "RS ",
+        }
+    }
+
+    /// The grid's group-band label.
+    const fn band(self) -> &'static str {
+        match self {
+            Mechanism::Dpad => "D-PAD",
+            Mechanism::LeftStick => "LEFT STICK",
+            Mechanism::RightStick => "RIGHT STICK",
+        }
+    }
+
+    /// The half of a diagonal cell token that names the mechanism.
+    const fn token(self) -> &'static str {
+        match self {
+            Mechanism::Dpad => "dpad",
+            Mechanism::LeftStick => "ls",
+            Mechanism::RightStick => "rs",
+        }
+    }
+
+    /// The canonical function name for one polarity of one axis of this
+    /// mechanism — what picking a direction WRITES.
+    const fn function(self, vertical: bool, positive: bool) -> &'static str {
+        match (self, vertical, positive) {
+            (Mechanism::Dpad, true, true) => "dpad.up",
+            (Mechanism::Dpad, true, false) => "dpad.down",
+            (Mechanism::Dpad, false, false) => "dpad.left",
+            (Mechanism::Dpad, false, true) => "dpad.right",
+            (Mechanism::LeftStick, true, true) => "ly.max",
+            (Mechanism::LeftStick, true, false) => "ly.min",
+            (Mechanism::LeftStick, false, false) => "lx.min",
+            (Mechanism::LeftStick, false, true) => "lx.max",
+            (Mechanism::RightStick, true, true) => "ry.max",
+            (Mechanism::RightStick, true, false) => "ry.min",
+            (Mechanism::RightStick, false, false) => "rx.min",
+            (Mechanism::RightStick, false, true) => "rx.max",
+        }
+    }
+}
+
+// ── DIAGONALS AS PRESENTATION ─────────────────────────────────────────────
+// Victor: "if down and right together equals diagonal, the user does not care —
+// we can present the diagonal in the piano and the user can select it, and
+// behind the scenes we do down and right, so it's seamless."
+//
+// He is right, and it is the root cause of the evening he lost. A diagonal IS
+// two simultaneous holds — that is ksx's implementation detail, not the user's
+// concept. Players think in ↘ / down-forward / numpad 3, never in "two axis
+// bindings held together", and no mapper in the field lets them pick one
+// (Steam Input: four cardinal binding slots; reWASD's own answer: build a
+// Shortcut out of two zones; MAME: four cardinals; GP2040-CE: cardinal pairs).
+//
+// NOTHING STORED CHANGES. A step still holds a set of ordinary bindings, so
+// files stay hand-editable, the engine is untouched, and old presets keep
+// working. This is the lens: `fold` reads a hold and says how to PRESENT it;
+// what a pick writes is the pair, spelled exactly as `ksx map` would.
+//
+// MIRROR of `ksx_core::diagonal` + `ksx_core::socd::pointing`, over FUNCTION
+// NAMES rather than `Binding` (ksx-studio links no ksx crate at runtime — the
+// established pattern, same as the zone tables). `the_diagonal_lens_matches_
+// ksx_core` pins the two against each other through the TEST-ONLY dev-deps.
+
+/// The four diagonals — ↖ ↗ ↙ ↘, numpad 7 9 1 3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Diag {
+    UpLeft,
+    UpRight,
+    DownLeft,
+    DownRight,
+}
+
+impl Diag {
+    const ALL: [Diag; 4] = [Diag::UpLeft, Diag::UpRight, Diag::DownLeft, Diag::DownRight];
+
+    /// ARROW is the glyph. Screens speak arrows in this genre — SF6's input
+    /// history, every Capcom move list, every arcade instruction card.
+    const fn glyph(self) -> &'static str {
+        match self {
+            Diag::UpLeft => "↖",
+            Diag::UpRight => "↗",
+            Diag::DownLeft => "↙",
+            Diag::DownRight => "↘",
+        }
+    }
+
+    /// The numpad digit — a LOOKUP TOKEN for the tooltip and the rule line,
+    /// never the label. It is how the input is written in text (Dustloop,
+    /// SuperCombo) and it is already in a cab owner's `mame.ini`
+    /// (`-joystick_map` uses the numpad mapping).
+    const fn numpad(self) -> u8 {
+        match self {
+            Diag::UpLeft => 7,
+            Diag::UpRight => 9,
+            Diag::DownLeft => 1,
+            Diag::DownRight => 3,
+        }
+    }
+
+    /// The name, in words. COMPASS, not forward/back — ksx offers the mirrored
+    /// spelling of every motion because player 2 is not an edge case, and
+    /// "down-forward" is only true for a character facing right.
+    const fn words(self) -> &'static str {
+        match self {
+            Diag::UpLeft => "up-left",
+            Diag::UpRight => "up-right",
+            Diag::DownLeft => "down-left",
+            Diag::DownRight => "down-right",
+        }
+    }
+
+    /// How a move list writes it (Tekken's official command lists spell `d/f`).
+    /// Offered BESIDE the compass name, never instead of it.
+    const fn move_list(self) -> &'static str {
+        match self {
+            Diag::UpLeft => "u/b",
+            Diag::UpRight => "u/f",
+            Diag::DownLeft => "d/b",
+            Diag::DownRight => "d/f",
+        }
+    }
+
+    /// `(up, right)`.
+    const fn halves(self) -> (bool, bool) {
+        match self {
+            Diag::UpLeft => (true, false),
+            Diag::UpRight => (true, true),
+            Diag::DownLeft => (false, false),
+            Diag::DownRight => (false, true),
+        }
+    }
+
+    const fn from_halves(up: bool, right: bool) -> Diag {
+        match (up, right) {
+            (true, false) => Diag::UpLeft,
+            (true, true) => Diag::UpRight,
+            (false, false) => Diag::DownLeft,
+            (false, true) => Diag::DownRight,
+        }
+    }
+
+    const fn token(self) -> &'static str {
+        match self {
+            Diag::UpLeft => "ul",
+            Diag::UpRight => "ur",
+            Diag::DownLeft => "dl",
+            Diag::DownRight => "dr",
+        }
+    }
+}
+
+/// The glyph for one cardinal polarity. ARROWS, the same family the diagonals
+/// wear — a diagonal that does not look like the same family as its two parents
+/// defeats the whole lens, and `◤◥◣◢` are corner *blocks*, not directions.
+const fn cardinal_glyph(vertical: bool, positive: bool) -> &'static str {
+    match (vertical, positive) {
+        (true, true) => "↑",
+        (true, false) => "↓",
+        (false, false) => "←",
+        (false, true) => "→",
+    }
+}
+
+const fn cardinal_words(vertical: bool, positive: bool) -> &'static str {
+    match (vertical, positive) {
+        (true, true) => "up",
+        (true, false) => "down",
+        (false, false) => "left",
+        (false, true) => "right",
+    }
+}
+
+const fn cardinal_numpad(vertical: bool, positive: bool) -> u8 {
+    match (vertical, positive) {
+        (true, true) => 8,
+        (true, false) => 2,
+        (false, false) => 4,
+        (false, true) => 6,
+    }
+}
+
+/// Mirror of `ksx_core::socd::Pointing`, over a FUNCTION NAME.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Pointing {
+    mechanism: Mechanism,
+    vertical: bool,
+    /// Right for a horizontal control, UP for a vertical one.
+    positive: bool,
+    /// Is this the canonical extreme (`min`/`max`), or a hand-written partial
+    /// deflection like `ly.-16384`?
+    exact: bool,
+}
+
+/// Where this function name points, or `None` when it points nowhere.
+///
+/// A CENTRED AXIS IS NEVER A DIRECTION (`lx.0`) — the same rule
+/// `ksx_core::socd::pointing` and `ksx_config::validate` state, which is why it
+/// is never half of a diagonal either.
+fn pointing(function: &str) -> Option<Pointing> {
+    let lower = function.to_ascii_lowercase();
+    let (base, rest) = lower.split_once('.')?;
+    match base {
+        "dpad" => {
+            let (vertical, positive) = match rest {
+                "up" => (true, true),
+                "down" => (true, false),
+                "left" => (false, false),
+                "right" => (false, true),
+                _ => return None,
+            };
+            Some(Pointing {
+                mechanism: Mechanism::Dpad,
+                vertical,
+                positive,
+                exact: true,
+            })
+        }
+        "lx" | "ly" | "rx" | "ry" => {
+            // `min`/`max`/`<i16>` — the same grammar `ksx_config::parse_function`
+            // takes, including its `i16::MIN` fold.
+            let value: i32 = match rest {
+                "min" => -32767,
+                "max" => 32767,
+                custom => {
+                    let raw: i32 = custom.parse::<i16>().ok()?.into();
+                    if raw == -32768 {
+                        -32767
+                    } else {
+                        raw
+                    }
+                }
+            };
+            if value == 0 {
+                return None;
+            }
+            let (mechanism, vertical) = match base {
+                "lx" => (Mechanism::LeftStick, false),
+                "ly" => (Mechanism::LeftStick, true),
+                "rx" => (Mechanism::RightStick, false),
+                _ => (Mechanism::RightStick, true),
+            };
+            Some(Pointing {
+                mechanism,
+                vertical,
+                positive: value > 0,
+                exact: value == -32767 || value == 32767,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// One PRESENTED control. Mirror of `ksx_core::diagonal::Held`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Held {
+    /// `members` are INDICES into the original hold — the round trip is "put
+    /// those strings back", so a hand-written `ly.-16384 + lx.max` displays as
+    /// the diagonal and is stored byte for byte as it was written.
+    Diagonal {
+        diag: Diag,
+        mechanisms: Vec<Mechanism>,
+        members: Vec<usize>,
+        exact: bool,
+    },
+    Plain {
+        member: usize,
+    },
+}
+
+/// How to PRESENT this hold.
+///
+/// **Per mechanism bucket, "contains both" — never exact-set-equality on the
+/// whole step.** `down + forward + A` is the single most common macro step in
+/// existence (the attack that ends a motion) and it folds: `A` is a passenger.
+/// `down + forward + up` never folds — which diagonal would it be, and what the
+/// pad publishes depends on the slot's `socd` policy, resolved at plan time,
+/// which this page cannot see.
+pub(crate) fn fold(hold: &[String]) -> Vec<Held> {
+    let parsed: Vec<Option<Pointing>> = hold.iter().map(|f| pointing(f)).collect();
+    let mut folded: Vec<(Diag, Mechanism, Vec<usize>, bool)> = Vec::new();
+    let mut consumed = vec![false; hold.len()];
+
+    for mechanism in Mechanism::ALL {
+        let members: Vec<usize> = parsed
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.filter(|p| p.mechanism == mechanism).map(|_| i))
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        // POLARITIES are counted, not bindings: a hold naming `dpad.down`
+        // twice is still one V−.
+        let mut vertical: Option<bool> = None;
+        let mut horizontal: Option<bool> = None;
+        let mut split = false;
+        let mut exact = true;
+        for &i in &members {
+            let p = parsed[i].expect("filtered above");
+            exact &= p.exact;
+            let slot = if p.vertical {
+                &mut vertical
+            } else {
+                &mut horizontal
+            };
+            match slot {
+                Some(seen) if *seen != p.positive => split = true,
+                Some(_) => {}
+                None => *slot = Some(p.positive),
+            }
+        }
+        let (Some(up), Some(right)) = (vertical, horizontal) else {
+            continue;
+        };
+        if split {
+            continue;
+        }
+        for &i in &members {
+            consumed[i] = true;
+        }
+        folded.push((Diag::from_halves(up, right), mechanism, members, exact));
+    }
+
+    // Coalesce: buckets that folded to the SAME diagonal are ONE presented
+    // control. That is the hat+stick double-binding every in-box template
+    // writes — one key on `dpad.down` AND `ly.min`.
+    let mut out: Vec<Held> = Vec::new();
+    for diag in Diag::ALL {
+        let hits: Vec<&(Diag, Mechanism, Vec<usize>, bool)> =
+            folded.iter().filter(|(d, ..)| *d == diag).collect();
+        if hits.is_empty() {
+            continue;
+        }
+        let mut members: Vec<usize> = hits.iter().flat_map(|(_, _, m, _)| m.clone()).collect();
+        members.sort_unstable();
+        out.push(Held::Diagonal {
+            diag,
+            mechanisms: hits.iter().map(|(_, m, _, _)| *m).collect(),
+            members,
+            exact: hits.iter().all(|(_, _, _, e)| *e),
+        });
+    }
+    for (i, taken) in consumed.iter().enumerate() {
+        if !taken {
+            out.push(Held::Plain { member: i });
+        }
+    }
+    out
+}
+
+/// The cell token for a diagonal column. Contains a `:`, which no function name
+/// ever does, so a diagonal pick can never be mistaken for one — the client
+/// EXPANDS it to the pair before anything is stored.
+fn diag_token(mechanism: Mechanism, diag: Diag) -> String {
+    format!("diag:{}:{}", mechanism.token(), diag.token())
+}
+
+/// One position on the direction ring.
+#[derive(Clone, Copy)]
+enum RingPos {
+    Cardinal { vertical: bool, positive: bool },
+    Diagonal(Diag),
+}
+
+/// **↑ ↖ ← ↙ ↓ ↘ → ↗** — numpad 8 7 4 1 2 3 6 9: walk the gate from up,
+/// counter-clockwise, around the bottom, back to up.
+///
+/// Why this order and not numpad-ascending or compass-clockwise: MOTIONS BECOME
+/// SHAPES. A piano roll is read as a picture, and this is the only ordering
+/// where the picture *is* the motion — a quarter-circle forward is a staircase
+/// sweeping right, a half-circle is a straight 45° line, a dragon punch is
+/// visibly a hook. Cardinals land on the even indices so each diagonal sits
+/// literally between its two parents and the block still reads as a compass.
+const RING: [RingPos; 8] = [
+    RingPos::Cardinal {
+        vertical: true,
+        positive: true,
+    },
+    RingPos::Diagonal(Diag::UpLeft),
+    RingPos::Cardinal {
+        vertical: false,
+        positive: false,
+    },
+    RingPos::Diagonal(Diag::DownLeft),
+    RingPos::Cardinal {
+        vertical: true,
+        positive: false,
+    },
+    RingPos::Diagonal(Diag::DownRight),
+    RingPos::Cardinal {
+        vertical: false,
+        positive: true,
+    },
+    RingPos::Diagonal(Diag::UpRight),
+];
+
+/// 25 zones → 37 columns: the twelve cardinal-only direction zones become three
+/// rings of eight. Pinned against the tables by `the_grid_is_three_rings`.
+#[cfg(test)]
+const MACRO_COLUMN_COUNT: usize = 37;
+
+/// One grid column: what it is called, what a click on it means, and which
+/// band it sits under.
+struct MacroColumn {
+    /// The cell token — a function name, or `diag:<mech>:<diag>`.
+    token: String,
+    glyph: String,
+    /// `maccolid`, plus `card` / `diag` for the two direction kinds.
+    idcls: &'static str,
+    title: String,
+    band: &'static str,
+}
+
+/// Which band a control sits under. The band is not decoration — it fixes a
+/// PRE-EXISTING defect: the header used to carry three identical `▲ ▼ ◀ ▶`
+/// runs disambiguated only by a tooltip.
+fn band_of(fn_name: &str) -> &'static str {
+    match fn_name {
+        "lt" | "lb" | "rb" | "rt" => "SHOULDERS",
+        "A" | "B" | "X" | "Y" => "FACE",
+        "guide" | "back" | "start" => "SYSTEM",
+        "lthumb" => Mechanism::LeftStick.band(),
+        "rthumb" => Mechanism::RightStick.band(),
+        other => Mechanism::of(other).map_or("SYSTEM", Mechanism::band),
+    }
+}
+
+/// The grid's columns for one persona: every non-direction control as itself,
+/// and every direction MECHANISM as its eight-position ring.
+///
+/// 25 zones → 37 columns. The twelve cardinal-only direction zones become three
+/// rings of eight, so the four diagonals are things you can point at instead of
+/// things you have to know how to build.
+fn macro_columns(persona: &str) -> Vec<MacroColumn> {
+    let mut out: Vec<MacroColumn> = Vec::new();
+    let mut rung: Vec<Mechanism> = Vec::new();
+    for z in zones_for(persona).iter() {
+        let Some(mechanism) = Mechanism::of(z.fn_name) else {
+            out.push(MacroColumn {
+                token: z.fn_name.to_owned(),
+                glyph: z.label.to_owned(),
+                idcls: "maccolid",
+                title: format!("{} ({})", legend_label(z), z.fn_name),
+                band: band_of(z.fn_name),
+            });
+            continue;
+        };
+        // The mechanism's whole ring is emitted at its FIRST direction zone;
+        // the other three zones of that mechanism are already in it.
+        if rung.contains(&mechanism) {
+            continue;
+        }
+        rung.push(mechanism);
+        for pos in RING {
+            out.push(match pos {
+                RingPos::Cardinal { vertical, positive } => {
+                    let function = mechanism.function(vertical, positive);
+                    MacroColumn {
+                        token: function.to_owned(),
+                        glyph: cardinal_glyph(vertical, positive).to_owned(),
+                        idcls: "maccolid card",
+                        title: format!(
+                            "{}{} · {} · numpad {} · holds {function}",
+                            mechanism.group(),
+                            cardinal_glyph(vertical, positive),
+                            cardinal_words(vertical, positive),
+                            cardinal_numpad(vertical, positive),
+                        ),
+                        band: mechanism.band(),
+                    }
+                }
+                RingPos::Diagonal(diag) => MacroColumn {
+                    token: diag_token(mechanism, diag),
+                    glyph: diag.glyph().to_owned(),
+                    idcls: "maccolid diag",
+                    title: format!(
+                        "{}{} · {} ({}) · numpad {} · one pick, and ksx writes {} + {}",
+                        mechanism.group(),
+                        diag.glyph(),
+                        diag.words(),
+                        diag.move_list(),
+                        diag.numpad(),
+                        mechanism.function(true, diag.halves().0),
+                        mechanism.function(false, diag.halves().1),
+                    ),
+                    band: mechanism.band(),
+                },
+            });
+        }
+    }
+    out
 }
 
 /// Every mechanism THIS SLOT's own bound direction keys drive. An inert `None`
@@ -1683,7 +2445,8 @@ fn macro_motion_line(slot: Option<&MapperSlot>) -> String {
     let driven = driven_mechanisms(slot);
     let pick = driven.first().copied().unwrap_or(Mechanism::Dpad);
     let tail = "Each one appends its steps to the macro below — the MIDDLE step of a \
-                quarter-circle holds two directions at once, which is what a diagonal is.";
+                quarter-circle is the diagonal, and a 360 is four of them. You can tick any of \
+                them yourself in that group's ↖ ↗ ↙ ↘ columns.";
     match driven.len() {
         0 => format!(
             "These write {} — this preset binds no direction keys of its own, so there is \
@@ -1976,6 +2739,7 @@ fn scalar_slots(
         // no macro data rather than vanishing, exactly like the preset card.
         "macroHead": macro_head(payload, selected, mac),
         "macroRuleLine": MACRO_RULE_LINE,
+        "macroRingLine": MACRO_RING_LINE,
         "macroPolicyLine": macro_policy_line(mac),
         "macroNote": macro_note(payload, mac),
         "macroTriggerLine": macro_trigger_line(mac),
@@ -2133,6 +2897,7 @@ fn build_slots(module: &IrModule, payload: &MapPayload, flash: Option<&str>) -> 
         // v11's piano roll. `None` for the selected step: an SSR paint has
         // pointed the duration editor at nothing.
         (LIST_SLOT_MACRO_TABS, macro_tabs(payload, mac)),
+        (LIST_SLOT_MACRO_GROUPS, macro_groups(selected)),
         (LIST_SLOT_MACRO_COLS, macro_cols(selected)),
         (LIST_SLOT_MACRO_ROWS, macro_rows(mac, selected, None)),
         (LIST_SLOT_MACRO_CELLS, macro_cells(mac, selected, None)),
@@ -2401,6 +3166,9 @@ mod tests {
                 // holds the column headers and the matrix.
                 LIST_SLOT_MACRO_TABS,
                 LIST_SLOT_MACRO_ROWS,
+                // v16: the group band is the first child of `.macscroll`,
+                // above the glyph row it labels.
+                LIST_SLOT_MACRO_GROUPS,
                 LIST_SLOT_MACRO_COLS,
                 LIST_SLOT_MACRO_CELLS,
                 LIST_SLOT_TABS_2,
@@ -2537,7 +3305,7 @@ mod tests {
         assert!(out.html.contains(">D-pad <"), "{}", out.html);
         assert_eq!(
             text_in(&out.html, "lid id-dir").as_deref(),
-            Some("▲"),
+            Some("↑"),
             "the legend leads with the same identity glyph: {}",
             out.html
         );
@@ -2589,7 +3357,7 @@ mod tests {
         );
         assert_eq!(
             text_in(&out.html, "zid id-dir").as_deref(),
-            Some("▲"),
+            Some("↑"),
             "{}",
             out.html
         );
@@ -3327,6 +4095,471 @@ mod tests {
         assert_eq!(total_ms(&hadouken()), 200);
     }
 
+    /// THE SEAM that keeps the lens honest: this crate's `fold` — which works
+    /// in function-name strings, because ksx-studio links no ksx crate at
+    /// runtime — must agree with `ksx_core::diagonal::fold`, which works in
+    /// `Binding`s, on every hold either of them can be shown.
+    ///
+    /// The two are re-derivations of ONE rule, the way the zone tables and the
+    /// sampling floor already are. A drift here is what "the grid says ↘ and
+    /// the validator says something else" would look like, and it fails the
+    /// build instead.
+    #[test]
+    fn the_diagonal_lens_matches_ksx_core() {
+        use ksx_config::parse_function;
+        use ksx_core::diagonal as core;
+        use ksx_core::DirMechanism;
+
+        let as_core = |m: Mechanism| match m {
+            Mechanism::Dpad => DirMechanism::Dpad,
+            Mechanism::LeftStick => DirMechanism::LeftStick,
+            Mechanism::RightStick => DirMechanism::RightStick,
+        };
+        // The vocabulary a step can hold: every direction of every mechanism,
+        // a hand-written partial deflection, a centred axis, a button, and a
+        // name the file may carry that this page cannot parse.
+        let vocabulary = [
+            "dpad.up",
+            "dpad.down",
+            "dpad.left",
+            "dpad.right",
+            "ly.max",
+            "ly.min",
+            "lx.min",
+            "lx.max",
+            "ly.-16384",
+            "lx.0",
+            "ry.max",
+            "rx.min",
+            "A",
+            "lt",
+            "consume",
+        ];
+        for a in vocabulary {
+            for b in vocabulary {
+                for c in vocabulary {
+                    let hold = [a.to_owned(), b.to_owned(), c.to_owned()];
+                    let mine = fold(&hold);
+                    let bindings: Vec<_> = hold
+                        .iter()
+                        .map(|f| parse_function(f).expect("vocabulary parses"))
+                        .collect();
+                    let theirs = core::fold(&bindings);
+                    assert_eq!(mine.len(), theirs.len(), "{hold:?}");
+                    for (m, t) in mine.iter().zip(theirs.iter()) {
+                        match (m, t) {
+                            (
+                                Held::Diagonal {
+                                    diag,
+                                    mechanisms,
+                                    members,
+                                    exact,
+                                },
+                                core::Held::Diagonal {
+                                    diag: cd,
+                                    mechanisms: cm,
+                                    members: cmem,
+                                    exact: ce,
+                                },
+                            ) => {
+                                assert_eq!(diag.glyph(), cd.glyph(), "{hold:?}");
+                                assert_eq!(diag.numpad(), cd.numpad(), "{hold:?}");
+                                assert_eq!(diag.words(), cd.words(), "{hold:?}");
+                                assert_eq!(diag.move_list(), cd.move_list(), "{hold:?}");
+                                assert_eq!(diag.halves(), cd.halves(), "{hold:?}");
+                                assert_eq!(
+                                    mechanisms.iter().copied().map(as_core).collect::<Vec<_>>(),
+                                    *cm,
+                                    "{hold:?}"
+                                );
+                                assert_eq!(members, cmem, "{hold:?}");
+                                assert_eq!(exact, ce, "{hold:?}");
+                            }
+                            (Held::Plain { member }, core::Held::Plain { member: cmember }) => {
+                                assert_eq!(member, cmember, "{hold:?}");
+                            }
+                            _ => panic!("{hold:?}: {m:?} vs {t:?}"),
+                        }
+                    }
+                }
+            }
+        }
+        // An UNPARSEABLE name is a passenger on this side too (ksx-core never
+        // sees one — the loader would have rejected it — but the page does, and
+        // validation already reports it).
+        assert_eq!(
+            fold(&["nonsense".to_owned(), "dpad.down".to_owned()]),
+            vec![Held::Plain { member: 0 }, Held::Plain { member: 1 }]
+        );
+        // And what a PICK writes is what ksx-core says the pair is.
+        for mechanism in Mechanism::ALL {
+            for diag in Diag::ALL {
+                let (up, right) = diag.halves();
+                let mine = [
+                    mechanism.function(true, up),
+                    mechanism.function(false, right),
+                ];
+                let core_pair = core::members_of(
+                    match diag {
+                        Diag::UpLeft => core::Diag::UpLeft,
+                        Diag::UpRight => core::Diag::UpRight,
+                        Diag::DownLeft => core::Diag::DownLeft,
+                        Diag::DownRight => core::Diag::DownRight,
+                    },
+                    as_core(mechanism),
+                );
+                let theirs: Vec<String> = core_pair.iter().map(ksx_config::function_name).collect();
+                assert_eq!(mine.to_vec(), theirs, "{mechanism:?} {diag:?}");
+            }
+        }
+    }
+
+    /// ⚠ THE SIGN TRAP. "Up" on a stick is `ly.max`, NOT `ly.min` (XInput's
+    /// positive Y is up). A copy-paste of the down-diagonals with the sign
+    /// wrong yields an ↖ that reads back perfectly in every reader on this page
+    /// and does nothing in the game — the worst failure this feature has,
+    /// because nothing else catches it.
+    ///
+    /// So all four diagonals are asserted NAME BY NAME, on all three
+    /// mechanisms, rather than only through the round trip (which a
+    /// consistently-mirrored sign would pass).
+    #[test]
+    fn all_four_diagonals_deflect_the_way_they_are_drawn() {
+        // The vertical half of an UP diagonal is the MAX end of the Y axis.
+        assert_eq!(Mechanism::LeftStick.function(true, true), "ly.max");
+        assert_eq!(Mechanism::LeftStick.function(true, false), "ly.min");
+        assert_eq!(Mechanism::RightStick.function(true, true), "ry.max");
+        assert_eq!(Mechanism::RightStick.function(true, false), "ry.min");
+        assert_eq!(Mechanism::Dpad.function(true, true), "dpad.up");
+        assert_eq!(Mechanism::Dpad.function(true, false), "dpad.down");
+
+        // Every diagonal, on every mechanism, written out.
+        let expected = [
+            (Diag::UpLeft, Mechanism::Dpad, ["dpad.up", "dpad.left"]),
+            (Diag::UpRight, Mechanism::Dpad, ["dpad.up", "dpad.right"]),
+            (Diag::DownLeft, Mechanism::Dpad, ["dpad.down", "dpad.left"]),
+            (
+                Diag::DownRight,
+                Mechanism::Dpad,
+                ["dpad.down", "dpad.right"],
+            ),
+            (Diag::UpLeft, Mechanism::LeftStick, ["ly.max", "lx.min"]),
+            (Diag::UpRight, Mechanism::LeftStick, ["ly.max", "lx.max"]),
+            (Diag::DownLeft, Mechanism::LeftStick, ["ly.min", "lx.min"]),
+            (Diag::DownRight, Mechanism::LeftStick, ["ly.min", "lx.max"]),
+            (Diag::UpLeft, Mechanism::RightStick, ["ry.max", "rx.min"]),
+            (Diag::UpRight, Mechanism::RightStick, ["ry.max", "rx.max"]),
+            (Diag::DownLeft, Mechanism::RightStick, ["ry.min", "rx.min"]),
+            (Diag::DownRight, Mechanism::RightStick, ["ry.min", "rx.max"]),
+        ];
+        for (diag, mechanism, pair) in expected {
+            let (up, right) = diag.halves();
+            assert_eq!(
+                [
+                    mechanism.function(true, up),
+                    mechanism.function(false, right)
+                ],
+                pair,
+                "{diag:?} on {mechanism:?} writes the wrong pair"
+            );
+            // …and reads back as ITSELF, on that mechanism and no other.
+            let hold: Vec<String> = pair.iter().map(|s| (*s).to_owned()).collect();
+            assert_eq!(
+                fold(&hold),
+                vec![Held::Diagonal {
+                    diag,
+                    mechanisms: vec![mechanism],
+                    members: vec![0, 1],
+                    exact: true,
+                }],
+                "{diag:?} on {mechanism:?} does not read back"
+            );
+        }
+
+        // THE FULL CIRCLE, which is why all four are first class: a 360 walks
+        // every position of the gate, and four of the eight are diagonals. Each
+        // one has to be a column you can point at, or the feature misses its
+        // purpose.
+        let gate = [
+            (vec!["dpad.right"], "D-pad →"),
+            (vec!["dpad.down", "dpad.right"], "D-pad ↘"),
+            (vec!["dpad.down"], "D-pad ↓"),
+            (vec!["dpad.down", "dpad.left"], "D-pad ↙"),
+            (vec!["dpad.left"], "D-pad ←"),
+            (vec!["dpad.up", "dpad.left"], "D-pad ↖"),
+            (vec!["dpad.up"], "D-pad ↑"),
+            (vec!["dpad.up", "dpad.right"], "D-pad ↗"),
+        ];
+        let mut payload = sample();
+        payload.macros.macros[0].steps = gate
+            .iter()
+            .map(|(hold, _)| step(hold, Some(50), None, false))
+            .collect();
+        let out = render_map(&page(), &payload, None);
+        for (hold, words) in gate {
+            assert!(
+                out.html.contains(&format!(">{words}<")),
+                "the 360's {hold:?} step does not read as {words}: {}",
+                out.html
+            );
+        }
+        // Four of the eight are diagonals, each lit on its own column.
+        assert_eq!(
+            out.html.matches(r#"class="maccell on isdiag""#).count(),
+            4,
+            "a 360 has four diagonal steps: {}",
+            out.html
+        );
+        for diag in Diag::ALL {
+            assert!(
+                out.html
+                    .contains(&format!(r#"|{}""#, diag_token(Mechanism::Dpad, diag))),
+                "{diag:?} has no column: {}",
+                out.html
+            );
+        }
+    }
+
+    /// The grid is three RINGS, in ring order, under a group band — and every
+    /// diagonal is a column you can point at.
+    #[test]
+    fn the_grid_is_three_rings() {
+        for persona in ["xbox360", "playstation"] {
+            let columns = macro_columns(persona);
+            assert_eq!(
+                columns.len(),
+                MACRO_COLUMN_COUNT,
+                "{persona}: 25 zones → 37 columns"
+            );
+            // Every mappable function still has exactly one column…
+            for z in zones_for(persona).iter() {
+                assert_eq!(
+                    columns.iter().filter(|c| c.token == z.fn_name).count(),
+                    1,
+                    "{persona}: {} lost its column",
+                    z.fn_name
+                );
+            }
+            // …plus twelve new picks nobody has had before.
+            let diagonals: Vec<&str> = columns
+                .iter()
+                .filter(|c| c.token.starts_with("diag:"))
+                .map(|c| c.token.as_str())
+                .collect();
+            assert_eq!(diagonals.len(), 12, "{persona}: {diagonals:?}");
+            for mechanism in Mechanism::ALL {
+                for diag in Diag::ALL {
+                    assert!(
+                        diagonals.contains(&diag_token(mechanism, diag).as_str()),
+                        "{persona}: {mechanism:?} {diag:?}"
+                    );
+                }
+            }
+            // RING ORDER — ↑ ↖ ← ↙ ↓ ↘ → ↗ — is what makes a motion a shape.
+            let glyphs: Vec<&str> = columns
+                .iter()
+                .filter(|c| c.idcls.starts_with("maccolid ") || c.token.starts_with("diag:"))
+                .map(|c| c.glyph.as_str())
+                .collect();
+            assert_eq!(
+                glyphs,
+                ["↑", "↖", "←", "↙", "↓", "↘", "→", "↗"].repeat(3),
+                "{persona}"
+            );
+            // The band, and the fact it exists for: three identical rings.
+            let bands = macro_groups(Some(&slot(1, persona, "p")));
+            let SlotValue::Array(bands) = bands else {
+                panic!("bands are a list")
+            };
+            let labels: Vec<String> = bands
+                .iter()
+                .map(|b| match b {
+                    SlotValue::Object(fields) => match &fields[0].1 {
+                        SlotValue::Text(t) => t.clone(),
+                        other => panic!("{other:?}"),
+                    },
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                labels,
+                [
+                    "SHOULDERS",
+                    "FACE",
+                    "SYSTEM",
+                    "LEFT STICK",
+                    "D-PAD",
+                    "RIGHT STICK"
+                ],
+                "{persona}"
+            );
+            // Spans sum to the column count, or the header would not line up
+            // with the matrix under it.
+            let spans: usize = bands
+                .iter()
+                .map(|b| match b {
+                    SlotValue::Object(fields) => match &fields[1].1 {
+                        SlotValue::Text(cls) => cls
+                            .rsplit_once('g')
+                            .and_then(|(_, n)| n.parse::<usize>().ok())
+                            .expect("g<N>"),
+                        other => panic!("{other:?}"),
+                    },
+                    other => panic!("{other:?}"),
+                })
+                .sum();
+            assert_eq!(spans, MACRO_COLUMN_COUNT, "{persona}");
+        }
+    }
+
+    /// THE ROUND TRIP, which is the whole promise: a step nobody made through
+    /// this page — hand-written into the TOML, or imported, or generated by the
+    /// motion helpers — DISPLAYS as the diagonal.
+    #[test]
+    fn a_hand_written_pair_reads_back_as_the_diagonal() {
+        let cases = [
+            // The canonical pair, on each mechanism.
+            (vec!["dpad.down", "dpad.right"], "D-pad ↘", "diag:dpad:dr"),
+            (vec!["ly.min", "lx.max"], "LS ↘", "diag:ls:dr"),
+            (vec!["ry.max", "rx.min"], "RS ↖", "diag:rs:ul"),
+            // Written the other way round — a hold is a SET.
+            (vec!["lx.max", "ly.min"], "LS ↘", "diag:ls:dr"),
+            // A hand-written partial deflection: still the diagonal.
+            (vec!["ly.-16384", "lx.max"], "LS ↘", "diag:ls:dr"),
+            // The hat+stick double-binding EVERY in-box template writes: one
+            // presented diagonal naming both mechanisms.
+            (
+                vec!["dpad.down", "dpad.right", "ly.min", "lx.max"],
+                "D-pad + LS ↘",
+                "diag:dpad:dr",
+            ),
+        ];
+        for (hold, words, token) in cases {
+            let mut payload = sample();
+            payload.macros.macros[0].steps = vec![step(&hold.to_vec(), Some(50), None, false)];
+            let out = render_map(&page(), &payload, None);
+            let html = &out.html;
+            assert!(
+                html.contains(&format!(">{words}<")),
+                "{hold:?} must read as {words}: {html}"
+            );
+            assert!(
+                html.contains(&format!(r#"data-cell="0|{token}""#)),
+                "{hold:?}: {html}"
+            );
+            // The pick is LIT, and the ledger names the file's own spelling.
+            let cell = html
+                .find(&format!(r#"data-cell="0|{token}""#))
+                .expect("the diagonal cell");
+            let before = &html[..cell];
+            assert!(
+                before
+                    .rsplit("<button")
+                    .next()
+                    .unwrap()
+                    .contains("maccell on"),
+                "{hold:?}: the diagonal cell is not lit: {html}"
+            );
+            assert!(
+                html.contains(&format!("↘ = {}", hold.join(" + ")))
+                    || html.contains(&format!("↖ = {}", hold.join(" + "))),
+                "{hold:?}: the ledger does not spell the stored pair: {html}"
+            );
+        }
+
+        // A hand-written PARTIAL deflection is labelled, never rewritten.
+        let mut payload = sample();
+        payload.macros.macros[0].steps =
+            vec![step(&["ly.-16384", "lx.max"], Some(50), None, false)];
+        let out = render_map(&page(), &payload, None);
+        assert!(out.html.contains("maccell on approx"), "{}", out.html);
+        assert!(
+            out.html.contains("as written, not at full deflection"),
+            "{}",
+            out.html
+        );
+        // …and the TOML it offers back is still exactly what the file said.
+        assert!(out.html.contains("ly.-16384"), "{}", out.html);
+    }
+
+    /// The named edge case that keeps the editor honest: `down + forward + up`
+    /// is CONTRADICTORY and must never fold. Which diagonal would it be — and
+    /// what the pad publishes depends on the slot's `socd` policy, resolved at
+    /// plan time, which this page cannot see. So it shows three cardinals.
+    #[test]
+    fn a_contradictory_step_stays_three_cardinals() {
+        let mut payload = sample();
+        payload.macros.macros[0].steps = vec![step(
+            &["dpad.down", "dpad.right", "dpad.up"],
+            Some(50),
+            None,
+            false,
+        )];
+        let out = render_map(&page(), &payload, None);
+        let html = &out.html;
+        assert!(
+            html.contains(">D-pad ↓ + D-pad → + D-pad ↑<"),
+            "no diagonal is guessed: {html}"
+        );
+        assert!(
+            !html.contains("maccell on isdiag"),
+            "a diagonal was fabricated: {html}"
+        );
+        assert!(
+            !html.contains(r#"class="maccell part""#),
+            "nothing is half of anything here: {html}"
+        );
+        assert_eq!(
+            html.matches(r#"class="maccell on""#).count(),
+            3,
+            "three cardinals, lit as themselves: {html}"
+        );
+    }
+
+    /// The ring is STATED, under the grid, on the page a reader with no
+    /// JavaScript gets — they cannot tick a cell, but they can read what the
+    /// columns mean and hand-write the pair into the TOML block below.
+    #[test]
+    fn the_ring_and_what_a_pick_writes_are_stated_on_the_page() {
+        let out = render_map(&page(), &sample(), None);
+        let html = &out.html;
+        assert!(html.contains(r#"class="macring""#), "{html}");
+        assert!(
+            html.contains("↑ ↖ ← ↙ ↓ ↘ → ↗ (numpad 8 7 4 1 2 3 6 9)"),
+            "the ring, with the lookup digits: {html}"
+        );
+        assert!(
+            html.contains("stores dpad.down + dpad.right on that step"),
+            "what a pick WRITES, in the file's own words: {html}"
+        );
+        // The digits are a LOOKUP KEY, not a label: no numpad digit reaches the
+        // glyph row. Every direction header is one arrow and nothing else — a
+        // second line of digits under only 24 of 37 columns would make the
+        // header ragged and re-introduce exactly the ornament the coloured
+        // discs were stripped for. (`L3`/`R3` are the controls' own names.)
+        for column in macro_columns("xbox360") {
+            if Mechanism::of(&column.token).is_none() && !column.token.starts_with("diag:") {
+                continue;
+            }
+            assert_eq!(
+                column.glyph.chars().count(),
+                1,
+                "a direction header is one arrow: {}",
+                column.glyph
+            );
+            assert!(
+                "↑↓←→↖↗↙↘".contains(&column.glyph),
+                "not an arrow: {}",
+                column.glyph
+            );
+        }
+        // …but every diagonal tooltip carries it, beside the move-list form.
+        assert!(
+            html.contains("down-right (d/f) · numpad 3"),
+            "the tooltip is the lookup: {html}"
+        );
+    }
+
     /// The three policy selects offer exactly what ksx-core accepts, spelled
     /// the way a config file stores it. A word this page invents is a select
     /// that writes a preset the loader refuses.
@@ -3367,23 +4600,42 @@ mod tests {
         let out = render_map(&page(), &sample(), None);
         let html = &out.html;
 
-        // 4 steps × 25 controls, every cell addressable as `step|function`.
+        // 4 steps × 37 columns, every cell addressable as `step|token`.
         assert_eq!(
             html.matches(r#"class="maccell"#).count(),
-            4 * 25,
-            "one cell per (step, control): {html}"
+            4 * MACRO_COLUMN_COUNT,
+            "one cell per (step, column): {html}"
         );
         assert!(html.contains(r#"data-cell="0|dpad.down""#), "{html}");
         assert!(html.contains(r#"data-cell="3|A""#), "{html}");
-        // Held cells carry the mark AND the class; the diagonal step holds two.
+        // THE POINT: step 2 holds `dpad.down` + `dpad.right`, and the grid
+        // lights the D-pad ↘ CELL — one pick, not two stray ticks.
+        assert!(html.contains(r#"data-cell="1|diag:dpad:dr""#), "{html}");
         assert_eq!(
-            html.matches(r#"class="maccell on""#).count(),
-            5,
-            "↓, ↓+→, →, A = five held cells: {html}"
+            html.matches(r#"class="maccell on isdiag""#).count(),
+            1,
+            "exactly one diagonal is lit in this hadouken: {html}"
         );
         assert!(
-            html.contains("step 2 holds D-pad ▼"),
+            html.contains("step 2 holds D-pad ↘ (down-right)"),
             "the cell says what it means in the pad's own words: {html}"
+        );
+        // …and the two cardinals it is made of are still shown, subordinate,
+        // because they really are in the file.
+        assert_eq!(
+            html.matches(r#"class="maccell part""#).count(),
+            2,
+            "↓ and → are half of ↘, and say so: {html}"
+        );
+        assert!(
+            html.contains("as half of ↘ — the ↘ column beside it is the pick"),
+            "{html}"
+        );
+        // The plain single-control holds: ↓, →, A.
+        assert_eq!(
+            html.matches(r#"class="maccell on""#).count(),
+            3,
+            "↓, →, A = three plainly held cells: {html}"
         );
         assert!(html.contains("step 1 does not hold"), "{html}");
         // Rows: numbered, in order, wearing their duration — including the one
@@ -3408,7 +4660,7 @@ mod tests {
             !html.contains("maccolid id-"),
             "no accent in a header: {html}"
         );
-        assert!(html.contains("D-pad ▼ (dpad.down)"), "{html}");
+        assert!(html.contains("D-pad ↓ (dpad.down)"), "{html}");
         // The head line and the policies, in words.
         assert_eq!(
             text_in(html, "machead").as_deref(),
@@ -3748,23 +5000,46 @@ mod tests {
         payload.macros.macros[0]
             .steps
             .push(step(&[], Some(50), None, false));
+        // …and the single most common macro step in existence: the diagonal
+        // WITH the attack that ends the motion.
+        payload.macros.macros[0].steps.push(step(
+            &["dpad.down", "dpad.right", "A"],
+            Some(50),
+            None,
+            false,
+        ));
         let out = render_map(&page(), &payload, None);
         let html = &out.html;
 
-        // The four hadouken steps, in words. Step 2 is the diagonal.
-        assert!(html.contains(">D-pad ▼<"), "step 1's readout: {html}");
+        // The hadouken steps, in words. Step 2 is the diagonal — and it reads
+        // as ONE control, because that is what a player means by it.
+        assert!(html.contains(">D-pad ↓<"), "step 1's readout: {html}");
         assert!(
-            html.contains(">D-pad ▼ + D-pad ▶<"),
-            "the diagonal, spelled out as ONE step holding TWO controls: {html}"
+            html.contains(">D-pad ↘<"),
+            "the diagonal, named the way a player names it: {html}"
         );
         assert!(html.contains(">(nothing — neutral gap)<"), "{html}");
+        // `down + forward + A` folds and keeps the button — exact-set matching
+        // would have failed this, and it settles the whole recognition rule.
+        assert!(html.contains(">D-pad ↘ + A<"), "{html}");
+
+        // THE LEDGER: what the file actually holds, beside the words. The lens
+        // is only honest if the storage is visible without opening the TOML.
+        assert_eq!(
+            html.matches(">↘ = dpad.down + dpad.right<").count(),
+            2,
+            "both diagonal rows spell out the pair they store: {html}"
+        );
+        assert_eq!(hold_expand(&[]), "");
+        assert_eq!(hold_expand_cls(&["A".to_owned()]), "macexp off");
 
         // The class carries the distinction the words make, so CSS can accent
-        // the chord row without re-deriving anything.
+        // the row that really holds several things — counted over PRESENTED
+        // controls, so a diagonal alone is no longer "two".
         assert_eq!(
             html.matches(r#"class="machold both""#).count(),
             1,
-            "exactly one row of this hadouken holds two controls: {html}"
+            "only `↘ + A` holds more than one presented control: {html}"
         );
         assert_eq!(
             html.matches(r#"class="machold none""#).count(),
@@ -3775,6 +5050,15 @@ mod tests {
         assert_eq!(hold_cls(&["A".to_owned()]), "machold");
         assert_eq!(
             hold_cls(&["dpad.down".to_owned(), "dpad.right".to_owned()]),
+            "machold",
+            "a diagonal is ONE presented control"
+        );
+        assert_eq!(
+            hold_cls(&[
+                "dpad.down".to_owned(),
+                "dpad.right".to_owned(),
+                "A".to_owned()
+            ]),
             "machold both"
         );
     }
@@ -3794,6 +5078,15 @@ mod tests {
                 && html.contains("is ONE step holding ↓ and →, not two steps."),
             "the sentence itself: {html}"
         );
+        // …and the answer to it, in the same breath: you PICK the diagonal, and
+        // ksx writes the pair. That is Victor's insight, stated where the
+        // mistake used to be made.
+        assert!(
+            html.contains("So pick the diagonal:")
+                && html.contains("ticking ↘ stores ")
+                && html.contains("dpad.down + dpad.right"),
+            "the lens is not explained where it is used: {html}"
+        );
         // Before the only nested disclosure this card has, so nothing has to be
         // opened to read it. (The card is a <details>; this is about not
         // burying the rule INSIDE another one.)
@@ -3804,7 +5097,7 @@ mod tests {
         // And the intro no longer says "a quarter-circle is three rows" without
         // saying which of them holds two things.
         assert!(
-            html.contains("then ↓ and → ") && html.contains("together on ONE row"),
+            html.contains("then ↘ (which ") && html.contains("is ↓ and → together on ONE row)"),
             "the intro spells the middle step out: {html}"
         );
     }
@@ -4053,7 +5346,7 @@ mod tests {
         );
         assert_eq!(
             out.html.matches(r#"class="maccell"#).count(),
-            25,
+            MACRO_COLUMN_COUNT,
             "one step = one row of cells: {}",
             out.html
         );

@@ -162,12 +162,18 @@ interface MacroRow {
   cls: string;
   dur: string;
   durtitle: string;
-  /** FIX 1: the plain-language readout of everything this row holds —
-   *  "D-pad ▼ + D-pad ▶", "(nothing — neutral gap)". */
+  /** The plain-language readout of everything this row holds — "D-pad ↘ + A",
+   *  "(nothing — neutral gap)". A diagonal reads as ONE control, because that
+   *  is what the player picked and what the player means. */
   hold: string;
   /** `machold` / `machold both` / `machold none` — the accent that says "this
-   *  row holds more than one control". */
+   *  row holds more than one control", counted over PRESENTED controls. */
   holdcls: string;
+  /** v16, THE LEDGER: every diagonal on this row spelled as the pair the file
+   *  stores — `↘ = dpad.down + dpad.right`. The lens is only honest if the
+   *  storage is visible without opening the TOML. Empty = no diagonal. */
+  exp: string;
+  expcls: string;
   /** Short enough to always fit; `warntitle` carries the whole sentence. */
   warn: string;
   warntitle: string;
@@ -194,10 +200,19 @@ interface MacroCell {
 }
 
 interface MacroCol {
+  /** The cell token: a function name, or `diag:<mech>:<diag>` for a pick. */
   fn: string;
   id: string;
   idcls: string;
   title: string;
+}
+
+/** v16: one cell of the GROUP BAND above the glyph row — `label` spanning
+ *  `cls`'s `g<N>` columns. Without it the header carries three identical
+ *  `↑ ↖ ← ↙ ↓ ↘ → ↗` runs told apart only by a tooltip. */
+interface MacroGroup {
+  label: string;
+  cls: string;
 }
 
 interface MacroTab {
@@ -384,19 +399,19 @@ const ZONE_XBOX: ZoneDef[] = [
   ["back", "view", "txt", 44.0, 39.0, 6.5, 8.0, "chip"],
   ["start", "menu", "txt", 56.0, 39.0, 6.5, 8.0, "chip"],
   ["lthumb", "L3", "hub", 24.0, 39.7, 8.0, 10.0, "round"],
-  ["ly.max", "▲", "dir", 24.0, 31.7, 7.0, 6.0, "chip"],
-  ["ly.min", "▼", "dir", 24.0, 47.7, 7.0, 6.0, "chip"],
-  ["lx.min", "◀", "dir", 17.25, 39.7, 5.5, 7.0, "chip"],
-  ["lx.max", "▶", "dir", 30.75, 39.7, 5.5, 7.0, "chip"],
-  ["dpad.up", "▲", "dir", 36.4, 50.6, 7.0, 9.0, "chip"],
-  ["dpad.down", "▼", "dir", 36.4, 69.2, 7.0, 9.0, "chip"],
-  ["dpad.left", "◀", "dir", 29.2, 59.9, 7.0, 9.0, "chip"],
-  ["dpad.right", "▶", "dir", 43.6, 59.9, 7.0, 9.0, "chip"],
+  ["ly.max", "↑", "dir", 24.0, 31.7, 7.0, 6.0, "chip"],
+  ["ly.min", "↓", "dir", 24.0, 47.7, 7.0, 6.0, "chip"],
+  ["lx.min", "←", "dir", 17.25, 39.7, 5.5, 7.0, "chip"],
+  ["lx.max", "→", "dir", 30.75, 39.7, 5.5, 7.0, "chip"],
+  ["dpad.up", "↑", "dir", 36.4, 50.6, 7.0, 9.0, "chip"],
+  ["dpad.down", "↓", "dir", 36.4, 69.2, 7.0, 9.0, "chip"],
+  ["dpad.left", "←", "dir", 29.2, 59.9, 7.0, 9.0, "chip"],
+  ["dpad.right", "→", "dir", 43.6, 59.9, 7.0, 9.0, "chip"],
   ["rthumb", "R3", "hub", 62.5, 58.4, 8.0, 10.0, "round"],
-  ["ry.max", "▲", "dir", 62.5, 50.4, 7.0, 6.0, "chip"],
-  ["ry.min", "▼", "dir", 62.5, 66.4, 7.0, 6.0, "chip"],
-  ["rx.min", "◀", "dir", 55.75, 58.4, 5.5, 7.0, "chip"],
-  ["rx.max", "▶", "dir", 69.25, 58.4, 5.5, 7.0, "chip"],
+  ["ry.max", "↑", "dir", 62.5, 50.4, 7.0, 6.0, "chip"],
+  ["ry.min", "↓", "dir", 62.5, 66.4, 7.0, 6.0, "chip"],
+  ["rx.min", "←", "dir", 55.75, 58.4, 5.5, 7.0, "chip"],
+  ["rx.max", "→", "dir", 69.25, 58.4, 5.5, 7.0, "chip"],
 ];
 
 const ZONE_DS4: ZoneDef[] = [
@@ -412,19 +427,19 @@ const ZONE_DS4: ZoneDef[] = [
   ["start", "options", "txt", 70.0, 25.5, 7.0, 9.0, "chip"],
   ["guide", "PS", "txt", 50.0, 63.0, 8.0, 10.0, "round"],
   ["lthumb", "L3", "hub", 33.8, 56.8, 8.0, 10.0, "round"],
-  ["ly.max", "▲", "dir", 33.8, 48.8, 7.0, 6.0, "chip"],
-  ["ly.min", "▼", "dir", 33.8, 64.8, 7.0, 6.0, "chip"],
-  ["lx.min", "◀", "dir", 27.05, 56.8, 5.5, 7.0, "chip"],
-  ["lx.max", "▶", "dir", 40.55, 56.8, 5.5, 7.0, "chip"],
-  ["dpad.up", "▲", "dir", 18.5, 31.5, 5.4, 7.2, "chip"],
-  ["dpad.down", "▼", "dir", 18.5, 46.6, 5.4, 7.2, "chip"],
-  ["dpad.left", "◀", "dir", 12.9, 39.2, 5.4, 7.2, "chip"],
-  ["dpad.right", "▶", "dir", 23.9, 39.2, 5.4, 7.2, "chip"],
+  ["ly.max", "↑", "dir", 33.8, 48.8, 7.0, 6.0, "chip"],
+  ["ly.min", "↓", "dir", 33.8, 64.8, 7.0, 6.0, "chip"],
+  ["lx.min", "←", "dir", 27.05, 56.8, 5.5, 7.0, "chip"],
+  ["lx.max", "→", "dir", 40.55, 56.8, 5.5, 7.0, "chip"],
+  ["dpad.up", "↑", "dir", 18.5, 31.5, 5.4, 7.2, "chip"],
+  ["dpad.down", "↓", "dir", 18.5, 46.6, 5.4, 7.2, "chip"],
+  ["dpad.left", "←", "dir", 12.9, 39.2, 5.4, 7.2, "chip"],
+  ["dpad.right", "→", "dir", 23.9, 39.2, 5.4, 7.2, "chip"],
   ["rthumb", "R3", "hub", 66.1, 56.8, 8.0, 10.0, "round"],
-  ["ry.max", "▲", "dir", 66.1, 48.8, 7.0, 6.0, "chip"],
-  ["ry.min", "▼", "dir", 66.1, 64.8, 7.0, 6.0, "chip"],
-  ["rx.min", "◀", "dir", 59.35, 56.8, 5.5, 7.0, "chip"],
-  ["rx.max", "▶", "dir", 72.85, 56.8, 5.5, 7.0, "chip"],
+  ["ry.max", "↑", "dir", 66.1, 48.8, 7.0, 6.0, "chip"],
+  ["ry.min", "↓", "dir", 66.1, 64.8, 7.0, 6.0, "chip"],
+  ["rx.min", "←", "dir", 59.35, 56.8, 5.5, 7.0, "chip"],
+  ["rx.max", "→", "dir", 72.85, 56.8, 5.5, 7.0, "chip"],
 ];
 
 export function isPlaystation(persona: string): boolean {
@@ -510,6 +525,9 @@ const [actionsCls, setActionsCls] = createSignal("card pactions off");
 // is now always a name the PRESET holds.
 const [macroHead, setMacroHead] = createSignal("no macro loaded yet");
 const [macroRuleLine, setMacroRuleLine] = createSignal("");
+/** v16: the ring, stated once under the grid — what the eight columns of a
+ *  direction group are, and exactly what ticking a diagonal writes. */
+const [macroRingLine, setMacroRingLine] = createSignal("");
 const [macroPolicyLine, setMacroPolicyLine] = createSignal(
   "on release: finish · retrigger: ignore · interrupt: none",
 );
@@ -588,6 +606,7 @@ const [modalTurboLine, setModalTurboLine] = createSignal("");
 const [macroTrigCls, setMacroTrigCls] = createSignal("mactrigger off");
 const [macroTabs, setMacroTabs] = createSignal<MacroTab[]>([]);
 const [macroCols, setMacroCols] = createSignal<MacroCol[]>([]);
+const [macroGroups, setMacroGroups] = createSignal<MacroGroup[]>([]);
 const [macroRows, setMacroRows] = createSignal<MacroRow[]>([]);
 const [macroCells, setMacroCells] = createSignal<MacroCell[]>([]);
 
@@ -1813,6 +1832,23 @@ const MACRO_RULE_LINE =
   "marked allow_short runs exactly as written and can be missed entirely. Neither is ever " +
   "silent, and Save asks before it writes either one.";
 
+/** THE RING, stated once, under the grid: what the eight columns of a direction
+ *  group are, what each is called, and — for the four that are PICKS rather than
+ *  stored names — exactly what ksx writes when you tick one. Mirror of
+ *  render_map.rs `MACRO_RING_LINE`.
+ *
+ *  The numpad digits live HERE and in the tooltips, never in the glyph row: a
+ *  second line of digits under only 24 of 37 columns makes the header ragged,
+ *  and the digit is a lookup key (for somebody who read "3" on Dustloop or typed
+ *  digits into MAME's `joystick_map`), not a label. */
+const MACRO_RING_LINE =
+  "Each direction group runs ↑ ↖ ← ↙ ↓ ↘ → ↗ (numpad 8 7 4 1 2 3 6 9), so a motion is a " +
+  "SHAPE: a quarter-circle forward is a staircase, a half-circle a straight line, a dragon " +
+  "punch a hook. The four diagonals are picks, not new bindings — ticking ↘ (down-right, d/f, " +
+  "numpad 3) stores dpad.down + dpad.right on that step, which is what a diagonal has always " +
+  "been in this file. Tick it on the group your preset's own direction keys drive; each row " +
+  "spells the pair it wrote beside its name.";
+
 /** The body "＋ New macro" WRITES: one real 50 ms step, at the default
  *  policies. A macro with no steps is refused by the loader (and by the
  *  daemon), so a new table has to arrive with one — and one empty step is the
@@ -2077,15 +2113,98 @@ export function macroSelectStep(index: number): void {
   refreshMacro();
 }
 
-/** Paint (or clear) one cell of the roll — the whole point of the shape. */
-export function macroToggleCell(index: number, fn: string): void {
+/** Paint (or clear) one cell of the roll — the whole point of the shape.
+ *
+ *  Three kinds of column, one entry point:
+ *
+ *  - **A DIAGONAL PICK** (`diag:<mech>:<diag>`) is expanded here and nowhere
+ *    else. Ticking it stores the PAIR, on that column's own mechanism — which
+ *    is what makes it mechanism-aware and why it can never raise
+ *    `Issue::MacroHoldsOtherMechanism` against a group the user pointed at.
+ *    Untick removes exactly the two. Asking for ↘ on a mechanism that is
+ *    already pointing somewhere else on the same axis REPLACES that direction:
+ *    "make this mechanism point ↘" is the whole meaning of the click, and
+ *    leaving `dpad.up` in place would produce a contradictory step that folds
+ *    to nothing and shows the cell still off. Every other hold — the other
+ *    mechanisms, the buttons, `consume` — is untouched.
+ *  - **A DIRECTION** matches by where it POINTS, so ticking `ly.min` off a step
+ *    that spells it `ly.-16384` clears the one that is really there.
+ *  - **Anything else** is the plain string toggle it always was.
+ *
+ *  Returns what changed, in words, plus the exact hold it replaced — so the
+ *  toast can offer Undo, the same parity every other write on this page has.
+ *  Null when there is nothing to report (a plain single-control toggle, which
+ *  the grid already shows). */
+export function macroToggleCell(index: number, fn: string): MacroCellOutcome | null {
   const step = macroDraft?.steps[index];
-  if (!step) return;
-  const at = step.hold.findIndex((f) => f.toLowerCase() === fn.toLowerCase());
+  if (!step) return null;
+  const before = [...step.hold];
+  const d = parseDiagToken(fn);
+  if (d) {
+    const [up, right] = DIAG_HALVES[d.diag];
+    const pair = [
+      mechanismFunction(d.mechanism, true, up),
+      mechanismFunction(d.mechanism, false, right),
+    ];
+    const want = pair.map((p) => pointing(p)!);
+    const has = want.every((w) => step.hold.some((f) => pointsSameWay(f, w)));
+    // Drop every direction this mechanism is currently holding, then (when
+    // this was a tick rather than an untick) say the diagonal.
+    step.hold = step.hold.filter((f) => {
+      const p = pointing(f);
+      return p === null || p.mechanism !== d.mechanism;
+    });
+    if (!has) step.hold.push(...pair);
+    macroStep = index;
+    macroEdited();
+    const glyph = DIAG_GLYPH[d.diag];
+    const displaced = before.filter((f) => {
+      const p = pointing(f);
+      return p !== null && p.mechanism === d.mechanism && !pair.includes(f);
+    });
+    const said = has
+      ? `Step ${index + 1}: cleared ${mechanismGroup(d.mechanism)}${glyph} — removed ` +
+        `${pair.join(" + ")}.`
+      : `Step ${index + 1}: ${mechanismGroup(d.mechanism)}${glyph} (${DIAG_WORDS[d.diag]}, ` +
+        `numpad ${DIAG_NUMPAD[d.diag]}) — ksx wrote ${pair.join(" + ")}, because that is ` +
+        `what a diagonal is in the file.` +
+        (displaced.length > 0
+          ? ` Replaced ${displaced.join(" + ")} on ${mechanismLabel(d.mechanism)}.`
+          : "");
+    return { said, undo: () => macroRestoreHold(index, before) };
+  }
+
+  const want = pointing(fn);
+  const at =
+    want === null
+      ? step.hold.findIndex((f) => f.toLowerCase() === fn.toLowerCase())
+      : step.hold.findIndex((f) => pointsSameWay(f, want));
   if (at >= 0) step.hold.splice(at, 1);
   else step.hold.push(fn);
   macroStep = index;
   macroEdited();
+  return null;
+}
+
+/** What a cell click did, and the road back. */
+export interface MacroCellOutcome {
+  said: string;
+  /** Puts the step's hold back exactly as it was. Returns the refusal when the
+   *  draft moved on underneath it (a slot switch, a revert) — never a silent
+   *  no-op, same rule as every other undo here. */
+  undo: () => string | null;
+}
+
+/** Restore one step's hold, byte for byte. The undo half of a diagonal pick. */
+export function macroRestoreHold(index: number, hold: string[]): string | null {
+  const step = macroDraft?.steps[index];
+  if (!step) {
+    return "that step is gone — the draft was reloaded, so there is nothing to put back.";
+  }
+  step.hold = [...hold];
+  macroStep = index;
+  macroEdited();
+  return null;
 }
 
 function newStep(): MacroStepView {
@@ -2118,8 +2237,13 @@ function newStep(): MacroStepView {
 // mistake it exists to prevent.
 
 /** Which control a preset's direction keys drive. Mirror of
- *  `ksx_config::validate::Mechanism`. */
+ *  `ksx_core::socd::DirMechanism` (= `ksx_config::validate::Mechanism`, which
+ *  is now a re-export of it) and of render_map.rs `Mechanism`. */
 type Mechanism = "dpad" | "lstick" | "rstick";
+
+/** Canonical order — how a coalesced diagonal lists its mechanisms and how the
+ *  grid draws its direction groups. */
+const MECHANISMS: Mechanism[] = ["dpad", "lstick", "rstick"];
 
 function mechanismOf(fn: string): Mechanism | null {
   const f = fn.toLowerCase();
@@ -2132,6 +2256,379 @@ function mechanismOf(fn: string): Mechanism | null {
 function mechanismLabel(m: Mechanism): string {
   if (m === "dpad") return "the dpad";
   return m === "lstick" ? "the left stick (lx/ly)" : "the right stick (rx/ry)";
+}
+
+/** The prefix a flat list needs to keep three identical arrow runs apart — the
+ *  same one `legendGroup` writes. */
+function mechanismGroup(m: Mechanism): string {
+  if (m === "dpad") return "D-pad ";
+  return m === "lstick" ? "LS " : "RS ";
+}
+
+/** The grid's group-band label. */
+function mechanismBand(m: Mechanism): string {
+  if (m === "dpad") return "D-PAD";
+  return m === "lstick" ? "LEFT STICK" : "RIGHT STICK";
+}
+
+/** The half of a diagonal cell token that names the mechanism. */
+function mechanismToken(m: Mechanism): string {
+  return m === "lstick" ? "ls" : m === "rstick" ? "rs" : "dpad";
+}
+
+/** The canonical function name for one polarity of one axis of a mechanism —
+ *  what picking a direction WRITES. Mirror of `Mechanism::function`. */
+function mechanismFunction(m: Mechanism, vertical: boolean, positive: boolean): string {
+  if (m === "dpad") {
+    return vertical ? (positive ? "dpad.up" : "dpad.down") : positive ? "dpad.right" : "dpad.left";
+  }
+  const [h, v] = m === "lstick" ? ["lx", "ly"] : ["rx", "ry"];
+  return vertical ? `${v}.${positive ? "max" : "min"}` : `${h}.${positive ? "max" : "min"}`;
+}
+
+// ── DIAGONALS AS PRESENTATION ─────────────────────────────────────────────
+// Victor: "if down and right together equals diagonal, the user does not care —
+// we can present the diagonal in the piano and the user can select it, and
+// behind the scenes we do down and right, so it's seamless."
+//
+// He is right, and it is the root cause of the evening he lost. A diagonal IS
+// two simultaneous holds — ksx's implementation detail, not the user's concept.
+// Players think in ↘ / down-forward / numpad 3, never in "two axis bindings held
+// together", and no mapper in the field lets them pick one (Steam Input: four
+// cardinal binding slots; reWASD's own answer: build a Shortcut out of two
+// zones; MAME: four cardinals; GP2040-CE: cardinal pairs, with its whole SOCD
+// feature spent on what happens when the pair is illegal).
+//
+// NOTHING STORED CHANGES. A step still holds a set of ordinary bindings, so the
+// file stays hand-editable, the engine is untouched, and old presets keep
+// working. `fold` reads a hold and says how to PRESENT it; a pick writes the
+// pair, spelled exactly as `ksx map` would.
+//
+// MIRROR of `ksx_core::diagonal` + `ksx_core::socd::pointing`, over FUNCTION
+// NAMES rather than Binding — same rule as the zone tables above, and pinned
+// against the Rust side by render_map.rs `the_diagonal_lens_matches_ksx_core`.
+
+type Diag = "ul" | "ur" | "dl" | "dr";
+
+/** Canonical order. */
+const DIAGS: Diag[] = ["ul", "ur", "dl", "dr"];
+
+/** ARROW is the glyph. Screens speak arrows in this genre — SF6's input
+ *  history, every Capcom move list, every arcade instruction card. */
+const DIAG_GLYPH: Record<Diag, string> = { ul: "↖", ur: "↗", dl: "↙", dr: "↘" };
+
+/** A LOOKUP TOKEN for tooltips and the ring line, never the label: it is how
+ *  the input is written in TEXT (Dustloop, SuperCombo), and it is already in a
+ *  cab owner's `mame.ini` — `-joystick_map`'s digits use the numpad mapping. */
+const DIAG_NUMPAD: Record<Diag, number> = { ul: 7, ur: 9, dl: 1, dr: 3 };
+
+/** COMPASS, not forward/back: ksx offers the mirrored spelling of every motion
+ *  because player 2 is not an edge case, and "down-forward" is only true for a
+ *  character facing right. */
+const DIAG_WORDS: Record<Diag, string> = {
+  ul: "up-left",
+  ur: "up-right",
+  dl: "down-left",
+  dr: "down-right",
+};
+
+/** How a move list writes it (Tekken's command lists spell `d/f`). Offered
+ *  BESIDE the compass name, never instead of it. */
+const DIAG_MOVELIST: Record<Diag, string> = { ul: "u/b", ur: "u/f", dl: "d/b", dr: "d/f" };
+
+/** `[up, right]`. */
+const DIAG_HALVES: Record<Diag, [boolean, boolean]> = {
+  ul: [true, false],
+  ur: [true, true],
+  dl: [false, false],
+  dr: [false, true],
+};
+
+function diagFromHalves(up: boolean, right: boolean): Diag {
+  return up ? (right ? "ur" : "ul") : right ? "dr" : "dl";
+}
+
+/** The glyph for one cardinal polarity. ARROWS, the same family the diagonals
+ *  wear — a diagonal that does not look like the same family as its two parents
+ *  defeats the whole lens, and `◤◥◣◢` are corner *blocks*, not directions. */
+function cardinalGlyph(vertical: boolean, positive: boolean): string {
+  return vertical ? (positive ? "↑" : "↓") : positive ? "→" : "←";
+}
+
+function cardinalWords(vertical: boolean, positive: boolean): string {
+  return vertical ? (positive ? "up" : "down") : positive ? "right" : "left";
+}
+
+function cardinalNumpad(vertical: boolean, positive: boolean): number {
+  return vertical ? (positive ? 8 : 2) : positive ? 6 : 4;
+}
+
+/** Mirror of `ksx_core::socd::Pointing`, over a FUNCTION NAME. */
+interface Pointing {
+  mechanism: Mechanism;
+  vertical: boolean;
+  /** Right for a horizontal control, UP for a vertical one. */
+  positive: boolean;
+  /** Canonical extreme (`min`/`max`), or a hand-written partial deflection? */
+  exact: boolean;
+}
+
+/** Where this function name points, or null when it points nowhere.
+ *
+ *  A CENTRED AXIS IS NEVER A DIRECTION (`lx.0`) — the same rule
+ *  `ksx_core::socd::pointing` and `ksx_config::validate` state, which is why it
+ *  is never half of a diagonal either. */
+function pointing(fn: string): Pointing | null {
+  const lower = fn.toLowerCase();
+  const at = lower.indexOf(".");
+  if (at < 0) return null;
+  const base = lower.slice(0, at);
+  const rest = lower.slice(at + 1);
+  if (base === "dpad") {
+    const table: Record<string, [boolean, boolean]> = {
+      up: [true, true],
+      down: [true, false],
+      left: [false, false],
+      right: [false, true],
+    };
+    const hit = table[rest];
+    if (!hit) return null;
+    return { mechanism: "dpad", vertical: hit[0], positive: hit[1], exact: true };
+  }
+  if (base !== "lx" && base !== "ly" && base !== "rx" && base !== "ry") return null;
+  // `min` / `max` / `<i16>` — the same grammar `ksx_config::parse_function`
+  // takes, including its i16::MIN fold.
+  let value: number;
+  if (rest === "min") value = -32767;
+  else if (rest === "max") value = 32767;
+  else {
+    if (!/^-?\d+$/.test(rest)) return null;
+    value = Number(rest);
+    if (!Number.isInteger(value) || value < -32768 || value > 32767) return null;
+    if (value === -32768) value = -32767;
+  }
+  if (value === 0) return null;
+  return {
+    mechanism: base === "lx" || base === "ly" ? "lstick" : "rstick",
+    vertical: base === "ly" || base === "ry",
+    positive: value > 0,
+    exact: value === -32767 || value === 32767,
+  };
+}
+
+/** Does `fn` point the same way as `want`, whatever it is spelled? `exact` is
+ *  deliberately NOT compared: `ly.-16384` is the down half of the left stick
+ *  just as `ly.min` is. Mirror of render_map.rs `points_same_way`. */
+function pointsSameWay(fn: string, want: Pointing): boolean {
+  const p = pointing(fn);
+  return (
+    p !== null &&
+    p.mechanism === want.mechanism &&
+    p.vertical === want.vertical &&
+    p.positive === want.positive
+  );
+}
+
+/** One PRESENTED control. Mirror of `ksx_core::diagonal::Held`. */
+type Held =
+  | {
+      kind: "diag";
+      diag: Diag;
+      mechanisms: Mechanism[];
+      /** INDICES into the original hold — the round trip is "put those strings
+       *  back", so a hand-written `ly.-16384 + lx.max` displays as the diagonal
+       *  and is stored byte for byte as it was written. */
+      members: number[];
+      exact: boolean;
+    }
+  | { kind: "plain"; member: number };
+
+/** How to PRESENT this hold.
+ *
+ *  **Per mechanism bucket, "contains both" — never exact-set-equality on the
+ *  whole step.** `down + forward + A` is the single most common macro step in
+ *  existence (the attack that ends a motion) and it folds: `A` is a passenger.
+ *  `down + forward + up` never folds — which diagonal would it be, and what the
+ *  pad publishes depends on the slot's `socd` policy, resolved at plan time,
+ *  which this page cannot see. */
+function fold(hold: string[]): Held[] {
+  const parsed = hold.map(pointing);
+  const folded: { diag: Diag; mechanism: Mechanism; members: number[]; exact: boolean }[] = [];
+  const consumed = hold.map(() => false);
+
+  for (const mechanism of MECHANISMS) {
+    const members: number[] = [];
+    parsed.forEach((p, i) => {
+      if (p !== null && p.mechanism === mechanism) members.push(i);
+    });
+    if (members.length === 0) continue;
+    // POLARITIES are counted, not bindings: a hold naming `dpad.down` twice is
+    // still one V−.
+    let vertical: boolean | null = null;
+    let horizontal: boolean | null = null;
+    let split = false;
+    let exact = true;
+    for (const i of members) {
+      const p = parsed[i]!;
+      exact = exact && p.exact;
+      if (p.vertical) {
+        if (vertical === null) vertical = p.positive;
+        else if (vertical !== p.positive) split = true;
+      } else {
+        if (horizontal === null) horizontal = p.positive;
+        else if (horizontal !== p.positive) split = true;
+      }
+    }
+    if (vertical === null || horizontal === null || split) continue;
+    for (const i of members) consumed[i] = true;
+    folded.push({ diag: diagFromHalves(vertical, horizontal), mechanism, members, exact });
+  }
+
+  // Coalesce: buckets that folded to the SAME diagonal are ONE presented
+  // control. That is the hat+stick double-binding every in-box template writes —
+  // one key on `dpad.down` AND `ly.min`.
+  const out: Held[] = [];
+  for (const diag of DIAGS) {
+    const hits = folded.filter((f) => f.diag === diag);
+    if (hits.length === 0) continue;
+    const members = hits.flatMap((h) => h.members).sort((a, b) => a - b);
+    out.push({
+      kind: "diag",
+      diag,
+      mechanisms: hits.map((h) => h.mechanism),
+      members,
+      exact: hits.every((h) => h.exact),
+    });
+  }
+  consumed.forEach((taken, i) => {
+    if (!taken) out.push({ kind: "plain", member: i });
+  });
+  return out;
+}
+
+/** The cell token for a diagonal column. Contains a `:`, which no function name
+ *  ever does, so a diagonal pick can never be mistaken for one — it is EXPANDED
+ *  to the pair before anything is stored. */
+function diagToken(m: Mechanism, d: Diag): string {
+  return `diag:${mechanismToken(m)}:${d}`;
+}
+
+function parseDiagToken(token: string): { mechanism: Mechanism; diag: Diag } | null {
+  if (!token.startsWith("diag:")) return null;
+  const [, mech, diag] = token.split(":");
+  const mechanism = MECHANISMS.find((m) => mechanismToken(m) === mech);
+  if (!mechanism || !DIAGS.includes(diag as Diag)) return null;
+  return { mechanism, diag: diag as Diag };
+}
+
+/** One position on the direction ring. */
+type RingPos =
+  | { kind: "card"; vertical: boolean; positive: boolean }
+  | { kind: "diag"; diag: Diag };
+
+/** **↑ ↖ ← ↙ ↓ ↘ → ↗** — numpad 8 7 4 1 2 3 6 9: walk the gate from up,
+ *  counter-clockwise, around the bottom, back to up.
+ *
+ *  Why this order and not numpad-ascending or compass-clockwise: MOTIONS BECOME
+ *  SHAPES. A piano roll is read as a picture, and this is the only ordering
+ *  where the picture *is* the motion — a quarter-circle forward is a staircase
+ *  sweeping right, a half-circle a straight 45° line, a dragon punch visibly a
+ *  hook. Cardinals land on the even indices so each diagonal sits literally
+ *  between its two parents. */
+const RING: RingPos[] = [
+  { kind: "card", vertical: true, positive: true },
+  { kind: "diag", diag: "ul" },
+  { kind: "card", vertical: false, positive: false },
+  { kind: "diag", diag: "dl" },
+  { kind: "card", vertical: true, positive: false },
+  { kind: "diag", diag: "dr" },
+  { kind: "card", vertical: false, positive: true },
+  { kind: "diag", diag: "ur" },
+];
+
+interface MacroColumn {
+  token: string;
+  glyph: string;
+  idcls: string;
+  title: string;
+  band: string;
+}
+
+/** Which band a control sits under. Mirror of render_map.rs `band_of`. */
+function bandOf(fn: string): string {
+  if (fn === "lt" || fn === "lb" || fn === "rb" || fn === "rt") return "SHOULDERS";
+  if (fn === "A" || fn === "B" || fn === "X" || fn === "Y") return "FACE";
+  if (fn === "guide" || fn === "back" || fn === "start") return "SYSTEM";
+  if (fn === "lthumb") return mechanismBand("lstick");
+  if (fn === "rthumb") return mechanismBand("rstick");
+  const m = mechanismOf(fn);
+  return m === null ? "SYSTEM" : mechanismBand(m);
+}
+
+/** The grid's columns for one persona: every non-direction control as itself,
+ *  and every direction MECHANISM as its eight-position ring. 25 zones → 37
+ *  columns. Mirror of render_map.rs `macro_columns`. */
+function macroColumns(slot: MapperSlot | null): MacroColumn[] {
+  const table = slot && isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
+  const out: MacroColumn[] = [];
+  const rung: Mechanism[] = [];
+  for (const [fn, label] of table) {
+    const mechanism = mechanismOf(fn);
+    if (mechanism === null) {
+      out.push({
+        token: fn,
+        glyph: label,
+        idcls: "maccolid",
+        title: `${legendLabel(fn, label)} (${fn})`,
+        band: bandOf(fn),
+      });
+      continue;
+    }
+    // The mechanism's whole ring is emitted at its FIRST direction zone; the
+    // other three zones of that mechanism are already in it.
+    if (rung.includes(mechanism)) continue;
+    rung.push(mechanism);
+    for (const pos of RING) {
+      if (pos.kind === "card") {
+        const fnName = mechanismFunction(mechanism, pos.vertical, pos.positive);
+        out.push({
+          token: fnName,
+          glyph: cardinalGlyph(pos.vertical, pos.positive),
+          idcls: "maccolid card",
+          title:
+            `${mechanismGroup(mechanism)}${cardinalGlyph(pos.vertical, pos.positive)} · ` +
+            `${cardinalWords(pos.vertical, pos.positive)} · ` +
+            `numpad ${cardinalNumpad(pos.vertical, pos.positive)} · holds ${fnName}`,
+          band: mechanismBand(mechanism),
+        });
+      } else {
+        const [up, right] = DIAG_HALVES[pos.diag];
+        out.push({
+          token: diagToken(mechanism, pos.diag),
+          glyph: DIAG_GLYPH[pos.diag],
+          idcls: "maccolid diag",
+          title:
+            `${mechanismGroup(mechanism)}${DIAG_GLYPH[pos.diag]} · ${DIAG_WORDS[pos.diag]} ` +
+            `(${DIAG_MOVELIST[pos.diag]}) · numpad ${DIAG_NUMPAD[pos.diag]} · one pick, and ` +
+            `ksx writes ${mechanismFunction(mechanism, true, up)} + ` +
+            `${mechanismFunction(mechanism, false, right)}`,
+          band: mechanismBand(mechanism),
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/** What a column is called in a sentence. Mirror of `column_name`. */
+function columnName(slot: MapperSlot | null, column: MacroColumn): string {
+  const d = parseDiagToken(column.token);
+  if (d) return `${mechanismGroup(d.mechanism)}${DIAG_GLYPH[d.diag]} (${DIAG_WORDS[d.diag]})`;
+  const m = mechanismOf(column.token);
+  if (m !== null) return `${mechanismGroup(m)}${column.glyph} (${column.token})`;
+  const table = slot && isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
+  const def = table.find(([fn]) => fn.toLowerCase() === column.token.toLowerCase());
+  return def ? `${legendLabel(def[0], def[1])} (${def[0]})` : column.token;
 }
 
 /** Every mechanism THIS SLOT's own bound direction keys drive, in the order a
@@ -2154,27 +2651,55 @@ function motionMechanism(slot: MapperSlot | null): Mechanism {
   return drivenMechanisms(slot)[0] ?? "dpad";
 }
 
-/** The four directional function names, on that mechanism. */
-function directionFns(m: Mechanism): Record<"up" | "down" | "left" | "right", string> {
-  if (m === "dpad") {
-    return { up: "dpad.up", down: "dpad.down", left: "dpad.left", right: "dpad.right" };
-  }
-  const axis = m === "lstick" ? ["lx", "ly"] : ["rx", "ry"];
+/** The four directional function names, on that mechanism.
+ *
+ *  ⚠ THE SIGN. "Up" on a stick is `ly.max`, NOT `ly.min` — XInput's positive Y
+ *  is UP, and legacy binds Up to `AXIS_MAX`. Getting it backwards yields an ↖
+ *  that looks right in every reader here and does nothing in the game, which is
+ *  the worst failure this page can produce. There is exactly one place that
+ *  decides it (`mechanismFunction`, which `socd::pointing` is pinned against),
+ *  and this delegates to it rather than re-deriving the axis names. */
+function directionFns(m: Mechanism): Record<Dir, string> {
   return {
-    up: `${axis[1]}.max`,
-    down: `${axis[1]}.min`,
-    left: `${axis[0]}.min`,
-    right: `${axis[0]}.max`,
+    up: mechanismFunction(m, true, true),
+    down: mechanismFunction(m, true, false),
+    left: mechanismFunction(m, false, false),
+    right: mechanismFunction(m, false, true),
   };
 }
+
+type Dir = "up" | "down" | "left" | "right";
+
+/** The eight positions of the gate, as direction sets — clockwise from →.
+ *  A full rotation is this list; every other motion is an arc of it. */
+const GATE: Dir[][] = [
+  ["right"],
+  ["down", "right"],
+  ["down"],
+  ["down", "left"],
+  ["left"],
+  ["up", "left"],
+  ["up"],
+  ["up", "right"],
+];
+
+/** The same walk the other way round, from ←. */
+const GATE_MIRRORED: Dir[][] = GATE.map((dirs) =>
+  dirs.map((d) => (d === "left" ? "right" : d === "right" ? "left" : d)),
+);
 
 /** A motion as DIRECTIONS PER STEP — the shape of the thing, before it knows
  *  which mechanism will express it. The two-name entries are the whole lesson.
  *
+ *  ALL FOUR DIAGONALS ARE HERE, because the motions are why they exist: a
+ *  half-circle needs ↙ AND ↘, a dragon punch needs ↘ specifically, and a 360
+ *  (the spinning piledriver) walks all eight positions of the gate — which is
+ *  the motion that proves recognition and expansion agree, because every one of
+ *  its four diagonal steps must read back as its own diagonal.
+ *
  *  "Forward" is right, the way a move list writes it for a character on the
- *  left; the mirrored spellings are offered beside them because player 2 is
- *  not an edge case. */
-type Dir = "up" | "down" | "left" | "right";
+ *  left; the mirrored spellings are offered beside them because player 2 is not
+ *  an edge case. */
 const MOTIONS: Record<string, { label: string; steps: Dir[][] }> = {
   qcf: { label: "quarter-circle forward (↓ ↘ →)", steps: [["down"], ["down", "right"], ["right"]] },
   qcb: { label: "quarter-circle back (↓ ↙ ←)", steps: [["down"], ["down", "left"], ["left"]] },
@@ -2188,6 +2713,10 @@ const MOTIONS: Record<string, { label: string; steps: Dir[][] }> = {
   },
   dpf: { label: "dragon punch forward (→ ↓ ↘)", steps: [["right"], ["down"], ["down", "right"]] },
   dpb: { label: "dragon punch back (← ↓ ↙)", steps: [["left"], ["down"], ["down", "left"]] },
+  // The full circle. Both facings, because a 360 is a rotation and which way
+  // round it goes is the player's, not ours.
+  spdf: { label: "360 forward (→ ↘ ↓ ↙ ← ↖ ↑ ↗)", steps: GATE },
+  spdb: { label: "360 back (← ↙ ↓ ↘ → ↗ ↑ ↖)", steps: GATE_MIRRORED },
 };
 
 /** The sentence above the motion buttons: which mechanism they will write, and
@@ -2196,8 +2725,9 @@ export function macroMotionLineFor(slot: MapperSlot | null): string {
   const driven = drivenMechanisms(slot);
   const pick = motionMechanism(slot);
   const tail =
-    "Each one appends its steps to the macro below — the MIDDLE step of a quarter-circle " +
-    "holds two directions at once, which is what a diagonal is.";
+    "Each one appends its steps to the macro below — the MIDDLE step of a quarter-circle is " +
+    "the diagonal, and a 360 is four of them. You can tick any of them yourself in that " +
+    "group's ↖ ↗ ↙ ↘ columns.";
   if (driven.length === 0) {
     return (
       `These write ${mechanismLabel(pick)} — this preset binds no direction keys of its own, ` +
@@ -2238,12 +2768,23 @@ export function macroInsertMotion(name: string): string | null {
   const shape = motion.steps
     .map((dirs) => holdText(slot, dirs.map((d) => fns[d])))
     .join(" · ");
-  const chord = motion.steps.findIndex((d) => d.length > 1);
+  // Every diagonal step, by its step number — a 360 has four of them, and the
+  // point of saying so is that each one is ONE step, not two.
+  const diagonals = motion.steps
+    .map((dirs, i) => [dirs, i] as const)
+    .filter(([dirs]) => dirs.length > 1);
+  const [firstDirs, firstAt] = diagonals[0];
+  const stored = firstDirs.map((d) => fns[d]).join(" + ");
+  const which =
+    diagonals.length === 1
+      ? `Step ${first + firstAt + 1} is the diagonal`
+      : `Steps ${diagonals.map(([, i]) => first + i + 1).join(", ")} are the diagonals`;
   return (
     `Added ${motion.steps.length} steps for the ${motion.label}, at 50 ms each, on ` +
-    `${mechanismLabel(m)}: ${shape}. Step ${first + chord + 1} holds TWO controls at once — ` +
-    "that is the diagonal, and it is one step, not two. Add the attack button as a final " +
-    "step, then press Save macro."
+    `${mechanismLabel(m)}: ${shape}. ${which} — ONE step each, the first stored as ` +
+    `${stored}, which is what a diagonal is in the file. You can tick the same cells ` +
+    "yourself in that group's ↖ ↗ ↙ ↘ columns. Add the attack button as a final step, " +
+    "then press Save macro."
   );
 }
 
@@ -2455,48 +2996,84 @@ export function macroTomlText(): string {
 
 // ── Derivations (mirror render_map.rs) ─────────────────────────────────────
 
+/** The glyph row: ARROWS ONLY, one line, no digits — it is a screen, and
+ *  screens speak arrows in this genre. The numpad digit lives in the tooltip
+ *  and the ring line, where it is a lookup key rather than a label. */
 function macroColsFor(slot: MapperSlot | null): MacroCol[] {
-  const table = slot && isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
-  return table.map(([fn, label, idk]) => ({
-    fn,
-    id: label,
-    // UNIFORM, deliberately: a header row of coloured discs at column width is
-    // noise rather than information. The identity colours earn their place on
-    // the controller art (where they map to physical buttons) and in the
-    // legend beside it — here the column is NAMED, not badged.
-    idcls: "maccolid",
-    title: `${legendLabel(fn, label)} (${fn})`,
+  return macroColumns(slot).map((c) => ({
+    fn: c.token,
+    id: c.glyph,
+    // UNIFORM colour, deliberately: a header row of coloured discs at column
+    // width is noise rather than information. The identity colours earn their
+    // place on the controller art (where they map to physical buttons) and in
+    // the legend beside it — here the column is NAMED, not badged.
+    // `card`/`diag` are TYPE, not palette.
+    idcls: c.idcls,
+    title: c.title,
   }));
 }
 
-/** FIX 1 — WHAT THIS ROW HOLDS, in words, beside the row.
+/** The GROUP BAND above the glyph row — one cell per run of columns belonging
+ *  to the same part of the pad, spanning it. */
+function macroGroupsFor(slot: MapperSlot | null): MacroGroup[] {
+  const runs: { label: string; span: number }[] = [];
+  for (const column of macroColumns(slot)) {
+    const last = runs[runs.length - 1];
+    if (last && last.label === column.band) last.span += 1;
+    else runs.push({ label: column.band, span: 1 });
+  }
+  // A CLASS, never an inline `grid-column`: forma's CSP nonce-locks style-src
+  // (ledger #13), and the span is a closed set anyway.
+  return runs.map((r) => ({ label: r.label, cls: `macgrp g${r.span}` }));
+}
+
+/** How one PRESENTED control is named on this pad. */
+function heldLabel(slot: MapperSlot | null, hold: string[], held: Held): string {
+  if (held.kind === "diag") {
+    return `${held.mechanisms.map((m) => mechanismGroup(m).trim()).join(" + ")} ${DIAG_GLYPH[held.diag]}`;
+  }
+  const table = slot && isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
+  const f = hold[held.member];
+  const def = table.find(([fn]) => fn.toLowerCase() === f.toLowerCase());
+  return def ? legendLabel(def[0], def[1]) : f;
+}
+
+/** WHAT THIS ROW HOLDS, in words, beside the row — "D-pad ↘ + A".
  *
- *  The piano roll's one unteachable fact is that a row is a CHORD: everything
- *  ticked in it is held together, for that step's duration. Victor lost an
- *  evening to a "hadouken" whose rows were ↓ then → then X, because a diagonal
- *  is not a thing you bind — it IS down+forward held at once, i.e. one row with
- *  two cells lit. Lit cells 12 columns apart do not say that; this line does,
- *  on every row, without being asked.
+ *  This is where the model is TAUGHT. Victor lost an evening to a "hadouken"
+ *  whose rows were ↓ then → then X, because a diagonal is not a thing you bind —
+ *  it IS down+forward held at once. Now it IS a thing you bind, in the piano;
+ *  the row reads it back as one control (which is what the player means) and
+ *  `holdExpand` says beside it exactly which two names the file carries.
  *
  *  Named the way THIS pad names it (so it matches the column headers and the
  *  art above), and `+` between them because that is the notation every player
  *  already reads. */
 function holdText(slot: MapperSlot | null, hold: string[]): string {
   if (hold.length === 0) return "(nothing — neutral gap)";
-  const table = slot && isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
-  return hold
-    .map((f) => {
-      const def = table.find(([fn]) => fn.toLowerCase() === f.toLowerCase());
-      return def ? legendLabel(def[0], def[1]) : f;
-    })
+  return fold(hold)
+    .map((h) => heldLabel(slot, hold, h))
     .join(" + ");
 }
 
-/** The readout's own class: a row holding TWO OR MORE controls is the shape
- *  the grid cannot teach, so it is the one that gets the accent. */
+/** THE LEDGER LINE: every diagonal on this row spelled as the pair the file
+ *  stores — `↘ = dpad.down + dpad.right`. The presentation says "one control",
+ *  the storage says "two holds", and this says both at once so nobody has to
+ *  open the TOML to find out what a pick wrote. */
+function holdExpand(hold: string[]): string {
+  return fold(hold)
+    .filter((h): h is Extract<Held, { kind: "diag" }> => h.kind === "diag")
+    .map((h) => `${DIAG_GLYPH[h.diag]} = ${h.members.map((i) => hold[i]).join(" + ")}`)
+    .join(" · ");
+}
+
+/** The readout's own class, over PRESENTED controls rather than stored ones: a
+ *  diagonal is ONE control, so `↓ + →` no longer reads as two. The accent is
+ *  for a row that really does hold several things at once. */
 function holdCls(hold: string[]): string {
-  if (hold.length === 0) return "machold none";
-  return hold.length > 1 ? "machold both" : "machold";
+  const n = fold(hold).length;
+  if (n === 0) return "machold none";
+  return n > 1 ? "machold both" : "machold";
 }
 
 function macroRowsFor(mac: MacroView, slot: MapperSlot | null): MacroRow[] {
@@ -2512,6 +3089,8 @@ function macroRowsFor(mac: MacroView, slot: MapperSlot | null): MacroRow[] {
         `(the engine runs it for ${effectiveMs(step)} ms)`,
       hold: holdText(slot, step.hold),
       holdcls: holdCls(step.hold),
+      exp: holdExpand(step.hold),
+      expcls: holdExpand(step.hold) === "" ? "macexp off" : "macexp",
       warn,
       warntitle: stepWarningLong(step),
       warncls: warn === "" ? "macwarn off" : "macwarn",
@@ -2527,19 +3106,78 @@ function macroRowsFor(mac: MacroView, slot: MapperSlot | null): MacroRow[] {
   });
 }
 
+/** The matrix, FLAT: `steps × 37` cells in row-major order.
+ *
+ *  A step holding `ly.min` + `lx.max` lights the LS `↘` cell — not two stray
+ *  ticks eight columns apart. That is the whole point, and it works on a
+ *  hand-written step nobody made through this page. The two cardinals still
+ *  show a subordinate tick (`part`), because pretending they are not in the
+ *  file would be the lens lying about the storage. */
 function macroCellsFor(mac: MacroView, slot: MapperSlot | null): MacroCell[] {
-  const table = slot && isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
+  const columns = macroColumns(slot);
   const cells: MacroCell[] = [];
   mac.steps.forEach((step, i) => {
-    for (const [fn, label] of table) {
-      const held = step.hold.some((f) => f.toLowerCase() === fn.toLowerCase());
+    const view = fold(step.hold);
+    const memberOf = new Map<number, Diag>();
+    const lit: { mechanism: Mechanism; diag: Diag; exact: boolean }[] = [];
+    for (const held of view) {
+      if (held.kind !== "diag") continue;
+      for (const m of held.members) memberOf.set(m, held.diag);
+      for (const mechanism of held.mechanisms) {
+        lit.push({ mechanism, diag: held.diag, exact: held.exact });
+      }
+    }
+    for (const column of columns) {
+      const d = parseDiagToken(column.token);
+      let state: "off" | "on" | "part" = "off";
+      let partOf: Diag | null = null;
+      let approx = false;
+      if (d) {
+        const hit = lit.find((l) => l.mechanism === d.mechanism && l.diag === d.diag);
+        if (hit) {
+          state = "on";
+          approx = !hit.exact;
+        }
+      } else {
+        const want = pointing(column.token);
+        if (want) {
+          // Matched by WHERE IT POINTS, not by spelling: `ly.-16384` is the
+          // down half of this pad's left stick however the file spells it.
+          const at = step.hold.findIndex((f) => pointsSameWay(f, want));
+          if (at >= 0) {
+            const diag = memberOf.get(at);
+            if (diag === undefined) state = "on";
+            else {
+              state = "part";
+              partOf = diag;
+            }
+          }
+        } else if (step.hold.some((f) => f.toLowerCase() === column.token.toLowerCase())) {
+          state = "on";
+        }
+      }
+      const name = columnName(slot, column);
+      let title: string;
+      if (state === "on" && approx) {
+        title = `step ${i + 1} holds ${name} — as written, not at full deflection (${step.hold.join(" + ")})`;
+      } else if (state === "on") {
+        title = `step ${i + 1} holds ${name}`;
+      } else if (state === "part" && partOf !== null) {
+        const g = DIAG_GLYPH[partOf];
+        title = `step ${i + 1} holds ${name} as half of ${g} — the ${g} column beside it is the pick`;
+      } else {
+        title = `step ${i + 1} does not hold ${name}`;
+      }
       cells.push({
-        cls: `maccell${held ? " on" : ""}${macroStep === i ? " inrow" : ""}`,
-        cell: `${i}|${fn}`,
-        mark: held ? "●" : "",
-        title:
-          `step ${i + 1} ${held ? "holds" : "does not hold"} ` +
-          `${legendLabel(fn, label)} (${fn})`,
+        cls:
+          "maccell" +
+          (state === "on" ? " on" : state === "part" ? " part" : "") +
+          (approx ? " approx" : "") +
+          (d ? " isdiag" : "") +
+          (macroStep === i ? " inrow" : ""),
+        cell: `${i}|${column.token}`,
+        mark: state === "on" ? "●" : state === "part" ? "·" : "",
+        title,
       });
     }
   });
@@ -2669,6 +3307,7 @@ function refreshMacro(): void {
     // sequence the preset does not hold.
     setMacroTabs(p ? macroTabsForNone(p, slot ? slot.number : p.selected) : []);
     setMacroCols(macroColsFor(slot));
+    setMacroGroups(macroGroupsFor(slot));
     setMacroRows([]);
     setMacroCells([]);
     setMacroGridCls("macgrid empty");
@@ -2679,6 +3318,7 @@ function refreshMacro(): void {
         : "no macro selected",
     );
     setMacroRuleLine(MACRO_RULE_LINE);
+    setMacroRingLine(MACRO_RING_LINE);
     setMacroPolicyLine("");
     setMacroTurboLine("");
     setMacroTurboValue("");
@@ -2704,6 +3344,7 @@ function refreshMacro(): void {
     return;
   }
   setMacroCols(macroColsFor(slot));
+  setMacroGroups(macroGroupsFor(slot));
   setMacroRows(macroRowsFor(mac, slot));
   setMacroCells(macroCellsFor(mac, slot));
   setMacroTabs(p ? macroTabsFor(p, mac, slot ? slot.number : p.selected) : []);
@@ -2715,6 +3356,7 @@ function refreshMacro(): void {
       (mac.disabled ? " · DISABLED (keeps its steps and its trigger; never runs)" : ""),
   );
   setMacroRuleLine(MACRO_RULE_LINE);
+  setMacroRingLine(MACRO_RING_LINE);
   setMacroPolicyLine(
     `on release: ${mac.on_release} · retrigger: ${mac.retrigger} · ` +
       `interrupt: ${mac.interrupt} · repeat: ${mac.repeat || "once"}` +
@@ -3442,8 +4084,11 @@ export function MapIsland() {
           "p",
           { class: "macconcept" },
           "A step holds everything you tick in that row AT ONCE — a diagonal ",
-          "is ONE step holding ↓ and →, not two steps. Every row says what it ",
-          "holds, in words, beside its number.",
+          "is ONE step holding ↓ and →, not two steps. So pick the diagonal: ",
+          "every direction group has ↖ ↗ ↙ ↘ of its own, and ticking ↘ stores ",
+          "dpad.down + dpad.right, which is what a diagonal has always been in ",
+          "the file. Every row says what it holds, in words, beside its number, ",
+          "and spells out the pair it wrote.",
         ),
         // What this card IS, before any of its controls. A first-time reader
         // should not have to open docs/INPUT-TRANSFORMS.md to use it.
@@ -3453,8 +4098,8 @@ export function MapIsland() {
           "A MACRO is a timed sequence the pad plays by itself: each row below ",
           "is one step, the columns are this pad's controls, and a step holds ",
           "whatever its row has filled in — for its own duration — before the ",
-          "next one starts. A quarter-circle is three steps: ↓, then ↓ and → ",
-          "together on ONE row, then →. A TRIGGER is the ",
+          "next one starts. A quarter-circle is three steps: ↓, then ↘ (which ",
+          "is ↓ and → together on ONE row), then →. A TRIGGER is the ",
           "panel key that STARTS the macro: bind one in the Trigger section at ",
           "the bottom, and from then on that single key press plays the whole ",
           "sequence. The two are separate on purpose — the sequence lives in ",
@@ -3584,6 +4229,33 @@ export function MapIsland() {
             },
             "DP ← · ← · ↓ · ↓+←",
           ),
+          // THE FULL CIRCLE — the motion that needs all four diagonals, and the
+          // reason they are first-class rather than just ↘. Eight steps, one
+          // per position of the gate, four of them diagonals.
+          h(
+            "button",
+            {
+              class: "btn btn-mini macmot",
+              "data-macmotion": "spdf",
+              type: "button",
+              title:
+                "append a full 360 (spinning piledriver), clockwise from →: " +
+                "→ ↘ ↓ ↙ ← ↖ ↑ ↗ — eight steps, four of them diagonals",
+            },
+            "360 → · → ↘ ↓ ↙ ← ↖ ↑ ↗",
+          ),
+          h(
+            "button",
+            {
+              class: "btn btn-mini macmot",
+              "data-macmotion": "spdb",
+              type: "button",
+              title:
+                "append a full 360 the other way round, from ←: " +
+                "← ↙ ↓ ↘ → ↗ ↑ ↖ — eight steps, four of them diagonals",
+            },
+            "360 ← · ← ↙ ↓ ↘ → ↗ ↑ ↖",
+          ),
           h("p", { class: "macmotnote" }, () => macroMotionLine()),
         ),
         // The grid. Two aligned columns: the row bar (step number, duration,
@@ -3599,18 +4271,34 @@ export function MapIsland() {
             createList(
               () => macroRows(),
               (r) =>
-                r.n + "|" + r.cls + "|" + r.dur + "|" + r.warn + "|" + r.hold + "|" + r.holdcls,
+                r.n +
+                "|" +
+                r.cls +
+                "|" +
+                r.dur +
+                "|" +
+                r.warn +
+                "|" +
+                r.hold +
+                "|" +
+                r.holdcls +
+                "|" +
+                r.exp,
               (r) =>
                 h(
                   "div",
                   { class: r.cls, title: r.durtitle },
                   h("span", { class: "macnum" }, r.n),
-                  // FIX 1: WHAT THIS ROW HOLDS, before its timing — reading
-                  // the grid must never mean decoding which of 25 columns are
-                  // lit. `machold both` is the accent for the row that holds
-                  // more than one control, because that row is the one the
-                  // piano roll cannot teach on its own.
+                  // WHAT THIS ROW HOLDS, before its timing — reading the grid
+                  // must never mean decoding which of 37 columns are lit. A
+                  // diagonal reads as ONE control here, because that is what
+                  // was picked and what it means; `machold both` is the accent
+                  // for a row that really does hold several things at once.
                   h("span", { class: r.holdcls }, r.hold),
+                  // …and THE LEDGER beside it: the two names the file carries
+                  // for that diagonal. The lens is honest only if the storage
+                  // is visible without opening the TOML.
+                  h("span", { class: r.expcls, title: r.exp }, r.exp),
                   h("span", { class: "macdur" }, r.dur),
                   // FLAGGED INLINE, in amber, with the reason — never a
                   // silent accept and never a silent rewrite (§0.2). The
@@ -3657,6 +4345,19 @@ export function MapIsland() {
           h(
             "div",
             { class: "macscroll" },
+            // v16: the GROUP BAND. Not decoration — it fixes a pre-existing
+            // defect: the header used to carry three identical direction runs
+            // told apart only by a tooltip, and with eight columns per group
+            // instead of four that would be three identical EIGHTS.
+            h(
+              "div",
+              { class: "macgrps" },
+              createList(
+                () => macroGroups(),
+                (g) => g.label + "|" + g.cls,
+                (g) => h("span", { class: g.cls }, g.label),
+              ),
+            ),
             h(
               "div",
               { class: "maccols" },
@@ -3682,6 +4383,11 @@ export function MapIsland() {
             ),
           ),
         ),
+        // The ring, and what a diagonal pick WRITES — stated once, under the
+        // grid it describes, and SSR'd like everything else: a page with no
+        // JavaScript cannot tick a cell, but it can read what the columns mean
+        // and hand-write the pair into the TOML block below.
+        h("p", { class: "macring" }, () => macroRingLine()),
         h("p", { class: "macrule" }, () => macroRuleLine()),
         // The step editor: everything here writes the DRAFT, so it only
         // exists with JavaScript (`.macedit` is display:none until map.ts

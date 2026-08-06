@@ -32,6 +32,7 @@ upstream the report/PR).
 | 15 | Good news, and the pattern that made the v6 mapper affordable: **a per-item member read can carry a whole interaction**, not just presentation. The legend's ✕ clear accelerator is `h("span", { class: "lclear", "data-clear": l.fn, title: l.cleartitle }, l.clear)` — a bare `param.field` per #11, so SSR emits it and the client re-derives it per poll, and `map.ts` reads `data-clear` by delegation. Empty string = CSS-hidden, which is how "only offer the ✕ where clearing does something" costs zero shows. Same trick disables controls: `cls` carries `z-dead`/`l-dead` instead of a `disabled` attribute (which would swallow the click that owes the user an explanation) | confirms #11's contract holds for interaction attrs too — worth including in the upstream ask | `MapIsland.ts` legend list; `render_map.rs` `legend_rows` |
 | 16 | Ledger #13(b)'s patched show seam held under a much heavier load: the v6 mapper nests shows THREE deep inside a re-toggled branch (`modalOpen` → `modalListening` / `modalBound` / `modalConflict`) and re-toggles them dozens of times per session with no stale prompts or empty boxes. The `__ksxShowBranch` unowned-root rewrite is the reason; without it this design would have been unbuildable | evidence for the upstream fix's shape (**OURS-TO-SEND**, unchanged) | `build.mjs` ledger-#13 patch |
 | 17 | Good news with a catch, and what made v9's no-JavaScript mapper buildable: **`...CONST.map((x) => h(…))` spreads are EXPANDED AT COMPILE TIME** into static markup (`extractFileConstants` → `emitSpreadChild` → `substituteProperties`), so a 122-option `<select>` can be authored once and rendered on all 25 legend rows without a nested list (which the item-body seam does not offer) and without 122 literals per select. Three constraints, all silent when broken: (a) the constants are read from the **root `*Page` file only** — the same blind spot as #9 — and from plain top-level `const` declarations, so `export const` is invisible (declare bare, `export { … }` separately, import back from the island: single-sourced, unlike the signals); (b) substitution reaches **children only, not attribute values** — `h("option", { value: x.k }, x.t)` compiles the text but leaves `value` as an EMPTY dyn-attr slot, i.e. `<option value="">` on every option, which for a form is silently wrong data rather than missing decoration (we render `h("option", null, x.k)` and lean on HTML's option-text-is-the-value rule); (c) an unexpandable spread falls back to an ISLAND placeholder — the tell is the build line, `24 islands` where the page has one | **OURS-TO-SEND**: document the pattern as supported; extend substitution to attribute values (or warn); read file constants from island files too | `studio-ui/src/MapPage.ts` key tables; `MapIsland.ts` legend row form |
+| 18 | Good news, and the reason v16's diagonal grid cost nothing structurally: **a list can grow a NEW SIBLING list without touching the show seam at all.** The macro grid's group band is a fourth `createList` inside `.macscroll` (`list:macroGroups:array`), and because 0.2.0 names lists from their binding (#3), adding it in the middle of the document renamed nothing — the only edit was one constant and one line in the seam-order assertion, versus #14's four-file cost for a single `createShow`. It also confirms #11/#15 one more time under a 37-column grid: `{ class: g.cls }` spans the band by CLASS (`macgrp g9`) rather than an inline `grid-column`, which #13(a) would have eaten anyway | reinforces #4's ask by CONTRAST: named list slots are already what named show slots should be | `render_map.rs` `LIST_SLOT_MACRO_GROUPS`; `MapIsland.ts` `.macgrps` |
 
 ## Details for filing — mechanism, upstream location, local repro
 
@@ -257,6 +258,30 @@ what you pick is character-for-character what the preset file will hold.)
 the build's own line gives it away: `IR emitted (real): map.ir (13362 bytes,
 24 islands)` for a page with exactly one island was the first symptom. Worth
 a warning upstream; the byte count and island count are the only signal.
+
+### #18 — a new sibling list is free; a new show is not (v16, 2026-08-06)
+Diagonals-as-presentation replaced the macro grid's 25 columns with 37 (every
+direction group is now its whole `↑ ↖ ← ↙ ↓ ↘ → ↗` ring) and added a group band
+above the glyph row. The band is a fourth `createList` inserted in the MIDDLE of
+`.macscroll`'s children.
+
+Under #4's positional show seam that insertion would have renumbered every show
+after it. Under 0.2.0's binding-derived list names (#3) it cost exactly two
+lines: one `LIST_SLOT_MACRO_GROUPS` constant and one entry in the order the
+layout test asserts. The lists around it — `macroCols`, `macroCells` — kept
+their names because those names come from `() => macroCols()`, not from where
+they sit.
+
+That is the same feature, priced twice, in the same file: **#14 measured what a
+show costs; this measures what a NAMED slot costs.** It is the strongest
+argument we have for #4, because it is not hypothetical — it is the identical
+edit in the identical page with the identical author.
+
+Second confirmation, for #11/#15: the band spans its columns by CLASS
+(`macgrp g9`, with `.macgrp.g9 { grid-column: span 9 }` in the stylesheet)
+rather than an inline `grid-column`. That was not a style choice — #13(a) means
+an inline `style` attribute would simply not survive the CSP — so per-item
+member reads carrying LAYOUT, not just interaction, is now load-bearing too.
 
 ### #16 — the #13(b) patch held under three-deep nested shows
 The v6 learn modal nests shows three levels inside a re-toggled branch

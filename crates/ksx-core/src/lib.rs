@@ -21,7 +21,10 @@
 //!   interruption policies; the scheduler that runs them lives in [`engine`]
 //! - [`slot`] — [`SlotSpec`] and the 13-variant [`InvalidationReason`] taxonomy
 //! - [`socd`] — [`Socd`]: SOCD cleaning, generated as chords rather than as a
-//!   new engine rule
+//!   new engine rule; also [`socd::pointing`], the ONE definition of "where
+//!   does this binding point" that opposition and diagonals are both built on
+//! - [`diagonal`] — [`Diag`]: diagonals as a PRESENTATION over the stored pair.
+//!   Nothing in the engine calls it; the stored model is unchanged
 //! - [`templates`] — in-box preset [`Template`]s for standard panels: the
 //!   zero-mapping out-of-box experience (`docs/MAPPER-UX.md` commandment 9)
 //! - [`persona`] — [`Persona`]: which controller a slot presents itself as
@@ -29,6 +32,7 @@
 //! - [`escape`] — [`EscapeDetector`], emergency-escape detection (policy lives upstream)
 
 pub mod device;
+pub mod diagonal;
 pub mod engine;
 pub mod escape;
 pub mod key;
@@ -41,6 +45,7 @@ pub mod socd;
 pub mod templates;
 
 pub use device::{DeviceId, KeyEvent};
+pub use diagonal::{Diag, Held};
 pub use engine::{Deltas, Engine, EngineTables, PadDelta, ResolvedSlot};
 pub use escape::{Escape, EscapeDetector};
 pub use key::Key;
@@ -56,5 +61,5 @@ pub use pad::{
 pub use persona::{PadBackend, Persona, UnknownPersona};
 pub use preset::{Binding, Chord, Macros, Preset, TurboBinding};
 pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS, MAX_XINPUT_SLOTS};
-pub use socd::{OpposingPair, Socd, UnknownSocd};
+pub use socd::{DirMechanism, OpposingPair, Pointing, Socd, UnknownSocd};
 pub use templates::{Template, TemplateError, MAX_TEMPLATE_PLAYERS, TEMPLATES};

@@ -120,8 +120,95 @@ impl OpposingPair {
     }
 }
 
+/// Which CONTROL a directional binding drives.
+///
+/// A pad has three ways to say "right", and a game reads whichever one it was
+/// written for. Buttons and triggers have no mechanism — they are read the same
+/// way whatever the preset does — so they never produce a mismatch.
+///
+/// This is the one definition in ksx: `ksx_config::validate` re-exports it for
+/// `Issue::MacroHoldsOtherMechanism`, [`crate::diagonal`] buckets by it, and the
+/// two ksx-studio mirrors are pinned against it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DirMechanism {
+    Dpad,
+    LeftStick,
+    RightStick,
+}
+
+impl DirMechanism {
+    /// Canonical order — dpad, then left stick, then right stick. What a
+    /// coalesced diagonal lists its mechanisms in.
+    pub const ALL: &'static [DirMechanism] = &[
+        DirMechanism::Dpad,
+        DirMechanism::LeftStick,
+        DirMechanism::RightStick,
+    ];
+
+    /// The mechanism this binding drives, if it points anywhere at all.
+    pub fn of(binding: Binding) -> Option<Self> {
+        pointing(binding).map(|p| p.mechanism)
+    }
+
+    /// How a report names it. Wording is contractual: it appears inside
+    /// `Issue::MacroHoldsOtherMechanism`'s message and on the mapper page.
+    pub const fn describe(self) -> &'static str {
+        match self {
+            DirMechanism::Dpad => "the dpad",
+            DirMechanism::LeftStick => "the left stick (lx/ly)",
+            DirMechanism::RightStick => "the right stick (rx/ry)",
+        }
+    }
+}
+
+/// WHERE one binding points: which mechanism, which axis of it, which way.
+///
+/// "Positive" is right for a horizontal control and UP for a vertical one —
+/// which is why `Axis::Y` reads its sign directly (legacy binds Up to
+/// `AXIS_MAX` and Down to `AXIS_MIN`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Pointing {
+    pub mechanism: DirMechanism,
+    /// `DPAD_V` | `AXIS_Y` | `AXIS_RY`.
+    pub vertical: bool,
+    /// Right for a horizontal control, UP for a vertical one.
+    pub positive: bool,
+}
+
+/// Where `binding` points, or `None` when it points nowhere.
+///
+/// **The one function.** `opposes` is built on it, and so is
+/// [`crate::diagonal::fold`] — which is the whole reason a diagonal can never
+/// disagree with SOCD or with [`crate::Interrupt::Opposing`]. A CENTRED AXIS IS
+/// NEVER A DIRECTION (`ksx_config::validate` has the same rule), so it is never
+/// half of a diagonal either.
+pub const fn pointing(binding: Binding) -> Option<Pointing> {
+    const fn p(mechanism: DirMechanism, vertical: bool, positive: bool) -> Option<Pointing> {
+        Some(Pointing {
+            mechanism,
+            vertical,
+            positive,
+        })
+    }
+    match binding {
+        Binding::Dpad(DpadDirection::Left) => p(DirMechanism::Dpad, false, false),
+        Binding::Dpad(DpadDirection::Right) => p(DirMechanism::Dpad, false, true),
+        Binding::Dpad(DpadDirection::Down) => p(DirMechanism::Dpad, true, false),
+        Binding::Dpad(DpadDirection::Up) => p(DirMechanism::Dpad, true, true),
+        Binding::Axis { value: 0, .. } => None, // centre drives no direction
+        Binding::Axis { axis, value } => match axis {
+            Axis::X => p(DirMechanism::LeftStick, false, value > 0),
+            Axis::Y => p(DirMechanism::LeftStick, true, value > 0),
+            Axis::Rx => p(DirMechanism::RightStick, false, value > 0),
+            Axis::Ry => p(DirMechanism::RightStick, true, value > 0),
+        },
+        Binding::Button(_) | Binding::Trigger(_) | Binding::Consume => None,
+    }
+}
+
 /// Control ids. Horizontal and vertical halves are separate controls, because
-/// SOCD treats them differently and a key can be bound to both.
+/// SOCD treats them differently and a key can be bound to both. Derived from
+/// [`Pointing`] so there is still only one relation.
 const DPAD_H: u8 = 0;
 const DPAD_V: u8 = 1;
 const AXIS_X: u8 = 2;
@@ -133,28 +220,20 @@ const fn is_vertical(control: u8) -> bool {
     matches!(control, DPAD_V | AXIS_Y | AXIS_RY)
 }
 
-/// `(control, positive)` for a binding that points somewhere, else `None`.
-/// "Positive" is right for a horizontal control and UP for a vertical one —
-/// which is why `Axis::Y` reads its sign directly (legacy binds Up to
-/// `AXIS_MAX` and Down to `AXIS_MIN`).
-fn direction(binding: Binding) -> Option<(u8, bool)> {
-    match binding {
-        Binding::Dpad(DpadDirection::Left) => Some((DPAD_H, false)),
-        Binding::Dpad(DpadDirection::Right) => Some((DPAD_H, true)),
-        Binding::Dpad(DpadDirection::Down) => Some((DPAD_V, false)),
-        Binding::Dpad(DpadDirection::Up) => Some((DPAD_V, true)),
-        Binding::Axis { value: 0, .. } => None, // centre drives no direction
-        Binding::Axis { axis, value } => {
-            let control = match axis {
-                Axis::X => AXIS_X,
-                Axis::Y => AXIS_Y,
-                Axis::Rx => AXIS_RX,
-                Axis::Ry => AXIS_RY,
-            };
-            Some((control, value > 0))
-        }
-        Binding::Button(_) | Binding::Trigger(_) | Binding::Consume => None,
+const fn control_of(p: Pointing) -> u8 {
+    match (p.mechanism, p.vertical) {
+        (DirMechanism::Dpad, false) => DPAD_H,
+        (DirMechanism::Dpad, true) => DPAD_V,
+        (DirMechanism::LeftStick, false) => AXIS_X,
+        (DirMechanism::LeftStick, true) => AXIS_Y,
+        (DirMechanism::RightStick, false) => AXIS_RX,
+        (DirMechanism::RightStick, true) => AXIS_RY,
     }
+}
+
+/// `(control, positive)` for a binding that points somewhere, else `None`.
+fn direction(binding: Binding) -> Option<(u8, bool)> {
+    pointing(binding).map(|p| (control_of(p), p.positive))
 }
 
 /// Do these two bindings point OPPOSITE ways along the same control?
@@ -169,9 +248,9 @@ fn direction(binding: Binding) -> Option<(u8, bool)> {
 /// Non-directional bindings (buttons, triggers, a centred axis, `Consume`)
 /// oppose nothing.
 pub fn opposes(a: Binding, b: Binding) -> bool {
-    match (direction(a), direction(b)) {
-        (Some((control_a, positive_a)), Some((control_b, positive_b))) => {
-            control_a == control_b && positive_a != positive_b
+    match (pointing(a), pointing(b)) {
+        (Some(x), Some(y)) => {
+            x.mechanism == y.mechanism && x.vertical == y.vertical && x.positive != y.positive
         }
         _ => false,
     }
@@ -623,6 +702,106 @@ mod tests {
         let once = preset.chords.clone();
         preset.apply_socd(Socd::UpPriority);
         assert_eq!(preset.chords, once);
+    }
+
+    /// `opposes` and `pointing` are ONE relation, and this is what says so.
+    /// A diagonal that counts as opposing in one place must count in the other:
+    /// `crate::diagonal::fold` refuses to fold exactly the buckets `opposes`
+    /// calls opposing, because both read the same function.
+    #[test]
+    fn opposition_is_pointing_and_nothing_else() {
+        let vocabulary = [
+            Binding::Dpad(DpadDirection::Up),
+            Binding::Dpad(DpadDirection::Down),
+            Binding::Dpad(DpadDirection::Left),
+            Binding::Dpad(DpadDirection::Right),
+            Binding::Axis {
+                axis: Axis::X,
+                value: AXIS_MIN,
+            },
+            Binding::Axis {
+                axis: Axis::X,
+                value: AXIS_MAX,
+            },
+            Binding::Axis {
+                axis: Axis::X,
+                value: -16384,
+            },
+            Binding::Axis {
+                axis: Axis::Y,
+                value: AXIS_MIN,
+            },
+            Binding::Axis {
+                axis: Axis::Y,
+                value: AXIS_MAX,
+            },
+            Binding::Axis {
+                axis: Axis::Ry,
+                value: AXIS_MAX,
+            },
+            Binding::Axis {
+                axis: Axis::Rx,
+                value: AXIS_MIN,
+            },
+            Binding::Axis {
+                axis: Axis::X,
+                value: 0,
+            },
+            Binding::Button(XButton::A),
+            Binding::Trigger(Trigger::Left),
+            Binding::Consume,
+        ];
+        for a in vocabulary {
+            // A centred axis points nowhere — the rule diagonals inherit.
+            assert_eq!(
+                pointing(a).is_none(),
+                matches!(
+                    a,
+                    Binding::Button(_)
+                        | Binding::Trigger(_)
+                        | Binding::Consume
+                        | Binding::Axis { value: 0, .. }
+                ),
+                "{a:?}"
+            );
+            for b in vocabulary {
+                let by_pointing = match (pointing(a), pointing(b)) {
+                    (Some(x), Some(y)) => {
+                        x.mechanism == y.mechanism
+                            && x.vertical == y.vertical
+                            && x.positive != y.positive
+                    }
+                    _ => false,
+                };
+                assert_eq!(opposes(a, b), by_pointing, "{a:?} vs {b:?}");
+                assert_eq!(opposes(a, b), opposes(b, a), "asymmetric: {a:?} {b:?}");
+            }
+        }
+        // The mechanism a report names, and its exact wording.
+        assert_eq!(
+            DirMechanism::of(Binding::Dpad(DpadDirection::Up)),
+            Some(DirMechanism::Dpad)
+        );
+        assert_eq!(
+            DirMechanism::of(Binding::Axis {
+                axis: Axis::Ry,
+                value: AXIS_MAX
+            }),
+            Some(DirMechanism::RightStick)
+        );
+        assert_eq!(
+            DirMechanism::of(Binding::Axis {
+                axis: Axis::X,
+                value: 0
+            }),
+            None
+        );
+        assert_eq!(DirMechanism::Dpad.describe(), "the dpad");
+        assert_eq!(DirMechanism::LeftStick.describe(), "the left stick (lx/ly)");
+        assert_eq!(
+            DirMechanism::RightStick.describe(),
+            "the right stick (rx/ry)"
+        );
     }
 
     #[test]

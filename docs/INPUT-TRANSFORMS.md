@@ -196,6 +196,35 @@ plus a duration** (`ksx-core/src/macros.rs`). Because combination is the
 natural state of a set (§0.1), the diagonal ↘ is one step holding two
 bindings — not two events, not a special case.
 
+> **Diagonals are PRESENTED as themselves** (`ksx-core/src/diagonal.rs`).
+> That a diagonal is two holds is ksx's implementation detail, not the
+> user's concept: players think in ↘ / down-forward / numpad 3. So Studio's
+> macro grid gives every direction group its own `↖ ↗ ↙ ↘` columns, ticking
+> one writes the pair, and a step that already holds the pair — hand-written,
+> imported, whoever made it — DISPLAYS as the diagonal.
+>
+> The stored model is unchanged: a step still holds a set of ordinary
+> bindings, so files stay hand-editable, the engine never sees any of this,
+> and old presets keep working. `diagonal::fold` reads a hold and reports how
+> to present it; `diagonal::expand` is the identity. Recognition is **per
+> mechanism bucket, "contains both"** — so `↓ + → + A` folds (the button is a
+> passenger, and it is the most common macro step there is), and `↓ + → + ↑`
+> never does: which diagonal would it be, and what the pad publishes there
+> depends on the slot's `socd` policy (§2.6), resolved at plan time. Both
+> `fold` and `opposes` are built on the one `socd::pointing`, so a diagonal
+> can never disagree with SOCD cleaning or with `Interrupt::Opposing`.
+>
+> **All four diagonals, on all three mechanisms.** A 360 walks every position
+> of the gate and four of its eight steps are diagonals, so `↖ ↗ ↙ ↘` are
+> equally first class — `diagonal::members_of(diag, mechanism)` is the one
+> write side, and `Diag::halves()` the one place the polarity of each is
+> decided. ⚠ The vertical half of an UP diagonal is `AXIS_MAX`, not
+> `AXIS_MIN`: XInput's positive Y is up and legacy binds Up to `AXIS_MAX`, so
+> a mirrored sign would produce an `↖` that round-trips perfectly through
+> `fold` and does nothing on the pad. `the_up_diagonals_deflect_upwards_on_
+> every_mechanism` asserts all twelve pairs value by value for exactly that
+> reason — the round trip alone would pass a consistently-wrong sign.
+
 ```rust
 pub struct MacroStep { hold: Vec<Binding>, duration: StepDuration, allow_short: bool }
 pub enum   StepDuration { Ms(u32), Frames(u32) }
@@ -571,6 +600,13 @@ the preset's own **bound** direction keys drive, and names the mismatch,
 the step and both mechanisms. It stays quiet when it has nothing to say: a
 preset that drives both, a hold that is a button or trigger (no mechanism),
 an unbound placeholder row, or a preset with no direction keys at all.
+
+"Which mechanism" is `ksx_core::DirMechanism`, re-exported here rather than
+re-decided: it is derived from `socd::pointing`, the one function that says
+where a binding points. That is also what makes Studio's diagonal columns
+mechanism-aware — a `↘` is picked on a named group (D-pad / LS / RS) and
+writes that group's pair, so a pick can never raise this advisory against the
+group the user pointed at.
 
 #### CLI surface — triggers only, on purpose
 

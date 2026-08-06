@@ -1555,12 +1555,27 @@ function macroAct(payload: string): void {
   syncMacroControls();
 }
 
-/** One `stepIndex|function` payload from a grid cell. */
+/** One `stepIndex|function` payload from a grid cell.
+ *
+ *  A DIAGONAL pick reports: it is the one click on this grid whose effect is not
+ *  literally the cell you hit (ksx stores the pair), so it says so — with the
+ *  two names it wrote, and with Undo, the same parity every other write here
+ *  has. A plain cardinal or button toggle says nothing: the cell itself is the
+ *  whole report. */
 function macroCell(payload: string): void {
   const at = payload.indexOf("|");
   if (at < 0) return;
-  macroToggleCell(Number(payload.slice(0, at)), payload.slice(at + 1));
+  const outcome = macroToggleCell(Number(payload.slice(0, at)), payload.slice(at + 1));
   syncMacroControls();
+  if (outcome === null) return;
+  pushToast(`${outcome.said} (Nothing is written until you press Save macro.)`, {
+    undo: async () => {
+      const refused = outcome.undo();
+      syncMacroControls();
+      return refused;
+    },
+    undone: "Put that step's holds back.",
+  });
 }
 
 /** FIX 1c: one of the ready-made motions, appended to the draft. The toast is

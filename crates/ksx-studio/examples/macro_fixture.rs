@@ -14,7 +14,7 @@
 //! user's own `ksx studio` (4460):
 //!
 //! ```text
-//! cargo run -p ksx-studio --example macro_fixture -- 4475
+//! cargo run -p ksx-studio --example macro_fixture -- 4476
 //! ```
 
 use std::collections::BTreeMap;
@@ -28,32 +28,10 @@ use ksx_studio::{
 
 const PRESET: &str = "IPAC P1";
 
-/// The preset the page opens on: step 1 authored in `ms`, step 2 authored in
-/// `frames` — the two spellings §1c keeps apart, so a test can watch either
-/// one round-trip.
-fn seed_macros() -> Vec<MacroView> {
-    vec![MacroView {
-        name: "piano".into(),
-        steps: vec![
-            MacroStepView {
-                hold: vec!["dpad.down".into()],
-                ms: Some(50),
-                frames: None,
-                allow_short: false,
-            },
-            MacroStepView {
-                hold: vec!["A".into()],
-                ms: None,
-                frames: Some(3),
-                allow_short: false,
-            },
-            MacroStepView {
-                hold: vec!["B".into()],
-                ms: Some(80),
-                frames: None,
-                allow_short: false,
-            },
-        ],
+fn mac(name: &str, steps: Vec<MacroStepView>) -> MacroView {
+    MacroView {
+        name: name.into(),
+        steps,
         on_release: "finish".into(),
         retrigger: "ignore".into(),
         interrupt: "none".into(),
@@ -62,7 +40,62 @@ fn seed_macros() -> Vec<MacroView> {
         gap_ms: None,
         triggers: vec!["P".into()],
         disabled: false,
-    }]
+    }
+}
+
+fn ms_step(hold: &[&str], ms: u32) -> MacroStepView {
+    MacroStepView {
+        hold: hold.iter().map(|s| (*s).to_owned()).collect(),
+        ms: Some(ms),
+        frames: None,
+        allow_short: false,
+    }
+}
+
+/// The preset the page opens on.
+///
+/// `piano` — step 1 authored in `ms`, step 2 authored in `frames`: the two
+/// spellings §1c keeps apart, so a test can watch either one round-trip.
+///
+/// `written-by-hand` — steps NOBODY MADE THROUGH THIS PAGE. Named to sort
+/// AFTER `piano`: `save_macro` re-sorts the table, and the page opens on the
+/// FIRST macro, so a fixture macro that sorted first would silently become what
+/// every other test is looking at once anything is saved. This is the round trip
+/// the diagonal lens promises: a hold that names two ordinary bindings must
+/// DISPLAY as the diagonal, including when it is spelled at a partial
+/// deflection, when a button rides along with it, and (never) when it
+/// contradicts itself.
+fn seed_macros() -> Vec<MacroView> {
+    vec![
+        mac(
+            "piano",
+            vec![
+                ms_step(&["dpad.down"], 50),
+                MacroStepView {
+                    hold: vec!["A".into()],
+                    ms: None,
+                    frames: Some(3),
+                    allow_short: false,
+                },
+                ms_step(&["B"], 80),
+            ],
+        ),
+        mac(
+            "written-by-hand",
+            vec![
+                // The canonical pair — reads back as D-pad ↘.
+                ms_step(&["dpad.down", "dpad.right"], 50),
+                // A hand-written partial deflection — still LS ↘, labelled.
+                ms_step(&["ly.-16384", "lx.max"], 50),
+                // The single most common macro step in existence.
+                ms_step(&["dpad.down", "dpad.right", "A"], 50),
+                // Contradictory: never folded, never guessed.
+                ms_step(&["dpad.down", "dpad.right", "dpad.up"], 50),
+                // The hat+stick double-binding every in-box template writes.
+                ms_step(&["dpad.down", "dpad.right", "ly.min", "lx.max"], 50),
+            ],
+        ),
+    ]
 }
 
 /// The one piece of state the fixture keeps: what Save wrote, so the poll that
@@ -180,7 +213,7 @@ fn main() {
     let port: u16 = std::env::args()
         .nth(1)
         .and_then(|a| a.parse().ok())
-        .unwrap_or(4474);
+        .unwrap_or(4476);
     let bind: SocketAddr = ([127, 0, 0, 1], port).into();
     let store = Store::new();
     println!("macro fixture on http://{bind}/map");
