@@ -102,6 +102,20 @@ pub enum DaemonCommand {
     ApplyBindings,
     /// Open the config folder in Explorer.
     OpenConfigFolder,
+    /// Open the 10-foot cabinet panel — a fourth thread in this process, with
+    /// exactly this channel's reach and no more (`crate::cabinet`).
+    ///
+    /// A command rather than something the tray thread does for itself,
+    /// because the tray's one structural property is that its ONLY outbound
+    /// edge is a `Sender<DaemonCommand>` (see [`tray`]'s module docs). A tray
+    /// that could spawn a window would be a tray that could do something the
+    /// control loop cannot see.
+    ///
+    /// **Closing that window does not quit the daemon.** Quit stays here, on
+    /// the tray.
+    OpenCabinet,
+    /// Open ksx Studio in a browser, starting one if nothing is listening.
+    OpenStudio,
     /// Print the current state (headless mode's `status`).
     Status,
     /// Stop everything and exit the process.
@@ -117,6 +131,8 @@ impl DaemonCommand {
             "stop" | "x" => Some(Self::Stop),
             "reload" | "r" => Some(Self::Reload),
             "config" | "c" => Some(Self::OpenConfigFolder),
+            "cabinet" | "ui" => Some(Self::OpenCabinet),
+            "studio" | "web" => Some(Self::OpenStudio),
             "status" | "?" => Some(Self::Status),
             "quit" | "q" | "exit" => Some(Self::Quit),
             _ => None,
@@ -125,7 +141,7 @@ impl DaemonCommand {
 
     /// The one-line help shown at startup and on an unrecognised line.
     pub fn help() -> &'static str {
-        "commands: start | stop | reload | config | status | quit"
+        "commands: start | stop | reload | cabinet | studio | config | status | quit"
     }
 }
 
@@ -334,9 +350,17 @@ impl DaemonState {
     }
 
     /// Menu item labels + whether each is enabled right now.
+    ///
+    /// **"Open cabinet UI" is first**, and that is the point of the M9 pass:
+    /// the tray's primary action is now the surface you can drive from the
+    /// machine, with Studio — the authoring surface, which needs a keyboard —
+    /// second. Start/Stop/Reload keep their place below both, because the
+    /// people who use those from the tray are already at a desk.
     pub fn menu(&self) -> Vec<(DaemonCommand, &'static str, bool)> {
         let running = matches!(self.run, RunState::Running { .. } | RunState::Starting);
         vec![
+            (DaemonCommand::OpenCabinet, "Open cabinet UI", true),
+            (DaemonCommand::OpenStudio, "Open Studio", true),
             (
                 DaemonCommand::Start { game: None },
                 "Start emulation",
@@ -467,6 +491,45 @@ pub trait PanelKeyboard: Send {
     fn arm_escapes(&mut self) {}
 }
 
+/// Opening the two surfaces a tray click can ask for.
+///
+/// Behind a trait for the same reason [`PanelKeyboard`] is: the control loop
+/// is tested with no window, no browser and no GPU anywhere near it, and a
+/// loop that called `eframe::run_native` directly could not be. [`NoUi`] is
+/// what every test and every headless daemon gets.
+pub trait UiHost: Send + Sync {
+    /// Open the 10-foot cabinet panel (a fourth thread in this process).
+    /// Returns immediately; closing that window must never end the daemon.
+    fn open_cabinet(&self, out: &mut dyn Write) {
+        let _ = writeln!(
+            out,
+            "this build has no cabinet window (rebuild with `--features cabinet`)"
+        );
+    }
+
+    /// Open ksx Studio in a browser.
+    fn open_studio(&self, out: &mut dyn Write) {
+        let _ = writeln!(
+            out,
+            "this build has no Studio (rebuild with `--features studio`)"
+        );
+    }
+}
+
+/// No surfaces at all — the honest host for a build with neither UI feature,
+/// and for every test. Both defaults SAY they cannot act rather than doing
+/// nothing, which is the same obligation every refusal on the control surface
+/// carries.
+///
+/// A build with BOTH features never constructs one outside its tests, which is
+/// exactly what "this build has every surface" means; it stays here because it
+/// is the type the control loop is specified against, and because the shape of
+/// this module must not depend on which features happen to be on.
+#[cfg_attr(any(feature = "cabinet", feature = "studio"), allow(dead_code))]
+pub struct NoUi;
+
+impl UiHost for NoUi {}
+
 /// The panel needs no help — its devices are still keyboards to Windows.
 pub struct NoPanel;
 
@@ -516,6 +579,7 @@ pub fn control_loop_with(
     state: SharedState,
     factory: &mut dyn SessionFactory,
     panel: &mut dyn PanelKeyboard,
+    ui: &dyn UiHost,
     out: &mut dyn Write,
 ) {
     let mut session: Option<LiveSession> = None;
@@ -601,6 +665,12 @@ pub fn control_loop_with(
                     s.apply = Some(report);
                 }
             }
+            // Both windows are opened by the HOST, on a thread of its own, and
+            // the control loop does not wait for either. A window that cannot
+            // be created logs and says so; it never stops emulation, and
+            // closing one later never does either — Quit is the tray's alone.
+            Ok(DaemonCommand::OpenCabinet) => ui.open_cabinet(out),
+            Ok(DaemonCommand::OpenStudio) => ui.open_studio(out),
             Ok(DaemonCommand::OpenConfigFolder) => {
                 let dir = factory.config_dir();
                 let _ = writeln!(out, "opening {}", dir.display());
@@ -1011,11 +1081,19 @@ pub fn run(
         None
     };
 
+    // The daemon-lifetime live fan-out. Created here, before any session, and
+    // outliving all of them: a surface subscribed to it watches sessions come
+    // and go rather than losing its subscription with each one. With nobody
+    // subscribed — the normal state of a cabinet — every publish is one
+    // relaxed atomic load (`crate::feed`).
+    let feed = crate::feed::LiveSink::new();
+
     let mut factory = live::LiveFactory {
         root,
         game,
         no_launch,
         panel: claimed.clone(),
+        feed: feed.clone(),
     };
 
     let (tx, rx) = crossbeam_channel::unbounded::<DaemonCommand>();
@@ -1053,11 +1131,26 @@ pub fn run(
                 save_macro: macro_writer,
                 restore: pipe::restore_fn(map_root.clone()),
                 clear_all: pipe::clear_all_fn(map_root.clone()),
-                backups: pipe::backups_fn(map_root),
+                backups: pipe::backups_fn(map_root.clone()),
+                // `slot-assign`: which preset a slot uses. The one write here
+                // that is not a preset edit, and the one whose `reload` is a
+                // BOUNCE rather than a hot swap.
+                slot_assign: pipe::slot_assign_fn(map_root),
                 learn: learn::LearnService::with_rawinput(),
             },
         );
     }
+
+    // The two surfaces a tray click can open. Built HERE because this is where
+    // the channel, the snapshot, the config root and the fan-out all exist at
+    // once — and handed to the control loop as a trait object, so the loop
+    // itself still knows nothing about windows.
+    let ui = ui_host(
+        tx.clone(),
+        state.clone(),
+        factory.root.clone(),
+        feed.clone(),
+    );
 
     // M6 seam. Taken FROM THE FACTORY on purpose: the panel the control loop
     // mutes and the panel the sessions borrow have to be the same object, and
@@ -1095,7 +1188,14 @@ pub fn run(
                 .name("ksx-daemon".into())
                 .spawn(move || {
                     let mut out = std::io::stdout();
-                    control_loop_with(rx, state, &mut factory, panel.as_mut(), &mut out);
+                    control_loop_with(
+                        rx,
+                        state,
+                        &mut factory,
+                        panel.as_mut(),
+                        ui.as_ref(),
+                        &mut out,
+                    );
                 })?
         };
         if let Some(tray) = tray {
@@ -1135,9 +1235,83 @@ pub fn run(
     });
     drop(tx);
     let mut out = std::io::stdout();
-    control_loop_with(rx, state, &mut factory, panel.as_mut(), &mut out);
+    control_loop_with(
+        rx,
+        state,
+        &mut factory,
+        panel.as_mut(),
+        ui.as_ref(),
+        &mut out,
+    );
     release_claim(claimed.as_ref());
     Ok(())
+}
+
+/// The [`UiHost`] this build can offer.
+///
+/// A build with neither UI feature gets [`NoUi`], whose defaults SAY they
+/// cannot act and name the feature that would — which is the same obligation
+/// every refusal on this control surface carries, applied to a tray menu item
+/// that would otherwise be a silent no-op.
+fn ui_host(
+    tx: Sender<DaemonCommand>,
+    state: SharedState,
+    root: ksx_config::ConfigRoot,
+    feed: crate::feed::LiveSink,
+) -> Box<dyn UiHost> {
+    let _ = (&tx, &state, &root, &feed);
+    #[cfg(any(feature = "cabinet", feature = "studio"))]
+    let host: Box<dyn UiHost> = Box::new(Surfaces {
+        #[cfg(feature = "cabinet")]
+        tx,
+        #[cfg(feature = "cabinet")]
+        state,
+        #[cfg(feature = "cabinet")]
+        root,
+        #[cfg(feature = "cabinet")]
+        feed,
+    });
+    #[cfg(not(any(feature = "cabinet", feature = "studio")))]
+    let host: Box<dyn UiHost> = Box::new(NoUi);
+    host
+}
+
+/// The real host: everything the windows this build HAS need, in one place.
+///
+/// The fields belong to the cabinet — the in-process window is the only
+/// surface that needs the channel, the snapshot and the fan-out, because it is
+/// the only one hosted here. Studio is a child process reached by URL and
+/// needs none of them, which is why they are gated rather than carried
+/// everywhere.
+#[cfg(any(feature = "cabinet", feature = "studio"))]
+struct Surfaces {
+    #[cfg(feature = "cabinet")]
+    tx: Sender<DaemonCommand>,
+    #[cfg(feature = "cabinet")]
+    state: SharedState,
+    #[cfg(feature = "cabinet")]
+    root: ksx_config::ConfigRoot,
+    #[cfg(feature = "cabinet")]
+    feed: crate::feed::LiveSink,
+}
+
+#[cfg(any(feature = "cabinet", feature = "studio"))]
+impl UiHost for Surfaces {
+    #[cfg(feature = "cabinet")]
+    fn open_cabinet(&self, out: &mut dyn Write) {
+        let _ = writeln!(out, "opening the cabinet panel…");
+        crate::cabinet::spawn_in_daemon(
+            self.tx.clone(),
+            self.state.clone(),
+            self.root.clone(),
+            self.feed.clone(),
+        );
+    }
+
+    #[cfg(feature = "studio")]
+    fn open_studio(&self, out: &mut dyn Write) {
+        crate::studio_launch::open(out);
+    }
 }
 
 /// Release the daemon's claim on the way out.
@@ -1384,7 +1558,7 @@ mod tests {
         drop(tx);
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
         let mut out: Vec<u8> = Vec::new();
-        control_loop_with(rx, state.clone(), factory, &mut NoPanel, &mut out);
+        control_loop_with(rx, state.clone(), factory, &mut NoPanel, &NoUi, &mut out);
         let final_state = state.lock().unwrap().clone();
         (final_state, String::from_utf8(out).unwrap())
     }
@@ -1718,7 +1892,14 @@ mod tests {
             let _ = tx.send(DaemonCommand::Quit);
         });
         let mut out: Vec<u8> = Vec::new();
-        control_loop_with(rx, state.clone(), &mut factory, &mut NoPanel, &mut out);
+        control_loop_with(
+            rx,
+            state.clone(),
+            &mut factory,
+            &mut NoPanel,
+            &NoUi,
+            &mut out,
+        );
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("game-exited"), "{text}");
         let last = watcher.lock().unwrap().last.clone().expect("recorded");
@@ -1755,7 +1936,14 @@ mod tests {
         drop(tx);
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
         let mut out: Vec<u8> = Vec::new();
-        control_loop_with(rx, state.clone(), &mut factory, &mut NoPanel, &mut out);
+        control_loop_with(
+            rx,
+            state.clone(),
+            &mut factory,
+            &mut NoPanel,
+            &NoUi,
+            &mut out,
+        );
         assert_eq!(state.lock().unwrap().run, RunState::Quitting);
     }
 
@@ -1946,7 +2134,14 @@ mod tests {
         });
 
         let mut out: Vec<u8> = Vec::new();
-        control_loop_with(rx, state.clone(), &mut factory, &mut NoPanel, &mut out);
+        control_loop_with(
+            rx,
+            state.clone(),
+            &mut factory,
+            &mut NoPanel,
+            &NoUi,
+            &mut out,
+        );
 
         let seen = seen
             .lock()
@@ -1990,22 +2185,31 @@ mod tests {
 
     #[test]
     fn the_menu_disables_what_cannot_be_done_right_now() {
+        // The two surfaces lead the menu (see the test below) and are always
+        // available; the session verbs sit behind them.
+        let start = 2;
         let stopped = DaemonState::default().menu();
         assert_eq!(
-            stopped[0],
+            stopped[start],
             (DaemonCommand::Start { game: None }, "Start emulation", true)
         );
-        assert_eq!(stopped[1], (DaemonCommand::Stop, "Stop emulation", false));
+        assert_eq!(
+            stopped[start + 1],
+            (DaemonCommand::Stop, "Stop emulation", false)
+        );
 
         let running = DaemonState {
             run: RunState::Running { slots: 4 },
             ..DaemonState::default()
         }
         .menu();
-        assert!(!running[0].2, "cannot start what is already running");
-        assert!(running[1].2, "stop must be available while running");
-        // The other three are always available.
-        assert!(running[2..].iter().all(|(_, _, enabled)| *enabled));
+        assert!(!running[start].2, "cannot start what is already running");
+        assert!(running[start + 1].2, "stop must be available while running");
+        // Everything else is always available — including both surfaces, which
+        // is the point of opening a window: you look at ksx when it is running
+        // AND when it will not.
+        assert!(running[..start].iter().all(|(_, _, enabled)| *enabled));
+        assert!(running[start + 2..].iter().all(|(_, _, enabled)| *enabled));
     }
 
     // -----------------------------------------------------------------
@@ -2028,7 +2232,7 @@ mod tests {
         drop(tx);
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
         let mut out: Vec<u8> = Vec::new();
-        control_loop_with(rx, state, &mut factory, &mut panel, &mut out);
+        control_loop_with(rx, state, &mut factory, &mut panel, &NoUi, &mut out);
         let log = trace.lock().unwrap().clone();
         log
     }
@@ -2092,7 +2296,7 @@ mod tests {
         });
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
         let mut out: Vec<u8> = Vec::new();
-        control_loop_with(rx, state, &mut factory, &mut panel, &mut out);
+        control_loop_with(rx, state, &mut factory, &mut panel, &NoUi, &mut out);
 
         let log = trace.lock().unwrap().clone();
         let ended = log
@@ -2125,7 +2329,7 @@ mod tests {
         drop(tx);
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
         let mut out: Vec<u8> = Vec::new();
-        control_loop_with(rx, state, &mut factory, &mut panel, &mut out);
+        control_loop_with(rx, state, &mut factory, &mut panel, &NoUi, &mut out);
 
         let log = trace.lock().unwrap().clone();
         assert_eq!(log.first(), Some(&"panel:muted"), "{log:?}");
@@ -2166,6 +2370,9 @@ mod tests {
             ("  STOP ", DaemonCommand::Stop),
             ("reload", DaemonCommand::Reload),
             ("config", DaemonCommand::OpenConfigFolder),
+            ("cabinet", DaemonCommand::OpenCabinet),
+            ("ui", DaemonCommand::OpenCabinet),
+            ("studio", DaemonCommand::OpenStudio),
             ("status", DaemonCommand::Status),
             ("quit", DaemonCommand::Quit),
             ("exit", DaemonCommand::Quit),
@@ -2177,28 +2384,103 @@ mod tests {
         // "identical control surface" is a lie.
         for (command, _, _) in DaemonState::default().menu() {
             assert!(
-                [
-                    DaemonCommand::Start { game: None },
-                    DaemonCommand::Stop,
-                    DaemonCommand::Reload,
-                    DaemonCommand::OpenConfigFolder,
-                    DaemonCommand::Quit
-                ]
-                .contains(&command)
-                    && DaemonCommand::help().contains(match command {
-                        DaemonCommand::Start { .. } => "start",
-                        DaemonCommand::Stop => "stop",
-                        DaemonCommand::Reload => "reload",
-                        DaemonCommand::OpenConfigFolder => "config",
-                        DaemonCommand::Status => "status",
-                        DaemonCommand::Quit => "quit",
-                        // Not a menu item: the mapper's save path, reachable
-                        // over the pipe only (there is nothing for a human to
-                        // click that means "apply bindings and nothing else").
-                        DaemonCommand::ApplyBindings => "reload",
-                    }),
+                DaemonCommand::help().contains(match command {
+                    DaemonCommand::Start { .. } => "start",
+                    DaemonCommand::Stop => "stop",
+                    DaemonCommand::Reload => "reload",
+                    DaemonCommand::OpenConfigFolder => "config",
+                    DaemonCommand::OpenCabinet => "cabinet",
+                    DaemonCommand::OpenStudio => "studio",
+                    DaemonCommand::Status => "status",
+                    DaemonCommand::Quit => "quit",
+                    // Not a menu item: the mapper's save path, reachable
+                    // over the pipe only (there is nothing for a human to
+                    // click that means "apply bindings and nothing else").
+                    DaemonCommand::ApplyBindings => "reload",
+                }),
                 "{command:?} is in the tray menu but not reachable headlessly"
             );
         }
+    }
+
+    /// **The tray's primary action is the cabinet panel.** The M9 pass moved
+    /// it there deliberately: the first item is the surface you can drive from
+    /// the machine, and Studio — which needs a keyboard — is second.
+    #[test]
+    fn the_trays_first_two_items_are_the_two_surfaces_in_order() {
+        let menu = DaemonState::default().menu();
+        assert_eq!(menu[0].0, DaemonCommand::OpenCabinet);
+        assert_eq!(menu[0].1, "Open cabinet UI");
+        assert!(menu[0].2, "always available — it is how you look at ksx");
+        assert_eq!(menu[1].0, DaemonCommand::OpenStudio);
+        assert_eq!(menu[1].1, "Open Studio");
+        // ...and Quit is still last, and still the tray's alone. Closing a
+        // window must never do what this item does.
+        assert_eq!(
+            menu.last().map(|item| item.0.clone()),
+            Some(DaemonCommand::Quit)
+        );
+    }
+
+    /// Neither window may be able to end the daemon: the control loop's Quit
+    /// arm is reachable from the tray and from stdin, and from nothing else.
+    /// A cabinet whose emulation stopped because somebody shut a status panel
+    /// would be a cabinet nobody trusts.
+    #[test]
+    fn opening_a_surface_never_stops_a_session() {
+        struct Recorder(Arc<Mutex<Vec<&'static str>>>);
+        impl UiHost for Recorder {
+            fn open_cabinet(&self, _out: &mut dyn Write) {
+                self.0.lock().unwrap().push("cabinet");
+            }
+            fn open_studio(&self, _out: &mut dyn Write) {
+                self.0.lock().unwrap().push("studio");
+            }
+        }
+
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let mut factory = FakeFactory::default();
+        let (tx, rx) = unbounded();
+        for command in [
+            DaemonCommand::Start { game: None },
+            DaemonCommand::OpenCabinet,
+            DaemonCommand::OpenStudio,
+            DaemonCommand::Status,
+            DaemonCommand::Quit,
+        ] {
+            tx.send(command).unwrap();
+        }
+        drop(tx);
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        let mut out: Vec<u8> = Vec::new();
+        control_loop_with(
+            rx,
+            state.clone(),
+            &mut factory,
+            &mut NoPanel,
+            &Recorder(opened.clone()),
+            &mut out,
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(*opened.lock().unwrap(), ["cabinet", "studio"]);
+        // The session started, survived both surfaces, and only ended at Quit.
+        assert_eq!(*factory.makes.lock().unwrap(), 1, "{text}");
+        assert!(factory.ran.load(Ordering::SeqCst), "{text}");
+        assert!(
+            !text.contains("stopping…"),
+            "opening a window must not stop a session: {text}"
+        );
+    }
+
+    /// A build with no UI features still answers the menu item — in words,
+    /// naming the feature that would. Never a silent no-op.
+    #[test]
+    fn a_build_with_no_surfaces_says_so_instead_of_doing_nothing() {
+        let mut out: Vec<u8> = Vec::new();
+        NoUi.open_cabinet(&mut out);
+        NoUi.open_studio(&mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("--features cabinet"), "{text}");
+        assert!(text.contains("--features studio"), "{text}");
     }
 }

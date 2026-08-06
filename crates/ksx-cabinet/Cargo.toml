@@ -1,0 +1,35 @@
+[package]
+name = "ksx-cabinet"
+description = "ksx cabinet — the 10-foot OPERATE surface: a pad-drivable egui panel for the machine itself."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# The dependency list is the boundary, exactly as it is for ksx-api and
+# ksx-studio. This crate reaches the daemon ONLY through `ksx-api`'s traits —
+# no pipe client of its own, no config store, no capture, no output, no
+# `DaemonCommand`. It is handed three trait objects and draws them.
+#
+# Nothing here is in the default build: `ksx-app`'s `cabinet` feature is the
+# only thing that names this crate, and `cargo tree` proves it (see the gate in
+# docs/GATES.md).
+[dependencies]
+ksx-api.workspace = true
+eframe.workspace = true
+egui.workspace = true
+
+# XInputGetState, read against OUR OWN virtual pads — the only way a cabinet
+# panel can drive this window while emulation is running, because the panel is
+# muted from typethrough then and winit sees nothing. ~150 lines, no gilrs.
+[target.'cfg(windows)'.dependencies]
+# Named directly for ONE call: `EventLoopBuilderExtWindows::with_any_thread`,
+# which is what lets the window be a fourth thread inside `ksx daemon` instead
+# of a second process. eframe already resolves this exact version; naming it
+# here does not add a crate to the tree, it adds a trait import.
+winit = "0.30"
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_XboxController",
+] }

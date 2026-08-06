@@ -172,8 +172,17 @@ performance and it is never required for the product to work.
    the case where a browser is genuinely the right client, since a cab has no keyboard.
 
 ### "Enhance, never compromise" — enforced, not promised
-- **Compile-time optional**: `--features studio`. The default build links no axum, no
-  forma, no HTTP — provable with `cargo tree`.
+- **Compile-time optional**: `--features studio` for the web surface,
+  `--features cabinet` for the 10-foot one. **The default build links NEITHER**
+  — no axum, no forma, no HTTP, and no egui, eframe or winit — and the two are
+  independent of each other (a cabinet with no browser builds one and not the
+  other). Provable, all three ways:
+
+  ```
+  cargo tree -p ksx-app -e normal                    | grep -ciE "axum|tokio|forma|eframe|egui|winit"   # 0
+  cargo tree -p ksx-app -e normal --features cabinet | grep -ciE "axum|tokio|forma"                     # 0
+  cargo tree -p ksx-app -e normal --features studio  | grep -ciE "eframe|egui|winit"                    # 0
+  ```
 - **Never touches pipeline threads.** Studio subscribes to a lossy fan-out sink; a slow
   browser can never backpressure the engine (same rule as the M4 delta coalescing).
 - **Display-rate coalescing** (~60 Hz) for the monitor. Full fidelity lives in

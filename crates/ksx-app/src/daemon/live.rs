@@ -25,6 +25,11 @@ pub struct LiveFactory {
     pub game: Option<String>,
     pub no_launch: bool,
     pub panel: Option<Arc<super::panel::Panel>>,
+    /// The daemon-lifetime live fan-out (`crate::feed`). Handed to every
+    /// session so a surface can watch the pipeline; costs a session nothing
+    /// while nobody is subscribed, which is every session on a cabinet with no
+    /// window open.
+    pub feed: crate::feed::LiveSink,
 }
 
 impl LiveFactory {
@@ -66,6 +71,7 @@ impl SessionFactory for LiveFactory {
             panel: self.panel.clone(),
             health: HealthSlot::default(),
             swap: crate::run::supervisor::HotSwapSlot::default(),
+            feed: self.feed.clone(),
         }))
     }
 
@@ -114,6 +120,10 @@ struct LiveRunner {
     /// Same handshake for the binding hot-swap: taken by the control loop
     /// before the move, filled in by `supervise` once the engine thread is up.
     swap: crate::run::supervisor::HotSwapSlot,
+    /// The daemon-lifetime live fan-out this session publishes into. The sink
+    /// outlives the session on purpose: a surface watching it does not lose
+    /// its subscription when a game exits, it sees `running` go false.
+    feed: crate::feed::LiveSink,
 }
 
 impl SessionRunner for LiveRunner {
@@ -178,6 +188,9 @@ impl SessionRunner for LiveRunner {
             // Ctrl+C takes the default action and ends the process.
             stop: Box::new(move || stop.load(Ordering::SeqCst)),
             hook,
+            // The live fan-out. Free while nobody is subscribed, which is
+            // every session on a cabinet with no window open (`crate::feed`).
+            feed: self.feed.clone(),
             ..RunOptions::default()
         };
         let outcome = supervisor::supervise(

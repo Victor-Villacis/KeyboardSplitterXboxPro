@@ -30,12 +30,20 @@ ksx-games.workspace = true
 # links no axum, no tokio, no forma — provable with
 # `cargo tree -p ksx-app | grep -ciE "axum|tokio|forma"` == 0.
 ksx-studio = { workspace = true, optional = true }
+# E7 rule again, for the second UI: the 10-foot cabinet surface links egui and
+# eframe, and the DEFAULT build links neither it nor Studio — provable with
+# `cargo tree -p ksx-app`, both ways.
+ksx-cabinet = { workspace = true, optional = true }
 anyhow.workspace = true
 # `capture::SetupError` is matched on for a stable --json error code, so it is a
 # typed enum rather than an anyhow::Error.
 thiserror.workspace = true
 clap.workspace = true
 crossbeam-channel.workspace = true
+# The live fan-out sink's subscriber list (`crate::feed`): the publisher reads
+# an arc-swapped snapshot instead of taking a lock, which is the same shape —
+# and the same reason — as ksx-capture's hot decision table.
+arc-swap.workspace = true
 # Capture→submit latency histogram for `ksx run` (p50/p99/max). A permanent
 # debug feature per docs/ARCHITECTURE.md rule 5, not a one-off measurement.
 hdrhistogram.workspace = true
@@ -76,6 +84,10 @@ windows-sys = { workspace = true, features = [
 [features]
 # `ksx studio` — the optional localhost web status page (docs/ENHANCEMENTS.md E7).
 studio = ["dep:ksx-studio"]
+# `ksx cabinet` + the daemon's in-process window (docs/M9-DECISION.md, the
+# cabinet/Studio split). Independent of `studio`: a cabinet with no browser
+# builds this and not that.
+cabinet = ["dep:ksx-cabinet"]
 
 [dev-dependencies]
 insta.workspace = true

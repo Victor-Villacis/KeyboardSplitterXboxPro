@@ -30,6 +30,10 @@ pub mod codes {
     pub const CONFLICT: &str = "conflict";
     /// No preset of that name is on disk.
     pub const UNKNOWN_PRESET: &str = "unknown-preset";
+    /// No games.toml profile of that title (`slot-assign --profile`).
+    pub const UNKNOWN_PROFILE: &str = "unknown-profile";
+    /// A slot number outside 1..=`ksx_core::MAX_SLOTS` (`slot-assign`).
+    pub const BAD_SLOT: &str = "bad-slot";
     /// No `[macros.<name>]` table of that name in that preset.
     pub const UNKNOWN_MACRO: &str = "unknown-macro";
     /// The macro body did not validate.

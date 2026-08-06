@@ -75,6 +75,9 @@ struct Learn {
 pub struct LearnService {
     state: Arc<Mutex<Learn>>,
     observe: ObserveFn,
+    /// Set by [`LearnService::refusing`]: this service will never listen, and
+    /// says why on every verb. `None` is the ordinary recorder.
+    refusal: Option<&'static str>,
 }
 
 impl LearnService {
@@ -87,7 +90,44 @@ impl LearnService {
                 cancel: Arc::new(AtomicBool::new(false)),
             })),
             observe,
+            refusal: None,
         }
+    }
+
+    /// A service that never listens and says so, in words, on every verb.
+    ///
+    /// For a dispatch that must not be able to learn at all — the cabinet's
+    /// (`crate::cabinet::daemon_sink`), because learning a key exists to fill
+    /// in a binding and that is AUTHORING. It has to refuse **synchronously**:
+    /// an injected observer that returns `Err` does not, because
+    /// [`Self::start`] answers "listening" first and the error only surfaces
+    /// on a later poll — a lock that opens for ten seconds is not a lock.
+    ///
+    /// Gated on `cabinet` because that is its only caller. Left ungated it is
+    /// dead code in the default and `studio` builds — a warning that only
+    /// appears when `cabinet` is OFF, so neither `--all-features` clippy nor a
+    /// cabinet-only build can see it. Building every feature combination is
+    /// what catches this class.
+    #[cfg(feature = "cabinet")]
+    pub fn refusing(reason: &'static str) -> Self {
+        Self {
+            refusal: Some(reason),
+            ..Self::new(Arc::new(|_, _| Ok(None)))
+        }
+    }
+
+    /// The one answer a refusing service ever gives.
+    fn refused(&self) -> Option<serde_json::Value> {
+        let reason = self.refusal?;
+        Some(serde_json::json!({
+            "ok": false,
+            "state": "unavailable",
+            "generation": 0,
+            "remaining_ms": serde_json::Value::Null,
+            "device": serde_json::Value::Null,
+            "key": serde_json::Value::Null,
+            "error": reason,
+        }))
     }
 
     /// The real observer: `ksx_capture::observe_next_key`, key reported by its
@@ -104,6 +144,9 @@ impl LearnService {
     /// Start (or supersede) a learn. Returns the poll snapshot for the fresh
     /// generation; never blocks beyond a mutex.
     pub fn start(&self) -> serde_json::Value {
+        if let Some(refused) = self.refused() {
+            return refused;
+        }
         let (generation, cancel) = {
             let mut learn = self.state.lock().expect("learn state poisoned");
             // Supersede: the old observer stops within a slice; its result,
@@ -142,6 +185,9 @@ impl LearnService {
 
     /// Snapshot for `learn-poll` (and the tail of `learn-key`).
     pub fn poll(&self) -> serde_json::Value {
+        if let Some(refused) = self.refused() {
+            return refused;
+        }
         let learn = self.state.lock().expect("learn state poisoned");
         let remaining_ms = match (&learn.phase, learn.deadline) {
             (Phase::Listening, Some(deadline)) => Some(
@@ -173,6 +219,9 @@ impl LearnService {
     /// `learn-cancel`: stop listening. Idempotent; a hit that already landed
     /// stays a hit (the caller has not read it yet).
     pub fn cancel(&self) -> serde_json::Value {
+        if let Some(refused) = self.refused() {
+            return refused;
+        }
         {
             let mut learn = self.state.lock().expect("learn state poisoned");
             learn.cancel.store(true, Ordering::SeqCst);

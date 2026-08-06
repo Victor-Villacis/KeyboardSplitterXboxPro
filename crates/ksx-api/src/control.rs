@@ -25,6 +25,7 @@ use crate::refusal::{codes, Refusal};
 use crate::status::MacroStepView;
 use crate::wire::{
     BackupView, MacroWriteKind, MapMacroRequest, MapRequest, MapResponse, RestoreMode,
+    SlotAssignRequest,
 };
 
 /// Performs the session and mapper verbs against a daemon.
@@ -154,6 +155,163 @@ pub trait ControlSource: Send + Sync {
     /// authored. One table in, one answer out.
     fn save_macro(&self, _request: &MacroWrite) -> MacroOutcome {
         MacroOutcome::failed("this control source cannot write macros")
+    }
+
+    /// Point a slot at a preset (pipe `slot-assign`) — the E5 verb
+    /// docs/CONTROL-SURFACE.md's honest gaps 1 and 5 name.
+    ///
+    /// The mapper edits bindings INSIDE a preset; this says which preset a
+    /// slot uses, in `config.toml` or in one games.toml profile. It is the
+    /// only write on this trait that is not a preset edit, and the only one
+    /// whose `reload` is a BOUNCE — see [`SlotOutcome::restarted`].
+    fn assign_slot(&self, _request: &SlotAssignRequest) -> SlotOutcome {
+        SlotOutcome::failed(
+            "this control source cannot re-wire slots",
+            "run `ksx slot assign --slot N --preset NAME`",
+        )
+    }
+}
+
+/// The `slot-assign` answer, as a surface reads it.
+///
+/// Structured rather than `Result<String, Refusal>` for the same reason
+/// [`BindOutcome`] is: the interesting half of a successful assignment is the
+/// pair of presets (what it was, what it is) and whether the pads bounced, and
+/// a sentence cannot be interrogated for those.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotOutcome {
+    pub ok: bool,
+    pub message: Option<String>,
+    pub error: Option<String>,
+    pub code: Option<String>,
+    pub slot: Option<u8>,
+    pub preset: Option<String>,
+    /// What the slot pointed at before; `None` when the slot was created.
+    pub previous_preset: Option<String>,
+    /// The games.toml profile this landed in, or `None` for `config.toml`.
+    pub profile: Option<String>,
+    /// The slot was ADDED to that file rather than repointed.
+    #[serde(default)]
+    pub created: bool,
+    /// The slot already used that preset. Success, and nothing happened.
+    #[serde(default)]
+    pub unchanged: bool,
+    /// **The pads replugged.**
+    ///
+    /// Every other write on this trait edits a key→function table, which the
+    /// live engine takes in place (docs/CONTROL-SURFACE.md "the binding hot
+    /// swap"): pads stay plugged, Windows plays no chime, a game in progress
+    /// notices nothing. A slot assignment is not that. It changes what the
+    /// slot IS, so it takes the blunt `Reload` — stop, re-read from disk,
+    /// start — and every surface has to SAY so before it is used, because on
+    /// a cabinet the cost is visible: four controllers vanish and come back,
+    /// and anything mid-game sees them go.
+    ///
+    /// Worth writing down because a reader of `SessionShape` will notice the
+    /// tension: which preset a slot NAMES is deliberately outside the shape
+    /// (`run/supervisor.rs`), so a preset-only re-point would in fact hot-swap
+    /// if this verb enqueued `ApplyBindings`. It does not, on purpose — this
+    /// verb writes the slot ENTRY, whose other fields (keyboard, persona) are
+    /// genuinely structural, and a verb whose pad behaviour depended on which
+    /// field you happened to change is a verb nobody can predict. One answer,
+    /// stated up front, beats a cheaper one that is sometimes true.
+    #[serde(default)]
+    pub restarted: bool,
+    /// `reload` was asked for and the daemon acted on it.
+    #[serde(default)]
+    pub reloaded: bool,
+    /// The file that was written.
+    pub path: Option<String>,
+}
+
+impl SlotOutcome {
+    /// A refusal with the way out attached — the shape every default on this
+    /// trait owes (docs/CONTROL-SURFACE.md "a surface that cannot act must SAY
+    /// so, per click").
+    pub fn failed(reason: impl Into<String>, remedy: impl Into<String>) -> Self {
+        let remedy = remedy.into();
+        Self {
+            ok: false,
+            error: Some(format!("{} — {remedy}", reason.into())),
+            code: Some(codes::NOT_HERE.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    /// The refusal this outcome carries, or `None` when it succeeded.
+    pub fn refusal(&self) -> Option<Refusal> {
+        if self.ok {
+            return None;
+        }
+        Some(Refusal::from_wire(
+            self.code.as_deref(),
+            self.error
+                .clone()
+                .unwrap_or_else(|| "the slot was not changed".to_owned()),
+        ))
+    }
+
+    /// The one line a 10-foot surface prints after the write — including the
+    /// pad bounce, which is the part a user must not have to infer.
+    pub fn headline(&self) -> String {
+        if let Some(refusal) = self.refusal() {
+            return refusal.message;
+        }
+        // **The daemon's own sentence wins when there is one.** It is built
+        // from what actually happened; the reconstruction below is built from
+        // flags, and flags cannot express "a restart was asked for, a session
+        // WAS running, and the restart then failed". Synthesising over the top
+        // of that produced the one lie this surface could least afford — a
+        // cabinet whose four pads had just vanished being told "nothing was
+        // running, so nothing had to restart".
+        //
+        // The reconstruction stays for outcomes built in-process (a fake, a
+        // future non-pipe sink) that carry the facts but no prose.
+        if let Some(message) = self
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        {
+            return message.to_owned();
+        }
+        let slot = self.slot.map_or_else(|| "?".to_owned(), |n| n.to_string());
+        let preset = self.preset.clone().unwrap_or_default();
+        if self.unchanged {
+            return format!("slot {slot} already uses \"{preset}\" — nothing changed");
+        }
+        let change = match &self.previous_preset {
+            Some(previous) => format!("slot {slot}: \"{previous}\" → \"{preset}\""),
+            None => format!("slot {slot} added, using \"{preset}\""),
+        };
+        let tail = if self.restarted {
+            " — the session restarted and the pads replugged"
+        } else if self.reloaded {
+            " — nothing was running, so nothing had to restart"
+        } else {
+            " — the next start reads it"
+        };
+        format!("{change}{tail}")
+    }
+}
+
+impl From<crate::wire::SlotAssignResponse> for SlotOutcome {
+    fn from(response: crate::wire::SlotAssignResponse) -> Self {
+        Self {
+            ok: response.ok,
+            message: response.message,
+            error: response.error,
+            code: response.code,
+            slot: response.slot,
+            preset: response.preset,
+            previous_preset: response.previous_preset,
+            profile: response.profile,
+            created: response.created,
+            unchanged: response.unchanged,
+            restarted: response.restarted,
+            reloaded: response.reloaded,
+            path: response.path,
+        }
     }
 }
 
@@ -904,5 +1062,56 @@ mod tests {
             .to_request(),
             one
         );
+    }
+
+    /// **The daemon's sentence wins.** A slot assignment whose restart was
+    /// asked for and then FAILED carries `restarted: false` and
+    /// `reloaded: false`, and the flag-driven reconstruction has no way to say
+    /// that — it used to print "nothing was running, so nothing had to
+    /// restart" at somebody whose four pads had just vanished.
+    #[test]
+    fn a_slot_outcome_prints_what_the_daemon_said_rather_than_re_deriving_it() {
+        let failed = SlotOutcome {
+            ok: true,
+            slot: Some(1),
+            preset: Some("IPAC P2".to_owned()),
+            previous_preset: Some("IPAC P1".to_owned()),
+            message: Some(
+                "slot 1: \"IPAC P1\" -> \"IPAC P2\" — a slot change needs the pads replugged                  — [FAIL] cannot start: no usable slot"
+                    .to_owned(),
+            ),
+            restarted: false,
+            reloaded: false,
+            ..SlotOutcome::default()
+        };
+        let headline = failed.headline();
+        assert!(headline.contains("cannot start"), "{headline}");
+        assert!(
+            !headline.contains("nothing was running"),
+            "a failed restart must never read as an idle daemon: {headline}"
+        );
+
+        // With no prose — an outcome built in process by a fake — the
+        // reconstruction is still there and still names the bounce.
+        let synthesised = SlotOutcome {
+            ok: true,
+            slot: Some(2),
+            preset: Some("IPAC P2".to_owned()),
+            previous_preset: Some("IPAC P1".to_owned()),
+            restarted: true,
+            reloaded: true,
+            ..SlotOutcome::default()
+        };
+        assert!(
+            synthesised.headline().contains("pads replugged"),
+            "{}",
+            synthesised.headline()
+        );
+        // A blank message is not a message.
+        let blank = SlotOutcome {
+            message: Some("   ".to_owned()),
+            ..synthesised
+        };
+        assert!(blank.headline().contains("pads replugged"));
     }
 }

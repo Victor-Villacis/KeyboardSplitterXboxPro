@@ -1,6 +1,8 @@
 //! ksx — split keyboards (I-PAC arcade encoders) into virtual Xbox 360 controllers.
 
 mod autostart;
+#[cfg(feature = "cabinet")]
+mod cabinet;
 #[cfg(windows)]
 mod capture;
 mod config_io;
@@ -10,6 +12,7 @@ mod ctrl_c;
 mod daemon;
 mod devices;
 mod doctor;
+mod feed;
 mod install;
 mod logging;
 mod macro_cli;
@@ -22,8 +25,14 @@ mod preset_cli;
 mod run;
 mod session;
 mod setup;
+mod slot_cli;
+mod slots;
+#[cfg(any(feature = "studio", feature = "cabinet"))]
+mod sources;
 #[cfg(feature = "studio")]
 mod studio;
+#[cfg(feature = "studio")]
+mod studio_launch;
 mod winusb;
 
 use clap::{Parser, Subcommand};
@@ -122,6 +131,29 @@ enum Command {
     Preset {
         #[command(subcommand)]
         command: PresetCommand,
+    },
+    /// Which preset a slot uses: list them, or point one somewhere else
+    ///
+    /// The gap `ksx map` never covered. `ksx map` edits the bindings INSIDE a
+    /// preset; this says which preset slot 3 points at — in config.toml, or in
+    /// one games.toml profile, so the same panel can be one thing for Steam
+    /// and another for MAME.
+    ///
+    /// `assign` writes ONE field and takes a timestamped backup of the file
+    /// first. The preset has to exist; a refusal lists the ones that do and
+    /// writes nothing.
+    ///
+    /// Wiring a DEVICE to a slot is still `ksx setup`'s job — it identifies
+    /// the board by pressing it, which is the only honest way to do it and is
+    /// not something a preset name can imply.
+    ///
+    /// Exit codes: 0 = listed / assigned, 1 = error (or the daemon refused a
+    /// --reload, in which case the FILE was still written and the message says
+    /// so), 2 = refused (unknown preset, unknown profile, bad slot number);
+    /// nothing written.
+    Slot {
+        #[command(subcommand)]
+        command: SlotCommand,
     },
     /// Start emulation: plug the pads, capture the assigned keyboards, translate
     ///
@@ -810,6 +842,38 @@ enum Command {
         #[arg(long, default_value_t = 4460)]
         port: u16,
     },
+    /// Open the 10-foot cabinet panel: buttons, status, start/stop, slots
+    ///
+    /// The surface for the MACHINE — a screen you read from six feet away and
+    /// drive with the arcade panel itself. It OPERATES: it chooses among
+    /// things that already exist. There is no mapper here, no macro editor and
+    /// no preset file management; that is authoring, it needs a keyboard, and
+    /// ksx Studio does it.
+    ///
+    /// Five screens: press a button and watch BOTH what the panel sent and
+    /// what the pad published (the wiring check); is ksx working; start and
+    /// stop; which game profile; which preset each slot uses.
+    ///
+    /// Normally you open this from the tray ("Open cabinet UI"), which runs it
+    /// INSIDE the daemon and is the only way the live button check has
+    /// anything to show. Run as its own process it still starts, stops and
+    /// re-wires over the control pipe — the recovery path when the in-daemon
+    /// window cannot be created.
+    ///
+    /// Driving it: with emulation STOPPED the panel is an ordinary keyboard
+    /// and arrow keys / Enter / Esc work. With emulation RUNNING the panel
+    /// produces no keystrokes at all — so the window reads the virtual pads
+    /// ksx itself is publishing. Stick or D-pad moves, SOUTH confirms, EAST
+    /// goes back.
+    ///
+    /// Exit codes: 0 = the window was closed, 1 = it could not be opened.
+    #[cfg(feature = "cabinet")]
+    Cabinet {
+        /// Draw the same window against a scripted cabinet, touching nothing.
+        /// For reviewing the 10-foot design without starting a session.
+        #[arg(long)]
+        demo: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1104,6 +1168,53 @@ enum PresetCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum SlotCommand {
+    /// What each slot uses — read-only, and needs no daemon
+    List {
+        /// Read a games.toml profile's slots instead of config.toml's
+        #[arg(long, value_name = "TITLE")]
+        profile: Option<String>,
+        /// One JSON object on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Point a slot at a preset
+    ///
+    /// One field of one entry. `ksx config export | edit | import` can do the
+    /// same thing and rewrites the WHOLE file, which loses every comment in
+    /// it — and ksx config files are annotated on purpose. This writes the one
+    /// line, after copying the file to <file>.bak-YYYYMMDD-HHMMSS.
+    ///
+    /// The preset must already exist (a slot pointing at a preset that is not
+    /// there is a cabinet that refuses to start, at the next boot). A refusal
+    /// lists the presets that do exist and writes nothing.
+    ///
+    /// THE PADS REPLUG. Every other write on this control surface is a
+    /// key->function table and the live engine takes it in place with the pads
+    /// left plugged; this one changes what the slot IS, so --reload means the
+    /// blunt stop, re-read, start. Without --reload nothing is disturbed and
+    /// the next session start reads the file.
+    Assign {
+        /// Slot number (1..=8)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=8))]
+        slot: u8,
+        /// Preset name — `ksx preset list` names them (case-insensitive)
+        #[arg(long, value_name = "NAME")]
+        preset: String,
+        /// Write into this games.toml profile instead of config.toml
+        #[arg(long, value_name = "TITLE")]
+        profile: Option<String>,
+        /// Ask a running daemon to take it now: the session RESTARTS and the
+        /// pads replug
+        #[arg(long)]
+        reload: bool,
+        /// One JSON object on stdout
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// What `ksx autostart` registers as the logon task. The clap-facing twin of
 /// [`ksx_platform::autostart::TaskMode`] (the platform crate stays clap-free);
 /// the rationale for `daemon` being the default lives on that type.
@@ -1172,6 +1283,27 @@ fn main() -> anyhow::Result<()> {
                     player,
                     force,
                     dry_run,
+                },
+                json,
+            },
+        }),
+        Command::Slot { command } => slot_cli::run(match command {
+            SlotCommand::List { profile, json } => slot_cli::Options {
+                action: slot_cli::Action::List { profile },
+                json,
+            },
+            SlotCommand::Assign {
+                slot,
+                preset,
+                profile,
+                reload,
+                json,
+            } => slot_cli::Options {
+                action: slot_cli::Action::Assign {
+                    slot,
+                    preset,
+                    profile,
+                    reload,
                 },
                 json,
             },
@@ -1254,6 +1386,14 @@ fn main() -> anyhow::Result<()> {
         }),
         #[cfg(feature = "studio")]
         Command::Studio { port } => studio::run(port),
+        #[cfg(feature = "cabinet")]
+        Command::Cabinet { demo } => {
+            if demo {
+                cabinet::run_demo()
+            } else {
+                cabinet::run()
+            }
+        }
         Command::Map {
             preset,
             function,
@@ -2703,6 +2843,118 @@ mod tests {
             "ALREADY TAKEN",
             "neither START nor BACK",
             "STOP EMULATION FIRST",
+        ] {
+            assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
+        }
+    }
+
+    /// `ksx slot assign` takes a slot NUMBER and a preset NAME, and both are
+    /// required — a verb that guessed either would rewire a cabinet by
+    /// accident.
+    #[test]
+    fn slot_assign_requires_a_slot_and_a_preset() {
+        let cli = Cli::try_parse_from([
+            "ksx", "slot", "assign", "--slot", "3", "--preset", "IPAC P3",
+        ])
+        .unwrap();
+        let Command::Slot {
+            command:
+                SlotCommand::Assign {
+                    slot,
+                    preset,
+                    profile,
+                    reload,
+                    json,
+                },
+        } = cli.command
+        else {
+            panic!("an assign");
+        };
+        assert_eq!(slot, 3);
+        assert_eq!(preset, "IPAC P3");
+        assert_eq!(profile, None, "config.toml unless a profile is named");
+        assert!(!reload, "nothing is disturbed unless asked");
+        assert!(!json);
+
+        assert!(Cli::try_parse_from(["ksx", "slot", "assign", "--slot", "3"]).is_err());
+        assert!(Cli::try_parse_from(["ksx", "slot", "assign", "--preset", "P"]).is_err());
+        // 1..=MAX_SLOTS, enforced by clap before anything reads a file.
+        assert!(
+            Cli::try_parse_from(["ksx", "slot", "assign", "--slot", "0", "--preset", "P"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["ksx", "slot", "assign", "--slot", "9", "--preset", "P"]).is_err()
+        );
+    }
+
+    /// The pad bounce is in `--help`, because it is the one consequence a user
+    /// must not discover by watching four controllers vanish.
+    #[test]
+    fn slot_assign_help_says_the_pads_replug() {
+        let mut cmd = Cli::command();
+        let slot = cmd.find_subcommand_mut("slot").unwrap();
+        // The parent verb draws the line this whole surface is built on: this
+        // one says which PRESET, and `ksx setup` is still what wires a DEVICE.
+        let parent = slot.render_long_help().to_string();
+        let parent = parent.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(parent.contains("ksx setup"), "{parent}");
+        assert!(
+            parent.contains("identifies the board by pressing it"),
+            "{parent}"
+        );
+
+        let assign = slot.find_subcommand_mut("assign").unwrap();
+        let help = assign.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "THE PADS REPLUG",
+            "loses every comment",
+            "must already exist",
+        ] {
+            assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
+        }
+    }
+
+    #[test]
+    fn slot_list_reads_config_or_one_profile() {
+        let cli = Cli::try_parse_from(["ksx", "slot", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Slot {
+                command: SlotCommand::List {
+                    profile: None,
+                    json: false
+                }
+            }
+        ));
+        let cli =
+            Cli::try_parse_from(["ksx", "slot", "list", "--profile", "Steam", "--json"]).unwrap();
+        let Command::Slot {
+            command: SlotCommand::List { profile, json },
+        } = cli.command
+        else {
+            panic!("a list");
+        };
+        assert_eq!(profile.as_deref(), Some("Steam"));
+        assert!(json);
+    }
+
+    /// The cabinet's `--help` has to carry the two facts that decide whether
+    /// somebody reaches for it at all: what it will NOT do, and how it is
+    /// driven when the panel produces no keystrokes.
+    #[cfg(feature = "cabinet")]
+    #[test]
+    fn cabinet_help_states_the_operate_only_rule_and_both_input_paths() {
+        let mut cmd = Cli::command();
+        let cabinet = cmd.find_subcommand_mut("cabinet").unwrap();
+        let help = cabinet.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "no mapper",
+            "no macro editor",
+            "ksx Studio does it",
+            "produces no keystrokes",
+            "virtual pads",
         ] {
             assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
         }

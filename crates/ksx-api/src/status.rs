@@ -100,6 +100,20 @@ pub struct MapperSnapshot {
     /// Where the slots came from, e.g. `slots of profile "Steam" (games.toml)`
     /// — or, with an empty `slots`, why there is nothing to map.
     pub source: String,
+    /// The same fact as [`source`](Self::source), **machine-readable**: the
+    /// games.toml profile title these slots were read from, or `None` for
+    /// `config.toml`'s `[[slot]]` list.
+    ///
+    /// It exists because a surface that offers to CHANGE one of these slots
+    /// has to write to the file it read them from, and prose cannot be asked
+    /// that. The cabinet's slot picker took the destination from
+    /// `SessionView::profile` instead, and those two are not the same answer:
+    /// a daemon started with `--game "Steam"` on a config that also has
+    /// `[[slot]]` entries listed config.toml's slots and wrote games.toml's —
+    /// silently editing a row the user was not looking at, and creating one if
+    /// the profile had no such slot.
+    #[serde(default)]
+    pub profile: Option<String>,
     pub config_root: String,
     pub slots: Vec<MapperSlot>,
 }
@@ -110,6 +124,7 @@ impl MapperSnapshot {
         Self {
             generated_at: "(unavailable)".to_owned(),
             source: reason.to_owned(),
+            profile: None,
             config_root: "(unavailable)".to_owned(),
             slots: Vec::new(),
         }

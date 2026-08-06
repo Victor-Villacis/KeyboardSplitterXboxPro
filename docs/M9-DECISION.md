@@ -431,3 +431,61 @@ the "zero web deps in the default build" clause now carries the honest scope
 noted in §1 and §5: it is a statement about the *default build*, not a promise
 that a GUI exists on a machine with no web engine. On such a machine the CLI —
 complete by CONTROL-SURFACE's standing rule — and the tray are the surfaces.
+
+---
+
+## 9. Amendment (2026-08-06, later the same day): the cabinet surface
+
+**§1's cancellation stands, and this is not a reversal of it — but the document
+above does not describe what was built next, so it says so here rather than
+being quietly contradicted by the tree.**
+
+What shipped is `crates/ksx-cabinet`: an egui/eframe window behind
+`--features cabinet`, hosted as a fourth thread inside `ksx daemon`. §7 named
+the trigger that would flip the decision to Option A ("ksx must run a GUI on a
+machine with no web engine at all"), and **that trigger has not fired.** This is
+a different thing, and the difference is the whole of the argument:
+
+| §2's Option A | what was built |
+|---|---|
+| a second **mapper** — 37-column piano roll, controller art, learn modal, macro editor | **no mapper, no macro editor, no preset file management, ever** |
+| parity with Studio, "a number that grows with every feature Studio gains" | five OPERATE screens: button check, am-I-working, start/stop, pick a profile, pick a slot's preset |
+| "every future feature designed, built, tested and documented **twice**" | every screen is a list of things that already exist; every confirm is one existing `ksx-api` verb |
+| "cannot serve the phone at all" — so it does not replace Studio | it does not try to. Studio stays the authoring surface and the phone surface |
+
+**The 2× multiplier was the argument against A, and it is what this avoids.**
+A's cost was never the build; it was that a second *authoring* surface has to
+re-implement every future authoring feature in a second idiom. An OPERATE
+surface has no such obligation: it renders `ControlSource`, `StatusSource` and
+the live sink, and a new verb reaches it as a new row in a list — or does not
+reach it at all, which is the ordinary case, because most verbs fail the
+ten-second-joystick test and belong in Studio by construction.
+
+What §2 priced and this surface does NOT pay: the design system landing at 85%
+(it translates DESIGN-SYSTEM's *intent* to 10-foot rather than porting its
+14 px values — one theme, one accent meaning one thing, a focus ring that is the
+cursor); the vendored controller art (there is none); the SVG rasterisation and
+its resize panic (no SVG); the `✕ ○ △ □` font subset (the surface is ASCII plus
+the preset vocabulary, after `▲ ▼ Ⓐ Ⓑ` all drew as tofu boxes on the first pass
+and had to be replaced).
+
+**What it buys that neither Studio nor the CLI can.** Studio is the wrong client
+for a machine with no keyboard and no mouse: §2 says so about egui in the other
+direction, and it is just as true here. Two things only this surface does:
+
+1. **The button check.** MAPPER-UX Build C's core value — press a panel button,
+   see what the panel sent beside what the pad published, per slot. It needs the
+   live pipeline, and the live pipeline is *inside the daemon's process*. A page
+   served over a socket could show it too, one day; a window that is already a
+   thread in that process shows it with a queue and no protocol.
+2. **Being drivable from the cabinet.** §2's argument that "an egui window on the
+   cabinet screen needs a keyboard and mouse at the cabinet" was correct about a
+   MAPPER and is answered here: while emulation runs the panel produces no
+   keystrokes at all, so the window reads ksx's own virtual pads
+   (`XInputGetState`, ~150 lines, no gilrs). Joystick, two buttons, no text
+   entry.
+
+**Still true, unchanged:** the default build links neither UI (`cargo tree`,
+both ways); Studio owns the mapper; the CLI remains complete by the standing
+rule; and §5's honest loss stands — on a machine with no web engine there is now
+a graphical *operate* surface, and there is still **no graphical mapper**.

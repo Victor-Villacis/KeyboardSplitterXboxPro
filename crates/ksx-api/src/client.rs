@@ -18,12 +18,12 @@
 
 use crate::control::{
     map_request, BindOutcome, BindRequest, ControlSource, LearnView, MacroOutcome, MacroWrite,
-    SessionView,
+    SessionView, SlotOutcome,
 };
 use crate::refusal::{codes, Refusal};
 use crate::wire::{
     BackupView, BackupsRequest, ClearAllRequest, LearnResponse, Request, Response, RestoreMode,
-    RestoreRequest,
+    RestoreRequest, SlotAssignRequest,
 };
 
 /// Performs one typed verb. The whole seam between a surface and a daemon.
@@ -250,6 +250,28 @@ impl<S: VerbSink> ControlSource for Client<S> {
                 Some(refusal) => Err(refusal),
             },
             _ => Err(Self::mismatch(&request)),
+        }
+    }
+
+    /// One `slot-assign` request. The BOUNCE is the daemon's to perform and
+    /// its to report: this only carries the answer back, so a surface cannot
+    /// end up claiming pads stayed plugged when they did not.
+    fn assign_slot(&self, request: &SlotAssignRequest) -> SlotOutcome {
+        let request = Request::SlotAssign(request.clone());
+        match self.call(&request) {
+            Ok(Response::SlotAssign(answer)) => SlotOutcome::from(answer),
+            Ok(_) => SlotOutcome {
+                ok: false,
+                error: Some(Self::mismatch(&request).message),
+                code: Some(codes::PIPE_ERROR.to_owned()),
+                ..SlotOutcome::default()
+            },
+            Err(refusal) => SlotOutcome {
+                ok: false,
+                error: Some(refusal.message),
+                code: Some(refusal.code),
+                ..SlotOutcome::default()
+            },
         }
     }
 

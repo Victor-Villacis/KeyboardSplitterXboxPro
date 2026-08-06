@@ -15,6 +15,7 @@ default-members = [
     "crates/ksx-games",
     "crates/ksx-app",
     "crates/ksx-studio",
+    "crates/ksx-cabinet",
     "crates/ksx-fuzz",
 ]
 
@@ -37,6 +38,7 @@ ksx-hidmaestro = { path = "crates/ksx-hidmaestro" }
 ksx-platform = { path = "crates/ksx-platform" }
 ksx-games = { path = "crates/ksx-games" }
 ksx-studio = { path = "crates/ksx-studio" }
+ksx-cabinet = { path = "crates/ksx-cabinet" }
 vigem-client = { path = "crates/vigem-client", features = ["unstable_xtarget_notification", "unstable_ds4"] }
 # shared
 bitflags = "2"
@@ -70,6 +72,11 @@ forma-ir = "0.1.4"
 forma-server = "0.1.4"
 rust-embed = "8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
+# cabinet (the 10-foot OPERATE surface) — reaches ksx-app ONLY through the
+# optional `cabinet` feature, exactly like `studio`. The default build must link
+# NEITHER ui (provable with `cargo tree -p ksx-app`).
+eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui = "0.32"
 # dev / diagnostics
 proptest = "1"
 insta = "1"

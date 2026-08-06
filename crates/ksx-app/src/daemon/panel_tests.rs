@@ -533,7 +533,14 @@ fn daemon_with_plug_delay(panel: &Arc<Panel>, slow_plug: Duration) -> Daemon {
                 factory.slow_plug = slow_plug;
                 let mut keyboard = PanelKeyboardHandle(panel);
                 let mut out: Vec<u8> = Vec::new();
-                control_loop_with(rx, state, &mut factory, &mut keyboard, &mut out);
+                control_loop_with(
+                    rx,
+                    state,
+                    &mut factory,
+                    &mut keyboard,
+                    &super::NoUi,
+                    &mut out,
+                );
                 out
             }
         })
@@ -736,6 +743,7 @@ fn one_claim_serves_two_sessions_and_the_panel_types_in_between() {
         Arc::clone(&state),
         &mut factory,
         &mut keyboard,
+        &super::NoUi,
         &mut out,
     );
     let between = user.join().expect("the user script must not panic");
@@ -811,7 +819,14 @@ fn a_key_held_into_emulation_is_released_and_not_latched() {
     let mut keyboard = PanelKeyboardHandle(Arc::clone(&rig.panel));
     let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
     let mut out: Vec<u8> = Vec::new();
-    control_loop_with(rx, state, &mut factory, &mut keyboard, &mut out);
+    control_loop_with(
+        rx,
+        state,
+        &mut factory,
+        &mut keyboard,
+        &super::NoUi,
+        &mut out,
+    );
 
     assert!(
         rig.typed.events().contains(&(Key::Left, false)),
@@ -884,6 +899,7 @@ fn the_control_loops_keyboard_is_the_daemons_own_claim() {
         game: None,
         no_launch: true,
         panel: Some(Arc::clone(&rig.panel)),
+        feed: crate::feed::LiveSink::default(),
     };
     let mut keyboard = factory.panel_keyboard();
 
@@ -911,6 +927,7 @@ fn the_control_loops_keyboard_is_the_daemons_own_claim() {
         game: None,
         no_launch: true,
         panel: None,
+        feed: crate::feed::LiveSink::default(),
     };
     none.panel_keyboard().set_emulating(true);
 }

@@ -86,6 +86,13 @@ pub type ClearAllFn =
 pub type BackupsFn =
     Box<dyn Fn(&str) -> Result<Vec<crate::mapping::PresetBackup>, crate::mapping::MapError> + Send>;
 
+/// The `slot-assign` verb's writer — [`crate::slots::assign`], same injection
+/// rule as [`MapFn`].
+pub type SlotAssignFn = Box<
+    dyn Fn(&crate::slots::SlotSpec) -> Result<crate::slots::AppliedSlot, crate::slots::SlotError>
+        + Send,
+>;
+
 /// Everything a pipe request can reach. One struct so the transport, the
 /// tests and future verbs share a single wiring point.
 pub struct PipeDeps {
@@ -98,6 +105,9 @@ pub struct PipeDeps {
     pub restore: RestoreFn,
     pub clear_all: ClearAllFn,
     pub backups: BackupsFn,
+    /// The one verb here that is not a preset write: which preset a slot uses
+    /// (`slot-assign`, docs/CONTROL-SURFACE.md honest gaps 1 and 5).
+    pub slot_assign: SlotAssignFn,
     pub learn: super::learn::LearnService,
 }
 
@@ -172,6 +182,18 @@ pub fn backups_fn(root: ksx_config::ConfigRoot) -> BackupsFn {
     Box::new(move |preset| {
         crate::mapping::list_backups(&ksx_config::Store::new(root.clone()), preset)
     })
+}
+
+/// The real [`SlotAssignFn`]: [`crate::slots::assign`] against `root`'s store.
+///
+/// No session-backup hook, unlike the preset writers: this writes `config.toml`
+/// or `games.toml`, and the store's own `backup()` already copies the file to
+/// `<file>.bak-YYYYMMDD-HHMMSS` before every write. The once-per-lifetime
+/// `.session-bak` belongs to presets, where a mapping session makes many small
+/// edits and "undo everything since the daemon started" is a thing people want.
+/// A slot assignment is one deliberate act.
+pub fn slot_assign_fn(root: ksx_config::ConfigRoot) -> SlotAssignFn {
+    Box::new(move |spec| crate::slots::assign(&ksx_config::Store::new(root.clone()), spec))
 }
 
 /// games.toml rows for the status response. Unreadable configuration reports
@@ -334,7 +356,7 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
     };
     let Some(verb) = request.get("verb").and_then(|v| v.as_str()) else {
         return err_msg(
-            r#"request has no "verb" (status | start | stop | reload | map | map-macro | map-restore | map-clear-all | map-backups | learn-key | learn-poll | learn-cancel)"#,
+            r#"request has no "verb" (status | start | stop | reload | map | map-macro | map-restore | map-clear-all | map-backups | slot-assign | learn-key | learn-poll | learn-cancel)"#,
         );
     };
     match verb {
@@ -376,6 +398,7 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
         "map-restore" => handle_map_restore(&request, deps, settle),
         "map-clear-all" => handle_map_clear_all(&request, deps, settle),
         "map-backups" => handle_map_backups(&request, deps),
+        "slot-assign" => handle_slot_assign(&request, deps, settle),
         // Learn needs an IDLE daemon, and this refusal is deliberate — it was
         // re-examined in full on 2026-08-05 and kept.
         //
@@ -426,7 +449,8 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
         "learn-cancel" => deps.learn.cancel(),
         other => err_msg(format!(
             "unknown verb '{other}' (status | start | stop | reload | map | map-macro | \
-             map-restore | map-clear-all | map-backups | learn-key | learn-poll |              learn-cancel)"
+             map-restore | map-clear-all | map-backups | slot-assign | learn-key | \
+             learn-poll | learn-cancel)"
         )),
     }
 }
@@ -689,6 +713,150 @@ fn handle_map_macro(
                 "problems": problems,
             })
         }
+    }
+}
+
+/// The pipe `slot-assign` verb: `{"verb":"slot-assign","slot":3,"preset":"IPAC
+/// P3","profile":"Steam","reload":true}` — which preset a slot uses
+/// (docs/CONTROL-SURFACE.md honest gaps 1 and 5).
+///
+/// **This is the one write verb that never claims a hot swap.** Every other one
+/// enqueues [`DaemonCommand::ApplyBindings`] and lets the control loop pick the
+/// cheapest correct answer; a slot assignment enqueues the blunt
+/// [`DaemonCommand::Reload`] and reports `restarted`. The reasoning is on
+/// [`ksx_api::SlotOutcome::restarted`] and it is deliberate: this verb writes
+/// the slot ENTRY, and one predictable answer beats a cheaper one that is only
+/// sometimes true.
+fn handle_slot_assign(
+    request: &serde_json::Value,
+    deps: &PipeDeps,
+    settle: Duration,
+) -> serde_json::Value {
+    // ONE reader, shared with every client — the same rule `map` follows: a
+    // caller is refused in these exact words before a round trip.
+    let assign = match ksx_api::SlotAssignRequest::from_json(request) {
+        Ok(assign) => assign,
+        Err(refusal) => {
+            return serde_json::json!({
+                "ok": false, "code": refusal.code, "error": refusal.message,
+            })
+        }
+    };
+    let applied = match (deps.slot_assign)(&crate::slots::SlotSpec {
+        slot: assign.slot,
+        preset: assign.preset.clone(),
+        profile: assign.profile.clone(),
+    }) {
+        Ok(applied) => applied,
+        Err(err) => {
+            return serde_json::json!({
+                "ok": false, "code": err.code(), "error": err.to_string(),
+            })
+        }
+    };
+
+    let mut message = applied.message();
+    let bounce = bounce_after_slot_write(&assign, &applied, deps, settle, &mut message);
+    serde_json::json!({
+        "ok": true,
+        "message": message,
+        "path": applied.path.display().to_string(),
+        "slot": applied.slot,
+        "preset": applied.preset,
+        "previous_preset": applied.previous,
+        "profile": applied.profile,
+        "created": applied.created,
+        "unchanged": applied.unchanged,
+        "backup": applied.backup.as_ref().map(|path| serde_json::json!({
+            "stamp": backup_stamp(path),
+            "label": backup_stamp(path),
+            "path": path.display().to_string(),
+        })),
+        "restarted": bounce.restarted,
+        // What the daemon DID, not what the caller asked for. `SlotOutcome`'s
+        // field is documented as "`reload` was asked for and the daemon acted
+        // on it", and echoing the request made that documentation false in the
+        // one case it mattered: a running session that was asked to restart and
+        // did not come back reported `reloaded: true, restarted: false`, which
+        // reads as "nothing was running".
+        "reloaded": bounce.reconciled,
+    })
+}
+
+/// What [`bounce_after_slot_write`] did.
+struct Bounce {
+    /// The session was torn down and came back on the new wiring.
+    restarted: bool,
+    /// The running session (if any) now matches what is on disk — either
+    /// because it restarted, or because there was nothing running to restart.
+    /// `false` means a session is running on the OLD wiring, or was stopped
+    /// and could not be started again; the appended message says which.
+    reconciled: bool,
+}
+
+/// `<file>.bak-YYYYMMDD-HHMMSS` → `YYYYMMDD-HHMMSS`, or the whole file name
+/// when it does not carry one. The store names these; this only reads them.
+fn backup_stamp(path: &std::path::Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once(".bak-").map(|(_, stamp)| stamp.to_owned()))
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// `slot-assign`'s tail: bounce a RUNNING session onto the new wiring, and say
+/// what happened either way.
+///
+/// Deliberately NOT [`apply_after_write`]: that one asks the control loop for
+/// the cheapest correct answer, and for a preset-only re-point the answer would
+/// be a hot swap with the pads left plugged. A caller that was told "the pads
+/// replug" and then saw them not replug has been lied to in the harmless
+/// direction, which is still a surface nobody can predict.
+fn bounce_after_slot_write(
+    assign: &ksx_api::SlotAssignRequest,
+    applied: &crate::slots::AppliedSlot,
+    deps: &PipeDeps,
+    settle: Duration,
+    message: &mut String,
+) -> Bounce {
+    let nothing_to_do = Bounce {
+        restarted: false,
+        reconciled: true,
+    };
+    let left_stale = Bounce {
+        restarted: false,
+        reconciled: false,
+    };
+    if applied.unchanged {
+        return nothing_to_do;
+    }
+    let baseline = snapshot(&deps.state).run;
+    let running = matches!(baseline, RunState::Running { .. } | RunState::Starting);
+    if !running {
+        message.push_str(" — nothing is running, so the next start reads it");
+        return nothing_to_do;
+    }
+    if !assign.reload {
+        message.push_str(" — a session is running on the old wiring; `reload` to restart it");
+        return left_stale;
+    }
+    if deps.tx.send(DaemonCommand::Reload).is_err() {
+        message.push_str(" — written, but the daemon is shutting down (not restarted)");
+        return left_stale;
+    }
+    let answer = await_start(&deps.state, &baseline, settle);
+    let restarted = answer
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if let Some(line) = answer.get("message").or_else(|| answer.get("error")) {
+        if let Some(line) = line.as_str() {
+            message.push_str(" — ");
+            message.push_str(line);
+        }
+    }
+    Bounce {
+        restarted,
+        reconciled: restarted,
     }
 }
 
@@ -1290,7 +1458,13 @@ steps = [{ hold = ["A"], ms = 50 }]
         d.save_macro = save_macro;
         d.restore = restore_fn(root.clone());
         d.clear_all = clear_all_fn(root.clone());
-        d.backups = backups_fn(root);
+        d.backups = backups_fn(root.clone());
+        d.slot_assign = slot_assign_fn(root.clone());
+        // `slot-assign` writes config.toml, so the file has to exist.
+        store
+            .save_config(&ksx_config::ConfigFile::default())
+            .unwrap();
+        let _ = root;
 
         // Every verb, in an order that leaves real data behind for the ones
         // that read it (the restores take timestamped backups, so `map-backups`
@@ -1350,6 +1524,12 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
             Request::MapBackups(ksx_api::BackupsRequest {
                 preset: "IPAC P1".into(),
             }),
+            Request::SlotAssign(ksx_api::SlotAssignRequest {
+                slot: 1,
+                preset: "IPAC P1".into(),
+                profile: None,
+                reload: false,
+            }),
             Request::LearnKey,
             Request::LearnPoll,
             Request::LearnCancel,
@@ -1385,6 +1565,7 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
                         Response::Restore(_)
                     )
                     | (Request::MapBackups(_), Response::Backups(_))
+                    | (Request::SlotAssign(_), Response::SlotAssign(_))
                     | (
                         Request::LearnKey | Request::LearnPoll | Request::LearnCancel,
                         Response::Learn(_)
@@ -1422,6 +1603,18 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
                         "the restores above each left one: {said}"
                     );
                     assert!(!answer.backups[0].label.is_empty());
+                }
+                (_, Response::SlotAssign(answer)) => {
+                    assert!(answer.ok, "{said}");
+                    assert_eq!(answer.slot, Some(1));
+                    assert_eq!(answer.preset.as_deref(), Some("IPAC P1"));
+                    assert!(answer.created, "slot 1 did not exist in this fixture");
+                    assert!(answer.path.is_some());
+                    // The pad bounce is in the sentence, always — with nothing
+                    // running that reads "the next start reads it".
+                    let message = answer.message.clone().unwrap_or_default();
+                    assert!(message.contains("pads replugged"), "{message}");
+                    assert!(!answer.restarted, "nothing was running to restart");
                 }
                 (_, Response::Learn(answer)) => {
                     assert!(answer.ok, "{said}");
@@ -1510,6 +1703,18 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
         Box::new(|_preset| Ok(Vec::new()))
     }
 
+    /// A `slot-assign` that refuses everything — protocol tests that never
+    /// re-wire. The refusal is the real one, so a test that DOES exercise the
+    /// verb sees the shape a cabinet would.
+    fn no_slot_assign() -> SlotAssignFn {
+        Box::new(|spec| {
+            Err(crate::slots::SlotError::UnknownPreset {
+                preset: spec.preset.clone(),
+                available: Vec::new(),
+            })
+        })
+    }
+
     fn deps(tx: Sender<DaemonCommand>, state: SharedState, profiles: ProfilesFn) -> PipeDeps {
         PipeDeps {
             tx,
@@ -1525,6 +1730,7 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
                 })
             }),
             backups: no_backups(),
+            slot_assign: no_slot_assign(),
             learn: idle_learn(),
         }
     }
@@ -2815,6 +3021,7 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
                         state,
                         &mut factory,
                         &mut super::super::super::NoPanel,
+                        &super::super::super::NoUi,
                         &mut out,
                     );
                 }
@@ -2839,5 +3046,84 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
             tx.send(DaemonCommand::Quit).unwrap();
             loop_thread.join().unwrap();
         }
+    }
+
+    /// **A slot assignment whose restart FAILED must not report as an idle
+    /// daemon.** `reloaded` is documented as "`reload` was asked for and the
+    /// daemon acted on it"; echoing the REQUEST made it true in a case where
+    /// the daemon had torn a session down and could not bring it back, and
+    /// `SlotOutcome::headline` then printed "nothing was running, so nothing
+    /// had to restart" at somebody whose four pads had just vanished.
+    #[test]
+    fn a_slot_assign_whose_restart_fails_says_so_and_never_claims_nothing_was_running() {
+        let dir = std::env::temp_dir().join(format!(
+            "ksx-slot-bounce-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = ksx_config::ConfigRoot::at(&dir);
+        let store = ksx_config::Store::new(root.clone());
+        let file: ksx_config::PresetFile =
+            toml::from_str("name = \"IPAC P1\"\n[bindings]\nA = \"S\"\n").unwrap();
+        store.save_preset(&file).unwrap();
+        store
+            .save_config(&ksx_config::ConfigFile::default())
+            .unwrap();
+
+        let state = shared(RunState::Running { slots: 4 });
+        let (tx, rx) = unbounded();
+        let mut d = deps(tx, state.clone(), no_profiles());
+        d.slot_assign = slot_assign_fn(root);
+
+        // Stand in for the control loop's Reload: the session comes down and
+        // the restart fails on the new wiring.
+        let loop_thread = std::thread::spawn({
+            let state = state.clone();
+            move || {
+                let command = rx.recv_timeout(Duration::from_secs(2)).expect("Reload");
+                if let Ok(mut s) = state.lock() {
+                    s.run = RunState::Starting;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                if let Ok(mut s) = state.lock() {
+                    s.run = RunState::Failed {
+                        message: "cannot start: no usable slot".to_owned(),
+                    };
+                }
+                command
+            }
+        });
+
+        let v = handle_request(
+            r#"{"verb":"slot-assign","slot":1,"preset":"IPAC P1","reload":true}"#,
+            &d,
+            Duration::from_secs(2),
+        );
+        assert_eq!(loop_thread.join().unwrap(), DaemonCommand::Reload);
+
+        assert_eq!(v["ok"], true, "the FILE was written: {v}");
+        assert_eq!(v["restarted"], false, "the restart failed: {v}");
+        assert_eq!(
+            v["reloaded"], false,
+            "the running session was NOT reconciled: {v}"
+        );
+        let message = v["message"].as_str().unwrap();
+        assert!(message.contains("no usable slot"), "{message}");
+
+        // ...and that is what a 10-foot surface prints, verbatim.
+        let outcome: ksx_api::SlotOutcome =
+            serde_json::from_value::<ksx_api::SlotAssignResponse>(v.clone())
+                .expect("a slot-assign response")
+                .into();
+        let headline = outcome.headline();
+        assert!(headline.contains("no usable slot"), "{headline}");
+        assert!(
+            !headline.contains("nothing was running"),
+            "the lie this test exists for: {headline}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -52,6 +52,7 @@
 
 pub mod client;
 pub mod control;
+pub mod live;
 pub mod machine;
 pub mod pipe;
 pub mod refusal;
@@ -61,8 +62,9 @@ pub mod wire;
 pub use client::{Client, VerbSink};
 pub use control::{
     map_request, multi_key_refusal, with_key, without_key, BindConflict, BindOutcome, BindRequest,
-    ControlSource, LearnView, MacroOutcome, MacroWrite, SessionView,
+    ControlSource, LearnView, MacroOutcome, MacroWrite, SessionView, SlotOutcome,
 };
+pub use live::{KeyHit, LiveFeed, LiveFrame, NoFeed, PadFeedback, SlotLive};
 pub use machine::{
     AdviceRow, AutostartView, DevicesView, DoctorRow, DoctorView, KeyboardRow, MachineSource,
     PresetRow, PresetsView, TemplateRow, UsbRow, WinusbView,
@@ -77,5 +79,6 @@ pub use wire::{
     macro_body, ActionResponse, BackupView, BackupsRequest, BackupsResponse, ClearAllRequest,
     ConflictView, FlashView, HealthView, LastSessionView, LearnResponse, MacroResponse,
     MacroWriteKind, MapMacroRequest, MapRequest, MapResponse, MovedFromView, Request, Response,
-    RestoreMode, RestoreRequest, RestoreResponse, StatusResponse, PIPE_NAME, RESTORE_MODES,
+    RestoreMode, RestoreRequest, RestoreResponse, SlotAssignRequest, SlotAssignResponse,
+    StatusResponse, PIPE_NAME, RESTORE_MODES,
 };

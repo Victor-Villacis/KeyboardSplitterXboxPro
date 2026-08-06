@@ -400,6 +400,14 @@ pub struct RunOptions {
     /// can reach the live engine without bouncing the pads. Default is a slot
     /// nobody reads — `ksx run` has no control channel to swap through.
     pub hot_swap: HotSwapSlot,
+    /// The live fan-out sink a surface watches the pipeline through
+    /// (`crate::feed`).
+    ///
+    /// Default is a sink with no subscribers, and that is not merely a
+    /// convenience: with nobody watching, every tap below is one relaxed atomic
+    /// load and a return, so `ksx run` and a daemon with no cabinet window open
+    /// run exactly the pipeline they ran before this existed.
+    pub feed: crate::feed::LiveSink,
 }
 
 impl Default for RunOptions {
@@ -415,6 +423,7 @@ impl Default for RunOptions {
             panic_after_events: None,
             hook: Box::new(NoHook),
             hot_swap: HotSwapSlot::default(),
+            feed: crate::feed::LiveSink::default(),
         }
     }
 }
@@ -710,6 +719,11 @@ struct DeltaTx {
     pending: Vec<OutMsg>,
     coalesced: u64,
     dropped: u64,
+    /// The live fan-out (`crate::feed`). Tapped at the TOP of [`Self::send`],
+    /// before the coalescing below — a button held for one millisecond is a
+    /// state this queue is entitled to collapse away, and the button check is
+    /// not entitled to miss it.
+    feed: crate::feed::LiveSink,
 }
 
 /// The output thread is gone; nothing can be delivered any more.
@@ -717,17 +731,21 @@ struct DeltaTx {
 struct OutputGone;
 
 impl DeltaTx {
-    fn new(tx: Sender<OutMsg>) -> Self {
+    fn new(tx: Sender<OutMsg>, feed: crate::feed::LiveSink) -> Self {
         Self {
             tx,
             pending: Vec::with_capacity(ksx_core::MAX_SLOTS as usize),
             coalesced: 0,
             dropped: 0,
+            feed,
         }
     }
 
     /// Queue a delta and push as much as the channel will take. Never blocks.
     fn send(&mut self, msg: OutMsg) -> Result<(), OutputGone> {
+        // The live tap, first, on the transition itself. With nobody watching
+        // this is a relaxed load and a return.
+        self.feed.pad(msg.slot, msg.state);
         match self.pending.iter_mut().find(|p| p.slot == msg.slot) {
             Some(slot) => {
                 *slot = msg;
@@ -935,11 +953,21 @@ pub fn supervise(
     let recorder = LatencyRecorder::new(opts.clock);
     let live = opts.live_latency.then_some(LIVE_LATENCY_INTERVAL);
     let output_msg = msg_tx.clone();
+    let output_feed = opts.feed.clone();
     let output_handle = std::thread::Builder::new()
         .name("ksx-output".into())
         .spawn(move || {
             output_thread(
-                pads, slot_plugs, delta_rx, octl_rx, output_msg, recorder, live,
+                pads,
+                slot_plugs,
+                delta_rx,
+                octl_rx,
+                output_msg,
+                OutputReporting {
+                    latency: recorder,
+                    live,
+                    feed: output_feed,
+                },
             )
         })?;
 
@@ -1037,8 +1065,15 @@ pub fn supervise(
                 max_events: opts.max_events,
                 panic_after_events: opts.panic_after_events,
             };
-            move || engine_thread(slots, ev_rx, ectl_rx, delta_tx, msg, limits)
+            let feed = opts.feed.clone();
+            move || engine_thread(slots, ev_rx, ectl_rx, delta_tx, msg, limits, feed)
         })?;
+
+    // The pipeline is up: a surface watching the fan-out can now tell "nothing
+    // is pressed" from "nothing is running". Cleared in teardown below, on
+    // every path out, so a closed session never leaves a button check claiming
+    // a live pipeline.
+    opts.feed.set_running(true);
 
     // The engine exists: a binding edit can now reach it in place. Published
     // here rather than at the top of the function because before this line
@@ -1083,6 +1118,7 @@ pub fn supervise(
         let _ = out.flush();
         opts.hook.finished(out);
         opts.hot_swap.clear();
+        opts.feed.set_running(false);
         guard.release();
         let _ = ctl_tx.send(CaptureCtl::Shutdown);
         let capture_exit = match capture_handle.join() {
@@ -1270,6 +1306,11 @@ pub fn supervise(
     opts.hook.finished(out);
     // Nothing may hand tables to an engine that is about to join.
     opts.hot_swap.clear();
+    // ...and no surface may go on claiming a live pipeline once there is not
+    // one. Both teardown paths clear it, so a button check that was open when
+    // the game exited says "no session is running" rather than "nothing is
+    // pressed".
+    opts.feed.set_running(false);
 
     // ---- teardown: uncapture, THEN unplug ----------------------------------
     //
@@ -1535,9 +1576,10 @@ fn engine_thread(
     deltas: Sender<OutMsg>,
     msg: Sender<Msg>,
     limits: Limits,
+    feed: crate::feed::LiveSink,
 ) -> EngineOutcome {
     let mut engine = Engine::new(slots);
-    let mut deltas = DeltaTx::new(deltas);
+    let mut deltas = DeltaTx::new(deltas, feed.clone());
     let mut seen: u64 = 0;
     let mut limit_signalled = false;
     // The macro clock: milliseconds since this thread started. Monotonic, and
@@ -1582,6 +1624,12 @@ fn engine_thread(
                     // Capture is gone; the supervisor sees the thread finish.
                     finish!();
                 };
+                // The live tap's other half: what the PANEL sent, before the
+                // engine has an opinion about it. That ordering is the point —
+                // a key that arrives here and lights nothing downstream is an
+                // unbound key, and the button check can only say so if it sees
+                // both columns. Free when nobody is watching.
+                feed.key(&event.device, event.key, event.down);
                 for delta in engine.handle_at(&event, clock()) {
                     if deltas.send(OutMsg {
                         slot: delta.slot,
@@ -1696,6 +1744,18 @@ struct OutputOutcome {
     updates: u64,
 }
 
+/// Everything the output thread REPORTS with, as opposed to everything it
+/// drives. Grouped because the three of them arrive together, are read on the
+/// same 50 ms service tick, and none of them can affect a pad.
+struct OutputReporting {
+    latency: LatencyRecorder,
+    /// `--latency`: how often to emit a rolling summary. `None` = never.
+    live: Option<Duration>,
+    /// The live fan-out (`crate::feed`) — this thread's half is the game's
+    /// feedback (E8's stream).
+    feed: crate::feed::LiveSink,
+}
+
 /// Owns the pad backend for its whole life: plugs at startup, applies deltas,
 /// drains feedback, unplugs on `Stop`. Nothing else ever touches the driver.
 ///
@@ -1711,9 +1771,13 @@ fn output_thread(
     deltas: Receiver<OutMsg>,
     ctl: Receiver<OutputCtl>,
     msg: Sender<Msg>,
-    mut latency: LatencyRecorder,
-    live: Option<Duration>,
+    reporting: OutputReporting,
 ) -> OutputOutcome {
+    let OutputReporting {
+        mut latency,
+        live,
+        feed,
+    } = reporting;
     let mut handles: Vec<(u8, PadHandle)> = Vec::with_capacity(slots.len());
     for &(slot, persona) in &slots {
         match pads.plug_persona(persona) {
@@ -1813,6 +1877,18 @@ fn output_thread(
                         led = feedback.led_number,
                         "pad feedback"
                     );
+                    // E8's stream, on E7's bus. This queue used to be drained
+                    // and discarded — "today that data is discarded: nothing
+                    // consumes the queue" (docs/ENHANCEMENTS.md E8). It now has
+                    // exactly one consumer shape, the same lossy fan-out the
+                    // button check reads, so a lamp driver is a subscriber
+                    // rather than a second tap into the output thread.
+                    feed.feedback(ksx_api::PadFeedback {
+                        slot,
+                        large_motor: feedback.large_motor,
+                        small_motor: feedback.small_motor,
+                        led_number: feedback.led_number,
+                    });
                 }
             }
         }
@@ -2001,7 +2077,7 @@ mod tests {
     #[test]
     fn delta_tx_coalesces_per_slot_instead_of_blocking() {
         let (tx, rx) = bounded::<OutMsg>(1);
-        let deltas = DeltaTx::new(tx);
+        let deltas = DeltaTx::new(tx, crate::feed::LiveSink::default());
         fn state(lt: u8) -> PadState {
             PadState {
                 lt,
@@ -2105,7 +2181,7 @@ mod tests {
         for capacity in [1usize, 2, 7, 64] {
             for stride in [Some(1usize), Some(3), Some(29), None] {
                 let (tx, rx) = bounded::<OutMsg>(capacity);
-                let mut deltas = DeltaTx::new(tx);
+                let mut deltas = DeltaTx::new(tx, crate::feed::LiveSink::default());
                 let mut got: Vec<(u8, PadState)> = Vec::new();
                 let drain = |rx: &Receiver<OutMsg>, got: &mut Vec<(u8, PadState)>| {
                     while let Ok(m) = rx.try_recv() {
@@ -2170,7 +2246,7 @@ mod tests {
     #[test]
     fn delta_tx_reports_a_dead_output_thread_and_counts_the_loss() {
         let (tx, rx) = bounded::<OutMsg>(1);
-        let mut deltas = DeltaTx::new(tx);
+        let mut deltas = DeltaTx::new(tx, crate::feed::LiveSink::default());
         let msg = |slot: u8| OutMsg {
             slot,
             state: PadState::default(),

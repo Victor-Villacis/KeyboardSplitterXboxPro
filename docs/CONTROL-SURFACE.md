@@ -6,12 +6,85 @@ egui window, and `ARCHITECTURE.md` for the thread model everything below defers
 to.
 
 **The standing rule: every front-door action must map to an existing backend
-verb — no GUI-only code paths.** A button in the native UI is a `DaemonCommand`
-enqueued on the in-process control loop, or a CLI verb's implementation called
-in-process; a button in Studio is a `ksx-api` call wrapping the same verb. If
-an operation has no verb, the GUI does not get the operation until the verb
-exists — which makes the gap list below the GUI's dependency list, not a wish
-list.
+verb — no GUI-only code paths.** A button in the cabinet window is a
+`DaemonCommand` enqueued through the daemon's own dispatch; a button in Studio
+is a `ksx-api` call wrapping the same verb. If an operation has no verb, the
+GUI does not get the operation until the verb exists — which makes the gap list
+below the GUI's dependency list, not a wish list.
+
+## The two surfaces: the cabinet OPERATES, Studio AUTHORS (2026-08-06)
+
+**One rule decides which surface gets a feature, and one test decides whether
+it belongs on the cabinet at all.**
+
+> **The cabinet OPERATES — choose among things that already exist. Studio
+> AUTHORS — create, edit, name, delete.**
+>
+> *Can it be done with a joystick, two buttons, no text entry, in ten seconds,
+> by someone standing at the cab with a game about to start?*
+
+| | ksx cabinet (`--features cabinet`) | ksx Studio (`--features studio`) |
+|---|---|---|
+| where | the machine's own screen, read at six feet, driven by the arcade panel | a desk, or a phone at the cab, with a pointer and a keyboard |
+| what | press a button and watch both columns; is it working; start/stop; which game profile; which preset each slot uses | the mapper, the macro editor, preset files, backups, templates |
+| never | a mapper, a macro editor, preset file management — **ever** | — |
+
+The split is not enforced by review. `crates/ksx-cabinet` links `ksx-api` and
+egui and **nothing else**: no pipe client, no config store, no `DaemonCommand`.
+And the in-daemon window's own dispatch (`ksx-app/src/cabinet.rs`) is built with
+its preset writers set to REFUSALS that name the surface which can do it — so a
+cabinet that ever tried to send `map`, `map-macro`, `map-restore`,
+`map-clear-all` **or `learn-key`** is refused by its own table, in words, on
+screen. `learn-key` is on that list because learning a key exists to fill in a
+binding, which is authoring; its refusal is **synchronous**
+(`LearnService::refusing`), because a learner that answers "listening" and only
+fails on a later poll is a lock that stands open for ten seconds. The whole
+table is asserted, not reviewed: `cabinet::tests::
+the_in_daemon_dispatch_refuses_every_authoring_verb_in_words`.
+
+**Driving it is the hard part, and it has two paths** (`ksx-cabinet/src/pad.rs`):
+with emulation **stopped** the panel is an ordinary keyboard (or typethrough is
+re-injecting its keys) and winit sees it; with emulation **running** the panel
+is captured below win32k and deliberately muted from typethrough, so winit sees
+**nothing at all** — and the window reads `XInputGetState` against ksx's own
+virtual pads instead. Both paths are read every frame, so the transition is
+invisible to the person at the cabinet. The window only consumes pad input while
+it has focus: while a session runs, those presses are also playing the game.
+
+**The hole in that, stated rather than discovered.** The second path is XInput,
+and XInput is Xbox personas only. A cabinet whose slots are all `playstation`
+(a DS4 on plain HID — which is what MAME and RetroArch read) presents **zero**
+XInput pads, so with emulation running its panel can drive neither path: no
+keystrokes, no pad. `screens::footer` says exactly that, in `WARN`, in the one
+state where it is true. It used to say "panel: keyboard only" there, which was
+the opposite of the truth.
+
+**Two things the cabinet window is not allowed to lie about**, both found by
+adversarial review of the first build and both now asserted:
+
+- **Reopening it.** winit permits one event loop per PROCESS
+  (`EVENT_LOOP_CREATED`, never reset) and eframe works around that with a
+  thread-local it re-enters via `run_app_on_demand`. A window hosted on a fresh
+  thread per open therefore worked exactly once per daemon lifetime and then
+  failed silently forever — a tray item that stops working with nothing on
+  screen saying why, which is this document's "must SAY so" invariant inverted.
+  `cabinet::spawn_in_daemon` keeps ONE host thread for the daemon's life and
+  re-enters the window on it.
+- **Which file the Slots screen writes to.** The list comes from
+  `StatusSource::mapper`, which reads `config.toml`'s `[[slot]]` entries when
+  there are any and the first games.toml profile otherwise. That is not the
+  same answer as `SessionView::profile`, which is whatever `--game` said. The
+  picker must write back to the file it READ from
+  (`MapperSnapshot::profile`, the machine-readable half of `source`), and where
+  the two disagree the screen says so rather than quietly choosing one.
+
+**Every glyph the cabinet draws is ASCII**, or one of two codepoints seen
+rendering in a named screenshot. egui's bundled fonts cover a specific set and
+nothing warns you when a codepoint is outside it: the first pass shipped
+`▲ ▼ Ⓐ Ⓑ` as tofu boxes into the one legend a mouseless surface has, and the
+sweep that replaced them missed every string on a path `--demo` cannot reach.
+It is a test now (`screens::tests::nothing_this_surface_draws_is_an_unverified_codepoint`),
+because a screenshot cannot cover a screen it cannot get to.
 
 ## `ksx-api` — the typed surface every front end consumes (2026-08-06)
 
@@ -99,7 +172,9 @@ have to re-implement.** Violating it is how Studio gets forked.
 | Per-slot persona | TOML edit: `persona = "playstation"` on the `[[slot]]` (aliases `ds4`/`ps4` accepted) | M7 wizard / mapping verbs first; then GUI forms write the same TOML and issue `Reload` | gap — TOML-only **by design** until M7 |
 | Preset editing | `ksx map --preset "IPAC P1" --function A --key G [--clear] [--force] [--move-from FUNCTION] [--json]`; **key LISTS: repeat or comma-separate `--key` (`--key S --key Enter`, `--key S,Enter`) → `A = ["S", "Enter"]`, one write** (pipe: `"keys": ["S","Enter"]`, the list spelling of `"key"` — exactly one of the two); chords: `--when B[,C] [--unless K]`; **TURBO: `--turbo-hz N`** (auto-fire while the key is held; `0` = off, omitted = leave the control's existing rate alone, `--clear` clears it with the keys; one rate per CONTROL, so several keys share one clock — docs/INPUT-TRANSFORMS.md §3a). The rate is CAPPED, never refused: a press AND a release must each survive a 60 Hz poll, so ~15 Hz is the fastest deliverable and the response carries both `turbo_hz` and `turbo_effective_hz` (pipe `map` takes the same `"turbo_hz"` field); whole-preset: `--restore defaults\|session-backup\|latest-backup`, `--clear-all`, `--list-backups`; macro BODIES: `ksx macro --preset X --name N --from-json FILE` / `--delete` (pipe `map-macro`); pipe `map` / `map-macro` / `map-restore` / `map-clear-all` / `map-backups` (same writers: `ksx-app/src/mapping.rs`); TOML edit still first-class | **Studio's `/map` mapper (live)**: click a control → pipe `learn-key` → pipe `map` — every write goes through the one shared writer, never a parallel editor. "Add another key" and the per-key ✕ send the control's WHOLE key list (`ControlSource::bind_keys` → one `map` with `"keys"`), so a multi-key edit is ONE atomic write, not read-modify-write. Conflict detection is server-side in that writer (see below). The macro editor reads a preset's `[macros]` tables (`StatusSource::macros`) and saves a whole table back through `/api/macro/save` → `ControlSource::save_macro` → pipe `map-macro` — including `repeat` / `turbo_hz` / `gap_ms`, with the effective-rate math printed live beside the selector. PER-BINDING TURBO shows on each legend row as its EFFECTIVE rate and is set from the learn dialog ("Set turbo" / "No turbo", beside Replace / Add another key / Clear) or, with no JavaScript, the row form's `turbo_hz` box and `Turbo` submit → `POST /map/turbo`; both write through the same `ControlSource::bind_keys` with the control's current key list, so turbo is never a second writer. Studio does not yet DISPLAY chords (later pass) — the CLI/pipe author them and the engine runs them | exists — CLI + pipe + Studio live |
 | Learn a key ("press the panel key for P1·A") | pipe `learn-key` / `learn-poll` / `learn-cancel` (asynchronous; see "learn-key semantics" below) | **Studio's mapper drives it (live)**: `/api/learn*` → the pipe verbs. No CLI face yet (`ksx map` takes the key by name; `ksx monitor` shows names) | exists — pipe + Studio |
-| Game profiles | TOML edit (`games.toml`); consumed by `ksx run --game`, `ksx daemon --game`, `ksx autostart --game` | Editing: M7 verbs (E5 `ksx slot assign` family), then GUI forms over them. Consuming: `DaemonCommand`/api as above | gap for editing; consuming exists |
+| Game profiles | TOML edit (`games.toml`); consumed by `ksx run --game`, `ksx daemon --game`, `ksx autostart --game` | Editing: M7 verbs (E5 `ksx slot assign` family), then GUI forms over them. Consuming: `DaemonCommand`/api as above. **The cabinet's "Game" screen picks one and starts it** — one `start` with a profile title, never a new path | gap for AUTHORING a profile; consuming and picking exist |
+| **Which preset a slot uses** | `ksx slot list [--profile TITLE]` (read-only, daemon-free); `ksx slot assign --slot N --preset NAME [--profile TITLE] [--reload] [--json]`; pipe `slot-assign`; writer `ksx-app/src/slots.rs` | **The cabinet's "Slots" screen** — pick a slot, pick a preset, confirm the pad bounce. `ControlSource::assign_slot` → the same verb. Studio has no face for it yet | exists — CLI + pipe + cabinet |
+| **Watch a running pipeline** (button check) | none — this is live data, not a verb | **The cabinet's "Buttons" screen**, over the lossy fan-out sink (`ksx-app/src/feed.rs`, shape in `ksx-api::live`): what the PANEL sent beside what the PAD published, per slot. Read-only by construction — the sink has no write path at all | exists — cabinet (in-daemon only; there is no wire protocol for the stream yet, and `ksx cabinet` as a separate process says so instead of rendering a dead panel) |
 | WinUSB claim / release / status | `ksx winusb status` (read-only); `claim`/`release` are dry runs by default, act only with `--yes` + an admin token | M9: same verbs in-process, preserving dry-run-first and the explicit consent step. M10: `status` is safe over the api; `claim`/`release` stay local + elevated | exists |
 | Autostart | `ksx autostart --enable/--disable/--status` (validates the config before registering) | M9: same verb in-process. M10: api | exists |
 | Install drivers | `ksx install-drivers [--dry-run] [--yes]` — the only elevated command (SealedFile pins, no self-elevation) | M9: same verb; the GUI never self-elevates either, it reports and stops exactly as the CLI does. M10: report-only over the api | exists |
@@ -267,6 +342,40 @@ The M7 mapper slice adds four verbs on the same channel:
      {"stamp":"20260805-221500","label":"2026-08-05 22:15:00 UTC","path":"…"},
      {"stamp":"20260804-090000","label":"2026-08-04 09:00:00 UTC","path":"…"}]}
 ```
+
+### Which preset a slot uses: `slot-assign` (2026-08-06)
+
+The one write verb on this channel that is **not** a preset edit, and the one
+whose `reload` is a BOUNCE (honest gaps 1 and 5, above).
+
+```
+→ {"verb":"slot-assign","slot":3,"preset":"IPAC P3","profile":"Steam","reload":true}
+← {"ok":true,
+   "message":"slot 3 in profile \"Steam\": \"Player 3\" → \"IPAC P3\" — a slot
+              change needs the pads replugged — running (4 slot(s))",
+   "path":"C:\\…\\games.toml","slot":3,"preset":"IPAC P3",
+   "previous_preset":"Player 3","profile":"Steam","created":false,
+   "unchanged":false,
+   "backup":{"stamp":"20260806-184011","label":"20260806-184011","path":"…"},
+   "restarted":true,"reloaded":true}
+
+→ {"verb":"slot-assign","slot":1,"preset":"Nope"}
+← {"ok":false,"code":"unknown-preset",
+   "error":"no preset called \"Nope\" — presets on disk: IPAC P1, IPAC P2"}
+```
+
+| field | meaning |
+|---|---|
+| `profile` | absent = `config.toml`'s `[[slot]]` list; present = that games.toml profile. The same either/or `ksx setup` asks about |
+| `previous_preset` | what the slot pointed at BEFORE — `null` when the slot was created. A surface must be able to say "P3: Player 3 → IPAC P3", not only the new half |
+| `unchanged` | the slot already used that preset. `ok: true`, nothing written, no backup, and the message says "already" so nobody waits for a bounce that is not coming |
+| `restarted` | a running session was bounced. **There is no `hot_swap` field on this verb**, deliberately: see gap 5 |
+| `backup` | the timestamped copy of the whole file, taken before the write, exactly like every whole-preset write |
+
+Refusal codes: `unknown-preset` (lists the ones on disk), `unknown-profile`
+(lists the titles), `bad-slot` (outside 1..=8), `config-error`. Every one of
+them refuses **before** anything is copied or written, so a refusal never
+leaves a stray backup behind.
 
 `map-restore` (writer: `mapping.rs::restore`; CLI face: `ksx map --preset …
 --restore defaults|session-backup|latest-backup`) has **three destinations**,
@@ -589,9 +698,12 @@ gets the same channel for free.
 
 1. ~~No non-interactive mapping verbs yet.~~ **CLOSED (M7 slice, 2026-08-05)**:
    `ksx map` + pipe `map`/`learn-*` + Studio's `/map` mapper, all over one
-   writer. Still open from the E5 family: `ksx slot assign` (device/preset
-   wiring per slot) — the mapper edits bindings inside a preset, not which
-   preset a slot uses.
+   writer. ~~Still open from the E5 family: `ksx slot assign`.~~ **CLOSED
+   (2026-08-06)**: `ksx slot list|assign` + pipe `slot-assign` +
+   `ControlSource::assign_slot`, over one writer (`ksx-app/src/slots.rs`). The
+   remaining half of that E5 item — wiring a DEVICE to a slot — stays with `ksx
+   setup`, which identifies the board by PRESS; a preset name cannot imply
+   which physical board is in front of the player.
 2. **Per-slot persona is a TOML edit today.** Deliberate until the M7 wizard:
    the hand-editable config *is* the interface, and it round-trips.
 3. **learn-key cannot hear a WinUSB-claimed panel** (see semantics above) —
@@ -600,14 +712,39 @@ gets the same channel for free.
 4. **learn-key still needs emulation stopped** — deliberately, for the four
    reasons in "learn-key semantics". Studio makes obeying it one click
    (Pause → map → Resume) rather than a dead end.
-5. **`ksx slot assign` (which preset a slot uses) is still a TOML edit** — or
-   now a whole-file one: `ksx config export --what config`, edit the JSON,
-   `ksx config import --what config --yes` is validated, backed up and
-   scriptable, which is what E5 actually needed. A narrow per-slot verb is
-   still worth having (it would not rewrite the file's comments), so this stays
-   open. Worth noting the change is nevertheless HOT at the engine level — only
-   the binding table moves — so it does not need a pad bounce once the verb
-   exists.
+5. ~~**`ksx slot assign` (which preset a slot uses) is still a TOML edit.**~~
+   **CLOSED (2026-08-06).** The whole-file road (`ksx config export --what
+   config`, edit, `ksx config import --yes`) still works and is still the right
+   tool for a bulk change — but it rewrites the file and **loses every
+   comment**, which is exactly the loss the TOML-is-canonical decision exists to
+   prevent. `ksx slot assign --slot N --preset NAME [--profile TITLE]` writes
+   one field, after a timestamped backup.
+
+   **It BOUNCES, and every surface says so before it is used.** The note this
+   entry used to carry — that the change is hot at the engine level, because
+   `SessionShape` deliberately leaves `SlotSpec::preset` outside the shape — is
+   still true, and the verb deliberately does not take that road. It writes the
+   slot ENTRY, whose other fields (keyboard, persona) are genuinely structural,
+   and a verb whose pad behaviour depended on which field you happened to change
+   is a verb nobody can predict. So `--reload` is `DaemonCommand::Reload`, the
+   response carries `restarted` and never `hot_swap`, and the cabinet's confirm
+   dialog spells it out: *"the session RESTARTS: all four pads unplug and plug
+   back in."* One answer, stated up front, beats a cheaper one that is only
+   sometimes true. (`ksx_api::SlotOutcome::restarted` carries the full
+   reasoning; flipping it to `ApplyBindings` is a one-line change if the trade
+   is ever re-decided.)
+
+   **And it reports what happened, not what was asked.** The response's
+   `reloaded` is documented as "`reload` was asked for and the daemon acted on
+   it"; the first build echoed the REQUEST instead, so a running session that
+   was told to restart and did not come back answered `restarted: false,
+   reloaded: true` — which `SlotOutcome::headline` rendered as *"nothing was
+   running, so nothing had to restart"* at somebody whose four pads had just
+   vanished. `reloaded` is now the daemon's own verdict, and `headline()`
+   prints the daemon's sentence (which already carries the failure) in
+   preference to re-deriving one from flags. Pinned by
+   `pipe::tests::a_slot_assign_whose_restart_fails_says_so_and_never_claims_
+   nothing_was_running`.
 
 ## Invariants a GUI must not break
 
@@ -615,11 +752,35 @@ Each one maps to a legacy defect or a measured constraint
 (`ARCHITECTURE.md` rules 1–5, `ENHANCEMENTS.md` E7 "enhance, never compromise"):
 
 - **Never touch pipeline threads.** The tray can only enqueue a
-  `DaemonCommand`; the pipe thread, the M9 native UI and M10 Studio get
+  `DaemonCommand`; the pipe thread, the cabinet window and Studio get
   exactly the same reach and no more. Live data flows out through snapshots (`DaemonState`,
   `HealthSlot`) or a lossy fan-out sink — a slow or wedged UI can cost a
   window, never a keyboard. The legacy WPF app died of the opposite
   arrangement.
+- **The live fan-out is a LOSSY QUEUE, never a callback, and it costs nothing
+  when nobody is watching.** `ksx-app/src/feed.rs` is the one stream a surface
+  sees a running pipeline through, and it has three properties that are
+  structural rather than promised:
+  1. **the gate** — every publish begins with one `Relaxed` load of a
+     subscriber count and returns. With no window open (the normal state of a
+     cabinet) the engine and output threads run exactly the pipeline they ran
+     before the sink existed;
+  2. **bounded and lossy** — delivery is `try_send` on a bounded channel. Full
+     means the event is dropped and a counter moves, and that counter is
+     reported to the consumer in its next frame, so loss is visible rather than
+     silent. A slow consumer can never backpressure the engine;
+  3. **no closure anywhere** — the sink holds `Sender`s, not callbacks. Nothing
+     a surface writes can execute on a pipeline thread. A wedged UI wedges
+     itself.
+  **Coalescing is the CONSUMER's job**, at display rate (~60 Hz): the producer
+  publishes every transition and `LiveSubscription::poll` folds whatever
+  arrived into one `ksx_api::LiveFrame`. Sampling at 60 Hz instead would drop a
+  button tap shorter than 16 ms — so every intermediate state is folded into
+  `SlotLive::hit`, and a 4 ms tap is invisible in `down` and unmistakable in
+  `hit`. That is the property the button check rests on. One stream, three
+  consumers by design (docs/MAPPER-UX.md Build C, docs/ENHANCEMENTS.md E8's
+  feedback bus, and Studio's live socket next); the shape lives in
+  `ksx-api::live` so none of them describes it twice.
 - **Capture-thread purity.** No tokio, no allocation, no locks in the capture
   thread — and therefore no GUI-serving code anywhere near it. Any live
   monitor coalesces to display rate (~60 Hz); full fidelity lives in

@@ -56,6 +56,7 @@ pub enum Request {
     MapRestore(RestoreRequest),
     MapClearAll(ClearAllRequest),
     MapBackups(BackupsRequest),
+    SlotAssign(SlotAssignRequest),
     LearnKey,
     LearnPoll,
     LearnCancel,
@@ -74,6 +75,7 @@ impl Request {
             Self::MapRestore(_) => "map-restore",
             Self::MapClearAll(_) => "map-clear-all",
             Self::MapBackups(_) => "map-backups",
+            Self::SlotAssign(_) => "slot-assign",
             Self::LearnKey => "learn-key",
             Self::LearnPoll => "learn-poll",
             Self::LearnCancel => "learn-cancel",
@@ -442,6 +444,72 @@ pub struct BackupsRequest {
     pub preset: String,
 }
 
+/// The `slot-assign` verb: **which preset a slot uses** (docs/CONTROL-SURFACE.md
+/// honest gaps 1 and 5 — the one E5 verb the mapper never covered, because the
+/// mapper edits bindings INSIDE a preset and this says which preset a slot
+/// points at).
+///
+/// One slot, one preset, one file. Deliberately narrow: `ksx config
+/// export|import` can already rewrite the whole document, and that is precisely
+/// its problem — a whole-file rewrite loses the comments the annotated config
+/// is for. This writes one field.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotAssignRequest {
+    /// 1..=`ksx_core::MAX_SLOTS`.
+    pub slot: u8,
+    /// The preset's `name` (its file's `name` field), e.g. `"IPAC P1"`.
+    pub preset: String,
+    /// A games.toml profile title. ABSENT means config.toml's `[[slot]]` list —
+    /// the same either/or `ksx setup` asks about, spelled the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Apply it to a RUNNING session.
+    ///
+    /// Unlike every other `reload` on this protocol this one is a **bounce**,
+    /// not a hot swap: see [`SlotAssignResponse::restarted`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reload: bool,
+}
+
+impl SlotAssignRequest {
+    /// The daemon's reader: one request object → this type, or the sentence to
+    /// refuse it with. Same rule as [`MapRequest::from_json`] — the validation
+    /// lives in the crate both sides link, so a client hears the identical
+    /// words with no round trip.
+    pub fn from_json(request: &serde_json::Value) -> Result<Self, Refusal> {
+        let Some(slot) = request.get("slot").and_then(serde_json::Value::as_u64) else {
+            return Err(bad_request(
+                r#"slot-assign needs a "slot" (the slot NUMBER, 1..=8)"#,
+            ));
+        };
+        let Ok(slot) = u8::try_from(slot) else {
+            return Err(Refusal::new(
+                codes::BAD_SLOT,
+                format!("slot {slot} is not a slot number (1..=8)"),
+            ));
+        };
+        let Some(preset) = field(request, "preset") else {
+            return Err(bad_request(
+                r#"slot-assign needs a "preset" (the preset this slot should use)"#,
+            ));
+        };
+        Ok(Self {
+            slot,
+            preset,
+            profile: field(request, "profile"),
+            reload: flag(request, "reload"),
+        })
+    }
+
+    /// Where this write lands, as a sentence — `config.toml` or the profile.
+    pub fn destination(&self) -> String {
+        match &self.profile {
+            Some(profile) => format!("profile \"{profile}\" (games.toml)"),
+            None => "config.toml".to_owned(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Responses
 // ---------------------------------------------------------------------------
@@ -461,6 +529,7 @@ pub enum Response {
     Macro(MacroResponse),
     Restore(RestoreResponse),
     Backups(BackupsResponse),
+    SlotAssign(SlotAssignResponse),
     Learn(LearnResponse),
 }
 
@@ -496,6 +565,9 @@ impl Response {
             Request::MapBackups(_) => {
                 Self::Backups(serde_json::from_value(value).map_err(read(verb))?)
             }
+            Request::SlotAssign(_) => {
+                Self::SlotAssign(serde_json::from_value(value).map_err(read(verb))?)
+            }
             Request::LearnKey | Request::LearnPoll | Request::LearnCancel => {
                 Self::Learn(serde_json::from_value(value).map_err(read(verb))?)
             }
@@ -512,6 +584,7 @@ impl Response {
             Self::Macro(r) => serde_json::to_value(r),
             Self::Restore(r) => serde_json::to_value(r),
             Self::Backups(r) => serde_json::to_value(r),
+            Self::SlotAssign(r) => serde_json::to_value(r),
             Self::Learn(r) => serde_json::to_value(r),
         };
         value.unwrap_or(serde_json::Value::Null)
@@ -788,6 +861,54 @@ pub struct BackupsResponse {
 }
 
 refusal_of!(BackupsResponse);
+
+/// `slot-assign`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotAssignResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub code: Option<String>,
+    /// The file that was written.
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub slot: Option<u8>,
+    #[serde(default)]
+    pub preset: Option<String>,
+    /// What the slot pointed at BEFORE. `None` when the slot was created — and
+    /// that difference is the whole reason this field exists: a surface must be
+    /// able to say "slot 3: IPAC P3 → Player 3" rather than only the new half.
+    #[serde(default)]
+    pub previous_preset: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// The slot did not exist in that file and was ADDED.
+    #[serde(default)]
+    pub created: bool,
+    /// Nothing changed: the slot already used that preset. `ok` all the same —
+    /// re-asserting a state is not an error — but a surface says "already" so a
+    /// user does not go looking for the pad bounce that never came.
+    #[serde(default)]
+    pub unchanged: bool,
+    /// The timestamped copy taken before the write.
+    #[serde(default)]
+    pub backup: Option<BackupView>,
+    /// A running session was BOUNCED onto the new wiring: pads replugged.
+    ///
+    /// The one write on this protocol that never claims a hot swap. See
+    /// [`crate::control::SlotOutcome::restarted`] for why.
+    #[serde(default)]
+    pub restarted: bool,
+    /// `reload` was asked for and the daemon acted on it.
+    #[serde(default)]
+    pub reloaded: bool,
+}
+
+refusal_of!(SlotAssignResponse);
 
 /// One timestamped restore point.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
