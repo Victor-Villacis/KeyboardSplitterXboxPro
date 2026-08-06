@@ -144,6 +144,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                     | MapError::NoSessionBackup { .. }
                     | MapError::NoBackup { .. }
                     | MapError::BadBackup { .. }
+                    | MapError::BadMacro { .. }
             );
             if options.json {
                 let conflicts = match &err {
@@ -206,6 +207,7 @@ pub fn error_code(err: &MapError) -> &'static str {
         MapError::NoSessionBackup { .. } => "no-session-backup",
         MapError::NoBackup { .. } => "no-backup",
         MapError::BadBackup { .. } => "bad-backup",
+        MapError::BadMacro { .. } => "macro-invalid",
         MapError::Config(_) => "config-error",
     }
 }

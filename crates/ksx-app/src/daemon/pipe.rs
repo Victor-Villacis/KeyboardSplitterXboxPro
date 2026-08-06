@@ -56,6 +56,15 @@ pub type MapFn = Box<
         + Send,
 >;
 
+/// The `map-macro` verb's writer — [`crate::mapping::save_macro`], same
+/// injection rule as [`MapFn`].
+pub type MacroFn = Box<
+    dyn Fn(
+            &crate::mapping::MacroSpec,
+        ) -> Result<crate::mapping::AppliedMacro, crate::mapping::MapError>
+        + Send,
+>;
+
 /// The `map-restore` verb's writer — [`crate::mapping::restore`], same
 /// injection rule as [`MapFn`].
 pub type RestoreFn = Box<
@@ -83,36 +92,64 @@ pub struct PipeDeps {
     pub state: SharedState,
     pub profiles: ProfilesFn,
     pub map: MapFn,
+    /// The whole-macro writer (`map-macro`).
+    pub save_macro: MacroFn,
     pub restore: RestoreFn,
     pub clear_all: ClearAllFn,
     pub backups: BackupsFn,
     pub learn: super::learn::LearnService,
 }
 
-/// The real [`MapFn`]: [`crate::mapping::apply`] against `root`'s store —
-/// with the session-backup hook: before this daemon lifetime's FIRST write to
-/// a preset, the current file is snapshotted to `<file>.session-bak`, which
-/// is exactly what `map-restore session-backup` ("undo this session")
-/// restores. Once per (daemon lifetime × preset); the set lives in the
-/// closure.
-pub fn map_fn(root: ksx_config::ConfigRoot) -> MapFn {
-    let backed_up = std::sync::Mutex::new(std::collections::BTreeSet::<String>::new());
-    Box::new(move |spec| {
-        let store = ksx_config::Store::new(root.clone());
-        {
+/// The real [`MapFn`] and [`MacroFn`]: [`crate::mapping::apply`] and
+/// [`crate::mapping::save_macro`] against `root`'s store, both behind the
+/// session-backup hook — before this daemon lifetime's FIRST write to a
+/// preset, the current file is snapshotted to `<file>.session-bak`, which is
+/// exactly what `map-restore session-backup` ("undo this session") restores.
+/// Once per (daemon lifetime × preset).
+///
+/// The two are built TOGETHER, and that is the point: they share ONE
+/// session-backup set.
+///
+/// Shared rather than one set each because "the snapshot taken before the
+/// FIRST write of this daemon lifetime" has to mean the first write by EITHER
+/// of them: a set per writer would let the second one overwrite the undo point
+/// with state the user had already changed, and `map-restore session-backup`
+/// would then restore a file that was never the starting point.
+///
+/// The macro writer is otherwise the same shape as the binding writer — a
+/// macro body IS a preset write — so neither can drift from the other.
+pub fn preset_writers(root: ksx_config::ConfigRoot) -> (MapFn, MacroFn) {
+    let backed_up = std::sync::Arc::new(std::sync::Mutex::new(
+        std::collections::BTreeSet::<String>::new(),
+    ));
+    // Best-effort ordering: the backup is taken before the write so a
+    // successful write can always be undone; if the copy itself fails the
+    // write proceeds (a missing undo must not block mapping) and restore will
+    // say "no session backup".
+    let once = |backed_up: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>| {
+        move |store: &ksx_config::Store, preset: &str| {
             let mut backed = backed_up.lock().expect("session-backup set poisoned");
-            if !backed.contains(&spec.preset) {
-                // Best-effort ordering: the backup is taken before apply so a
-                // successful write can always be undone; if the copy itself
-                // fails the bind proceeds (a missing undo must not block
-                // mapping) and restore will say "no session backup".
-                if crate::mapping::take_session_backup(&store, &spec.preset).is_ok() {
-                    backed.insert(spec.preset.clone());
-                }
+            if !backed.contains(preset)
+                && crate::mapping::take_session_backup(store, preset).is_ok()
+            {
+                backed.insert(preset.to_owned());
             }
         }
-        crate::mapping::apply(&store, spec)
-    })
+    };
+    let (map_root, macro_root) = (root.clone(), root);
+    let (map_once, macro_once) = (once(backed_up.clone()), once(backed_up));
+    (
+        Box::new(move |spec| {
+            let store = ksx_config::Store::new(map_root.clone());
+            map_once(&store, &spec.preset);
+            crate::mapping::apply(&store, spec)
+        }),
+        Box::new(move |spec| {
+            let store = ksx_config::Store::new(macro_root.clone());
+            macro_once(&store, &spec.preset);
+            crate::mapping::save_macro(&store, spec)
+        }),
+    )
 }
 
 /// The real [`RestoreFn`]: [`crate::mapping::restore`] against `root`'s store.
@@ -296,7 +333,7 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
     };
     let Some(verb) = request.get("verb").and_then(|v| v.as_str()) else {
         return err_msg(
-            r#"request has no "verb" (status | start | stop | reload | map | map-restore | map-clear-all | map-backups | learn-key | learn-poll | learn-cancel)"#,
+            r#"request has no "verb" (status | start | stop | reload | map | map-macro | map-restore | map-clear-all | map-backups | learn-key | learn-poll | learn-cancel)"#,
         );
     };
     match verb {
@@ -334,6 +371,7 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
             await_start(state, &baseline, settle)
         }
         "map" => handle_map(&request, deps, settle),
+        "map-macro" => handle_map_macro(&request, deps, settle),
         "map-restore" => handle_map_restore(&request, deps, settle),
         "map-clear-all" => handle_map_clear_all(&request, deps, settle),
         "map-backups" => handle_map_backups(&request, deps),
@@ -386,7 +424,7 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
         "learn-poll" => deps.learn.poll(),
         "learn-cancel" => deps.learn.cancel(),
         other => err_msg(format!(
-            "unknown verb '{other}' (status | start | stop | reload | map | \
+            "unknown verb '{other}' (status | start | stop | reload | map | map-macro | \
              map-restore | map-clear-all | map-backups | learn-key | learn-poll |              learn-cancel)"
         )),
     }
@@ -580,6 +618,132 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
             })
         }
         Err(err) => err_msg(err.to_string()),
+    }
+}
+
+/// The pipe `map-macro` verb: one preset's WHOLE `[macros.<name>]` table.
+///
+/// ```json
+/// {"verb":"map-macro","preset":"IPAC P1","name":"hadouken",
+///  "steps":[{"hold":["dpad.down"],"ms":50},
+///           {"hold":["dpad.down","dpad.right"],"ms":50},
+///           {"hold":["dpad.right"],"ms":50},
+///           {"hold":["A"],"frames":3}],
+///  "on_release":"finish","retrigger":"ignore","interrupt":"none",
+///  "reload":true}
+/// ```
+///
+/// The body's field names ARE `ksx_config::MacroFile`'s: this verb hands the
+/// object straight to the same serde types the preset file uses, so the wire
+/// shape and the file shape cannot drift and `frames` survives as `frames`.
+/// `{"delete": true}` removes the table (and the `macro.<name>` trigger rows
+/// that would otherwise dangle) — an explicit word, never an empty step list.
+///
+/// `"reload": true` applies it to a RUNNING session, and a macro body is a
+/// BINDING change: it changes no slot, persona, device or capture backend, so
+/// [`crate::run::supervisor::SessionShape::bounce_reason`] finds nothing and
+/// the control loop hot-swaps it with the pads left plugged — the same
+/// [`super::DaemonCommand::ApplyBindings`] path `map` takes, through the same
+/// [`apply_after_write`].
+fn handle_map_macro(
+    request: &serde_json::Value,
+    deps: &PipeDeps,
+    settle: Duration,
+) -> serde_json::Value {
+    let field = |name: &str| {
+        request
+            .get(name)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_owned)
+    };
+    let Some(preset) = field("preset") else {
+        return err_msg(r#"map-macro needs a "preset""#);
+    };
+    let Some(name) = field("name") else {
+        return err_msg(r#"map-macro needs a "name" (the [macros.<name>] table)"#);
+    };
+    let delete = request
+        .get("delete")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !delete && request.get("steps").is_none() {
+        return err_msg(
+            "map-macro needs \"steps\" (or \"delete\": true) — an absent step list is a \
+             misspelled field far more often than an intended deletion, and deleting a \
+             macro is its own word",
+        );
+    }
+    // The body, in the preset file's own vocabulary. Only the fields
+    // `MacroFile` knows are forwarded, so the envelope's own keys (verb,
+    // preset, name, delete, reload) cannot collide with it.
+    let mut object = serde_json::Map::new();
+    for key in ["steps", "on_release", "retrigger", "interrupt"] {
+        if let Some(value) = request.get(key) {
+            object.insert(key.to_owned(), value.clone());
+        }
+    }
+    let body: ksx_config::MacroFile = match serde_json::from_value(object.into()) {
+        Ok(body) => body,
+        Err(err) => {
+            return err_msg(format!(
+                "map-macro could not read the macro body: {err} — steps are \
+                 [{{\"hold\":[\"dpad.down\"],\"ms\":50}}] (exactly one of \"ms\"/\"frames\", \
+                 optional \"allow_short\"), and the policies are \"finish\"|\"abort\", \
+                 \"ignore\"|\"restart\", \"none\"|\"any-input\"|\"opposing\""
+            ))
+        }
+    };
+
+    let spec = crate::mapping::MacroSpec {
+        preset,
+        name,
+        body,
+        delete,
+    };
+    match (deps.save_macro)(&spec) {
+        Ok(applied) => {
+            let mut message = applied.message();
+            let outcome = apply_after_write(request, deps, settle, &mut message);
+            serde_json::json!({
+                "ok": true,
+                "message": message,
+                "path": applied.path.display().to_string(),
+                "preset": applied.preset,
+                "name": applied.name,
+                "steps": applied.steps,
+                "total_ms": applied.total_ms,
+                "deleted": applied.deleted,
+                // The keys that START it — unchanged by this verb (`map` with
+                // "macro.<name>" is what writes those), except on a delete,
+                // where these are the rows that had to go with the table.
+                "triggers": applied.triggers,
+                // Advisories, never swallowed: a step below the sampling floor
+                // is raised, or run as written and possibly missed.
+                "warnings": applied.warnings,
+                "backup": applied.backup.as_ref().map(|b| serde_json::json!({
+                    "stamp": b.stamp,
+                    "label": b.label(),
+                    "path": b.path.display().to_string(),
+                })),
+                "reloaded": outcome.reloaded,
+                "hot_swap": outcome.hot,
+            })
+        }
+        Err(err) => {
+            let problems = match &err {
+                crate::mapping::MapError::BadMacro { problems, .. } => problems.clone(),
+                _ => Vec::new(),
+            };
+            serde_json::json!({
+                "ok": false,
+                "code": crate::map::error_code(&err),
+                "error": err.to_string(),
+                // The refusals one by one, so a UI can put each on its own row
+                // instead of parsing the sentence apart.
+                "problems": problems,
+            })
+        }
     }
 }
 
@@ -1081,6 +1245,17 @@ mod tests {
         })
     }
 
+    /// A `map-macro` that refuses everything — protocol tests that never write
+    /// a macro body.
+    fn no_macro() -> MacroFn {
+        Box::new(|spec| {
+            Err(crate::mapping::MapError::UnknownPreset {
+                name: spec.preset.clone(),
+                known: Vec::new(),
+            })
+        })
+    }
+
     /// A learn service whose observer parks until cancelled (protocol tests
     /// drive phases through the service API, not a keyboard).
     fn idle_learn() -> super::super::learn::LearnService {
@@ -1118,6 +1293,7 @@ mod tests {
             state,
             profiles,
             map: no_map(),
+            save_macro: no_macro(),
             restore: no_restore(),
             clear_all: Box::new(|preset| {
                 Err(crate::mapping::MapError::UnknownPreset {
@@ -1398,6 +1574,177 @@ mod tests {
         })
     }
 
+    /// A `map-macro` writer that records what it was handed and answers with a
+    /// plausible write.
+    fn scripted_macro(seen: Arc<Mutex<Vec<crate::mapping::MacroSpec>>>) -> MacroFn {
+        Box::new(move |spec| {
+            seen.lock().unwrap().push(spec.clone());
+            Ok(crate::mapping::AppliedMacro {
+                path: std::path::PathBuf::from(r"C:\cfg\ksx\presets\IPAC P1.toml"),
+                preset: spec.preset.clone(),
+                name: spec.name.clone(),
+                steps: spec.body.steps.len(),
+                total_ms: 200,
+                deleted: spec.delete,
+                triggers: vec!["P".to_owned()],
+                backup: Some(crate::mapping::PresetBackup {
+                    path: std::path::PathBuf::from(r"C:\cfg\ksx\presets\IPAC P1.toml.bak-x"),
+                    stamp: "20260805-143207".to_owned(),
+                }),
+                warnings: Vec::new(),
+            })
+        })
+    }
+
+    const HADOUKEN_BODY: &str = r#""steps":[{"hold":["dpad.down"],"ms":50},
+        {"hold":["dpad.down","dpad.right"],"ms":50},
+        {"hold":["dpad.right"],"ms":50},
+        {"hold":["A"],"frames":3}]"#;
+
+    /// The body's field names ARE the preset file's, so the wire and the file
+    /// cannot drift — `frames` arrives as `frames`, not as milliseconds.
+    #[test]
+    fn map_macro_hands_the_file_shaped_body_to_the_writer() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut d = deps(tx, state, no_profiles());
+        d.save_macro = scripted_macro(seen.clone());
+        let v = handle_request(
+            &format!(
+                r#"{{"verb":"map-macro","preset":"IPAC P1","name":"hadouken",{HADOUKEN_BODY},
+                   "on_release":"abort","retrigger":"restart","interrupt":"opposing"}}"#
+            ),
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["name"], "hadouken");
+        assert_eq!(v["steps"], 4);
+        assert_eq!(v["backup"]["stamp"], "20260805-143207", "{v}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let spec = &seen[0];
+        assert_eq!(spec.preset, "IPAC P1");
+        assert!(!spec.delete);
+        assert_eq!(spec.body.steps.len(), 4);
+        assert_eq!(spec.body.steps[1].hold, ["dpad.down", "dpad.right"]);
+        assert_eq!(spec.body.steps[3].frames, Some(3), "frames stay frames");
+        assert_eq!(spec.body.steps[3].ms, None);
+        assert_eq!(spec.body.on_release, ksx_core::OnRelease::Abort);
+        assert_eq!(spec.body.retrigger, ksx_core::Retrigger::Restart);
+        assert_eq!(spec.body.interrupt, ksx_core::Interrupt::Opposing);
+    }
+
+    #[test]
+    fn map_macro_validates_its_fields_before_touching_the_writer() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut d = deps(tx, state, no_profiles());
+        d.save_macro = scripted_macro(seen.clone());
+        for junk in [
+            r#"{"verb":"map-macro"}"#.to_owned(),
+            r#"{"verb":"map-macro","preset":"IPAC P1"}"#.to_owned(),
+            // No "steps" and no "delete": a misspelled field, not a deletion.
+            r#"{"verb":"map-macro","preset":"IPAC P1","name":"hadouken"}"#.to_owned(),
+            // Bodies the preset file itself would refuse.
+            r#"{"verb":"map-macro","preset":"P","name":"m","steps":[{"hold":["A"],"ms":"soon"}]}"#
+                .to_owned(),
+            r#"{"verb":"map-macro","preset":"P","name":"m","steps":[{"hold":["A"],"ms":50}],"on_release":"maybe"}"#
+                .to_owned(),
+            r#"{"verb":"map-macro","preset":"P","name":"m","steps":[{"hold":["A"],"ms":50,"nope":1}]}"#
+                .to_owned(),
+        ] {
+            let v = handle_request(&junk, &d, FAST);
+            assert_eq!(v["ok"], false, "{junk} → {v}");
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no write may have happened"
+        );
+    }
+
+    /// Deletion is an explicit word, and it reaches the writer as one.
+    #[test]
+    fn map_macro_delete_needs_no_steps_and_says_so_in_the_answer() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut d = deps(tx, state, no_profiles());
+        d.save_macro = scripted_macro(seen.clone());
+        let v = handle_request(
+            r#"{"verb":"map-macro","preset":"IPAC P1","name":"hadouken","delete":true}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["deleted"], true, "{v}");
+        assert_eq!(v["triggers"][0], "P", "{v}");
+        assert!(seen.lock().unwrap()[0].delete);
+    }
+
+    /// A macro BODY is a binding change: `reload: true` enqueues
+    /// `ApplyBindings` (never a blunt Reload), and when the control loop
+    /// reports the in-place swap the response says the pads were left alone.
+    /// Same wiring, same fields, same guarantee as `map`.
+    #[test]
+    fn map_macro_with_reload_hot_swaps_a_running_session() {
+        let state = shared(RunState::Running { slots: 4 });
+        let (tx, rx) = unbounded();
+        let loop_thread = answer_apply(
+            rx,
+            state.clone(),
+            super::super::ApplyReport {
+                generation: 0,
+                ok: true,
+                hot: true,
+                restarted: false,
+                message: "bindings applied live — pads untouched".to_owned(),
+            },
+        );
+        let mut d = deps(tx, state, no_profiles());
+        d.save_macro = scripted_macro(Arc::new(Mutex::new(Vec::new())));
+        let v = handle_request(
+            &format!(
+                r#"{{"verb":"map-macro","preset":"IPAC P1","name":"hadouken",{HADOUKEN_BODY},"reload":true}}"#
+            ),
+            &d,
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            loop_thread.join().unwrap(),
+            DaemonCommand::ApplyBindings,
+            "a macro body must take the hot-swap path, not a pad bounce"
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["reloaded"], true, "{v}");
+        assert_eq!(v["hot_swap"], true, "{v}");
+    }
+
+    /// A refusal names its problems one by one AND carries the stable code.
+    #[test]
+    fn map_macro_reports_a_refusal_with_its_code_and_problem_list() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let mut d = deps(tx, state, no_profiles());
+        d.save_macro = Box::new(|spec| {
+            Err(crate::mapping::MapError::BadMacro {
+                preset: spec.preset.clone(),
+                name: spec.name.clone(),
+                problems: vec!["step 0 holds 'warp'".to_owned()],
+            })
+        });
+        let v = handle_request(
+            r#"{"verb":"map-macro","preset":"P","name":"m","steps":[{"hold":["warp"],"ms":50}]}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], false, "{v}");
+        assert_eq!(v["code"], "macro-invalid", "{v}");
+        assert_eq!(v["problems"][0], "step 0 holds 'warp'", "{v}");
+    }
+
     #[test]
     fn map_validates_its_fields_before_touching_the_writer() {
         let state = shared(RunState::Stopped);
@@ -1614,7 +1961,7 @@ mod tests {
         let state = shared(RunState::Stopped);
         let (tx, _rx) = unbounded();
         let mut d = deps(tx, state, no_profiles());
-        d.map = map_fn(root);
+        d.map = preset_writers(root).0;
 
         let mut last = serde_json::Value::Null;
         for function in ["A", "B", "rt"] {
@@ -1675,7 +2022,7 @@ mod tests {
         let state = shared(RunState::Stopped);
         let (tx, _rx) = unbounded();
         let mut d = deps(tx, state, no_profiles());
-        d.map = map_fn(root);
+        d.map = preset_writers(root).0;
 
         let v = handle_request(
             r#"{"verb":"map","preset":"IPAC P1","function":"A","keys":["S","Enter","s"]}"#,
@@ -1890,7 +2237,7 @@ mod tests {
         let state = shared(RunState::Stopped);
         let (tx, _rx) = unbounded();
         let mut d = deps(tx, state, no_profiles());
-        d.map = map_fn(root.clone());
+        d.map = preset_writers(root.clone()).0;
         d.restore = restore_fn(root);
 
         for req in [
@@ -1915,6 +2262,60 @@ mod tests {
             "backup is the PRE-first-write state: {restored}"
         );
         assert!(!restored.contains("B = \"F\""), "{restored}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reason `map` and `map-macro` are built together: they write the
+    /// same files, so "undo everything since the daemon started" has to mean
+    /// the snapshot taken before the first write by EITHER of them. A set per
+    /// writer would let the macro write re-snapshot a file the bind had
+    /// already changed, and the undo would restore a state that never existed.
+    #[test]
+    fn the_two_preset_writers_share_one_session_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "ksx-pipe-shared-bak-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = ksx_config::ConfigRoot::at(&dir);
+        let store = ksx_config::Store::new(root.clone());
+        let file: ksx_config::PresetFile = toml::from_str(
+            "name = \"IPAC P1\"\n[bindings]\nA = \"S\"\n\
+             [macros.m]\nsteps = [{ hold = [\"A\"], ms = 50 }]\n",
+        )
+        .unwrap();
+        store.save_preset(&file).unwrap();
+
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let mut d = deps(tx, state, no_profiles());
+        let (map, save_macro) = preset_writers(root.clone());
+        d.map = map;
+        d.save_macro = save_macro;
+        d.restore = restore_fn(root);
+
+        // A bind first (which takes the snapshot), then a macro body.
+        for req in [
+            r#"{"verb":"map","preset":"IPAC P1","function":"A","key":"G"}"#,
+            r#"{"verb":"map-macro","preset":"IPAC P1","name":"m","steps":[{"hold":["B"],"ms":90}]}"#,
+        ] {
+            let v = handle_request(req, &d, FAST);
+            assert_eq!(v["ok"], true, "{req} → {v}");
+        }
+
+        let v = handle_request(
+            r#"{"verb":"map-restore","preset":"IPAC P1","mode":"session-backup"}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        let restored = std::fs::read_to_string(store.preset_path("IPAC P1").unwrap()).unwrap();
+        assert!(
+            restored.contains("A = \"S\""),
+            "the snapshot is the PRE-first-write state: {restored}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

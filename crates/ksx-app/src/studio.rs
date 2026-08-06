@@ -19,8 +19,9 @@ use crate::daemon::pipe::{self, client};
 use ksx_platform::autostart;
 use ksx_platform::{BusDriverReport, InterceptionReport, ServiceState};
 use ksx_studio::{
-    BindConflict, BindOutcome, BindRequest, LearnView, MapperSlot, MapperSnapshot, PadRow,
-    ProfileRow, SessionView, StatusSnapshot, StatusSource,
+    BindConflict, BindOutcome, BindRequest, LearnView, MacroOutcome, MacroSnapshot, MacroStepView,
+    MacroView, MacroWrite, MapperSlot, MapperSnapshot, PadRow, ProfileRow, SessionView,
+    StatusSnapshot, StatusSource,
 };
 
 pub fn run(port: u16) -> anyhow::Result<()> {
@@ -134,6 +135,79 @@ impl ksx_studio::ControlSource for PipeControlSource {
         reload: bool,
     ) -> BindOutcome {
         map_request(map_wire(preset, function, keys, force, reload))
+    }
+
+    /// The macro editor's save: ONE `map-macro` request carrying the whole
+    /// `[macros.<name>]` table. The steps go over the wire in the preset
+    /// FILE's own field names, so the daemon hands them straight to the same
+    /// serde types the file uses — no translation layer, and `frames` stays
+    /// `frames`.
+    fn save_macro(&self, request: &MacroWrite) -> MacroOutcome {
+        macro_request(macro_wire(request))
+    }
+}
+
+/// The `map-macro` request body for one whole macro table.
+///
+/// The three policies are normalized here rather than on the daemon: a blank
+/// select is the FILE's own "field omitted" case, which means the default, and
+/// spelling that out at the edge keeps the daemon's parser strict (a genuine
+/// typo is still refused, in words that name the options).
+fn macro_wire(request: &MacroWrite) -> serde_json::Value {
+    let policy = |value: &str, default: &'static str| {
+        let value = value.trim();
+        if value.is_empty() {
+            default.to_owned()
+        } else {
+            value.to_owned()
+        }
+    };
+    let mut wire = serde_json::json!({
+        "verb": "map-macro",
+        "preset": request.preset,
+        "name": request.name,
+        "delete": request.delete,
+        "reload": request.reload,
+        "on_release": policy(&request.on_release, "finish"),
+        "retrigger": policy(&request.retrigger, "ignore"),
+        "interrupt": policy(&request.interrupt, "none"),
+    });
+    // A delete carries no body at all — the verb's own refusal for a missing
+    // step list is what protects a WRITE from an editor that lost its grid.
+    if !request.delete {
+        wire["steps"] = serde_json::to_value(&request.steps)
+            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+    }
+    wire
+}
+
+/// One `map-macro` pipe request → [`MacroOutcome`].
+fn macro_request(wire: serde_json::Value) -> MacroOutcome {
+    let strings = |value: &serde_json::Value| -> Vec<String> {
+        value
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.as_str())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    match client::request(pipe::PIPE_NAME, &wire) {
+        Ok(response) => MacroOutcome {
+            ok: response["ok"] == true,
+            message: response["message"].as_str().map(str::to_owned),
+            error: response["error"].as_str().map(str::to_owned),
+            code: response["code"].as_str().map(str::to_owned),
+            problems: strings(&response["problems"]),
+            warnings: strings(&response["warnings"]),
+            deleted: response["deleted"] == true,
+            backup: response["backup"]["label"].as_str().map(str::to_owned),
+            reloaded: response["reloaded"] == true,
+        },
+        Err(client::ClientError::NotRunning) => MacroOutcome::failed(NO_CHANNEL),
+        Err(err) => MacroOutcome::failed(err.to_string()),
     }
 }
 
@@ -315,6 +389,70 @@ impl StatusSource for CollectorSource {
     fn mapper(&self) -> MapperSnapshot {
         collect_mapper()
     }
+
+    fn macros(&self, preset: &str) -> MacroSnapshot {
+        let root = match ksx_config::ConfigRoot::discover() {
+            Ok(root) => root,
+            Err(err) => {
+                return MacroSnapshot::unavailable(&format!("config root not found: {err}"))
+            }
+        };
+        collect_macros(&ksx_config::Store::new(root), preset)
+    }
+}
+
+/// One preset's `[macros]` tables, re-read from disk per call like everything
+/// else this provider serves.
+///
+/// Deliberately the FILE's shape, not a resolved one: `ms` and `frames` stay
+/// apart and `allow_short` is passed through as written, because the editor's
+/// job is to show what the file says (and to emit a block that can go back
+/// into it). Read from `PresetFile` rather than through `to_core()` for the
+/// same reason it is worth saying twice — a preset with a typo somewhere ELSE
+/// still has readable macros, and a page that showed an empty grid for it
+/// would be claiming "this preset defines none", which is a different fact.
+fn collect_macros(store: &ksx_config::Store, preset_name: &str) -> MacroSnapshot {
+    let loaded = match store.load_presets() {
+        Ok(loaded) => loaded,
+        Err(err) => return MacroSnapshot::unavailable(&format!("presets unreadable: {err}")),
+    };
+    let known: Vec<String> = loaded.value.iter().map(|p| p.name.clone()).collect();
+    let Some(file) = loaded.value.into_iter().find(|p| p.name == preset_name) else {
+        return MacroSnapshot::unavailable(&format!(
+            "no preset called \"{preset_name}\" is on disk (presets found: {})",
+            if known.is_empty() {
+                "none".to_owned()
+            } else {
+                known.join(", ")
+            }
+        ));
+    };
+    let macros = file
+        .macros
+        .iter()
+        .map(|(name, def)| MacroView {
+            name: name.clone(),
+            steps: def
+                .steps
+                .iter()
+                .map(|step| MacroStepView {
+                    hold: step.hold.clone(),
+                    ms: step.ms,
+                    frames: step.frames,
+                    allow_short: step.allow_short,
+                })
+                .collect(),
+            on_release: def.on_release.as_str().to_owned(),
+            retrigger: def.retrigger.as_str().to_owned(),
+            interrupt: def.interrupt.as_str().to_owned(),
+            // The `macro.<name>` rows of `[bindings]` — many keys → one macro
+            // is native, exactly like many keys → one button. Read through the
+            // mapping writer's own helper, so the keys the card shows are the
+            // keys a delete would take with it.
+            triggers: crate::mapping::macro_trigger_keys(&file, name),
+        })
+        .collect();
+    MacroSnapshot::read(&file.name, macros)
 }
 
 /// The mapper's slot list, re-read from disk per call (fresh writes = fresh
@@ -642,6 +780,145 @@ mod tests {
             false,
         );
         assert_eq!(via_bind, one);
+    }
+
+    /// The macro editor's WHOLE read side, against a real store: the file's
+    /// own shape comes through untranslated (`ms` and `frames` stay apart,
+    /// `allow_short` as written), the policies come through as the words the
+    /// page prints, and `triggers` carries the keys the `macro.<name>` rows
+    /// bind — many keys → one macro, like any other binding.
+    #[test]
+    fn macros_are_read_in_the_files_own_shape_with_their_trigger_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "ksx-studio-macros-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ksx_config::Store::new(ksx_config::ConfigRoot::at(&dir));
+        let file: ksx_config::PresetFile = toml::from_str(
+            r#"
+name = "IPAC P1"
+[bindings]
+A = "S"
+macro.hadouken = ["P", "O"]
+macro.taunt = "None"
+
+[macros.hadouken]
+on_release = "abort"
+retrigger = "restart"
+interrupt = "opposing"
+steps = [
+  { hold = ["dpad.down"], ms = 50 },
+  { hold = ["dpad.down","dpad.right"], frames = 3 },
+  { hold = [], ms = 5, allow_short = true },
+]
+
+[macros.taunt]
+steps = [{ hold = ["back"], ms = 200 }]
+"#,
+        )
+        .unwrap();
+        store.save_preset(&file).unwrap();
+
+        let snapshot = collect_macros(&store, "IPAC P1");
+        assert!(snapshot.available, "{}", snapshot.reason);
+        assert_eq!(snapshot.preset, "IPAC P1");
+        assert_eq!(snapshot.macros.len(), 2);
+
+        let hadouken = &snapshot.macros[0];
+        assert_eq!(hadouken.name, "hadouken");
+        assert_eq!(hadouken.on_release, "abort");
+        assert_eq!(hadouken.retrigger, "restart");
+        assert_eq!(hadouken.interrupt, "opposing");
+        assert_eq!(hadouken.triggers, ["P", "O"]);
+        assert_eq!(hadouken.steps.len(), 3);
+        assert_eq!(hadouken.steps[0].ms, Some(50));
+        assert_eq!(hadouken.steps[0].frames, None);
+        // A duration authored in frames must survive the read AS frames.
+        assert_eq!(hadouken.steps[1].frames, Some(3));
+        assert_eq!(hadouken.steps[1].ms, None);
+        assert_eq!(hadouken.steps[1].hold, ["dpad.down", "dpad.right"]);
+        assert!(hadouken.steps[2].hold.is_empty(), "a neutral gap is legal");
+        assert!(hadouken.steps[2].allow_short);
+
+        // Defaults are omitted from the file and come back as the words the
+        // page prints, never as an empty string.
+        let taunt = &snapshot.macros[1];
+        assert_eq!(taunt.name, "taunt");
+        assert_eq!(taunt.on_release, "finish");
+        assert_eq!(taunt.retrigger, "ignore");
+        assert_eq!(taunt.interrupt, "none");
+        // The inert "None" placeholder is not a trigger key.
+        assert!(taunt.triggers.is_empty());
+
+        // A preset that is not there is UNAVAILABLE with a reason, which is a
+        // different fact from "this preset defines no macros" — and a preset
+        // that IS there with none says so as an available, empty read.
+        let missing = collect_macros(&store, "IPAC P2");
+        assert!(!missing.available);
+        assert!(missing.reason.contains("IPAC P2"), "{}", missing.reason);
+        assert!(missing.reason.contains("IPAC P1"), "{}", missing.reason);
+
+        let plain: ksx_config::PresetFile =
+            toml::from_str("name = \"Plain\"\n[bindings]\nA = \"S\"\n").unwrap();
+        store.save_preset(&plain).unwrap();
+        let none = collect_macros(&store, "Plain");
+        assert!(none.available && none.macros.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The macro editor's SAVE is one `map-macro` request carrying the whole
+    /// table, in the preset FILE's own field names — and a delete carries no
+    /// body at all, so the verb's missing-steps refusal still protects a write.
+    #[test]
+    fn save_macro_sends_the_whole_table_in_one_map_macro_request() {
+        let write = MacroWrite {
+            preset: "IPAC P1".into(),
+            name: "hadouken".into(),
+            steps: vec![
+                MacroStepView {
+                    hold: vec!["dpad.down".into()],
+                    ms: Some(50),
+                    frames: None,
+                    allow_short: false,
+                },
+                MacroStepView {
+                    hold: vec!["A".into()],
+                    ms: None,
+                    frames: Some(3),
+                    allow_short: false,
+                },
+            ],
+            on_release: "abort".into(),
+            // Blank is the file's own "field omitted" case: the default.
+            retrigger: String::new(),
+            interrupt: "  ".into(),
+            delete: false,
+            reload: true,
+        };
+        let wire = macro_wire(&write);
+        assert_eq!(wire["verb"], "map-macro");
+        assert_eq!(wire["preset"], "IPAC P1");
+        assert_eq!(wire["name"], "hadouken");
+        assert_eq!(wire["delete"], false);
+        assert_eq!(wire["reload"], true);
+        assert_eq!(wire["on_release"], "abort");
+        assert_eq!(wire["retrigger"], "ignore");
+        assert_eq!(wire["interrupt"], "none");
+        assert_eq!(wire["steps"][0]["hold"][0], "dpad.down");
+        assert_eq!(wire["steps"][0]["ms"], 50);
+        assert_eq!(wire["steps"][1]["frames"], 3, "frames stay frames: {wire}");
+        assert_eq!(wire["steps"][1]["ms"], serde_json::Value::Null);
+
+        let deleted = macro_wire(&MacroWrite {
+            delete: true,
+            ..write
+        });
+        assert_eq!(deleted["delete"], true);
+        assert!(deleted.get("steps").is_none(), "{deleted}");
     }
 
     #[test]

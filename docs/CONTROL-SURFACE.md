@@ -23,7 +23,7 @@ list.
 | List / identify devices | `ksx devices [--json]` (both backends, read-only); `ksx winusb status [--json]` for the USB/claim view | M9: same enumeration in-process — strictly read-only, safe mid-session. M10: api devices | exists |
 | Pad test | `ksx pads --count N --persona xbox360\|playstation [--json]` (plug, test pattern, unplug) | M9: same routine in-process, only while emulation is stopped (test pads compete for the four XInput slots). M10: api | exists |
 | Per-slot persona | TOML edit: `persona = "playstation"` on the `[[slot]]` (aliases `ds4`/`ps4` accepted) | M7 wizard / mapping verbs first; then GUI forms write the same TOML and issue `Reload` | gap — TOML-only **by design** until M7 |
-| Preset editing | `ksx map --preset "IPAC P1" --function A --key G [--clear] [--force] [--move-from FUNCTION] [--json]`; **key LISTS: repeat or comma-separate `--key` (`--key S --key Enter`, `--key S,Enter`) → `A = ["S", "Enter"]`, one write** (pipe: `"keys": ["S","Enter"]`, the list spelling of `"key"` — exactly one of the two); chords: `--when B[,C] [--unless K]`; whole-preset: `--restore defaults\|session-backup\|latest-backup`, `--clear-all`, `--list-backups`; pipe `map` / `map-restore` / `map-clear-all` / `map-backups` (same writers: `ksx-app/src/mapping.rs`); TOML edit still first-class | **Studio's `/map` mapper (live)**: click a control → pipe `learn-key` → pipe `map` — every write goes through the one shared writer, never a parallel editor. "Add another key" and the per-key ✕ send the control's WHOLE key list (`ControlSource::bind_keys` → one `map` with `"keys"`), so a multi-key edit is ONE atomic write, not read-modify-write. Conflict detection is server-side in that writer (see below). Studio does not yet DISPLAY chords (later pass) — the CLI/pipe author them and the engine runs them | exists — CLI + pipe + Studio live |
+| Preset editing | `ksx map --preset "IPAC P1" --function A --key G [--clear] [--force] [--move-from FUNCTION] [--json]`; **key LISTS: repeat or comma-separate `--key` (`--key S --key Enter`, `--key S,Enter`) → `A = ["S", "Enter"]`, one write** (pipe: `"keys": ["S","Enter"]`, the list spelling of `"key"` — exactly one of the two); chords: `--when B[,C] [--unless K]`; whole-preset: `--restore defaults\|session-backup\|latest-backup`, `--clear-all`, `--list-backups`; macro BODIES: `ksx macro --preset X --name N --from-json FILE` / `--delete` (pipe `map-macro`); pipe `map` / `map-macro` / `map-restore` / `map-clear-all` / `map-backups` (same writers: `ksx-app/src/mapping.rs`); TOML edit still first-class | **Studio's `/map` mapper (live)**: click a control → pipe `learn-key` → pipe `map` — every write goes through the one shared writer, never a parallel editor. "Add another key" and the per-key ✕ send the control's WHOLE key list (`ControlSource::bind_keys` → one `map` with `"keys"`), so a multi-key edit is ONE atomic write, not read-modify-write. Conflict detection is server-side in that writer (see below). The macro editor reads a preset's `[macros]` tables (`StatusSource::macros`) and saves a whole table back through `/api/macro/save` → `ControlSource::save_macro` → pipe `map-macro`. Studio does not yet DISPLAY chords (later pass) — the CLI/pipe author them and the engine runs them | exists — CLI + pipe + Studio live |
 | Learn a key ("press the panel key for P1·A") | pipe `learn-key` / `learn-poll` / `learn-cancel` (asynchronous; see "learn-key semantics" below) | **Studio's mapper drives it (live)**: `/api/learn*` → the pipe verbs. No CLI face yet (`ksx map` takes the key by name; `ksx monitor` shows names) | exists — pipe + Studio |
 | Game profiles | TOML edit (`games.toml`); consumed by `ksx run --game`, `ksx daemon --game`, `ksx autostart --game` | Editing: M7 verbs (E5 `ksx slot assign` family), then GUI forms over them. Consuming: `DaemonCommand`/api as above | gap for editing; consuming exists |
 | WinUSB claim / release / status | `ksx winusb status` (read-only); `claim`/`release` are dry runs by default, act only with `--yes` + an admin token | M9: same verbs in-process, preserving dry-run-first and the explicit consent step. M10: `status` is safe over the api; `claim`/`release` stay local + elevated | exists |
@@ -249,12 +249,55 @@ a pad function. `--when`/`--unless` and `--move-from` are refused with a reason
 (`invalid-guard` / `bad-move-from`), and a name with no `[macros.<name>]` table
 behind it gives `unknown-macro` listing the macros the preset does have.
 
-**Authoring the sequence stays TOML-only** — a step list is a timeline with
-durations, a hold set and three interruption policies, and a flag-per-field CLI
-would be worse than the `[macros]` table it would write. `ksx run --dry-run`
-prints every configured macro (steps, total ms, `on_release`/`retrigger`/
-`interrupt`, and the keys that start it) in both human and `--json` form, so the
-CLI/AI surface can still read everything. See docs/INPUT-TRANSFORMS.md §1c.
+`ksx run --dry-run` prints every configured macro (steps, total ms,
+`on_release`/`retrigger`/`interrupt`, and the keys that start it) in both human
+and `--json` form. See docs/INPUT-TRANSFORMS.md §1c.
+
+### Macro BODIES: `ksx macro` / pipe `map-macro` (2026-08-06)
+
+The sequence itself, as a WHOLE table — one more surface on the same writer
+(`mapping.rs::save_macro`), never a second editor:
+
+```
+ksx macro --preset "SF P1" --name hadouken --from-json hadouken.json
+ksx macro --preset "SF P1" --name hadouken --delete
+echo '{"steps":[{"hold":["A"],"ms":50}]}' | ksx macro --preset "SF P1" --name jab
+
+→ {"verb":"map-macro","preset":"SF P1","name":"hadouken",
+   "steps":[{"hold":["dpad.down"],"ms":50},{"hold":["A"],"frames":3}],
+   "on_release":"finish","retrigger":"ignore","interrupt":"none","reload":true}
+← {"ok":true,"message":"…","path":"…","preset":"SF P1","name":"hadouken",
+   "steps":2,"total_ms":83,"deleted":false,"triggers":["P"],"warnings":[],
+   "backup":{"stamp":"…","label":"…","path":"…"},
+   "reloaded":true,"hot_swap":true}
+```
+
+- **The body is JSON on stdin or `--from-json FILE`**, and its field names ARE
+  `ksx_config::MacroFile`'s — the preset file's own serde types, not a parallel
+  schema. A duration authored in `frames` survives as frames. A flag-per-field
+  CLI for a timeline would be worse than the TOML it writes; this way an editor
+  round-trips what it was shown.
+- **WHOLE-MACRO, never per-step.** The editor holds the entire grid, so it can
+  always send all of it; a per-step protocol would carry indices computed
+  against a file that may have moved, and one dropped message would leave a
+  sequence nobody authored. Bindings, chords and the preset's other macros are
+  untouched.
+- **Validated before the write**, through `ksx_config::validate` — the rules
+  `ksx doctor` reports for a hand-edited file. Unknown functions in a `hold`
+  set, no steps, a step with two duration units or none are REFUSED
+  (`macro-invalid`, with a `problems` row each); a step below the sampling
+  floor is an ADVISORY and comes back in `warnings`, never swallowed.
+- **`--delete` is an explicit word**, and it takes the `macro.<name>` trigger
+  rows with it (a trigger whose table is gone does not load at all). An empty
+  step list is a refusal, so a tool that lost its draft cannot delete a macro
+  by omission.
+- **A timestamped backup first**, exactly like `map-restore` / `map-clear-all`
+  — so `ksx map --restore latest-backup` is the undo for a macro edit too.
+- **`"reload":true` hot-swaps.** A macro body is a BINDING change: it moves no
+  slot, persona, device or capture backend, so `SessionShape::bounce_reason`
+  finds nothing and the live engine takes it with the pads left plugged (see
+  the hot-swap section below). Studio's macro editor posts `/api/macro/save`
+  → `ControlSource::save_macro` → this verb.
 
 ### Chords: `--when` / `--unless` (2026-08-06)
 
@@ -359,8 +402,8 @@ taking a timestamped backup first.
 
 ### `"reload":true` — the binding hot-swap (2026-08-05)
 
-Every write verb (`map`, `map-restore`, `map-clear-all`) takes the same
-optional `"reload":true`. It used to mean `DaemonCommand::Reload`: a clean
+Every write verb (`map`, `map-macro`, `map-restore`, `map-clear-all`) takes the
+same optional `"reload":true`. It used to mean `DaemonCommand::Reload`: a clean
 stop, re-read, start — which unplugged four pads, made Windows play its
 disconnect/reconnect chime, made Steam re-enumerate, and made a game in
 progress see its controllers vanish. Victor's question, verbatim: "why does it

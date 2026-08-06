@@ -12,6 +12,7 @@ mod devices;
 mod doctor;
 mod install;
 mod logging;
+mod macro_cli;
 mod map;
 mod mapping;
 mod monitor;
@@ -485,6 +486,78 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Write (or delete) a preset's whole [macros.<name>] table — a timed
+    /// sequence — from JSON
+    ///
+    /// `ksx map` binds the KEY that starts a macro; this writes the SEQUENCE
+    /// itself: an ordered list of steps, each holding a SET of pad functions
+    /// (everything simultaneous is free — the diagonal is one step holding
+    /// two) for a duration given in `ms` or 60 Hz `frames`, plus the three
+    /// policies (on_release, retrigger, interrupt).
+    ///
+    /// THE BODY IS JSON, on stdin or --from-json FILE, in exactly the shape
+    /// the preset file uses (the same serde types `ksx config export` emits —
+    /// there is no second macro schema):
+    ///
+    ///   ksx macro --preset "IPAC P1" --name hadouken --from-json hadouken.json
+    ///
+    ///   { "steps": [
+    ///       { "hold": ["dpad.down"],               "ms": 50 },
+    ///       { "hold": ["dpad.down","dpad.right"],  "ms": 50 },
+    ///       { "hold": ["dpad.right"],              "ms": 50 },
+    ///       { "hold": ["A"],                       "frames": 3 } ],
+    ///     "on_release": "finish",     // or "abort"
+    ///     "retrigger":  "ignore",     // or "restart"
+    ///     "interrupt":  "none" }      // or "any-input" / "opposing"
+    ///
+    /// Each step gives EXACTLY ONE of "ms" or "frames"; an empty "hold" is a
+    /// deliberate neutral gap. A step shorter than ~2 poll intervals (33 ms at
+    /// 60 Hz) is RAISED to it — the game cannot see anything shorter — unless
+    /// the step says "allow_short": true, in which case it runs as written and
+    /// may be missed. Both outcomes are reported as warnings; neither is ever
+    /// silent.
+    ///
+    /// WHOLE-MACRO, always: the table is replaced, never patched, so what you
+    /// send is what the preset holds. Bindings, chords and the preset's OTHER
+    /// macros are untouched.
+    ///
+    /// --delete removes the table AND the `macro.<name>` trigger rows that
+    /// would otherwise dangle (a trigger for a macro that no longer exists
+    /// does not load). Deletion is this explicit flag and never "a body with
+    /// no steps" — an empty step list is refused, so a tool that lost its
+    /// draft cannot delete a macro by omission.
+    ///
+    /// A timestamped backup ("<preset>.toml.bak-YYYYMMDD-HHMMSS") is taken
+    /// before the write and named in the answer; `ksx map --list-backups`
+    /// shows them and `--restore latest-backup` walks one back.
+    ///
+    /// Exit codes: 0 = written, 1 = error, 2 = refused (unknown preset, a body
+    /// validation names — an unknown function in a hold set, no steps, a step
+    /// with two duration units or none — or --delete for a macro this preset
+    /// does not define; nothing written, no backup taken).
+    // Verbatim so the JSON sample above keeps its line breaks: a body shape
+    // reflowed into one paragraph is a shape nobody can copy.
+    #[command(verbatim_doc_comment)]
+    Macro {
+        /// Preset name (the file's `name` field, e.g. "IPAC P1")
+        #[arg(long, value_name = "NAME")]
+        preset: String,
+        /// The macro's name — the [macros.<name>] table, and the second half
+        /// of the `macro.<name>` function that triggers it
+        #[arg(long, value_name = "NAME")]
+        name: String,
+        /// Read the JSON body from this file instead of stdin
+        #[arg(long, value_name = "FILE", conflicts_with = "delete")]
+        from_json: Option<std::path::PathBuf>,
+        /// Delete the macro (and its trigger rows) instead of writing one
+        #[arg(long)]
+        delete: bool,
+        /// One JSON object on stdout: {ok, path, preset, name, steps,
+        /// total_ms, deleted, triggers, warnings, backup}; on a refusal
+        /// {ok:false, code, error, problems}
+        #[arg(long)]
+        json: bool,
+    },
     /// Control a running `ksx daemon`: status, start, stop, reload
     ///
     /// Talks to the daemon over its named pipe (\\.\pipe\ksx-daemon) — the
@@ -921,6 +994,19 @@ fn main() -> anyhow::Result<()> {
                     unless,
                 },
             },
+            json,
+        }),
+        Command::Macro {
+            preset,
+            name,
+            from_json,
+            delete,
+            json,
+        } => macro_cli::run(macro_cli::Options {
+            preset,
+            name,
+            from_json,
+            delete,
             json,
         }),
         Command::Session { command } => match command {

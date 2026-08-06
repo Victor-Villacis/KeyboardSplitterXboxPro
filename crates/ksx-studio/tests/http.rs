@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ksx_studio::{
-    BindConflict, BindOutcome, BindRequest, ControlSource, LearnView, MapperSlot, MapperSnapshot,
-    PadRow, ProfileRow, SessionView, StatusSnapshot, StatusSource,
+    BindConflict, BindOutcome, BindRequest, ControlSource, LearnView, MacroOutcome, MacroSnapshot,
+    MacroStepView, MacroView, MacroWrite, MapperSlot, MapperSnapshot, PadRow, ProfileRow,
+    SessionView, StatusSnapshot, StatusSource,
 };
 
 struct FixedStatus;
@@ -63,6 +64,36 @@ impl StatusSource for FixedStatus {
             }],
         }
     }
+
+    /// The preset's `[macros]` tables, in the file's own shape — what
+    /// ksx-app's collector reads off disk (`ms` and `frames` kept apart, the
+    /// `macro.<name>` rows resolved into `triggers`).
+    fn macros(&self, preset: &str) -> MacroSnapshot {
+        MacroSnapshot::read(
+            preset,
+            vec![MacroView {
+                name: "hadouken".into(),
+                steps: vec![
+                    MacroStepView {
+                        hold: vec!["dpad.down".into()],
+                        ms: Some(50),
+                        frames: None,
+                        allow_short: false,
+                    },
+                    MacroStepView {
+                        hold: vec!["A".into()],
+                        ms: None,
+                        frames: Some(3),
+                        allow_short: false,
+                    },
+                ],
+                on_release: "finish".into(),
+                retrigger: "ignore".into(),
+                interrupt: "none".into(),
+                triggers: vec!["P".into()],
+            }],
+        )
+    }
 }
 
 /// Scriptable control: session() flips between idle and running; start()
@@ -77,6 +108,7 @@ struct ScriptedControl {
     bound_with: std::sync::Mutex<Option<BindRequest>>,
     restored_with: std::sync::Mutex<Option<(String, String)>>,
     cleared: std::sync::Mutex<Option<String>>,
+    saved_macro: std::sync::Mutex<Option<MacroWrite>>,
 }
 
 impl ScriptedControl {
@@ -90,6 +122,7 @@ impl ScriptedControl {
             bound_with: std::sync::Mutex::new(None),
             restored_with: std::sync::Mutex::new(None),
             cleared: std::sync::Mutex::new(None),
+            saved_macro: std::sync::Mutex::new(None),
         }
     }
 
@@ -226,6 +259,43 @@ impl ControlSource for ScriptedControl {
         Ok(format!("\"{preset}\": every binding cleared"))
     }
 
+    fn save_macro(&self, request: &MacroWrite) -> MacroOutcome {
+        *self.saved_macro.lock().unwrap() = Some(request.clone());
+        if self.no_daemon {
+            return MacroOutcome::failed(NO_CHANNEL);
+        }
+        // The one refusal the daemon answers with rows rather than a sentence.
+        if request
+            .steps
+            .iter()
+            .any(|s| s.hold.iter().any(|f| f == "warp"))
+        {
+            return MacroOutcome {
+                code: Some("macro-invalid".into()),
+                problems: vec!["macro 'hadouken' step 1 holds 'warp'".into()],
+                ..MacroOutcome::failed("refusing to write macro \"hadouken\"")
+            };
+        }
+        MacroOutcome {
+            ok: true,
+            message: Some(if request.delete {
+                format!("\"{}\": macro \"{}\" deleted", request.preset, request.name)
+            } else {
+                format!(
+                    "\"{}\": macro \"{}\" = {} step(s)",
+                    request.preset,
+                    request.name,
+                    request.steps.len()
+                )
+            }),
+            warnings: vec!["step 2 asks for 5 ms and was raised to 33 ms".into()],
+            deleted: request.delete,
+            backup: Some(BACKUP_LABEL.to_owned()),
+            reloaded: request.reload,
+            ..MacroOutcome::default()
+        }
+    }
+
     fn bind(&self, request: &BindRequest) -> BindOutcome {
         *self.bound_with.lock().unwrap() = Some(request.clone());
         if request.key.as_deref() == Some("G") && !request.force {
@@ -305,6 +375,9 @@ fn start_server(control: Arc<ScriptedControl>) -> SocketAddr {
         }
         fn clear_all(&self, preset: &str) -> Result<String, String> {
             self.0.clear_all(preset)
+        }
+        fn save_macro(&self, request: &MacroWrite) -> MacroOutcome {
+            self.0.save_macro(request)
         }
     }
     std::thread::spawn(move || {
@@ -703,6 +776,90 @@ fn the_three_restore_destinations_and_clear_all_round_trip() {
         control.cleared.lock().unwrap().clone(),
         Some("IPAC P1".to_owned())
     );
+}
+
+/// v11 over HTTP: the macro editor READS a real preset and SAVES the whole
+/// table back through the one control verb.
+///
+/// The read half proves the card is no longer a blank draft — the file's own
+/// numbers reach the page, in the unit they were authored in — and the write
+/// half proves the save is `ControlSource::save_macro` (= the daemon's
+/// `map-macro`), carrying the toast, the advisories a successful write still
+/// has to say, and the backup label that IS the undo.
+#[test]
+fn the_macro_editor_reads_a_preset_and_saves_the_whole_table() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control.clone());
+
+    // READ: the payload the island polls carries the file's shape.
+    let map: serde_json::Value =
+        serde_json::from_str(body_of(&get(addr, "/api/map?slot=1"))).expect("json");
+    assert_eq!(map["macros"]["available"], true, "{map}");
+    assert_eq!(map["macros"]["preset"], "IPAC P1");
+    assert_eq!(map["macros"]["macros"][0]["name"], "hadouken");
+    assert_eq!(map["macros"]["macros"][0]["triggers"][0], "P");
+    assert_eq!(map["macros"]["macros"][0]["steps"][0]["ms"], 50);
+    // A duration authored in frames stays frames all the way to the client.
+    assert_eq!(map["macros"]["macros"][0]["steps"][1]["frames"], 3);
+    assert_eq!(
+        map["macros"]["macros"][0]["steps"][1]["ms"],
+        serde_json::Value::Null
+    );
+    // ...and the SSR paint says the same thing without any JavaScript.
+    let page = body_of(&get(addr, "/map?slot=1")).to_owned();
+    assert!(page.contains("hadouken"), "{page}");
+    assert!(page.contains("started by P"), "{page}");
+
+    // WRITE: one POST, one whole table.
+    let saved: serde_json::Value = serde_json::from_str(body_of(&post_json(
+        addr,
+        "/api/macro/save",
+        r#"{"preset":"IPAC P1","name":"hadouken","on_release":"abort",
+            "steps":[{"hold":["dpad.down"],"ms":50},{"hold":["A"],"frames":3}]}"#,
+    )))
+    .expect("json");
+    assert_eq!(saved["ok"], true, "{saved}");
+    assert_eq!(saved["backup"], BACKUP_LABEL, "the undo, named: {saved}");
+    assert_eq!(
+        saved["warnings"][0], "step 2 asks for 5 ms and was raised to 33 ms",
+        "an advisory is never swallowed: {saved}"
+    );
+    let write = control.saved_macro.lock().unwrap().clone().expect("saved");
+    assert_eq!(write.preset, "IPAC P1");
+    assert_eq!(write.name, "hadouken");
+    assert_eq!(write.on_release, "abort");
+    assert_eq!(write.steps.len(), 2);
+    assert_eq!(write.steps[1].frames, Some(3));
+    assert!(!write.delete);
+    assert!(
+        write.reload,
+        "a macro body is a binding change: the running session takes it in place"
+    );
+
+    // A refusal comes back as rows a page can list, not a sentence to parse.
+    let refused: serde_json::Value = serde_json::from_str(body_of(&post_json(
+        addr,
+        "/api/macro/save",
+        r#"{"preset":"IPAC P1","name":"hadouken","steps":[{"hold":["warp"],"ms":50}]}"#,
+    )))
+    .expect("json");
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["code"], "macro-invalid", "{refused}");
+    assert!(
+        refused["problems"][0].as_str().unwrap().contains("warp"),
+        "{refused}"
+    );
+
+    // DELETE is the same route with the explicit word.
+    let deleted: serde_json::Value = serde_json::from_str(body_of(&post_json(
+        addr,
+        "/api/macro/save",
+        r#"{"preset":"IPAC P1","name":"hadouken","delete":true}"#,
+    )))
+    .expect("json");
+    assert_eq!(deleted["ok"], true, "{deleted}");
+    assert_eq!(deleted["deleted"], true, "{deleted}");
+    assert!(control.saved_macro.lock().unwrap().as_ref().unwrap().delete);
 }
 
 /// Clearing ONE binding is the plain `map` verb with a null key — no second

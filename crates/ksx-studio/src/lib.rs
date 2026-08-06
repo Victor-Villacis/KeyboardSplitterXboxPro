@@ -73,7 +73,10 @@ mod render_map;
 mod server;
 mod snapshot;
 
-pub use control::{BindConflict, BindOutcome, BindRequest, ControlSource, LearnView, SessionView};
+pub use control::{
+    BindConflict, BindOutcome, BindRequest, ControlSource, LearnView, MacroOutcome, MacroWrite,
+    SessionView,
+};
 pub use error::StudioError;
 pub use server::serve;
 pub use snapshot::{

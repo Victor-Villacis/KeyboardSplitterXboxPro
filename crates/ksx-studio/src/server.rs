@@ -99,6 +99,12 @@ pub fn serve(
             // wire. Not a new daemon verb: today it composes the same `map`
             // the button beside it uses.
             .route("/api/bind/keys", post(api_bind_keys))
+            // v11: the macro editor's SAVE — one whole `[macros.<name>]`
+            // table per call, through `ControlSource::save_macro` (= the
+            // daemon's `map-macro` verb, = the `ksx macro` CLI's writer). No
+            // GUI-only path, and no second macro schema: the steps on the wire
+            // are the MacroStepView rows the read side already served.
+            .route("/api/macro/save", post(api_macro_save))
             .route("/api/preset/restore", post(api_preset_restore))
             .route("/api/preset/clear-all", post(api_preset_clear_all))
             // The mapper's own session controls (FIX 0): "Pause emulation &
@@ -397,6 +403,29 @@ async fn api_bind_keys(
         )
     })
     .await
+}
+
+/// POST /api/macro/save — write (or delete) one whole `[macros.<name>]` table.
+///
+/// `reload` is forced on, exactly like the restore route: the daemon only
+/// applies to a session that is actually RUNNING, and a macro body is a
+/// binding change — it changes no slot, persona or device, so the session
+/// hot-swaps it with the pads left plugged instead of bouncing them.
+///
+/// Feedback parity with every other write on this page: `message` is the
+/// toast, `problems` are the refusal's rows, `warnings` are the advisories a
+/// successful save still has to say out loud (a step below the sampling
+/// floor), and `backup` names the restore point this edit left — which the
+/// mapper's existing "Restore backup from …" (`latest-backup`) undoes.
+async fn api_macro_save(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<crate::control::MacroWrite>,
+) -> Response {
+    let request = crate::control::MacroWrite {
+        reload: true,
+        ..request
+    };
+    control_json(state, move |control| control.save_macro(&request)).await
 }
 
 #[derive(Deserialize)]

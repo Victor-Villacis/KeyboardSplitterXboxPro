@@ -70,7 +70,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use ksx_config::{parse_function, ConfigError, PresetFile, Store};
+use ksx_config::{parse_function, BindingEntry, ConfigError, MacroFile, PresetFile, Store};
 use ksx_core::Key;
 
 /// One requested edit.
@@ -317,6 +317,16 @@ pub enum MapError {
         source: String,
         reason: String,
     },
+    /// A macro BODY that cannot be written, in the words validation already
+    /// uses for it: a step holding something that is not a pad function, a
+    /// table with no steps at all, a step with two duration units or none, a
+    /// macro with no name. Every one of them is refused BEFORE the backup is
+    /// taken and before a byte is written — see [`save_macro`].
+    BadMacro {
+        preset: String,
+        name: String,
+        problems: Vec<String>,
+    },
     Config(ConfigError),
 }
 
@@ -399,6 +409,16 @@ impl std::fmt::Display for MapError {
                 f,
                 "{source} for \"{preset}\" is unreadable ({reason}) — refusing to replace a \
                  good preset with it"
+            ),
+            MapError::BadMacro {
+                preset,
+                name,
+                problems,
+            } => write!(
+                f,
+                "refusing to write macro \"{name}\" of preset \"{preset}\": {} — nothing was \
+                 written and no backup was taken",
+                problems.join("; ")
             ),
             MapError::Config(err) => write!(f, "{err}"),
         }
@@ -1197,6 +1217,376 @@ pub fn clear_all(store: &Store, preset_name: &str) -> Result<AppliedRestore, Map
         kind: RestoreKind::ClearAll,
         backup,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Macro BODIES — the whole `[macros.<name>]` table
+// (docs/INPUT-TRANSFORMS.md §1c)
+//
+// `apply` writes the key that STARTS a macro; this writes the sequence itself.
+// One more surface on the same writer, not a second editor: it loads through
+// the store, validates with `ksx_config::validate`, takes the same timestamped
+// backup every whole-preset write takes, and saves through `Store::save_preset`
+// — so `ksx macro`, the pipe's `map-macro` verb and Studio's macro editor are
+// three faces of this one function, exactly as they are for `apply`.
+// ---------------------------------------------------------------------------
+
+/// One requested macro-body edit: the WHOLE `[macros.<name>]` table.
+///
+/// Whole-macro, never per-step, on purpose. An editor holds the entire grid in
+/// front of the user, so it can always send the whole thing; a per-step
+/// protocol would have to carry indices computed against a file that may have
+/// moved underneath it, and the first dropped or reordered message would leave
+/// a sequence nobody authored. One table in, one table out — the same
+/// replace-per-function rule [`apply`] uses for a binding.
+#[derive(Clone, Debug, Default)]
+pub struct MacroSpec {
+    /// Preset name (the `name` field, e.g. `"IPAC P1"`), not a file name.
+    pub preset: String,
+    /// `[macros.<name>]`. Matched case-insensitively against the tables on
+    /// disk, like every other name in ksx; a table that already exists KEEPS
+    /// its own spelling, so replacing a macro never silently renames it.
+    pub name: String,
+    /// The body in the FILE's own shape ([`ksx_config::MacroFile`]) — the same
+    /// type the preset parser reads and `ksx config export` emits, so there is
+    /// no second macro schema anywhere in ksx. Durations stay in the unit they
+    /// were authored in (`ms` or `frames`, never both).
+    pub body: MacroFile,
+    /// DELETE the table instead of writing it, together with the
+    /// `macro.<name>` trigger rows that would otherwise dangle (a trigger for
+    /// a macro that no longer exists does not load at all).
+    ///
+    /// Deletion is an explicit FLAG and NOT "a write with no steps". An empty
+    /// `steps` list is a fault validation already names ("triggering it does
+    /// nothing"), so it is refused here — which means an editor that lost its
+    /// grid, or a caller whose `steps` field was misspelled, gets a refusal
+    /// instead of quietly deleting the user's macro.
+    pub delete: bool,
+}
+
+/// What a successful [`save_macro`] did.
+#[derive(Clone, Debug)]
+pub struct AppliedMacro {
+    pub path: PathBuf,
+    pub preset: String,
+    /// The table's name as the file now spells it.
+    pub name: String,
+    /// Steps written (0 for a delete).
+    pub steps: usize,
+    /// Run length at the durations the engine will use (the sampling floor
+    /// applied) — 0 for a delete.
+    pub total_ms: u64,
+    pub deleted: bool,
+    /// The keys that START this macro. Untouched by this verb either way:
+    /// on a write they are what the trigger rows already say (`ksx map
+    /// --function macro.<name>` is what changes them), and on a delete they
+    /// are the rows that had to go with the table.
+    pub triggers: Vec<String>,
+    /// The timestamped backup taken immediately before the write — the road
+    /// back from this very edit. `None` only when there was no file to copy.
+    pub backup: Option<PresetBackup>,
+    /// Validation ADVISORIES, passed through rather than swallowed: a step
+    /// shorter than the sampling floor is raised (or, with `allow_short`, run
+    /// as written and possibly missed). Neither outcome is ever silent.
+    pub warnings: Vec<String>,
+}
+
+impl AppliedMacro {
+    /// The one-line confirmation every surface prints — what was written, what
+    /// starts it, what was backed up, and every advisory, in that order.
+    pub fn message(&self) -> String {
+        let mut line = if self.deleted {
+            let mut line = format!("\"{}\": macro \"{}\" deleted", self.preset, self.name);
+            if !self.triggers.is_empty() {
+                line.push_str(&format!(
+                    " — its trigger row(s) went with it ({})",
+                    self.triggers.join(", ")
+                ));
+            }
+            line
+        } else {
+            let mut line = format!(
+                "\"{}\": macro \"{}\" = {} step(s) · {} ms",
+                self.preset, self.name, self.steps, self.total_ms
+            );
+            line.push_str(&match self.triggers.as_slice() {
+                [] => {
+                    " — no trigger key yet (bind one with `ksx map --function macro.".to_owned()
+                        + &self.name
+                        + " --key <KEY>`)"
+                }
+                keys => format!(" — started by {}", keys.join(", ")),
+            });
+            line
+        };
+        if let Some(backup) = &self.backup {
+            line.push_str(&format!(
+                " — the previous file is backed up as {}",
+                backup.stamp
+            ));
+        }
+        for warning in &self.warnings {
+            line.push_str(&format!("; note: {warning}"));
+        }
+        line
+    }
+}
+
+/// Write (or delete) one preset's whole `[macros.<name>]` table.
+///
+/// The order is the safety property, and it is the same one [`restore`] uses:
+///
+/// 1. the preset is loaded (this verb edits presets, it never creates them);
+/// 2. the BODY is validated on its own through `ksx_config::validate` — the
+///    very rules `ksx doctor` reports for a hand-edited file, so a step holding
+///    `warp`, a table with no steps, or a step with two duration units is
+///    refused in the same words. Advisories (a step below the sampling floor)
+///    are collected, not refused;
+/// 3. the edited file is validated as a WHOLE, and any NEW fault the edit
+///    introduced elsewhere refuses it too — nothing this verb writes may leave
+///    a preset that will not load;
+/// 4. only then is the current file copied to
+///    `<preset>.toml.bak-YYYYMMDD-HHMMSS` and overwritten. A refusal therefore
+///    leaves no pointless backup, and a success always has one.
+///
+/// Bindings, chords and every OTHER macro of the preset are carried through
+/// untouched: this is a whole-MACRO write, not a whole-preset one.
+pub fn save_macro(store: &Store, spec: &MacroSpec) -> Result<AppliedMacro, MapError> {
+    let name = spec.name.trim();
+    let file = load_preset_by_name(store, &spec.preset)?;
+    let refuse = |problems: Vec<String>| MapError::BadMacro {
+        preset: file.name.clone(),
+        name: name.to_owned(),
+        problems,
+    };
+    if name.is_empty() {
+        return Err(refuse(vec![
+            "a macro needs a name — it is half of the `macro.<name>` function that starts it"
+                .to_owned(),
+        ]));
+    }
+
+    // The table this edit is about, in the FILE's own spelling when it is
+    // already there (names match case-insensitively, so replacing "Hadouken"
+    // with "hadouken" must not leave two tables behind).
+    let existing = file
+        .macros
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case(name))
+        .cloned();
+    // Read before the edit: on a delete these are the rows that go with the
+    // table, and on a write they are what the response reports as "started by".
+    let triggers = macro_trigger_keys(&file, name);
+
+    let mut next = file.clone();
+    let mut warnings = Vec::new();
+    if spec.delete {
+        let Some(key) = existing else {
+            return Err(MapError::UnknownMacro {
+                preset: file.name.clone(),
+                name: name.to_owned(),
+                known: file.macros.keys().cloned().collect(),
+            });
+        };
+        next.macros.remove(&key);
+        // A `macro.<name>` row whose table is gone does not load at all
+        // (`ConfigError::UnknownMacro`), so the rows leave with it. That is
+        // the one binding this verb removes, it is never a surprise — deleting
+        // the sequence a key starts is the whole request — and the response
+        // names every key it took.
+        remove_macro_triggers(&mut next.bindings, &key);
+    } else {
+        // Step 2: the body on its own. Validated as a preset that contains
+        // NOTHING but this macro, so a fault the file already had somewhere
+        // else can neither mask this write's problems nor block it.
+        let (problems, advisories) = macro_body_issues(&file.name, name, &spec.body);
+        if !problems.is_empty() {
+            return Err(refuse(problems));
+        }
+        warnings = advisories;
+        next.macros.insert(
+            existing.unwrap_or_else(|| name.to_owned()),
+            spec.body.clone(),
+        );
+    }
+
+    // Step 3: nothing this verb writes may leave a preset that will not load.
+    // Compared against the file as it was, so a fault that was ALREADY there
+    // is not this edit's to refuse (and not this edit's to fix).
+    let before: std::collections::BTreeSet<String> = validate_preset_file(&file);
+    let broke: Vec<String> = validate_preset_file(&next)
+        .into_iter()
+        .filter(|issue| !before.contains(issue))
+        .filter(|issue| !warnings.contains(issue))
+        .collect();
+    if !broke.is_empty() {
+        return Err(refuse(broke));
+    }
+
+    // Everything below this line WILL write: take the road home first.
+    let backup = take_backup(store, &file.name)?;
+    let path = store.save_preset(&next)?;
+    // The table as the file now holds it — which is the file's spelling of the
+    // name, not necessarily the caller's, and nothing at all after a delete.
+    let written = next
+        .macros
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name));
+    Ok(AppliedMacro {
+        path,
+        preset: file.name,
+        name: written.map_or_else(|| name.to_owned(), |(key, _)| key.clone()),
+        steps: written.map_or(0, |(_, body)| body.steps.len()),
+        total_ms: written.map_or(0, |(_, body)| body_total_ms(body)),
+        deleted: spec.delete,
+        triggers,
+        backup,
+        warnings,
+    })
+}
+
+/// One macro body's own issues, split into refusals and advisories.
+///
+/// Validated as a preset containing NOTHING but this table, which is what
+/// keeps the answer about the body: `ksx_config::validate` is the only rule
+/// set (no parallel checker), and an unrelated fault elsewhere in the file can
+/// neither hide a problem here nor block a write that is fine.
+fn macro_body_issues(
+    preset_name: &str,
+    name: &str,
+    body: &MacroFile,
+) -> (Vec<String>, Vec<String>) {
+    let solo = PresetFile {
+        name: preset_name.to_owned(),
+        bindings: Default::default(),
+        macros: std::iter::once((name.to_owned(), body.clone())).collect(),
+    };
+    let mut problems = Vec::new();
+    let mut advisories = Vec::new();
+    for issue in ksx_config::validate(
+        &ksx_config::ConfigFile::default(),
+        std::slice::from_ref(&solo),
+    ) {
+        if issue.is_advisory() {
+            advisories.push(issue.to_string());
+        } else {
+            problems.push(issue.to_string());
+        }
+    }
+    if body.steps.is_empty() {
+        // Validation already says "triggering it does nothing"; this adds the
+        // one thing it cannot know — that the caller may have meant `delete`.
+        problems.push(format!(
+            "an empty step list is not how a macro is removed — pass the delete flag \
+             (`ksx macro --preset … --name {name} --delete`) if that is what you meant"
+        ));
+    }
+    (problems, advisories)
+}
+
+/// Every issue in one preset file, as text — the set the whole-file check
+/// compares before and after.
+fn validate_preset_file(file: &PresetFile) -> std::collections::BTreeSet<String> {
+    ksx_config::validate(
+        &ksx_config::ConfigFile::default(),
+        std::slice::from_ref(file),
+    )
+    .into_iter()
+    .filter(|issue| !issue.is_advisory())
+    .map(|issue| issue.to_string())
+    .collect()
+}
+
+/// A macro body's run length in milliseconds, at the durations the engine will
+/// actually use — the sampling floor (`ksx_core::MIN_STEP_MS`) applied exactly
+/// as `MacroStep::effective_ms` applies it.
+fn body_total_ms(body: &MacroFile) -> u64 {
+    body.steps
+        .iter()
+        .map(|step| {
+            // A step with no readable duration contributes nothing here; it is
+            // a refusal, and this number is only ever computed for a body that
+            // passed validation.
+            let Ok(duration) = step.duration() else {
+                return 0;
+            };
+            let ms = duration.ms();
+            if step.allow_short || ms >= ksx_core::MIN_STEP_MS {
+                u64::from(ms)
+            } else {
+                u64::from(ksx_core::MIN_STEP_MS)
+            }
+        })
+        .sum()
+}
+
+/// The keys that START `name` in this preset file — the `macro.<name>` rows of
+/// `[bindings]`, in file order, with the inert `"None"` placeholder dropped.
+///
+/// Reads the FILE rather than the core model on purpose: a preset with an
+/// unknown key or function somewhere else still has readable macro triggers,
+/// and the macro editor's whole job is to show what the file says.
+pub fn macro_trigger_keys(file: &PresetFile, name: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for (function, entry) in &file.bindings {
+        collect_macro_keys(function, entry, name, &mut keys);
+    }
+    keys
+}
+
+fn collect_macro_keys(function: &str, entry: &BindingEntry, name: &str, out: &mut Vec<String>) {
+    let mut push = |key: &String| {
+        if is_trigger_row(function, name) && key != "None" {
+            out.push(key.clone());
+        }
+    };
+    match entry {
+        BindingEntry::Key(key) => push(key),
+        BindingEntry::Keys(keys) => keys.iter().for_each(push),
+        BindingEntry::Guarded(guarded) => push(&guarded.key),
+        BindingEntry::Many(entries) => {
+            for entry in entries {
+                collect_macro_keys(function, entry, name, out);
+            }
+        }
+        // TOML dotted keys: `macro.hadouken = "P"` parses as a `macro` table
+        // holding `hadouken`, which is the same row spelled differently.
+        BindingEntry::Group(group) => {
+            for (sub, entry) in group {
+                collect_macro_keys(&format!("{function}.{sub}"), entry, name, out);
+            }
+        }
+    }
+}
+
+/// Is this function name the `macro.<name>` row of THIS macro?
+fn is_trigger_row(function: &str, name: &str) -> bool {
+    ksx_config::macro_name(function).is_some_and(|target| target.eq_ignore_ascii_case(name))
+}
+
+/// Drop every `macro.<name>` row from a `[bindings]` table — both spellings
+/// (the flat `"macro.hadouken"` key and the nested `macro = { hadouken = … }`
+/// group a TOML dotted key produces).
+fn remove_macro_triggers(bindings: &mut BTreeMap<String, BindingEntry>, name: &str) {
+    bindings.retain(|function, _| !is_trigger_row(function, name));
+    let Some(group_key) = bindings
+        .keys()
+        .find(|function| {
+            ksx_config::MACRO_PREFIX
+                .strip_suffix('.')
+                .is_some_and(|head| function.eq_ignore_ascii_case(head))
+        })
+        .cloned()
+    else {
+        return;
+    };
+    let Some(BindingEntry::Group(group)) = bindings.get_mut(&group_key) else {
+        return;
+    };
+    group.retain(|sub, _| !sub.eq_ignore_ascii_case(name));
+    if group.is_empty() {
+        bindings.remove(&group_key);
+    }
 }
 
 /// Exact legacy spelling first; a UNIQUE case-insensitive match is accepted
@@ -2537,6 +2927,390 @@ preset = "Other"
                 "profile": "Steam", "slot": 2
             }])
         );
+    }
+
+    // ---- macro BODIES (docs/INPUT-TRANSFORMS.md §1c) ----------------------
+
+    /// A preset written from raw TOML, so a test can carry `[macros]` tables
+    /// and trigger rows the `preset` helper's bindings-only shape cannot.
+    fn preset_toml(store: &Store, toml: &str) -> PresetFile {
+        let file: PresetFile = toml::from_str(toml).unwrap();
+        store.save_preset(&file).unwrap();
+        file
+    }
+
+    /// The macro body a JSON caller (or the editor) sends.
+    fn body(json: &str) -> MacroFile {
+        serde_json::from_str(json).unwrap()
+    }
+
+    const SF_PRESET: &str = r#"
+name = "P1"
+[bindings]
+A = "S"
+"dpad.down" = "Down"
+"dpad.right" = "Right"
+macro.hadouken = ["P", "O"]
+
+[macros.hadouken]
+steps = [{ hold = ["A"], ms = 50 }]
+"#;
+
+    /// The headline: a four-step macro goes in as JSON, lands in the preset's
+    /// TOML, and comes back out of the file as the same four steps — with the
+    /// unit each one was authored in intact (a sequence written in frames must
+    /// still read in frames) and the policies alongside it.
+    #[test]
+    fn a_four_step_macro_round_trips_to_toml_and_back() {
+        let root = TempRoot::new("macro-roundtrip");
+        let store = root.store();
+        preset_toml(&store, SF_PRESET);
+
+        let applied = save_macro(
+            &store,
+            &MacroSpec {
+                preset: "P1".into(),
+                name: "hadouken".into(),
+                body: body(
+                    r#"{ "steps": [
+                          { "hold": ["dpad.down"], "ms": 50 },
+                          { "hold": ["dpad.down","dpad.right"], "ms": 50 },
+                          { "hold": ["dpad.right"], "ms": 50 },
+                          { "hold": ["A"], "frames": 3 } ],
+                        "on_release": "abort", "retrigger": "restart",
+                        "interrupt": "opposing" }"#,
+                ),
+                delete: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(applied.steps, 4);
+        assert_eq!(applied.total_ms, 200, "50 + 50 + 50 + 3 frames (50)");
+        assert!(!applied.deleted);
+        assert!(applied.warnings.is_empty(), "{:?}", applied.warnings);
+        // The trigger rows are this verb's business only to REPORT.
+        assert_eq!(applied.triggers, ["P", "O"]);
+        assert!(
+            applied.message().contains("started by P, O"),
+            "{}",
+            applied.message()
+        );
+
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(on_disk.contains("frames = 3"), "{on_disk}");
+        assert!(on_disk.contains("on_release = \"abort\""), "{on_disk}");
+
+        // ...and the file the engine loads says exactly what was asked for.
+        let core = load_preset_by_name(&store, "P1")
+            .unwrap()
+            .to_core()
+            .unwrap();
+        let mac = &core.macros.defs[0];
+        assert_eq!(mac.steps.len(), 4);
+        assert_eq!(mac.steps[1].hold.len(), 2, "the diagonal is ONE step");
+        assert_eq!(mac.steps[3].duration, ksx_core::StepDuration::Frames(3));
+        assert_eq!(mac.total_ms(), 200);
+        assert_eq!(mac.on_release, ksx_core::OnRelease::Abort);
+        assert_eq!(mac.retrigger, ksx_core::Retrigger::Restart);
+        assert_eq!(mac.interrupt, ksx_core::Interrupt::Opposing);
+        // Everything ELSE the preset held is untouched: this is a whole-MACRO
+        // write, not a whole-preset one.
+        assert!(core
+            .entries
+            .contains(&(Key::S, ksx_core::Binding::Button(ksx_core::XButton::A))));
+        assert_eq!(core.macros.triggers.len(), 2);
+    }
+
+    /// A macro that did not exist is CREATED by the same call, next to the
+    /// preset's other tables — and it starts with no trigger, which the
+    /// message says out loud rather than implying the key is bound.
+    #[test]
+    fn writing_a_name_the_preset_lacks_adds_a_second_macro() {
+        let root = TempRoot::new("macro-new");
+        let store = root.store();
+        preset_toml(&store, SF_PRESET);
+        let applied = save_macro(
+            &store,
+            &MacroSpec {
+                preset: "P1".into(),
+                name: "shoryuken".into(),
+                body: body(r#"{ "steps": [{ "hold": ["dpad.right"], "ms": 50 }] }"#),
+                delete: false,
+            },
+        )
+        .unwrap();
+        assert!(applied.triggers.is_empty());
+        assert!(
+            applied.message().contains("no trigger key yet"),
+            "{}",
+            applied.message()
+        );
+        let file = load_preset_by_name(&store, "P1").unwrap();
+        assert_eq!(file.macros.len(), 2);
+        assert!(file.macros.contains_key("hadouken"));
+        assert!(file.macros.contains_key("shoryuken"));
+    }
+
+    /// A step holding something that is not a pad function is REFUSED, in the
+    /// words validation already uses for it — and the refusal is total: no
+    /// write, and no pointless backup left behind either.
+    #[test]
+    fn an_unknown_binding_in_a_hold_set_is_refused_and_nothing_is_written() {
+        let root = TempRoot::new("macro-unknown-hold");
+        let store = root.store();
+        preset_toml(&store, SF_PRESET);
+        let before = std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap();
+
+        let err = save_macro(
+            &store,
+            &MacroSpec {
+                preset: "P1".into(),
+                name: "hadouken".into(),
+                body: body(
+                    r#"{ "steps": [{ "hold": ["dpad.down"], "ms": 50 },
+                                   { "hold": ["warp"], "ms": 50 }] }"#,
+                ),
+                delete: false,
+            },
+        )
+        .unwrap_err();
+
+        let MapError::BadMacro { ref problems, .. } = err else {
+            panic!("expected a body refusal, got {err}");
+        };
+        assert!(problems.iter().any(|p| p.contains("warp")), "{problems:?}");
+        assert!(err.to_string().contains("nothing was written"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap(),
+            before,
+            "a refusal must not touch the file"
+        );
+        assert!(
+            list_backups(&store, "P1").unwrap().is_empty(),
+            "a refusal must not leave a backup behind"
+        );
+    }
+
+    /// Every other refusal the body itself can carry: no steps at all (which
+    /// also points at the flag the caller probably meant), and a step with two
+    /// duration units or none.
+    #[test]
+    fn a_body_that_cannot_run_is_refused_before_the_write() {
+        let root = TempRoot::new("macro-bad-body");
+        let store = root.store();
+        preset_toml(&store, SF_PRESET);
+        for (json, needle) in [
+            (r#"{ "steps": [] }"#, "delete"),
+            (
+                r#"{ "steps": [{ "hold": ["A"], "ms": 50, "frames": 3 }] }"#,
+                "frames",
+            ),
+            (r#"{ "steps": [{ "hold": ["A"] }] }"#, "duration"),
+        ] {
+            let err = save_macro(
+                &store,
+                &MacroSpec {
+                    preset: "P1".into(),
+                    name: "hadouken".into(),
+                    body: body(json),
+                    delete: false,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, MapError::BadMacro { .. }),
+                "{json} gave {err}"
+            );
+            assert!(err.to_string().contains(needle), "{json} gave {err}");
+        }
+        // A macro with no name is the same class of refusal.
+        let err = save_macro(
+            &store,
+            &MacroSpec {
+                preset: "P1".into(),
+                name: "   ".into(),
+                body: body(r#"{ "steps": [{ "hold": ["A"], "ms": 50 }] }"#),
+                delete: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("needs a name"), "{err}");
+    }
+
+    /// The sampling rule (§0.2) is an ADVISORY on both sides, never a refusal:
+    /// the write lands and the answer says what the engine will really do.
+    #[test]
+    fn a_short_step_is_a_warning_the_write_carries_not_a_refusal() {
+        let root = TempRoot::new("macro-short");
+        let store = root.store();
+        preset_toml(&store, SF_PRESET);
+        let applied = save_macro(
+            &store,
+            &MacroSpec {
+                preset: "P1".into(),
+                name: "hadouken".into(),
+                body: body(
+                    r#"{ "steps": [{ "hold": ["A"], "ms": 5 },
+                                   { "hold": [], "ms": 5, "allow_short": true }] }"#,
+                ),
+                delete: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(applied.warnings.len(), 2, "{:?}", applied.warnings);
+        assert!(
+            applied.warnings.iter().any(|w| w.contains("raised")),
+            "{:?}",
+            applied.warnings
+        );
+        assert!(
+            applied.warnings.iter().any(|w| w.contains("allow_short")),
+            "{:?}",
+            applied.warnings
+        );
+        // ...and the reported length is what the ENGINE will run: the first
+        // step was raised to the floor, the opted-out one was not.
+        assert_eq!(applied.total_ms, u64::from(ksx_core::MIN_STEP_MS) + 5);
+        assert!(applied.message().contains("note:"), "{}", applied.message());
+    }
+
+    /// Every macro write takes the same timestamped backup a restore does —
+    /// so "I just overwrote my sequence" has the same one-click road home as
+    /// every other whole-file write, through the SAME `--restore
+    /// latest-backup`.
+    #[test]
+    fn a_macro_write_takes_a_timestamped_backup_first() {
+        let root = TempRoot::new("macro-backup");
+        let store = root.store();
+        preset_toml(&store, SF_PRESET);
+
+        let applied = save_macro(
+            &store,
+            &MacroSpec {
+                preset: "P1".into(),
+                name: "hadouken".into(),
+                body: body(r#"{ "steps": [{ "hold": ["dpad.down"], "ms": 50 }] }"#),
+                delete: false,
+            },
+        )
+        .unwrap();
+        let backup = applied.backup.clone().expect("a backup was taken");
+        assert!(backup.path.exists(), "{}", backup.path.display());
+        assert_eq!(list_backups(&store, "P1").unwrap().len(), 1);
+        // It holds the file as it was BEFORE this write.
+        let saved = std::fs::read_to_string(&backup.path).unwrap();
+        assert!(saved.contains("hold = [\"A\"]"), "{saved}");
+        assert!(
+            applied.message().contains(&backup.stamp),
+            "{}",
+            applied.message()
+        );
+
+        // ...and the restore verb that walks it back really does.
+        restore(&store, "P1", RestoreKind::LatestBackup).unwrap();
+    }
+
+    /// DELETE takes the `macro.<name>` trigger rows with it — a trigger whose
+    /// table is gone does not load at all, so leaving one behind would be
+    /// writing a file the engine refuses.
+    #[test]
+    fn deleting_a_macro_takes_its_trigger_rows_with_it() {
+        let root = TempRoot::new("macro-delete");
+        let store = root.store();
+        preset_toml(&store, SF_PRESET);
+
+        let applied = save_macro(
+            &store,
+            &MacroSpec {
+                preset: "P1".into(),
+                name: "HADOUKEN".into(), // names match case-insensitively
+                body: MacroFile::default(),
+                delete: true,
+            },
+        )
+        .unwrap();
+        assert!(applied.deleted);
+        assert_eq!(applied.steps, 0);
+        assert_eq!(applied.triggers, ["P", "O"], "the rows it removed");
+        assert!(
+            applied.backup.is_some(),
+            "a delete is backed up like any write"
+        );
+        assert!(
+            applied.message().contains("trigger row(s) went with it"),
+            "{}",
+            applied.message()
+        );
+
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(!on_disk.contains("macro"), "{on_disk}");
+        let file = load_preset_by_name(&store, "P1").unwrap();
+        assert!(file.macros.is_empty());
+        // The preset still LOADS — the whole point of taking the rows too.
+        let core = file.to_core().unwrap();
+        assert!(core.macros.triggers.is_empty());
+        assert!(core
+            .entries
+            .contains(&(Key::S, ksx_core::Binding::Button(ksx_core::XButton::A))));
+    }
+
+    /// Deleting something that is not there is a refusal that names what IS.
+    #[test]
+    fn deleting_a_macro_the_preset_does_not_define_is_refused() {
+        let root = TempRoot::new("macro-delete-missing");
+        let store = root.store();
+        preset_toml(&store, SF_PRESET);
+        let err = save_macro(
+            &store,
+            &MacroSpec {
+                preset: "P1".into(),
+                name: "shoryuken".into(),
+                body: MacroFile::default(),
+                delete: true,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, MapError::UnknownMacro { .. }), "{err}");
+        assert!(err.to_string().contains("hadouken"), "{err}");
+        assert!(list_backups(&store, "P1").unwrap().is_empty());
+    }
+
+    /// The trigger reader sees both spellings of the same row — the flat
+    /// quoted key ksx writes and the dotted key a hand-edited file uses.
+    #[test]
+    fn macro_triggers_are_read_in_either_toml_spelling() {
+        let dotted: PresetFile = toml::from_str(
+            "name = \"p\"\n[macros.m]\nsteps = [{ hold = [\"A\"], ms = 50 }]\n\
+             [bindings]\nmacro.m = \"P\"\n",
+        )
+        .unwrap();
+        let flat: PresetFile = toml::from_str(
+            "name = \"p\"\n[macros.m]\nsteps = [{ hold = [\"A\"], ms = 50 }]\n\
+             [bindings]\n\"macro.m\" = [\"P\", \"None\"]\n",
+        )
+        .unwrap();
+        assert_eq!(macro_trigger_keys(&dotted, "m"), ["P"]);
+        // The inert "None" placeholder is not a trigger.
+        assert_eq!(macro_trigger_keys(&flat, "M"), ["P"]);
+        assert!(macro_trigger_keys(&flat, "other").is_empty());
+    }
+
+    #[test]
+    fn a_macro_write_needs_a_preset_that_exists() {
+        let root = TempRoot::new("macro-no-preset");
+        let store = root.store();
+        let err = save_macro(
+            &store,
+            &MacroSpec {
+                preset: "nope".into(),
+                name: "m".into(),
+                body: body(r#"{ "steps": [{ "hold": ["A"], "ms": 50 }] }"#),
+                delete: false,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, MapError::UnknownPreset { .. }), "{err}");
     }
 
     #[test]

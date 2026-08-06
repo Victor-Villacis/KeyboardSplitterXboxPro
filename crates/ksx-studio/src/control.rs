@@ -96,6 +96,93 @@ pub trait ControlSource: Send + Sync {
     fn clear_all(&self, _preset: &str) -> Result<String, String> {
         Err("this control source cannot clear presets".to_owned())
     }
+
+    /// Write a preset's WHOLE `[macros.<name>]` table (pipe `map-macro`) — the
+    /// macro editor's save.
+    ///
+    /// WHOLE-MACRO, not per-step, and for the same reason
+    /// [`ControlSource::bind_keys`] is whole-list: the editor already holds
+    /// the entire grid, so it can always send all of it, and a partial-step
+    /// protocol would have to carry indices computed against a file that may
+    /// have moved — one dropped message and the preset holds a sequence
+    /// nobody authored. One table in, one answer out.
+    ///
+    /// Defaulted, like the mapper verbs, so a pre-macro control source keeps
+    /// compiling and says so on screen instead of pretending to save.
+    fn save_macro(&self, _request: &MacroWrite) -> MacroOutcome {
+        MacroOutcome::failed("this control source cannot write macros")
+    }
+}
+
+/// One whole-macro write, straight onto the pipe `map-macro` verb's fields.
+///
+/// `steps` reuses [`crate::MacroStepView`] — the SAME type the read side
+/// serves — so what the editor was shown and what it saves are one shape, and
+/// a duration authored in `frames` survives the round trip as frames.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MacroWrite {
+    pub preset: String,
+    /// The `[macros.<name>]` table. Matched case-insensitively against what is
+    /// on disk; a table that already exists keeps its own spelling.
+    pub name: String,
+    #[serde(default)]
+    pub steps: Vec<crate::snapshot::MacroStepView>,
+    /// `"finish"` | `"abort"` — blank means the default, as the file's own
+    /// omitted-field rule does.
+    #[serde(default)]
+    pub on_release: String,
+    /// `"ignore"` | `"restart"`.
+    #[serde(default)]
+    pub retrigger: String,
+    /// `"none"` | `"any-input"` | `"opposing"`.
+    #[serde(default)]
+    pub interrupt: String,
+    /// DELETE the table (and the `macro.<name>` trigger rows that would
+    /// otherwise dangle) instead of writing it. An explicit flag on purpose:
+    /// an empty `steps` list is a REFUSAL, so an editor that lost its grid
+    /// cannot delete the user's macro by omission.
+    #[serde(default)]
+    pub delete: bool,
+    /// Apply it to a running session. A macro body is a BINDING change, so the
+    /// daemon swaps it into the live engine with the pads left plugged.
+    #[serde(default)]
+    pub reload: bool,
+}
+
+/// The pipe `map-macro` response, typed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MacroOutcome {
+    pub ok: bool,
+    pub message: Option<String>,
+    pub error: Option<String>,
+    /// Stable refusal word (`macro-invalid`, `unknown-preset`, `unknown-macro`…).
+    pub code: Option<String>,
+    /// The refusals one per row, so a page can list them instead of taking a
+    /// sentence apart.
+    #[serde(default)]
+    pub problems: Vec<String>,
+    /// ADVISORIES from a write that SUCCEEDED — a step below the sampling
+    /// floor was raised, or runs as written and may be missed. Never silent.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub deleted: bool,
+    /// Human label of the timestamped backup taken before the write — the undo
+    /// this edit leaves behind. The mapper's existing "Restore backup from …"
+    /// (mode `latest-backup`) is what walks it back; this field is what lets
+    /// the toast say the road home exists without waiting for the next poll.
+    pub backup: Option<String>,
+    pub reloaded: bool,
+}
+
+impl MacroOutcome {
+    pub fn failed(reason: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            error: Some(reason.into()),
+            ..Self::default()
+        }
+    }
 }
 
 /// Why a multi-key write cannot land on a daemon whose only shape is one key

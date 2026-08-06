@@ -1034,6 +1034,7 @@ pub fn run(
     {
         let profiles_root = factory.root.clone();
         let map_root = factory.root.clone();
+        let (map_writer, macro_writer) = pipe::preset_writers(map_root.clone());
         pipe::server::spawn(
             pipe::PIPE_NAME.to_owned(),
             pipe::PipeDeps {
@@ -1045,7 +1046,11 @@ pub fn run(
                 // once-per-lifetime session backup); `map-restore` pulls the
                 // defaults / session-backup safety nets; learn-key observes
                 // idle keyboards over Raw Input.
-                map: pipe::map_fn(map_root.clone()),
+                map: map_writer,
+                // `map-macro` writes a whole [macros.<name>] table through the
+                // same crate::mapping writer the `ksx macro` CLI uses, behind
+                // the session backup it shares with `map`.
+                save_macro: macro_writer,
                 restore: pipe::restore_fn(map_root.clone()),
                 clear_all: pipe::clear_all_fn(map_root.clone()),
                 backups: pipe::backups_fn(map_root),
@@ -1504,6 +1509,56 @@ mod tests {
         assert!(text.contains("pads untouched"), "{text}");
         // The tables really went down the channel to the engine.
         assert_eq!(swaps.load(Ordering::SeqCst), 1);
+    }
+
+    /// A MACRO BODY is a binding change, so it takes the in-place swap and
+    /// never bounces the pads. Stated against `SessionShape` itself, because
+    /// that is the thing that decides: a preset that grew (or lost) a timed
+    /// sequence has the same slots, personas, devices, blocking policy and
+    /// capture backends, so there is nothing for `bounce_reason` to name — and
+    /// `map-macro` therefore reaches the live engine exactly the way `map`
+    /// does, through `ApplyBindings`.
+    #[test]
+    fn a_macro_body_change_is_a_binding_change_not_a_bounce() {
+        let mut with_macro = tiny_plan(1, ksx_core::Persona::Xbox360);
+        with_macro.slots[0]
+            .preset
+            .macros
+            .defs
+            .push(ksx_core::Macro::new(
+                "hadouken",
+                vec![ksx_core::MacroStep::new(
+                    vec![ksx_core::Binding::Dpad(ksx_core::DpadDirection::Down)],
+                    50,
+                )],
+            ));
+        with_macro.slots[0]
+            .preset
+            .macros
+            .triggers
+            .push(ksx_core::MacroTrigger::new(ksx_core::Key::P, 0));
+        let plain = tiny_plan(1, ksx_core::Persona::Xbox360);
+
+        let running = crate::run::supervisor::SessionShape::of(&plain);
+        let edited = crate::run::supervisor::SessionShape::of(&with_macro);
+        assert_eq!(
+            running.bounce_reason(&edited),
+            None,
+            "adding a macro must not replug the pads"
+        );
+        assert_eq!(
+            edited.bounce_reason(&running),
+            None,
+            "...and neither must deleting one"
+        );
+        // The sanity check on the other side of the line, so this test cannot
+        // pass by SessionShape having stopped comparing anything at all.
+        assert!(running
+            .bounce_reason(&crate::run::supervisor::SessionShape::of(&tiny_plan(
+                1,
+                ksx_core::Persona::PlayStation
+            )))
+            .is_some());
     }
 
     /// A structural change takes the old road, and says so in the same field
