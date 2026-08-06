@@ -430,3 +430,70 @@ it samples on its own clock, unsynchronized with ours, and drifting. So:
    merely unpressed. Falls out of #3's state stream almost free, and it
    is the difference between "the engine did something" and "the engine
    did nothing".
+
+## 6. What TAS tooling teaches us (Victor, 2026-08-06)
+
+TAS (tool-assisted speedrun) tools — BizHawk/TAStudio, FCEUX, libTAS —
+solved input timing problems adjacent to ours, and the differences are
+as instructive as the similarities.
+
+### The boundary, stated once and for all
+
+TAS movie files are **frame-indexed** (`|..U..A.|`, one line per frame)
+because the emulator *is* the clock: it advances a frame, then reads
+input, deterministically. **TAS gets frame exactness by owning the frame
+loop.** That is precisely what an out-of-process mapper can never do.
+
+So: **inside the emulator, frames; outside it, absolute-deadline
+milliseconds plus margin.** Every timing promise ksx makes lives on the
+outside of that line, and `frames = N` is a unit for authoring, not a
+guarantee of sampling (§5).
+
+### Adopted
+
+1. **The truth stream gets HISTORY, not just current state** (upgrades
+   Enhancement A/§5.3). Every TAS tool ships a scrolling per-frame input
+   display, because the interesting failures are transient — a step that
+   was dropped, a chord that flashed, a SOCD scrub. Current-state-only
+   would miss exactly the bugs the debugger exists to catch. Two columns,
+   timestamped, scrolling: what the panel sent, what the pad published —
+   which is TAS's own "pressed vs consumed" split.
+2. **The piano roll is the right macro editor.** TAStudio shows frames as
+   rows and controls as columns and you paint into cells. That beats a
+   form with "add step" buttons badly, and it maps directly onto our
+   model: rows = steps, columns = the slot's controls, cells = held or
+   not. When a macro editor lands in Studio, this is its shape. Bonus: the
+   same grid visualizes turbo and shows SOCD interventions in time.
+3. **Surface lateness — with precision about whose.** TAS communities
+   learned that inputs on lag frames vanish, and their fix was to make lag
+   VISIBLE. Ours: when a macro step's scheduled window elapses, report how
+   late OUR wake was (deadline vs actual). Be exact about the limit — we
+   cannot know whether the game sampled a step, only whether we published
+   it on time. Claiming otherwise would be inventing knowledge we don't
+   have; reporting our own lateness is honest and actionable.
+4. **Record both sides of the stream.** TAS re-verifies a whole run from a
+   movie file. Our M3 replay corpus records the capture stream; extend it
+   to record the PUBLISHED PAD STATES alongside, so a session replays as a
+   true two-sided regression: same inputs must produce the same outputs
+   through a rebuilt engine. Cheap — the recorder exists, this adds the
+   second column — and it is the only automated way to keep chords, SOCD,
+   macros and turbo honest as they compose.
+
+### Deliberately not adopted
+
+Anything depending on frame-advance, savestates or rerecording. Real
+hardware, real games and a real OS scheduler give us a world that is not
+pausable, rewindable or deterministic. Those parts of the TAS toolkit are
+a useful illustration of the limits, not a design to copy.
+
+### Policy note for M7 preset sharing
+
+TAS is explicitly "not human play", and the fighting-game world draws a
+hard line at macros compressing inputs a human could not perform. Local
+cabinet play makes this a non-issue today. But when preset sharing ships
+(M7), **macros are the presets people will argue about**: a shared
+"Street Fighter P1" that silently contains a one-button super is a
+different artifact from a button layout. Cheap now, expensive to
+retrofit: mark presets that contain macros/turbo at share time so an
+importer knows what they are getting, and let a cabinet owner refuse them
+wholesale.
