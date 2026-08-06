@@ -375,11 +375,19 @@ pub fn build_plan(
         }
     };
 
+    // Advice is not a fault: a chord layered over already-bound keys works
+    // exactly as written and only costs the documented flash, so it warns and
+    // the session starts (`Issue::is_advisory`).
+    let (advisories, issues): (Vec<_>, Vec<_>) =
+        issues.into_iter().partition(ksx_config::Issue::is_advisory);
     if !issues.is_empty() {
         return Err(PlanError::Issues(issues));
     }
 
-    let mut notes = Vec::new();
+    let mut notes: Vec<String> = advisories
+        .iter()
+        .map(|advisory| format!("[WARN] {advisory}"))
+        .collect();
     let mut slots = Vec::new();
     for spec in specs {
         if spec.keyboard.is_none() && spec.mouse.is_none() {
@@ -536,7 +544,9 @@ pub fn render_human(plan: &RunPlan) -> String {
             "  slot {}  preset \"{}\" ({} binding(s))  keyboard {keyboard}",
             slot.spec.number,
             slot.preset.name,
-            slot.preset.entries.len()
+            // Chords are bindings too: a preset made only of chords must not
+            // print "0 binding(s)".
+            slot.preset.entries.len() + slot.preset.chords.len()
         );
         if let Some(mouse) = &slot.spec.mouse {
             let _ = writeln!(out, "           mouse {} (routed, never blocked)", mouse);
@@ -566,7 +576,8 @@ pub fn plan_json(plan: &RunPlan) -> serde_json::Value {
             serde_json::json!({
                 "number": s.spec.number,
                 "preset": s.preset.name,
-                "bindings": s.preset.entries.len(),
+                "bindings": s.preset.entries.len() + s.preset.chords.len(),
+                "chords": s.preset.chords.len(),
                 "keyboard": s.spec.keyboard.as_ref().map(|d| d.as_str()),
                 "mouse": s.spec.mouse.as_ref().map(|d| d.as_str()),
             })
@@ -721,6 +732,29 @@ preset = "nope"
             .iter()
             .any(|i| matches!(i, Issue::UnknownPresetRef { .. })));
         assert!(err.to_string().contains("refusing to start"), "{err}");
+    }
+
+    /// A chord layered over already-bound keys is a legitimate choice with a
+    /// documented cost. It must WARN and start — refusing to run the cabinet
+    /// over a latency note would be the wrong trade
+    /// (docs/INPUT-TRANSFORMS.md §1b).
+    #[test]
+    fn a_chord_flash_advisory_warns_but_still_starts() {
+        let presets = vec![
+            toml::from_str(
+                "name = \"IPAC P1\"\n[bindings]\nA = \"S\"\nrt = { key = \"S\", when = [\"D\"] }\n",
+            )
+            .unwrap(),
+            toml::from_str("name = \"IPAC P2\"\n[bindings]\nB = \"D\"\n").unwrap(),
+        ];
+        let plan = build_plan(&config(CAB_CONFIG), &GamesFile::default(), &presets, None).unwrap();
+        assert!(
+            plan.notes
+                .iter()
+                .any(|n| n.contains("does not defer input")),
+            "{:?}",
+            plan.notes
+        );
     }
 
     #[test]

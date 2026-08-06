@@ -10,7 +10,20 @@
 //!   this verb does not author it.)
 //! - **`--clear`** leaves the function in the file bound to the inert `"None"`
 //!   placeholder — the same convention as the built-in empty preset, so a
-//!   cleared control stays visible instead of silently vanishing.
+//!   cleared control stays visible instead of silently vanishing. Guarded rows
+//!   (chords) are replaced/cleared by the same rule, so a cleared control is
+//!   really cleared and never keeps a chord the engine still obeys.
+//! - **Chords** (`when`/`unless`, docs/INPUT-TRANSFORMS.md §1b) write a
+//!   GUARDED binding: "this function, but only while these other keys are (or
+//!   are not) also held". Two deliberate differences from a plain write:
+//!   a chord **never conflicts** (layering it over keys that already do
+//!   something is the point, and stealing from them would destroy what the
+//!   chord sits on), and it reports a **flash advisory** instead — one entry
+//!   per constituent that is also individually bound, because ksx does not
+//!   defer input and the game will see that binding for a moment before the
+//!   chord completes. Guards that cannot mean anything (the trigger in its own
+//!   guard, a key required and forbidden at once, a guard with no key) are
+//!   refused before any write.
 //! - **Conflicts block, the caller decides** (the PadForge gap this closes —
 //!   docs/research/padforge-code-audit.md §1.2 "Conflict handling: none"). Two
 //!   scopes are checked: the key already bound to ANOTHER function in the same
@@ -33,7 +46,7 @@ use ksx_config::{parse_function, ConfigError, PresetFile, Store};
 use ksx_core::Key;
 
 /// One requested edit.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MapSpec {
     /// Preset name (the `name` field, e.g. `"IPAC P1"`), not a file name.
     pub preset: String,
@@ -43,6 +56,11 @@ pub struct MapSpec {
     pub key: Option<String>,
     /// Proceed despite conflicts (see module docs for exactly what that does).
     pub force: bool,
+    /// CHORD: extra keys that must ALL be held for this binding to apply.
+    /// Empty means an ordinary unguarded binding — exactly as before.
+    pub when: Vec<String>,
+    /// CHORD: keys that must NOT be held (MAME's `NOT`).
+    pub unless: Vec<String>,
 }
 
 /// Where a conflicting binding lives.
@@ -98,19 +116,44 @@ pub struct AppliedMap {
     pub function: String,
     /// Canonical key name, `None` for a clear.
     pub key: Option<String>,
+    /// Canonical `when` key names — empty for an unguarded binding.
+    pub when: Vec<String>,
+    /// Canonical `unless` key names — empty for an unguarded binding.
+    pub unless: Vec<String>,
     /// Same-preset functions the key was stolen from (`force`).
     pub stolen_from: Vec<String>,
     /// Cross-profile conflicts that were overridden by `force` — written
     /// anyway, reported so the caller can say so.
     pub overridden: Vec<MapConflict>,
+    /// The honest caveat, per constituent: `(key, the function it is also
+    /// bound to on its own)`. ksx does not defer input, so that binding shows
+    /// for a moment before the chord completes.
+    pub flash: Vec<(String, String)>,
 }
 
 impl AppliedMap {
+    /// The chord as a human reads it: `A+B`, `A+B unless LeftShift`.
+    pub fn chord(&self) -> Option<String> {
+        let key = self.key.as_ref()?;
+        if self.when.is_empty() && self.unless.is_empty() {
+            return None;
+        }
+        let mut text = std::iter::once(key.as_str())
+            .chain(self.when.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("+");
+        if !self.unless.is_empty() {
+            text.push_str(&format!(" unless {}", self.unless.join("+")));
+        }
+        Some(text)
+    }
+
     /// The one-line confirmation every surface prints.
     pub fn message(&self) -> String {
-        let mut line = match &self.key {
-            Some(key) => format!("\"{}\": {} = {}", self.preset, self.function, key),
-            None => format!("\"{}\": {} cleared", self.preset, self.function),
+        let mut line = match (&self.key, self.chord()) {
+            (Some(_), Some(chord)) => format!("\"{}\": {} = {}", self.preset, self.function, chord),
+            (Some(key), None) => format!("\"{}\": {} = {}", self.preset, self.function, key),
+            (None, _) => format!("\"{}\": {} cleared", self.preset, self.function),
         };
         if !self.stolen_from.is_empty() {
             line.push_str(&format!(" (taken from {})", self.stolen_from.join(", ")));
@@ -119,6 +162,12 @@ impl AppliedMap {
             for conflict in &self.overridden {
                 line.push_str(&format!("; still {}", conflict.describe(key)));
             }
+        }
+        for (key, bound_to) in &self.flash {
+            line.push_str(&format!(
+                "; note: {key} is also {bound_to} on its own, so the game sees {bound_to} for a \
+                 moment before the chord completes (ksx does not defer input)"
+            ));
         }
         line
     }
@@ -134,6 +183,9 @@ pub enum MapError {
     },
     UnknownFunction(String),
     UnknownKey(String),
+    /// `--when`/`--unless` that cannot mean anything (the trigger guarding
+    /// itself, a key required and forbidden at once, a guard with no key).
+    InvalidGuard(String),
     /// Conflicts found and `force` not given. The write did NOT happen.
     Conflicts {
         key: String,
@@ -181,6 +233,7 @@ impl std::fmt::Display for MapError {
                 "unknown key \"{name}\" — key names use the legacy spelling \
                  (`ksx monitor` shows the name for any key you press)"
             ),
+            MapError::InvalidGuard(reason) => write!(f, "refusing to write that chord: {reason}"),
             MapError::Conflicts { key, conflicts } => {
                 write!(f, "refusing to bind {key}: ")?;
                 for (i, conflict) in conflicts.iter().enumerate() {
@@ -237,14 +290,47 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         .map_err(|_| MapError::UnknownFunction(spec.function.clone()))?;
     let canonical = ksx_config::function_name(&binding);
     let key = spec.key.as_deref().map(resolve_key).transpose()?;
+    let when = resolve_keys(&spec.when)?;
+    let unless = resolve_keys(&spec.unless)?;
+    let guarded = !when.is_empty() || !unless.is_empty();
+    if guarded {
+        let Some(trigger) = key else {
+            return Err(MapError::InvalidGuard(
+                "--when/--unless need a --key to guard (a cleared function has nothing to guard)"
+                    .to_owned(),
+            ));
+        };
+        check_guard(trigger, &when, &unless)?;
+    }
 
     // The preset must exist; `ksx map` creates bindings, never presets.
     let file = load_preset_by_name(store, &spec.preset)?;
-    let mut entries = file.to_core()?.entries;
+    let core = file.to_core()?;
+    let mut entries = core.entries;
+    let mut chords = core.chords;
 
     let mut stolen_from = Vec::new();
     let mut overridden = Vec::new();
-    if let Some(key) = key {
+    // A chord deliberately does NOT run the conflict machinery: its whole
+    // point is to reuse keys that already do something, so "G is already this
+    // preset's A" is the normal case, not a refusal — and stealing G from A
+    // would destroy the binding the chord is layered over. What the caller
+    // gets instead is the flash advisory below, which names the cost.
+    let flash = if guarded {
+        let key = key.expect("a guard requires a key");
+        std::iter::once(key)
+            .chain(when.iter().copied())
+            .filter_map(|k| {
+                entries
+                    .iter()
+                    .find(|(bound, _)| *bound == k)
+                    .map(|(_, b)| (k.name().to_owned(), ksx_config::function_name(b)))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if let Some(key) = key.filter(|_| !guarded) {
         let conflicts = find_conflicts(store, &spec.preset, &entries, key, &canonical);
         if !conflicts.is_empty() && !spec.force {
             return Err(MapError::Conflicts {
@@ -277,14 +363,27 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         }
     }
 
-    // Replace-per-function: out with every old key for this function...
+    // Replace-per-function: out with every old key for this function —
+    // guarded rows included, so `--clear` and a re-map both wipe a chord
+    // instead of leaving a ghost the file still obeys...
     entries.retain(|(_, b)| ksx_config::function_name(b) != canonical);
+    chords.retain(|c| ksx_config::function_name(&c.binding) != canonical);
     // ...in with the new one (or the inert placeholder for a clear).
-    entries.push((key.unwrap_or(Key::None), binding));
+    if guarded {
+        chords.push(ksx_core::Chord {
+            key: key.expect("a guard requires a key"),
+            binding,
+            when: when.clone(),
+            unless: unless.clone(),
+        });
+    } else {
+        entries.push((key.unwrap_or(Key::None), binding));
+    }
 
     let rewritten = PresetFile::from_core(&ksx_core::Preset {
         name: file.name.clone(),
         entries,
+        chords,
         protected: false,
     });
     let path = store.save_preset(&rewritten)?;
@@ -293,9 +392,40 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         preset: file.name,
         function: canonical,
         key: key.map(|k| k.name().to_owned()),
+        when: when.iter().map(|k| k.name().to_owned()).collect(),
+        unless: unless.iter().map(|k| k.name().to_owned()).collect(),
         stolen_from,
         overridden,
+        flash,
     })
+}
+
+/// Resolve a list of key names the same way [`resolve_key`] does one.
+fn resolve_keys(names: &[String]) -> Result<Vec<Key>, MapError> {
+    names.iter().map(|n| resolve_key(n)).collect()
+}
+
+/// The guard rules `ksx map` refuses rather than writes — the same ones
+/// `ksx doctor` reports for a hand-edited file.
+fn check_guard(trigger: Key, when: &[Key], unless: &[Key]) -> Result<(), MapError> {
+    for key in when.iter().chain(unless.iter()) {
+        if *key == trigger {
+            return Err(MapError::InvalidGuard(format!(
+                "{} is the key being bound; the trigger is always required, so listing it in \
+                 --when/--unless says nothing",
+                key.name()
+            )));
+        }
+    }
+    for key in when {
+        if unless.contains(key) {
+            return Err(MapError::InvalidGuard(format!(
+                "{} is in both --when and --unless, so the chord could never fire",
+                key.name()
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -634,6 +764,9 @@ pub fn restore(
     let rewritten = PresetFile::from_core(&ksx_core::Preset {
         name: file.name.clone(),
         entries,
+        // Whole-preset writes replace the bindings wholesale, chords
+        // included: "restore" and "clear all" must not leave a guard behind.
+        chords: Vec::new(),
         protected: false,
     });
     let path = store.save_preset(&rewritten)?;
@@ -660,6 +793,7 @@ pub fn clear_all(store: &Store, preset_name: &str) -> Result<AppliedRestore, Map
     let rewritten = PresetFile::from_core(&ksx_core::Preset {
         name: file.name.clone(),
         entries: ksx_core::Preset::builtin_empty().entries,
+        chords: Vec::new(),
         protected: false,
     });
     let path = store.save_preset(&rewritten)?;
@@ -778,6 +912,17 @@ fn find_conflicts(
     conflicts
 }
 
+/// The flash advisories as pipe/Studio JSON rows — one shape everywhere.
+/// `[{ "key": "G", "bound_to": "A" }]`, empty for any unguarded write.
+pub fn flash_json(flash: &[(String, String)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        flash
+            .iter()
+            .map(|(key, bound_to)| serde_json::json!({ "key": key, "bound_to": bound_to }))
+            .collect(),
+    )
+}
+
 /// The conflicts as pipe/Studio JSON rows — one shape everywhere.
 pub fn conflicts_json(conflicts: &[MapConflict]) -> serde_json::Value {
     serde_json::Value::Array(
@@ -843,6 +988,18 @@ mod tests {
             function: function.into(),
             key: key.map(str::to_owned),
             force,
+            ..MapSpec::default()
+        }
+    }
+
+    /// The chord shape: `--function F --key K --when …`.
+    fn chord_spec(preset: &str, function: &str, key: &str, when: &[&str]) -> MapSpec {
+        MapSpec {
+            preset: preset.into(),
+            function: function.into(),
+            key: Some(key.to_owned()),
+            when: when.iter().map(|k| (*k).to_owned()).collect(),
+            ..MapSpec::default()
         }
     }
 
@@ -1037,6 +1194,191 @@ preset = "Other"
         assert!(apply(&store, &spec("P1", "B", Some("G"), false)).is_ok());
     }
 
+    // ---- chords (docs/INPUT-TRANSFORMS.md §1b) ----------------------------
+
+    #[test]
+    fn a_chord_writes_the_guarded_form_and_says_so() {
+        let root = TempRoot::new("chord");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\n");
+
+        let applied = apply(&store, &chord_spec("P1", "rt", "d", &["f"])).unwrap();
+        assert_eq!(applied.key.as_deref(), Some("D"), "canonicalized");
+        assert_eq!(applied.when, vec!["F".to_owned()]);
+        assert_eq!(applied.chord().as_deref(), Some("D+F"));
+        assert_eq!(applied.message(), "\"P1\": rt = D+F");
+        assert!(
+            applied.flash.is_empty(),
+            "F and D bind nothing on their own"
+        );
+
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(on_disk.contains("key = \"D\""), "{on_disk}");
+        assert!(on_disk.contains("when = [\"F\"]"), "{on_disk}");
+        assert!(
+            on_disk.contains("A = \"S\""),
+            "untouched sibling: {on_disk}"
+        );
+
+        // And it reloads as a chord, not as anything else.
+        let core = store
+            .load_preset("P1")
+            .unwrap()
+            .unwrap()
+            .value
+            .to_core()
+            .unwrap();
+        assert_eq!(
+            core.chords,
+            vec![ksx_core::Chord::new(
+                Key::D,
+                ksx_core::Binding::Trigger(ksx_core::Trigger::Right),
+                vec![Key::F]
+            )]
+        );
+    }
+
+    /// A chord over keys that already do something is ALLOWED — that is the
+    /// point — so it must not trip the conflict machinery, and must not steal
+    /// the bindings it is layered over. What the caller gets is the flash.
+    #[test]
+    fn a_chord_over_bound_keys_is_written_with_the_flash_named() {
+        let root = TempRoot::new("chord-flash");
+        let store = root.store();
+        preset(&store, "P1", "X = \"A\"\nY = \"B\"\n");
+
+        let applied = apply(&store, &chord_spec("P1", "rt", "A", &["B"])).unwrap();
+        assert!(applied.stolen_from.is_empty(), "a chord steals nothing");
+        assert_eq!(
+            applied.flash,
+            vec![
+                ("A".to_owned(), "X".to_owned()),
+                ("B".to_owned(), "Y".to_owned())
+            ]
+        );
+        let message = applied.message();
+        assert!(message.contains("does not defer input"), "{message}");
+
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(
+            on_disk.contains("X = \"A\""),
+            "layered over, not stolen: {on_disk}"
+        );
+        assert!(on_disk.contains("Y = \"B\""), "{on_disk}");
+    }
+
+    /// Replace-per-function covers guarded rows: re-mapping and `--clear`
+    /// both wipe the chord instead of leaving a ghost the engine still obeys.
+    #[test]
+    fn clear_and_rebind_remove_a_chord() {
+        let root = TempRoot::new("chord-clear");
+        let store = root.store();
+        preset(&store, "P1", "rt = { key = \"D\", when = [\"F\"] }\n");
+
+        // Plain re-bind of the same function drops the guard.
+        let applied = apply(&store, &spec("P1", "rt", Some("Q"), false)).unwrap();
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(on_disk.contains("rt = \"Q\""), "{on_disk}");
+        assert!(!on_disk.contains("when"), "{on_disk}");
+
+        // Back to a chord, then clear it.
+        apply(&store, &chord_spec("P1", "rt", "D", &["F"])).unwrap();
+        let applied = apply(&store, &spec("P1", "rt", None, false)).unwrap();
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(on_disk.contains("rt = \"None\""), "{on_disk}");
+        assert!(!on_disk.contains("when"), "{on_disk}");
+        let core = store
+            .load_preset("P1")
+            .unwrap()
+            .unwrap()
+            .value
+            .to_core()
+            .unwrap();
+        assert!(core.chords.is_empty());
+    }
+
+    /// A chord on one function must not disturb another function's chord.
+    #[test]
+    fn chords_on_different_functions_coexist() {
+        let root = TempRoot::new("chord-coexist");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\n");
+        apply(&store, &chord_spec("P1", "rt", "D", &["F"])).unwrap();
+        apply(&store, &chord_spec("P1", "lt", "D", &["C"])).unwrap();
+        let core = store
+            .load_preset("P1")
+            .unwrap()
+            .unwrap()
+            .value
+            .to_core()
+            .unwrap();
+        assert_eq!(core.chords.len(), 2, "{:?}", core.chords);
+    }
+
+    #[test]
+    fn impossible_guards_are_refused_before_any_write() {
+        let root = TempRoot::new("chord-refuse");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\n");
+        let before = std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap();
+
+        // The trigger guarding itself.
+        let err = apply(&store, &chord_spec("P1", "rt", "D", &["D"])).unwrap_err();
+        assert!(matches!(err, MapError::InvalidGuard(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("the trigger is always required"),
+            "{err}"
+        );
+
+        // Required and forbidden at once.
+        let err = apply(
+            &store,
+            &MapSpec {
+                preset: "P1".into(),
+                function: "rt".into(),
+                key: Some("D".into()),
+                when: vec!["F".into()],
+                unless: vec!["F".into()],
+                ..MapSpec::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, MapError::InvalidGuard(_)), "{err:?}");
+
+        // A guard with nothing to guard.
+        let err = apply(
+            &store,
+            &MapSpec {
+                preset: "P1".into(),
+                function: "rt".into(),
+                key: None,
+                when: vec!["F".into()],
+                ..MapSpec::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, MapError::InvalidGuard(_)), "{err:?}");
+
+        // An unknown guard key is refused like any other key name.
+        let err = apply(&store, &chord_spec("P1", "rt", "D", &["NotAKey"])).unwrap_err();
+        assert!(matches!(err, MapError::UnknownKey(_)), "{err:?}");
+
+        assert_eq!(
+            before,
+            std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap(),
+            "no refusal may leave a changed file"
+        );
+    }
+
+    #[test]
+    fn flash_advisories_serialize_to_the_documented_rows() {
+        assert_eq!(
+            flash_json(&[("G".into(), "A".into())]),
+            serde_json::json!([{ "key": "G", "bound_to": "A" }])
+        );
+        assert_eq!(flash_json(&[]), serde_json::json!([]));
+    }
+
     #[test]
     fn keys_resolve_case_insensitively_when_unique() {
         assert_eq!(resolve_key("g").unwrap(), Key::G);
@@ -1068,6 +1410,7 @@ preset = "Other"
         let defaults = PresetFile::from_core(&ksx_core::Preset {
             name: "P1".into(),
             entries: ksx_core::Preset::builtin_default().entries,
+            chords: Vec::new(),
             protected: false,
         });
         assert_eq!(

@@ -21,6 +21,10 @@ pub enum Action {
         /// `None` = clear (clap guarantees `--clear` was given).
         key: Option<String>,
         force: bool,
+        /// CHORD: keys that must ALL be held too (`--when B,C`).
+        when: Vec<String>,
+        /// CHORD: keys that must NOT be held (`--unless LeftShift`).
+        unless: Vec<String>,
     },
     Restore(RestoreKind),
     /// Unbind every function of the preset (a timestamped backup first).
@@ -50,6 +54,8 @@ pub fn run(options: Options) -> anyhow::Result<()> {
             function,
             key,
             force,
+            when,
+            unless,
         } => mapping::apply(
             &store,
             &MapSpec {
@@ -57,6 +63,8 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                 function,
                 key,
                 force,
+                when,
+                unless,
             },
         )
         .map(|applied| {
@@ -66,8 +74,14 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                 "preset": applied.preset,
                 "function": applied.function,
                 "key": applied.key,
+                // Guards: empty arrays for an ordinary binding, so a reader
+                // can treat "chord" as `when.length || unless.length`.
+                "when": applied.when,
+                "unless": applied.unless,
+                "chord": applied.chord(),
                 "stolen_from": applied.stolen_from,
                 "conflicts": mapping::conflicts_json(&applied.overridden),
+                "flash": mapping::flash_json(&applied.flash),
             });
             (applied.message(), applied.path, json)
         }),
@@ -98,6 +112,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                 MapError::UnknownPreset { .. }
                     | MapError::UnknownFunction(_)
                     | MapError::UnknownKey(_)
+                    | MapError::InvalidGuard(_)
                     | MapError::Conflicts { .. }
                     | MapError::NoSessionBackup { .. }
                     | MapError::NoBackup { .. }
@@ -156,6 +171,7 @@ pub fn error_code(err: &MapError) -> &'static str {
         MapError::UnknownPreset { .. } => "unknown-preset",
         MapError::UnknownFunction(_) => "unknown-function",
         MapError::UnknownKey(_) => "unknown-key",
+        MapError::InvalidGuard(_) => "invalid-guard",
         MapError::Conflicts { .. } => "conflict",
         MapError::NoSessionBackup { .. } => "no-session-backup",
         MapError::NoBackup { .. } => "no-backup",

@@ -13,7 +13,7 @@ use crate::config::ConfigFile;
 use crate::error::ConfigError;
 use crate::function::parse_function;
 use crate::games::GamesFile;
-use crate::preset::{BindingEntry, PresetFile};
+use crate::preset::{BindingEntry, GuardedEntry, PresetFile};
 use ksx_core::{Key, Persona, Preset, MAX_SLOTS, MAX_XINPUT_SLOTS};
 
 /// One validation finding. All findings are non-fatal: the caller decides
@@ -54,6 +54,45 @@ pub enum Issue {
         function: String,
         key: String,
     },
+    /// A chord's `when`/`unless` names a key that does not exist.
+    UnknownGuardKey {
+        preset: String,
+        function: String,
+        key: String,
+    },
+    /// A chord's guard lists its own trigger key. The trigger is already
+    /// required to be down, so this is always a mistake (and it would make the
+    /// chord look more specific than it is).
+    GuardIncludesTriggerKey {
+        preset: String,
+        function: String,
+        key: String,
+    },
+    /// A chord lists the same key in `when` and in `unless`: it can never fire.
+    ContradictoryGuard {
+        preset: String,
+        function: String,
+        key: String,
+    },
+    /// Two chords on the same trigger key, with guards of the SAME size, that
+    /// can be satisfied at the same moment. Which one wins would be a build
+    /// order accident, so it is refused instead of resolved.
+    AmbiguousChords {
+        preset: String,
+        key: String,
+        function: String,
+        other: String,
+    },
+    /// Advisory: a chord constituent is ALSO bound on its own. With no
+    /// deferral (ksx v1 has none, deliberately — see
+    /// docs/INPUT-TRANSFORMS.md §1b), the game briefly sees that individual
+    /// output between the first and second keypress.
+    ChordConstituentAlsoBound {
+        preset: String,
+        function: String,
+        key: String,
+        bound_to: String,
+    },
     /// Game slot number outside 1..=[`MAX_SLOTS`].
     GameSlotNumberOutOfRange { game: String, number: u8 },
     /// See [`Issue::TooManyXinputSlots`], for one game's slot list.
@@ -68,6 +107,21 @@ pub enum Issue {
     },
     /// Advisory `user_index` outside 1..=4.
     GameUserIndexOutOfRange { game: String, slot: u8, value: u8 },
+}
+
+impl Issue {
+    /// Is this a piece of ADVICE rather than a fault?
+    ///
+    /// Everything validation reports is worth saying, but not everything is
+    /// worth refusing to start over. An advisory describes a configuration
+    /// that works exactly as written and merely has a cost the user should
+    /// know about — today that is only the chord flash
+    /// ([`Issue::ChordConstituentAlsoBound`]): binding a chord over keys that
+    /// already do something is a legitimate, deliberate choice, so it prints
+    /// as a warning and the session starts.
+    pub fn is_advisory(&self) -> bool {
+        matches!(self, Issue::ChordConstituentAlsoBound { .. })
+    }
 }
 
 impl fmt::Display for Issue {
@@ -128,6 +182,57 @@ impl fmt::Display for Issue {
                     "preset '{preset}': '{function}' is bound to unknown key '{key}'"
                 )
             }
+            Issue::UnknownGuardKey {
+                preset,
+                function,
+                key,
+            } => write!(
+                f,
+                "preset '{preset}': '{function}' is guarded by unknown key '{key}' \
+                 (`ksx monitor` shows the name for any key you press)"
+            ),
+            Issue::GuardIncludesTriggerKey {
+                preset,
+                function,
+                key,
+            } => write!(
+                f,
+                "preset '{preset}': '{function}' is triggered by '{key}' and also guards on \
+                 '{key}' — drop it from when/unless; the trigger is always required"
+            ),
+            Issue::ContradictoryGuard {
+                preset,
+                function,
+                key,
+            } => write!(
+                f,
+                "preset '{preset}': '{function}' requires '{key}' in `when` and forbids it in \
+                 `unless`, so it can never fire"
+            ),
+            Issue::AmbiguousChords {
+                preset,
+                key,
+                function,
+                other,
+            } => write!(
+                f,
+                "preset '{preset}': '{function}' and '{other}' are both triggered by '{key}' \
+                 with guards of the same size and can be satisfied together — make one of them \
+                 more specific (a bigger guard wins; equal size is a coin flip, so it is \
+                 refused)"
+            ),
+            Issue::ChordConstituentAlsoBound {
+                preset,
+                function,
+                key,
+                bound_to,
+            } => write!(
+                f,
+                "preset '{preset}': chord '{function}' uses '{key}', which is also bound on its \
+                 own to '{bound_to}' — ksx does not defer input, so pressing '{key}' first makes \
+                 the game see '{bound_to}' for a moment before the chord takes over. Prefer a \
+                 chord key with no individual binding (then consumption is free and instant)"
+            ),
             Issue::GameSlotNumberOutOfRange { game, number } => {
                 write!(
                     f,
@@ -307,10 +412,11 @@ fn validate_preset(preset: &PresetFile, issues: &mut Vec<Issue>) {
     for (function, entry) in &preset.bindings {
         flatten_bindings(function, entry, &mut pairs);
     }
+
     let mut checked_functions = BTreeSet::new();
-    for (function, key) in pairs {
+    for (function, flat) in &pairs {
         if checked_functions.insert(function.clone()) {
-            match parse_function(&function) {
+            match parse_function(function) {
                 Ok(_) => {}
                 Err(ConfigError::InvalidAxisValue(_)) => issues.push(Issue::InvalidAxisValue {
                     preset: preset.name.clone(),
@@ -322,23 +428,141 @@ fn validate_preset(preset: &PresetFile, issues: &mut Vec<Issue>) {
                 }),
             }
         }
+        let key = match flat {
+            Flat::Plain(key) => key,
+            Flat::Guard(guard) => guard.key.as_str(),
+        };
         if Key::from_name(key).is_none() {
             issues.push(Issue::UnknownKeyName {
                 preset: preset.name.clone(),
-                function,
+                function: function.clone(),
                 key: key.to_owned(),
+            });
+        }
+    }
+
+    validate_chords(preset, &pairs, issues);
+}
+
+/// Everything that can only go wrong once a binding carries a guard
+/// (docs/INPUT-TRANSFORMS.md §1b).
+fn validate_chords(preset: &PresetFile, pairs: &[(String, Flat<'_>)], issues: &mut Vec<Issue>) {
+    let name = || preset.name.clone();
+    // Keys bound on their own, and to what — the flash advisory reads this.
+    let mut plain: BTreeMap<&str, String> = BTreeMap::new();
+    for (function, flat) in pairs {
+        if let Flat::Plain(key) = flat {
+            plain.entry(key).or_insert_with(|| function.clone());
+        }
+    }
+
+    let chords: Vec<(&String, &GuardedEntry)> = pairs
+        .iter()
+        .filter_map(|(function, flat)| match flat {
+            Flat::Guard(guard) => Some((function, *guard)),
+            Flat::Plain(_) => None,
+        })
+        // An empty guard is a plain binding, not a chord (preset.rs
+        // normalizes it), so it carries none of these rules.
+        .filter(|(_, guard)| !(guard.when.is_empty() && guard.unless.is_empty()))
+        .collect();
+
+    for (function, guard) in &chords {
+        for key in guard.when.iter().chain(guard.unless.iter()) {
+            if Key::from_name(key).is_none() {
+                issues.push(Issue::UnknownGuardKey {
+                    preset: name(),
+                    function: (*function).clone(),
+                    key: key.clone(),
+                });
+            }
+            if *key == guard.key {
+                issues.push(Issue::GuardIncludesTriggerKey {
+                    preset: name(),
+                    function: (*function).clone(),
+                    key: key.clone(),
+                });
+            }
+        }
+        for key in &guard.when {
+            if guard.unless.contains(key) {
+                issues.push(Issue::ContradictoryGuard {
+                    preset: name(),
+                    function: (*function).clone(),
+                    key: key.clone(),
+                });
+            }
+        }
+        // The honest caveat, said out loud: a constituent that is bound on its
+        // own flashes that binding before the chord completes.
+        for key in std::iter::once(&guard.key).chain(guard.when.iter()) {
+            if let Some(bound_to) = plain.get(key.as_str()) {
+                issues.push(Issue::ChordConstituentAlsoBound {
+                    preset: name(),
+                    function: (*function).clone(),
+                    key: key.clone(),
+                    bound_to: bound_to.clone(),
+                });
+            }
+        }
+    }
+
+    // Equal specificity on the same trigger, both satisfiable at once: the
+    // engine would activate both in build order, so the file has to say which
+    // one it means.
+    for (i, (function, guard)) in chords.iter().enumerate() {
+        for (other_function, other) in chords.iter().skip(i + 1) {
+            let same_guard = guard.when == other.when && guard.unless == other.unless;
+            if guard.key != other.key
+                || guard.when.len() + guard.unless.len()
+                    != other.when.len() + other.unless.len()
+                // Identical guards are a MULTI-BIND (one chord, several
+                // functions) — native, not ambiguous.
+                || same_guard
+            {
+                continue;
+            }
+            let exclusive = guard.when.iter().any(|k| other.unless.contains(k))
+                || other.when.iter().any(|k| guard.unless.contains(k));
+            if exclusive {
+                continue; // they can never be satisfied together
+            }
+            issues.push(Issue::AmbiguousChords {
+                preset: name(),
+                key: guard.key.clone(),
+                function: (*function).clone(),
+                other: (*other_function).clone(),
             });
         }
     }
 }
 
-/// Flatten nested dotted-key groups into `(function, key_name)` pairs, the
-/// same shape [`PresetFile::to_core`] consumes.
-fn flatten_bindings<'a>(function: &str, entry: &'a BindingEntry, out: &mut Vec<(String, &'a str)>) {
+/// One flattened binding value: a plain key name or a guarded entry.
+enum Flat<'a> {
+    Plain(&'a str),
+    Guard(&'a GuardedEntry),
+}
+
+/// Flatten nested dotted-key groups into `(function, value)` pairs, the same
+/// shape [`PresetFile::to_core`] consumes.
+fn flatten_bindings<'a>(
+    function: &str,
+    entry: &'a BindingEntry,
+    out: &mut Vec<(String, Flat<'a>)>,
+) {
     match entry {
-        BindingEntry::Key(key) => out.push((function.to_owned(), key.as_str())),
+        BindingEntry::Key(key) => out.push((function.to_owned(), Flat::Plain(key.as_str()))),
         BindingEntry::Keys(keys) => {
-            out.extend(keys.iter().map(|k| (function.to_owned(), k.as_str())));
+            out.extend(
+                keys.iter()
+                    .map(|k| (function.to_owned(), Flat::Plain(k.as_str()))),
+            );
+        }
+        BindingEntry::Guarded(guard) => out.push((function.to_owned(), Flat::Guard(guard))),
+        BindingEntry::Many(entries) => {
+            for entry in entries {
+                flatten_bindings(function, entry, out);
+            }
         }
         BindingEntry::Group(group) => {
             for (sub, entry) in group {
@@ -552,6 +776,136 @@ preset = "default"
             key: "AlsoFake".into()
         }));
         assert_eq!(issues.len(), 4);
+    }
+
+    // ---- chords (docs/INPUT-TRANSFORMS.md §1b) ----------------------------
+
+    /// The recommended shape — chord keys with no individual binding — must
+    /// be completely clean, warning included.
+    #[test]
+    fn a_chord_on_dedicated_keys_is_clean() {
+        let presets = vec![preset(
+            "cab",
+            "A = \"G\"\nrt = { key = \"D\", when = [\"F\"] }\n\
+             lb = { key = \"D\", when = [\"F\", \"C\"], unless = [\"LeftShift\"] }",
+        )];
+        assert_eq!(validate(&ConfigFile::default(), &presets), Vec::new());
+    }
+
+    /// Every guard mistake the file can hold, named separately.
+    #[test]
+    fn guard_mistakes_are_reported() {
+        let presets = vec![preset(
+            "bad",
+            "rt = { key = \"A\", when = [\"Nope\"] }\n\
+             lb = { key = \"A\", when = [\"A\"] }\n\
+             rb = { key = \"A\", when = [\"B\"], unless = [\"B\"] }",
+        )];
+        let issues = validate(&ConfigFile::default(), &presets);
+        assert!(
+            issues.contains(&Issue::UnknownGuardKey {
+                preset: "bad".into(),
+                function: "rt".into(),
+                key: "Nope".into()
+            }),
+            "{issues:?}"
+        );
+        assert!(
+            issues.contains(&Issue::GuardIncludesTriggerKey {
+                preset: "bad".into(),
+                function: "lb".into(),
+                key: "A".into()
+            }),
+            "{issues:?}"
+        );
+        assert!(
+            issues.contains(&Issue::ContradictoryGuard {
+                preset: "bad".into(),
+                function: "rb".into(),
+                key: "B".into()
+            }),
+            "{issues:?}"
+        );
+    }
+
+    /// The flash advisory: a constituent that is ALSO bound on its own. This
+    /// is the one honest caveat of a zero-deferral design, so the message has
+    /// to say what the player will see, not just that something is odd.
+    #[test]
+    fn an_individually_bound_constituent_warns_about_the_flash() {
+        let presets = vec![preset(
+            "flash",
+            "X = \"A\"\nY = \"B\"\nrt = { key = \"A\", when = [\"B\"] }",
+        )];
+        let issues = validate(&ConfigFile::default(), &presets);
+        assert!(
+            issues.contains(&Issue::ChordConstituentAlsoBound {
+                preset: "flash".into(),
+                function: "rt".into(),
+                key: "A".into(),
+                bound_to: "X".into()
+            }),
+            "{issues:?}"
+        );
+        assert!(
+            issues.contains(&Issue::ChordConstituentAlsoBound {
+                preset: "flash".into(),
+                function: "rt".into(),
+                key: "B".into(),
+                bound_to: "Y".into()
+            }),
+            "{issues:?}"
+        );
+        let message = issues
+            .iter()
+            .find(|i| matches!(i, Issue::ChordConstituentAlsoBound { .. }))
+            .unwrap()
+            .to_string();
+        assert!(message.contains("does not defer"), "{message}");
+        assert!(message.contains("for a moment"), "{message}");
+    }
+
+    /// Equal specificity on the same trigger, both satisfiable: refused, not
+    /// raced. Identical guards are a multi-bind and stay legal.
+    #[test]
+    fn ambiguous_equal_specificity_chords_are_refused_but_multi_bind_is_not() {
+        let ambiguous = vec![preset(
+            "ambiguous",
+            "rt = { key = \"A\", when = [\"B\"] }\nlb = { key = \"A\", when = [\"C\"] }",
+        )];
+        let issues = validate(&ConfigFile::default(), &ambiguous);
+        assert_eq!(
+            issues,
+            vec![Issue::AmbiguousChords {
+                preset: "ambiguous".into(),
+                key: "A".into(),
+                function: "lb".into(),
+                other: "rt".into(),
+            }],
+            "{issues:?}"
+        );
+        assert!(issues[0].to_string().contains("more specific"));
+
+        // Same trigger, same guard, two outputs: a multi-bind, native in ksx.
+        let multibind = vec![preset(
+            "multibind",
+            "rt = { key = \"A\", when = [\"B\"] }\nlb = { key = \"A\", when = [\"B\"] }",
+        )];
+        assert_eq!(validate(&ConfigFile::default(), &multibind), Vec::new());
+
+        // Different sizes: specificity decides, no issue.
+        let nested = vec![preset(
+            "nested",
+            "rt = { key = \"A\", when = [\"B\"] }\nlb = { key = \"A\", when = [\"B\", \"C\"] }",
+        )];
+        assert_eq!(validate(&ConfigFile::default(), &nested), Vec::new());
+
+        // Mutually exclusive guards can never both be satisfied.
+        let exclusive = vec![preset(
+            "exclusive",
+            "rt = { key = \"A\", when = [\"B\"] }\nlb = { key = \"A\", unless = [\"B\"] }",
+        )];
+        assert_eq!(validate(&ConfigFile::default(), &exclusive), Vec::new());
     }
 
     #[test]

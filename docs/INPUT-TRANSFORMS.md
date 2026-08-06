@@ -30,7 +30,7 @@ Two consequences run through everything below:
 | Shape | Example | Status |
 |---|---|---|
 | **Multi-bind** (one physical → many virtual, simultaneous) | P → A + B + RT | **WORKS TODAY** |
-| **Chord** (many physical → one virtual, simultaneous) | A + B → RT | **Not expressible** — needs an AND condition |
+| **Chord** (many physical → one virtual, simultaneous) | A + B → RT | **SHIPPED** (§1b) — `when`/`unless` guard, with consumption |
 | **Macro** (one physical → a timed SEQUENCE) | P → ↓, ↘, →, A (hadouken) | **Not expressible** — needs a scheduler |
 
 ### 1a. Multi-bind already works — try it now
@@ -57,12 +57,12 @@ accept a key already used by another control in the same preset without
 treating it as a conflict to resolve — it is a multi-bind, and the legend
 should show it as one ("P → A · B · RT").
 
-### 1b. Chords — and the tradeoff Victor spotted
+### 1b. Chords — SHIPPED (2026-08-06)
 
 He identified the real problem before writing a line: *if A→A and B→B, and
 the game's move is A+B, a chord A+B→RT means the game never sees A+B.*
 Correct, and it generalizes: **a chord must consume its constituents, or
-it double-fires.** There are only three honest options:
+it double-fires.** There were only three honest options:
 
 - **Consume** — A+B produces RT and nothing else. The game loses A+B.
 - **Pass through too** — the game sees A, B *and* RT. Almost always wrong.
@@ -71,24 +71,113 @@ it double-fires.** There are only three honest options:
   latency**. This is the tap-hold tax (QMK/kanata live with it); on a
   fighting cabinet where a 16 ms frame decides a match, it is a real cost.
 
-**The recommendation, in order:**
-1. **Prefer dedicated chord keys.** If the constituents are not bound
-   individually, there is no ambiguity and no latency — the chord is just
-   a two-key AND with zero cost. On an arcade panel with spare buttons,
-   this is nearly always available.
-2. If a constituent *is* individually bound, chords become opt-in with an
-   explicit timing window, and the UI must state the latency cost on that
-   key. Never silently.
-3. Note the physical reality: a human hitting two arcade buttons "together"
-   lands them 10–30 ms apart, so any window under ~25 ms will feel broken.
-   Fighting games solve their own version of this with input leniency —
-   and many already ship 2-button macro assignments in-game, which is a
-   better place to solve it when available.
+**ksx consumes, and never defers.** That is the whole design decision, and
+everything below follows from it.
 
-Model change required: `Binding` gains a condition — the cleanest shape is
-a `when: [Key…]` (all-of) guard rather than a new binding *kind*, so a
-chord is "this binding, but only while these other keys are also down."
-That composes with everything else instead of forking the model.
+#### The model
+
+A binding gains a GUARD. It is not a new binding *kind* — a chord is "this
+binding, but only while these other keys are (not) also down" — so it
+composes with buttons, triggers, axes and dpad identically
+(`ksx-core/src/preset.rs::Chord`):
+
+```rust
+pub struct Chord {
+    pub key: Key,          // the trigger
+    pub binding: Binding,  // any binding kind
+    pub when: Vec<Key>,    // ALL must be held
+    pub unless: Vec<Key>,  // NONE may be held   (MAME's NOT — §2.7, free)
+}
+```
+
+Guarded rows live in `Preset::chords`, unguarded ones stay in
+`Preset::entries` **exactly as before**. That is not cosmetic: it is what
+makes "no chords ⇒ nothing changed" checkable rather than claimed — the M3
+replay corpus still hashes to the same `SESSION_DIGEST`, the legacy
+importer is untouched, and every pre-chord preset file is byte-identical.
+
+#### The file
+
+```toml
+[bindings]
+A  = "G"                                              # unchanged
+rt = { key = "D", when = ["F"] }                      # D+F -> RT
+lb = { key = "D", when = ["F", "C"], unless = ["LeftShift"] }
+lt = ["Q", { key = "A", when = ["B"] }]               # plain AND chord
+```
+
+A guard with nothing in it (`{ key = "G" }`) is normalized to a plain
+binding — a zero-key "chord" would consume its own trigger and silently
+disable that key's other bindings.
+
+#### The semantics, exactly
+
+- **Activation is state, not sequence.** A chord is a SET of held keys
+  (§0.1): press order does not matter, and there is no window to miss.
+- **Consumption.** While a chord is active, its constituents (trigger +
+  every `when` key) are SUPPRESSED: their own unguarded entries drive
+  nothing. `unless` keys are a negative condition and are never consumed.
+- **One batch, always.** Activation releases whatever a consumed
+  constituent was holding *in the same delta batch* that presses the
+  chord's output — no stranded button, no intermediate state on the wire
+  (the neutral-delta discipline `Engine::swap_tables` established).
+  Release is the mirror: the chord's output goes and every constituent
+  still held resumes its own binding in that one batch, so lifting B while
+  A stays down gives you A back with no flicker.
+- **A chord is a holder.** It participates in the all-keys-up rule and the
+  opposite-axis snap like any key, so an endpoint driven by both a key and
+  a chord stays down while either drives it.
+- **Specificity.** A bigger guard beats a smaller one *where they share a
+  constituent*: A+B+C suppresses A+B, and A+B comes back the instant C
+  lifts. Disjoint chords never interfere. Chords with the SAME guard are a
+  multi-bind (one chord, several outputs — native in ksx) and both fire.
+  Two guards of the SAME size on the same trigger that could be satisfied
+  together are a **config error**, reported by validation and refused at
+  session start — never a coin flip on build order.
+- **Everything releases on the way out**: unplug, session stop, hot-swap
+  and `reset` all clear chord state and emit the releases.
+
+#### The honest caveat
+
+**There is no deferral and no timing window.** So if a chord key is *also*
+bound on its own, the game sees that individual output for the moment
+between the first and the second keypress. A+B→RT with A→X shows X, then
+X-off + RT-on. That is a real, visible flash, and it is the price of never
+charging a single press one millisecond of latency.
+
+Therefore, in order:
+
+1. **Prefer dedicated chord keys.** If the constituents are not bound
+   individually there is no flash and no cost at all — the chord is a
+   plain AND. On an arcade panel with spare buttons this is nearly always
+   available, and it is what the docs, the CLI help and the validator all
+   recommend.
+2. If a constituent *is* individually bound, ksx allows it and **says so
+   every time**: `ksx map` reports a `flash` advisory naming the key and
+   what it flashes, validation emits `ChordConstituentAlsoBound`, and the
+   plan prints it as a `[WARN]` (advisory, not a refusal — the config
+   works exactly as written). Never silently.
+3. Physical reality, unchanged: a human hitting two arcade buttons
+   "together" lands them 10–30 ms apart. With no window that is not a
+   correctness problem, only the flash above. Many fighting games also
+   ship 2-button macro assignments in-game, which remains a better place
+   to solve it when available.
+
+#### The hot path
+
+Guard evaluation is O(guard size) bit tests per event, allocation-free:
+
+- guard keys are interned into the same dense-id space as everything else,
+  so a guard is `bit(down, id)` — no key lookup, no preset scan;
+- chords are precompiled per slot, sorted most-specific-first, so one
+  forward pass resolves specificity;
+- `held` / `consumed` / `blocked` / `scan` are sized in
+  `EngineTables::build` (off the hot path, like the whole table set) and
+  reused per event;
+- **a slot with no chords never touches any of it** — the extra state is
+  not even allocated, and the dispatch loop takes the pre-chord branch.
+  `tests/engine_chords_alloc.rs` pins zero allocation on the chord path;
+  `tests/engine_alloc.rs` and the replay corpus pin the chord-free one.
 
 ### 1c. Macros — a different subsystem, not a bigger binding
 
@@ -141,9 +230,9 @@ Ordered by value on *this* machine, not by novelty.
    last-wins ("snap tap"), applied at submit for both dpad and stick. We
    already have a fixed neutral rule inside the DS4 mapper; it should be
    engine-level, configurable, and stated — tournaments legislate this.
-7. **NOT / exclusion conditions.** MAME's input sequences support `NOT`;
-   it is how a binding avoids firing while a modifier is held. Falls out
-   free if chords are implemented as a `when` guard (§1b) — add `unless`.
+7. ~~**NOT / exclusion conditions.**~~ **SHIPPED with chords** (§1b): the
+   `when` guard made `unless` fall out free, exactly as predicted. MAME's
+   `NOT`, in the same row as the binding it qualifies.
 8. **Toggle-hold (sticky hold).** Press once → held until pressed again.
    Accessibility, and useful for triggers/auto-run.
 9. **Double-tap / multi-tap activators** (Steam's model). Cheap once the
@@ -201,9 +290,12 @@ Nothing here blocks M6/M7. Suggested order, cheapest-and-most-useful first:
    just stop treating a shared key as a conflict and show it honestly.
 2. **E3 key output** — unlocks admin/exit/coin, the cabinet's real gap.
 3. **Layers** — the biggest ergonomic win per line of code.
-4. **The transform stage** (clock + context), then in order: turbo,
-   tap-hold, SOCD policy, chords (with the latency warning), analog
-   shaping.
+4. ~~**Chords**~~ — **DONE** (§1b), and done *without* the transform stage:
+   consumption needs context, not time, so it landed as a guard on a
+   binding with no clock, no deferral and no latency. What is left for the
+   transform stage is the genuinely time-based half: turbo, tap-hold,
+   double-tap, ramps — plus SOCD policy and analog shaping, which need
+   neither.
 5. **Macros** last of the big ones — they need the scheduler, the
    interruption policy, and the sampling rule, and they are the easiest to
    get subtly wrong.

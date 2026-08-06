@@ -487,6 +487,22 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
     if key.is_some() && clear {
         return err_msg(r#"map takes either "key" or "clear", not both"#);
     }
+    // CHORD guards, optional and absent from every pre-chord caller:
+    // "when": ["B"] / "unless": ["LeftShift"] (docs/INPUT-TRANSFORMS.md §1b).
+    let list = |name: &str| -> Vec<String> {
+        request
+            .get(name)
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|v| !v.trim().is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let spec = crate::mapping::MapSpec {
         preset,
         function,
@@ -495,6 +511,8 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
             .get("force")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        when: list("when"),
+        unless: list("unless"),
     };
     match (deps.map)(&spec) {
         Ok(applied) => {
@@ -507,8 +525,11 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
                 "preset": applied.preset,
                 "function": applied.function,
                 "key": applied.key,
+                "when": applied.when,
+                "unless": applied.unless,
                 "stolen_from": applied.stolen_from,
                 "conflicts": crate::mapping::conflicts_json(&applied.overridden),
+                "flash": crate::mapping::flash_json(&applied.flash),
                 "reloaded": outcome.reloaded,
                 // true = the live session took it with the pads left plugged.
                 "hot_swap": outcome.hot,
@@ -1333,8 +1354,11 @@ mod tests {
             preset: spec.preset.clone(),
             function: spec.function.to_ascii_uppercase(),
             key: spec.key.clone(),
+            when: spec.when.clone(),
+            unless: spec.unless.clone(),
             stolen_from: Vec::new(),
             overridden: Vec::new(),
+            flash: Vec::new(),
         })
     }
 

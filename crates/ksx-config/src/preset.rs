@@ -18,16 +18,49 @@ pub struct PresetFile {
     pub bindings: BTreeMap<String, BindingEntry>,
 }
 
-/// Value side of a `[bindings]` entry: one key, several keys, or a nested
-/// group produced by TOML dotted keys (`dpad.up = "I"` parses as a `dpad`
-/// table containing `up`). A quoted literal key with a dot (`"lx.min"`) and a
-/// nested group are equivalent; conversion flattens groups with `.`.
+/// Value side of a `[bindings]` entry: one key, several keys, a GUARDED key
+/// (a chord), a mixed list of those, or a nested group produced by TOML dotted
+/// keys (`dpad.up = "I"` parses as a `dpad` table containing `up`). A quoted
+/// literal key with a dot (`"lx.min"`) and a nested group are equivalent;
+/// conversion flattens groups with `.`.
+///
+/// ```toml
+/// [bindings]
+/// A  = "G"                                  # plain, exactly as before
+/// rt = { key = "A", when = ["B"] }           # chord: A while B is held
+/// lb = ["Q", { key = "A", when = ["C"] }]    # both, on one function
+/// ```
+///
+/// Variant order is load-bearing: `serde(untagged)` tries them top to bottom,
+/// so a plain string still parses as [`BindingEntry::Key`] and a table with a
+/// `key` field is a guard rather than a dotted group.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum BindingEntry {
     Key(String),
     Keys(Vec<String>),
+    Guarded(GuardedEntry),
+    /// Mixed list: plain keys and guarded keys on the same function.
+    Many(Vec<BindingEntry>),
     Group(BTreeMap<String, BindingEntry>),
+}
+
+/// A guarded key — the file spelling of [`ksx_core::Chord`].
+///
+/// `key` is the trigger; `when` keys must all be held, `unless` keys must not
+/// be. `deny_unknown_fields` is what keeps a dotted group (`lx = { min = … }`)
+/// from ever being mistaken for a guard.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardedEntry {
+    /// Trigger key name (legacy spelling), or `"None"` for an inert row.
+    pub key: String,
+    /// All of these must be held.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub when: Vec<String>,
+    /// None of these may be held (MAME's `NOT`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unless: Vec<String>,
 }
 
 impl PresetFile {
@@ -37,12 +70,14 @@ impl PresetFile {
     /// files are user presets.
     pub fn to_core(&self) -> Result<ksx_core::Preset, ConfigError> {
         let mut entries = Vec::new();
+        let mut chords = Vec::new();
         for (function, entry) in &self.bindings {
-            collect_entries(function, entry, &mut entries)?;
+            collect_entries(function, entry, &mut entries, &mut chords)?;
         }
         Ok(ksx_core::Preset {
             name: self.name.clone(),
             entries,
+            chords,
             protected: false,
         })
     }
@@ -51,21 +86,42 @@ impl PresetFile {
     /// (multiple keys become an array); emission uses flat literal keys
     /// (`"dpad.up"`), which parse back identically to the nested form.
     /// `protected` does not survive the trip.
+    ///
+    /// Chords are emitted after the function's plain keys, so a preset with no
+    /// chords serializes to exactly the bytes it always did.
     pub fn from_core(preset: &ksx_core::Preset) -> Self {
-        let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut grouped: BTreeMap<String, (Vec<String>, Vec<GuardedEntry>)> = BTreeMap::new();
         for (key, binding) in &preset.entries {
             grouped
                 .entry(function_name(binding))
                 .or_default()
+                .0
                 .push(key.name().to_owned());
+        }
+        for chord in &preset.chords {
+            grouped
+                .entry(function_name(&chord.binding))
+                .or_default()
+                .1
+                .push(GuardedEntry {
+                    key: chord.key.name().to_owned(),
+                    when: chord.when.iter().map(|k| k.name().to_owned()).collect(),
+                    unless: chord.unless.iter().map(|k| k.name().to_owned()).collect(),
+                });
         }
         let bindings = grouped
             .into_iter()
-            .map(|(function, mut keys)| {
-                let entry = if keys.len() == 1 {
-                    BindingEntry::Key(keys.remove(0))
-                } else {
-                    BindingEntry::Keys(keys)
+            .map(|(function, (mut keys, mut guards))| {
+                let entry = match (keys.len(), guards.len()) {
+                    (1, 0) => BindingEntry::Key(keys.remove(0)),
+                    (0, 1) => BindingEntry::Guarded(guards.remove(0)),
+                    (_, 0) => BindingEntry::Keys(keys),
+                    _ => BindingEntry::Many(
+                        keys.into_iter()
+                            .map(BindingEntry::Key)
+                            .chain(guards.into_iter().map(BindingEntry::Guarded))
+                            .collect(),
+                    ),
                 };
                 (function, entry)
             })
@@ -81,6 +137,7 @@ fn collect_entries(
     function: &str,
     entry: &BindingEntry,
     out: &mut Vec<(ksx_core::Key, ksx_core::Binding)>,
+    chords: &mut Vec<ksx_core::Chord>,
 ) -> Result<(), ConfigError> {
     match entry {
         BindingEntry::Key(key) => push_entry(function, key, out),
@@ -90,9 +147,19 @@ fn collect_entries(
             }
             Ok(())
         }
+        BindingEntry::Guarded(guarded) if guarded.when.is_empty() && guarded.unless.is_empty() => {
+            push_entry(function, &guarded.key, out)
+        }
+        BindingEntry::Guarded(guarded) => push_chord(function, guarded, chords),
+        BindingEntry::Many(entries) => {
+            for entry in entries {
+                collect_entries(function, entry, out, chords)?;
+            }
+            Ok(())
+        }
         BindingEntry::Group(group) => {
             for (sub, entry) in group {
-                collect_entries(&format!("{function}.{sub}"), entry, out)?;
+                collect_entries(&format!("{function}.{sub}"), entry, out, chords)?;
             }
             Ok(())
         }
@@ -105,10 +172,43 @@ fn push_entry(
     out: &mut Vec<(ksx_core::Key, ksx_core::Binding)>,
 ) -> Result<(), ConfigError> {
     let binding = parse_function(function)?;
-    let key = ksx_core::Key::from_name(key_name)
-        .ok_or_else(|| ConfigError::UnknownKey(key_name.to_owned()))?;
+    let key = key_named(key_name)?;
     out.push((key, binding));
     Ok(())
+}
+
+/// A guarded entry with a non-empty guard. An EMPTY guard is normalized to a
+/// plain entry by the caller: `{ key = "G" }` means exactly `"G"`, and must
+/// not consume anything (a zero-key "chord" that suppressed its own trigger
+/// would silently disable that key's other bindings).
+fn push_chord(
+    function: &str,
+    guarded: &GuardedEntry,
+    chords: &mut Vec<ksx_core::Chord>,
+) -> Result<(), ConfigError> {
+    let binding = parse_function(function)?;
+    let key = key_named(&guarded.key)?;
+    let when = guarded
+        .when
+        .iter()
+        .map(|k| key_named(k))
+        .collect::<Result<Vec<_>, _>>()?;
+    let unless = guarded
+        .unless
+        .iter()
+        .map(|k| key_named(k))
+        .collect::<Result<Vec<_>, _>>()?;
+    chords.push(ksx_core::Chord {
+        key,
+        binding,
+        when,
+        unless,
+    });
+    Ok(())
+}
+
+fn key_named(name: &str) -> Result<ksx_core::Key, ConfigError> {
+    ksx_core::Key::from_name(name).ok_or_else(|| ConfigError::UnknownKey(name.to_owned()))
 }
 
 #[cfg(test)]
@@ -254,6 +354,125 @@ A = ["S", "Enter"]
         let serialized = toml::to_string(&file).unwrap();
         let reparsed: PresetFile = toml::from_str(&serialized).unwrap();
         assert_eq!(file, reparsed);
+    }
+
+    // ---- chords (docs/INPUT-TRANSFORMS.md §1b) ----------------------------
+
+    /// The documented file shape, and the promise that adding one does not
+    /// disturb the plain rows around it.
+    #[test]
+    fn a_guarded_entry_parses_as_a_chord() {
+        let file: PresetFile = toml::from_str(
+            r#"
+name = "chords"
+[bindings]
+A = "G"
+rt = { key = "A", when = ["B"] }
+lb = { key = "A", when = ["B", "C"], unless = ["LeftShift"] }
+"#,
+        )
+        .unwrap();
+        let core = file.to_core().unwrap();
+        // Plain rows stay plain rows.
+        assert_eq!(core.entries, vec![(Key::G, Binding::Button(XButton::A))]);
+        assert_eq!(core.chords.len(), 2);
+        assert!(core.chords.contains(&ksx_core::Chord {
+            key: Key::A,
+            binding: Binding::Trigger(Trigger::Right),
+            when: vec![Key::B],
+            unless: vec![],
+        }));
+        assert!(core.chords.contains(&ksx_core::Chord {
+            key: Key::A,
+            binding: Binding::Button(XButton::LeftBumper),
+            when: vec![Key::B, Key::C],
+            unless: vec![Key::LeftShift],
+        }));
+    }
+
+    /// One function can carry plain keys AND chords; the list form round-trips.
+    #[test]
+    fn a_function_can_hold_plain_keys_and_chords_together() {
+        let original = Preset {
+            name: "mixed".into(),
+            entries: vec![
+                (Key::Q, Binding::Trigger(Trigger::Right)),
+                (Key::E, Binding::Trigger(Trigger::Right)),
+            ],
+            chords: vec![ksx_core::Chord::new(
+                Key::A,
+                Binding::Trigger(Trigger::Right),
+                vec![Key::B],
+            )],
+            protected: false,
+        };
+        let file = PresetFile::from_core(&original);
+        let text = toml::to_string(&file).unwrap();
+        let reparsed: PresetFile = toml::from_str(&text).unwrap();
+        assert_eq!(file, reparsed, "{text}");
+        let back = reparsed.to_core().unwrap();
+        assert_eq!(back.entries, original.entries);
+        assert_eq!(back.chords, original.chords);
+    }
+
+    /// Chords survive core → file → TOML → file → core unchanged, including
+    /// dotted function names.
+    #[test]
+    fn chords_round_trip_through_toml() {
+        let original = Preset {
+            name: "rt".into(),
+            entries: vec![(Key::G, Binding::Button(XButton::A))],
+            chords: vec![
+                ksx_core::Chord::new(Key::D, Binding::Dpad(DpadDirection::Up), vec![Key::F]),
+                ksx_core::Chord {
+                    key: Key::D,
+                    binding: Binding::Axis {
+                        axis: Axis::X,
+                        value: AXIS_MIN,
+                    },
+                    when: vec![Key::F, Key::G],
+                    unless: vec![Key::LeftShift],
+                },
+            ],
+            protected: false,
+        };
+        let text = toml::to_string(&PresetFile::from_core(&original)).unwrap();
+        let back: PresetFile = toml::from_str(&text).unwrap();
+        let core = back.to_core().unwrap();
+        assert_eq!(core.entries, original.entries, "{text}");
+        assert_eq!(core.chords, original.chords, "{text}");
+    }
+
+    /// A guard with nothing in it is not a chord: it must not consume its own
+    /// trigger key (which would silently disable that key's other bindings).
+    #[test]
+    fn an_empty_guard_is_a_plain_binding() {
+        let file: PresetFile =
+            toml::from_str("name = \"p\"\n[bindings]\nA = { key = \"G\" }\n").unwrap();
+        let core = file.to_core().unwrap();
+        assert!(core.chords.is_empty());
+        assert_eq!(core.entries, vec![(Key::G, Binding::Button(XButton::A))]);
+    }
+
+    /// The regression guarantee at the file layer: a preset without chords
+    /// emits exactly the bytes it always did — no guard syntax anywhere.
+    #[test]
+    fn a_chordless_preset_emits_no_guard_syntax() {
+        for preset in Preset::builtins() {
+            let text = toml::to_string(&PresetFile::from_core(&preset)).unwrap();
+            assert!(!text.contains("when"), "{text}");
+            assert!(!text.contains("unless"), "{text}");
+            assert!(!text.contains("key ="), "{text}");
+        }
+    }
+
+    #[test]
+    fn unknown_guard_keys_are_errors() {
+        let file: PresetFile = toml::from_str(
+            "name = \"p\"\n[bindings]\nrt = { key = \"A\", when = [\"NotAKey\"] }\n",
+        )
+        .unwrap();
+        assert!(matches!(file.to_core(), Err(ConfigError::UnknownKey(_))));
     }
 
     #[test]

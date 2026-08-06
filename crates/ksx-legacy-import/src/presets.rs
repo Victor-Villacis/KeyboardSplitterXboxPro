@@ -71,6 +71,9 @@ pub fn parse_presets(text: &str, file: &str) -> ParsedPresets {
                                 current = Some(Preset {
                                     name: preset_name,
                                     entries: Vec::new(),
+                                    // Legacy XML has no chord vocabulary; an
+                                    // imported preset never has one.
+                                    chords: Vec::new(),
                                     protected: false,
                                 });
                             }
@@ -156,6 +159,7 @@ pub fn parse_presets(text: &str, file: &str) -> ParsedPresets {
                         Ok(preset_name) => presets.push(Preset {
                             name: preset_name,
                             entries: Vec::new(),
+                            chords: Vec::new(),
                             protected: false,
                         }),
                         Err(reason) => warnings.push(Warning::file_level(

@@ -23,7 +23,7 @@ list.
 | List / identify devices | `ksx devices [--json]` (both backends, read-only); `ksx winusb status [--json]` for the USB/claim view | M9: same enumeration in-process — strictly read-only, safe mid-session. M10: api devices | exists |
 | Pad test | `ksx pads --count N --persona xbox360\|playstation [--json]` (plug, test pattern, unplug) | M9: same routine in-process, only while emulation is stopped (test pads compete for the four XInput slots). M10: api | exists |
 | Per-slot persona | TOML edit: `persona = "playstation"` on the `[[slot]]` (aliases `ds4`/`ps4` accepted) | M7 wizard / mapping verbs first; then GUI forms write the same TOML and issue `Reload` | gap — TOML-only **by design** until M7 |
-| Preset editing | `ksx map --preset "IPAC P1" --function A --key G [--clear] [--force] [--json]`; whole-preset: `--restore defaults\|session-backup\|latest-backup`, `--clear-all`, `--list-backups`; pipe `map` / `map-restore` / `map-clear-all` / `map-backups` (same writers: `ksx-app/src/mapping.rs`); TOML edit still first-class | **Studio's `/map` mapper (live)**: click a control → pipe `learn-key` → pipe `map` — every write goes through the one shared writer, never a parallel editor. Conflict detection is server-side in that writer (see below) | exists — CLI + pipe + Studio live |
+| Preset editing | `ksx map --preset "IPAC P1" --function A --key G [--clear] [--force] [--json]`; chords: `--when B[,C] [--unless K]`; whole-preset: `--restore defaults\|session-backup\|latest-backup`, `--clear-all`, `--list-backups`; pipe `map` / `map-restore` / `map-clear-all` / `map-backups` (same writers: `ksx-app/src/mapping.rs`); TOML edit still first-class | **Studio's `/map` mapper (live)**: click a control → pipe `learn-key` → pipe `map` — every write goes through the one shared writer, never a parallel editor. Conflict detection is server-side in that writer (see below). Studio does not yet DISPLAY chords (later pass) — the CLI/pipe author them and the engine runs them | exists — CLI + pipe + Studio live |
 | Learn a key ("press the panel key for P1·A") | pipe `learn-key` / `learn-poll` / `learn-cancel` (asynchronous; see "learn-key semantics" below) | **Studio's mapper drives it (live)**: `/api/learn*` → the pipe verbs. No CLI face yet (`ksx map` takes the key by name; `ksx monitor` shows names) | exists — pipe + Studio |
 | Game profiles | TOML edit (`games.toml`); consumed by `ksx run --game`, `ksx daemon --game`, `ksx autostart --game` | Editing: M7 verbs (E5 `ksx slot assign` family), then GUI forms over them. Consuming: `DaemonCommand`/api as above | gap for editing; consuming exists |
 | WinUSB claim / release / status | `ksx winusb status` (read-only); `claim`/`release` are dry runs by default, act only with `--yes` + an admin token | M9: same verbs in-process, preserving dry-run-first and the explicit consent step. M10: `status` is safe over the api; `claim`/`release` stay local + elevated | exists |
@@ -72,7 +72,12 @@ The M7 mapper slice adds four verbs on the same channel:
    "force":false,"reload":true}          ("clear":true instead of "key" unbinds)
 ← {"ok":true,"message":"\"IPAC P1\": A = G — the next session start reads it",
    "path":"C:\\…\\presets\\IPAC P1.toml","preset":"IPAC P1","function":"A",
-   "key":"G","stolen_from":[],"conflicts":[],"reloaded":false}
+   "key":"G","when":[],"unless":[],"stolen_from":[],"conflicts":[],
+   "flash":[],"reloaded":false}
+
+→ {"verb":"map","preset":"IPAC P1","function":"rt","key":"D","when":["F"]}
+← {"ok":true,"message":"\"IPAC P1\": rt = D+F", …,
+   "when":["F"],"unless":[],"flash":[]}   (a CHORD — see "chords" below)
 ← {"ok":false,"code":"conflict",
    "error":"refusing to bind G: G is \"IPAC P2\"'s A (slot 2 of \"Steam\") — use --force …",
    "conflicts":[{"scope":"profile","preset":"IPAC P2","function":"A",
@@ -153,8 +158,48 @@ it writes the `empty` built-in's SHAPE — all 25 functions present, each keyed
 control stays visible in the legend instead of vanishing.
 
 Refusal codes (`--json` `code`, stable): `unknown-preset`, `unknown-function`,
-`unknown-key`, `conflict`, `no-session-backup`, `no-backup`, `bad-backup`,
-`config-error`. A corrupt backup is refused, never written.
+`unknown-key`, `invalid-guard`, `conflict`, `no-session-backup`, `no-backup`,
+`bad-backup`, `config-error`. A corrupt backup is refused, never written.
+
+### Chords: `--when` / `--unless` (2026-08-06)
+
+```
+ksx map --preset "IPAC P1" --function rt --key D --when F
+ksx map --preset "IPAC P1" --function lb --key D --when F,C --unless LeftShift
+ksx map --preset "IPAC P1" --function rt --clear      # removes the chord too
+```
+
+`--when KEYS` / `--unless KEYS` (comma-separated, or repeated) turn the write
+into a GUARDED binding — a chord: "this function, but only while these other
+keys are (not) also held". Pipe equivalent: `"when":["F"]`, `"unless":[…]`;
+both absent from a plain write, so every pre-chord caller is unchanged. They
+belong to the BIND action only — clap refuses them alongside `--clear`,
+`--restore` or `--clear-all`. `--clear` and any re-map of the same function
+remove that function's chord as well as its plain keys (replace-per-function
+covers guarded rows), so a cleared control is really cleared. The full
+semantics — consumption, specificity, releases — are
+docs/INPUT-TRANSFORMS.md §1b.
+
+Two deliberate differences from a plain bind, both about not lying:
+
+- **A chord never conflicts.** Layering `rt = D+F` over keys that already do
+  something is the whole point, so the conflict gate is skipped and nothing
+  is ever stolen from the bindings the chord sits on top of.
+- **It reports the flash instead.** `flash` is `[{"key":"G","bound_to":"A"}]`
+  for every constituent that is ALSO bound on its own, and the human message
+  spells out what the player will see: ksx does not defer input, so pressing
+  that key first shows its own output for a moment before the chord takes
+  over. Empty `flash` = the recommended shape (dedicated chord keys, no cost
+  at all). The same finding appears as a `[WARN]` in the run plan; it is
+  advice, not a refusal.
+
+`invalid-guard` (exit 2, nothing written) covers the guards that cannot mean
+anything: the trigger key listed in its own `--when`/`--unless`, a key in both
+lists, or a guard with no `--key`. Unknown guard key names are `unknown-key`,
+like any other key name. `ksx doctor`-style config validation additionally
+refuses **ambiguous equal-specificity chords** — two guards of the same size
+on the same trigger that could be satisfied together — at session start, so
+which one wins is never a build-order accident.
 
 `map` writes through the SAME `ksx-app/src/mapping.rs::apply` the CLI verb
 uses — replace-per-function, `"None"` placeholder on clear, canonical TOML

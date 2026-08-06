@@ -15,7 +15,8 @@
 //! - [`key`] — the single key vocabulary (legacy `InterceptionKey`, exact names/values)
 //! - [`pad`] — XInput wire-shape [`PadState`] + legacy `VirtualXbox` ID tables
 //! - [`device`] — [`DeviceId`] (instance-path identity) and [`KeyEvent`]
-//! - [`preset`] — [`Binding`], [`Preset`], and the `default`/`empty` built-ins
+//! - [`preset`] — [`Binding`], [`Chord`] (guarded bindings), [`Preset`], and
+//!   the `default`/`empty` built-ins
 //! - [`slot`] — [`SlotSpec`] and the 13-variant [`InvalidationReason`] taxonomy
 //! - [`persona`] — [`Persona`]: which controller a slot presents itself as
 //! - [`engine`] — the [`Engine`]: precompiled dispatch, per-device key state, diffing
@@ -38,5 +39,5 @@ pub use pad::{
     Axis, DpadDirection, PadState, Trigger, XButton, XButtons, AXIS_CENTER, AXIS_MAX, AXIS_MIN,
 };
 pub use persona::{Persona, UnknownPersona};
-pub use preset::{Binding, Preset};
+pub use preset::{Binding, Chord, Preset};
 pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS, MAX_XINPUT_SLOTS};

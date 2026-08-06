@@ -20,6 +20,67 @@ pub enum Binding {
     Dpad(DpadDirection),
 }
 
+/// A binding that only applies while other keys are (or are not) held — the
+/// CHORD (docs/INPUT-TRANSFORMS.md §1b).
+///
+/// A chord is deliberately **not** a new [`Binding`] kind: it is an ordinary
+/// binding plus a guard, so it composes with buttons, triggers, axes and dpad
+/// alike ("A+B → RT" and "A+B → lx.min" are the same construct).
+///
+/// - `key` is the TRIGGER: the key whose press completes the chord.
+/// - `when` keys must ALL be held for the chord to apply.
+/// - `unless` keys must NONE be held (MAME's `NOT`).
+///
+/// **Consumption**: while the chord is active, its constituents (`key` plus
+/// every `when` key) are suppressed — their own unguarded entries produce
+/// nothing, so the game sees the chord's output instead of the parts. `unless`
+/// keys are a negative condition, never consumed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Chord {
+    /// Trigger key. [`Key::None`] makes the whole chord an inert placeholder.
+    pub key: Key,
+    /// What the chord drives while it is active.
+    pub binding: Binding,
+    /// All of these must be held.
+    pub when: Vec<Key>,
+    /// None of these may be held.
+    pub unless: Vec<Key>,
+}
+
+impl Chord {
+    /// A `when`-only chord (the common shape).
+    pub fn new(key: Key, binding: Binding, when: Vec<Key>) -> Self {
+        Self {
+            key,
+            binding,
+            when,
+            unless: Vec::new(),
+        }
+    }
+
+    /// Guard size: how many extra conditions this chord carries. A chord with
+    /// a LARGER guard is more specific and wins over one with a smaller guard
+    /// that shares a constituent (A+B+C beats A+B). Equal specificity is a
+    /// config error, caught by `ksx-config`'s validation rather than resolved
+    /// by a coin flip.
+    pub fn specificity(&self) -> usize {
+        self.when.len() + self.unless.len()
+    }
+
+    /// The keys this chord CONSUMES while active: the trigger plus every
+    /// `when` key. Guard keys listed in `unless` are not consumed — they are
+    /// not held in the first place.
+    pub fn constituents(&self) -> impl Iterator<Item = Key> + '_ {
+        std::iter::once(self.key).chain(self.when.iter().copied())
+    }
+
+    /// Every key the guard mentions (`when` then `unless`) — the keys whose
+    /// state can change this chord's activation, minus the trigger.
+    pub fn guard_keys(&self) -> impl Iterator<Item = Key> + '_ {
+        self.when.iter().copied().chain(self.unless.iter().copied())
+    }
+}
+
 /// A named set of key→function bindings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preset {
@@ -29,7 +90,16 @@ pub struct Preset {
     /// `<custom>` category for this; here it is just more entries).
     /// Entries keyed [`Key::None`] are inert placeholders ("function present,
     /// unbound") preserved for legacy fidelity; engines must ignore them.
+    ///
+    /// Entries here are UNGUARDED: they apply whenever their key is down (and
+    /// no active chord is consuming that key). Guarded entries live in
+    /// [`Preset::chords`], which keeps this field — and every file, importer
+    /// and test that predates chords — byte-for-byte unchanged.
     pub entries: Vec<(Key, Binding)>,
+    /// Guarded entries: the same bindings, conditional on other keys. Empty in
+    /// every preset that predates chords, which is exactly why the chord-free
+    /// engine path is unchanged.
+    pub chords: Vec<Chord>,
     /// Built-ins ship in code, are never saved, and cannot be edited/deleted
     /// (legacy `ImuttablePresets` semantics).
     pub protected: bool,
@@ -124,6 +194,7 @@ impl Preset {
         Self {
             name: Self::DEFAULT_NAME.to_owned(),
             entries,
+            chords: Vec::new(),
             protected: true,
         }
     }
@@ -163,6 +234,7 @@ impl Preset {
         Self {
             name: Self::EMPTY_NAME.to_owned(),
             entries,
+            chords: Vec::new(),
             protected: true,
         }
     }
@@ -272,6 +344,42 @@ mod tests {
         bindings.sort();
         bindings.dedup();
         assert_eq!(bindings.len(), 25);
+    }
+
+    #[test]
+    fn a_chord_names_its_specificity_and_its_constituents() {
+        let chord = Chord {
+            key: Key::A,
+            binding: Binding::Trigger(Trigger::Right),
+            when: vec![Key::B],
+            unless: vec![Key::LeftShift],
+        };
+        assert_eq!(chord.specificity(), 2);
+        // The trigger and every `when` key are consumed; `unless` is not.
+        assert_eq!(
+            chord.constituents().collect::<Vec<_>>(),
+            vec![Key::A, Key::B]
+        );
+        assert_eq!(
+            chord.guard_keys().collect::<Vec<_>>(),
+            vec![Key::B, Key::LeftShift]
+        );
+        // A+B+C is more specific than A+B, and wins where they overlap.
+        let bigger = Chord::new(
+            Key::A,
+            Binding::Button(XButton::LeftBumper),
+            vec![Key::B, Key::C],
+        );
+        assert!(
+            bigger.specificity() > Chord::new(Key::A, chord.binding, vec![Key::B]).specificity()
+        );
+        assert!(bigger.unless.is_empty());
+    }
+
+    #[test]
+    fn builtins_carry_no_chords() {
+        // The regression guarantee: nothing that predates chords grows one.
+        assert!(Preset::builtins().iter().all(|p| p.chords.is_empty()));
     }
 
     #[test]

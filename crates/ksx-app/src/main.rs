@@ -327,6 +327,24 @@ enum Command {
     /// quoted literals ("dpad.up"), hand-written comments do not survive —
     /// the trade for atomic, validated writes.
     ///
+    /// CHORDS (--when / --unless): `--function rt --key A --when B` binds
+    /// "A while B is held" to RT. While the chord is active its keys are
+    /// CONSUMED — A's and B's own bindings produce nothing, so the game sees
+    /// RT instead of the parts, and any output they were holding is released
+    /// in the same instant. Lift either key and the chord releases; whatever
+    /// is still down resumes its own binding immediately. A bigger guard wins
+    /// over a smaller one (A+B+C beats A+B); two guards of the same size on
+    /// the same key are refused by `ksx doctor` rather than raced.
+    ///
+    /// THE HONEST CAVEAT: ksx does not defer input — there is no timing
+    /// window, and no press is ever held back. So if a chord key is ALSO
+    /// bound on its own, the game sees that individual output for the moment
+    /// between the first keypress and the second. The recommended shape is
+    /// chord keys with no individual binding (a spare panel button): then
+    /// consumption costs nothing and adds no latency. Binding a chord over an
+    /// already-bound key is allowed and does not conflict — the response names
+    /// the flash instead.
+    ///
     /// CONFLICTS block by default: a key already on another function in the
     /// same preset, or bound in another slot's preset within a games.toml
     /// profile that uses this preset, is reported and nothing is written.
@@ -376,6 +394,25 @@ enum Command {
         /// Unbind the function (leaves the inert "None" placeholder)
         #[arg(long)]
         clear: bool,
+        /// CHORD: extra keys that must ALL be held for this binding to apply
+        /// (comma-separated, e.g. --when B or --when B,C). While the chord is
+        /// active its keys are CONSUMED: their own bindings produce nothing.
+        #[arg(
+            long,
+            value_name = "KEYS",
+            value_delimiter = ',',
+            conflicts_with_all = ["clear", "restore", "list_backups", "clear_all"]
+        )]
+        when: Vec<String>,
+        /// CHORD: keys that must NOT be held for this binding to apply
+        /// (comma-separated) — MAME's NOT
+        #[arg(
+            long,
+            value_name = "KEYS",
+            value_delimiter = ',',
+            conflicts_with_all = ["clear", "restore", "list_backups", "clear_all"]
+        )]
+        unless: Vec<String>,
         /// Proceed despite conflicts (same-preset conflicts are stolen)
         #[arg(long)]
         force: bool,
@@ -691,6 +728,8 @@ fn main() -> anyhow::Result<()> {
             key,
             clear: _,
             force,
+            when,
+            unless,
             restore,
             list_backups,
             clear_all,
@@ -711,6 +750,8 @@ fn main() -> anyhow::Result<()> {
                     function: function.expect("clap requires --function without --restore"),
                     key,
                     force,
+                    when,
+                    unless,
                 },
             },
             json,
@@ -1429,6 +1470,8 @@ mod tests {
                 key,
                 clear,
                 force,
+                when,
+                unless,
                 restore,
                 list_backups,
                 clear_all,
@@ -1439,6 +1482,8 @@ mod tests {
                 assert_eq!(key.as_deref(), Some("G"));
                 assert!(!clear && !force && json && !list_backups && !clear_all);
                 assert_eq!(restore, None);
+                // No guard given: an ordinary binding, byte for byte as before.
+                assert!(when.is_empty() && unless.is_empty());
             }
             _ => panic!("parsed to the wrong subcommand"),
         }
@@ -1615,8 +1660,82 @@ mod tests {
             "bak-YYYYMMDD-HHMMSS",
             // FIX 3: the honest description of what a live session does now.
             "hot-swapped into the live engine with the pads left plugged",
+            // Chords: the feature, the consumption rule, and — above all —
+            // the caveat, because a zero-deferral design has one.
+            "--when",
+            "keys are CONSUMED",
+            "ksx does not defer input",
+            "no timing window",
+            "chord keys with no individual binding",
+            "A bigger guard wins over a smaller one",
         ] {
             assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
+        }
+    }
+
+    /// `--when`/`--unless` take a comma-separated list and belong to the BIND
+    /// action only — never to a restore or a clear.
+    #[test]
+    fn map_parses_chord_guards() {
+        let cli = Cli::try_parse_from([
+            "ksx",
+            "map",
+            "--preset",
+            "IPAC P1",
+            "--function",
+            "rt",
+            "--key",
+            "A",
+            "--when",
+            "B,C",
+            "--unless",
+            "LeftShift",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Map {
+                function,
+                key,
+                when,
+                unless,
+                ..
+            } => {
+                assert_eq!(function.as_deref(), Some("rt"));
+                assert_eq!(key.as_deref(), Some("A"));
+                assert_eq!(when, vec!["B".to_owned(), "C".to_owned()]);
+                assert_eq!(unless, vec!["LeftShift".to_owned()]);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+
+        for bad in [
+            vec![
+                "ksx",
+                "map",
+                "--preset",
+                "P",
+                "--function",
+                "rt",
+                "--clear",
+                "--when",
+                "B",
+            ],
+            vec![
+                "ksx",
+                "map",
+                "--preset",
+                "P",
+                "--restore",
+                "defaults",
+                "--when",
+                "B",
+            ],
+            vec!["ksx", "map", "--preset", "P", "--clear-all", "--when", "B"],
+        ] {
+            assert!(
+                Cli::try_parse_from(bad.clone()).is_err(),
+                "must not parse: {bad:?}"
+            );
         }
     }
 

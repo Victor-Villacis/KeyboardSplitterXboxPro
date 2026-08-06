@@ -28,8 +28,32 @@ pub fn preset(name: &str, entries: Vec<(Key, Binding)>) -> Preset {
     Preset {
         name: name.to_owned(),
         entries,
+        chords: Vec::new(),
         protected: false,
     }
+}
+
+/// Same, plus guarded entries (chords).
+pub fn preset_with_chords(
+    name: &str,
+    entries: Vec<(Key, Binding)>,
+    chords: Vec<ksx_core::Chord>,
+) -> Preset {
+    Preset {
+        name: name.to_owned(),
+        entries,
+        chords,
+        protected: false,
+    }
+}
+
+/// One slot, one keyboard, one preset — the shape every chord test uses.
+pub fn engine_for(preset: Preset) -> Engine {
+    let dev = ipac_device();
+    Engine::new(vec![ResolvedSlot {
+        spec: SlotSpec::new(1, Some(dev), None, preset.name.clone()).expect("valid slot"),
+        preset,
+    }])
 }
 
 fn axis(axis: Axis, value: i16) -> Binding {
