@@ -872,6 +872,83 @@ fn the_macro_editor_reads_a_preset_and_saves_the_whole_table() {
     assert!(control.saved_macro.lock().unwrap().as_ref().unwrap().delete);
 }
 
+/// END TO END over HTTP for the field that broke: `repeat`, and the turbo
+/// rate that hangs off it.
+///
+/// The user set `repeat = while-held` in the card, clicked Save, was told
+/// "saved", and watched the control snap back to `once` — because the value
+/// was dropped between the wire and the preset file. Nothing about that was
+/// visible from the outside: the POST returned `ok`. So this test asserts what
+/// the POST actually DELIVERS, not just that it succeeded — the `MacroWrite`
+/// that reached `ControlSource::save_macro` must carry the policy the request
+/// asked for, in every spelling the card can produce.
+#[test]
+fn the_repeat_policy_and_its_rate_reach_the_control_source_over_http() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control.clone());
+
+    // The read half serves the field at all — an absent `repeat` on the wire
+    // would leave the card with nothing to show.
+    let map: serde_json::Value =
+        serde_json::from_str(body_of(&get(addr, "/api/map?slot=1"))).expect("json");
+    assert_eq!(map["macros"]["macros"][0]["repeat"], "once", "{map}");
+
+    // while-held: the exact edit that was reported lost.
+    let saved: serde_json::Value = serde_json::from_str(body_of(&post_json(
+        addr,
+        "/api/macro/save",
+        r#"{"preset":"IPAC P1","name":"hadouken","repeat":"while-held",
+            "steps":[{"hold":["A"],"ms":50}]}"#,
+    )))
+    .expect("json");
+    assert_eq!(saved["ok"], true, "{saved}");
+    let write = control.saved_macro.lock().unwrap().clone().expect("saved");
+    assert_eq!(
+        write.repeat, "while-held",
+        "the repeat policy must reach the writer, or Save is a lie: {saved}"
+    );
+
+    // turbo authored in hertz: the rate travels in the unit it was written in.
+    let _ = post_json(
+        addr,
+        "/api/macro/save",
+        r#"{"preset":"IPAC P1","name":"hadouken","repeat":"turbo","turbo_hz":12,
+            "steps":[{"hold":["A"],"ms":50}]}"#,
+    );
+    let write = control.saved_macro.lock().unwrap().clone().expect("saved");
+    assert_eq!(write.repeat, "turbo");
+    assert_eq!(write.turbo_hz, Some(12));
+    assert_eq!(write.gap_ms, None, "the other spelling is not invented");
+
+    // ...and the same rate said the other way.
+    let _ = post_json(
+        addr,
+        "/api/macro/save",
+        r#"{"preset":"IPAC P1","name":"hadouken","repeat":"turbo","gap_ms":50,
+            "steps":[{"hold":["A"],"frames":2,"allow_short":true}]}"#,
+    );
+    let write = control.saved_macro.lock().unwrap().clone().expect("saved");
+    assert_eq!(write.gap_ms, Some(50));
+    assert_eq!(write.turbo_hz, None);
+    // The step's own fields ride along untouched, in the author's unit.
+    assert_eq!(write.steps[0].frames, Some(2));
+    assert_eq!(write.steps[0].ms, None);
+    assert!(write.steps[0].allow_short);
+
+    // An omitted `repeat` is the file's own default, not an empty string the
+    // daemon would refuse.
+    let _ = post_json(
+        addr,
+        "/api/macro/save",
+        r#"{"preset":"IPAC P1","name":"hadouken","steps":[{"hold":["A"],"ms":50}]}"#,
+    );
+    let write = control.saved_macro.lock().unwrap().clone().expect("saved");
+    assert!(
+        write.repeat.is_empty(),
+        "blank = the file's omitted-field rule"
+    );
+}
+
 /// Clearing ONE binding is the plain `map` verb with a null key — no second
 /// writer, no GUI-only path.
 #[test]

@@ -641,6 +641,7 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
 ///           {"hold":["dpad.right"],"ms":50},
 ///           {"hold":["A"],"frames":3}],
 ///  "on_release":"finish","retrigger":"ignore","interrupt":"none",
+///  "repeat":"turbo","turbo_hz":10,
 ///  "reload":true}
 /// ```
 ///
@@ -656,6 +657,49 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
 /// the control loop hot-swaps it with the pads left plugged — the same
 /// [`super::DaemonCommand::ApplyBindings`] path `map` takes, through the same
 /// [`apply_after_write`].
+/// EVERY field of a `[macros.<name>]` table that travels on the `map-macro`
+/// wire — i.e. every field of [`ksx_config::MacroFile`] except the ones the
+/// envelope owns (`verb`, `preset`, `name`, `delete`, `reload`).
+///
+/// This list is an ALLOWLIST on purpose (the envelope's keys must not collide
+/// with the body's), which makes forgetting an entry a SILENT field drop: the
+/// value never reaches `MacroFile`, serde fills the default, and the editor
+/// gets a cheerful "saved" for a value that was thrown away on the way in.
+/// That is exactly what happened to `repeat` (and its `turbo_hz`/`gap_ms`
+/// rate) — a card that set `while-held` saved `once`. `macro_body_is_every_
+/// macro_file_field` pins the list against `MacroFile`'s own serde shape so a
+/// field added there cannot be forgotten here.
+const MACRO_BODY_FIELDS: &[&str] = &[
+    "steps",
+    "on_release",
+    "retrigger",
+    "interrupt",
+    "repeat",
+    "turbo_hz",
+    "gap_ms",
+];
+
+/// The `[macros.<name>]` table a `map-macro` request carries, in the preset
+/// file's own vocabulary, or the sentence to refuse it with.
+pub(crate) fn macro_body(request: &serde_json::Value) -> Result<ksx_config::MacroFile, String> {
+    let mut object = serde_json::Map::new();
+    for key in MACRO_BODY_FIELDS {
+        if let Some(value) = request.get(*key) {
+            object.insert((*key).to_owned(), value.clone());
+        }
+    }
+    serde_json::from_value(object.into()).map_err(|err| {
+        format!(
+            "map-macro could not read the macro body: {err} — steps are \
+             [{{\"hold\":[\"dpad.down\"],\"ms\":50}}] (exactly one of \"ms\"/\"frames\", \
+             optional \"allow_short\"), the policies are \"finish\"|\"abort\", \
+             \"ignore\"|\"restart\", \"none\"|\"any-input\"|\"opposing\", and the repeat \
+             policy is \"once\"|\"while-held\"|\"turbo\" (a turbo gives exactly one of \
+             \"turbo_hz\"/\"gap_ms\")"
+        )
+    })
+}
+
 fn handle_map_macro(
     request: &serde_json::Value,
     deps: &PipeDeps,
@@ -685,25 +729,9 @@ fn handle_map_macro(
              macro is its own word",
         );
     }
-    // The body, in the preset file's own vocabulary. Only the fields
-    // `MacroFile` knows are forwarded, so the envelope's own keys (verb,
-    // preset, name, delete, reload) cannot collide with it.
-    let mut object = serde_json::Map::new();
-    for key in ["steps", "on_release", "retrigger", "interrupt"] {
-        if let Some(value) = request.get(key) {
-            object.insert(key.to_owned(), value.clone());
-        }
-    }
-    let body: ksx_config::MacroFile = match serde_json::from_value(object.into()) {
+    let body = match macro_body(request) {
         Ok(body) => body,
-        Err(err) => {
-            return err_msg(format!(
-                "map-macro could not read the macro body: {err} — steps are \
-                 [{{\"hold\":[\"dpad.down\"],\"ms\":50}}] (exactly one of \"ms\"/\"frames\", \
-                 optional \"allow_short\"), and the policies are \"finish\"|\"abort\", \
-                 \"ignore\"|\"restart\", \"none\"|\"any-input\"|\"opposing\""
-            ))
-        }
+        Err(err) => return err_msg(err),
     };
 
     let spec = crate::mapping::MacroSpec {
@@ -1222,6 +1250,86 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crossbeam_channel::unbounded;
+
+    /// The `map-macro` body allowlist is EVERY field `MacroFile` serializes.
+    ///
+    /// The allowlist exists so the envelope's keys (verb/preset/name/…) cannot
+    /// collide with the body's, but a missing entry is a SILENT field drop —
+    /// which is exactly how `repeat = "while-held"` saved as `once` while the
+    /// page said "saved". Pinned against `MacroFile`'s own serde shape, with
+    /// every field set to a NON-default so nothing is skipped on write: adding
+    /// a field to the table without adding it here fails right here.
+    #[test]
+    fn the_macro_body_allowlist_is_every_macro_file_field() {
+        let full: ksx_config::MacroFile = toml::from_str(
+            r#"
+on_release = "abort"
+retrigger = "restart"
+interrupt = "opposing"
+repeat = "turbo"
+turbo_hz = 10
+steps = [{ hold = ["A"], ms = 50, allow_short = true }]
+"#,
+        )
+        .unwrap();
+        let serde_json::Value::Object(shape) = serde_json::to_value(&full).unwrap() else {
+            panic!("a macro table is an object");
+        };
+        for key in shape.keys() {
+            assert!(
+                MACRO_BODY_FIELDS.contains(&key.as_str()),
+                "MacroFile has a `{key}` field the map-macro body reader drops on the floor — \
+                 add it to MACRO_BODY_FIELDS, or a save of it is a silent no-op"
+            );
+        }
+        // `gap_ms` is the other spelling of the rate, so it never coexists
+        // with `turbo_hz` in one file and cannot appear above.
+        assert!(MACRO_BODY_FIELDS.contains(&"gap_ms"));
+    }
+
+    /// The regression, at the hop it happened: a request that SAYS
+    /// `repeat`/`turbo_hz` must produce a body that HAS them.
+    #[test]
+    fn the_macro_body_carries_the_repeat_policy_and_its_rate() {
+        let body = macro_body(&serde_json::json!({
+            "verb": "map-macro",
+            "preset": "IPAC P1",
+            "name": "hadouken",
+            "steps": [{"hold": ["A"], "ms": 50}],
+            "on_release": "finish",
+            "retrigger": "ignore",
+            "interrupt": "none",
+            "repeat": "while-held",
+        }))
+        .expect("body");
+        assert_eq!(body.repeat, ksx_core::Repeat::WhileHeld);
+
+        let turbo = macro_body(&serde_json::json!({
+            "steps": [{"hold": ["A"], "frames": 2}],
+            "repeat": "turbo",
+            "gap_ms": 50,
+        }))
+        .expect("body");
+        assert_eq!(turbo.repeat, ksx_core::Repeat::Turbo);
+        assert_eq!(turbo.gap_ms, Some(50));
+        assert_eq!(turbo.turbo_hz, None);
+        // ...and the step's unit is the one that was written.
+        assert_eq!(turbo.steps[0].frames, Some(2));
+        assert_eq!(turbo.steps[0].ms, None);
+
+        // An omitted policy is still the file's own default, not a refusal.
+        let plain =
+            macro_body(&serde_json::json!({"steps": [{"hold": ["A"], "ms": 50}]})).expect("body");
+        assert_eq!(plain.repeat, ksx_core::Repeat::Once);
+
+        // A typo is still refused, in words that name the options.
+        let err = macro_body(&serde_json::json!({
+            "steps": [{"hold": ["A"], "ms": 50}],
+            "repeat": "sometimes",
+        }))
+        .unwrap_err();
+        assert!(err.contains("while-held"), "{err}");
+    }
 
     fn shared(run: RunState) -> SharedState {
         Arc::new(Mutex::new(DaemonState {

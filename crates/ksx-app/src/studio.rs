@@ -924,6 +924,243 @@ steps = [{ hold = ["back"], ms = 200 }]
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// EVERY macro field survives a FULL round trip: disk → `collect_macros`
+    /// → the editor's draft → `MacroWrite` → `macro_wire` → the daemon's
+    /// `map-macro` body reader → `mapping::save_macro` → disk → read again.
+    ///
+    /// This is the test the `repeat` bug needed. `repeat = "while-held"` was
+    /// set in the card, saved, toasted "saved" — and came back `once`, because
+    /// the pipe's body allowlist forwarded only `steps` and the three
+    /// interruption policies, so `repeat`, `turbo_hz` and `gap_ms` were
+    /// dropped between the wire and `MacroFile` and serde filled the default.
+    /// A dropped field, a struct-literal conversion that forgets a member, and
+    /// a `default()` that overwrites all present IDENTICALLY to the user: the
+    /// value they typed is not the value they get back. So the assertion is
+    /// per FIELD and table-driven — adding a field to the card without adding
+    /// a row here is the only way this can regress silently again.
+    #[test]
+    fn every_macro_field_survives_the_whole_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "ksx-studio-roundtrip-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ksx_config::Store::new(ksx_config::ConfigRoot::at(&dir));
+
+        /// One field's round trip: how the editor EDITS it, and what the read
+        /// side must say afterwards.
+        struct Case {
+            what: &'static str,
+            edit: fn(&mut MacroView),
+            check: fn(&MacroView),
+        }
+
+        let cases = [
+            Case {
+                what: "repeat = while-held (the reported bug)",
+                edit: |m| m.repeat = "while-held".into(),
+                check: |m| assert_eq!(m.repeat, "while-held"),
+            },
+            Case {
+                what: "repeat = turbo with an authored turbo_hz",
+                edit: |m| {
+                    m.repeat = "turbo".into();
+                    m.turbo_hz = Some(12);
+                    m.gap_ms = None;
+                },
+                check: |m| {
+                    assert_eq!(m.repeat, "turbo");
+                    assert_eq!(m.turbo_hz, Some(12));
+                    // The rate as AUTHORED: a turbo written in hertz must not
+                    // come back converted into the gap spelling.
+                    assert_eq!(m.gap_ms, None);
+                },
+            },
+            Case {
+                what: "repeat = turbo with an authored gap_ms",
+                edit: |m| {
+                    m.repeat = "turbo".into();
+                    m.turbo_hz = None;
+                    m.gap_ms = Some(50);
+                },
+                check: |m| {
+                    assert_eq!(m.repeat, "turbo");
+                    assert_eq!(m.gap_ms, Some(50));
+                    assert_eq!(m.turbo_hz, None, "the other unit is not invented");
+                },
+            },
+            Case {
+                what: "on_release = abort",
+                edit: |m| m.on_release = "abort".into(),
+                check: |m| assert_eq!(m.on_release, "abort"),
+            },
+            Case {
+                what: "retrigger = restart",
+                edit: |m| m.retrigger = "restart".into(),
+                check: |m| assert_eq!(m.retrigger, "restart"),
+            },
+            Case {
+                what: "interrupt = any-input",
+                edit: |m| m.interrupt = "any-input".into(),
+                check: |m| assert_eq!(m.interrupt, "any-input"),
+            },
+            Case {
+                what: "interrupt = opposing",
+                edit: |m| m.interrupt = "opposing".into(),
+                check: |m| assert_eq!(m.interrupt, "opposing"),
+            },
+            Case {
+                what: "a step's hold SET (many functions at once)",
+                edit: |m| m.steps[0].hold = vec!["dpad.down".into(), "dpad.right".into()],
+                check: |m| assert_eq!(m.steps[0].hold, ["dpad.down", "dpad.right"]),
+            },
+            Case {
+                what: "an EMPTY hold — a deliberate neutral gap, not a nothing",
+                edit: |m| m.steps[0].hold = Vec::new(),
+                check: |m| assert!(m.steps[0].hold.is_empty()),
+            },
+            Case {
+                what: "a duration authored in ms stays ms",
+                edit: |m| {
+                    m.steps[0].ms = Some(120);
+                    m.steps[0].frames = None;
+                },
+                check: |m| {
+                    assert_eq!(m.steps[0].ms, Some(120));
+                    assert_eq!(m.steps[0].frames, None, "ms must not become frames");
+                },
+            },
+            Case {
+                what: "a duration authored in FRAMES stays frames",
+                edit: |m| {
+                    m.steps[0].ms = None;
+                    m.steps[0].frames = Some(3);
+                },
+                check: |m| {
+                    // The whole point of keeping the two units apart: a macro
+                    // written by a frame-counter must read back in frames, not
+                    // as the 50 ms it happens to equal.
+                    assert_eq!(m.steps[0].frames, Some(3));
+                    assert_eq!(m.steps[0].ms, None, "frames must not become ms");
+                },
+            },
+            Case {
+                what: "allow_short on a deliberately sub-floor step",
+                edit: |m| {
+                    m.steps[0].ms = Some(5);
+                    m.steps[0].frames = None;
+                    m.steps[0].allow_short = true;
+                },
+                check: |m| {
+                    assert!(m.steps[0].allow_short);
+                    // ...and the short duration is kept AS WRITTEN, not raised
+                    // on disk — allow_short is the author saying they meant it.
+                    assert_eq!(m.steps[0].ms, Some(5));
+                },
+            },
+            Case {
+                what: "step COUNT and order",
+                edit: |m| {
+                    m.steps = vec![
+                        MacroStepView {
+                            hold: vec!["dpad.down".into()],
+                            ms: Some(50),
+                            frames: None,
+                            allow_short: false,
+                        },
+                        MacroStepView {
+                            hold: vec!["A".into()],
+                            ms: None,
+                            frames: Some(2),
+                            allow_short: false,
+                        },
+                    ];
+                },
+                check: |m| {
+                    assert_eq!(m.steps.len(), 2);
+                    assert_eq!(m.steps[0].hold, ["dpad.down"]);
+                    assert_eq!(m.steps[1].hold, ["A"]);
+                    assert_eq!(m.steps[1].frames, Some(2));
+                },
+            },
+        ];
+
+        for case in cases {
+            // ── disk: the macro as it starts, plus the trigger rows that
+            // start it. Rewritten per case so each one is independent.
+            let file: ksx_config::PresetFile = toml::from_str(
+                r#"
+name = "IPAC P1"
+[bindings]
+A = "S"
+macro.hadouken = ["P", "O"]
+
+[macros.hadouken]
+steps = [{ hold = ["A"], ms = 50 }]
+"#,
+            )
+            .unwrap();
+            store.save_preset(&file).unwrap();
+
+            // ── read: what the card is seeded with.
+            let before = collect_macros(&store, "IPAC P1");
+            assert!(before.available, "{}: {}", case.what, before.reason);
+            let mut draft = before.macros[0].clone();
+
+            // ── edit: the one field this case is about.
+            (case.edit)(&mut draft);
+
+            // ── save: the editor's own path, hop for hop.
+            let wire = macro_wire(&MacroWrite {
+                preset: "IPAC P1".into(),
+                name: draft.name.clone(),
+                steps: draft.steps.clone(),
+                on_release: draft.on_release.clone(),
+                retrigger: draft.retrigger.clone(),
+                interrupt: draft.interrupt.clone(),
+                repeat: draft.repeat.clone(),
+                turbo_hz: draft.turbo_hz,
+                gap_ms: draft.gap_ms,
+                delete: false,
+                reload: true,
+            });
+            let body = crate::daemon::pipe::macro_body(&wire)
+                .unwrap_or_else(|err| panic!("{}: the wire body was refused: {err}", case.what));
+            crate::mapping::save_macro(
+                &store,
+                &crate::mapping::MacroSpec {
+                    preset: "IPAC P1".into(),
+                    name: draft.name.clone(),
+                    body,
+                    delete: false,
+                },
+            )
+            .unwrap_or_else(|err| panic!("{}: the write was refused: {err}", case.what));
+
+            // ── read again, from disk: does the value survive?
+            let after = collect_macros(&store, "IPAC P1");
+            assert!(after.available, "{}: {}", case.what, after.reason);
+            let round = after
+                .macros
+                .iter()
+                .find(|m| m.name == "hadouken")
+                .unwrap_or_else(|| panic!("{}: the macro is gone", case.what));
+            (case.check)(round);
+
+            // A body write is not a trigger write: the keys that START the
+            // macro must still be there afterwards, or saving a policy would
+            // quietly unbind the macro.
+            assert_eq!(round.triggers, ["P", "O"], "{}", case.what);
+            // And the fields this case did NOT touch keep their defaults
+            // rather than drifting.
+            assert_eq!(round.name, "hadouken", "{}", case.what);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The macro editor's SAVE is one `map-macro` request carrying the whole
     /// table, in the preset FILE's own field names — and a delete carries no
     /// body at all, so the verb's missing-steps refusal still protects a write.
@@ -950,6 +1187,9 @@ steps = [{ hold = ["back"], ms = 200 }]
             // Blank is the file's own "field omitted" case: the default.
             retrigger: String::new(),
             interrupt: "  ".into(),
+            repeat: "while-held".into(),
+            turbo_hz: None,
+            gap_ms: None,
             delete: false,
             reload: true,
         };
@@ -962,6 +1202,7 @@ steps = [{ hold = ["back"], ms = 200 }]
         assert_eq!(wire["on_release"], "abort");
         assert_eq!(wire["retrigger"], "ignore");
         assert_eq!(wire["interrupt"], "none");
+        assert_eq!(wire["repeat"], "while-held");
         assert_eq!(wire["steps"][0]["hold"][0], "dpad.down");
         assert_eq!(wire["steps"][0]["ms"], 50);
         assert_eq!(wire["steps"][1]["frames"], 3, "frames stay frames: {wire}");
