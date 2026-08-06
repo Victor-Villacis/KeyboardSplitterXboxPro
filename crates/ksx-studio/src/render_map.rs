@@ -99,45 +99,46 @@ const LIST_SLOT_MACRO_CELLS: &str = "list:macroCells:array";
 #[cfg(test)]
 const ISLAND_COMPONENT: &str = "MapIsland";
 
-/// The mapper's positional `show:createShow` seam (ledger #4), document order
-/// in MapIsland.ts.
-const SHOW_SLOT_NAME: &str = "show:createShow";
-const MAP_SHOW_ORDER: [&str; 19] = [
-    "header pill: running",
-    "header pill: idle",
-    "header pill: no daemon",
-    // FIX 0: client-only — set by the page's own Pause action, so the user
-    // cannot forget the cabinet is paused because they opened the mapper.
-    "header pill: paused for mapping",
-    // FIX 1: the unmissable banner, first child of <main>.
-    "no-daemon banner (top of page)",
-    // FIX 0: running-session banner + the one-click "Pause emulation & map".
-    "banner: emulation running (pause & map)",
-    // FIX 0: the road back — client-only, same flag as the pill.
-    "banner: paused for mapping (resume)",
-    "read-only banner + CLI fallback",
-    "hint: click-a-control (learnable)",
-    "stage: xbox art (+ zone layer)",
-    "stage: ds4 art (+ zone layer)",
-    // FIX 2: the third restore destination only exists when a backup does.
-    "preset actions: restore-backup button",
-    // v9: SERVER-driven now. A no-JS form POST 303s back to
-    // /map?slot=N&flash=…, and these two are how that outcome reaches the
-    // page (the client keeps reporting through the toast stack instead —
-    // map.ts blanks these on adoption, so nothing is said twice).
-    "saved flash: ok",
-    "saved flash: error",
-    "modal: overlay open",
-    "modal: listening (countdown)",
-    "modal: current binding + Clear",
-    "modal: conflict (Replace / Cancel)",
-    // v7 multi-select. APPENDED, deliberately: ledger #14 — a show inserted in
-    // the middle shifts every show after it, so a new client-only overlay goes
-    // LAST in document order (it is `position: fixed`, so the DOM position
-    // costs nothing visually).
-    "selection bar: N controls selected (multi-select)",
+/// How many `createShow` pairs the mapper has. Name-addressable since
+/// compiler 0.3.1 (`show:<condition getter>`), so the `MAP_SHOW_ORDER`
+/// positional array is gone along with the rule it enforced — "append a new
+/// show, never insert one, or every boolean after it shifts" (ledger
+/// #4/#14, adopted 2026-08-06). [`show_values`] yields `(slot name, value)`
+/// pairs; the layout test pins the exact name set.
+const MAP_SHOW_COUNT: usize = 19;
+
+/// Bare-named slots the mapper renders and the seam deliberately never fills.
+///
+/// `modalTurboLine` is the learn modal's auto-fire sentence. It describes the
+/// control the USER just picked in a dialog that is never SSR-open
+/// (`show:modalOpen` is unconditionally false here), so the server has nothing
+/// to say about it and its authored `""` is the honest paint. Every other
+/// signal `MapIsland.ts` binds to the DOM is server-injected — see
+/// [`crate::render::assert_island_slot_contract`] for why that list has to be
+/// explicit rather than implied.
+#[cfg(test)]
+const MAP_CLIENT_ONLY_SLOTS: [&str; 1] = ["modalTurboLine"];
+
+/// The anonymous (`attr:`/`text:`) slots this page compiles to — every one of
+/// them a string CONCATENATION, and every one of them a live test of ledger
+/// #20's fix.
+///
+/// Compiler 0.3.1 folds `"a" + "b"` instead of dropping it, but it folds it
+/// into a slot's DEFAULT rather than into static markup: four concatenated
+/// `title` attributes (the two 360 motion buttons, the reverse 360, and the
+/// macro Enable switch) and one concatenated child (`.macstephint`). The seam
+/// can never inject these — they render their default or they render nothing —
+/// so the contract check pins the set AND asserts each default is non-empty.
+/// A concatenation with a non-literal operand would land here with an empty
+/// default, which is the silent failure #20(a) shipped.
+#[cfg(test)]
+const MAP_ANONYMOUS_SLOTS: [&str; 5] = [
+    "attr:title",
+    "attr:title#2",
+    "attr:title#3",
+    "attr:title#4",
+    "text:0",
 ];
-const MAP_SHOW_COUNT: usize = MAP_SHOW_ORDER.len();
 
 // The art `<img>` occupies the bottom 86% of the stage (`.padart` in
 // studio.css); the top band holds the shoulder chips. Zone Y values below
@@ -2959,7 +2960,7 @@ fn show_values(
     payload: &MapPayload,
     selected: Option<&MapperSlot>,
     flash: Option<&str>,
-) -> [bool; MAP_SHOW_COUNT] {
+) -> [(&'static str, bool); MAP_SHOW_COUNT] {
     let art = selected.map(|s| art_for(&s.persona));
     let live = learnable(payload) && selected.is_some();
     let running = payload.session.reachable && payload.session.running;
@@ -2968,26 +2969,44 @@ fn show_values(
     let flash = flash.map(str::trim).filter(|f| !f.is_empty());
     let flash_err = flash.is_some_and(|f| f.starts_with("error"));
     [
-        running,
-        payload.session.reachable && !payload.session.running,
-        !payload.session.reachable,
-        false, // "paused for mapping": client-only, set by the Pause action
-        !payload.session.reachable, // the top-of-page no-daemon banner
-        running, // the pause-and-map banner
-        false, // the resume bar: client-only, same flag
-        !live,
-        live,
-        art == Some(crate::render::ART_XBOX),
-        art == Some(crate::render::ART_DS4),
-        selected.is_some_and(|s| s.backup.is_some()),
-        // v9: the no-JS flash, server-rendered from ?flash=.
-        flash.is_some() && !flash_err,
-        flash_err,
-        false, // modal: client-only, never SSR-open
-        false,
-        false,
-        false,
-        false, // the multi-select bar: client-only, nothing is selected on SSR
+        ("show:pillRunning", running),
+        (
+            "show:pillIdle",
+            payload.session.reachable && !payload.session.running,
+        ),
+        ("show:pillDown", !payload.session.reachable),
+        // FIX 0: client-only — set by the page's own Pause action, so the
+        // user cannot forget the cabinet is paused because they opened the
+        // mapper. Never SSR-true.
+        ("show:pillPaused", false),
+        // FIX 1: the unmissable banner, first child of <main>.
+        ("show:noDaemon", !payload.session.reachable),
+        // FIX 0: running-session banner + the one-click "Pause emulation & map".
+        ("show:sessionRunning", running),
+        // FIX 0: the road back — client-only, same flag as the pill.
+        ("show:pausedBar", false),
+        ("show:readOnly", !live),
+        ("show:canLearn", live),
+        ("show:artXbox", art == Some(crate::render::ART_XBOX)),
+        ("show:artDs4", art == Some(crate::render::ART_DS4)),
+        // FIX 2: the third restore destination only exists when a backup does.
+        (
+            "show:hasBackup",
+            selected.is_some_and(|s| s.backup.is_some()),
+        ),
+        // v9: the no-JS flash, server-rendered from ?flash=. The client keeps
+        // reporting through the toast stack instead — map.ts blanks these on
+        // adoption, so nothing is said twice.
+        ("show:savedOk", flash.is_some() && !flash_err),
+        ("show:savedErr", flash_err),
+        // The learn modal and its three inner states: client-only, never
+        // SSR-open.
+        ("show:modalOpen", false),
+        ("show:modalListening", false),
+        ("show:modalBound", false),
+        ("show:modalConflict", false),
+        // v7 multi-select: client-only, nothing is selected on an SSR paint.
+        ("show:selBar", false),
     ]
 }
 
@@ -3039,11 +3058,13 @@ fn build_slots(module: &IrModule, payload: &MapPayload, flash: Option<&str>) -> 
             slots.set(id, value);
         }
     }
-    for (id, value) in named_slot_ids(module, SHOW_SLOT_NAME)
-        .into_iter()
-        .zip(show_values(payload, selected, flash))
-    {
-        slots.set(id, SlotValue::Bool(value));
+    // Shows BY NAME since compiler 0.3.1 (ledger #4 closed) — a renamed
+    // condition signal degrades to its authored `false` default instead of
+    // silently inheriting the next show's boolean.
+    for (name, value) in show_values(payload, selected, flash) {
+        if let Some(id) = named_slot_ids(module, name).into_iter().next() {
+            slots.set(id, SlotValue::Bool(value));
+        }
     }
     slots
 }
@@ -3152,6 +3173,7 @@ mod tests {
             mapper: MapperSnapshot {
                 generated_at: "2026-08-05 12:00:00 UTC".into(),
                 source: "slots of profile \"Steam\" (games.toml)".into(),
+                profile: Some("Steam".into()),
                 config_root: r"C:\Users\arcade\AppData\Roaming\ksx".into(),
                 slots: vec![
                     slot(1, "xbox360", "IPAC P1"),
@@ -3178,6 +3200,34 @@ mod tests {
 
     fn page() -> EmbeddedPage {
         EmbeddedPage::load("/map").expect("embedded mapper page must load")
+    }
+
+    /// The page with its two MACHINE-readable blocks removed: forma-ir's
+    /// native `data-forma-props` attribute (ledger #8, adopted 2026-08-06 —
+    /// it repeats every injected slot value, and its KEYS are slot names like
+    /// `conflictLine`) and the `__ksx-payload` data block. Use it for
+    /// assertions about what the page SAYS — a negative one especially, since
+    /// a word that must not appear in the prose now appears in both blocks as
+    /// a matter of course.
+    fn visible(html: &str) -> String {
+        let mut out = String::with_capacity(html.len());
+        let mut rest = html;
+        while let Some(i) = rest.find("data-forma-props=\"") {
+            out.push_str(&rest[..i]);
+            let after = &rest[i + "data-forma-props=\"".len()..];
+            rest = after.split_once('"').map_or("", |(_, r)| r);
+        }
+        out.push_str(rest);
+        let mut cleaned = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        let open = "<script id=\"__ksx-payload\" type=\"application/json\">";
+        while let Some(i) = rest.find(open) {
+            cleaned.push_str(&rest[..i]);
+            let after = &rest[i + open.len()..];
+            rest = after.split_once("</script>").map_or("", |(_, r)| r);
+        }
+        cleaned.push_str(rest);
+        cleaned
     }
 
     /// The injected text inside the FIRST element carrying `class="<cls>"`.
@@ -3309,11 +3359,31 @@ mod tests {
             ],
             "mapper list slot names drifted; slots: {names:?}"
         );
+        // Shows, BY NAME and as a SET (ledger #4, adopted 2026-08-06): what
+        // used to be a count assertion — the only guard a positional seam
+        // could have — now names every slot on both sides.
+        let ir_shows: std::collections::BTreeSet<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| n.starts_with("show:"))
+            .collect();
+        let seam_shows: std::collections::BTreeSet<&str> = show_values(&sample(), None, None)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         assert_eq!(
-            named_slot_ids(module, SHOW_SLOT_NAME).len(),
-            MAP_SHOW_ORDER.len(),
-            "mapper show count drifted between MapIsland.ts and MAP_SHOW_ORDER"
+            ir_shows, seam_shows,
+            "mapper show slots drifted between MapIsland.ts and show_values()"
         );
+        assert_eq!(
+            ir_shows.len(),
+            MAP_SHOW_COUNT,
+            "MAP_SHOW_COUNT is stale; slots: {names:?}"
+        );
+        // Ledger #8, adopted 2026-08-06: `slot_ids` are populated, so
+        // forma-ir emits `data-forma-props` and the `__forma_islands` block
+        // this seam used to hand-build is gone. This assertion used to be
+        // `slot_ids.is_empty()` — a tripwire written to fail here.
         let islands = module.islands.entries();
         assert_eq!(islands.len(), 1, "expected exactly one island");
         assert_eq!(
@@ -3321,8 +3391,39 @@ mod tests {
             ISLAND_COMPONENT
         );
         assert!(
-            islands[0].slot_ids.is_empty(),
-            "ledger #8 flipped — adopt native props"
+            !islands[0].slot_ids.is_empty(),
+            "island slot_ids are empty — compiler regressed to 0.2.0 \
+             behaviour and native data-forma-props will not be emitted"
+        );
+        // The slot contract: injected == rendered, both ways, plus the
+        // anonymous set. `assert_island_slot_contract` carries the reason a
+        // name-EXISTS check is not enough (a twin declaration renames the
+        // rendered binding to `#2` and injection then fills a dead slot).
+        let injected: Vec<&str> = scalars
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .chain([
+                LIST_SLOT_TABS,
+                LIST_SLOT_ZONES,
+                LIST_SLOT_ZONES_2,
+                LIST_SLOT_LEGEND,
+                LIST_SLOT_TABS_2,
+                LIST_SLOT_TOASTS,
+                LIST_SLOT_MACRO_TABS,
+                LIST_SLOT_MACRO_GROUPS,
+                LIST_SLOT_MACRO_COLS,
+                LIST_SLOT_MACRO_ROWS,
+                LIST_SLOT_MACRO_CELLS,
+            ])
+            .chain(seam_shows.iter().copied())
+            .collect();
+        crate::render::assert_island_slot_contract(
+            module,
+            &injected,
+            &MAP_CLIENT_ONLY_SLOTS,
+            &MAP_ANONYMOUS_SLOTS,
         );
     }
 
@@ -3559,8 +3660,12 @@ mod tests {
             "{}",
             out.html
         );
-        // Nothing about it is styled or worded as an error.
-        assert!(!out.html.contains("conflict"), "{}", out.html);
+        // Nothing about it is styled or worded as an error. Asserted against
+        // the VISIBLE page: forma-ir's native props attribute carries a
+        // `conflictLine` slot on every paint (ledger #8/#19), which says
+        // nothing about what the user reads.
+        let visible = visible(&out.html);
+        assert!(!visible.contains("conflict"), "{visible}");
         // A control bound to a key nobody else uses stays plain.
         assert!(
             !out.html.contains(">also LS ◀<"),
@@ -3967,20 +4072,81 @@ mod tests {
         assert!(out.html.contains("unknown verb"), "{}", out.html);
     }
 
-    /// Ledger #5 parity, mapper edition: island props ARE the /api/map
-    /// payload.
+    /// Ledger #5 parity, mapper edition: the embedded payload block IS the
+    /// /api/map payload, and the ledger-#8 workaround is gone.
     #[test]
-    fn island_props_match_the_api_map_payload_shape() {
+    fn the_payload_block_matches_the_api_map_payload_shape() {
         let payload = sample();
-        let props = crate::render::island_props_json(&payload);
-        let parsed: serde_json::Value = serde_json::from_str(&props).expect("props parse");
+        let json = crate::render::payload_json(&payload);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("payload parse");
         assert_eq!(
-            parsed["0"],
+            parsed,
             serde_json::to_value(&payload).unwrap(),
-            "island props must be byte-compatible with what /api/map serves"
+            "the payload block must be byte-compatible with /api/map"
         );
         let out = render_map(&page(), &payload, None);
-        assert!(out.html.contains(&props), "{}", out.html);
+        assert!(out.html.contains(&json), "{}", out.html);
+        assert!(
+            !out.html.contains("__forma_islands"),
+            "the ledger #8 workaround must be gone: {}",
+            out.html
+        );
+        // Native island props (ledger #8 closed): the walker's own emission,
+        // carrying the rendered slot values the client adopts against.
+        assert!(out.html.contains("data-forma-props=\""), "{}", out.html);
+    }
+
+    /// Dogfood ledger #20, both halves, pinned server-side.
+    ///
+    /// **(a) attribute position.** A `"a" + "b"` as an h() ATTRIBUTE value
+    /// used to compile to an empty slot: the attribute was emitted with NO
+    /// VALUE AT ALL. Both 360 buttons shipped without a tooltip that way. The
+    /// titles below are concatenations again (compiler 0.3.1 folds them), and
+    /// this asserts the folded text really reaches the SSR markup — the
+    /// failure mode is silent, so only an assertion catches it.
+    ///
+    /// **(b) child position.** A `"a" + "b"` as a CHILD used to be a
+    /// BinaryExpression the walker could not fold, and it emitted an
+    /// anonymous SECOND ISLAND. `.macstephint` is one concatenated child
+    /// again; the single-island assertion in
+    /// `embedded_map_ir_slot_layout_matches_the_seam` is the other half of
+    /// this guard.
+    #[test]
+    fn concatenated_strings_render_in_attributes_and_children() {
+        let out = render_map(&page(), &sample(), None);
+        // (a) The two ends of a folded attribute concatenation, on the button
+        // the pwtest suite reads the title back from.
+        assert!(
+            out.html.contains(
+                r#"title="append a quarter-circle forward: ↓ ↘ → — three steps, the middle one the diagonal (each row spells the pair it stores)""#
+            ),
+            "folded attribute concatenation missing from SSR: {}",
+            out.html
+        );
+        assert!(
+            out.html.contains(
+                r#"title="append a full 360 (spinning piledriver), clockwise from →: → ↘ ↓ ↙ ← ↖ ↑ ↗ — eight steps, four of them diagonals""#
+            ),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html
+                .contains("title=\"switch this macro off (or back on) without losing it — the steps and the key that starts it stay exactly where they are."),
+            "{}",
+            out.html
+        );
+        // Not one empty title anywhere on the page — the exact shape of the
+        // bug (`title=""`, or the attribute dropped entirely).
+        assert!(!out.html.contains(r#"title="""#), "{}", out.html);
+        // (b) The concatenated CHILD renders as one uninterrupted string.
+        assert!(
+            out.html.contains(
+                "…or ＋↑ / ＋↓ on a row to insert next to it. ✕ deletes a step — on the last one it empties it instead, because a macro with no steps is not something ksx can save."
+            ),
+            "folded child concatenation missing from SSR: {}",
+            out.html
+        );
     }
 
     /// The attribution promised in studio-ui/art/README.md is visibly on the

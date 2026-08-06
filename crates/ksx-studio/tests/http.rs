@@ -63,6 +63,7 @@ impl StatusSource for FixedStatus {
         MapperSnapshot {
             generated_at: "test".into(),
             source: "slots of profile \"Steam\" (games.toml)".into(),
+            profile: Some("Steam".into()),
             config_root: "C:\\cfg".into(),
             slots: vec![MapperSlot {
                 number: 1,

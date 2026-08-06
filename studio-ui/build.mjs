@@ -8,13 +8,45 @@
 //
 // v5: TWO routes — "/" (status) and "/map" (the mapper) — plus the vendored
 // controller art copied (cleaned) from art/ into the embed.
+//
+// 2026-08-06: @getforma/compiler 0.3.1 + @getforma/build 0.2.0 are consumed
+// from disk (`file:` deps in package.json — npm publishing was down; the note
+// there says when to swap back). What that wave bought this file: the island
+// BYPRODUCT scrub is gone (build no longer emits `*.islands.js/json`), and
+// shows/islands are name-addressable so render.rs dropped its positional
+// seams. What it did NOT touch: @getforma/core, so the ledger-#13 show-branch
+// patch below stays.
 
 import { build } from "@getforma/build";
-import { readFileSync, writeFileSync, rmSync } from "fs";
+import { readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { brotliCompressSync, gzipSync, constants as zlibConstants } from "zlib";
 
 const outputDir = "../crates/ksx-studio/assets";
+
+// ---------------------------------------------------------------------------
+// SLOT-NAME COLLISIONS ARE FATAL (docs/FORMA-DOGFOOD.md #9, hardened
+// 2026-08-06).
+//
+// Compiler 0.3.1 keeps every slot name on a page unique by SUFFIXING a
+// collision (`signal-scope.ts` uniqueName): a signal declared in two scopes —
+// one stray `createSignal` in a `*Page.ts` twin — gives the DEAD declaration
+// the unsuffixed name and renames the RENDERED one to `<name>#2`. Injection by
+// name then fills a slot nothing renders, and the page shows its authored
+// default forever. Nothing errors. The compiler does say so, but it says it as
+// one `console.warn` line among the thirteen benign ArrayExpression notes the
+// ledger tells you not to chase — which is exactly how a warning gets missed.
+//
+// So it is not a warning here. `render.rs`'s `assert_island_slot_contract` is
+// the durable gate (it reads the emitted IR); this is the early one, on the
+// build that caused it.
+// ---------------------------------------------------------------------------
+const compilerWarnings = [];
+const realWarn = console.warn;
+console.warn = (...args) => {
+  compilerWarnings.push(args.map(String).join(" "));
+  realWarn(...args);
+};
 
 await build({
   entryPoints: [
@@ -31,29 +63,35 @@ await build({
   ssrEntryPoints: { status: "src/status.ts", map: "src/map.ts" },
 });
 
-// ---------------------------------------------------------------------------
-// The client JS SHIPS (v4+): the islands protocol seeds signals from server
-// props before adoption (dogfood ledger #5). What still gets removed: the
-// compiler's island BYPRODUCTS (`*.islands.js`) — they map each island to the
-// page ROOT component (the exact clobber pattern ledger #5 bans) and import
-// `../src/...` paths that do not resolve from the output dir. Our entries do
-// their own activateIslands; the byproducts must not be embedded by
-// rust-embed or linger in the manifest.
-// ---------------------------------------------------------------------------
+console.warn = realWarn;
+const collisions = compilerWarnings.filter((line) =>
+  /is also declared in another scope on this page/.test(line),
+);
+if (collisions.length) {
+  throw new Error(
+    `${collisions.length} slot-name collision(s) — the renamed slot is the one ` +
+      "the page RENDERS, so the seam's injection would fill a dead slot and the " +
+      "page would show compile-time defaults. Declare the signal once (in the " +
+      `*Island.ts file) and delete the twin:\n${collisions.join("\n")}`,
+  );
+}
+
+// The island BYPRODUCT scrub (`*.islands.js` / `*.islands.json`) lived here
+// until 2026-08-06 — see docs/FORMA-DOGFOOD.md #12. Those files mapped each
+// island to the page ROOT component (the exact clobber pattern ledger #5
+// bans) and imported `../src/...` paths that do not resolve from the output
+// dir, so they had to be deleted from the embed and the manifest, per entry.
+// @getforma/build 0.2.0 stops emitting them; the scrub is gone with them.
 const manifestPath = join(outputDir, "manifest.json");
 const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-for (const [logical, hashed] of Object.entries(manifest.assets)) {
-  if (/^(status|map)\.islands\./.test(logical)) {
-    for (const f of [hashed, `${hashed}.br`, `${hashed}.gz`]) {
-      rmSync(join(outputDir, f), { force: true });
-    }
-    delete manifest.assets[logical];
+for (const logical of Object.keys(manifest.assets)) {
+  if (/\.islands\./.test(logical)) {
+    throw new Error(
+      `'${logical}' is back in the manifest — the build is emitting island ` +
+        "byproducts again (ledger #12); restore the scrub before shipping",
+    );
   }
 }
-for (const entry of ["status", "map"]) {
-  rmSync(join(outputDir, `${entry}.islands.json`), { force: true });
-}
-writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
 
 // ---------------------------------------------------------------------------
 // Dogfood ledger #13, part 2: patch the ADOPTION-path show effect
@@ -69,6 +107,14 @@ writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
 // helper the entries install (map.ts / status.ts). Anchored replacements
 // that MUST match exactly once — an upstream change fails the build loudly
 // instead of silently reintroducing the bug.
+//
+// STILL REQUIRED as of 2026-08-06. The 0.3.1 wave fixed @getforma/compiler
+// and @getforma/build; @getforma/core is untouched at 1.5.0, and its
+// `setupShowEffect` still reads
+// `branch = next ? thenFragment ?? desc.whenTrue() : …` inside the
+// internalEffect with no createRoot/untrack — verified by reading
+// node_modules/@getforma/core/dist/chunk-3U2IQIKB.js, and by both anchors
+// below still matching exactly once. Ledger #13(b)/#16 stay OURS-TO-SEND.
 // ---------------------------------------------------------------------------
 function patchAdoptionShowSeam(file) {
   let src = readFileSync(file, "utf8");

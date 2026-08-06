@@ -2,19 +2,24 @@ import { h, createSignal, createList, createShow } from "@getforma/core";
 
 // The island: the entire Studio screen, live.
 //
-// This file is BOTH halves of the islands protocol (v4):
+// This file is BOTH halves of the islands protocol:
 //
 // - **Compile time** — `StatusPage.ts` returns `StatusIsland()`, and the
 //   entry registers `StatusIsland` in `activateIslands`, so the compiler
 //   inlines the h() tree below between ISLAND_START/ISLAND_END opcodes. The
-//   Rust walker then renders the island server-side with real data AND stamps
+//   signal DECLARATIONS below are the slot table too: compiler 0.3.1 walks
+//   island component files for signal scopes, so the twin declarations
+//   StatusPage.ts used to carry are gone (ledger #9, adopted 2026-08-06).
+//   The Rust walker renders the island server-side with real data, stamps
 //   `data-forma-island="0" data-forma-component="StatusIsland"` on the root
-//   element — the client activation hook.
+//   element — the client activation hook — and hangs `data-forma-props`
+//   (every injected slot value) off the same element.
 // - **Run time** — the module-level signals below are the page's one live
 //   state store (single island, page lifetime). `applyStatus` seeds them from
-//   the server props BEFORE adoption (the ledger-#5 rule: hydration adopts
-//   whatever the signals hold, so they must hold the SSR truth first), and
-//   the 2 s poller in `status.ts` keeps writing the SAME signals afterwards.
+//   the server's `__ksx-payload` block BEFORE adoption (the ledger-#5 rule:
+//   hydration adopts whatever the signals hold, so they must hold the SSR
+//   truth first), and the 2 s poller in `status.ts` keeps writing the SAME
+//   signals afterwards.
 //
 // The derivations in `applyStatus` (summary sentences, pill booleans, pad
 // tile numbering, ghost padding) deliberately MIRROR render.rs — the server
@@ -22,15 +27,16 @@ import { h, createSignal, createList, createShow } from "@getforma/core";
 // same `/api/status` payload. render.rs unit tests pin the Rust side; keep
 // both in sync when either changes.
 //
-// Compiler constraints honored below (same as v3, see render.rs):
+// Compiler constraints honored below (see render.rs):
 // - dynamic text/attrs must be bare `() => signalName()` calls — the slot is
-//   named after the getter, which must be declared in StatusPage.ts;
+//   named after the getter;
 // - list sources are bare `() => listSignal()` calls — compiler 0.2.0 derives
 //   the slot name from the binding (`list:padTiles:array`), which upgraded
 //   the old positional `list:#N:array` seam;
 // - list item bodies may only use direct member reads (`p.persona`);
-// - createShow conditions are ignored by the compiler (the server injects the
-//   boolean), but at runtime they are exactly what makes the pills live;
+// - createShow conditions must be bare `() => signalName()` too: 0.3.1 names
+//   the Bool slot after that getter (`show:canStart`), which is what retired
+//   render.rs's positional SHOW_ORDER (ledger #4);
 // - every h() attribute must be a string literal — an identifier (the old
 //   shared SIL_BODY const) silently compiles to an empty client slot, which
 //   is why the silhouette `d` path is inlined verbatim in both tiles.
@@ -95,8 +101,9 @@ interface GhostTile {
 const PAD_TILE_FLOOR = 4;
 
 // ── The live state store (module-level: one island, page lifetime) ─────────
-// Getter names MUST match the slot declarations in StatusPage.ts — that is
-// the compile-time contract that names the FMIR slots.
+// These declarations ARE the compile-time contract: the compiler reads them
+// here and names the FMIR slots after the getters, so render.rs injects
+// `vigemLine`, `show:canStart` and `list:padTiles:array` by those names.
 
 const [generatedAt, setGeneratedAt] = createSignal("(no snapshot)");
 const [vigemLine, setVigemLine] = createSignal("not collected");
@@ -251,7 +258,7 @@ export function applyFlash(flash: string | null | undefined): void {
   flashTimer = setTimeout(() => applyFlash(null), FLASH_MS);
 }
 
-// ── The screen (identical structure to v3 — the slot layout test pins it) ──
+// ── The screen (the slot layout test pins its names) ───────────────────────
 
 export function StatusIsland() {
   return h(

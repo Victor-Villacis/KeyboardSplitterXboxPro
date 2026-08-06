@@ -343,10 +343,11 @@ The system above is what things look like. This is where they go.
 At ≥ 68 rem Profiles and System sit side by side (7/5), so the page stops being
 one long vertical narrative.
 
-> Moving the plugging panel below Profiles permuted `SHOW_ORDER` in `render.rs`,
-> because `createShow` slots are still positional (dogfood ledger #4). The
-> permutation is a block swap of the two profile-row shows against the six
-> driver/autostart pills; nothing else moved.
+> Moving the plumbing panel below Profiles used to permute `SHOW_ORDER` in
+> `render.rs`, because `createShow` slots were positional (dogfood ledger #4).
+> As of 2026-08-06 that tax is gone: compiler 0.3.1 names show slots after
+> their condition getter (`show:vigemOk`), `render.rs` injects by name, and
+> moving a panel is a move — no renumbering, no seam edit.
 
 ### Mapper — the controller is the hero
 

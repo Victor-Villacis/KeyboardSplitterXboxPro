@@ -114,7 +114,19 @@ interface VerbOutcome {
 
 async function poll(): Promise<void> {
   try {
-    applyMap(await fetchJSON<MapPayload>("/api/map"));
+    // The SELECTED slot travels with the poll. `MapPayload.macros` is ONE
+    // preset's table — the selected slot's (server.rs `collect_map`) — and a
+    // request with no `slot=` makes the server fall back to the FIRST slot. So
+    // on /map?slot=2 the SSR paint and the hydration seed were right and then,
+    // two seconds later, the macro card silently swapped to P1's macros while
+    // the slot rail, the legend and the stage all still said P2. Saving from
+    // that state writes P1's steps into P2's preset, because `saveMacro`
+    // resolves the preset from the CLIENT's selection — which never moved.
+    // Everything else in the payload is slot-independent, so this is the only
+    // parameter the poller needs.
+    const slot = currentSlot();
+    const url = slot ? `/api/map?slot=${encodeURIComponent(String(slot.number))}` : "/api/map";
+    applyMap(await fetchJSON<MapPayload>(url));
   } catch {
     applyMapUnreachable();
   }
@@ -2115,11 +2127,29 @@ function wire(root: HTMLElement): void {
   });
 }
 
+/** The SOURCE payload the server embedded (render.rs `PAYLOAD_SCRIPT_ID`).
+ *
+ *  Deliberately NOT the island's `props` argument — see status.ts for the
+ *  full note. Short version: compiler 0.3.1 populates island `slot_ids`, so
+ *  forma-ir emits `data-forma-props` and core prefers it, which makes `props`
+ *  the rendered SLOT values. This page edits a MODEL (bindings, macro drafts,
+ *  undo, conflicts) that no slot carries, so it reads the payload itself.
+ *  Dogfood ledger #8 (closed) / #19 (the gap it left). */
+function embeddedPayload<T>(): T | null {
+  const el = document.getElementById("__ksx-payload");
+  if (!el?.textContent) return null;
+  try {
+    return JSON.parse(el.textContent) as T;
+  } catch {
+    return null;
+  }
+}
+
 activateIslands({
-  // Ledger #5 order: signals seeded from the props BEFORE adoption.
-  MapIsland: (el, props) => {
-    if (props) {
-      const seed = props as unknown as MapPayload;
+  // Ledger #5 order: signals seeded from the payload BEFORE adoption.
+  MapIsland: (el) => {
+    const seed = embeddedPayload<MapPayload>();
+    if (seed) {
       // Honour /map?slot=N on first paint (the server already did for SSR).
       const query = new URLSearchParams(window.location.search);
       const fromQuery = query.get("slot");

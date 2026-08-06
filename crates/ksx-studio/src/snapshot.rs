@@ -13,11 +13,11 @@ pub use ksx_api::status::*;
 
 use serde::{Deserialize, Serialize};
 
-/// The one live-data shape: what `GET /api/status` serves AND what the
-/// island props carry (render.rs serializes it into the `__forma_islands`
-/// script block). One struct, one serializer — the client seeds its signals
-/// from the props and then overwrites the SAME signals from `/api/status`
-/// every 2 s, so the two must never drift. `render.rs` has the parity test;
+/// The one live-data shape: what `GET /api/status` serves AND what the page
+/// embeds (render.rs serializes it into the `__ksx-payload` script block).
+/// One struct, one serializer — the client seeds its signals from the block
+/// and then overwrites the SAME signals from `/api/status` every 2 s, so the
+/// two must never drift. `render.rs` has the parity test;
 /// `studio-ui/src/StatusIsland.ts` mirrors the field names.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusPayload {

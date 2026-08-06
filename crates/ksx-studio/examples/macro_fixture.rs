@@ -134,6 +134,7 @@ impl StatusSource for Store {
         MapperSnapshot {
             generated_at: "fixture".into(),
             source: "fixture".into(),
+            profile: None,
             config_root: "C:\\fixture".into(),
             slots: vec![MapperSlot {
                 number: 1,
@@ -154,14 +155,35 @@ impl StatusSource for Store {
     }
 }
 
-impl ControlSource for Store {
-    fn session(&self) -> SessionView {
-        SessionView {
+/// Which session the fixture reports, from `KSX_FIXTURE_SESSION`.
+///
+/// The default is unchanged (`idle`) — every existing pwtest depends on it.
+/// The other two exist so the SSR-vs-hydration parity check can be run in the
+/// states where the show pairs actually MOVE: `running` flips
+/// pillRunning/canStop/rowsPlain/sessionRunning/readOnly, and `down` flips the
+/// whole no-daemon surface. Those are the only states where a first paint
+/// could visibly disagree with what the client renders a moment later.
+fn fixture_session() -> SessionView {
+    match std::env::var("KSX_FIXTURE_SESSION").as_deref() {
+        Ok("running") => SessionView {
+            reachable: true,
+            running: true,
+            line: "running — Fixture — 1 pad(s)".into(),
+            profile: Some("Fixture".into()),
+        },
+        Ok("down") => SessionView::unreachable("no daemon control channel"),
+        _ => SessionView {
             reachable: true,
             running: false,
             line: "idle".into(),
             profile: None,
-        }
+        },
+    }
+}
+
+impl ControlSource for Store {
+    fn session(&self) -> SessionView {
+        fixture_session()
     }
 
     fn start(&self, _profile: Option<&str>) -> Result<String, ksx_api::Refusal> {

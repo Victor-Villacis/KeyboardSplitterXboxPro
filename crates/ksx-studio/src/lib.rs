@@ -44,14 +44,16 @@
 //! # Data injection
 //!
 //! The same per-request data is emitted twice, deliberately: server-side
-//! FMIR slot injection for the SSR first paint (scalars and lists by slot
-//! name; `createShow` booleans positional — the last shared-name slot kind),
-//! and a `StatusPayload` JSON as island props (`__forma_islands` script
-//! block) for client hydration — the identical shape `GET /api/status`
-//! serves the poller, pinned by a parity test. See `render.rs` for the
-//! mechanism, the rationale, and the E7 dogfood history — first cycle
-//! closed when `@getforma/compiler` 0.2.0 shipped the per-list naming this
-//! seam requested.
+//! FMIR slot injection for the SSR first paint (scalars, lists AND
+//! `createShow` booleans, all by slot name since compiler 0.3.1), and a
+//! `StatusPayload` JSON in the `__ksx-payload` script block for client
+//! hydration — the identical shape `GET /api/status` serves the poller,
+//! pinned by a parity test. forma-ir additionally emits its own
+//! `data-forma-props` from the island's slot_ids, carrying the rendered slot
+//! values. See `render.rs` for the mechanism, the rationale, and the E7
+//! dogfood history — cycle one closed when `@getforma/compiler` 0.2.0
+//! shipped per-list naming, cycle two when 0.3.1 shipped named shows,
+//! island slot_ids and island-file signal extraction.
 //!
 //! # Boundaries (docs/ENHANCEMENTS.md E7, enforced)
 //!

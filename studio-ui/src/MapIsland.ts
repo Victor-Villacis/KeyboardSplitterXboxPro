@@ -21,9 +21,12 @@ import {
 
 // THE MAPPER (v5): click a control on the pad art, press the panel key,
 // binding saved. One island, same architecture as StatusIsland.ts — the
-// module-level signals are the page's live state store; `applyMap` seeds
-// them from the server props BEFORE adoption (ledger #5) and the 2 s
-// /api/map poller (map.ts) keeps rewriting them. Derivations here MIRROR
+// module-level signals are the page's live state store AND the compile-time
+// slot table (compiler 0.3.1 walks island component files for signal scopes,
+// so the twin declarations MapPage.ts used to carry are gone — ledger #9,
+// adopted 2026-08-06). `applyMap` seeds them from the server's payload block
+// BEFORE adoption (ledger #5) and the 2 s /api/map poller (map.ts) keeps
+// rewriting them. Derivations here MIRROR
 // crates/ksx-studio/src/render_map.rs (server derives for the SSR first
 // paint, this file re-derives per poll); the Rust unit tests pin that side —
 // keep both in sync when either changes.
@@ -1046,9 +1049,16 @@ function reason(p: MapPayload): string {
     );
   if (p.session.running)
     return (
+      // WORD FOR WORD what render_map.rs's `reason_line` renders — this is the
+      // one banner whose text differs between the two branches, so a drift
+      // here is a VISIBLE flash: the server paints one sentence and the client
+      // replaces it a few milliseconds later. It said "the Pause button" until
+      // 2026-08-06, which also named a control that does not exist; the button
+      // is labelled "Pause emulation & map". Pinned by the SSR/hydration
+      // parity suite (pwtest/ssr-hydration-parity.test.mjs).
       "read-only while emulation runs: the panel's keys are captured, so ksx cannot " +
-      "hear them for mapping. Use the Pause button above, or bind from a shell " +
-      "with the command below"
+      'hear them for mapping. Use "Pause emulation & map" above, or bind from a ' +
+      "shell with the command below"
     );
   if (p.learn.state === "unavailable")
     return (
@@ -3705,15 +3715,15 @@ export function macroStepAllowShort(): boolean {
 }
 
 // ── The screen ─────────────────────────────────────────────────────────────
-// createShow document order == render_map.rs MAP_SHOW_ORDER (positional seam,
-// ledger #4). Nineteen, in this order:
-//   pillRunning, pillIdle, pillDown, pillPaused,
-//   noDaemon, sessionRunning, pausedBar, readOnly, canLearn,
-//   artXbox, artDs4, hasBackup, savedOk, savedErr,
-//   modalOpen, modalListening, modalBound, modalConflict,
-//   selBar (v7 — APPENDED, never inserted: ledger #14).
-// Adding or reordering one here without updating MAP_SHOW_ORDER shows the
-// wrong panel; `embedded_map_ir_slot_layout_matches_the_seam` catches it.
+// Nineteen createShow pairs. Their DOCUMENT ORDER no longer matters
+// (2026-08-06, ledger #4 closed): compiler 0.3.1 names each show slot after
+// its condition getter — `createShow(() => canLearn(), …)` becomes
+// `show:canLearn` — and render_map.rs injects by that name, so a show can be
+// added, removed or moved WHERE IT BELONGS VISUALLY without renumbering
+// anything. `selBar` is still authored last only because that is where a
+// `position: fixed` bar reads naturally; it is no longer a rule.
+// `embedded_map_ir_slot_layout_matches_the_seam` asserts the NAME SET on both
+// sides, so a rename here fails loudly instead of showing the wrong panel.
 
 export function MapIsland() {
   return h(
@@ -4413,13 +4423,16 @@ export function MapIsland() {
               class: "btn btn-mini macmot",
               "data-macmotion": "qcf",
               type: "button",
-              // ⚠ ONE STRING LITERAL, like every other title on this card. A
-              // concatenation in ATTRIBUTE position is not folded by the
-              // compiler — the attribute is emitted with NO VALUE AT ALL, so
-              // the tooltip silently disappears (it had been missing from both
-              // 360 buttons for exactly this reason until FIX 3's pwtest case
-              // read the titles back and found `null`).
-              title: "append a quarter-circle forward: ↓ ↘ → — three steps, the middle one the diagonal (each row spells the pair it stores)",
+              // Wrapped across lines again on 2026-08-06: a concatenation in
+              // ATTRIBUTE position used to emit the attribute with NO VALUE AT
+              // ALL — the tooltip silently disappeared, which is how both 360
+              // buttons shipped without one until FIX 3's pwtest case read the
+              // titles back and found `null`. Fixed in @getforma/compiler
+              // 0.3.1 (docs/FORMA-DOGFOOD.md #20a); the pwtest case is what
+              // keeps it fixed.
+              title:
+                "append a quarter-circle forward: ↓ ↘ → — three steps, the " +
+                "middle one the diagonal (each row spells the pair it stores)",
             },
             "¼ → · ↓ ↘ →",
           ),
@@ -4482,7 +4495,9 @@ export function MapIsland() {
               class: "btn btn-mini macmot",
               "data-macmotion": "spdf",
               type: "button",
-              title: "append a full 360 (spinning piledriver), clockwise from →: → ↘ ↓ ↙ ← ↖ ↑ ↗ — eight steps, four of them diagonals",
+              title:
+                "append a full 360 (spinning piledriver), clockwise from →: " +
+                "→ ↘ ↓ ↙ ← ↖ ↑ ↗ — eight steps, four of them diagonals",
             },
             "360 → · → ↘ ↓ ↙ ← ↖ ↑ ↗",
           ),
@@ -4492,7 +4507,9 @@ export function MapIsland() {
               class: "btn btn-mini macmot",
               "data-macmotion": "spdb",
               type: "button",
-              title: "append a full 360 the other way round, from ←: ← ↙ ↓ ↘ → ↗ ↑ ↖ — eight steps, four of them diagonals",
+              title:
+                "append a full 360 the other way round, from ←: " +
+                "← ↙ ↓ ↘ → ↗ ↑ ↖ — eight steps, four of them diagonals",
             },
             "360 ← · ← ↙ ↓ ↘ → ↗ ↑ ↖",
           ),
@@ -4525,19 +4542,17 @@ export function MapIsland() {
             },
             "＋ Add step",
           ),
-          // ⚠ SEPARATE STRING CHILDREN, never `"a" + "b"`. A concatenation in
-          // ATTRIBUTE position is folded by the compiler (the motion titles
-          // above do it), but as a CHILD it is a BinaryExpression the h-tree
-          // walker cannot fold, and it emits an anonymous SECOND ISLAND —
-          // which `embedded_map_ir_slot_layout_matches_the_seam` catches as
-          // "expected exactly one island". Same rule the long paragraphs on
-          // this card already follow.
+          // One concatenated child again (2026-08-06). Until compiler 0.3.1
+          // a `"a" + "b"` in CHILD position was a BinaryExpression the h-tree
+          // walker could not fold, so it emitted an anonymous SECOND ISLAND —
+          // caught, loudly, by `embedded_map_ir_slot_layout_matches_the_seam`'s
+          // "expected exactly one island". docs/FORMA-DOGFOOD.md #20b.
           h(
             "span",
             { class: "macstephint" },
-            "…or ＋↑ / ＋↓ on a row to insert next to it. ✕ deletes a step — on the ",
-            "last one it empties it instead, because a macro with no steps is not ",
-            "something ksx can save.",
+            "…or ＋↑ / ＋↓ on a row to insert next to it. ✕ deletes a step — on the " +
+              "last one it empties it instead, because a macro with no steps is not " +
+              "something ksx can save.",
           ),
         ),
         // The grid. Two aligned columns: the row bar (step number, duration,
@@ -4805,9 +4820,12 @@ export function MapIsland() {
               class: () => macroEnableCls(),
               "data-act": "macro-enable",
               type: "button",
-              // One literal — a concatenation here emits the attribute with no
-              // value at all (see the motion buttons above).
-              title: "switch this macro off (or back on) without losing it — the steps and the key that starts it stay exactly where they are. Disable one to TEST the others, or the lot for a tournament",
+              // Concatenated again (ledger #20a, fixed in compiler 0.3.1 —
+              // this used to emit the attribute with no value at all).
+              title:
+                "switch this macro off (or back on) without losing it — the " +
+                "steps and the key that starts it stay exactly where they are. " +
+                "Disable one to TEST the others, or the lot for a tournament",
             },
             () => macroEnableLabel(),
           ),

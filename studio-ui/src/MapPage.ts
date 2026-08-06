@@ -1,13 +1,35 @@
-import { createSignal } from "@getforma/core";
 import { MapIsland } from "./MapIsland";
 
-// The mapper's SSR root — same compile-time-only twin pattern as
-// StatusPage.ts (docs/FORMA-DOGFOOD.md finding #9: the compiler extracts
-// signal defaults ONLY from the entry's root *Page component function).
-// Every declaration below exists to put a NAMED slot into the compiled IR;
-// the names must match the runtime signals in MapIsland.ts one for one — a
-// rename on either side fails ksx-studio's
-// `embedded_map_ir_slot_layout_matches_the_seam` test, never a blank page.
+// The mapper's SSR root — the same compile-time-only anchor as StatusPage.ts.
+// `parseEntryPoint` picks the imported `*Page` that is NOT in map.ts's
+// `activateIslands` registry as the SSR root, and `return MapIsland()` is what
+// puts the whole screen between ISLAND_START/ISLAND_END.
+//
+// The 67 `createSignal` twins that used to live in `MapPage()` were deleted on
+// 2026-08-06 (docs/FORMA-DOGFOOD.md #9): compiler 0.3.1 walks island component
+// files for signal scopes, so MapIsland.ts's own declarations mint the named
+// slots. After 0.3.1 the twins were harmful, not redundant — each minted its
+// own slot and pushed the island's real one to `#2`, so injection by name hit
+// a slot nothing renders (283 slots, 67 of them dead → 216).
+//
+// DO NOT ADD A `createSignal` BACK TO THIS FILE. It does not fail loudly on
+// its own: the compiler renames the RENDERED binding to `<name>#2` and the
+// seam then fills the dead one, so the page shows its authored default with a
+// green gate. Two things now stop it — `build.mjs` throws on the compiler's
+// collision warning, and `render.rs`'s `assert_island_slot_contract` requires
+// every injected name to be a slot the island actually renders. (The committed
+// mapper IR is 221 slots / 191 island slot_ids; the extra five over 216 are
+// #21's anonymous concatenation slots, not signals.)
+//
+// The KEYS_*/FUNCTIONS tables below stay here by CHOICE, not by constraint.
+// Compiler 0.3.1 fixed ledger #17 edge 1 — file constants declared in an
+// ISLAND file expand too now (verified by probe, 2026-08-06) — so these 250
+// lines could move to MapIsland.ts beside the markup that spreads them.
+// Moving them buys nothing today and would rehash both bundles, so they stay;
+// but nobody should preserve this arrangement believing the compiler still
+// requires it. What they DO still prove is that the expansion works: the
+// mapper SSRs 3 364 `<option>` elements across 34 selects as STATIC markup —
+// no slots, no islands, no per-option literals in source.
 //
 // This function never executes in a browser (map.ts registers MapIsland via
 // activateIslands; esbuild tree-shakes this).
@@ -258,122 +280,5 @@ export {
 };
 
 export function MapPage() {
-  // Scalars — defaults are what renders if server injection ever misses a
-  // name: honest placeholders, never fake data.
-  const [slotLine] = createSignal("no mappable slots");
-  const [sourceLine] = createSignal("not collected");
-  const [reasonLine] = createSignal("");
-  const [cliLine] = createSignal("ksx map --preset <NAME> --function <FUNCTION> --key <KEY>");
-  // The remedy printed in the no-daemon banner, with this machine's profile
-  // flag when it needs one.
-  const [daemonCmd] = createSignal("ksx daemon");
-  // The third restore destination's label carries its timestamp.
-  const [backupLine] = createSignal("Restore backup");
-  // v14, the preset surface's identity block (twins in MapIsland.ts).
-  const [presetLine] = createSignal("(no preset)");
-  const [presetPath] = createSignal("(unknown)");
-  const [backupFact] = createSignal("none yet — the first restore writes one");
-  // v9: the selected slot number, as the hidden field of every no-JS form
-  // that lives outside the legend list (preset actions, bind-by-name).
-  const [slotNum] = createSignal("1");
-  const [modalPrompt] = createSignal("");
-  const [modalBinding] = createSignal("");
-  const [countdownText] = createSignal("");
-  const [barStyle] = createSignal("width:100%");
-  const [conflictLine] = createSignal("");
-  const [savedLine] = createSignal("");
-  // Auto-save made visible; empty until this page has written something.
-  const [savedAt] = createSignal("");
-  const [generatedAt] = createSignal("(no snapshot)");
-  // v7 multi-select (a JS enhancement — SSR always paints it off).
-  const [selToggleCls] = createSignal("btn btn-row seltoggle");
-  const [selToggleLabel] = createSignal("Select multiple");
-  const [selCountLine] = createSignal("");
-  // The preset-actions card renders inert until a payload proves the daemon
-  // reachable (a class string, not a show — ledger #13).
-  const [actionsCls] = createSignal("card pactions off");
-  // v11, the MACRO EDITOR (the piano roll). Thirteen scalars and not one new
-  // createShow: every state it has is a class string on an element that is
-  // always in the DOM, so MAP_SHOW_ORDER does not move (ledger #4/#14 — shows
-  // are positional, and one inserted in the middle silently shifts every panel
-  // after it). Defaults are the honest "nothing read yet" values.
-  const [macroHead] = createSignal("no macro loaded yet");
-  const [macroRuleLine] = createSignal("");
-  // v16: the direction RING, and what ticking a diagonal writes. SSR'd like
-  // every other explainer — a page with no JavaScript cannot tick a cell, but
-  // it can read what the columns mean and hand-write the pair.
-  const [macroRingLine] = createSignal("");
-  const [macroPolicyLine] = createSignal("on release: finish · retrigger: ignore · interrupt: none");
-  const [macroNote] = createSignal("");
-  const [macroTriggerLine] = createSignal("no trigger key yet — nothing starts this macro");
-  // v12: never a made-up macro name. The old "my-macro" default existed only
-  // in the browser, so its trigger could not be bound.
-  const [macroFnName] = createSignal("");
-  const [macroName] = createSignal("");
-  const [macroCliLine] = createSignal(
-    "ksx map --preset <NAME> --function macro.<NAME> --key <KEY>",
-  );
-  const [macroToml] = createSignal("");
-  const [macroCardCls] = createSignal("card macrocard off");
-  const [macroGridCls] = createSignal("macgrid empty");
-  const [macroDirtyLine] = createSignal("");
-  // FIX 2 dropped `macroDurValue` / `macroDurCls`: the duration editor is no
-  // longer one field under the grid pointed at a selected step, so there is no
-  // single value or class for the card to hold. Every row carries its own box
-  // (a list-item field, not a signal), and this line only reports which step
-  // the frame maths is about.
-  const [macroStepLine] = createSignal(
-    "every step's time is its own box on its own row — type in the row you want",
-  );
-  // v15/FIX 2: Save's inline question about short steps — a class string plus
-  // its sentence, never a show (ledger #13/#14). An SSR paint has asked
-  // nothing, so the bar renders off and empty.
-  const [macroConfirmCls] = createSignal("macconfirm off");
-  const [macroConfirmLine] = createSignal("");
-  // v15/FIX 1c: which mechanism the "common motions" buttons write, and why.
-  const [macroMotionLine] = createSignal("");
-  // v12's three: the Save button's look, the live frame arithmetic, and the
-  // trigger block's inert class while the preset holds no macro.
-  const [macroSaveCls] = createSignal("btn btn-mini macsave off");
-  // v14: the per-macro switch (a class string plus its label — never a show),
-  // and the slot-wide `macros = "off"` sentence. An SSR paint has read the
-  // file, so both come from the payload; these are the honest defaults for a
-  // page with no macro loaded and a slot that runs macros.
-  const [macroEnableCls] = createSignal("btn btn-mini macen off dead");
-  const [macroEnableLabel] = createSignal("Enabled");
-  const [slotMacrosLine] = createSignal("");
-  const [macroMathLine] = createSignal("");
-  // v13: the repeat policy's own live math, and the rate box's value.
-  const [macroTurboLine] = createSignal("");
-  const [macroTurboValue] = createSignal("");
-  // Client-only: the learn modal's auto-fire sentence (an SSR paint has no
-  // modal open, so there is nothing to say about a control nobody picked).
-  const [modalTurboLine] = createSignal("");
-  const [macroTrigCls] = createSignal("mactrigger off");
-  // Booleans behind the createShow pairs (positional show:createShow slots —
-  // render_map.rs MAP_SHOW_ORDER pins the document order). Default false:
-  // nothing renders until the server says otherwise.
-  const [pillRunning] = createSignal(false);
-  const [pillIdle] = createSignal(false);
-  const [pillDown] = createSignal(false);
-  const [pillPaused] = createSignal(false);
-  const [noDaemon] = createSignal(false);
-  const [sessionRunning] = createSignal(false);
-  const [pausedBar] = createSignal(false);
-  const [readOnly] = createSignal(false);
-  const [canLearn] = createSignal(false);
-  const [artXbox] = createSignal(false);
-  const [artDs4] = createSignal(false);
-  const [hasBackup] = createSignal(false);
-  const [savedOk] = createSignal(false);
-  const [savedErr] = createSignal(false);
-  const [modalOpen] = createSignal(false);
-  const [modalListening] = createSignal(false);
-  const [modalBound] = createSignal(false);
-  const [modalConflict] = createSignal(false);
-  // Appended LAST, deliberately: a show inserted mid-document shifts every
-  // show after it (ledger #14). See render_map.rs MAP_SHOW_ORDER.
-  const [selBar] = createSignal(false);
-
   return MapIsland();
 }

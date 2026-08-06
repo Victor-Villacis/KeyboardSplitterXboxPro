@@ -65,18 +65,35 @@ async function submitForm(form: HTMLFormElement): Promise<void> {
   void poll();
 }
 
+/** The SOURCE payload the server embedded (render.rs `PAYLOAD_SCRIPT_ID`).
+ *
+ *  Deliberately NOT the island's `props` argument. Since compiler 0.3.1
+ *  populates island `slot_ids`, forma-ir emits `data-forma-props` itself and
+ *  `loadIslandProps` prefers it — so `props` is now the RENDERED SLOT VALUES
+ *  (`vigemLine`, `show:canStart`, `list:padTiles:array`, …), not the payload
+ *  this page derives everything from. Dogfood ledger #8 is closed by that
+ *  (we no longer hand-emit `__forma_islands`); #19 records the gap it left. */
+function embeddedPayload<T>(): T | null {
+  const el = document.getElementById("__ksx-payload");
+  if (!el?.textContent) return null;
+  try {
+    return JSON.parse(el.textContent) as T;
+  } catch {
+    return null;
+  }
+}
+
 activateIslands({
-  // One island: the whole screen. Props are the same StatusPayload JSON that
-  // /api/status serves, emitted by render.rs into the __forma_islands script
-  // block (the islands protocol's script-tag props mode).
+  // One island: the whole screen, seeded from the same StatusPayload JSON
+  // that /api/status serves.
   //
   // Order matters (docs/FORMA-DOGFOOD.md finding #5): the signals MUST hold
   // the server's values BEFORE StatusIsland() builds the descriptor tree —
   // adoption binds effects that immediately write signal state into the DOM,
   // so seeding after adoption would clobber the SSR text with defaults.
-  StatusIsland: (el, props) => {
-    if (props) {
-      const seed = props as unknown as StatusPayload;
+  StatusIsland: (el) => {
+    const seed = embeddedPayload<StatusPayload>();
+    if (seed) {
       applyStatus(seed);
       applyFlash(seed.flash);
       if (seed.flash && window.location.search !== "") {

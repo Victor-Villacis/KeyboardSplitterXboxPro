@@ -1,8 +1,8 @@
 //! The render seam: embedded FMIR + per-request [`StatusSnapshot`] /
 //! [`SessionView`] → HTML, with the same data emitted twice — slots for the
-//! SSR first paint, island props for client hydration.
+//! SSR first paint, the source payload for client hydration.
 //!
-//! # v4: SSR slots for first paint, islands props for hydration (and why both)
+//! # SSR slots for first paint, a payload block for hydration (and why both)
 //!
 //! The page is one Forma ISLAND (`StatusIsland`, compiled between
 //! ISLAND_START/ISLAND_END opcodes). Per request this seam:
@@ -13,58 +13,73 @@
 //!    browser paints before (or without) any JavaScript — the no-JS
 //!    experience is still the complete v3 page, plus a `<noscript>` meta
 //!    refresh so it keeps updating.
-//! 2. **Emits the SAME data as island props** — a [`StatusPayload`] JSON in
-//!    the `__forma_islands` script block (the islands protocol's script-tag
-//!    props mode; a non-executing `type="application/json"` data block, so
-//!    the strict CSP is untouched). The client seeds its signals from it
-//!    BEFORE adoption — dogfood ledger #5: adoption binds effects that
-//!    immediately write signal state into the DOM, so plain hydration
-//!    clobbers SSR values; islands-with-props is the one sanctioned live
-//!    path. After adoption a 2 s poller rewrites the same signals from
-//!    `GET /api/status`, which serves the identical [`StatusPayload`] shape
-//!    (parity pinned by `island_props_match_the_api_payload_shape`).
+//! 2. **Emits the SAME data as the domain payload** — a [`StatusPayload`]
+//!    JSON in the [`PAYLOAD_SCRIPT_ID`] script block (a non-executing
+//!    `type="application/json"` data block, so the strict CSP is untouched).
+//!    The client seeds its signals from it BEFORE adoption — dogfood ledger
+//!    #5: adoption binds effects that immediately write signal state into the
+//!    DOM, so plain hydration clobbers SSR values; seeding first is the one
+//!    sanctioned live path. After adoption a 2 s poller rewrites the same
+//!    signals from `GET /api/status`, which serves the identical
+//!    [`StatusPayload`] shape (parity pinned by
+//!    `the_payload_block_matches_the_api_payload_shape`).
 //!
 //!    Keeping BOTH emissions is deliberate: slots alone give a correct first
-//!    paint but hydration would clobber it (ledger #5); props alone would
-//!    require client rendering and break the no-JS baseline. The redundancy
-//!    is the design, not an accident — same struct, same serializer, one
-//!    derivation mirror (StatusIsland.ts) covered by tests on this side.
+//!    paint but hydration would clobber it (ledger #5); the payload alone
+//!    would require client rendering and break the no-JS baseline. The
+//!    redundancy is the design, not an accident — same struct, same
+//!    serializer, one derivation mirror (StatusIsland.ts) covered by tests on
+//!    this side.
 //!
-//!    The props ride our own script block rather than a `data-forma-props`
-//!    attribute because compiler 0.2.0 registers islands with EMPTY
-//!    `slot_ids` — the walker's own props emission never fires (ledger #8).
+//!    Since compiler 0.3.1 the walker ALSO emits `data-forma-props` on the
+//!    island root, built from the island's `slot_ids` (ledger #8 closed — the
+//!    `__forma_islands` impersonation this file used to hand-emit is gone).
+//!    Those native props carry the rendered SLOT values; the block above
+//!    carries the SOURCE payload the client's own model needs. Ledger #19.
 //!
 //! Three flavours of slot exist on this page:
 //!
-//! - **Scalars** — every `createSignal` in `studio-ui/src/StatusPage.ts`
-//!   (the compile-time slot-table declaration; the runtime twin lives in
-//!   `StatusIsland.ts`) becomes a slot named after the signal getter.
-//!   Unique names, injected via [`SlotData::from_json`] (name-keyed,
-//!   defaults preserved for misses).
+//! - **Scalars** — every `createSignal` in `studio-ui/src/StatusIsland.ts`
+//!   becomes a slot named after the signal getter. Unique names, injected via
+//!   [`SlotData::from_json`] (name-keyed, defaults preserved for misses).
+//!   Compiler 0.3.1 walks island component files for signal scopes, so the
+//!   twin re-declarations `StatusPage.ts` used to carry are gone (ledger #9).
 //! - **Lists** — every `createList` becomes an Array slot. Since the v4
 //!   lists read from named signals (`() => padTiles()`), compiler 0.2.0
 //!   derives the slot name from the BINDING (`list:padTiles:array`) instead
 //!   of the positional `list:#N:array` v3 lived with — reordering lists in
 //!   the page no longer shifts names (ledger #3, mostly resolved for us).
 //!   Injected by NAME; the `LIST_SLOT_*` constants pin the five names.
-//! - **Shows** — every `createShow` still becomes a Bool slot named
-//!   `show:createShow` — so shows remain the one POSITIONAL seam
-//!   (slot-table order == emission order == document order). [`SHOW_ORDER`]
-//!   documents that mapping; the show pairs are what color state server-side
-//!   (the server picks which statically-styled variant renders), and after
-//!   hydration the same pairs flip live from client signals.
+//! - **Shows** — every `createShow` becomes a Bool slot named after its
+//!   CONDITION binding (`createShow(() => canStart(), …)` →
+//!   `show:canStart`), so shows are injected by name like everything else
+//!   (compiler 0.3.1; dogfood ledger #4 closed 2026-08-06 — the `SHOW_ORDER`
+//!   positional array and its "append, never insert" rule are gone). The show
+//!   pairs are what color state server-side (the server picks which
+//!   statically-styled variant renders), and after hydration the same pairs
+//!   flip live from client signals.
 //!
 //! `tests::embedded_ir_slot_layout_matches_the_seam` pins the exact list slot
-//! NAMES (order included), the show count, and the island table — a compiler
-//! bump that renames slots, or a StatusIsland.ts edit that adds/reorders
-//! lists or shows, is a test failure, not a silently blank section.
+//! NAMES (order included), the exact show slot NAMES, and the island table
+//! including its non-empty `slot_ids` — a compiler bump that renames slots,
+//! or a StatusIsland.ts edit that adds/renames lists or shows, is a test
+//! failure, not a silently blank section. It then hands the whole slot table
+//! to [`assert_island_slot_contract`], which asserts the thing a name-exists
+//! check cannot: that every name the seam injects is one the ISLAND RENDERS,
+//! and that every scalar the island renders is one the seam injects. Read that
+//! function before touching this seam — "the slot exists" was the assertion
+//! that let a dead slot through the whole gate on 2026-08-06.
 //!
 //! History: compiler 0.1.8 named EVERY list `list:array`, and this seam
 //! resolved lists positionally too (a `LIST_ORDER` table, since deleted).
 //! Per-instance slot naming was the upstream feature request this page
 //! dogfooded (docs/ENHANCEMENTS.md E7 loop); fixed upstream in
 //! `@getforma/compiler` 0.2.0, adopted 2026-08-05 — the E7 dogfood loop's
-//! first closed cycle. Per-instance `createShow` naming is the remaining ask.
+//! first closed cycle. Per-instance `createShow` naming (ledger #4) and
+//! populated island `slot_ids` (ledger #8) landed in 0.3.1 and were adopted
+//! 2026-08-06; the same release stopped extracting signals from the root
+//! `*Page` file ONLY (ledger #9), which is why `StatusPage.ts` is now four
+//! lines instead of thirty declarations.
 
 use forma_ir::parser::IrModule;
 use forma_ir::slot::{SlotData, SlotValue};
@@ -93,45 +108,45 @@ const LIST_SLOT_PROFILES_LIVE: &str = "list:profileRows:array";
 const LIST_SLOT_PROFILES_PLAIN: &str = "list:profileRows#2:array";
 
 /// The island table this page compiles to: exactly one island — the whole
-/// screen — hydrated on load. Its id keys the props in the
-/// `__forma_islands` script block; its name is the `activateIslands`
-/// registry key in `studio-ui/src/status.ts`. The layout test pins both.
-pub(crate) const ISLAND_ID: u16 = 0;
+/// screen — hydrated on load. Its name is the `activateIslands` registry key
+/// in `studio-ui/src/status.ts`; forma-ir stamps the id on the SSR root as
+/// `data-forma-island` and hangs the native props off the same element. The
+/// layout test pins both. Test-only since 2026-08-06: the id used to key the
+/// hand-emitted `__forma_islands` props object (ledger #8's workaround), and
+/// nothing in the request path needs it now that forma-ir emits the props.
+#[cfg(test)]
+const ISLAND_ID: u16 = 0;
 #[cfg(test)]
 const ISLAND_COMPONENT: &str = "StatusIsland";
 
-/// `createShow` booleans did NOT gain unique names in compiler 0.2.0 — every
-/// show is still `show:createShow`, so shows are the remaining positional
-/// seam (slot-table order == document order in StatusPage.ts). All state
-/// COLOR on this SSR page is done with show pairs — the server picks which
-/// statically-styled variant renders — so the list is long; the layout test
-/// pins the count.
-const SHOW_SLOT_NAME: &str = "show:createShow";
-const SHOW_ORDER: [&str; 17] = [
-    "header pill: running",
-    "header pill: idle",
-    "header pill: no daemon",
-    // FIX 1: the unmissable banner, first child of <main> on BOTH pages.
-    "no-daemon banner (top of page)",
-    "flash: success",
-    "flash: error",
-    "start controls",
-    "stop controls",
-    "daemon down controls",
-    // v14 moved the plumbing panel BELOW the profiles list (it is tertiary
-    // information and was reading as loud as the session), so the profile-row
-    // pair now precedes the driver/autostart pills. Shows are positional
-    // (ledger #4): this order IS the document order in StatusIsland.ts.
-    "profile rows: with Start buttons",
-    "profile rows: inert",
-    "vigem: ok pill",
-    "vigem: attention pill",
-    "interception: borrowed-time pill",
-    "interception: absent pill",
-    "autostart: on pill",
-    "autostart: off pill",
-];
-const SHOW_COUNT: usize = SHOW_ORDER.len();
+/// How many `createShow` pairs this page has. All state COLOR on this SSR
+/// page is done with show pairs — the server picks which statically-styled
+/// variant renders — so the list is long; the layout test pins both the count
+/// and every name.
+///
+/// Compiler 0.3.1 names show slots after their CONDITION binding
+/// (`createShow(() => pillIdle(), …)` → `show:pillIdle`), so shows are
+/// name-addressable exactly like lists and scalars. The `SHOW_ORDER`
+/// positional array this file carried since v1 — the mapping whose only guard
+/// was a count assertion, and which renumbered itself whenever a show was
+/// inserted mid-document — is GONE (dogfood ledger #4/#14, adopted
+/// 2026-08-06). [`show_values`] now yields `(slot name, value)` pairs, so
+/// document order is documentation, not contract.
+const SHOW_COUNT: usize = 17;
+
+/// Bare-named slots this page renders and the seam deliberately never fills.
+/// EMPTY here, and that is the claim: every signal `StatusIsland.ts` binds to
+/// the DOM gets a server value on every request. See
+/// [`assert_island_slot_contract`] for what an unlisted one would cost.
+#[cfg(test)]
+const CLIENT_ONLY_SLOTS: [&str; 0] = [];
+
+/// Anonymous (`attr:`/`text:`) slots this page compiles to. EMPTY, and that is
+/// the strongest form of ledger #10/#20's guard: every attribute value and
+/// every text child on the status page is either a named signal binding or
+/// static markup — nothing renders from a default the seam cannot reach.
+#[cfg(test)]
+const ANONYMOUS_SLOTS: [&str; 0] = [];
 
 /// Seconds between full-page refreshes for the NO-JS fallback only (v4): the
 /// meta pragma now lives inside `<noscript>`, so browsers running the island
@@ -362,36 +377,45 @@ fn autostart_on(snap: &StatusSnapshot) -> bool {
     snap.autostart.starts_with("registered")
 }
 
-/// The show booleans, in [`SHOW_ORDER`]. The session-controls policy is
-/// unchanged: exactly one of "start", "stop" or "daemon down" is true, so
-/// the panel always says something and never offers a dead button as live.
-/// The same rule colors the header pill, and every status pill is a pair
-/// where exactly one side renders.
+/// Every show slot on this page, BY NAME, with the boolean the server wants
+/// in it. The session-controls policy is unchanged: exactly one of "start",
+/// "stop" or "daemon down" is true, so the panel always says something and
+/// never offers a dead button as live. The same rule colors the header pill,
+/// and every status pill is a pair where exactly one side renders.
+///
+/// The names are the compiler's (`show:<condition getter>`), so they are the
+/// signal names in `StatusIsland.ts` — rename a signal there and the layout
+/// test names the missing slot instead of some panel quietly rendering its
+/// neighbour's boolean. The comments carry what the old SHOW_ORDER labels
+/// said; nothing here depends on their order any more.
 fn show_values(
     snap: &StatusSnapshot,
     session: &SessionView,
     flash: Option<&str>,
-) -> [bool; SHOW_COUNT] {
+) -> [(&'static str, bool); SHOW_COUNT] {
     let flash_err = flash.is_some_and(|f| f.starts_with("error"));
     let can_start = session.reachable && !session.running;
+    let running = session.reachable && session.running;
     [
-        session.reachable && session.running,
-        can_start,
-        !session.reachable,
-        !session.reachable, // the top-of-page banner
-        flash.is_some() && !flash_err,
-        flash_err,
-        can_start,
-        session.reachable && session.running,
-        !session.reachable,
-        can_start,
-        !can_start,
-        vigem_ok(snap),
-        !vigem_ok(snap),
-        interception_installed(snap),
-        !interception_installed(snap),
-        autostart_on(snap),
-        !autostart_on(snap),
+        ("show:pillRunning", running),
+        ("show:pillIdle", can_start),
+        ("show:pillDown", !session.reachable),
+        // FIX 1: the unmissable banner, first child of <main> on BOTH pages.
+        ("show:noDaemon", !session.reachable),
+        ("show:flashOk", flash.is_some() && !flash_err),
+        ("show:flashError", flash_err),
+        ("show:canStart", can_start),
+        ("show:canStop", running),
+        ("show:daemonDown", !session.reachable),
+        // profile rows: with Start buttons / inert.
+        ("show:rowsLive", can_start),
+        ("show:rowsPlain", !can_start),
+        ("show:vigemOk", vigem_ok(snap)),
+        ("show:vigemWarn", !vigem_ok(snap)),
+        ("show:icptBorrowed", interception_installed(snap)),
+        ("show:icptAbsent", !interception_installed(snap)),
+        ("show:autostartOn", autostart_on(snap)),
+        ("show:autostartOff", !autostart_on(snap)),
     ]
 }
 
@@ -427,47 +451,189 @@ fn build_slots(
             slots.set(id, value);
         }
     }
-    // Shows by position — still all named `show:createShow` (module docs).
-    for (id, value) in named_slot_ids(module, SHOW_SLOT_NAME)
-        .into_iter()
-        .zip(show_values(snap, session, flash))
-    {
-        slots.set(id, SlotValue::Bool(value));
+    // Shows BY NAME since compiler 0.3.1 (ledger #4 closed): a show whose
+    // signal was renamed degrades to its authored default (false — nothing
+    // renders) instead of silently taking the next show's boolean, which is
+    // what the old positional zip did.
+    for (name, value) in show_values(snap, session, flash) {
+        if let Some(id) = named_slot_ids(module, name).into_iter().next() {
+            slots.set(id, SlotValue::Bool(value));
+        }
     }
     slots
 }
 
-/// The island props JSON: `{"0": <payload>}`, keyed by [`ISLAND_ID`] the way
-/// `loadIslandProps` expects shared props (both pages compile to a single
-/// island with id 0 — each pins that in its layout test). `<` is JSON-escaped
-/// so a hostile snapshot line can never close the `<script>` data block early
-/// — inside JSON, `<` only occurs in strings, where `<` is equivalent.
-pub(crate) fn island_props_json<T: serde::Serialize>(payload: &T) -> String {
-    let mut by_island = serde_json::Map::new();
-    by_island.insert(
-        ISLAND_ID.to_string(),
-        serde_json::to_value(payload).unwrap_or(serde_json::Value::Null),
+/// The id of the DOMAIN PAYLOAD data block — ksx's own channel, not Forma's.
+///
+/// History (dogfood ledger #8, adopted 2026-08-06): this block used to be
+/// `__forma_islands` and used to carry `{"0": <payload>}`, because compiler
+/// 0.2.0 registered islands with EMPTY `slot_ids`, which meant forma-ir's
+/// walker never emitted `data-forma-props` and the islands protocol's
+/// script-tag shared-props path was the only way to get server data to the
+/// client. Compiler 0.3.1 populates `slot_ids`, so the walker emits
+/// `data-forma-props` ITSELF and `loadIslandProps` prefers it — the
+/// impersonation is deleted, along with the island-id keying it needed.
+///
+/// What is left is a genuinely different thing, which is why it kept a block
+/// and got a ksx name: native island props carry the RENDERED SLOT VALUES
+/// (`vigemLine`, `show:canStart`, `list:padTiles:array`, …). The clients own
+/// an editing model over the SOURCE payload — `map.ts` keeps `lastPayload`
+/// and derives conflicts, macro drafts and undo from it — and no slot carries
+/// that. See ledger #19.
+pub(crate) const PAYLOAD_SCRIPT_ID: &str = "__ksx-payload";
+
+/// The slot contract both pages' layout tests assert, in one place because it
+/// is one invariant: **a name the seam injects must be the name the island
+/// actually renders, and a name the island renders must be one the seam
+/// injects.**
+///
+/// Existence is NOT the check, and finding that out cost an evening. Compiler
+/// 0.3.1 keeps every slot name on a page unique by SUFFIXING collisions
+/// (`signal-scope.ts` `uniqueName`), so a signal declared in two scopes — the
+/// ledger #9 twin shape, one careless `createSignal` in `*Page.ts` — mints the
+/// UNSUFFIXED name for the DEAD declaration and pushes the rendered one to
+/// `#2`. `names.contains("vigemLine")` still passes, [`SlotData::from_json`]
+/// still reports the value set, and the page renders its compile-time default
+/// forever. The compiler says so on one build line among the thirteen the
+/// ledger tells you not to chase; nothing else noticed, and every test here
+/// stayed green (verified 2026-08-06 by resurrecting one twin and running the
+/// whole gate).
+///
+/// The island's `slot_ids` ARE the render set — that is what makes them the
+/// right oracle, and the reason ledger #8's fix is load-bearing for more than
+/// `data-forma-props`.
+///
+/// - `injected` — every slot name the seam addresses by name (scalars, lists,
+///   shows). Each must resolve to exactly ONE slot, and that slot must be in
+///   the island's `slot_ids`.
+/// - `client_only` — bare-named slots the seam deliberately never fills,
+///   because the value only exists after an interaction the server has not
+///   had. Every one is a documented exception; anything else rendered by the
+///   island and not injected is the #10 failure mode (a field that silently
+///   shows its authored default).
+/// - `anonymous` — `attr:`/`text:` slots, the compiler's name for a binding it
+///   could not name after a signal. These can NEVER be injected: they render
+///   their compile-time default and nothing else. Pinned as an exact set (a
+///   new one is a review, not a surprise) and asserted non-empty, which is the
+///   guard against ledger #10/#20(a) — an attribute whose value silently
+///   vanishes.
+#[cfg(test)]
+pub(crate) fn assert_island_slot_contract(
+    module: &IrModule,
+    injected: &[&str],
+    client_only: &[&str],
+    anonymous: &[&str],
+) {
+    use std::collections::BTreeSet;
+
+    let entries = module.slots.entries();
+    let name_of = |id: u16| -> &str {
+        entries
+            .iter()
+            .find(|e| e.slot_id == id)
+            .and_then(|e| module.strings.get(e.name_str_idx).ok())
+            .unwrap_or("<unknown>")
+    };
+    let islands = module.islands.entries();
+    assert_eq!(islands.len(), 1, "expected exactly one island");
+    let rendered: BTreeSet<u16> = islands[0].slot_ids.iter().copied().collect();
+
+    for name in injected {
+        let ids = named_slot_ids(module, name);
+        assert_eq!(
+            ids.len(),
+            1,
+            "slot '{name}' occurs {} times — the seam injects the FIRST, so \
+             the others can never be filled",
+            ids.len()
+        );
+        assert!(
+            rendered.contains(&ids[0]),
+            "slot '{name}' (id {}) is injected server-side but the island \
+             never renders it — the compiler gave the rendered binding a \
+             different name (look for '{name}#2' in the build log). Injection \
+             will silently succeed and the page will show the authored \
+             default.",
+            ids[0]
+        );
+    }
+
+    // The converse: every bare-named slot the island renders is either
+    // injected or a documented client-only exception.
+    let rendered_bare: BTreeSet<&str> = rendered
+        .iter()
+        .map(|id| name_of(*id))
+        .filter(|n| !n.contains(':'))
+        .collect();
+    let accounted: BTreeSet<&str> = injected
+        .iter()
+        .copied()
+        .filter(|n| !n.contains(':'))
+        .chain(client_only.iter().copied())
+        .collect();
+    assert_eq!(
+        rendered_bare, accounted,
+        "the island renders scalar slots the seam does not inject (or the \
+         seam claims ones it does not render). An un-injected scalar renders \
+         its authored default on every request, forever, with no error — add \
+         it to the seam, or name it in the client-only list with a reason."
     );
-    serde_json::Value::Object(by_island)
+
+    // Anonymous slots: un-injectable by construction.
+    let anon_found: BTreeSet<&str> = entries
+        .iter()
+        .filter_map(|e| module.strings.get(e.name_str_idx).ok())
+        .filter(|n| n.starts_with("attr:") || n.starts_with("text:"))
+        .collect();
+    let anon_expected: BTreeSet<&str> = anonymous.iter().copied().collect();
+    assert_eq!(
+        anon_found, anon_expected,
+        "the anonymous-slot set changed. These are bindings the compiler \
+         could not name after a signal, so the seam can never inject them — \
+         they render their COMPILE-TIME DEFAULT and nothing else. A new one \
+         is fine only if that default is the finished text (a concatenation \
+         of literals folds; anything reading a signal does not). Check the \
+         default, then pin it here."
+    );
+    for name in &anon_found {
+        let entry = entries
+            .iter()
+            .find(|e| module.strings.get(e.name_str_idx).is_ok_and(|n| n == *name))
+            .expect("just enumerated");
+        assert!(
+            !entry.default_bytes.is_empty(),
+            "anonymous slot '{name}' has an EMPTY default, so it renders as \
+             nothing — this is ledger #10/#20(a) exactly: an attribute with no \
+             value, or a child with no text, and no warning anywhere"
+        );
+    }
+}
+
+/// The domain payload as a JSON data block body. `<` is JSON-escaped so a
+/// hostile snapshot line can never close the `<script>` data block early —
+/// inside JSON, `<` only occurs in strings, where `<` is equivalent.
+pub(crate) fn payload_json<T: serde::Serialize>(payload: &T) -> String {
+    serde_json::to_value(payload)
+        .unwrap_or(serde_json::Value::Null)
         .to_string()
         .replace('<', "\\u003c")
 }
 
-/// Everything that precedes `#app`: the no-JS fallback refresh and the
-/// island props block.
+/// Everything that precedes `#app`: the no-JS fallback refresh and the domain
+/// payload block.
 ///
 /// - The `<noscript>` meta refresh targets `refresh_url` WITHOUT any query
 ///   string: a flash arrives via /?flash=… (post-redirect), shows for one
 ///   cycle, and the next no-JS refresh lands on a clean URL. (With JS the
 ///   poller keeps the page live and the entry clears the flash + URL itself.)
-/// - The props block is `type="application/json"` — a data block, never
-///   executed, outside the CSP's script-src entirely; the client reads it by
-///   id (`__forma_islands`, the islands protocol's script-tag props mode).
+/// - The payload block is `type="application/json"` — a data block, never
+///   executed, outside the CSP's script-src entirely; the entries read it by
+///   id ([`PAYLOAD_SCRIPT_ID`]).
 pub(crate) fn body_prefix<T: serde::Serialize>(payload: &T, refresh_url: &str) -> String {
     format!(
         "<noscript><meta http-equiv=\"refresh\" content=\"{REFRESH_SECS}; url={refresh_url}\"></noscript>\
-         <script id=\"__forma_islands\" type=\"application/json\">{}</script>",
-        island_props_json(payload)
+         <script id=\"{PAYLOAD_SCRIPT_ID}\" type=\"application/json\">{}</script>",
+        payload_json(payload)
     )
 }
 
@@ -564,11 +730,15 @@ mod tests {
 
     /// Pins the slot-table contract the seam depends on: every scalar signal
     /// name exists, the list array slot NAMES are exactly the ones the
-    /// `LIST_SLOT_*` constants claim (order included), there are exactly
-    /// as many `show:createShow` slots as [`SHOW_ORDER`] claims, and the
-    /// island table is the one island the client registry activates. Fails
-    /// when StatusPage.ts/StatusIsland.ts, the compiler's naming scheme, or
-    /// this file drift.
+    /// `LIST_SLOT_*` constants claim (order included), the `show:` slots are
+    /// exactly the ones [`show_values`] addresses BY NAME (ledger #4, adopted
+    /// 2026-08-06 — this replaced a bare count assertion, which was all a
+    /// positional seam could be guarded by), and the island table is the one
+    /// island the client registry activates, carrying real `slot_ids` (ledger
+    /// #8, adopted the same day — the assertion used to be
+    /// `slot_ids.is_empty()`, a tripwire written to fail exactly here).
+    /// Fails when StatusIsland.ts, the compiler's naming scheme, or this file
+    /// drift.
     #[test]
     fn embedded_ir_slot_layout_matches_the_seam() {
         let page = EmbeddedPage::load("/").unwrap();
@@ -606,17 +776,34 @@ mod tests {
             "list slot names drifted between the compiler/StatusIsland.ts and \
              the LIST_SLOT_* constants; slots: {names:?}"
         );
+        // Shows, BY NAME and as a SET: every show slot the page compiles to
+        // is addressed by the seam, and every name the seam addresses exists.
+        // Order is deliberately not asserted — that is the whole point of
+        // ledger #4 being closed.
+        let ir_shows: std::collections::BTreeSet<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| n.starts_with("show:"))
+            .collect();
+        let seam_shows: std::collections::BTreeSet<&str> =
+            show_values(&StatusSnapshot::default(), &SessionView::default(), None)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
         assert_eq!(
-            named_slot_ids(module, SHOW_SLOT_NAME).len(),
-            SHOW_ORDER.len(),
-            "show count drifted between StatusIsland.ts and SHOW_ORDER; slots: {names:?}"
+            ir_shows, seam_shows,
+            "show slots drifted between StatusIsland.ts and show_values()"
+        );
+        assert_eq!(
+            ir_shows.len(),
+            SHOW_COUNT,
+            "SHOW_COUNT is stale; slots: {names:?}"
         );
         // The island table: exactly one island, the whole screen, hydrated
         // on load, named for the activateIslands registry key in status.ts.
-        // Its `slot_ids` are EMPTY under compiler 0.2.0 (ledger #8) — the
-        // reason props ride our own `__forma_islands` block, so if a
-        // compiler bump starts populating them, this fails and the seam
-        // gets to adopt the native props path.
+        // Compiler 0.3.1 populates `slot_ids` (ledger #8 closed), so
+        // forma-ir's walker emits `data-forma-props` itself — the reason the
+        // hand-built `__forma_islands` block is gone from this file.
         let islands = module.islands.entries();
         assert_eq!(islands.len(), 1, "expected exactly one island");
         assert_eq!(islands[0].id, ISLAND_ID);
@@ -625,10 +812,26 @@ mod tests {
             ISLAND_COMPONENT
         );
         assert!(
-            islands[0].slot_ids.is_empty(),
-            "compiler now populates island slot_ids — consider native \
-             data-forma-props emission instead of the __forma_islands block"
+            !islands[0].slot_ids.is_empty(),
+            "island slot_ids are empty — compiler regressed to 0.2.0 \
+             behaviour and native data-forma-props will not be emitted"
         );
+        // …and the slot contract itself: injected == rendered, both ways.
+        // See [`assert_island_slot_contract`] for why "the name exists" is
+        // not the check.
+        let injected: Vec<&str> = scalars
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .chain(
+                list_values(&StatusSnapshot::default())
+                    .iter()
+                    .map(|(n, _)| *n),
+            )
+            .chain(seam_shows.iter().copied())
+            .collect();
+        assert_island_slot_contract(module, &injected, &CLIENT_ONLY_SLOTS, &ANONYMOUS_SLOTS);
     }
 
     #[test]
@@ -661,10 +864,12 @@ mod tests {
         );
     }
 
-    /// The v4 island shape: the SSR walker stamps the island attributes on
-    /// the page root, the props block carries the payload, and the client
-    /// bundle loads via a NONCE'd module script (the strict CSP allows
-    /// nothing else). The anti-flash personality CSS rides the same nonce.
+    /// The island shape: the SSR walker stamps the island attributes on the
+    /// page root, emits NATIVE `data-forma-props` from the island's slot_ids
+    /// (ledger #8, adopted 2026-08-06), the ksx payload block carries the
+    /// source payload beside it, and the client bundle loads via a NONCE'd
+    /// module script (the strict CSP allows nothing else). The anti-flash
+    /// personality CSS rides the same nonce.
     #[test]
     fn render_emits_the_island_its_props_and_nonced_scripts() {
         let page = EmbeddedPage::load("/").unwrap();
@@ -677,10 +882,38 @@ mod tests {
             out.html
         );
         assert!(out.html.contains(r#"data-forma-hydrate="load""#));
-        // The props data block (non-executing, CSP-exempt).
+        // Native island props, carrying the SSR slot values themselves — the
+        // whole point of ledger #8 being closed. `loadIslandProps` prefers
+        // this attribute over any script block, so it IS what the hydrate fn
+        // receives.
+        assert!(
+            out.html.contains("data-forma-props=\""),
+            "compiler 0.3.1 populates slot_ids, so the walker must emit \
+             native props: {}",
+            out.html
+        );
         assert!(
             out.html
-                .contains(r#"<script id="__forma_islands" type="application/json">"#),
+                .contains("&quot;vigemLine&quot;:&quot;installed — service running"),
+            "native props must carry the injected slot VALUES: {}",
+            out.html
+        );
+        assert!(
+            out.html.contains("&quot;show:pillIdle&quot;:true"),
+            "native props must carry the named show booleans: {}",
+            out.html
+        );
+        // We no longer hand-emit the islands protocol's shared-props path.
+        assert!(
+            !out.html.contains("__forma_islands"),
+            "the ledger #8 workaround must be gone: {}",
+            out.html
+        );
+        // The ksx payload data block (non-executing, CSP-exempt) — the SOURCE
+        // payload the client's own model reads (ledger #19).
+        assert!(
+            out.html
+                .contains(r#"<script id="__ksx-payload" type="application/json">"#),
             "{}",
             out.html
         );
@@ -707,35 +940,35 @@ mod tests {
         );
     }
 
-    /// Ledger #5's contract, server side: the island props ARE the
+    /// Ledger #5's contract, server side: the payload block IS the
     /// /api/status payload — one struct, one serializer, so the signals the
     /// client seeds before adoption and the ones the poller overwrites can
     /// never see different shapes. (The poller itself only runs in a
     /// browser; visual confirmation stays a manual step.)
     #[test]
-    fn island_props_match_the_api_payload_shape() {
+    fn the_payload_block_matches_the_api_payload_shape() {
         let payload = StatusPayload {
             snapshot: sample(),
             session: idle_session(),
             flash: None,
         };
-        let props = island_props_json(&payload);
-        let parsed: serde_json::Value = serde_json::from_str(&props).expect("props parse");
+        let json = payload_json(&payload);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("payload parse");
         assert_eq!(
-            parsed[ISLAND_ID.to_string()],
+            parsed,
             serde_json::to_value(&payload).unwrap(),
-            "island props must be byte-compatible with what /api/status serves"
+            "the payload block must be byte-compatible with /api/status"
         );
         // And the rendered page embeds exactly that block.
         let page = EmbeddedPage::load("/").unwrap();
         let out = render_status(&page, &payload.snapshot, &payload.session, None);
-        assert!(out.html.contains(&props), "{}", out.html);
+        assert!(out.html.contains(&json), "{}", out.html);
     }
 
-    /// The props block is a data block inside HTML: a hostile snapshot line
+    /// The payload block is a data block inside HTML: a hostile snapshot line
     /// must not be able to close the script element early.
     #[test]
-    fn island_props_cannot_break_out_of_the_script_block() {
+    fn the_payload_block_cannot_break_out_of_its_script() {
         let mut snap = sample();
         snap.vigem = "</script><script>alert(1)</script>".into();
         let payload = StatusPayload {
@@ -743,13 +976,27 @@ mod tests {
             session: idle_session(),
             flash: Some("</script>".into()),
         };
-        let props = island_props_json(&payload);
-        assert!(!props.contains('<'), "unescaped '<' in props: {props}");
-        let parsed: serde_json::Value = serde_json::from_str(&props).expect("still valid JSON");
+        let json = payload_json(&payload);
+        assert!(!json.contains('<'), "unescaped '<' in payload: {json}");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("still valid JSON");
         assert_eq!(
-            parsed[ISLAND_ID.to_string()]["snapshot"]["vigem"],
+            parsed["snapshot"]["vigem"],
             serde_json::json!("</script><script>alert(1)</script>"),
             "escaping must be lossless"
+        );
+        // The NATIVE props path escapes into an ATTRIBUTE, which is forma-ir's
+        // job — pin that a hostile line cannot break out of it either.
+        let page = EmbeddedPage::load("/").unwrap();
+        let out = render_status(&page, &payload.snapshot, &payload.session, None);
+        let props = out
+            .html
+            .split("data-forma-props=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("native props attribute");
+        assert!(
+            !props.contains("<script"),
+            "native props must be attribute-escaped: {props}"
         );
     }
 
