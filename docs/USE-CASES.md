@@ -53,17 +53,38 @@ Recommendation: (1) now as a setup-time feature, (2) as the durable answer.
 The cabinet's config came from importing 10-year-old XML. Someone starting fresh
 has none of that:
 
-- **`ksx setup` wizard** (biggest gap): enumerate devices → "press a key on player
-  N's panel" using the existing RawInput identify primitive → pick a preset
-  template → write `config.toml`. Without this, first use means hand-writing TOML.
-- **Preset templates** shipped in-box: `arcade-6button` (fighting-game layout),
-  `arcade-4button`, `wasd-keyboard`, `arrows-keyboard`, plus the ported legacy
-  `default`. Today only `default`/`empty` exist.
+- ~~**`ksx setup` wizard**~~ → **SHIPPED (M7)**: `ksx setup` identifies the panel
+  by PRESS through the RawInput observer ("hold a key on the panel for player
+  N" — never a numbered list, which is the only answer that works when two
+  encoders share a hardware id), then walks position-named prompts
+  (`SOUTH`, not `A`), auto-advances, refuses an already-taken key inline, audits
+  for completeness (it warns when the panel can reach neither START nor BACK —
+  the cabinet's exit keys), and commits TRANSACTIONALLY: nothing is written
+  until the review screen is confirmed, and wiring the slot into `config.toml`
+  (or a `--profile` games entry) is asked, never assumed. It offers the next
+  player when a slot is done, so P1→P4 is one run. The state machine is pure
+  and unit-tested; the interactive loop only prints and reads.
+  **Deliberate deviation from ES**: skipping is "press nothing" with a visible
+  countdown rather than hold-to-skip — the Raw Input observer re-baselines held
+  keys, so a hold is invisible without taxing every press with an autorepeat
+  probe. Two silent prompts end the run, which makes bailing out cheaper than
+  ES's ~40 s of holding.
+- ~~**Preset templates**~~ → **SHIPPED (M7)**, in `ksx-core/src/templates.rs`
+  beside the built-ins: `arcade-6button` (I-PAC2/MAME six-button fighting panel,
+  P1–P2 key blocks), `arcade-4way` (MAME's four-player chart, P1–P4),
+  `keyboard-wasd` (one ordinary keyboard — give each player their own and
+  nothing collides), plus `default`/`empty` as named seeds. `ksx preset list
+  --templates` / `ksx preset new <NAME> --from-template <ID> [--player N]`.
+  Every direction binds the hat AND the left stick, because some games read only
+  one; that is fan-out, not duplication.
 - **`ksx install-drivers` should also offer Interception**, not just ViGEmBus — a
   fresh machine has neither. (License note in `docs/DRIVERS.md`: Interception is
   LGPL/non-commercial; bundling its installer is fine, commercial use is not.)
-- **Quickstart in the README** written for someone who has never seen the legacy
-  app, ending at "your panel now moves a controller".
+- ~~**Quickstart**~~ → **SHIPPED (M7)**: [`QUICKSTART.md`](QUICKSTART.md) — a
+  fresh machine to four working players, written for someone who has never seen
+  the legacy app: drivers, the capture-mode decision spelled out as a table,
+  templates for the fast path and the wizard for the sure one, slot wiring, and
+  the "fix one binding" flow that means you never re-run the wizard.
 - **`ksx map` verbs** (ENHANCEMENTS E5) so a preset can be edited without TOML —
   and so an AI assistant can configure a cabinet conversationally.
 
@@ -106,7 +127,13 @@ Fold into the roadmap after M5, without delaying the M6 deadline work:
   does nothing**, and injected keys never reach the secure desktop — mitigated by
   autostart, a mandatory second keyboard (`ksx winusb claim` refuses the last
   one), and `ksx winusb release`.
-- **M8 "general availability"** (new): `ksx setup` wizard, preset templates,
+- **M7 "general availability"**: `ksx setup` wizard, preset templates,
   Interception in `install-drivers`, quickstart docs, `ksx map` verbs, and a
   tested T2/T4 path. This is what turns "Victor's cabinet software" into
   "the thing people install instead of the abandoned app".
+  → **Landed so far**: `ksx map` and its whole verb family; `ksx setup`;
+  `ksx preset list --templates` / `ksx preset new --from-template`;
+  [`QUICKSTART.md`](QUICKSTART.md).
+  → **Still open**: offering Interception inside `ksx install-drivers` (licence
+  note above), and T2/T4 tested on real hardware — the wizard makes T2 *easy*
+  (each keyboard identifies itself by press) but easy is not tested.

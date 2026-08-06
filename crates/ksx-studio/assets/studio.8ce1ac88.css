@@ -2829,6 +2829,99 @@ a.strow:hover {
   opacity: 0.6;
 }
 
+/* FIX 1 — THE ONE SENTENCE. Permanent, above the grid, and styled as a rule
+   rather than as prose: it is the fact the piano roll cannot draw. Not behind
+   a disclosure, a tooltip or a hover, because the evening it cost was spent
+   looking for a timing bug that was never there. */
+.macconcept {
+  margin: 0 0 var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  background: var(--accent-dim);
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  line-height: 1.45;
+}
+
+/* FIX 2 — Save's short-step question. It sits between the button and the
+   grid, so the answer is where the click was. */
+.macconfirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-3);
+  margin: 0 0 var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--warn-line);
+  border-left-width: 3px;
+  border-radius: var(--r-sm);
+  background: var(--warn-dim);
+}
+
+.macconfirm.off {
+  display: none;
+}
+
+.macconfirmline {
+  flex: 1 1 18rem;
+  margin: 0;
+  min-width: 0;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--text-primary);
+}
+
+.macconfirmbtns {
+  display: flex;
+  flex: 0 0 auto;
+  gap: var(--sp-2);
+}
+
+.macsaveyes {
+  border-color: var(--warn-line);
+  color: var(--warn);
+  font-weight: var(--fw-semibold);
+}
+
+/* FIX 1c — the common-motion helpers. JS-only, like every other draft edit on
+   this card: without JavaScript there is nothing for them to append to. */
+.macmotions {
+  display: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-3);
+}
+
+.studio.js .macmotions {
+  display: flex;
+}
+
+.macmotlbl {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.macmot {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+}
+
+.macmotnote {
+  flex: 1 1 100%;
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  line-height: 1.4;
+}
+
 .macnewbox {
   display: none;
   flex-wrap: wrap;
@@ -2934,8 +3027,11 @@ a.strow:hover {
   color: var(--text-tertiary);
 }
 
+/* A COLUMN, not "whatever is left after the text before it": the durations are
+   compared down the list ("which step is the odd one out?"), and numbers that
+   start at a different x on every row cannot be. */
 .macdur {
-  flex: 0 0 auto;
+  flex: 0 0 6.5rem;
   font-family: var(--mono);
   font-size: var(--fs-xs);
   font-weight: var(--fw-bold);
@@ -2962,17 +3058,55 @@ a.strow:hover {
   display: none;
 }
 
-.macrow.short .macnum {
+/* FIX 2 — a below-floor row is MARKED, not merely annotated: the amber runs
+   down its edge and tints the whole row, so it is visible from the number
+   column without reading a word. */
+.macrow.short {
+  border-left: 3px solid var(--warn);
+  padding-left: calc(var(--sp-1) - 3px);
+  background: var(--warn-dim);
+}
+
+.macrow.short:nth-child(even) {
+  background: var(--warn-dim);
+}
+
+.macrow.short .macnum,
+.macrow.short .macdur {
   color: var(--warn);
 }
 
+/* FIX 1 — WHAT THE ROW HOLDS, in words. First-class text: this is the row's
+   MEANING, and it used to be tertiary-grey filler at the end of the line. */
 .machold {
-  flex: 1 1 auto;
+  flex: 0 0 15rem;
   min-width: 0;
   font-size: var(--fs-xs);
-  color: var(--text-tertiary);
+  font-weight: var(--fw-semibold);
+  color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* THE ONE THE GRID CANNOT TEACH: a row holding two or more controls at once.
+   That row is the diagonal, and it gets the accent plus a `2 controls` tail so
+   "one step, two things held" is legible without counting lit cells. */
+.machold.both {
+  color: var(--accent);
+}
+
+.machold.both::after {
+  content: " · held together";
+  font-weight: var(--fw-regular);
+  color: var(--text-tertiary);
+}
+
+/* A neutral gap is a step too — it says so rather than reading as an empty
+   row somebody forgot to fill in. */
+.machold.none {
+  font-weight: var(--fw-regular);
+  font-style: italic;
+  color: var(--text-tertiary);
 }
 
 .macbtns {
@@ -3132,6 +3266,15 @@ a.strow:hover {
 .macdurin,
 .macturboin {
   width: 5.5rem;
+}
+
+/* FIX 2 — the OFFENDING FIELD, not a note elsewhere. The number in this box is
+   what is below the sampling floor, so this box is what turns amber. */
+.macdurin.short {
+  border-color: var(--warn);
+  background: var(--warn-dim);
+  color: var(--warn);
+  font-weight: var(--fw-semibold);
 }
 
 .macturbounit {
@@ -3462,11 +3605,24 @@ a.strow:hover {
 }
 
 @media (max-width: 45rem) {
+  /* The hold readout used to be the first thing dropped here — which left a
+     narrow window showing exactly the piano roll that taught nobody what a
+     diagonal is. It stays; the MATRIX gives up the width instead (it scrolls,
+     and the row height stays fixed so the two columns keep their alignment).
+     Only the "· held together" tail goes, because the accent already says it. */
   .macrowbar {
-    max-width: 45%;
+    max-width: 70%;
   }
 
   .machold {
-    display: none;
+    flex-basis: 9rem;
+  }
+
+  .macdur {
+    flex-basis: 5.5rem;
+  }
+
+  .machold.both::after {
+    content: "";
   }
 }

@@ -27,7 +27,7 @@ import path from "node:path";
 import { chromium } from "playwright";
 
 /** OUR port, never the 4460 a real `ksx studio` sits on. */
-const PORT = Number(process.env.KSX_PWTEST_PORT ?? 4474);
+const PORT = Number(process.env.KSX_PWTEST_PORT ?? 4475);
 const BASE = `http://127.0.0.1:${PORT}`;
 /** map.ts's POLL_MS is 2000; anything above it has crossed at least one poll. */
 const PAST_ONE_POLL = 2600;
@@ -116,6 +116,17 @@ function editorState(page) {
     ),
     stepLine: document.querySelector(".macsteplbl")?.textContent ?? "",
     activeClass: document.activeElement?.className ?? "",
+    // FIX 1: the plain-language readout on every row — what this step holds.
+    holds: [...document.querySelectorAll(".macrowbar .machold")].map((h) => h.textContent),
+    holdClasses: [...document.querySelectorAll(".macrowbar .machold")].map(
+      (h) => h.className,
+    ),
+    // FIX 2: the duration field's own warn class, and Save's question.
+    durClass: document.querySelector(".macdurin")?.className ?? "",
+    confirmClass: document.querySelector(".macconfirm")?.className ?? "",
+    confirmLine: document.querySelector(".macconfirmline")?.textContent ?? "",
+    shortRows: document.querySelectorAll(".macrow.short").length,
+    dirty: document.querySelector(".macdirty")?.textContent ?? "",
   }));
 }
 
@@ -225,6 +236,179 @@ describe("the macro editor's duration controls", () => {
         "frames",
         "the reloaded preset came back in ms",
       );
+    } finally {
+      await page.close();
+    }
+  });
+});
+
+// ── FIX 1: a row can hold several controls, and it SAYS so ─────────────────
+// The evening this pins: Victor's "hadouken" had rows ↓ then → then X and no
+// diagonal at all, because a diagonal is not an input you bind — it IS
+// down+forward held together, i.e. ONE ROW HOLDING TWO CONTROLS. The piano
+// roll never taught that, and two lit cells twelve columns apart never will.
+// The readout has to be LIVE: it is only a teacher if it changes under the
+// finger that is ticking the cells.
+
+describe("what a step holds, in words", () => {
+  test("the readout updates as cells are toggled", async () => {
+    const page = await openEditor();
+    try {
+      // The fixture's step 1 holds one direction, and says so.
+      const start = await editorState(page);
+      assert.equal(start.holds[0], "D-pad ▼");
+      assert.equal(start.holdClasses[0], "machold");
+
+      // Tick a SECOND control into the SAME row — the whole lesson.
+      await page.locator('[data-cell="0|dpad.right"]').click();
+      const chord = await editorState(page);
+      assert.equal(
+        chord.holds[0],
+        "D-pad ▼ + D-pad ▶",
+        "the row did not say it now holds two controls",
+      );
+      assert.equal(
+        chord.holdClasses[0],
+        "machold both",
+        "the two-control row is not marked as one",
+      );
+
+      // Untick both and the row reads as what it now is: a neutral gap, not a
+      // row somebody forgot to fill in.
+      await page.locator('[data-cell="0|dpad.right"]').click();
+      await page.locator('[data-cell="0|dpad.down"]').click();
+      const empty = await editorState(page);
+      assert.equal(empty.holds[0], "(nothing — neutral gap)");
+      assert.equal(empty.holdClasses[0], "machold none");
+
+      // And it survives a poll, like every other draft edit.
+      await settle(page);
+      assert.equal((await editorState(page)).holds[0], "(nothing — neutral gap)");
+    } finally {
+      await page.close();
+    }
+  });
+
+  test("a common motion inserts the chord step nobody thinks to write", async () => {
+    const page = await openEditor();
+    try {
+      const before = (await editorState(page)).holds.length;
+      await page.locator('[data-macmotion="qcf"]').click();
+      const after = await editorState(page);
+      assert.equal(after.holds.length, before + 3, "a quarter-circle is three steps");
+
+      // The three appended steps, in order — the middle one is the diagonal.
+      const added = after.holds.slice(before);
+      assert.deepEqual(added, ["D-pad ▼", "D-pad ▼ + D-pad ▶", "D-pad ▶"]);
+      assert.equal(after.holdClasses[before + 1], "machold both");
+
+      // Generated ABOVE the sampling floor: a helper that seeded steps the
+      // sampler cannot see would teach the exact mistake it exists to prevent.
+      assert.equal(after.shortRows, 0, "the generated steps are below the floor");
+      assert.match(after.dirty, /unsaved/);
+    } finally {
+      await page.close();
+    }
+  });
+});
+
+// ── FIX 2: a below-floor step cannot be missed ─────────────────────────────
+// The advisory existed and read as decoration, so the 1-frame steps went in
+// anyway. It is now on the offending FIELD, on the ROW, and between the click
+// and the write — but it never refuses, because a short step is legal.
+
+describe("a step shorter than the sampling floor", () => {
+  test("a 1-frame step marks its field and its row, in frames", async () => {
+    const page = await openEditor();
+    try {
+      await page.locator('[data-macact="sel|0"]').click();
+      await page.locator(".macunit").selectOption("frames");
+      const box = page.locator(".macdurin");
+      await box.click();
+      await box.fill("1");
+      await box.blur();
+
+      const state = await editorState(page);
+      assert.equal(state.duration, "1");
+      assert.match(state.durClass, /\bshort\b/, "the duration field is not flagged");
+      assert.equal(state.shortRows, 1, "the row is not marked");
+      // Answered in the unit it was AUTHORED in — not "16 ms", a number this
+      // author never typed.
+      assert.match(state.stepLine, /1 frame is shorter than the 2-frame floor/);
+
+      // Back above the floor and every mark goes away.
+      await box.fill("3");
+      await box.blur();
+      const fixed = await editorState(page);
+      assert.equal(fixed.durClass, "macdurin");
+      assert.equal(fixed.shortRows, 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  // Runs BEFORE the test that saves a short step: the fixture keeps what Save
+  // wrote (that is what makes "survives a reload" testable at all), so an
+  // "ordinary save" case has to be asserted while the preset is still ordinary.
+  test("a macro with nothing short saves on the first click", async () => {
+    const page = await openEditor();
+    try {
+      await page.locator('[data-macact="sel|0"]').click(); // 50 ms, authored in ms
+      const box = page.locator(".macdurin");
+      await box.click();
+      await box.fill("60");
+      await box.blur();
+      assert.equal((await editorState(page)).shortRows, 0);
+
+      await page.locator('[data-act="macro-save"]').click();
+      await page.waitForFunction(() =>
+        (document.querySelector(".macdirty")?.textContent ?? "").startsWith("saved"),
+      );
+      assert.match(
+        (await editorState(page)).confirmClass,
+        /\boff\b/,
+        "an ordinary save asked a question it had no reason to ask",
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  test("Save asks before it writes one, and never refuses", async () => {
+    const page = await openEditor();
+    try {
+      await page.locator('[data-macact="sel|0"]').click();
+      await page.locator(".macunit").selectOption("frames");
+      const box = page.locator(".macdurin");
+      await box.click();
+      await box.fill("1");
+      await box.blur();
+
+      // FIRST click: the question, not the write.
+      await page.locator('[data-act="macro-save"]').click();
+      const asked = await editorState(page);
+      assert.doesNotMatch(asked.confirmClass, /\boff\b/, "Save wrote it silently");
+      assert.match(asked.confirmLine, /1 step is shorter than ~33 ms \(2 frames at 60 Hz\)/);
+      assert.match(asked.confirmLine, /Save anyway\?$/);
+      assert.match(asked.dirty, /unsaved/, "the draft was written while being asked about");
+
+      // "Not yet" takes it down and leaves the preset alone.
+      await page.locator('[data-act="macro-save-cancel"]').click();
+      const cancelled = await editorState(page);
+      assert.match(cancelled.confirmClass, /\boff\b/);
+      assert.match(cancelled.dirty, /unsaved/, "cancelling wrote the macro");
+
+      // Ask again, then answer it: the save goes through exactly as authored.
+      await page.locator('[data-act="macro-save"]').click();
+      assert.doesNotMatch((await editorState(page)).confirmClass, /\boff\b/);
+      await page.locator('[data-act="macro-save-anyway"]').click();
+      await page.waitForFunction(() =>
+        (document.querySelector(".macdirty")?.textContent ?? "").startsWith("saved"),
+      );
+      const saved = await editorState(page);
+      assert.match(saved.confirmClass, /\boff\b/, "the question outlived the answer");
+      // The short step is still short — the save never rewrote it.
+      assert.equal(saved.shortRows, 1);
     } finally {
       await page.close();
     }

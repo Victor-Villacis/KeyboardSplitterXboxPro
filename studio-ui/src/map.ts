@@ -31,11 +31,15 @@ import {
   keyList,
   learnAllowed,
   liveProfile,
+  macroAskAboutShortSteps,
+  macroClearShortStepQuestion,
   macroDraftTriggers,
+  macroInsertMotion,
   macroIsDirty,
   macroIsOnDisk,
   macroNameProblem,
   macroOnDiskCopy,
+  macroShortStepQuestion,
   macroSeededFrom,
   macroSetAllowShort,
   macroSetDuration,
@@ -1243,8 +1247,16 @@ function macroTarget(): { mac: MacroView; preset: string } | null {
   return { mac, preset };
 }
 
-/** SAVE: the whole draft table into the preset. */
-async function macroSave(): Promise<void> {
+/** SAVE: the whole draft table into the preset.
+ *
+ *  FIX 2 — a draft holding a step below the sampling floor is not saved on the
+ *  first click. The card ASKS, inline, with the count in it, and the second
+ *  click writes it exactly as authored. Never a refusal: a short step is legal
+ *  and `allow_short` exists so one can be written on purpose. What it stops is
+ *  the SILENT save — which is how an evening went into a hadouken whose steps
+ *  were one frame long, with the explanation sitting under the grid being read
+ *  as decoration. */
+async function macroSave(confirmed = false): Promise<void> {
   const target = macroTarget();
   if (!target) return;
   const { mac, preset } = target;
@@ -1252,6 +1264,10 @@ async function macroSave(): Promise<void> {
     pushToast(`"${mac.name}" already matches the preset file — nothing to save.`, { kind: "warn" });
     return;
   }
+  // The question, once. `macroAskAboutShortSteps` answers false when there is
+  // nothing below the floor, which is the ordinary save and costs no click.
+  if (!confirmed && macroAskAboutShortSteps()) return;
+  macroClearShortStepQuestion();
   // Read BEFORE the write: this is the entire undo.
   const before = macroOnDiskCopy(mac.name);
   const out = await macroWrite(preset, mac);
@@ -1267,9 +1283,13 @@ async function macroSave(): Promise<void> {
   let line =
     `"${mac.name}" saved into "${preset}" — ${mac.steps.length} step` +
     `${mac.steps.length === 1 ? "" : "s"}.${macroNotes(out)}`;
+  // Confirmed is not forgotten: the toast repeats what was agreed to, so the
+  // fact survives the bar coming down.
+  const short = macroShortStepQuestion();
+  if (short !== "") line += ` Saved as authored: ${short.replace(/\. Save anyway\?$/, ".")}`;
   if (out.reloaded) line += " The running session is already playing this version.";
   pushToast(line, {
-    kind: out.warnings.length > 0 ? "warn" : "ok",
+    kind: out.warnings.length > 0 || short !== "" ? "warn" : "ok",
     undo: undoMacroTo(preset, before, mac.name),
     undone:
       before === null
@@ -1543,6 +1563,24 @@ function macroCell(payload: string): void {
   syncMacroControls();
 }
 
+/** FIX 1c: one of the ready-made motions, appended to the draft. The toast is
+ *  the teaching — it names which step holds two controls and why that is what
+ *  a diagonal is, because the point of the helper is the concept, not the
+ *  typing it saves. */
+function macroMotion(name: string): void {
+  if (!currentMacro()) {
+    oops(
+      "No macro is loaded, so there is nothing to add a motion to. Pick one from the tabs " +
+        "above, or type a name and press ＋ New macro.",
+    );
+    return;
+  }
+  const said = macroInsertMotion(name);
+  if (said === null) return;
+  syncMacroControls();
+  pushToast(`${said} (Nothing is written until you do — "Revert to file" undoes this.)`);
+}
+
 /** Switch the editor to another of the preset's macros. Unsaved grid edits are
  *  DISCARDED — and said so, naming what they were, because the one thing this
  *  page never does is lose work quietly. */
@@ -1631,6 +1669,12 @@ function wire(root: HTMLElement): void {
     if (macact) {
       ev.preventDefault();
       macroAct(macact);
+      return;
+    }
+    const motion = target.closest<HTMLElement>("[data-macmotion]")?.dataset.macmotion;
+    if (motion) {
+      ev.preventDefault();
+      macroMotion(motion);
       return;
     }
     const macro = target.closest<HTMLElement>("[data-macro]")?.dataset.macro;
@@ -1736,6 +1780,23 @@ function wire(root: HTMLElement): void {
     // draft. ─────────────────────────────────────────────────────────────
     if (act === "macro-save") {
       void macroSave();
+      return;
+    }
+    // FIX 2: the answers to Save's short-step question. "Save anyway" is the
+    // same write with the asking skipped; "Not yet" just takes the bar down
+    // and leaves the preset alone.
+    if (act === "macro-save-anyway") {
+      void macroSave(true);
+      return;
+    }
+    if (act === "macro-save-cancel") {
+      macroClearShortStepQuestion();
+      pushToast(
+        "Nothing was written — the preset file is untouched. The amber rows are the short " +
+          "steps: pick one's ⏱ and give it 33 ms (2 frames) or more, and the flag goes away. " +
+          "If you meant it, Save anyway writes it exactly as authored.",
+        { kind: "warn" },
+      );
       return;
     }
     if (act === "macro-new") {

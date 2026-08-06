@@ -18,8 +18,10 @@ mod map;
 mod mapping;
 mod monitor;
 mod pads;
+mod preset_cli;
 mod run;
 mod session;
+mod setup;
 #[cfg(feature = "studio")]
 mod studio;
 mod winusb;
@@ -35,6 +37,92 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// First contact: identify a panel by pressing it, map it, write the config
+    ///
+    /// The wizard for a machine that has never run ksx (docs/USE-CASES.md
+    /// "adoption gaps"). It asks you to HOLD A KEY on the panel you want to set
+    /// up — never to pick a device from a numbered list, because on a cabinet
+    /// with two identical encoders that is not a question anyone can answer —
+    /// and then walks one control at a time: press the button the prompt names,
+    /// it binds and moves on.
+    ///
+    /// PROMPTS ARE POSITION-NAMED. It asks for SOUTH, not "A": the letter is in
+    /// a different place on a Nintendo pad and most arcade panels are labelled
+    /// by position anyway. What gets STORED is ksx's own function vocabulary
+    /// (`A`, `dpad.up`, `lx.min`) — the prompt is for you, the name is for the
+    /// file. Each stick direction binds the D-pad AND the left stick from one
+    /// press, because some games read only one of them.
+    ///
+    /// SKIPPING: press nothing. Every prompt runs a visible countdown
+    /// (--step-secs, default 6) and skips the control when it expires; two
+    /// silent prompts in a row end the run and skip everything left, so bailing
+    /// out of the optional tail costs about twelve seconds. A key that already
+    /// drives another control in this run is refused inline ("ALREADY TAKEN")
+    /// and the prompt stays put. `Escape` cancels the whole run and is the only
+    /// reserved key.
+    ///
+    /// NOTHING IS WRITTEN UNTIL YOU SAY SO. The run ends at a review screen: a
+    /// table of what was bound, then a completeness audit (it warns when the
+    /// panel can reach neither START nor BACK — on a cabinet those are the exit
+    /// keys), then a yes/no. "No" discards everything. Only after "yes" does it
+    /// ask whether to point a slot at it, in config.toml or — with --profile —
+    /// inside a games.toml profile. It asks rather than assumes.
+    ///
+    /// MULTI-PLAYER: after each slot it offers the next one, so P1 through P4
+    /// is one continuous run.
+    ///
+    /// STOP EMULATION FIRST. While `ksx run` has a panel captured, Interception
+    /// suppresses its keystrokes below win32k and the wizard's Raw Input
+    /// observer hears nothing at all.
+    ///
+    /// Exit codes: 0 = written, discarded or a dry run, 1 = error, 2 = refused
+    /// (no panel identified, nothing bound, an unknown --profile).
+    Setup {
+        /// Slot to set up first; later players continue from it (1..=8)
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
+        slot: u8,
+        /// Name the preset it writes (default: "Player <N>")
+        #[arg(long, value_name = "NAME")]
+        preset: Option<String>,
+        /// Wire finished slots into this games.toml profile instead of config.toml
+        #[arg(long, value_name = "TITLE")]
+        profile: Option<String>,
+        /// Seconds each prompt listens before skipping that control
+        #[arg(long, value_name = "N", default_value_t = setup::DEFAULT_STEP_SECS)]
+        step_secs: u64,
+        /// Run the whole wizard and report what it WOULD write; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// One JSON object on stdout instead of the prose summary (prompts stay
+        /// on stderr)
+        #[arg(long)]
+        json: bool,
+    },
+    /// List presets, or start a new one from an in-box template
+    ///
+    /// `list` shows what is in the presets folder; `list --templates` shows the
+    /// layouts that ship inside the binary. `new` turns one of those templates
+    /// into an ordinary preset file you own and can edit.
+    ///
+    /// The templates exist so that a standard panel needs NO mapping session at
+    /// all (docs/MAPPER-UX.md commandment 9): an I-PAC ships MAME-ready, so ksx
+    /// ships the same chart. `arcade-6button` is the two-player, six-button
+    /// fighting panel; `arcade-4way` is the four-player, two-button cabinet;
+    /// `keyboard-wasd` is one ordinary keyboard; `default` and `empty` are the
+    /// two built-ins, copied under a name of your choosing.
+    ///
+    /// Multi-player templates carry a key block per player — `--player 2`
+    /// writes player 2's keys, which on an I-PAC is a different set of
+    /// scancodes from the SAME encoder. That is the primary topology: one
+    /// board, four slots.
+    ///
+    /// Exit codes: 0 = listed / written / dry run, 1 = error, 2 = refused
+    /// (unknown template, no such player block, or a preset of that name
+    /// already exists and --force was not given); nothing written.
+    Preset {
+        #[command(subcommand)]
+        command: PresetCommand,
+    },
     /// Start emulation: plug the pads, capture the assigned keyboards, translate
     ///
     /// Resolves `[[slot]]` entries (or a `--game` profile) into virtual Xbox 360
@@ -969,6 +1057,53 @@ fn parse_persona(s: &str) -> Result<ksx_core::Persona, ksx_core::UnknownPersona>
     s.parse()
 }
 
+#[derive(Subcommand)]
+enum PresetCommand {
+    /// What presets exist — on disk, or (--templates) in the box
+    ///
+    /// The disk listing names every preset the store can load and the file it
+    /// came from. `--templates` switches to the in-box layouts instead, with
+    /// the player blocks each one carries; add `--json` for their panel notes
+    /// and the exact keys they expect.
+    List {
+        /// List the in-box templates instead of the presets on disk
+        #[arg(long)]
+        templates: bool,
+        /// One JSON object on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a new preset from an in-box template
+    ///
+    /// One atomic write, validated the same way every other preset write is.
+    /// The result is an ORDINARY preset: not protected, editable by `ksx map`,
+    /// by Studio's mapper or by hand.
+    ///
+    /// Refuses to overwrite an existing preset of the same name; --force does
+    /// it anyway and copies the old file to <preset>.toml.bak-YYYYMMDD-HHMMSS
+    /// first (the same backups `ksx map --list-backups` shows).
+    New {
+        /// Name for the new preset (also its file name)
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Template id — `ksx preset list --templates` names them
+        #[arg(long, value_name = "ID")]
+        from_template: String,
+        /// Which player's key block to write, for templates that carry several
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
+        player: u8,
+        /// Overwrite an existing preset of this name (backup taken first)
+        #[arg(long)]
+        force: bool,
+        /// Print the TOML it would write; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// One JSON object on stdout
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// What `ksx autostart` registers as the logon task. The clap-facing twin of
 /// [`ksx_platform::autostart::TaskMode`] (the platform crate stays clap-free);
 /// the rationale for `daemon` being the default lives on that type.
@@ -1003,6 +1138,44 @@ fn main() -> anyhow::Result<()> {
     logging::announce(&sink);
     let cli = Cli::parse();
     match cli.command {
+        Command::Setup {
+            slot,
+            preset,
+            profile,
+            step_secs,
+            dry_run,
+            json,
+        } => setup::run(setup::Options {
+            slot,
+            preset,
+            profile,
+            step_secs,
+            dry_run,
+            json,
+        }),
+        Command::Preset { command } => preset_cli::run(match command {
+            PresetCommand::List { templates, json } => preset_cli::Options {
+                action: preset_cli::Action::List { templates },
+                json,
+            },
+            PresetCommand::New {
+                name,
+                from_template,
+                player,
+                force,
+                dry_run,
+                json,
+            } => preset_cli::Options {
+                action: preset_cli::Action::New {
+                    name,
+                    from_template,
+                    player,
+                    force,
+                    dry_run,
+                },
+                json,
+            },
+        }),
         Command::Run {
             game,
             no_launch,
@@ -2448,6 +2621,185 @@ mod tests {
             }
             _ => panic!("parsed to the wrong subcommand"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // M7 general availability: ksx setup + ksx preset
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn setup_defaults_to_slot_one_and_takes_the_wizard_flags() {
+        let cli = Cli::try_parse_from(["ksx", "setup"]).unwrap();
+        match cli.command {
+            Command::Setup {
+                slot,
+                preset,
+                profile,
+                step_secs,
+                dry_run,
+                json,
+            } => {
+                assert_eq!(slot, 1);
+                assert_eq!(preset, None);
+                assert_eq!(profile, None);
+                assert_eq!(step_secs, setup::DEFAULT_STEP_SECS);
+                assert!(!dry_run && !json);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "ksx",
+            "setup",
+            "--slot",
+            "3",
+            "--preset",
+            "Cabinet",
+            "--profile",
+            "MAME 4P",
+            "--step-secs",
+            "10",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Setup {
+                slot,
+                preset,
+                profile,
+                step_secs,
+                dry_run,
+                json,
+            } => {
+                assert_eq!(slot, 3);
+                assert_eq!(preset.as_deref(), Some("Cabinet"));
+                assert_eq!(profile.as_deref(), Some("MAME 4P"));
+                assert_eq!(step_secs, 10);
+                assert!(dry_run && json);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+
+        // Slots are 1..=8 (5..=8 need a PlayStation persona; XInput has four).
+        assert!(Cli::try_parse_from(["ksx", "setup", "--slot", "0"]).is_err());
+        assert!(Cli::try_parse_from(["ksx", "setup", "--slot", "9"]).is_err());
+    }
+
+    /// The wizard's `--help` has to carry the promises the design rests on:
+    /// press-to-identify, position names, the skip affordance, and the fact
+    /// that nothing is written until the review screen is confirmed.
+    #[test]
+    fn setup_help_states_press_to_identify_and_the_transaction() {
+        let mut cmd = Cli::command();
+        let setup = cmd.find_subcommand_mut("setup").unwrap();
+        let help = setup.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "HOLD A KEY",
+            "never to pick a device from a numbered list",
+            "It asks for SOUTH, not \"A\"",
+            "NOTHING IS WRITTEN UNTIL YOU SAY SO",
+            "ALREADY TAKEN",
+            "neither START nor BACK",
+            "STOP EMULATION FIRST",
+        ] {
+            assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
+        }
+    }
+
+    #[test]
+    fn preset_list_takes_the_templates_switch() {
+        let cli = Cli::try_parse_from(["ksx", "preset", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Preset {
+                command: PresetCommand::List {
+                    templates: false,
+                    json: false
+                }
+            }
+        ));
+        let cli = Cli::try_parse_from(["ksx", "preset", "list", "--templates", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Preset {
+                command: PresetCommand::List {
+                    templates: true,
+                    json: true
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn preset_new_requires_a_template_and_defaults_to_player_one() {
+        // The template is the whole point of the verb: no guessing a default.
+        assert!(Cli::try_parse_from(["ksx", "preset", "new", "P1"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "ksx",
+            "preset",
+            "new",
+            "P1",
+            "--from-template",
+            "arcade-6button",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Preset {
+                command:
+                    PresetCommand::New {
+                        name,
+                        from_template,
+                        player,
+                        force,
+                        dry_run,
+                        json,
+                    },
+            } => {
+                assert_eq!(name, "P1");
+                assert_eq!(from_template, "arcade-6button");
+                assert_eq!(player, 1);
+                assert!(!force && !dry_run && !json);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "ksx",
+            "preset",
+            "new",
+            "P2",
+            "--from-template",
+            "arcade-4way",
+            "--player",
+            "4",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Preset {
+                command: PresetCommand::New { player, force, .. },
+            } => {
+                assert_eq!(player, 4);
+                assert!(force);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+
+        // Player blocks are 1..=4; no template carries more.
+        assert!(Cli::try_parse_from([
+            "ksx",
+            "preset",
+            "new",
+            "P5",
+            "--from-template",
+            "arcade-4way",
+            "--player",
+            "5",
+        ])
+        .is_err());
     }
 
     #[test]

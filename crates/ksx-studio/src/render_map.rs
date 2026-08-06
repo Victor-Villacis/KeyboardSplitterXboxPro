@@ -945,6 +945,13 @@ const SEL_TOGGLE_LABEL_OFF: &str = "Select multiple";
 /// `the_sampling_floor_matches_ksx_core`.
 pub(crate) const MIN_STEP_MS: u32 = 33;
 
+/// The same floor counted the way a FRAME author counts it: two 60 Hz samples.
+/// `frames_ms(2)` is exactly [`MIN_STEP_MS`], which is the point — a warning
+/// about a `frames = 1` step that answers in milliseconds is asking its reader
+/// to do the conversion that got them there. Pinned in
+/// `the_sampling_floor_and_frame_maths_match_ksx_core`.
+pub(crate) const MIN_STEP_FRAMES: u32 = 2;
+
 /// The fastest turbo a file may ASK for, and a MIRROR of
 /// `ksx_core::TURBO_MAX_HZ` for the same reason as above: one cycle is a press
 /// AND a release, so a 60 Hz poll resolves at most 30 of them a second.
@@ -989,6 +996,11 @@ fn duration_text(step: &MacroStepView) -> String {
     }
 }
 
+/// Is this step below the sampling floor at all? (Both spellings, one rule.)
+fn step_is_short(step: &MacroStepView) -> bool {
+    requested_ms(step).is_some_and(|ms| ms < MIN_STEP_MS)
+}
+
 /// The INLINE amber flag — short enough to always fit on the row beside the
 /// duration, because a truncated warning is a warning nobody reads. The rule
 /// it is short for is stated once, in full, in the card's own note; the whole
@@ -997,13 +1009,28 @@ fn step_warning(step: &MacroStepView) -> String {
     match (step.ms, step.frames) {
         (Some(_), Some(_)) => "two units".to_owned(),
         (None, None) => "no duration".to_owned(),
-        _ => match requested_ms(step) {
-            Some(ms) if ms < MIN_STEP_MS && step.allow_short => {
-                format!("{ms} ms — may be missed")
+        _ => {
+            if !step_is_short(step) {
+                return String::new();
             }
-            Some(ms) if ms < MIN_STEP_MS => format!("{ms} ms — raised to {MIN_STEP_MS} ms"),
-            _ => String::new(),
-        },
+            // IN THE AUTHOR'S OWN UNIT. A `frames = 1` step used to be told
+            // "16 ms — raised to 33 ms", which is a true sentence about a
+            // number the author never typed: it hands them the conversion
+            // instead of the answer.
+            if let Some(f) = step.frames {
+                return if step.allow_short {
+                    format!("{f} fr — may be missed")
+                } else {
+                    format!("{f} fr — raised to {MIN_STEP_FRAMES} fr")
+                };
+            }
+            let ms = step.ms.unwrap_or(0);
+            if step.allow_short {
+                format!("{ms} ms — may be missed")
+            } else {
+                format!("{ms} ms — raised to {MIN_STEP_MS} ms")
+            }
+        }
     }
 }
 
@@ -1019,12 +1046,28 @@ fn step_warning_long(step: &MacroStepView) -> String {
             "no duration — give it ms or frames (a step with none is refused)".to_owned()
         }
         _ => {
-            let Some(ms) = requested_ms(step) else {
-                return String::new();
-            };
-            if ms >= MIN_STEP_MS {
+            if !step_is_short(step) {
                 return String::new();
             }
+            if let Some(f) = step.frames {
+                let plural = if f == 1 { "" } else { "s" };
+                let each = format!(
+                    "{f} frame{plural} is shorter than the {MIN_STEP_FRAMES}-frame floor \
+                     ({MIN_STEP_MS} ms — a press has to survive two 60 Hz polls)"
+                );
+                return if step.allow_short {
+                    format!(
+                        "{each} — allow_short is on, so it runs as written and the game may \
+                         never see it"
+                    )
+                } else {
+                    format!(
+                        "{each} — the game may never see it, so ksx raises this step to \
+                         {MIN_STEP_FRAMES} frames ({MIN_STEP_MS} ms)"
+                    )
+                };
+            }
+            let ms = step.ms.unwrap_or(0);
             if step.allow_short {
                 format!(
                     "{ms} ms is shorter than ~2 poll intervals ({MIN_STEP_MS} ms) — allow_short \
@@ -1043,10 +1086,11 @@ fn step_warning_long(step: &MacroStepView) -> String {
 /// The sampling rule, stated ONCE, where the amber rows can point at it (§0.2).
 /// The per-row flag is short so it always fits; this is what it means.
 pub(crate) const MACRO_RULE_LINE: &str =
-    "Amber steps are shorter than ~2 poll intervals (33 ms at 60 Hz), which is the shortest \
-     thing a game can be relied on to see — a 5 ms step is not unreliable, it is invisible. \
-     ksx raises a short step to 33 ms so it lands; a step marked allow_short runs exactly as \
-     written and can be missed entirely. Neither is ever silent.";
+    "Amber steps are shorter than ~2 poll intervals — 33 ms, or 2 frames if you are counting \
+     frames — which is the shortest thing a game can be relied on to see. A 1-frame step is \
+     not unreliable, it is invisible. ksx raises a short step to 33 ms so it lands; a step \
+     marked allow_short runs exactly as written and can be missed entirely. Neither is ever \
+     silent, and Save asks before it writes either one.";
 
 /// A macro's run length at the durations the engine will use.
 fn total_ms(mac: &MacroView) -> u32 {
@@ -1270,9 +1314,15 @@ fn macro_cols(slot: Option<&MapperSlot>) -> SlotValue {
 }
 
 /// What one step holds, named the way this pad names it: "D-pad ▼ + D-pad ▶".
+///
+/// FIX 1 — the piano roll's one unteachable fact is that a row is a CHORD:
+/// everything ticked in it is held together, for that step's duration. A
+/// diagonal is not a thing you bind, it IS down+forward at once — one row, two
+/// cells lit. Lit cells 12 columns apart do not say that; this line does, on
+/// every row, without being asked.
 fn hold_text(slot: Option<&MapperSlot>, hold: &[String]) -> String {
     if hold.is_empty() {
-        return "nothing — a neutral gap".to_owned();
+        return "(nothing — neutral gap)".to_owned();
     }
     let persona = slot.map_or("xbox360", |s| s.persona.as_str());
     let zones = zones_for(persona);
@@ -1287,9 +1337,20 @@ fn hold_text(slot: Option<&MapperSlot>, hold: &[String]) -> String {
         .join(" + ")
 }
 
-/// The ROW BAR beside the grid: step number, its duration, the amber flag, and
-/// the five step verbs. One list, because the row's controls and the row's
-/// label are the same row — the matrix beside it aligns on a fixed row height.
+/// The hold readout's own class. A row holding TWO OR MORE controls is the
+/// shape the grid cannot teach, so it is the one that gets the accent.
+fn hold_cls(hold: &[String]) -> &'static str {
+    match hold.len() {
+        0 => "machold none",
+        1 => "machold",
+        _ => "machold both",
+    }
+}
+
+/// The ROW BAR beside the grid: step number, what it holds IN WORDS, its
+/// duration, the amber flag, and the five step verbs. One list, because the
+/// row's controls and the row's label are the same row — the matrix beside it
+/// aligns on a fixed row height.
 ///
 /// `selected` is the step the duration editor is pointed at (client-only: an
 /// SSR paint has selected nothing, so it passes `None`).
@@ -1332,6 +1393,10 @@ fn macro_rows(
                     (
                         "hold".to_owned(),
                         SlotValue::Text(hold_text(slot, &step.hold)),
+                    ),
+                    (
+                        "holdcls".to_owned(),
+                        SlotValue::Text(hold_cls(&step.hold).to_owned()),
                     ),
                     ("warn".to_owned(), SlotValue::Text(warn.clone())),
                     (
@@ -1539,6 +1604,108 @@ fn macro_trigger_line(mac: Option<&MacroView>) -> String {
             "started by {} — any one of them ({} keys)",
             many.join(KEY_SEP),
             many.len()
+        ),
+    }
+}
+
+// ── FIX 1c: COMMON MOTIONS — which mechanism they write, and why ───────────
+// The quarter-circle is where both traps bite at once: its middle step is the
+// diagonal (one row, two controls), and a pad has THREE ways to say "right".
+// ksx publishes exactly what a step names, so a motion written in dpad holds
+// on a preset whose player keys drive the left stick is published faithfully
+// and read by nobody — `Issue::MacroHoldsOtherMechanism` in
+// ksx-config/src/validate.rs, an advisory that only arrives AFTER a save.
+// Generating from the slot's OWN bound direction keys means it never fires.
+//
+// The buttons themselves are client-only (they edit a draft), but this
+// sentence is SSR'd like everything else on the card: a no-JS reader is told
+// which mechanism their preset drives, which is the fact, not the affordance.
+
+/// Which control a preset's direction keys drive. Mirror of
+/// `ksx_config::validate::Mechanism`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mechanism {
+    Dpad,
+    LeftStick,
+    RightStick,
+}
+
+impl Mechanism {
+    fn of(function: &str) -> Option<Self> {
+        let f = function.to_ascii_lowercase();
+        if f.starts_with("dpad.") {
+            Some(Mechanism::Dpad)
+        } else if f.starts_with("lx.") || f.starts_with("ly.") {
+            Some(Mechanism::LeftStick)
+        } else if f.starts_with("rx.") || f.starts_with("ry.") {
+            Some(Mechanism::RightStick)
+        } else {
+            None
+        }
+    }
+
+    const fn describe(self) -> &'static str {
+        match self {
+            Mechanism::Dpad => "the dpad",
+            Mechanism::LeftStick => "the left stick (lx/ly)",
+            Mechanism::RightStick => "the right stick (rx/ry)",
+        }
+    }
+}
+
+/// Every mechanism THIS SLOT's own bound direction keys drive. An inert `None`
+/// row does not count: a placeholder is a function the preset lists, not a
+/// direction the player can produce (same rule as `driven_mechanisms` there).
+fn driven_mechanisms(slot: Option<&MapperSlot>) -> Vec<Mechanism> {
+    let mut out: Vec<Mechanism> = Vec::new();
+    let Some(slot) = slot else {
+        return out;
+    };
+    for (function, keys) in &slot.bindings {
+        if keys
+            .iter()
+            .all(|k| k.is_empty() || k.eq_ignore_ascii_case("None"))
+        {
+            continue;
+        }
+        if let Some(m) = Mechanism::of(function) {
+            if !out.contains(&m) {
+                out.push(m);
+            }
+        }
+    }
+    out
+}
+
+/// The sentence above the motion buttons: which mechanism they will write, and
+/// why that is the one.
+fn macro_motion_line(slot: Option<&MapperSlot>) -> String {
+    let driven = driven_mechanisms(slot);
+    let pick = driven.first().copied().unwrap_or(Mechanism::Dpad);
+    let tail = "Each one appends its steps to the macro below — the MIDDLE step of a \
+                quarter-circle holds two directions at once, which is what a diagonal is.";
+    match driven.len() {
+        0 => format!(
+            "These write {} — this preset binds no direction keys of its own, so there is \
+             nothing to match. If the game reads a stick, retick the rows. {tail}",
+            pick.describe()
+        ),
+        1 => format!(
+            "These write {} — the same mechanism this preset's own direction keys drive, so \
+             the game reads them. (A motion written on the other mechanism is published \
+             faithfully and read by nobody: that is the trap.) {tail}",
+            pick.describe()
+        ),
+        _ => format!(
+            "These write {}. This preset's own direction keys drive {}, so either would be \
+             read — a pad has three ways to say \"right\" and a game reads whichever one it \
+             was written for. {tail}",
+            pick.describe(),
+            driven
+                .iter()
+                .map(|m| m.describe())
+                .collect::<Vec<_>>()
+                .join(" and ")
         ),
     }
 }
@@ -1862,6 +2029,20 @@ fn scalar_slots(
         "slotMacrosLine": slot_macros_line(selected),
         "macroStepLine": "click a step's ⏱ to edit its duration",
         "macroDurValue": "50",
+        // v15/FIX 2: the duration BOX's own class — a below-floor step is a
+        // fact about the number in that field, not about a note two elements
+        // away. SSR has no step selected, so it is the plain box. (Every
+        // variant keeps `macdurin`: map.ts finds the box by that class.)
+        "macroDurCls": "macdurin",
+        // v15/FIX 2: Save's inline question about short steps. A class string
+        // plus its sentence and no show, like everything else here. An SSR
+        // paint has asked nothing — every write on this card is a fetch.
+        "macroConfirmCls": "macconfirm off",
+        "macroConfirmLine": "",
+        // v15/FIX 1c: which mechanism the "common motions" buttons write. The
+        // buttons are client-only (they edit a draft), but WHICH MECHANISM
+        // THIS PRESET DRIVES is a fact about the file, so it is server-side.
+        "macroMotionLine": macro_motion_line(selected),
         // The frame maths, at the selector's default rate — no step is
         // selected on an SSR paint, so this is the floor sentence.
         "macroMathLine": frame_math(None, SSR_RATE_HZ),
@@ -3548,6 +3729,233 @@ mod tests {
             .starts_with("This step says both ms and frames"));
         assert!(frame_math(Some(&step(&[], None, None, false)), 60.0)
             .starts_with("This step has no duration"));
+    }
+
+    /// FIX 1 — EVERY ROW SAYS WHAT IT HOLDS, in the pad's own words, without
+    /// being hovered, clicked or decoded.
+    ///
+    /// The bug this exists for was never in the engine: Victor's "hadouken"
+    /// had rows ↓ then → then X and no diagonal at all, because a diagonal is
+    /// not an input you bind — it IS down+forward held together, i.e. ONE ROW
+    /// HOLDING TWO CONTROLS. Two lit cells twelve columns apart do not say
+    /// that. This line does, on every row, and the row that holds more than one
+    /// control is the one that gets the accent.
+    #[test]
+    fn every_step_says_what_it_holds_in_words() {
+        let mut payload = sample();
+        // A neutral gap, appended: the empty row is a step too, and reads as
+        // one rather than as a row somebody forgot to fill in.
+        payload.macros.macros[0]
+            .steps
+            .push(step(&[], Some(50), None, false));
+        let out = render_map(&page(), &payload, None);
+        let html = &out.html;
+
+        // The four hadouken steps, in words. Step 2 is the diagonal.
+        assert!(html.contains(">D-pad ▼<"), "step 1's readout: {html}");
+        assert!(
+            html.contains(">D-pad ▼ + D-pad ▶<"),
+            "the diagonal, spelled out as ONE step holding TWO controls: {html}"
+        );
+        assert!(html.contains(">(nothing — neutral gap)<"), "{html}");
+
+        // The class carries the distinction the words make, so CSS can accent
+        // the chord row without re-deriving anything.
+        assert_eq!(
+            html.matches(r#"class="machold both""#).count(),
+            1,
+            "exactly one row of this hadouken holds two controls: {html}"
+        );
+        assert_eq!(
+            html.matches(r#"class="machold none""#).count(),
+            1,
+            "and exactly one holds nothing: {html}"
+        );
+        assert_eq!(hold_cls(&[]), "machold none");
+        assert_eq!(hold_cls(&["A".to_owned()]), "machold");
+        assert_eq!(
+            hold_cls(&["dpad.down".to_owned(), "dpad.right".to_owned()]),
+            "machold both"
+        );
+    }
+
+    /// FIX 1 — the concept itself, stated once, permanently, and NOT behind a
+    /// disclosure: it is the fact the piano roll cannot draw, and the evening
+    /// it cost was spent looking for a timing bug that was never there.
+    #[test]
+    fn the_chord_rule_is_stated_where_it_cannot_be_missed() {
+        let out = render_map(&page(), &sample(), None);
+        let html = &out.html;
+        let at = html
+            .find(r#"class="macconcept""#)
+            .unwrap_or_else(|| panic!("the concept line is not on the page: {html}"));
+        assert!(
+            html.contains("a diagonal ")
+                && html.contains("is ONE step holding ↓ and →, not two steps."),
+            "the sentence itself: {html}"
+        );
+        // Before the only nested disclosure this card has, so nothing has to be
+        // opened to read it. (The card is a <details>; this is about not
+        // burying the rule INSIDE another one.)
+        let toml = html
+            .find(r#"<details class="mactomlbox">"#)
+            .unwrap_or_else(|| panic!("the TOML block moved: {html}"));
+        assert!(at < toml, "the rule is buried under a disclosure: {html}");
+        // And the intro no longer says "a quarter-circle is three rows" without
+        // saying which of them holds two things.
+        assert!(
+            html.contains("then ↓ and → ") && html.contains("together on ONE row"),
+            "the intro spells the middle step out: {html}"
+        );
+    }
+
+    /// FIX 1c — the motion helpers generate on the mechanism THIS PRESET's own
+    /// direction keys drive. A pad has three ways to say "right" and ksx
+    /// publishes exactly what a step names, so a quarter-circle written in dpad
+    /// holds on a stick preset is published faithfully and read by nobody —
+    /// `Issue::MacroHoldsOtherMechanism`, which only arrives after a save.
+    #[test]
+    fn the_motion_helpers_name_the_mechanism_this_preset_drives() {
+        // The sample slot binds `lx.min` — a left-stick direction.
+        let out = render_map(&page(), &sample(), None);
+        assert!(
+            out.html.contains("These write the left stick (lx/ly)"),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains("read by nobody: that is the trap"),
+            "{}",
+            out.html
+        );
+
+        // A dpad preset gets dpad motions.
+        let mut payload = sample();
+        payload.mapper.slots[0].bindings.remove("lx.min");
+        payload.mapper.slots[0]
+            .bindings
+            .insert("dpad.left".to_owned(), vec!["M".to_owned()]);
+        let out = render_map(&page(), &payload, None);
+        assert!(out.html.contains("These write the dpad"), "{}", out.html);
+
+        // A preset driving BOTH says so rather than picking silently.
+        let mut payload = sample();
+        payload.mapper.slots[0]
+            .bindings
+            .insert("dpad.left".to_owned(), vec!["N".to_owned()]);
+        let out = render_map(&page(), &payload, None);
+        assert!(
+            out.html
+                .contains("direction keys drive the left stick (lx/ly) and the dpad")
+                || out
+                    .html
+                    .contains("direction keys drive the dpad and the left stick (lx/ly)"),
+            "{}",
+            out.html
+        );
+
+        // An INERT row is a function the preset lists, not a direction the
+        // player can produce — same rule as ksx-config's `driven_mechanisms`.
+        let mut payload = sample();
+        payload.mapper.slots[0]
+            .bindings
+            .insert("lx.min".to_owned(), vec!["None".to_owned()]);
+        let out = render_map(&page(), &payload, None);
+        assert!(
+            out.html
+                .contains("this preset binds no direction keys of its own"),
+            "{}",
+            out.html
+        );
+    }
+
+    /// FIX 2 — a step authored in FRAMES is warned in frames. The old text told
+    /// a `frames = 1` author "16 ms — raised to 33 ms": true, about a number
+    /// they never typed, and it hands them the conversion instead of the
+    /// answer.
+    #[test]
+    fn a_frame_authored_step_is_told_the_floor_in_frames() {
+        assert_eq!(
+            frames_ms(MIN_STEP_FRAMES),
+            MIN_STEP_MS,
+            "the two floors are one floor"
+        );
+
+        let one = step(&["A"], None, Some(1), false);
+        assert_eq!(step_warning(&one), "1 fr — raised to 2 fr");
+        assert!(
+            step_warning_long(&one).starts_with("1 frame is shorter than the 2-frame floor (33 ms"),
+            "{}",
+            step_warning_long(&one)
+        );
+        assert!(
+            step_warning_long(&one).contains("raises this step to 2 frames (33 ms)"),
+            "{}",
+            step_warning_long(&one)
+        );
+        let opted = step(&["A"], None, Some(1), true);
+        assert_eq!(step_warning(&opted), "1 fr — may be missed");
+        assert!(step_warning_long(&opted).contains("allow_short is on"));
+        // An ms author still hears milliseconds — the unit is the AUTHOR's.
+        assert_eq!(
+            step_warning(&step(&["A"], Some(5), None, false)),
+            "5 ms — raised to 33 ms"
+        );
+        // Two frames is the floor, so it says nothing at all.
+        assert_eq!(step_warning(&step(&["A"], None, Some(2), false)), "");
+
+        // And it reaches the page.
+        let mut payload = sample();
+        payload.macros.macros[0].steps[0] = one;
+        let out = render_map(&page(), &payload, None);
+        assert!(out.html.contains(">1 fr — raised to 2 fr<"), "{}", out.html);
+        assert!(out.html.contains("macrow short"), "{}", out.html);
+        // The rule under the grid carries both units now.
+        assert!(
+            out.html
+                .contains("33 ms, or 2 frames if you are counting frames"),
+            "{}",
+            out.html
+        );
+    }
+
+    /// FIX 2 — the save-confirmation bar and the duration field's own warn
+    /// class exist in the SSR document and ship inert. Both are client state
+    /// (every write on this card is a fetch, and an SSR paint has selected no
+    /// step and asked no question), but the ELEMENTS must be there: the client
+    /// only ever changes a class string, never inserts a panel (ledger #13/#14
+    /// — a show inserted mid-document shifts every show after it).
+    #[test]
+    fn the_short_step_confirmation_ships_present_and_inert() {
+        let out = render_map(&page(), &sample(), None);
+        let html = &out.html;
+        assert!(html.contains(r#"class="macconfirm off""#), "{html}");
+        assert!(html.contains(r#"data-act="macro-save-anyway""#), "{html}");
+        assert!(html.contains(r#"data-act="macro-save-cancel""#), "{html}");
+        // Empty, but PRESENT: an empty text slot renders the zero-width
+        // placeholder that keeps the node adoptable, which is exactly what the
+        // client needs in order to write the question into it later.
+        assert_eq!(
+            text_in(html, "macconfirmline").as_deref(),
+            Some("\u{200b}"),
+            "{html}"
+        );
+        // The duration box is a plain box until a short step is selected.
+        assert!(html.contains(r#"class="macdurin""#), "{html}");
+        assert!(
+            !html.contains("macdurin short"),
+            "SSR selects no step: {html}"
+        );
+        // The six motion buttons, each carrying its own payload.
+        for m in ["qcf", "qcb", "hcf", "hcb", "dpf", "dpb"] {
+            assert!(
+                html.contains(&format!(r#"data-macmotion="{m}""#)),
+                "{m}: {html}"
+            );
+        }
+        // The labels spell the holds, so the shape is legible before a click —
+        // and the middle step of the quarter-circle is written as a chord.
+        assert!(html.contains("¼ → · ↓ · ↓+→ · →"), "{html}");
     }
 
     /// The copy-and-paste path is still there and is no longer the point: a

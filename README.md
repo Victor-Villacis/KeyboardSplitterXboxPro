@@ -8,6 +8,12 @@ This is a ground-up **Rust** rebuild of djlastnight's
 (2016, C#/.NET 4.0, unmaintained). The original lives on in [`legacy/`](legacy/) as the
 behavior reference; the Rust workspace at the repo root is the project now.
 
+**New here?** [`docs/QUICKSTART.md`](docs/QUICKSTART.md) goes from a fresh
+machine to four working players: drivers, which capture mode to pick, and then
+either `ksx preset new --from-template arcade-6button` (a standard panel needs
+no mapping at all) or `ksx setup` (press each button once, and it writes the
+config for you).
+
 ## Why rebuild it
 
 The legacy app still works, but both of its drivers are dead ends in 2026:
@@ -129,6 +135,9 @@ machine is untouched.
 ## The other commands
 
 ```sh
+ksx setup                         # first contact: press the panel, it writes the config
+ksx preset list --templates       # ready-made layouts for standard panels
+ksx preset new "P1" --from-template arcade-6button --player 1
 ksx devices                       # keyboards as the driver sees them (read-only)
 ksx monitor --for-secs 10         # live per-device key stream, never blocks
 ksx pads --count 4                # plug 4 test pads, LED order, kill-recovery
@@ -136,6 +145,21 @@ ksx doctor                        # driver health, CI-policy state, verdicts
 ksx import-legacy --dry-run       # legacy XML -> TOML
 ksx winusb status                 # WinUSB claim state per USB interface (read-only)
 ```
+
+### `ksx setup` — the first-contact wizard
+
+Identify the panel by **pressing** it ("hold a key on the panel for player 1"),
+then one position-named prompt per control (`SOUTH`, not `A`) with auto-advance,
+an inline `ALREADY TAKEN` when a key is reused, and a countdown that skips a
+control you have no button for. It ends at a review screen with a completeness
+audit — it warns when the panel can reach neither START nor BACK, the cabinet's
+exit keys — and **writes nothing until you confirm**. Then it asks (never
+assumes) whether to point a slot at the result, and offers the next player, so
+P1→P4 is one continuous run. `--dry-run` walks the whole thing and writes
+nothing; `--json` prints the outcome.
+
+Stop emulation first: a captured panel's keys are suppressed below win32k and
+the wizard cannot hear them.
 
 ### `ksx daemon` — stay resident with a tray icon
 

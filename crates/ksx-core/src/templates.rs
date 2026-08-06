@@ -212,28 +212,79 @@ impl Template {
 /// exist on plenty of panels and cost nothing when they do not.
 const ARCADE_6BUTTON: &[Row] = &[
     // Stick: hat + left stick together.
-    row(dpad(DpadDirection::Up), [Key::Up, Key::R, Key::None, Key::None]),
-    row(axis(Axis::Y, AXIS_MAX), [Key::Up, Key::R, Key::None, Key::None]),
-    row(dpad(DpadDirection::Down), [Key::Down, Key::F, Key::None, Key::None]),
-    row(axis(Axis::Y, AXIS_MIN), [Key::Down, Key::F, Key::None, Key::None]),
-    row(dpad(DpadDirection::Left), [Key::Left, Key::D, Key::None, Key::None]),
-    row(axis(Axis::X, AXIS_MIN), [Key::Left, Key::D, Key::None, Key::None]),
-    row(dpad(DpadDirection::Right), [Key::Right, Key::G, Key::None, Key::None]),
-    row(axis(Axis::X, AXIS_MAX), [Key::Right, Key::G, Key::None, Key::None]),
+    row(
+        dpad(DpadDirection::Up),
+        [Key::Up, Key::R, Key::None, Key::None],
+    ),
+    row(
+        axis(Axis::Y, AXIS_MAX),
+        [Key::Up, Key::R, Key::None, Key::None],
+    ),
+    row(
+        dpad(DpadDirection::Down),
+        [Key::Down, Key::F, Key::None, Key::None],
+    ),
+    row(
+        axis(Axis::Y, AXIS_MIN),
+        [Key::Down, Key::F, Key::None, Key::None],
+    ),
+    row(
+        dpad(DpadDirection::Left),
+        [Key::Left, Key::D, Key::None, Key::None],
+    ),
+    row(
+        axis(Axis::X, AXIS_MIN),
+        [Key::Left, Key::D, Key::None, Key::None],
+    ),
+    row(
+        dpad(DpadDirection::Right),
+        [Key::Right, Key::G, Key::None, Key::None],
+    ),
+    row(
+        axis(Axis::X, AXIS_MAX),
+        [Key::Right, Key::G, Key::None, Key::None],
+    ),
     // Top row: buttons 1·2·3 (light/medium/heavy punch).
-    row(button(XButton::X), [Key::LeftControl, Key::A, Key::None, Key::None]),
-    row(button(XButton::Y), [Key::LeftAlt, Key::S, Key::None, Key::None]),
-    row(button(XButton::RightBumper), [Key::Space, Key::Q, Key::None, Key::None]),
+    row(
+        button(XButton::X),
+        [Key::LeftControl, Key::A, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::Y),
+        [Key::LeftAlt, Key::S, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::RightBumper),
+        [Key::Space, Key::Q, Key::None, Key::None],
+    ),
     // Bottom row: buttons 4·5·6 (light/medium/heavy kick).
-    row(button(XButton::A), [Key::LeftShift, Key::W, Key::None, Key::None]),
+    row(
+        button(XButton::A),
+        [Key::LeftShift, Key::W, Key::None, Key::None],
+    ),
     row(button(XButton::B), [Key::Z, Key::I, Key::None, Key::None]),
-    row(trigger(Trigger::Right), [Key::X, Key::K, Key::None, Key::None]),
+    row(
+        trigger(Trigger::Right),
+        [Key::X, Key::K, Key::None, Key::None],
+    ),
     // Buttons 7·8, if the panel has them.
-    row(button(XButton::LeftBumper), [Key::C, Key::J, Key::None, Key::None]),
-    row(trigger(Trigger::Left), [Key::V, Key::L, Key::None, Key::None]),
+    row(
+        button(XButton::LeftBumper),
+        [Key::C, Key::J, Key::None, Key::None],
+    ),
+    row(
+        trigger(Trigger::Left),
+        [Key::V, Key::L, Key::None, Key::None],
+    ),
     // Start and coin — the cabinet's exit keys.
-    row(button(XButton::Start), [Key::One, Key::Two, Key::None, Key::None]),
-    row(button(XButton::Back), [Key::Five, Key::Six, Key::None, Key::None]),
+    row(
+        button(XButton::Start),
+        [Key::One, Key::Two, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::Back),
+        [Key::Five, Key::Six, Key::None, Key::None],
+    ),
 ];
 
 /// **`arcade-4way`** — the four-player, two-button cabinet (Gauntlet, TMNT,
@@ -244,14 +295,38 @@ const ARCADE_6BUTTON: &[Row] = &[
 /// small: stick, two buttons, start, coin. Anything more is `ksx map` or the
 /// wizard.
 const ARCADE_4WAY: &[Row] = &[
-    row(dpad(DpadDirection::Up), [Key::Up, Key::R, Key::I, Key::Numpad8]),
-    row(axis(Axis::Y, AXIS_MAX), [Key::Up, Key::R, Key::I, Key::Numpad8]),
-    row(dpad(DpadDirection::Down), [Key::Down, Key::F, Key::K, Key::Numpad2]),
-    row(axis(Axis::Y, AXIS_MIN), [Key::Down, Key::F, Key::K, Key::Numpad2]),
-    row(dpad(DpadDirection::Left), [Key::Left, Key::D, Key::J, Key::Numpad4]),
-    row(axis(Axis::X, AXIS_MIN), [Key::Left, Key::D, Key::J, Key::Numpad4]),
-    row(dpad(DpadDirection::Right), [Key::Right, Key::G, Key::L, Key::Numpad6]),
-    row(axis(Axis::X, AXIS_MAX), [Key::Right, Key::G, Key::L, Key::Numpad6]),
+    row(
+        dpad(DpadDirection::Up),
+        [Key::Up, Key::R, Key::I, Key::Numpad8],
+    ),
+    row(
+        axis(Axis::Y, AXIS_MAX),
+        [Key::Up, Key::R, Key::I, Key::Numpad8],
+    ),
+    row(
+        dpad(DpadDirection::Down),
+        [Key::Down, Key::F, Key::K, Key::Numpad2],
+    ),
+    row(
+        axis(Axis::Y, AXIS_MIN),
+        [Key::Down, Key::F, Key::K, Key::Numpad2],
+    ),
+    row(
+        dpad(DpadDirection::Left),
+        [Key::Left, Key::D, Key::J, Key::Numpad4],
+    ),
+    row(
+        axis(Axis::X, AXIS_MIN),
+        [Key::Left, Key::D, Key::J, Key::Numpad4],
+    ),
+    row(
+        dpad(DpadDirection::Right),
+        [Key::Right, Key::G, Key::L, Key::Numpad6],
+    ),
+    row(
+        axis(Axis::X, AXIS_MAX),
+        [Key::Right, Key::G, Key::L, Key::Numpad6],
+    ),
     row(
         button(XButton::A),
         [Key::LeftControl, Key::A, Key::RightControl, Key::Numpad0],
@@ -283,37 +358,112 @@ const ARCADE_4WAY: &[Row] = &[
 /// to reason about.
 const KEYBOARD_WASD: &[Row] = &[
     // Left stick — movement.
-    row(axis(Axis::Y, AXIS_MAX), [Key::W, Key::None, Key::None, Key::None]),
-    row(axis(Axis::Y, AXIS_MIN), [Key::S, Key::None, Key::None, Key::None]),
-    row(axis(Axis::X, AXIS_MIN), [Key::A, Key::None, Key::None, Key::None]),
-    row(axis(Axis::X, AXIS_MAX), [Key::D, Key::None, Key::None, Key::None]),
+    row(
+        axis(Axis::Y, AXIS_MAX),
+        [Key::W, Key::None, Key::None, Key::None],
+    ),
+    row(
+        axis(Axis::Y, AXIS_MIN),
+        [Key::S, Key::None, Key::None, Key::None],
+    ),
+    row(
+        axis(Axis::X, AXIS_MIN),
+        [Key::A, Key::None, Key::None, Key::None],
+    ),
+    row(
+        axis(Axis::X, AXIS_MAX),
+        [Key::D, Key::None, Key::None, Key::None],
+    ),
     // Right stick — camera.
-    row(axis(Axis::Ry, AXIS_MAX), [Key::Up, Key::None, Key::None, Key::None]),
-    row(axis(Axis::Ry, AXIS_MIN), [Key::Down, Key::None, Key::None, Key::None]),
-    row(axis(Axis::Rx, AXIS_MIN), [Key::Left, Key::None, Key::None, Key::None]),
-    row(axis(Axis::Rx, AXIS_MAX), [Key::Right, Key::None, Key::None, Key::None]),
+    row(
+        axis(Axis::Ry, AXIS_MAX),
+        [Key::Up, Key::None, Key::None, Key::None],
+    ),
+    row(
+        axis(Axis::Ry, AXIS_MIN),
+        [Key::Down, Key::None, Key::None, Key::None],
+    ),
+    row(
+        axis(Axis::Rx, AXIS_MIN),
+        [Key::Left, Key::None, Key::None, Key::None],
+    ),
+    row(
+        axis(Axis::Rx, AXIS_MAX),
+        [Key::Right, Key::None, Key::None, Key::None],
+    ),
     // D-pad — menus, weapon wheels.
-    row(dpad(DpadDirection::Up), [Key::Numpad8, Key::None, Key::None, Key::None]),
-    row(dpad(DpadDirection::Down), [Key::Numpad2, Key::None, Key::None, Key::None]),
-    row(dpad(DpadDirection::Left), [Key::Numpad4, Key::None, Key::None, Key::None]),
-    row(dpad(DpadDirection::Right), [Key::Numpad6, Key::None, Key::None, Key::None]),
+    row(
+        dpad(DpadDirection::Up),
+        [Key::Numpad8, Key::None, Key::None, Key::None],
+    ),
+    row(
+        dpad(DpadDirection::Down),
+        [Key::Numpad2, Key::None, Key::None, Key::None],
+    ),
+    row(
+        dpad(DpadDirection::Left),
+        [Key::Numpad4, Key::None, Key::None, Key::None],
+    ),
+    row(
+        dpad(DpadDirection::Right),
+        [Key::Numpad6, Key::None, Key::None, Key::None],
+    ),
     // Face buttons, where their verbs live.
-    row(button(XButton::A), [Key::Space, Key::None, Key::None, Key::None]),
-    row(button(XButton::B), [Key::C, Key::None, Key::None, Key::None]),
-    row(button(XButton::X), [Key::R, Key::None, Key::None, Key::None]),
-    row(button(XButton::Y), [Key::F, Key::None, Key::None, Key::None]),
+    row(
+        button(XButton::A),
+        [Key::Space, Key::None, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::B),
+        [Key::C, Key::None, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::X),
+        [Key::R, Key::None, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::Y),
+        [Key::F, Key::None, Key::None, Key::None],
+    ),
     // Shoulders and triggers, both hands' reach from WASD.
-    row(button(XButton::LeftBumper), [Key::Q, Key::None, Key::None, Key::None]),
-    row(button(XButton::RightBumper), [Key::E, Key::None, Key::None, Key::None]),
-    row(trigger(Trigger::Left), [Key::Z, Key::None, Key::None, Key::None]),
-    row(trigger(Trigger::Right), [Key::X, Key::None, Key::None, Key::None]),
+    row(
+        button(XButton::LeftBumper),
+        [Key::Q, Key::None, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::RightBumper),
+        [Key::E, Key::None, Key::None, Key::None],
+    ),
+    row(
+        trigger(Trigger::Left),
+        [Key::Z, Key::None, Key::None, Key::None],
+    ),
+    row(
+        trigger(Trigger::Right),
+        [Key::X, Key::None, Key::None, Key::None],
+    ),
     // Thumbs: sprint and melee, the usual homes.
-    row(button(XButton::LeftThumb), [Key::LeftShift, Key::None, Key::None, Key::None]),
-    row(button(XButton::RightThumb), [Key::V, Key::None, Key::None, Key::None]),
+    row(
+        button(XButton::LeftThumb),
+        [Key::LeftShift, Key::None, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::RightThumb),
+        [Key::V, Key::None, Key::None, Key::None],
+    ),
     // System.
-    row(button(XButton::Start), [Key::Enter, Key::None, Key::None, Key::None]),
-    row(button(XButton::Back), [Key::Backspace, Key::None, Key::None, Key::None]),
-    row(button(XButton::Guide), [Key::LeftWindows, Key::None, Key::None, Key::None]),
+    row(
+        button(XButton::Start),
+        [Key::Enter, Key::None, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::Back),
+        [Key::Backspace, Key::None, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::Guide),
+        [Key::LeftWindows, Key::None, Key::None, Key::None],
+    ),
 ];
 
 /// Every in-box template, in the order `ksx preset list --templates` prints
@@ -410,14 +560,16 @@ mod tests {
                     .instantiate("Try", player)
                     .unwrap_or_else(|e| panic!("{} p{player}: {e}", template.id));
                 assert_eq!(preset.name, "Try");
-                assert!(!preset.protected, "{} is a seed, not a built-in", template.id);
+                assert!(
+                    !preset.protected,
+                    "{} is a seed, not a built-in",
+                    template.id
+                );
                 assert!(preset.chords.is_empty());
                 assert!(preset.macros.is_empty());
                 assert!(preset.turbo.is_empty());
             }
-            assert!(template
-                .instantiate("Try", template.players + 1)
-                .is_err());
+            assert!(template.instantiate("Try", template.players + 1).is_err());
             assert!(template.instantiate("Try", 0).is_err());
         }
     }
@@ -540,7 +692,11 @@ mod tests {
                     let first: BTreeSet<Key> = template.keys_for(a).into_iter().collect();
                     let second: BTreeSet<Key> = template.keys_for(b).into_iter().collect();
                     let shared: Vec<&Key> = first.intersection(&second).collect();
-                    assert!(shared.is_empty(), "{} p{a}/p{b} share {shared:?}", template.id);
+                    assert!(
+                        shared.is_empty(),
+                        "{} p{a}/p{b} share {shared:?}",
+                        template.id
+                    );
                 }
             }
         }
@@ -548,27 +704,51 @@ mod tests {
 
     #[test]
     fn the_six_button_layout_is_the_fightstick_one() {
-        let preset = find("arcade-6button").unwrap().instantiate("P1", 1).unwrap();
+        let preset = find("arcade-6button")
+            .unwrap()
+            .instantiate("P1", 1)
+            .unwrap();
         // Top row: buttons 1-2-3 = LP MP HP = X Y RB.
-        assert_eq!(keys_for(&preset, Binding::Button(XButton::X)), vec![Key::LeftControl]);
-        assert_eq!(keys_for(&preset, Binding::Button(XButton::Y)), vec![Key::LeftAlt]);
+        assert_eq!(
+            keys_for(&preset, Binding::Button(XButton::X)),
+            vec![Key::LeftControl]
+        );
+        assert_eq!(
+            keys_for(&preset, Binding::Button(XButton::Y)),
+            vec![Key::LeftAlt]
+        );
         assert_eq!(
             keys_for(&preset, Binding::Button(XButton::RightBumper)),
             vec![Key::Space]
         );
         // Bottom row: buttons 4-5-6 = LK MK HK = A B RT.
-        assert_eq!(keys_for(&preset, Binding::Button(XButton::A)), vec![Key::LeftShift]);
+        assert_eq!(
+            keys_for(&preset, Binding::Button(XButton::A)),
+            vec![Key::LeftShift]
+        );
         assert_eq!(keys_for(&preset, Binding::Button(XButton::B)), vec![Key::Z]);
         assert_eq!(
             keys_for(&preset, Binding::Trigger(Trigger::Right)),
             vec![Key::X]
         );
-        assert_eq!(keys_for(&preset, Binding::Button(XButton::Start)), vec![Key::One]);
-        assert_eq!(keys_for(&preset, Binding::Button(XButton::Back)), vec![Key::Five]);
+        assert_eq!(
+            keys_for(&preset, Binding::Button(XButton::Start)),
+            vec![Key::One]
+        );
+        assert_eq!(
+            keys_for(&preset, Binding::Button(XButton::Back)),
+            vec![Key::Five]
+        );
 
-        let p2 = find("arcade-6button").unwrap().instantiate("P2", 2).unwrap();
+        let p2 = find("arcade-6button")
+            .unwrap()
+            .instantiate("P2", 2)
+            .unwrap();
         assert_eq!(keys_for(&p2, Binding::Button(XButton::X)), vec![Key::A]);
-        assert_eq!(keys_for(&p2, Binding::Button(XButton::Start)), vec![Key::Two]);
+        assert_eq!(
+            keys_for(&p2, Binding::Button(XButton::Start)),
+            vec![Key::Two]
+        );
     }
 
     /// `default` and `empty` are the built-ins, copied — same entries, a new

@@ -162,7 +162,12 @@ interface MacroRow {
   cls: string;
   dur: string;
   durtitle: string;
+  /** FIX 1: the plain-language readout of everything this row holds —
+   *  "D-pad ▼ + D-pad ▶", "(nothing — neutral gap)". */
   hold: string;
+  /** `machold` / `machold both` / `machold none` — the accent that says "this
+   *  row holds more than one control". */
+  holdcls: string;
   /** Short enough to always fit; `warntitle` carries the whole sentence. */
   warn: string;
   warntitle: string;
@@ -525,10 +530,24 @@ const [macroStepLine, setMacroStepLine] = createSignal(
   "click a step's ⏱ to edit its duration",
 );
 const [macroDurValue, setMacroDurValue] = createSignal("50");
+/** v15/FIX 2: the duration BOX's own class. A below-floor step is not a fact
+ *  about some row elsewhere in the card — it is a fact about the number in
+ *  this field, so the field itself wears it. (Every variant keeps `macdurin`:
+ *  map.ts finds the box by that class after every poll.) */
+const [macroDurCls, setMacroDurCls] = createSignal("macdurin");
 /** v12: the Save button's own look — "btn macsave" when there is nothing to
  *  write, "… dirty" the moment the draft differs from the file. A class
  *  string, never a show (ledger #13/#14). */
 const [macroSaveCls, setMacroSaveCls] = createSignal("btn btn-mini macsave off");
+/** v15/FIX 2: Save's inline question about short steps, and the class that
+ *  shows the bar holding it. Two scalars and no show, like everything else on
+ *  this card (ledger #13/#14). Empty + "off" is the resting state: a macro with
+ *  nothing below the sampling floor never sees this. */
+const [macroConfirmCls, setMacroConfirmCls] = createSignal("macconfirm off");
+const [macroConfirmLine, setMacroConfirmLine] = createSignal("");
+/** v15/FIX 1c: which mechanism the "common motions" buttons will write, and
+ *  why — read off THIS SLOT's own bound direction keys. */
+const [macroMotionLine, setMacroMotionLine] = createSignal("");
 /** v14: the per-macro ON/OFF switch. Two scalars, no show (ledger #13/#14):
  *  a class string for the look and a label for the word on the button.
  *
@@ -1545,6 +1564,12 @@ export async function runUndo(id: string | null): Promise<void> {
  *  ms is two of them). Pinned against the real constant in render_map.rs. */
 const MIN_STEP_MS = 33;
 
+/** The same floor counted the way a frame author counts: two 60 Hz samples.
+ *  `framesMs(2)` is exactly [`MIN_STEP_MS`], which is the point — a warning
+ *  about a `frames = 1` step that answers in milliseconds is asking its reader
+ *  to do the conversion that got them here. */
+const MIN_STEP_FRAMES = 2;
+
 /** 60 Hz frames → ms, rounded to nearest ONCE (3 frames is 50 ms, not 51). */
 function framesMs(frames: number): number {
   return Math.floor((frames * 1000 + 30) / 60);
@@ -1570,12 +1595,29 @@ function durationText(step: MacroStepView): string {
   return "—";
 }
 
-/** The INLINE flag — short enough to always fit beside the duration. */
+/** Is this step below the sampling floor at all? (Both spellings, one rule.) */
+function stepIsShort(step: MacroStepView): boolean {
+  const ms = requestedMs(step);
+  return ms !== null && ms < MIN_STEP_MS;
+}
+
+/** The INLINE flag — short enough to always fit beside the duration.
+ *
+ *  IN THE AUTHOR'S OWN UNIT. A `frames = 1` step used to be told "16 ms —
+ *  raised to 33 ms", which is a true sentence about a number the author never
+ *  typed: it hands them the conversion instead of the answer. A step authored
+ *  in frames is answered in frames. */
 function stepWarning(step: MacroStepView): string {
   if (step.ms !== null && step.frames !== null) return "two units";
   if (step.ms === null && step.frames === null) return "no duration";
-  const ms = requestedMs(step);
-  if (ms === null || ms >= MIN_STEP_MS) return "";
+  if (!stepIsShort(step)) return "";
+  if (step.frames !== null) {
+    const f = step.frames;
+    return step.allow_short
+      ? `${f} fr — may be missed`
+      : `${f} fr — raised to ${MIN_STEP_FRAMES} fr`;
+  }
+  const ms = step.ms as number;
   return step.allow_short
     ? `${ms} ms — may be missed`
     : `${ms} ms — raised to ${MIN_STEP_MS} ms`;
@@ -1589,13 +1631,58 @@ function stepWarningLong(step: MacroStepView): string {
   if (step.ms === null && step.frames === null) {
     return "no duration — give it ms or frames (a step with none is refused)";
   }
-  const ms = requestedMs(step);
-  if (ms === null || ms >= MIN_STEP_MS) return "";
+  if (!stepIsShort(step)) return "";
+  if (step.frames !== null) {
+    const f = step.frames;
+    const each = `${f} frame${f === 1 ? "" : "s"} is shorter than the ${MIN_STEP_FRAMES}-frame ` +
+      `floor (${MIN_STEP_MS} ms — a press has to survive two 60 Hz polls)`;
+    return step.allow_short
+      ? `${each} — allow_short is on, so it runs as written and the game may never see it`
+      : `${each} — the game may never see it, so ksx raises this step to ` +
+          `${MIN_STEP_FRAMES} frames (${MIN_STEP_MS} ms)`;
+  }
+  const ms = step.ms as number;
   return step.allow_short
     ? `${ms} ms is shorter than ~2 poll intervals (${MIN_STEP_MS} ms) — allow_short is on, ` +
         "so it runs as written and the game may never see it"
     : `${ms} ms is shorter than ~2 poll intervals (${MIN_STEP_MS} ms) — the game may never ` +
         `see it, so ksx raises this step to ${MIN_STEP_MS} ms`;
+}
+
+/** FIX 2 — the question Save asks before it writes a macro with a step the
+ *  sampler cannot be relied on to see. Empty when there is nothing to ask.
+ *
+ *  Never a refusal: a short step is legal, `allow_short` exists precisely so
+ *  one can be authored on purpose, and Studio does not get to overrule a file
+ *  the loader accepts. But it stopped being a SILENT save, because the advisory
+ *  under the grid was read as decoration by the one person it was written for.
+ *
+ *  The two cases are different consequences and are counted apart: a plain
+ *  short step is RAISED (the sequence runs slower than it reads), a short step
+ *  marked `allow_short` runs as written and may be MISSED. The floor is quoted
+ *  in both units so it lands whichever one the author is thinking in. */
+function shortStepQuestion(mac: MacroView): string {
+  const raised = mac.steps.filter((s) => stepIsShort(s) && !s.allow_short).length;
+  const missable = mac.steps.filter((s) => stepIsShort(s) && s.allow_short).length;
+  if (raised + missable === 0) return "";
+  const floor = `~${MIN_STEP_MS} ms (${MIN_STEP_FRAMES} frames at 60 Hz)`;
+  const parts: string[] = [];
+  if (raised > 0) {
+    parts.push(
+      `${raised} step${raised === 1 ? " is" : "s are"} shorter than ${floor} — a 60 Hz game ` +
+        `may never see ${raised === 1 ? "it" : "them"}, so ksx will run ` +
+        `${raised === 1 ? "it" : "each of them"} for ${MIN_STEP_MS} ms instead of the ` +
+        "time you wrote",
+    );
+  }
+  if (missable > 0) {
+    parts.push(
+      `${missable} step${missable === 1 ? " is" : "s are"} shorter than ${floor} AND marked ` +
+        `allow short — ${missable === 1 ? "it runs" : "they run"} exactly as written, so a ` +
+        `60 Hz game may never see ${missable === 1 ? "it" : "them"} at all`,
+    );
+  }
+  return `${parts.join(". ")}. Save anyway?`;
 }
 
 function macroTotalMs(mac: MacroView): number {
@@ -1720,10 +1807,11 @@ function turboMath(mac: MacroView | null): string {
 }
 
 const MACRO_RULE_LINE =
-  "Amber steps are shorter than ~2 poll intervals (33 ms at 60 Hz), which is the shortest " +
-  "thing a game can be relied on to see — a 5 ms step is not unreliable, it is invisible. " +
-  "ksx raises a short step to 33 ms so it lands; a step marked allow_short runs exactly as " +
-  "written and can be missed entirely. Neither is ever silent.";
+  "Amber steps are shorter than ~2 poll intervals — 33 ms, or 2 frames if you are counting " +
+  "frames — which is the shortest thing a game can be relied on to see. A 1-frame step is " +
+  "not unreliable, it is invisible. ksx raises a short step to 33 ms so it lands; a step " +
+  "marked allow_short runs exactly as written and can be missed entirely. Neither is ever " +
+  "silent, and Save asks before it writes either one.";
 
 /** The body "＋ New macro" WRITES: one real 50 ms step, at the default
  *  policies. A macro with no steps is refused by the loader (and by the
@@ -1813,6 +1901,11 @@ let macroStep: number | null = null;
  *  no poll and no hover may repaint out from under. map.ts drives this from
  *  focusin/focusout: the island holds the state, the page holds the DOM. */
 let macroEditorFocused = false;
+/** FIX 2: Save has ASKED about this draft's short steps and is waiting for an
+ *  answer. Cleared by any edit and by every macro switch — the question is
+ *  about the steps as they stood when it was asked, and an armed "Save anyway"
+ *  surviving an edit would be a button that writes something nobody read. */
+let macroSaveAsked = false;
 
 /** Is there an edit in flight the poll must leave alone? Unsaved changes, or a
  *  control the user's hands are on this second. */
@@ -1916,6 +2009,7 @@ export function seedMacro(name: string | null): void {
   macroFromDisk = found !== undefined;
   macroSeedName = found ? found.name : null;
   macroDirty = false;
+  macroSaveAsked = false;
   // WHICH STEP the editor points at is the USER's place in the macro, not the
   // file's — so re-seeding the SAME macro keeps it. The 2 s poll re-seeds
   // every clean draft, and clearing the selection there is what made the
@@ -1943,6 +2037,7 @@ export function markMacroSaved(name: string): void {
   macroSeedName = name;
   macroChosen = name;
   macroDirty = false;
+  macroSaveAsked = false;
   refreshMacro();
 }
 
@@ -1962,11 +2057,16 @@ export function resetMacroDraft(): void {
   macroDirty = false;
   macroStep = null;
   macroLastUnit = "ms";
+  macroSaveAsked = false;
 }
 
 /** Every mutation lands here: mark the draft edited and repaint. */
 function macroEdited(): void {
   macroDirty = true;
+  // FIX 2: an edit answers Save's question by changing the thing it was about.
+  // Leaving "Save anyway?" armed across an edit would arm a button for a draft
+  // nobody has been asked about.
+  macroSaveAsked = false;
   refreshMacro();
 }
 
@@ -1992,6 +2092,159 @@ function newStep(): MacroStepView {
   const step: MacroStepView = { hold: [], ms: 50, frames: null, allow_short: false };
   stepUnits.set(step, "ms");
   return step;
+}
+
+// ── FIX 1c: COMMON MOTIONS — the sequences everyone is actually building ────
+// WHY THIS EXISTS. The quarter-circle is where both traps bite at once, and
+// they bite together for the same reason: a motion is not a list of directions,
+// it is a list of STATES, and the state in the middle is two directions held
+// together. Somebody who has not learned that writes ↓ then → then punch, gets
+// nothing, and — reasonably — goes looking for a timing bug. Handing them a
+// correct three-step group with `↓ + →` written on the middle row teaches the
+// concept in one click, on their own macro, with their own pad's names on it.
+//
+// It generates from the SLOT'S OWN BINDINGS, never from a fixed table: a pad
+// has three ways to say "right" (dpad, left stick, right stick) and ksx
+// publishes exactly what a step names, so a motion written in dpad holds on a
+// preset whose player keys drive the left stick is published faithfully and
+// read by nobody. That is `Issue::MacroHoldsOtherMechanism` in
+// ksx-config/src/validate.rs — an advisory that arrives AFTER a save. Choosing
+// the mechanism the preset already drives means the generated steps never
+// raise it. Same rule as `driven_mechanisms` there: an inert `None` row is a
+// function the preset lists, not a direction the player can produce.
+//
+// Durations default to 50 ms — above the ~33 ms floor, deliberately: a helper
+// that seeds steps the sampler cannot see would be this card teaching the exact
+// mistake it exists to prevent.
+
+/** Which control a preset's direction keys drive. Mirror of
+ *  `ksx_config::validate::Mechanism`. */
+type Mechanism = "dpad" | "lstick" | "rstick";
+
+function mechanismOf(fn: string): Mechanism | null {
+  const f = fn.toLowerCase();
+  if (f.startsWith("dpad.")) return "dpad";
+  if (f.startsWith("lx.") || f.startsWith("ly.")) return "lstick";
+  if (f.startsWith("rx.") || f.startsWith("ry.")) return "rstick";
+  return null;
+}
+
+function mechanismLabel(m: Mechanism): string {
+  if (m === "dpad") return "the dpad";
+  return m === "lstick" ? "the left stick (lx/ly)" : "the right stick (rx/ry)";
+}
+
+/** Every mechanism THIS SLOT's own bound direction keys drive, in the order a
+ *  motion should prefer them. */
+function drivenMechanisms(slot: MapperSlot | null): Mechanism[] {
+  if (!slot) return [];
+  const out: Mechanism[] = [];
+  for (const [fn, keys] of Object.entries(slot.bindings ?? {})) {
+    const live = (keys ?? []).filter((k) => k !== "" && k.toLowerCase() !== "none");
+    if (live.length === 0) continue;
+    const m = mechanismOf(fn);
+    if (m !== null && !out.includes(m)) out.push(m);
+  }
+  return out;
+}
+
+/** The mechanism a generated motion should be written in: the one the player's
+ *  own keys already drive, and the dpad when nothing says otherwise. */
+function motionMechanism(slot: MapperSlot | null): Mechanism {
+  return drivenMechanisms(slot)[0] ?? "dpad";
+}
+
+/** The four directional function names, on that mechanism. */
+function directionFns(m: Mechanism): Record<"up" | "down" | "left" | "right", string> {
+  if (m === "dpad") {
+    return { up: "dpad.up", down: "dpad.down", left: "dpad.left", right: "dpad.right" };
+  }
+  const axis = m === "lstick" ? ["lx", "ly"] : ["rx", "ry"];
+  return {
+    up: `${axis[1]}.max`,
+    down: `${axis[1]}.min`,
+    left: `${axis[0]}.min`,
+    right: `${axis[0]}.max`,
+  };
+}
+
+/** A motion as DIRECTIONS PER STEP — the shape of the thing, before it knows
+ *  which mechanism will express it. The two-name entries are the whole lesson.
+ *
+ *  "Forward" is right, the way a move list writes it for a character on the
+ *  left; the mirrored spellings are offered beside them because player 2 is
+ *  not an edge case. */
+type Dir = "up" | "down" | "left" | "right";
+const MOTIONS: Record<string, { label: string; steps: Dir[][] }> = {
+  qcf: { label: "quarter-circle forward (↓ ↘ →)", steps: [["down"], ["down", "right"], ["right"]] },
+  qcb: { label: "quarter-circle back (↓ ↙ ←)", steps: [["down"], ["down", "left"], ["left"]] },
+  hcf: {
+    label: "half-circle forward (← ↙ ↓ ↘ →)",
+    steps: [["left"], ["down", "left"], ["down"], ["down", "right"], ["right"]],
+  },
+  hcb: {
+    label: "half-circle back (→ ↘ ↓ ↙ ←)",
+    steps: [["right"], ["down", "right"], ["down"], ["down", "left"], ["left"]],
+  },
+  dpf: { label: "dragon punch forward (→ ↓ ↘)", steps: [["right"], ["down"], ["down", "right"]] },
+  dpb: { label: "dragon punch back (← ↓ ↙)", steps: [["left"], ["down"], ["down", "left"]] },
+};
+
+/** The sentence above the motion buttons: which mechanism they will write, and
+ *  why that is the one. Empty when there is no slot to read. */
+export function macroMotionLineFor(slot: MapperSlot | null): string {
+  const driven = drivenMechanisms(slot);
+  const pick = motionMechanism(slot);
+  const tail =
+    "Each one appends its steps to the macro below — the MIDDLE step of a quarter-circle " +
+    "holds two directions at once, which is what a diagonal is.";
+  if (driven.length === 0) {
+    return (
+      `These write ${mechanismLabel(pick)} — this preset binds no direction keys of its own, ` +
+      `so there is nothing to match. If the game reads a stick, retick the rows. ${tail}`
+    );
+  }
+  if (driven.length > 1) {
+    return (
+      `These write ${mechanismLabel(pick)}. This preset's own direction keys drive ` +
+      `${driven.map(mechanismLabel).join(" and ")}, so either would be read — a pad has three ` +
+      `ways to say "right" and a game reads whichever one it was written for. ${tail}`
+    );
+  }
+  return (
+    `These write ${mechanismLabel(pick)} — the same mechanism this preset's own direction ` +
+    `keys drive, so the game reads them. (A motion written on the other mechanism is ` +
+    `published faithfully and read by nobody: that is the trap.) ${tail}`
+  );
+}
+
+/** Append a ready-made motion to the draft. Returns what happened, in words,
+ *  for the toast — or null when there is nothing to append it to. */
+export function macroInsertMotion(name: string): string | null {
+  const mac = macroDraft;
+  const motion = MOTIONS[name];
+  if (!mac || !motion) return null;
+  const slot = currentSlot();
+  const m = motionMechanism(slot);
+  const fns = directionFns(m);
+  const first = mac.steps.length;
+  for (const dirs of motion.steps) {
+    const step = newStep();
+    step.hold = dirs.map((d) => fns[d]);
+    mac.steps.push(step);
+  }
+  macroStep = first;
+  macroEdited();
+  const shape = motion.steps
+    .map((dirs) => holdText(slot, dirs.map((d) => fns[d])))
+    .join(" · ");
+  const chord = motion.steps.findIndex((d) => d.length > 1);
+  return (
+    `Added ${motion.steps.length} steps for the ${motion.label}, at 50 ms each, on ` +
+    `${mechanismLabel(m)}: ${shape}. Step ${first + chord + 1} holds TWO controls at once — ` +
+    "that is the diagonal, and it is one step, not two. Add the attack button as a final " +
+    "step, then press Save macro."
+  );
 }
 
 /** add / insert above / insert below / delete / move up / move down. */
@@ -2216,8 +2469,20 @@ function macroColsFor(slot: MapperSlot | null): MacroCol[] {
   }));
 }
 
+/** FIX 1 — WHAT THIS ROW HOLDS, in words, beside the row.
+ *
+ *  The piano roll's one unteachable fact is that a row is a CHORD: everything
+ *  ticked in it is held together, for that step's duration. Victor lost an
+ *  evening to a "hadouken" whose rows were ↓ then → then X, because a diagonal
+ *  is not a thing you bind — it IS down+forward held at once, i.e. one row with
+ *  two cells lit. Lit cells 12 columns apart do not say that; this line does,
+ *  on every row, without being asked.
+ *
+ *  Named the way THIS pad names it (so it matches the column headers and the
+ *  art above), and `+` between them because that is the notation every player
+ *  already reads. */
 function holdText(slot: MapperSlot | null, hold: string[]): string {
-  if (hold.length === 0) return "nothing — a neutral gap";
+  if (hold.length === 0) return "(nothing — neutral gap)";
   const table = slot && isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
   return hold
     .map((f) => {
@@ -2225,6 +2490,13 @@ function holdText(slot: MapperSlot | null, hold: string[]): string {
       return def ? legendLabel(def[0], def[1]) : f;
     })
     .join(" + ");
+}
+
+/** The readout's own class: a row holding TWO OR MORE controls is the shape
+ *  the grid cannot teach, so it is the one that gets the accent. */
+function holdCls(hold: string[]): string {
+  if (hold.length === 0) return "machold none";
+  return hold.length > 1 ? "machold both" : "machold";
 }
 
 function macroRowsFor(mac: MacroView, slot: MapperSlot | null): MacroRow[] {
@@ -2239,6 +2511,7 @@ function macroRowsFor(mac: MacroView, slot: MapperSlot | null): MacroRow[] {
         `step ${i + 1} holds ${holdText(slot, step.hold)} for ${durationText(step)} ` +
         `(the engine runs it for ${effectiveMs(step)} ms)`,
       hold: holdText(slot, step.hold),
+      holdcls: holdCls(step.hold),
       warn,
       warntitle: stepWarningLong(step),
       warncls: warn === "" ? "macwarn off" : "macwarn",
@@ -2422,6 +2695,10 @@ function refreshMacro(): void {
     setSlotMacrosLine(slotMacrosLineFor(slot));
     setMacroStepLine("");
     setMacroDurValue("50");
+    setMacroDurCls("macdurin");
+    setMacroConfirmCls("macconfirm off");
+    setMacroConfirmLine("");
+    setMacroMotionLine(macroMotionLineFor(slot));
     setMacroMathLine(frameMath(undefined, macroRateHz));
     setMacroTrigCls("mactrigger off");
     return;
@@ -2487,7 +2764,59 @@ function refreshMacro(): void {
   setMacroDurValue(
     step === undefined ? "50" : String(step.frames ?? step.ms ?? 50),
   );
+  // FIX 2: the field itself, not just an advisory somewhere under the grid.
+  setMacroDurCls(
+    step !== undefined && stepIsShort(step) ? "macdurin short" : "macdurin",
+  );
+  setMacroMotionLine(macroMotionLineFor(slot));
+  // The question is only ever on screen because Save asked it — and it is
+  // re-derived here so it cannot outlive the steps it is about.
+  const question = macroSaveAsked ? shortStepQuestion(mac) : "";
+  setMacroConfirmLine(question);
+  setMacroConfirmCls(question === "" ? "macconfirm off" : "macconfirm");
+  if (question === "") macroSaveAsked = false;
   setMacroMathLine(frameMath(step, macroRateHz));
+}
+
+// ── FIX 2: Save's inline confirmation ──────────────────────────────────────
+// The rule under the grid ("amber steps are shorter than…") has been there
+// since v11 and was read as decoration by the one person it was written for —
+// who then authored 1-frame steps and spent an evening on a macro the sampler
+// could not deliver. So the consequence now stands between the click and the
+// write, once, in the same words: a question with the count in it.
+//
+// It never REFUSES. A short step is legal, `allow_short` exists so one can be
+// authored on purpose, and Studio does not overrule a file the loader accepts.
+// The second click is the whole ceremony.
+
+/** Does this draft hold a step below the sampling floor? */
+export function macroHasShortSteps(): boolean {
+  return macroDraft?.steps.some(stepIsShort) ?? false;
+}
+
+/** ASK: put the question on screen and answer "yes, I asked". Returns false
+ *  when there is nothing to ask about, which is the ordinary save. */
+export function macroAskAboutShortSteps(): boolean {
+  const mac = macroDraft;
+  if (!mac) return false;
+  const question = shortStepQuestion(mac);
+  if (question === "") return false;
+  macroSaveAsked = true;
+  refreshMacro();
+  return true;
+}
+
+/** The question is answered (either way) — take it down. */
+export function macroClearShortStepQuestion(): void {
+  if (!macroSaveAsked) return;
+  macroSaveAsked = false;
+  refreshMacro();
+}
+
+/** What the bar is asking right now — "" when it is not up. For map.ts's
+ *  toast, so the two cannot word the same fact differently. */
+export function macroShortStepQuestion(): string {
+  return macroDraft === null ? "" : shortStepQuestion(macroDraft);
 }
 
 /** The unit the duration editor should show for the selected step. map.ts
@@ -3076,6 +3405,51 @@ export function MapIsland() {
           // second signal.
           h("span", { class: "macdirty mono" }, () => macroDirtyLine()),
         ),
+        // FIX 2: Save's question about steps below the sampling floor. Static
+        // in the DOM, hidden by its own class until Save asks — no createShow
+        // (ledger #4/#14), and its two buttons are the whole answer.
+        h(
+          "div",
+          { class: () => macroConfirmCls() },
+          h("p", { class: "macconfirmline" }, () => macroConfirmLine()),
+          h(
+            "span",
+            { class: "macconfirmbtns" },
+            h(
+              "button",
+              {
+                class: "btn btn-mini macsaveyes",
+                "data-act": "macro-save-anyway",
+                type: "button",
+                title: "write the macro exactly as it stands, short steps and all",
+              },
+              "Save anyway",
+            ),
+            h(
+              "button",
+              {
+                class: "btn btn-mini macsaveno",
+                "data-act": "macro-save-cancel",
+                type: "button",
+                title: "leave the preset alone and go back to the grid",
+              },
+              "Not yet",
+            ),
+          ),
+        ),
+        // FIX 1 — THE ONE SENTENCE, permanent, above everything it explains.
+        // Victor's evening was lost to a "hadouken" whose rows were ↓ then →
+        // then X: a diagonal is not an input you bind, it is down and forward
+        // held TOGETHER, which is one row with two cells lit. The grid never
+        // said so, and a fact this load-bearing does not go behind a
+        // disclosure, a tooltip or a hover.
+        h(
+          "p",
+          { class: "macconcept" },
+          "A step holds everything you tick in that row AT ONCE — a diagonal ",
+          "is ONE step holding ↓ and →, not two steps. Every row says what it ",
+          "holds, in words, beside its number.",
+        ),
         // What this card IS, before any of its controls. A first-time reader
         // should not have to open docs/INPUT-TRANSFORMS.md to use it.
         h(
@@ -3084,7 +3458,8 @@ export function MapIsland() {
           "A MACRO is a timed sequence the pad plays by itself: each row below ",
           "is one step, the columns are this pad's controls, and a step holds ",
           "whatever its row has filled in — for its own duration — before the ",
-          "next one starts. A quarter-circle is three rows. A TRIGGER is the ",
+          "next one starts. A quarter-circle is three steps: ↓, then ↓ and → ",
+          "together on ONE row, then →. A TRIGGER is the ",
           "panel key that STARTS the macro: bind one in the Trigger section at ",
           "the bottom, and from then on that single key press plays the whole ",
           "sequence. The two are separate on purpose — the sequence lives in ",
@@ -3140,6 +3515,82 @@ export function MapIsland() {
         // why this is a sentence and not a button.
         h("p", { class: "macslotoff" }, () => slotMacrosLine()),
         h("p", { class: "macpolicy mono" }, () => macroPolicyLine()),
+        // FIX 1c — COMMON MOTIONS. These are the sequences everybody is
+        // actually trying to build, and they are exactly where the
+        // two-controls-per-row concept bites: the middle step of a
+        // quarter-circle IS the diagonal. Each button appends a correct step
+        // group at 50 ms (above the sampling floor), written on the mechanism
+        // this slot's own direction keys drive — see `macroMotionLineFor`, and
+        // `Issue::MacroHoldsOtherMechanism` for the trap it sidesteps.
+        //
+        // JS-only, like every other draft edit here; the labels spell the
+        // holds so the shape is legible before anything is clicked.
+        h(
+          "div",
+          { class: "macmotions" },
+          h("span", { class: "macmotlbl" }, "common motions"),
+          h(
+            "button",
+            {
+              class: "btn btn-mini macmot",
+              "data-macmotion": "qcf",
+              type: "button",
+              title: "append a quarter-circle forward: ↓, then ↓+→ held together, then →",
+            },
+            "¼ → · ↓ · ↓+→ · →",
+          ),
+          h(
+            "button",
+            {
+              class: "btn btn-mini macmot",
+              "data-macmotion": "qcb",
+              type: "button",
+              title: "append a quarter-circle back: ↓, then ↓+← held together, then ←",
+            },
+            "¼ ← · ↓ · ↓+← · ←",
+          ),
+          h(
+            "button",
+            {
+              class: "btn btn-mini macmot",
+              "data-macmotion": "hcf",
+              type: "button",
+              title: "append a half-circle forward: ←, ↓+←, ↓, ↓+→, →",
+            },
+            "½ → · ← · ↓+← · ↓ · ↓+→ · →",
+          ),
+          h(
+            "button",
+            {
+              class: "btn btn-mini macmot",
+              "data-macmotion": "hcb",
+              type: "button",
+              title: "append a half-circle back: →, ↓+→, ↓, ↓+←, ←",
+            },
+            "½ ← · → · ↓+→ · ↓ · ↓+← · ←",
+          ),
+          h(
+            "button",
+            {
+              class: "btn btn-mini macmot",
+              "data-macmotion": "dpf",
+              type: "button",
+              title: "append a dragon punch forward: →, ↓, then ↓+→ held together",
+            },
+            "DP → · → · ↓ · ↓+→",
+          ),
+          h(
+            "button",
+            {
+              class: "btn btn-mini macmot",
+              "data-macmotion": "dpb",
+              type: "button",
+              title: "append a dragon punch back: ←, ↓, then ↓+← held together",
+            },
+            "DP ← · ← · ↓ · ↓+←",
+          ),
+          h("p", { class: "macmotnote" }, () => macroMotionLine()),
+        ),
         // The grid. Two aligned columns: the row bar (step number, duration,
         // amber flag, the five step verbs) and the scrollable matrix with its
         // control headers. Row heights are fixed in CSS so the two line up.
@@ -3152,19 +3603,25 @@ export function MapIsland() {
             h("div", { class: "macrowhead" }, "step"),
             createList(
               () => macroRows(),
-              (r) => r.n + "|" + r.cls + "|" + r.dur + "|" + r.warn + "|" + r.hold,
+              (r) =>
+                r.n + "|" + r.cls + "|" + r.dur + "|" + r.warn + "|" + r.hold + "|" + r.holdcls,
               (r) =>
                 h(
                   "div",
                   { class: r.cls, title: r.durtitle },
                   h("span", { class: "macnum" }, r.n),
+                  // FIX 1: WHAT THIS ROW HOLDS, before its timing — reading
+                  // the grid must never mean decoding which of 25 columns are
+                  // lit. `machold both` is the accent for the row that holds
+                  // more than one control, because that row is the one the
+                  // piano roll cannot teach on its own.
+                  h("span", { class: r.holdcls }, r.hold),
                   h("span", { class: "macdur" }, r.dur),
                   // FLAGGED INLINE, in amber, with the reason — never a
                   // silent accept and never a silent rewrite (§0.2). The
                   // short form always fits; the whole sentence is the title,
                   // and the rule behind it is stated once below the grid.
                   h("span", { class: r.warncls, title: r.warntitle }, r.warn),
-                  h("span", { class: "machold" }, r.hold),
                   h(
                     "span",
                     { class: "macbtns" },
@@ -3243,8 +3700,12 @@ export function MapIsland() {
             "label",
             { class: "bindlabel" },
             "duration",
+            // FIX 2: the BOX turns warn-coloured when the number in it is
+            // below the sampling floor. An advisory two elements away was read
+            // as decoration; the field that holds the offending number cannot
+            // be.
             h("input", {
-              class: "macdurin",
+              class: () => macroDurCls(),
               type: "number",
               min: "1",
               step: "1",

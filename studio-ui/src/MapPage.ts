@@ -315,6 +315,15 @@ export function MapPage() {
   const [macroDirtyLine] = createSignal("");
   const [macroStepLine] = createSignal("click a step's ⏱ to edit its duration");
   const [macroDurValue] = createSignal("50");
+  // v15/FIX 2: the duration BOX's own class (a below-floor step is a fact
+  // about the number in that field), and Save's inline question about short
+  // steps — a class string plus its sentence, never a show (ledger #13/#14).
+  // An SSR paint has asked nothing, so the bar renders off and empty.
+  const [macroDurCls] = createSignal("macdurin");
+  const [macroConfirmCls] = createSignal("macconfirm off");
+  const [macroConfirmLine] = createSignal("");
+  // v15/FIX 1c: which mechanism the "common motions" buttons write, and why.
+  const [macroMotionLine] = createSignal("");
   // v12's three: the Save button's look, the live frame arithmetic, and the
   // trigger block's inert class while the preset holds no macro.
   const [macroSaveCls] = createSignal("btn btn-mini macsave off");

@@ -56,5 +56,5 @@ pub use pad::{
 pub use persona::{Persona, UnknownPersona};
 pub use preset::{Binding, Chord, Macros, Preset, TurboBinding};
 pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS, MAX_XINPUT_SLOTS};
-pub use templates::{Template, TemplateError, MAX_TEMPLATE_PLAYERS, TEMPLATES};
 pub use socd::{OpposingPair, Socd, UnknownSocd};
+pub use templates::{Template, TemplateError, MAX_TEMPLATE_PLAYERS, TEMPLATES};
