@@ -13,6 +13,7 @@ mod doctor;
 mod install;
 mod logging;
 mod macro_cli;
+mod macro_trace;
 mod map;
 mod mapping;
 mod monitor;
@@ -537,15 +538,26 @@ enum Command {
     /// does not define; nothing written, no backup taken).
     // Verbatim so the JSON sample above keeps its line breaks: a body shape
     // reflowed into one paragraph is a shape nobody can copy.
-    #[command(verbatim_doc_comment)]
+    ///
+    /// `ksx macro trace` is the other half of this verb: it MEASURES a macro
+    /// instead of writing one (see its own --help).
+    #[command(
+        verbatim_doc_comment,
+        args_conflicts_with_subcommands = true,
+        subcommand_negates_reqs = true
+    )]
     Macro {
+        /// `trace` — play the macro through the real output path and report
+        /// what a 60 Hz poller would have seen
+        #[command(subcommand)]
+        command: Option<MacroCommand>,
         /// Preset name (the file's `name` field, e.g. "IPAC P1")
-        #[arg(long, value_name = "NAME")]
-        preset: String,
+        #[arg(long, value_name = "NAME", required = true)]
+        preset: Option<String>,
         /// The macro's name — the [macros.<name>] table, and the second half
         /// of the `macro.<name>` function that triggers it
-        #[arg(long, value_name = "NAME")]
-        name: String,
+        #[arg(long, value_name = "NAME", required = true)]
+        name: Option<String>,
         /// Read the JSON body from this file instead of stdin
         #[arg(long, value_name = "FILE", conflicts_with = "delete")]
         from_json: Option<std::path::PathBuf>,
@@ -664,6 +676,71 @@ enum Command {
         /// TCP port on 127.0.0.1
         #[arg(long, default_value_t = 4460)]
         port: u16,
+    },
+}
+
+#[derive(Subcommand)]
+enum MacroCommand {
+    /// Measure a macro: play it through the REAL output path and report what a
+    /// 60 Hz poller would have seen
+    ///
+    /// The question a macro's correctness actually turns on is not "did ksx
+    /// emit the state" — that is a unit test — but "did the state live long
+    /// enough for the game to sample it". XInput hands a game a SNAPSHOT, not
+    /// a queue, and an Unreal-engine game polls it once per frame, so a state
+    /// shorter than one poll interval is not unreliable: it is invisible.
+    ///
+    /// So this plugs a pad, plays one run through the same Engine and the same
+    /// VirtualPadBackend the daemon uses, timestamps every submission to the
+    /// microsecond, and — separately, on its own thread — samples the published
+    /// state at --sample-hz and reports the DISTINCT states that consumer saw.
+    /// Two lists, and the gap between them is the finding:
+    ///
+    ///   SUBMITTED  what ksx handed the driver, with dwell and driver-call time
+    ///   OBSERVED   what a poller at the game's rate actually read
+    ///
+    /// Anything in the first list and not the second was too short to survive
+    /// sampling. The verdict names those explicitly, plus how many samples the
+    /// diagonal (any state deflecting two perpendicular directions) got.
+    ///
+    /// It captures no keyboard and writes nothing. --config-dir points it at a
+    /// portable root so it cannot read or disturb the installed configuration,
+    /// and the pad is its own — ViGEm targets are per-process, so it runs
+    /// safely beside a live daemon, though it does occupy one XInput slot while
+    /// it runs.
+    ///
+    /// Exit codes: 0 = traced, 1 = error, 2 = refused (unknown preset or macro)
+    /// or ViGEmBus missing.
+    #[command(verbatim_doc_comment)]
+    Trace {
+        /// Preset name (the file's `name` field, e.g. "IPAC P1")
+        #[arg(long, value_name = "NAME")]
+        preset: String,
+        /// The macro to play
+        #[arg(long, value_name = "NAME")]
+        name: String,
+        /// Rate of the simulated consumer, in hertz. 60 is the number that
+        /// matters: it is what a 60 fps game polls at
+        #[arg(long, value_name = "HZ", default_value_t = 60)]
+        sample_hz: u32,
+        /// Configuration directory to read the preset from. Use a portable
+        /// root to keep a trace away from the installed configuration
+        #[arg(long, value_name = "DIR")]
+        config_dir: Option<std::path::PathBuf>,
+        /// Controller the traced pad presents itself as
+        #[arg(long, default_value = "xbox360", value_parser = parse_persona)]
+        persona: ksx_core::Persona,
+        /// Trace the scheduler with no driver and no pad (mock backend). The
+        /// timing is real; the driver call is not measured
+        #[arg(long)]
+        dry_run: bool,
+        /// How long the trigger key is held, in milliseconds. A tap by default
+        #[arg(long, value_name = "MS", default_value_t = 33)]
+        hold_ms: u64,
+        /// One JSON object on stdout: {preset, macro, sample_hz, submits[],
+        /// observed[], verdict}
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -997,14 +1074,40 @@ fn main() -> anyhow::Result<()> {
             json,
         }),
         Command::Macro {
+            command:
+                Some(MacroCommand::Trace {
+                    preset,
+                    name,
+                    sample_hz,
+                    config_dir,
+                    persona,
+                    dry_run,
+                    hold_ms,
+                    json,
+                }),
+            ..
+        } => macro_trace::run(macro_trace::Options {
+            preset,
+            name,
+            sample_hz,
+            config_dir,
+            persona,
+            dry_run,
+            hold_ms,
+            json,
+        }),
+        Command::Macro {
+            command: None,
             preset,
             name,
             from_json,
             delete,
             json,
         } => macro_cli::run(macro_cli::Options {
-            preset,
-            name,
+            // `required = true` on both, negated only by a subcommand — which
+            // the arm above already took, so clap has guaranteed these are here.
+            preset: preset.expect("clap enforces --preset"),
+            name: name.expect("clap enforces --name"),
             from_json,
             delete,
             json,

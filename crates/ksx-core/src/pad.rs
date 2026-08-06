@@ -7,12 +7,48 @@
 
 use bitflags::bitflags;
 
-/// Legacy `XboxAxisPosition.Min`.
-pub const AXIS_MIN: i16 = i16::MIN;
+/// Legacy `XboxAxisPosition.Min` — full negative deflection, **-32767 and not
+/// `i16::MIN`**.
+///
+/// # Why one LSB is given away
+///
+/// `i16::MIN` is the one value in the range with no positive twin: `-(-32768)`
+/// and `(-32768).abs()` are unrepresentable, and `-32768 / 32767.0` is
+/// -1.00003, outside the [-1.0, 1.0] every normalizing consumer assumes. It is
+/// a legal XInput value (Microsoft documents the range as -32768..=32767) and
+/// most consumers survive it — but the ones that do not fail in a way that is
+/// invisible from this side. Firefox shipped exactly this bug: its XInput
+/// backend divided by 32767, produced -1.00003, and broke SDL2/Emscripten
+/// games until it was fixed with a sign-dependent divisor
+/// (Mozilla bug 1606562).
+///
+/// -32767 is 0.003% less deflection — below the resolution of any stick, any
+/// game's deadzone, and any human — and it removes that entire class of
+/// consumer bug for free. There is no configuration in which ksx's own "min"
+/// hands a game a value only careful code survives.
+///
+/// A preset may still name the raw value literally (`lx.-32768`); [`safe_axis`]
+/// is the wire guarantee that covers that case.
+pub const AXIS_MIN: i16 = -32767;
 /// Legacy `XboxAxisPosition.Center`.
 pub const AXIS_CENTER: i16 = 0;
 /// Legacy `XboxAxisPosition.Max`.
 pub const AXIS_MAX: i16 = i16::MAX;
+
+/// An axis value as it may go on the wire: [`i16::MIN`] folded to [`AXIS_MIN`],
+/// everything else untouched.
+///
+/// [`AXIS_MIN`] explains why. This is the same rule applied at the *boundary*
+/// rather than at authoring time, so a hand-written literal, a legacy import, or
+/// a future binding source cannot route around it. Backends call it once, on the
+/// way out; nothing in the engine needs to know.
+pub const fn safe_axis(value: i16) -> i16 {
+    if value == i16::MIN {
+        AXIS_MIN
+    } else {
+        value
+    }
+}
 
 bitflags! {
     /// XInput `wButtons` wire bits.
@@ -291,9 +327,38 @@ mod tests {
 
     #[test]
     fn axis_positions_match_legacy() {
-        assert_eq!(AXIS_MIN, -32768);
+        // Legacy's Min was i16::MIN; ksx's is one LSB in from it, on purpose —
+        // see AXIS_MIN. Everything else is bit-identical.
+        assert_eq!(AXIS_MIN, -32767);
         assert_eq!(AXIS_CENTER, 0);
         assert_eq!(AXIS_MAX, 32767);
+    }
+
+    /// The property the whole `-32767` decision rests on: full deflection is
+    /// SYMMETRIC, so every arithmetic a consumer might do on it is total.
+    #[test]
+    fn full_deflection_is_symmetric_and_survives_consumer_arithmetic() {
+        assert_eq!(AXIS_MIN, -AXIS_MAX);
+        // Negation and abs are the two operations i16::MIN has no answer for.
+        assert_eq!(AXIS_MIN.checked_neg(), Some(AXIS_MAX));
+        assert_eq!(AXIS_MIN.checked_abs(), Some(AXIS_MAX));
+        assert_eq!(i16::MIN.checked_neg(), None);
+        assert_eq!(i16::MIN.checked_abs(), None);
+        // ...and normalizing by 32767 — what a game does before it computes an
+        // angle — stays inside the range every consumer assumes.
+        assert!((f64::from(AXIS_MIN) / f64::from(AXIS_MAX)) >= -1.0);
+        assert!((f64::from(i16::MIN) / f64::from(AXIS_MAX)) < -1.0);
+    }
+
+    /// The wire guarantee, which covers what authoring cannot: a literal.
+    #[test]
+    fn safe_axis_folds_only_the_one_dangerous_value() {
+        assert_eq!(safe_axis(i16::MIN), AXIS_MIN);
+        assert_eq!(safe_axis(AXIS_MIN), AXIS_MIN);
+        assert_eq!(safe_axis(AXIS_MAX), AXIS_MAX);
+        assert_eq!(safe_axis(0), 0);
+        assert_eq!(safe_axis(-1), -1);
+        assert_eq!(safe_axis(-32767), -32767);
     }
 
     #[test]

@@ -47,9 +47,10 @@ pub use macros::{
     TURBO_MAX_HZ,
 };
 pub use pad::{
-    Axis, DpadDirection, PadState, Trigger, XButton, XButtons, AXIS_CENTER, AXIS_MAX, AXIS_MIN,
+    safe_axis, Axis, DpadDirection, PadState, Trigger, XButton, XButtons, AXIS_CENTER, AXIS_MAX,
+    AXIS_MIN,
 };
 pub use persona::{Persona, UnknownPersona};
-pub use preset::{Binding, Chord, Macros, Preset};
+pub use preset::{Binding, Chord, Macros, Preset, TurboBinding};
 pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS, MAX_XINPUT_SLOTS};
 pub use socd::{OpposingPair, Socd, UnknownSocd};

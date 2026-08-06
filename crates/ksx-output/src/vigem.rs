@@ -25,7 +25,7 @@ use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ksx_core::{PadState, Persona};
+use ksx_core::{safe_axis, PadState, Persona};
 use rusty_xinput::XInputHandle;
 use vigem_client::{Client, DualShock4Wired, TargetId, XGamepad, Xbox360Wired};
 
@@ -45,8 +45,18 @@ const FEEDBACK_QUEUE_CAP: usize = 64;
 
 /// `PadState` (ksx-core) → `XGamepad` (vigem wire struct).
 ///
-/// Deliberately a plain field copy — `PadState` is defined in XInput wire shape
-/// and the bit-level equivalence is locked down by the tests below.
+/// A plain field copy — `PadState` is defined in XInput wire shape and the
+/// bit-level equivalence is locked down by the tests below — with exactly one
+/// adjustment: the axes go through [`safe_axis`], which folds `i16::MIN` to
+/// -32767.
+///
+/// That is not a rounding: it is the one value in the range with no positive
+/// twin, so a game normalizing by 32767 reads -1.00003 and a game taking
+/// `abs()` on an `i16` reads a negative magnitude. `AXIS_MIN` already is -32767,
+/// so a preset saying `ly.min` never gets here — this covers what authoring
+/// cannot, a hand-written `ly.-32768` or a legacy import, and makes "ksx never
+/// puts i16::MIN on the wire" a property of the boundary rather than of every
+/// caller upstream of it. See `ksx_core::AXIS_MIN` for the citation.
 fn to_xgamepad(state: &PadState) -> XGamepad {
     XGamepad {
         buttons: vigem_client::XButtons {
@@ -54,10 +64,10 @@ fn to_xgamepad(state: &PadState) -> XGamepad {
         },
         left_trigger: state.lt,
         right_trigger: state.rt,
-        thumb_lx: state.lx,
-        thumb_ly: state.ly,
-        thumb_rx: state.rx,
-        thumb_ry: state.ry,
+        thumb_lx: safe_axis(state.lx),
+        thumb_ly: safe_axis(state.ly),
+        thumb_rx: safe_axis(state.rx),
+        thumb_ry: safe_axis(state.ry),
     }
 }
 
@@ -469,10 +479,33 @@ mod tests {
             let g = to_xgamepad(&state);
             assert_eq!(g.left_trigger, lt);
             assert_eq!(g.right_trigger, rt);
-            assert_eq!(g.thumb_lx, lx);
-            assert_eq!(g.thumb_ly, ly);
-            assert_eq!(g.thumb_rx, rx);
-            assert_eq!(g.thumb_ry, ry);
+            // Verbatim EXCEPT i16::MIN, which is folded to -32767 on the way
+            // out (see `to_xgamepad`): the one value a consumer cannot negate,
+            // abs, or normalize by 32767 without producing nonsense.
+            assert_eq!(g.thumb_lx, safe_axis(lx));
+            assert_eq!(g.thumb_ly, safe_axis(ly));
+            assert_eq!(g.thumb_rx, safe_axis(rx));
+            assert_eq!(g.thumb_ry, safe_axis(ry));
+        }
+    }
+
+    /// The wire promise, stated as a test rather than as a comment: no axis ksx
+    /// submits to ViGEm is ever `i16::MIN`, whatever the preset said.
+    #[test]
+    fn no_axis_reaches_the_wire_as_i16_min() {
+        let state = PadState {
+            lx: i16::MIN,
+            ly: i16::MIN,
+            rx: i16::MIN,
+            ry: i16::MIN,
+            ..PadState::default()
+        };
+        let g = to_xgamepad(&state);
+        for axis in [g.thumb_lx, g.thumb_ly, g.thumb_rx, g.thumb_ry] {
+            assert_ne!(axis, i16::MIN);
+            assert_eq!(axis, ksx_core::AXIS_MIN);
+            // Full deflection is still full deflection, and now symmetric.
+            assert_eq!(axis.checked_neg(), Some(i16::MAX));
         }
     }
 
