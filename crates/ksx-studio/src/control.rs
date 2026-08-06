@@ -51,17 +51,17 @@ pub trait ControlSource: Send + Sync {
     /// current keys ∖ {k}), and the whole set is what gets written, so a
     /// caller never has to know how the writer spells the edit.
     ///
-    /// The default implementation composes it from [`ControlSource::bind`],
-    /// which is all today's daemon offers — and that is exactly where it runs
-    /// out: the pipe `map` verb takes ONE `"key"` and is replace-per-function
-    /// (`ksx-app/src/mapping.rs`: "out with every old key for this function"),
-    /// so an empty set is a clear, a one-key set is an ordinary bind, and a
-    /// two-key set has no wire shape at all. Rather than write the first key
-    /// and silently drop the rest — the Synapse-4 sin MAPPER-UX commandment 7
-    /// bans — it refuses in words that name the missing field. An
-    /// implementation that CAN write a list (a `"keys": [...]` on the map
-    /// verb, or an `"add"`/`"remove"` mode) overrides this and makes every
-    /// edit atomic; nothing else on the page changes when it does.
+    /// **ksx-app overrides this**: the daemon's `map` verb takes a `"keys":
+    /// [...]` list, so the whole set lands in ONE atomic write —
+    /// replace-per-function with the list the caller computed, no
+    /// read-modify-write and no half-applied edit when a write is refused.
+    ///
+    /// The DEFAULT implementation is the fallback for a control source that
+    /// has only [`ControlSource::bind`] (one `"key"` per call): an empty set
+    /// is a clear, a one-key set is an ordinary bind, and a two-key set has no
+    /// wire shape at all there. Rather than write the first key and silently
+    /// drop the rest — the Synapse-4 sin MAPPER-UX commandment 7 bans — it
+    /// refuses in words that name the missing field.
     fn bind_keys(
         &self,
         preset: &str,
@@ -98,9 +98,11 @@ pub trait ControlSource: Send + Sync {
     }
 }
 
-/// Why a multi-key write cannot land on this daemon, in one sentence a page
-/// can flash verbatim. Named here (not formatted at three call sites) so the
-/// day the wire grows a key list there is exactly one place to delete.
+/// Why a multi-key write cannot land on a daemon whose only shape is one key
+/// per call, in one sentence a page can flash verbatim. A current ksx daemon
+/// never says this — it overrides [`ControlSource::bind_keys`] and writes the
+/// list — so it is the honest answer for a control source that predates the
+/// `"keys"` field, kept in one place rather than formatted at three.
 pub fn multi_key_refusal(function: &str, keys: &[String]) -> String {
     format!(
         "{function} would have to hold {} keys at once ({}), and this daemon's map verb writes \

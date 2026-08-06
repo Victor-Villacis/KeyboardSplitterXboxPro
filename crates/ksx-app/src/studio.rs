@@ -108,54 +108,100 @@ impl ksx_studio::ControlSource for PipeControlSource {
     }
 
     fn bind(&self, request: &BindRequest) -> BindOutcome {
-        let mut wire = serde_json::json!({
-            "verb": "map",
-            "preset": request.preset,
-            "function": request.function,
-            "force": request.force,
-            "reload": request.reload,
-        });
-        match &request.key {
-            Some(key) => wire["key"] = serde_json::json!(key),
-            None => wire["clear"] = serde_json::json!(true),
-        }
-        match client::request(pipe::PIPE_NAME, &wire) {
-            Ok(response) => BindOutcome {
-                ok: response["ok"] == true,
-                message: response["message"].as_str().map(str::to_owned),
-                error: response["error"].as_str().map(str::to_owned),
-                code: response["code"].as_str().map(str::to_owned),
-                conflicts: response["conflicts"]
-                    .as_array()
-                    .map(|rows| {
-                        rows.iter()
-                            .map(|row| BindConflict {
-                                scope: row["scope"].as_str().unwrap_or("").to_owned(),
-                                preset: row["preset"].as_str().unwrap_or("").to_owned(),
-                                function: row["function"].as_str().unwrap_or("").to_owned(),
-                                profile: row["profile"].as_str().map(str::to_owned),
-                                slot: row["slot"].as_u64().and_then(|n| u8::try_from(n).ok()),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                // Multi-bind information (absent from a pre-multi-bind daemon,
-                // which is exactly an empty list: it had no co-bindings to
-                // report because it moved the key instead).
-                also_drives: response["also_drives"]
-                    .as_array()
-                    .map(|rows| {
-                        rows.iter()
-                            .filter_map(|row| row.as_str())
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                reloaded: response["reloaded"] == true,
-            },
-            Err(client::ClientError::NotRunning) => BindOutcome::failed(NO_CHANNEL),
-            Err(err) => BindOutcome::failed(err.to_string()),
-        }
+        // One key or none — the single-key spelling of a key list.
+        let keys: Vec<String> = request.key.clone().into_iter().collect();
+        map_request(map_wire(
+            &request.preset,
+            &request.function,
+            &keys,
+            request.force,
+            request.reload,
+        ))
+    }
+
+    /// The control's WHOLE key list in ONE pipe call — the override the
+    /// contract in `ksx-studio/src/control.rs` asks for. The default
+    /// implementation composes `bind` calls and can only express nothing or
+    /// one key; the daemon's `map` verb takes a `"keys"` list, so "add another
+    /// key" and the per-key ✕ become a single atomic write (no
+    /// read-modify-write, no half-applied list if the write is refused).
+    fn bind_keys(
+        &self,
+        preset: &str,
+        function: &str,
+        keys: &[String],
+        force: bool,
+        reload: bool,
+    ) -> BindOutcome {
+        map_request(map_wire(preset, function, keys, force, reload))
+    }
+}
+
+/// The `map` request body for a control's whole key list. An EMPTY list is a
+/// clear (`"clear": true`) — the honest wire shape for "this control now holds
+/// nothing", same as `bind(None)`. One key sends `"key"`, so a single-key
+/// write is byte-for-byte the request it always was; two or more send
+/// `"keys"`.
+fn map_wire(
+    preset: &str,
+    function: &str,
+    keys: &[String],
+    force: bool,
+    reload: bool,
+) -> serde_json::Value {
+    let mut wire = serde_json::json!({
+        "verb": "map",
+        "preset": preset,
+        "function": function,
+        "force": force,
+        "reload": reload,
+    });
+    match keys {
+        [] => wire["clear"] = serde_json::json!(true),
+        [only] => wire["key"] = serde_json::json!(only),
+        many => wire["keys"] = serde_json::json!(many),
+    }
+    wire
+}
+
+/// One `map` pipe request → [`BindOutcome`].
+fn map_request(wire: serde_json::Value) -> BindOutcome {
+    match client::request(pipe::PIPE_NAME, &wire) {
+        Ok(response) => BindOutcome {
+            ok: response["ok"] == true,
+            message: response["message"].as_str().map(str::to_owned),
+            error: response["error"].as_str().map(str::to_owned),
+            code: response["code"].as_str().map(str::to_owned),
+            conflicts: response["conflicts"]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .map(|row| BindConflict {
+                            scope: row["scope"].as_str().unwrap_or("").to_owned(),
+                            preset: row["preset"].as_str().unwrap_or("").to_owned(),
+                            function: row["function"].as_str().unwrap_or("").to_owned(),
+                            profile: row["profile"].as_str().map(str::to_owned),
+                            slot: row["slot"].as_u64().and_then(|n| u8::try_from(n).ok()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            // Multi-bind information (absent from a pre-multi-bind daemon,
+            // which is exactly an empty list: it had no co-bindings to
+            // report because it moved the key instead).
+            also_drives: response["also_drives"]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| row.as_str())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            reloaded: response["reloaded"] == true,
+        },
+        Err(client::ClientError::NotRunning) => BindOutcome::failed(NO_CHANNEL),
+        Err(err) => BindOutcome::failed(err.to_string()),
     }
 }
 
@@ -555,6 +601,48 @@ fn load_profiles() -> (Vec<ProfileRow>, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `bind_keys` OVERRIDE: Studio's whole-key-list edit is ONE `map`
+    /// request carrying `"keys"`, not N single-key writes and not a refusal.
+    /// Empty is an honest clear, one key is the request the verb always got
+    /// (`"key"`, so a pre-list daemon still understands it), and two or more
+    /// is the list the engine runs as an OR-chain.
+    #[test]
+    fn bind_keys_sends_the_whole_list_in_one_map_request() {
+        let two = vec!["S".to_owned(), "Enter".to_owned()];
+        let wire = map_wire("IPAC P1", "A", &two, false, true);
+        assert_eq!(wire["verb"], "map");
+        assert_eq!(wire["preset"], "IPAC P1");
+        assert_eq!(wire["function"], "A");
+        assert_eq!(wire["keys"], serde_json::json!(["S", "Enter"]));
+        assert!(wire.get("key").is_none(), "{wire}");
+        assert!(wire.get("clear").is_none(), "{wire}");
+        assert_eq!(wire["reload"], true);
+
+        // One key: the single-key request, unchanged.
+        let one = map_wire("IPAC P1", "A", &["G".to_owned()], true, false);
+        assert_eq!(one["key"], "G");
+        assert!(one.get("keys").is_none(), "{one}");
+        assert_eq!(one["force"], true);
+
+        // The empty list is the clear — removing a control's last key must
+        // leave the inert "None" placeholder, not a silently missing row.
+        let none = map_wire("IPAC P1", "A", &[], false, true);
+        assert_eq!(none["clear"], true);
+        assert!(none.get("key").is_none(), "{none}");
+        assert!(none.get("keys").is_none(), "{none}");
+
+        // And `bind` composes to exactly the same body, so the two entry
+        // points cannot drift.
+        let via_bind = map_wire(
+            "IPAC P1",
+            "A",
+            &Some("G".to_owned()).into_iter().collect::<Vec<_>>(),
+            true,
+            false,
+        );
+        assert_eq!(via_bind, one);
+    }
 
     #[test]
     fn bus_line_includes_the_driver_version() {

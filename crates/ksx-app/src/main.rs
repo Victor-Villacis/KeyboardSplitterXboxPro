@@ -313,7 +313,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Bind one preset function to one panel key (writes the preset TOML)
+    /// Bind one preset function to one panel key — or to a list of them
+    /// (writes the preset TOML)
     ///
     /// The non-interactive mapping verb (docs/CONTROL-SURFACE.md): validates
     /// the preset name against the files on disk, the function name against
@@ -322,11 +323,19 @@ enum Command {
     /// the legacy key-name spelling (`ksx monitor` shows the name for any key
     /// you press) — then rewrites exactly one preset file atomically.
     ///
-    /// Binding REPLACES the function's keys (one key per control, what the
-    /// mapper shows) AND NOTHING ELSE; --clear leaves the inert "None"
-    /// placeholder. The write is canonical TOML: bindings come back sorted,
-    /// dotted functions as quoted literals ("dpad.up"), hand-written comments
-    /// do not survive — the trade for atomic, validated writes.
+    /// Binding REPLACES the function's keys AND NOTHING ELSE; --clear leaves
+    /// the inert "None" placeholder. The write is canonical TOML: bindings
+    /// come back sorted, dotted functions as quoted literals ("dpad.up"),
+    /// hand-written comments do not survive — the trade for atomic, validated
+    /// writes.
+    ///
+    /// MANY KEYS → ONE CONTROL: repeat --key (or comma-separate it) to give a
+    /// control a whole key list in ONE write — `--function A --key S --key
+    /// Enter` writes A = ["S", "Enter"], and pressing EITHER fires A (the
+    /// OR-chain the engine has always run). The list is written in the order
+    /// given, exact duplicates dropped (`--key s --key S` is one key); the
+    /// list REPLACES what the control held, so an add is "the old keys plus
+    /// the new one", which is what Studio's mapper sends.
     ///
     /// MULTI-BIND: binding a key that already drives another control adds a
     /// second driver; use --move-from to take it away instead. One key driving
@@ -397,14 +406,18 @@ enum Command {
             required_unless_present_any = ["restore", "list_backups", "clear_all"]
         )]
         function: Option<String>,
-        /// Key name to bind (legacy spelling, e.g. G, Enter, Left)
+        /// Key name to bind (legacy spelling, e.g. G, Enter, Left). REPEAT IT
+        /// (or comma-separate) for MANY KEYS → ONE CONTROL: --key S --key
+        /// Enter, or --key S,Enter, writes A = ["S", "Enter"] in one write and
+        /// the control fires on either. Order is kept, duplicates dropped
         #[arg(
             long,
             value_name = "KEY",
+            value_delimiter = ',',
             required_unless_present_any = ["clear", "restore", "list_backups", "clear_all"],
             conflicts_with = "clear"
         )]
-        key: Option<String>,
+        key: Vec<String>,
         /// Unbind the function (leaves the inert "None" placeholder)
         #[arg(long)]
         clear: bool,
@@ -898,9 +911,10 @@ fn main() -> anyhow::Result<()> {
                 ),
                 (false, false, None) => map::Action::Bind {
                     // clap: --function is required without --restore, and
-                    // exactly one of --key/--clear; a `None` key IS the clear.
+                    // either --key (once or many times) or --clear; an EMPTY
+                    // key list IS the clear.
                     function: function.expect("clap requires --function without --restore"),
-                    key,
+                    keys: key,
                     force,
                     move_from,
                     when,
@@ -1675,7 +1689,7 @@ mod tests {
             } => {
                 assert_eq!(preset, "IPAC P1");
                 assert_eq!(function.as_deref(), Some("A"));
-                assert_eq!(key.as_deref(), Some("G"));
+                assert_eq!(key, ["G"], "one --key is a one-key list");
                 assert!(!clear && !force && json && !list_backups && !clear_all);
                 assert_eq!(restore, None);
                 // The default write shares a key rather than moving it.
@@ -1700,7 +1714,7 @@ mod tests {
             Command::Map {
                 key, clear, force, ..
             } => {
-                assert_eq!(key, None);
+                assert!(key.is_empty());
                 assert!(clear && force);
             }
             _ => panic!("parsed to the wrong subcommand"),
@@ -1797,7 +1811,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(function, None);
-                assert_eq!(key, None);
+                assert!(key.is_empty());
                 assert_eq!(restore.as_deref(), Some("defaults"));
             }
             _ => panic!("parsed to the wrong subcommand"),
@@ -1875,7 +1889,7 @@ mod tests {
             } => {
                 assert_eq!(preset, "IPAC P1");
                 assert_eq!(function, None);
-                assert_eq!(key, None);
+                assert!(key.is_empty());
                 assert!(list_backups && json);
             }
             _ => panic!("parsed to the wrong subcommand"),
@@ -1979,7 +1993,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(function.as_deref(), Some("rt"));
-                assert_eq!(key.as_deref(), Some("A"));
+                assert_eq!(key, ["A"]);
                 assert_eq!(when, vec!["B".to_owned(), "C".to_owned()]);
                 assert_eq!(unless, vec!["LeftShift".to_owned()]);
             }

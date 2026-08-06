@@ -1,4 +1,5 @@
-//! `ksx map` — bind one preset function to one panel key, from a shell.
+//! `ksx map` — bind one preset function to one panel key (or to a LIST of
+//! them: `--key S --key Enter`, the OR-chain the engine runs), from a shell.
 //!
 //! The CLI face of [`crate::mapping::apply`] (the pipe's `map` verb and, over
 //! it, Studio's mapper are the other two faces — one writer, three surfaces).
@@ -21,8 +22,10 @@ pub const EXIT_REFUSED: i32 = 2;
 pub enum Action {
     Bind {
         function: String,
-        /// `None` = clear (clap guarantees `--clear` was given).
-        key: Option<String>,
+        /// Every `--key` given, in order (`--key S --key Enter`, or the
+        /// comma spelling `--key S,Enter`). EMPTY = clear (clap guarantees
+        /// `--clear` was given); one = the ordinary single-key write.
+        keys: Vec<String>,
         /// Bind anyway despite a CROSS-SLOT duplicate (removes nothing).
         force: bool,
         /// `--move-from B`: take the key off exactly that one function.
@@ -58,7 +61,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
     let outcome = match options.action {
         Action::Bind {
             function,
-            key,
+            keys,
             force,
             move_from,
             when,
@@ -68,7 +71,10 @@ pub fn run(options: Options) -> anyhow::Result<()> {
             &MapSpec {
                 preset: options.preset,
                 function,
-                key,
+                // The CLI always speaks the LIST spelling: an empty list is
+                // `--clear`, one entry is the write it always was.
+                key: None,
+                keys,
                 force,
                 move_from,
                 when,
@@ -81,7 +87,11 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                 "path": applied.path.display().to_string(),
                 "preset": applied.preset,
                 "function": applied.function,
+                // "key" is the FIRST key (null for a clear) — what every
+                // pre-list reader expects; "keys" is the whole list the
+                // control now holds, in file order.
                 "key": applied.key,
+                "keys": applied.keys,
                 // Guards: empty arrays for an ordinary binding, so a reader
                 // can treat "chord" as `when.length || unless.length`.
                 "when": applied.when,
@@ -127,6 +137,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                     | MapError::UnknownFunction(_)
                     | MapError::UnknownMacro { .. }
                     | MapError::UnknownKey(_)
+                    | MapError::KeyAndKeys
                     | MapError::InvalidGuard(_)
                     | MapError::BadMoveFrom(_)
                     | MapError::Conflicts { .. }
@@ -188,6 +199,7 @@ pub fn error_code(err: &MapError) -> &'static str {
         MapError::UnknownFunction(_) => "unknown-function",
         MapError::UnknownMacro { .. } => "unknown-macro",
         MapError::UnknownKey(_) => "unknown-key",
+        MapError::KeyAndKeys => "key-and-keys",
         MapError::InvalidGuard(_) => "invalid-guard",
         MapError::BadMoveFrom(_) => "bad-move-from",
         MapError::Conflicts { .. } => "conflict",

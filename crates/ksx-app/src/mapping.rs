@@ -5,11 +5,20 @@
 //! Semantics:
 //!
 //! - **Replace per function.** `map --function A --key G` makes G the ONLY key
-//!   bound to A — the mapper's tile shows one tag per control, and the file
-//!   says what the tile says. (Multi-key fan-in stays expressible by hand;
-//!   this verb does not author it.) It replaces the KEYS OF ONE FUNCTION and
-//!   nothing else: the same key on OTHER functions is left exactly where it is
-//!   (see multi-bind, below).
+//!   bound to A. It replaces the KEYS OF ONE FUNCTION and nothing else: the
+//!   same key on OTHER functions is left exactly where it is (see multi-bind,
+//!   below).
+//! - **A function may be given a KEY LIST** — many keys → one control, the
+//!   OR-chain the engine has always executed (`A = ["S", "Enter"]`,
+//!   docs/INPUT-TRANSFORMS.md §1a). `--key S --key Enter` (or `--key S,Enter`,
+//!   or the pipe's `"keys": ["S","Enter"]`) writes the WHOLE list in ONE
+//!   write, so the mapper's "add another key" / per-key ✕ are atomic instead
+//!   of read-modify-write. The caller's ORDER is kept and DUPLICATES are
+//!   dropped (first occurrence wins; `s` and `S` are the same key, because the
+//!   list is deduped after each name is resolved). A one-key list is exactly
+//!   the old single-key write, byte for byte. `"key"` and `"keys"` are two
+//!   spellings of the same field, so giving both is refused rather than
+//!   guessed.
 //! - **One key may drive many functions — that is a MULTI-BIND, not a
 //!   conflict.** The engine has no uniqueness constraint in either direction:
 //!   "many keys → one function and one key → many functions are both native"
@@ -71,8 +80,15 @@ pub struct MapSpec {
     pub preset: String,
     /// Function name, any case (`A`, `dpad.up`, `lx.min`, `lx.-16384`).
     pub function: String,
-    /// `Some(key name)` binds, `None` clears.
+    /// `Some(key name)` binds ONE key, `None` clears — the single-key
+    /// spelling, and what every pre-list caller sends. Mutually exclusive with
+    /// [`MapSpec::keys`]: both given is [`MapError::KeyAndKeys`].
     pub key: Option<String>,
+    /// MANY KEYS → ONE CONTROL: the whole list this function should hold,
+    /// in the caller's order (duplicates dropped, first occurrence wins).
+    /// Empty means "not given" — the write then follows [`MapSpec::key`], and
+    /// neither one is a clear.
+    pub keys: Vec<String>,
     /// Write anyway when the key is already bound in ANOTHER SLOT's preset
     /// (the only conflict left). It removes nothing, anywhere: see module
     /// docs. Same-preset duplicates never need it — they are multi-binds.
@@ -97,6 +113,9 @@ pub struct MapSpec {
 /// switch on it are unaffected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MapConflict {
+    /// The key that conflicts. Carried per row because ONE write can now
+    /// place several keys, and "still G is …" must name the key it is about.
+    pub key: String,
     /// The OTHER slot's preset, which is never edited.
     pub preset: String,
     /// Canonical function name the key is bound to there.
@@ -121,6 +140,12 @@ impl MapConflict {
             }
         )
     }
+
+    /// The same line, about this row's OWN key — what a multi-key write has to
+    /// print, since its conflicts can come from different keys.
+    pub fn line(&self) -> String {
+        self.describe(&self.key)
+    }
 }
 
 /// What `--move-from` unbound: the function the key was taken from, and the
@@ -140,8 +165,14 @@ pub struct AppliedMap {
     pub preset: String,
     /// Canonical function spelling (what the file now says).
     pub function: String,
-    /// Canonical key name, `None` for a clear.
+    /// Canonical name of the FIRST key — `None` for a clear. The single-key
+    /// spelling of [`AppliedMap::keys`], kept because every existing reader
+    /// (and the wire's `"key"`) says exactly this for a one-key write.
     pub key: Option<String>,
+    /// The function's WHOLE key list as the file now holds it, in order.
+    /// Empty for a clear; one entry for an ordinary write; one entry for a
+    /// chord (the trigger).
+    pub keys: Vec<String>,
     /// Canonical `when` key names — empty for an unguarded binding.
     pub when: Vec<String>,
     /// Canonical `unless` key names — empty for an unguarded binding.
@@ -184,7 +215,14 @@ impl AppliedMap {
     pub fn message(&self) -> String {
         let mut line = match (&self.key, self.chord()) {
             (Some(_), Some(chord)) => format!("\"{}\": {} = {}", self.preset, self.function, chord),
-            (Some(key), None) => format!("\"{}\": {} = {}", self.preset, self.function, key),
+            // A list reads as a list — "A = S, Enter" — and a one-key list is
+            // the same sentence it always was.
+            (Some(_), None) => format!(
+                "\"{}\": {} = {}",
+                self.preset,
+                self.function,
+                self.keys.join(", ")
+            ),
             (None, _) => format!("\"{}\": {} cleared", self.preset, self.function),
         };
         if let Some(moved) = &self.moved_from {
@@ -201,17 +239,19 @@ impl AppliedMap {
                 ),
             });
         }
-        if let Some(key) = &self.key {
+        if self.key.is_some() {
             // Multi-bind: say what else the key drives, in the same words the
-            // mapper's legend uses ("G also drives A, B").
+            // mapper's legend uses ("G also drives A, B"). With a key LIST the
+            // subject is the list, because any of them can be the one sharing.
             if !self.also_drives.is_empty() {
                 line.push_str(&format!(
-                    "; {key} also drives {}",
+                    "; {} also drives {}",
+                    self.keys.join(", "),
                     self.also_drives.join(", ")
                 ));
             }
             for conflict in &self.overridden {
-                line.push_str(&format!("; still {}", conflict.describe(key)));
+                line.push_str(&format!("; still {}", conflict.line()));
             }
         }
         for (key, bound_to) in &self.flash {
@@ -234,6 +274,9 @@ pub enum MapError {
     },
     UnknownFunction(String),
     UnknownKey(String),
+    /// `key` AND `keys` in the same request. They are two spellings of the
+    /// same field, so one of them would have to be ignored — refused instead.
+    KeyAndKeys,
     /// `--when`/`--unless` that cannot mean anything (the trigger guarding
     /// itself, a key required and forbidden at once, a guard with no key).
     InvalidGuard(String),
@@ -297,6 +340,12 @@ impl std::fmt::Display for MapError {
                 f,
                 "unknown key \"{name}\" — key names use the legacy spelling \
                  (`ksx monitor` shows the name for any key you press)"
+            ),
+            MapError::KeyAndKeys => write!(
+                f,
+                "a key and a key LIST were both given — \"keys\" already holds every key this \
+                 control should fire on (\"key\" is the one-key spelling of it), so honouring \
+                 both would mean ignoring one. Nothing was written"
             ),
             MapError::InvalidGuard(reason) => write!(f, "refusing to write that chord: {reason}"),
             MapError::BadMoveFrom(reason) => write!(f, "refusing that --move-from: {reason}"),
@@ -379,7 +428,10 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
     let binding = parse_function(&spec.function)
         .map_err(|_| MapError::UnknownFunction(spec.function.clone()))?;
     let canonical = ksx_config::function_name(&binding);
-    let key = spec.key.as_deref().map(resolve_key).transpose()?;
+    // The WHOLE list this function will hold: caller order, duplicates gone,
+    // empty = a clear. One key here is the single-key write, unchanged.
+    let keys = resolve_key_list(spec)?;
+    let key = keys.first().copied();
     let when = resolve_keys(&spec.when)?;
     let unless = resolve_keys(&spec.unless)?;
     let guarded = !when.is_empty() || !unless.is_empty();
@@ -390,11 +442,22 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
                     .to_owned(),
             ));
         };
+        // A chord has ONE trigger — "either of these two keys while B is held"
+        // is two chords, and writing it as one would have to pick a key to
+        // drop or a message that lies about which key fires.
+        if keys.len() > 1 {
+            return Err(MapError::InvalidGuard(format!(
+                "a chord is ONE trigger key plus its guard, and {} keys were given ({}) — write \
+                 one chord per trigger",
+                keys.len(),
+                keys.iter().map(|k| k.name()).collect::<Vec<_>>().join(", ")
+            )));
+        }
         check_guard(trigger, &when, &unless)?;
     }
     // The only path that unbinds a function the caller did not name in
     // `--function` is validated here, before a file is even read.
-    let move_from = resolve_move_from(spec, &canonical, key.is_some(), guarded)?;
+    let move_from = resolve_move_from(spec, &canonical, &keys, guarded)?;
 
     // The preset must exist; `ksx map` creates bindings, never presets.
     let file = load_preset_by_name(store, &spec.preset)?;
@@ -424,22 +487,28 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
     } else {
         Vec::new()
     };
-    if let Some(key) = key.filter(|_| !guarded) {
+    if !guarded && !keys.is_empty() {
         // Same-preset duplicates are NOT checked here on purpose: one key
         // driving several functions is a multi-bind the engine executes as
         // written, so it is reported (`also_drives`, below) and never refused.
         // The only conflict left is the one that crosses into a preset this
-        // writer refuses to edit.
-        let conflicts = find_profile_conflicts(store, &spec.preset, key);
-        if !conflicts.is_empty() && !spec.force {
-            return Err(MapError::Conflicts {
-                key: key.name().to_owned(),
-                conflicts,
-            });
+        // writer refuses to edit — and with a key LIST every key faces it, in
+        // the order given, so the refusal names the first key that hits one
+        // and nothing is written for any of them.
+        for key in &keys {
+            let conflicts = find_profile_conflicts(store, &spec.preset, *key);
+            if !conflicts.is_empty() && !spec.force {
+                return Err(MapError::Conflicts {
+                    key: key.name().to_owned(),
+                    conflicts,
+                });
+            }
+            overridden.extend(conflicts);
         }
-        overridden = conflicts;
 
         // `--move-from B`: take THIS key off B, and nothing else off anybody.
+        // (Validated to a single key above — a list has no "this key".)
+        let key = keys[0];
         if let Some(victim) = &move_from {
             let Some(victim_binding) = entries
                 .iter()
@@ -487,19 +556,30 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
             when: when.clone(),
             unless: unless.clone(),
         });
+    } else if keys.is_empty() {
+        entries.push((Key::None, binding));
     } else {
-        entries.push((key.unwrap_or(Key::None), binding));
+        // The list, IN ORDER — `from_core` groups a function's keys in the
+        // order they were pushed, so the file reads the way the caller wrote
+        // it (`A = ["S", "Enter"]`).
+        for key in &keys {
+            entries.push((*key, binding));
+        }
     }
 
     // The co-binding report, read off the file as it is ABOUT TO BE WRITTEN —
     // so it already excludes anything `--move-from` took away, and it says
     // what the preset will really do rather than what the caller assumed.
-    if let Some(key) = key.filter(|_| !guarded) {
-        also_drives = entries
-            .iter()
-            .filter(|(k, b)| *k == key && ksx_config::function_name(b) != canonical)
-            .map(|(_, b)| ksx_config::function_name(b))
-            .collect();
+    // With a key list it is the UNION: what any of these keys also drives.
+    if !guarded {
+        for key in &keys {
+            also_drives.extend(
+                entries
+                    .iter()
+                    .filter(|(k, b)| k == key && ksx_config::function_name(b) != canonical)
+                    .map(|(_, b)| ksx_config::function_name(b)),
+            );
+        }
         also_drives.sort();
         also_drives.dedup();
     }
@@ -518,6 +598,7 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         preset: file.name,
         function: canonical,
         key: key.map(|k| k.name().to_owned()),
+        keys: keys.iter().map(|k| k.name().to_owned()).collect(),
         when: when.iter().map(|k| k.name().to_owned()).collect(),
         unless: unless.iter().map(|k| k.name().to_owned()).collect(),
         also_drives,
@@ -548,7 +629,9 @@ fn apply_macro_trigger(store: &Store, spec: &MapSpec, name: &str) -> Result<Appl
                 .to_owned(),
         ));
     }
-    let key = spec.key.as_deref().map(resolve_key).transpose()?;
+    // A macro takes a key LIST exactly like a button does: several triggers
+    // for one sequence are ordinary `macro.<name>` rows in the file.
+    let keys = resolve_key_list(spec)?;
 
     let file = load_preset_by_name(store, &spec.preset)?;
     let mut core = file.to_core()?;
@@ -565,43 +648,45 @@ fn apply_macro_trigger(store: &Store, spec: &MapSpec, name: &str) -> Result<Appl
     // survives — the key already doing something in ANOTHER slot's preset —
     // is checked with exactly the same rule and the same `--force` escape.
     let mut overridden = Vec::new();
-    if let Some(key) = key {
-        let conflicts = find_profile_conflicts(store, &spec.preset, key);
+    for key in &keys {
+        let conflicts = find_profile_conflicts(store, &spec.preset, *key);
         if !conflicts.is_empty() && !spec.force {
             return Err(MapError::Conflicts {
                 key: key.name().to_owned(),
                 conflicts,
             });
         }
-        overridden = conflicts;
+        overridden.extend(conflicts);
     }
 
     // Replace-per-function, as everywhere else: this macro's old triggers go,
-    // the new one arrives (or nothing, for a clear).
+    // the new one(s) arrive (or nothing, for a clear).
     core.macros.triggers.retain(|t| t.index != index);
-    if let Some(key) = key {
+    for key in &keys {
         core.macros
             .triggers
-            .push(ksx_core::MacroTrigger::new(key, index));
+            .push(ksx_core::MacroTrigger::new(*key, index));
     }
 
-    // Multi-bind reads the same as anywhere: what else does this key do now?
+    // Multi-bind reads the same as anywhere: what else do these keys do now?
     let mut also_drives: Vec<String> = Vec::new();
-    if let Some(key) = key {
+    for key in &keys {
         also_drives.extend(
             core.entries
                 .iter()
-                .filter(|(k, _)| *k == key)
+                .filter(|(k, _)| k == key)
                 .map(|(_, b)| ksx_config::function_name(b)),
         );
         also_drives.extend(
             core.macros
                 .triggers
                 .iter()
-                .filter(|t| t.key == key && t.index != index)
+                .filter(|t| t.key == *key && t.index != index)
                 .filter_map(|t| core.macros.get(t.index))
                 .map(|m| ksx_config::macro_function_name(&m.name)),
         );
+    }
+    if !keys.is_empty() {
         also_drives.sort();
         also_drives.dedup();
     }
@@ -612,7 +697,8 @@ fn apply_macro_trigger(store: &Store, spec: &MapSpec, name: &str) -> Result<Appl
         path,
         preset: file.name,
         function: canonical,
-        key: key.map(|k| k.name().to_owned()),
+        key: keys.first().map(|k| k.name().to_owned()),
+        keys: keys.iter().map(|k| k.name().to_owned()).collect(),
         when: Vec::new(),
         unless: Vec::new(),
         also_drives,
@@ -628,7 +714,7 @@ fn apply_macro_trigger(store: &Store, spec: &MapSpec, name: &str) -> Result<Appl
 fn resolve_move_from(
     spec: &MapSpec,
     canonical: &str,
-    has_key: bool,
+    keys: &[Key],
     guarded: bool,
 ) -> Result<Option<String>, MapError> {
     let Some(name) = spec.move_from.as_deref() else {
@@ -641,12 +727,20 @@ fn resolve_move_from(
             "{canonical} is the function being bound — a control cannot take a key from itself"
         )));
     }
-    if !has_key {
+    if keys.is_empty() {
         return Err(MapError::BadMoveFrom(
             "it needs a --key (it takes THAT key away from the named function, and a clear \
              takes nothing from anyone)"
                 .to_owned(),
         ));
+    }
+    if keys.len() > 1 {
+        return Err(MapError::BadMoveFrom(format!(
+            "it takes ONE key away from {victim}, and {} were given ({}) — say which key moves, \
+             or unbind {victim} yourself with --clear",
+            keys.len(),
+            keys.iter().map(|k| k.name()).collect::<Vec<_>>().join(", ")
+        )));
     }
     if guarded {
         return Err(MapError::BadMoveFrom(format!(
@@ -674,6 +768,28 @@ fn not_holding(entries: &[(Key, ksx_core::Binding)], victim: &str, key: &str) ->
             keys.join(", ")
         ),
     }
+}
+
+/// The keys a [`MapSpec`] asks this function to hold, resolved and in the
+/// caller's order. `Ok(vec![])` is a clear.
+///
+/// `key` and `keys` are the same field spelled two ways, so BOTH is a refusal
+/// rather than a silent choice. Duplicates are dropped AFTER resolution —
+/// `--key s --key S` is one key, not a file with the same row twice — and the
+/// FIRST occurrence keeps its place, so the order the mapper shows is the
+/// order the file holds.
+fn resolve_key_list(spec: &MapSpec) -> Result<Vec<Key>, MapError> {
+    if spec.key.is_some() && !spec.keys.is_empty() {
+        return Err(MapError::KeyAndKeys);
+    }
+    let mut keys: Vec<Key> = Vec::new();
+    for name in spec.key.iter().chain(spec.keys.iter()) {
+        let key = resolve_key(name)?;
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    Ok(keys)
 }
 
 /// Resolve a list of key names the same way [`resolve_key`] does one.
@@ -1161,6 +1277,7 @@ fn find_profile_conflicts(store: &Store, preset_name: &str, key: Key) -> Vec<Map
                 }
                 seen.push(dedupe);
                 conflicts.push(MapConflict {
+                    key: key.name().to_owned(),
                     preset: slot.preset.clone(),
                     function: function.clone(),
                     profile: Some(game.title.clone()),
@@ -1269,6 +1386,17 @@ mod tests {
         }
     }
 
+    /// The list spelling: the WHOLE set of keys this control should hold
+    /// (empty = a clear), which is what Studio's mapper computes and sends.
+    fn keys_spec(preset: &str, function: &str, keys: &[&str]) -> MapSpec {
+        MapSpec {
+            preset: preset.into(),
+            function: function.into(),
+            keys: keys.iter().map(|k| (*k).to_owned()).collect(),
+            ..MapSpec::default()
+        }
+    }
+
     /// The explicit move: `--function F --key K --move-from VICTIM`.
     fn move_spec(preset: &str, function: &str, key: &str, victim: &str) -> MapSpec {
         MapSpec {
@@ -1321,6 +1449,235 @@ mod tests {
         let on_disk = std::fs::read_to_string(&applied.path).unwrap();
         assert!(on_disk.contains("A = \"G\""), "{on_disk}");
         assert!(!on_disk.contains("Enter"), "{on_disk}");
+    }
+
+    /// `--function F --key K` and the one-entry list are the SAME write —
+    /// same bytes on disk, same message — so the list spelling costs nothing.
+    #[test]
+    fn a_one_key_list_is_byte_for_byte_the_single_key_write() {
+        let root = TempRoot::new("one-key-list");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\nB = \"D\"\n");
+        let single = apply(&store, &spec("P1", "A", Some("G"), false)).unwrap();
+        let after_single = std::fs::read_to_string(&single.path).unwrap();
+
+        preset(&store, "P1", "A = \"S\"\nB = \"D\"\n");
+        let listed = apply(&store, &keys_spec("P1", "A", &["G"])).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&listed.path).unwrap(),
+            after_single,
+            "a one-key list must not write a different file"
+        );
+        assert_eq!(listed.message(), single.message());
+        assert_eq!(listed.key.as_deref(), Some("G"));
+        assert_eq!(listed.keys, vec!["G".to_owned()]);
+    }
+
+    /// MANY KEYS → ONE CONTROL, in ONE write: the file gets a list, in the
+    /// order asked for, and the engine reads two entries for that function.
+    #[test]
+    fn two_keys_land_as_a_list_in_one_write() {
+        let root = TempRoot::new("two-keys");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\nB = \"D\"\n");
+
+        let applied = apply(&store, &keys_spec("P1", "A", &["Enter", "g"])).unwrap();
+        assert_eq!(applied.keys, vec!["Enter".to_owned(), "G".to_owned()]);
+        assert_eq!(
+            applied.key.as_deref(),
+            Some("Enter"),
+            "\"key\" stays the FIRST key for pre-list readers"
+        );
+        assert_eq!(applied.message(), "\"P1\": A = Enter, G");
+
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(
+            on_disk.contains("A = [\"Enter\", \"G\"]"),
+            "caller order, as a list: {on_disk}"
+        );
+        assert!(
+            on_disk.contains("B = \"D\""),
+            "sibling untouched: {on_disk}"
+        );
+
+        // And the engine sees BOTH keys driving A (the OR-chain).
+        let core = store
+            .load_preset("P1")
+            .unwrap()
+            .unwrap()
+            .value
+            .to_core()
+            .unwrap();
+        let on_a: Vec<Key> = core
+            .entries
+            .iter()
+            .filter(|(_, b)| ksx_config::function_name(b) == "A")
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(on_a, vec![Key::Enter, Key::G], "{:?}", core.entries);
+    }
+
+    /// The mapper's "add another key" then its per-key ✕, as the two writes
+    /// Studio actually sends: each one carries the WHOLE list, so removing the
+    /// added key restores exactly the file that was there before.
+    #[test]
+    fn add_then_remove_a_key_round_trips_to_the_original_file() {
+        let root = TempRoot::new("add-remove");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\nB = \"D\"\n");
+        let before = std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap();
+
+        // "Add another key": current keys ∪ {Enter}.
+        let added = apply(&store, &keys_spec("P1", "A", &["S", "Enter"])).unwrap();
+        let with_both = std::fs::read_to_string(&added.path).unwrap();
+        assert!(with_both.contains("A = [\"S\", \"Enter\"]"), "{with_both}");
+
+        // The per-key ✕ on Enter: current keys ∖ {Enter}.
+        let removed = apply(&store, &keys_spec("P1", "A", &["S"])).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&removed.path).unwrap(),
+            before,
+            "add then remove must land back on the original file"
+        );
+
+        // And the ✕ on the LAST key is an honest clear, not a vanished row.
+        let cleared = apply(&store, &keys_spec("P1", "A", &[])).unwrap();
+        assert!(cleared.keys.is_empty());
+        assert_eq!(cleared.message(), "\"P1\": A cleared");
+        let on_disk = std::fs::read_to_string(&cleared.path).unwrap();
+        assert!(on_disk.contains("A = \"None\""), "{on_disk}");
+    }
+
+    /// Duplicates are dropped AFTER the key name is resolved (so `s` and `S`
+    /// are one key), and the FIRST occurrence keeps its place: the file never
+    /// holds the same key twice for one control, whatever the caller sent.
+    #[test]
+    fn a_key_list_keeps_its_order_and_drops_duplicates() {
+        let root = TempRoot::new("dedup");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\n");
+        let applied = apply(
+            &store,
+            &keys_spec("P1", "A", &["Enter", "g", "enter", "G", "S"]),
+        )
+        .unwrap();
+        assert_eq!(
+            applied.keys,
+            vec!["Enter".to_owned(), "G".to_owned(), "S".to_owned()]
+        );
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(
+            on_disk.contains("A = [\"Enter\", \"G\", \"S\"]"),
+            "{on_disk}"
+        );
+    }
+
+    /// `key` and `keys` are two spellings of one field. Sending both is
+    /// refused BEFORE any write — merging them would silently invent a
+    /// binding the caller never asked for.
+    #[test]
+    fn a_key_and_a_key_list_together_are_refused_and_write_nothing() {
+        let root = TempRoot::new("key-and-keys");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\n");
+        let before = std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap();
+
+        let err = apply(
+            &store,
+            &MapSpec {
+                preset: "P1".into(),
+                function: "A".into(),
+                key: Some("G".into()),
+                keys: vec!["Enter".into()],
+                ..MapSpec::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, MapError::KeyAndKeys), "{err:?}");
+        assert!(err.to_string().contains("Nothing was written"), "{err}");
+        assert_eq!(
+            before,
+            std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap()
+        );
+    }
+
+    /// A key LIST and CHORDS live side by side: chords are their own rows
+    /// (`Preset::chords`), so writing a list to one control leaves another
+    /// control's guard exactly where it was — and the two can be read back
+    /// together.
+    #[test]
+    fn a_key_list_leaves_another_functions_chord_alone() {
+        let root = TempRoot::new("list-and-chords");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\nB = \"D\"\n");
+        apply(&store, &chord_spec("P1", "rt", "D", &["F"])).unwrap();
+
+        let applied = apply(&store, &keys_spec("P1", "A", &["S", "Enter"])).unwrap();
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(on_disk.contains("A = [\"S\", \"Enter\"]"), "{on_disk}");
+
+        let core = store
+            .load_preset("P1")
+            .unwrap()
+            .unwrap()
+            .value
+            .to_core()
+            .unwrap();
+        assert_eq!(core.chords.len(), 1, "the chord survived: {on_disk}");
+        assert_eq!(core.chords[0].key, Key::D);
+        assert_eq!(core.chords[0].when, vec![Key::F]);
+        assert_eq!(
+            core.entries
+                .iter()
+                .filter(|(_, b)| ksx_config::function_name(b) == "A")
+                .count(),
+            2
+        );
+    }
+
+    /// The two edits that mean "this ONE key": a chord's trigger and
+    /// `--move-from`'s victim. Given a list they refuse in words instead of
+    /// picking a key for the caller.
+    #[test]
+    fn a_key_list_is_refused_where_exactly_one_key_is_meant() {
+        let root = TempRoot::new("list-refusals");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\nB = \"G\"\n");
+        let before = std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap();
+
+        let err = apply(
+            &store,
+            &MapSpec {
+                preset: "P1".into(),
+                function: "rt".into(),
+                keys: vec!["S".into(), "Enter".into()],
+                when: vec!["F".into()],
+                ..MapSpec::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, MapError::InvalidGuard(_)), "{err:?}");
+        assert!(err.to_string().contains("ONE trigger key"), "{err}");
+
+        let err = apply(
+            &store,
+            &MapSpec {
+                preset: "P1".into(),
+                function: "A".into(),
+                keys: vec!["G".into(), "Enter".into()],
+                move_from: Some("B".into()),
+                ..MapSpec::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, MapError::BadMoveFrom(_)), "{err:?}");
+        assert!(err.to_string().contains("ONE key away from B"), "{err}");
+
+        assert_eq!(
+            before,
+            std::fs::read_to_string(store.preset_path("P1").unwrap()).unwrap(),
+            "no refusal may leave a changed file"
+        );
     }
 
     #[test]
@@ -2167,6 +2524,7 @@ preset = "Other"
     #[test]
     fn conflicts_serialize_to_the_documented_rows() {
         let rows = conflicts_json(&[MapConflict {
+            key: "G".into(),
             preset: "P2".into(),
             function: "A".into(),
             profile: Some("Steam".into()),

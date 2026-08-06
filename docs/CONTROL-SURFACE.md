@@ -23,7 +23,7 @@ list.
 | List / identify devices | `ksx devices [--json]` (both backends, read-only); `ksx winusb status [--json]` for the USB/claim view | M9: same enumeration in-process — strictly read-only, safe mid-session. M10: api devices | exists |
 | Pad test | `ksx pads --count N --persona xbox360\|playstation [--json]` (plug, test pattern, unplug) | M9: same routine in-process, only while emulation is stopped (test pads compete for the four XInput slots). M10: api | exists |
 | Per-slot persona | TOML edit: `persona = "playstation"` on the `[[slot]]` (aliases `ds4`/`ps4` accepted) | M7 wizard / mapping verbs first; then GUI forms write the same TOML and issue `Reload` | gap — TOML-only **by design** until M7 |
-| Preset editing | `ksx map --preset "IPAC P1" --function A --key G [--clear] [--force] [--move-from FUNCTION] [--json]`; chords: `--when B[,C] [--unless K]`; whole-preset: `--restore defaults\|session-backup\|latest-backup`, `--clear-all`, `--list-backups`; pipe `map` / `map-restore` / `map-clear-all` / `map-backups` (same writers: `ksx-app/src/mapping.rs`); TOML edit still first-class | **Studio's `/map` mapper (live)**: click a control → pipe `learn-key` → pipe `map` — every write goes through the one shared writer, never a parallel editor. Conflict detection is server-side in that writer (see below). Studio does not yet DISPLAY chords (later pass) — the CLI/pipe author them and the engine runs them | exists — CLI + pipe + Studio live |
+| Preset editing | `ksx map --preset "IPAC P1" --function A --key G [--clear] [--force] [--move-from FUNCTION] [--json]`; **key LISTS: repeat or comma-separate `--key` (`--key S --key Enter`, `--key S,Enter`) → `A = ["S", "Enter"]`, one write** (pipe: `"keys": ["S","Enter"]`, the list spelling of `"key"` — exactly one of the two); chords: `--when B[,C] [--unless K]`; whole-preset: `--restore defaults\|session-backup\|latest-backup`, `--clear-all`, `--list-backups`; pipe `map` / `map-restore` / `map-clear-all` / `map-backups` (same writers: `ksx-app/src/mapping.rs`); TOML edit still first-class | **Studio's `/map` mapper (live)**: click a control → pipe `learn-key` → pipe `map` — every write goes through the one shared writer, never a parallel editor. "Add another key" and the per-key ✕ send the control's WHOLE key list (`ControlSource::bind_keys` → one `map` with `"keys"`), so a multi-key edit is ONE atomic write, not read-modify-write. Conflict detection is server-side in that writer (see below). Studio does not yet DISPLAY chords (later pass) — the CLI/pipe author them and the engine runs them | exists — CLI + pipe + Studio live |
 | Learn a key ("press the panel key for P1·A") | pipe `learn-key` / `learn-poll` / `learn-cancel` (asynchronous; see "learn-key semantics" below) | **Studio's mapper drives it (live)**: `/api/learn*` → the pipe verbs. No CLI face yet (`ksx map` takes the key by name; `ksx monitor` shows names) | exists — pipe + Studio |
 | Game profiles | TOML edit (`games.toml`); consumed by `ksx run --game`, `ksx daemon --game`, `ksx autostart --game` | Editing: M7 verbs (E5 `ksx slot assign` family), then GUI forms over them. Consuming: `DaemonCommand`/api as above | gap for editing; consuming exists |
 | WinUSB claim / release / status | `ksx winusb status` (read-only); `claim`/`release` are dry runs by default, act only with `--yes` + an admin token | M9: same verbs in-process, preserving dry-run-first and the explicit consent step. M10: `status` is safe over the api; `claim`/`release` stay local + elevated | exists |
@@ -134,8 +134,12 @@ The M7 mapper slice adds four verbs on the same channel:
    "force":false,"reload":true}          ("clear":true instead of "key" unbinds)
 ← {"ok":true,"message":"\"IPAC P1\": A = G — the next session start reads it",
    "path":"C:\\…\\presets\\IPAC P1.toml","preset":"IPAC P1","function":"A",
-   "key":"G","when":[],"unless":[],"also_drives":[],"moved_from":null,
-   "conflicts":[],"flash":[],"reloaded":false}
+   "key":"G","keys":["G"],"when":[],"unless":[],"also_drives":[],
+   "moved_from":null,"conflicts":[],"flash":[],"reloaded":false}
+
+→ {"verb":"map","preset":"IPAC P1","function":"A","keys":["S","Enter"]}
+← {"ok":true,"message":"\"IPAC P1\": A = S, Enter — …", …,
+   "key":"S","keys":["S","Enter"]}        (MANY KEYS → ONE CONTROL — see below)
 
 → {"verb":"map","preset":"IPAC P1","function":"B","key":"G"}   (G is already A's)
 ← {"ok":true,"message":"\"IPAC P1\": B = G; G also drives A", …,
@@ -296,6 +300,23 @@ which one wins is never a build-order accident.
 uses — replace-per-function, `"None"` placeholder on clear, canonical TOML
 rewrite (comments do not survive; the store's atomic-write trade), CONFLICT
 DETECTION server-side in the writer.
+
+### Key lists: many keys, one control (2026-08-06)
+
+**A control can be given its WHOLE key list in one `map` write** — the OR-chain
+the engine has always executed (`A = ["S", "Enter"]`, press either;
+docs/INPUT-TRANSFORMS.md §1a). `"keys": ["S","Enter"]` on the pipe verb,
+`--key S --key Enter` (or `--key S,Enter`) on the CLI.
+
+| rule | what happens |
+|---|---|
+| `"key"` vs `"keys"` | two spellings of ONE field. `"key"` is the one-key form; **both in one request is refused** (`key-and-keys`, exit 2, nothing written) rather than merged — honouring both would mean ignoring one |
+| ordering | the caller's order is kept verbatim, and that is the order the file holds (`A = ["S", "Enter"]`) — the mapper's tags read the way the player built them |
+| duplicates | dropped, FIRST occurrence wins, compared AFTER the key name is resolved (`--key s --key S` is one key). The file never holds the same key twice for one control |
+| still replace-per-function | the list REPLACES what that control held (an empty list is a `--clear`, leaving the inert `"None"`). So "add another key" is *old keys + new one* and the per-key ✕ is *old keys − that one*: Studio computes the set and sends it whole, which makes each edit ONE atomic write instead of read-modify-write |
+| response | `"keys"` is the resulting list; `"key"` stays the FIRST key (`null` for a clear) so every pre-list reader is unaffected |
+| conflicts | checked per key, in order: the first cross-slot conflict refuses the WHOLE write (nothing is written for any key). `--force` writes and reports every overridden key by name |
+| chords | untouched — a guarded binding lives in its own row (`Preset::chords`), so a key list on one control and a chord on another coexist in the same file. A chord is ONE trigger key, so `--when`/`--unless` with a list is refused (`invalid-guard`), as is `--move-from` with a list (`bad-move-from`: it takes ONE key away from ONE control) |
 
 ### Multi-bind: one key, many controls (2026-08-06)
 

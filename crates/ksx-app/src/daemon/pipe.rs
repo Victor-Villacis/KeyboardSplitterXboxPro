@@ -457,7 +457,9 @@ fn handle_map_backups(request: &serde_json::Value, deps: &PipeDeps) -> serde_jso
     }
 }
 
-/// The pipe `map` verb: same fields as `ksx map`, plus `"reload": true` to
+/// The pipe `map` verb: same fields as `ksx map` — including `"keys":
+/// ["S","Enter"]`, the whole key list for one control (`"key"` is its one-key
+/// spelling; exactly one of the two) — plus `"reload": true` to
 /// bounce a RUNNING session onto the new binding (a clean `Reload` — stop,
 /// re-read from disk, start — never a hot-patch; the CONTROL-SURFACE
 /// invariant). With nothing running there is nothing to bounce: the next
@@ -480,13 +482,6 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
         .get("clear")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let key = field("key");
-    if key.is_none() && !clear {
-        return err_msg(r#"map needs a "key" (or "clear": true)"#);
-    }
-    if key.is_some() && clear {
-        return err_msg(r#"map takes either "key" or "clear", not both"#);
-    }
     // CHORD guards, optional and absent from every pre-chord caller:
     // "when": ["B"] / "unless": ["LeftShift"] (docs/INPUT-TRANSFORMS.md §1b).
     let list = |name: &str| -> Vec<String> {
@@ -503,10 +498,26 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
             })
             .unwrap_or_default()
     };
+    // MANY KEYS → ONE CONTROL: "keys": ["S","Enter"] is the whole list the
+    // control should hold, written in ONE call (so Studio's "add another key"
+    // is atomic instead of read-modify-write). "key" is the one-key spelling
+    // of the same field, so both together is refused, never merged.
+    let keys = list("keys");
+    let key = field("key");
+    if key.is_some() && !keys.is_empty() {
+        return err_msg(r#"map takes either "key" or "keys", not both"#);
+    }
+    if key.is_none() && keys.is_empty() && !clear {
+        return err_msg(r#"map needs a "key" (or "keys", or "clear": true)"#);
+    }
+    if (key.is_some() || !keys.is_empty()) && clear {
+        return err_msg(r#"map takes either "key"/"keys" or "clear", not both"#);
+    }
     let spec = crate::mapping::MapSpec {
         preset,
         function,
         key,
+        keys,
         // "force" is now ONLY about a cross-slot duplicate (another slot's
         // preset in a profile that uses this one). It removes nothing: a key
         // already used by another control of THIS preset is a multi-bind and
@@ -531,7 +542,11 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
                 "path": applied.path.display().to_string(),
                 "preset": applied.preset,
                 "function": applied.function,
+                // "key" is the FIRST key (null for a clear): unchanged for
+                // every one-key write. "keys" is the control's WHOLE list as
+                // the file now holds it — what a key-list write reports back.
                 "key": applied.key,
+                "keys": applied.keys,
                 "when": applied.when,
                 "unless": applied.unless,
                 // MULTI-BIND: the other controls of this preset this key also
@@ -1367,7 +1382,13 @@ mod tests {
             path: std::path::PathBuf::from(r"C:\cfg\ksx\presets\IPAC P1.toml"),
             preset: spec.preset.clone(),
             function: spec.function.to_ascii_uppercase(),
-            key: spec.key.clone(),
+            key: spec.key.clone().or_else(|| spec.keys.first().cloned()),
+            keys: spec
+                .key
+                .clone()
+                .into_iter()
+                .chain(spec.keys.iter().cloned())
+                .collect(),
             when: spec.when.clone(),
             unless: spec.unless.clone(),
             also_drives: Vec::new(),
@@ -1389,6 +1410,10 @@ mod tests {
             r#"{"verb":"map","preset":"IPAC P1"}"#,
             r#"{"verb":"map","preset":"IPAC P1","function":"A"}"#,
             r#"{"verb":"map","preset":"IPAC P1","function":"A","key":"G","clear":true}"#,
+            // "key" and "keys" are two spellings of one field: both together
+            // would mean ignoring one, so the verb refuses instead.
+            r#"{"verb":"map","preset":"IPAC P1","function":"A","key":"G","keys":["S"]}"#,
+            r#"{"verb":"map","preset":"IPAC P1","function":"A","keys":["S"],"clear":true}"#,
         ] {
             let v = handle_request(junk, &d, FAST);
             assert_eq!(v["ok"], false, "{junk} → {v}");
@@ -1537,6 +1562,7 @@ mod tests {
             Err(crate::mapping::MapError::Conflicts {
                 key: "G".into(),
                 conflicts: vec![crate::mapping::MapConflict {
+                    key: "G".into(),
                     preset: "IPAC P2".into(),
                     function: "A".into(),
                     profile: Some("Steam".into()),
@@ -1624,6 +1650,77 @@ mod tests {
         assert!(on_disk.contains("rt = \"None\""), "{on_disk}");
         assert!(on_disk.contains("A = \"P\""), "{on_disk}");
         assert!(on_disk.contains("X = \"P\""), "{on_disk}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MANY KEYS → ONE CONTROL over the wire, through the REAL writer: one
+    /// `map` call with `"keys"` writes the whole list, and the response says
+    /// what the control now holds. This is Studio's "add another key" — one
+    /// atomic write, not a read-modify-write.
+    #[test]
+    fn map_writes_a_whole_key_list_and_reports_it_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "ksx-pipe-keylist-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = ksx_config::ConfigRoot::at(&dir);
+        let store = ksx_config::Store::new(root.clone());
+        let file: ksx_config::PresetFile =
+            toml::from_str("name = \"IPAC P1\"\n[bindings]\nA = \"S\"\nB = \"D\"\n").unwrap();
+        store.save_preset(&file).unwrap();
+
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let mut d = deps(tx, state, no_profiles());
+        d.map = map_fn(root);
+
+        let v = handle_request(
+            r#"{"verb":"map","preset":"IPAC P1","function":"A","keys":["S","Enter","s"]}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        // Order kept, the duplicate `s` gone, and "key" still the FIRST key
+        // for every reader that predates the list.
+        assert_eq!(v["keys"], serde_json::json!(["S", "Enter"]), "{v}");
+        assert_eq!(v["key"], "S", "{v}");
+        assert!(
+            v["message"].as_str().unwrap().contains("A = S, Enter"),
+            "{v}"
+        );
+        let on_disk = std::fs::read_to_string(store.preset_path("IPAC P1").unwrap()).unwrap();
+        assert!(on_disk.contains("A = [\"S\", \"Enter\"]"), "{on_disk}");
+        assert!(on_disk.contains("B = \"D\""), "{on_disk}");
+
+        // The per-key ✕ sends the remaining list — one write again.
+        let v = handle_request(
+            r#"{"verb":"map","preset":"IPAC P1","function":"A","keys":["Enter"]}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["keys"], serde_json::json!(["Enter"]), "{v}");
+        let on_disk = std::fs::read_to_string(store.preset_path("IPAC P1").unwrap()).unwrap();
+        assert!(on_disk.contains("A = \"Enter\""), "{on_disk}");
+
+        // A single-key write still reports a one-entry list, so a caller can
+        // read `keys` unconditionally.
+        let v = handle_request(
+            r#"{"verb":"map","preset":"IPAC P1","function":"B","key":"G"}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["keys"], serde_json::json!(["G"]), "{v}");
+        // …and a clear reports the empty one.
+        let v = handle_request(
+            r#"{"verb":"map","preset":"IPAC P1","function":"B","clear":true}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["keys"], serde_json::json!([]), "{v}");
+        assert_eq!(v["key"], serde_json::Value::Null, "{v}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
