@@ -1029,6 +1029,22 @@ select,
   display: block;
 }
 
+/* AUTO-FIRE (docs/INPUT-TRANSFORMS.md §3). Its own line, like the shared-key
+   badge: a row that auto-fires GROWS rather than squeezing its key chips. An
+   empty span collapses, so a row without turbo is exactly the row it was. */
+.lturbo {
+  flex-basis: 100%;
+  font: 700 0.68rem/1.3 var(--mono);
+  color: var(--warn);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lturbo:empty {
+  display: none;
+}
+
 .l-shared .lkey {
   color: var(--cool);
 }
@@ -1134,6 +1150,23 @@ select,
   display: flex;
   gap: 0.6rem;
   justify-content: center;
+}
+
+/* AUTO-FIRE, beside Replace / Add / Clear — same row rhythm as `.mbtns`, with
+   its own number box first because the buttons act on what it holds. */
+.mturbo {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-top: 0.7rem;
+}
+
+.mturbo .mturboin {
+  width: 4.5rem;
+  font-size: 0.85rem;
+  padding: 0.25rem 0.4rem;
 }
 
 /* ── Footer ────────────────────────────────────────────────────────────── */
@@ -1653,6 +1686,15 @@ footer p {
   padding: 0.2rem 0.5rem;
 }
 
+/* The row form's auto-fire box. Narrow on purpose — it holds a small integer,
+   and the key picker beside it is what needs the row's free space. */
+.lbind .turboin {
+  flex: 0 0 auto;
+  width: 3.4rem;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.35rem;
+}
+
 /* No daemon: the forms stay, dimmed. They are NOT disabled — a POST that the
    daemon refuses comes back as a flash sentence naming the reason, which is
    worth more than a control that is not there (the same rule the zone's
@@ -1967,13 +2009,33 @@ footer p {
   width: max-content;
 }
 
+/* UNIFORM by design: the grid header carries one of these per control at
+   column width, and a row of coloured discs that narrow reads as noise rather
+   than information. The identity colours earn their place on the controller
+   art (where they map to physical buttons) and in the legend beside it — here
+   the column is NAMED, in one type treatment, in the theme's own text colour.
+   No `id-*` class reaches this element, so the disc rules above cannot apply
+   to it. */
 .maccolid {
   height: var(--macrow);
   display: flex;
   align-items: center;
   justify-content: center;
   font: 700 0.62rem/1 var(--mono);
+  /* Legible in both themes without an accent: the same colour the rest of the
+     card's small type uses, one notch up from `--muted` so a 0.62rem glyph
+     still reads at column width. */
+  color: var(--text);
+  letter-spacing: 0.01em;
+  padding: 0 0.1rem;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* Discs came with a background and a shadow; a plain header gets neither. */
+  background: none;
+  border-radius: 0;
+  box-shadow: none;
+  width: auto;
 }
 
 .macmatrix {
@@ -2053,6 +2115,16 @@ footer p {
 
 .macdurin {
   width: 5.5rem;
+}
+
+/* v13: the repeat policy's rate box and its unit picker. Same widths as the
+   duration pair above, because they answer the same kind of question. */
+.macturboin {
+  width: 5.5rem;
+}
+
+.macturbounit {
+  max-width: 12rem;
 }
 
 .macnamein {

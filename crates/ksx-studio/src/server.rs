@@ -130,6 +130,7 @@ pub fn serve(
             .route("/map/add", post(map_form_add))
             .route("/map/key/remove", post(map_form_remove_key))
             .route("/map/clear", post(map_form_clear))
+            .route("/map/turbo", post(map_form_turbo))
             .route("/map/preset/restore", post(map_form_restore))
             .route("/map/preset/clear-all", post(map_form_clear_all))
             .route("/map/session/stop", post(map_form_session_stop))
@@ -387,6 +388,11 @@ struct BindKeysRequest {
     force: bool,
     #[serde(default)]
     reload: bool,
+    /// AUTO-FIRE (docs/INPUT-TRANSFORMS.md §3). Absent leaves the control's
+    /// existing rate alone — "Add another key" must not switch an auto-fire
+    /// off — `0` clears it, `n` sets it.
+    #[serde(default)]
+    turbo_hz: Option<u32>,
 }
 
 async fn api_bind_keys(
@@ -400,6 +406,7 @@ async fn api_bind_keys(
             &request.keys,
             request.force,
             request.reload,
+            request.turbo_hz,
         )
     })
     .await
@@ -555,6 +562,11 @@ struct MapBindForm {
     /// box entirely), which is this path's answer to a cross-slot refusal.
     #[serde(default)]
     force: Option<String>,
+    /// The row's turbo box. Blank leaves the rate alone; `0` clears it. Only
+    /// the "Turbo" submit reads it — Bind/Add/Remove/Clear all send it too
+    /// (one form, several verbs), and each one decides for itself.
+    #[serde(default)]
+    turbo_hz: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -730,7 +742,7 @@ async fn map_form_add(
                 current.join(" · ")
             ));
         }
-        let outcome = control.bind_keys(&slot.preset, &function, &next, force, true);
+        let outcome = control.bind_keys(&slot.preset, &function, &next, force, true, None);
         keys_flash(&function, Some(&key), &next, outcome)
     })
     .await
@@ -761,7 +773,7 @@ async fn map_form_remove_key(
                 }
             ));
         }
-        let outcome = control.bind_keys(&slot.preset, &function, &next, false, true);
+        let outcome = control.bind_keys(&slot.preset, &function, &next, false, true, None);
         // The removed key is named in the sentence, because "A is now S" on
         // its own does not say what just left.
         keys_flash(&function, Some(&key), &next, outcome)
@@ -823,6 +835,54 @@ async fn map_form_clear(
             reload: true,
         };
         bind_flash(&function, None, control.bind(&request))
+    })
+    .await
+}
+
+/// POST /map/turbo — set (or clear) a control's AUTO-FIRE rate
+/// (docs/INPUT-TRANSFORMS.md §3), the no-JS twin of the learn modal's Turbo
+/// row.
+///
+/// It writes through the SAME `bind_keys` every other row verb uses, with the
+/// control's CURRENT key list: turbo is a property of the control, so setting
+/// it is a re-write of that control with one more field, not a second writer.
+/// A blank box is a refusal rather than a silent clear — `0` is how you say
+/// "off", exactly as it is on the CLI.
+async fn map_form_turbo(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<MapBindForm>,
+) -> Response {
+    let function = form.function.trim().to_owned();
+    let raw = form.turbo_hz.as_deref().map(str::trim).unwrap_or("");
+    let hz = match raw.parse::<u32>() {
+        Ok(hz) => hz,
+        Err(_) => {
+            return map_redirect(
+                form.slot.unwrap_or(0),
+                Err(format!(
+                    "no turbo rate given for {function} — type a number of presses a second                      into the box (0 turns auto-fire off)"
+                )),
+            )
+        }
+    };
+    map_act_slot(state, form.slot, move |control, slot| {
+        let current = slot.bindings.get(&function).cloned().unwrap_or_default();
+        if current.is_empty() && hz > 0 {
+            return Err(format!(
+                "{function} has no keys, so there is nothing to auto-fire — bind a key first"
+            ));
+        }
+        let outcome = control.bind_keys(&slot.preset, &function, &current, false, true, Some(hz));
+        if !outcome.ok {
+            return Err(bind_refusal(&function, None, outcome));
+        }
+        Ok(match (hz, outcome.turbo_effective_hz) {
+            (0, _) => format!("{function} no longer auto-fires."),
+            (asked, Some(effective)) if effective != asked => format!(
+                "{function} auto-fires at about {effective} Hz — {asked} Hz was asked for, but                  a press AND a release must each survive a 60 Hz poll."
+            ),
+            (asked, _) => format!("{function} auto-fires at {asked} Hz."),
+        })
     })
     .await
 }

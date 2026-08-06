@@ -442,6 +442,32 @@ enum Command {
             conflicts_with_all = ["clear", "restore", "list_backups", "clear_all"]
         )]
         unless: Vec<String>,
+        /// TURBO: make this control auto-fire while its key is held, at N
+        /// press/release cycles a second (`--turbo-hz 12`). 0 turns it off.
+        ///
+        /// The rate belongs to the CONTROL, not to the key: several keys on
+        /// one control share ONE clock, so holding two of them fires once, not
+        /// twice out of phase. It composes with a chord — the guard decides
+        /// whether the control is being driven, the rate decides what it does
+        /// while it is.
+        ///
+        /// Omitting the flag leaves an existing rate alone, so rebinding an
+        /// auto-fire button does not silently switch the auto-fire off;
+        /// --clear clears the rate with the keys.
+        ///
+        /// THE CEILING IS ARITHMETIC: one cycle is a press AND a release, a
+        /// game polling at 60 Hz sees state every ~16.7 ms, and each half must
+        /// be sampled to exist — so ~15 Hz is the fastest that can actually be
+        /// delivered and anything above it is capped. The response says both
+        /// the number you asked for and the one you get; it is never silently
+        /// substituted. For a timed SEQUENCE that repeats, use a macro with
+        /// `repeat = "turbo"` instead
+        #[arg(
+            long,
+            value_name = "N",
+            conflicts_with_all = ["restore", "list_backups", "clear_all"]
+        )]
+        turbo_hz: Option<u32>,
         /// Bind anyway when the key is already used by ANOTHER SLOT's preset
         /// (cross-slot fan-out). Removes nothing, edits no other preset — a
         /// same-preset duplicate is a multi-bind and never needs this
@@ -1041,6 +1067,7 @@ fn main() -> anyhow::Result<()> {
             function,
             key,
             clear: _,
+            turbo_hz,
             force,
             move_from,
             when,
@@ -1069,6 +1096,7 @@ fn main() -> anyhow::Result<()> {
                     move_from,
                     when,
                     unless,
+                    turbo_hz,
                 },
             },
             json,
@@ -1867,6 +1895,7 @@ mod tests {
                 function,
                 key,
                 clear,
+                turbo_hz: _,
                 force,
                 move_from,
                 when,

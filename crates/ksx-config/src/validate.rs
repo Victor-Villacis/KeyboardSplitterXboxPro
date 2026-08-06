@@ -16,8 +16,8 @@ use crate::games::GamesFile;
 use crate::preset::{BindingEntry, GuardedEntry, MacroFile, PresetFile};
 use ksx_core::socd::{opposing_pairs, shadowing_chord};
 use ksx_core::{
-    Axis, Binding, Key, Persona, Preset, Repeat, Socd, MAX_SLOTS, MAX_XINPUT_SLOTS, MIN_STEP_MS,
-    TURBO_MAX_HZ,
+    Axis, Binding, Key, Persona, Preset, Repeat, Socd, TurboBinding, MAX_SLOTS, MAX_XINPUT_SLOTS,
+    MIN_STEP_MS, TURBO_MAX_HZ,
 };
 
 /// One validation finding. All findings are non-fatal: the caller decides
@@ -196,6 +196,31 @@ pub enum Issue {
         name: String,
         repeat: String,
     },
+    /// Advisory: a per-binding `turbo_hz` (docs/INPUT-TRANSFORMS.md §3) that is
+    /// not deliverable as written. Same arithmetic as the macro one and stated
+    /// the same way — both numbers, never a silent substitution.
+    BindingTurboClamped {
+        preset: String,
+        function: String,
+        asked_hz: u32,
+        effective_hz: u32,
+    },
+    /// Two rows on ONE function give different `turbo_hz`. Turbo belongs to the
+    /// output, so there is exactly one rate per function; which of two won
+    /// would be a file-order accident, so it is refused instead of resolved.
+    ConflictingTurboRates {
+        preset: String,
+        function: String,
+        first_hz: u32,
+        other_hz: u32,
+    },
+    /// Advisory: `turbo_hz` on a `consume` row. A consume-only chord drives no
+    /// endpoint at all, so there is nothing for a rate to auto-fire.
+    TurboOnConsume { preset: String, function: String },
+    /// `macro.<name> = { key = …, turbo_hz = … }`. A macro repeats by saying so
+    /// in its own table; a second spelling for the same thing would make "which
+    /// one runs" something a reader has to remember.
+    GuardedMacroTurbo { preset: String, name: String },
     /// Advisory: a slot's `socd` policy would have generated a rule for a key
     /// pair the preset already chords by hand. The hand-written one wins —
     /// a deliberate statement beats a default — and this says so out loud.
@@ -252,6 +277,8 @@ impl Issue {
                 | Issue::TurboRateClamped { .. }
                 | Issue::TurboGapRaised { .. }
                 | Issue::TurboRateWithoutTurbo { .. }
+                | Issue::BindingTurboClamped { .. }
+                | Issue::TurboOnConsume { .. }
         )
     }
 }
@@ -452,6 +479,42 @@ impl fmt::Display for Issue {
                 "preset '{preset}': macro '{name}' sets a turbo rate but is \
                  `repeat = \"{repeat}\"`, so the rate does nothing until it says \
                  `repeat = \"turbo\"` (the number is kept)"
+            ),
+            Issue::BindingTurboClamped {
+                preset,
+                function,
+                asked_hz,
+                effective_hz,
+            } => write!(
+                f,
+                "preset '{preset}': '{function}' asks for turbo_hz = {asked_hz} and will \
+                 auto-fire at about {effective_hz} Hz. One cycle is a press AND a release, a \
+                 60 Hz poller resolves at most {TURBO_MAX_HZ} of those a second, and each half \
+                 must survive being sampled ({MIN_STEP_MS} ms) — so the rate is capped rather \
+                 than refused (docs/INPUT-TRANSFORMS.md §3)"
+            ),
+            Issue::ConflictingTurboRates {
+                preset,
+                function,
+                first_hz,
+                other_hz,
+            } => write!(
+                f,
+                "preset '{preset}': '{function}' gives two turbo rates ({first_hz} Hz and \
+                 {other_hz} Hz). Turbo belongs to the OUTPUT, not to the key — several keys on \
+                 one function share one clock — so give the rate once, on one row"
+            ),
+            Issue::GuardedMacroTurbo { preset, name } => write!(
+                f,
+                "preset '{preset}': '{MACRO_PREFIX}{name}' sets turbo_hz, but a macro repeats by \
+                 saying `repeat = \"turbo\"` in its own [macros.{name}] table — per-binding turbo \
+                 is for the plain bindings a macro is the alternative to (§3)"
+            ),
+            Issue::TurboOnConsume { preset, function } => write!(
+                f,
+                "preset '{preset}': '{function}' sets turbo_hz, but `consume` drives no endpoint \
+                 at all — its whole effect is suppressing its constituents, and there is nothing \
+                 there to auto-fire"
             ),
             Issue::UnknownMacroRef {
                 preset,
@@ -786,6 +849,67 @@ fn validate_preset(preset: &PresetFile, issues: &mut Vec<Issue>) {
     }
 
     validate_chords(preset, &pairs, issues);
+    validate_binding_turbo(preset, &pairs, issues);
+}
+
+/// Per-binding auto-fire (docs/INPUT-TRANSFORMS.md §3).
+///
+/// Three things can go wrong and exactly one of them is fatal. The rate being
+/// undeliverable is not: the engine runs the closest thing a 60 Hz sampler can
+/// see, and saying BOTH numbers is the whole point of resolving the clamp in
+/// one place. Two rows on one function disagreeing IS fatal, because turbo
+/// belongs to the output and picking a winner by file order is the kind of
+/// silent decision this project refuses to make.
+fn validate_binding_turbo(
+    preset: &PresetFile,
+    pairs: &[(String, Flat<'_>)],
+    issues: &mut Vec<Issue>,
+) {
+    let mut seen: BTreeMap<&str, u32> = BTreeMap::new();
+    for (function, flat) in pairs {
+        let Flat::Guard(guard) = flat else { continue };
+        let Some(hz) = guard.turbo_hz else { continue };
+        // `macro.<name>` with a rate is refused at load time
+        // (`ConfigError::TurboOnMacroTrigger`); named here too so `ksx check`
+        // reports it rather than only failing to parse.
+        if let Some(name) = macro_name(function) {
+            issues.push(Issue::GuardedMacroTurbo {
+                preset: preset.name.clone(),
+                name: name.to_owned(),
+            });
+            continue;
+        }
+        match seen.get(function.as_str()) {
+            Some(&first) if first != hz => issues.push(Issue::ConflictingTurboRates {
+                preset: preset.name.clone(),
+                function: function.clone(),
+                first_hz: first,
+                other_hz: hz,
+            }),
+            Some(_) => {}
+            None => {
+                seen.insert(function.as_str(), hz);
+                let Ok(binding) = parse_function(function) else {
+                    continue; // an unknown function is already reported above
+                };
+                if binding == Binding::Consume {
+                    issues.push(Issue::TurboOnConsume {
+                        preset: preset.name.clone(),
+                        function: function.clone(),
+                    });
+                    continue;
+                }
+                if let Some((asked_hz, effective_hz)) = TurboBinding::new(binding, hz).clamped() {
+                    issues.push(Issue::BindingTurboClamped {
+                        preset: preset.name.clone(),
+                        function: function.clone(),
+                        asked_hz,
+                        effective_hz,
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Everything that can only go wrong once a preset carries a timed sequence
@@ -1702,6 +1826,7 @@ preset = "default"
                 key: "Right".into(),
                 when: vec!["Left".into()],
                 unless: Vec::new(),
+                turbo_hz: None,
             }),
         );
         // (The flash advisory fires too — a direction key is by definition
@@ -1734,6 +1859,7 @@ preset = "default"
                 key: "Right".into(),
                 when: vec!["Left".into()],
                 unless: Vec::new(),
+                turbo_hz: None,
             }),
         );
         assert_eq!(
@@ -1752,6 +1878,7 @@ preset = "default"
                 key: "Down".into(),
                 when: vec!["Up".into()],
                 unless: Vec::new(),
+                turbo_hz: None,
             }),
         );
         let games: GamesFile = toml::from_str(
@@ -2031,5 +2158,105 @@ preset = "empty"
              steps = [{ hold = [\"A\"], ms = 50 }]\n",
         )];
         assert_eq!(validate(&ConfigFile::default(), &presets), Vec::new());
+    }
+
+    // ---- per-binding turbo (docs/INPUT-TRANSFORMS.md §3) ------------------
+
+    /// A deliverable per-binding rate is completely clean.
+    #[test]
+    fn a_deliverable_binding_turbo_reports_nothing() {
+        let presets = vec![preset("t", "A = { key = \"G\", turbo_hz = 12 }\n")];
+        assert_eq!(validate(&ConfigFile::default(), &presets), Vec::new());
+    }
+
+    /// An undeliverable one is stated, not silently substituted — and it is
+    /// ADVISORY, because the engine still does the closest honest thing.
+    #[test]
+    fn a_binding_turbo_above_the_ceiling_states_both_numbers() {
+        let presets = vec![preset("t", "A = { key = \"G\", turbo_hz = 30 }\n")];
+        let issues = validate(&ConfigFile::default(), &presets);
+        assert_eq!(
+            issues,
+            vec![Issue::BindingTurboClamped {
+                preset: "t".into(),
+                function: "A".into(),
+                asked_hz: 30,
+                effective_hz: 15,
+            }]
+        );
+        assert!(issues[0].is_advisory());
+        let text = issues[0].to_string();
+        assert!(text.contains("30"), "{text}");
+        assert!(text.contains("15"), "{text}");
+    }
+
+    /// Two rows on one function that disagree is REFUSED, not resolved: which
+    /// one wins would be a file-order accident.
+    #[test]
+    fn two_rates_on_one_function_are_refused() {
+        let presets = vec![preset(
+            "t",
+            "A = [{ key = \"G\", turbo_hz = 12 }, { key = \"H\", turbo_hz = 6 }]\n",
+        )];
+        let issues = validate(&ConfigFile::default(), &presets);
+        assert_eq!(
+            issues,
+            vec![Issue::ConflictingTurboRates {
+                preset: "t".into(),
+                function: "A".into(),
+                first_hz: 12,
+                other_hz: 6,
+            }]
+        );
+        assert!(!issues[0].is_advisory());
+    }
+
+    /// The same rate twice is a redundancy, not a contradiction: nothing to
+    /// report, because there is only one answer.
+    #[test]
+    fn the_same_rate_twice_on_one_function_is_fine() {
+        let presets = vec![preset(
+            "t",
+            "A = [{ key = \"G\", turbo_hz = 12 }, { key = \"H\", turbo_hz = 12 }]\n",
+        )];
+        assert_eq!(validate(&ConfigFile::default(), &presets), Vec::new());
+    }
+
+    /// A rate on `consume` auto-fires nothing: a consume-only chord drives no
+    /// endpoint at all.
+    #[test]
+    fn a_rate_on_consume_is_reported() {
+        let presets = vec![preset(
+            "t",
+            "\"lx.min\" = \"Left\"\n\"lx.max\" = \"Right\"\n\
+             consume = { key = \"Left\", when = [\"Right\"], turbo_hz = 10 }\n",
+        )];
+        let issues = validate(&ConfigFile::default(), &presets);
+        assert!(
+            issues.contains(&Issue::TurboOnConsume {
+                preset: "t".into(),
+                function: "consume".into(),
+            }),
+            "{issues:?}"
+        );
+    }
+
+    /// A macro repeats by saying so in its own table. A rate on its trigger row
+    /// is named here as well as refused at load time, so `ksx check` explains
+    /// it rather than the file merely failing to parse.
+    #[test]
+    fn a_rate_on_a_macro_trigger_is_named() {
+        let presets = vec![macro_preset(
+            "[bindings]\nA = \"S\"\nmacro.fire = { key = \"P\", turbo_hz = 10 }\n\
+             [macros.fire]\nsteps = [{ hold = [\"A\"], ms = 50 }]\n",
+        )];
+        let issues = validate(&ConfigFile::default(), &presets);
+        assert!(
+            issues.contains(&Issue::GuardedMacroTurbo {
+                preset: "m".into(),
+                name: "fire".into(),
+            }),
+            "{issues:?}"
+        );
     }
 }

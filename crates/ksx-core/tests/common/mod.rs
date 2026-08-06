@@ -30,6 +30,7 @@ pub fn preset(name: &str, entries: Vec<(Key, Binding)>) -> Preset {
         entries,
         chords: Vec::new(),
         macros: Default::default(),
+        turbo: Vec::new(),
         protected: false,
     }
 }
@@ -45,6 +46,7 @@ pub fn preset_with_chords(
         entries,
         chords,
         macros: Default::default(),
+        turbo: Vec::new(),
         protected: false,
     }
 }
@@ -60,6 +62,24 @@ pub fn preset_with_macros(
         entries,
         chords: Vec::new(),
         macros,
+        turbo: Vec::new(),
+        protected: false,
+    }
+}
+
+/// Same, plus auto-firing endpoints (and the chords that may drive them).
+pub fn preset_with_turbo(
+    name: &str,
+    entries: Vec<(Key, Binding)>,
+    chords: Vec<ksx_core::Chord>,
+    turbo: Vec<ksx_core::TurboBinding>,
+) -> Preset {
+    Preset {
+        name: name.to_owned(),
+        entries,
+        chords,
+        macros: Default::default(),
+        turbo,
         protected: false,
     }
 }

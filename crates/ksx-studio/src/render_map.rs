@@ -596,12 +596,100 @@ fn legend_rows(slot: &MapperSlot, live: bool, write: bool) -> SlotValue {
                             z.fn_name, key
                         )),
                     ),
+                    // AUTO-FIRE (docs/INPUT-TRANSFORMS.md §3). The badge says
+                    // what the game will actually SEE, not what was typed: a
+                    // press and a release must each survive a 60 Hz poll, so a
+                    // rate above ~15 Hz cannot be delivered however it is
+                    // spelled. Empty string = no turbo, and CSS hides the badge
+                    // rather than the row changing shape.
+                    (
+                        "turbo".to_owned(),
+                        SlotValue::Text(turbo_tag(slot, z.fn_name)),
+                    ),
+                    (
+                        "turbotitle".to_owned(),
+                        SlotValue::Text(turbo_title(slot, z.fn_name)),
+                    ),
+                    (
+                        "turboval".to_owned(),
+                        SlotValue::Text(
+                            slot.turbo
+                                .get(z.fn_name)
+                                .map_or_else(String::new, u32::to_string),
+                        ),
+                    ),
                 ];
                 fields.extend(key_chip_fields(z.fn_name, &keys, live));
                 SlotValue::Object(fields)
             })
             .collect(),
     )
+}
+
+/// The auto-fire badge on a legend row: what the control will really do.
+///
+/// The EFFECTIVE rate, not the authored one. `turbo_hz = 30` is a legal thing
+/// to write and an impossible thing to deliver — one cycle is a press AND a
+/// release, a 60 Hz poller resolves each half no faster than
+/// [`MIN_STEP_MS`] — so a badge echoing "30 Hz" back would be the page lying
+/// about the file on the file's behalf.
+fn turbo_tag(slot: &MapperSlot, function: &str) -> String {
+    match slot.turbo.get(function) {
+        None => String::new(),
+        Some(&hz) => {
+            let effective = effective_turbo_hz(hz);
+            if effective == hz {
+                format!("turbo {hz} Hz")
+            } else {
+                format!("turbo ~{effective} Hz")
+            }
+        }
+    }
+}
+
+fn turbo_title(slot: &MapperSlot, function: &str) -> String {
+    match slot.turbo.get(function) {
+        None => format!(
+            "{function} does not auto-fire — hold its key and it stays down. \"Turbo\" in the \
+             learn dialog (or the box in this row without JavaScript) gives it a rate."
+        ),
+        Some(&hz) => {
+            let effective = effective_turbo_hz(hz);
+            let mut line = format!(
+                "{function} AUTO-FIRES while any of its keys is held: {} ms pressed, {} ms \
+                 released, one clock however many keys point at it.",
+                turbo_on_ms(hz),
+                turbo_off_ms(hz)
+            );
+            if effective != hz {
+                line.push_str(&format!(
+                    " The file asks for {hz} Hz and gets about {effective} Hz: a press AND a \
+                     release must each survive a 60 Hz poll ({MIN_STEP_MS} ms), so ~15 Hz is the \
+                     fastest anything can be delivered."
+                ));
+            }
+            line
+        }
+    }
+}
+
+/// Per-binding turbo halves. Mirrors `ksx_core::TurboBinding`, which is the
+/// arithmetic the engine actually runs; pinned against it in the tests below.
+fn turbo_on_ms(hz: u32) -> u32 {
+    let hz = hz.clamp(1, TURBO_MAX_HZ);
+    (1_000 / hz).div_ceil(2).max(MIN_STEP_MS)
+}
+
+fn turbo_off_ms(hz: u32) -> u32 {
+    let hz = hz.clamp(1, TURBO_MAX_HZ);
+    (1_000 / hz)
+        .saturating_sub(turbo_on_ms(hz))
+        .max(MIN_STEP_MS)
+}
+
+fn effective_turbo_hz(hz: u32) -> u32 {
+    let cycle = turbo_on_ms(hz) + turbo_off_ms(hz);
+    (1_000 + cycle / 2) / cycle
 }
 
 /// The legend row's per-key chips — FEATURE: **remove ONE key**, leaving the
@@ -839,6 +927,13 @@ const SEL_TOGGLE_LABEL_OFF: &str = "Select multiple";
 /// `the_sampling_floor_matches_ksx_core`.
 pub(crate) const MIN_STEP_MS: u32 = 33;
 
+/// The fastest turbo a file may ASK for, and a MIRROR of
+/// `ksx_core::TURBO_MAX_HZ` for the same reason as above: one cycle is a press
+/// AND a release, so a 60 Hz poll resolves at most 30 of them a second.
+/// (The rate a preset actually GETS is lower still — each half is floored at
+/// [`MIN_STEP_MS`] — which is exactly what this page has to say out loud.)
+pub(crate) const TURBO_MAX_HZ: u32 = 30;
+
 /// 60 Hz frames → ms, rounded to nearest ONCE — `ksx_core::StepDuration::ms`.
 /// Rounded once so three frames is 50 ms and not 3 × 17 = 51.
 fn frames_ms(frames: u32) -> u32 {
@@ -982,6 +1077,11 @@ pub(crate) fn new_macro_body(name: &str) -> MacroView {
         on_release: "finish".to_owned(),
         retrigger: "ignore".to_owned(),
         interrupt: "none".to_owned(),
+        // A new macro runs ONCE. Auto-fire is asked for by name, never a
+        // default a starter body hands somebody who did not ask.
+        repeat: "once".to_owned(),
+        turbo_hz: None,
+        gap_ms: None,
         triggers: Vec::new(),
     }
 }
@@ -1132,10 +1232,13 @@ fn macro_cols(slot: Option<&MapperSlot>) -> SlotValue {
                 SlotValue::Object(vec![
                     ("fn".to_owned(), SlotValue::Text(z.fn_name.to_owned())),
                     ("id".to_owned(), SlotValue::Text(z.label.to_owned())),
-                    (
-                        "idcls".to_owned(),
-                        SlotValue::Text(format!("maccolid id-{}", z.idk)),
-                    ),
+                    // UNIFORM, deliberately: the grid header carries one of
+                    // these per control at column width, and a row of coloured
+                    // discs that narrow is noise rather than information. The
+                    // identity colours earn their place on the controller art,
+                    // where they map to physical buttons, and in the legend
+                    // beside it — here the column is NAMED, not badged.
+                    ("idcls".to_owned(), SlotValue::Text("maccolid".to_owned())),
                     (
                         "title".to_owned(),
                         SlotValue::Text(format!("{} ({})", legend_label(z), z.fn_name)),
@@ -1340,6 +1443,17 @@ fn macro_toml(mac: &MacroView) -> String {
     if mac.interrupt != "none" {
         out.push_str(&format!("interrupt = {}\n", toml_str(&mac.interrupt)));
     }
+    if !mac.repeat.is_empty() && mac.repeat != "once" {
+        out.push_str(&format!("repeat = {}\n", toml_str(&mac.repeat)));
+    }
+    // Two spellings of one number, so exactly ONE is emitted — a block giving
+    // both is refused by the loader, and pasting one back must never be how a
+    // reader finds that out.
+    if let Some(hz) = mac.turbo_hz {
+        out.push_str(&format!("turbo_hz = {hz}\n"));
+    } else if let Some(ms) = mac.gap_ms {
+        out.push_str(&format!("gap_ms = {ms}\n"));
+    }
     out.push_str("steps = [\n");
     for step in &mac.steps {
         let hold = step
@@ -1447,11 +1561,97 @@ fn preset_name(payload: &MapPayload, selected: Option<&MapperSlot>) -> String {
 /// without JavaScript, this line never is).
 fn macro_policy_line(mac: Option<&MacroView>) -> String {
     match mac {
-        Some(mac) => format!(
-            "on release: {} · retrigger: {} · interrupt: {}",
-            mac.on_release, mac.retrigger, mac.interrupt
-        ),
+        Some(mac) => {
+            let repeat = if mac.repeat.is_empty() {
+                "once"
+            } else {
+                mac.repeat.as_str()
+            };
+            let rate = match (mac.turbo_hz, mac.gap_ms) {
+                (Some(hz), _) => format!(" ({hz} Hz)"),
+                (None, Some(ms)) => format!(" ({ms} ms gap)"),
+                (None, None) => String::new(),
+            };
+            format!(
+                "on release: {} · retrigger: {} · interrupt: {} · repeat: {repeat}{rate}",
+                mac.on_release, mac.retrigger, mac.interrupt
+            )
+        }
         None => String::new(),
+    }
+}
+
+/// The macro's REPEAT arithmetic, in words — the same live-math treatment the
+/// duration field got, for the same reason: `turbo_hz = 30` on a 50 ms
+/// sequence is not 30 Hz and never could be, and the only honest thing to do
+/// with that number is say so while it is being typed.
+///
+/// Mirrored in MapIsland.ts `turboMath`, and the arithmetic is the one
+/// `ksx_core::Macro::turbo_gap_ms` runs, so the card and the engine cannot
+/// drift.
+fn turbo_math(mac: Option<&MacroView>) -> String {
+    let Some(mac) = mac else {
+        return String::new();
+    };
+    match mac.repeat.as_str() {
+        "while-held" => "Holding the trigger starts the sequence again the instant it ends, with \
+             NO gap between runs — the right shape for a MOTION whose last step flows into its \
+             first, and the wrong one for auto-fire (a game reads two touching runs as one long \
+             hold)."
+            .to_owned(),
+        "turbo" => {
+            let run = macro_total_ms(mac);
+            let (gap, why) = turbo_gap_ms(mac, run);
+            let cycle = run + gap;
+            if cycle == 0 {
+                return "This macro has no steps, so there is nothing to repeat.".to_owned();
+            }
+            let effective = (1_000 + cycle / 2) / cycle;
+            let asked = match (mac.turbo_hz, mac.gap_ms) {
+                (Some(hz), _) => format!("Requested {hz} Hz"),
+                (None, Some(ms)) => format!("Requested a {ms} ms gap"),
+                (None, None) => {
+                    "No rate given — a turbo with no rate is refused by the loader".to_owned()
+                }
+            };
+            format!(
+                "{asked} → effective ~{effective} Hz, because the sequence itself is {run} ms \
+                 long and the neutral gap between runs is {gap} ms{why}: one full press/release \
+                 cycle takes {cycle} ms. Each half has to survive a 60 Hz poll ({MIN_STEP_MS} \
+                 ms), which is what caps this — the rate is capped, never refused."
+            )
+        }
+        _ => "One run per press. Holding the trigger changes nothing, which is what stops a \
+             special move turning into a machine gun when a panel switch bounces."
+            .to_owned(),
+    }
+}
+
+/// The macro's whole run at the durations the engine will really use.
+fn macro_total_ms(mac: &MacroView) -> u32 {
+    mac.steps.iter().map(effective_ms).sum()
+}
+
+/// The neutral window between two turbo runs, and WHY it is that number.
+/// Mirrors `ksx_core::Macro::turbo_gap_ms`.
+fn turbo_gap_ms(mac: &MacroView, run: u32) -> (u32, &'static str) {
+    let asked = match (mac.turbo_hz, mac.gap_ms) {
+        (Some(hz), _) => {
+            let hz = hz.clamp(1, TURBO_MAX_HZ);
+            let cycle = (1_000 + hz / 2) / hz;
+            cycle.saturating_sub(run)
+        }
+        (None, Some(ms)) => ms,
+        (None, None) => MIN_STEP_MS,
+    };
+    if asked < MIN_STEP_MS {
+        (
+            MIN_STEP_MS,
+            " (raised to the sampling floor — a gap the game never samples is not a gap, it \
+             reads as one long hold)",
+        )
+    } else {
+        (asked, "")
     }
 }
 
@@ -1582,6 +1782,15 @@ fn scalar_slots(
         // The frame maths, at the selector's default rate — no step is
         // selected on an SSR paint, so this is the floor sentence.
         "macroMathLine": frame_math(None, SSR_RATE_HZ),
+        // v13: the repeat policy and its rate, with the SAME live-math
+        // treatment the duration field got — a rate the sampler cannot deliver
+        // says BOTH numbers, on screen, while it is being typed.
+        "macroTurboLine": turbo_math(mac),
+        "macroTurboValue": mac.map_or_else(String::new, |m| match (m.turbo_hz, m.gap_ms) {
+            (Some(hz), _) => hz.to_string(),
+            (None, Some(ms)) => ms.to_string(),
+            (None, None) => String::new(),
+        }),
     })
 }
 
@@ -1741,6 +1950,9 @@ mod tests {
             on_release: "finish".to_owned(),
             retrigger: "ignore".to_owned(),
             interrupt: "none".to_owned(),
+            repeat: "once".to_owned(),
+            turbo_hz: None,
+            gap_ms: None,
             triggers: vec!["P".to_owned()],
         }
     }
@@ -1751,6 +1963,9 @@ mod tests {
         bindings.insert("B".to_owned(), vec!["F".to_owned()]);
         bindings.insert("lx.min".to_owned(), vec!["M".to_owned()]);
         bindings.insert("start".to_owned(), Vec::new()); // cleared → unbound
+                                                         // One control that AUTO-FIRES, so the legend badge and its title ride
+                                                         // the ordinary render tests rather than only their own.
+        let turbo = BTreeMap::from([("B".to_owned(), 12)]);
         MapperSlot {
             number,
             persona: persona.to_owned(),
@@ -1763,6 +1978,7 @@ mod tests {
             keyboard: r"HID\VID_D209&PID_0430&REV_0056&MI_00".to_owned(),
             bindings,
             backup: Some("2026-08-05 14:32:07 UTC".to_owned()),
+            turbo,
         }
     }
 
@@ -2843,8 +3059,15 @@ mod tests {
             html.contains("3 fr · 50 ms"),
             "the authored unit survives: {html}"
         );
-        // Columns: the persona's identity glyphs, the same ones the art wears.
-        assert!(html.contains(r#"class="maccolid id-xa""#), "{html}");
+        // Columns: the persona's identity GLYPHS, but UNIFORM — no `id-*`
+        // accent class reaches a grid header, so the coloured discs the art and
+        // the legend wear cannot follow the glyph in here (a header row of them
+        // at column width is noise, not information).
+        assert!(html.contains(r#"class="maccolid""#), "{html}");
+        assert!(
+            !html.contains("maccolid id-"),
+            "no accent in a header: {html}"
+        );
         assert!(html.contains("D-pad ▼ (dpad.down)"), "{html}");
         // The head line and the policies, in words.
         assert_eq!(
@@ -2853,7 +3076,9 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("on release: finish · retrigger: ignore · interrupt: none"),
+            html.contains(
+                "on release: finish · retrigger: ignore · interrupt: none · repeat: once"
+            ),
             "{html}"
         );
         // Step verbs, one payload per row.
@@ -3267,6 +3492,109 @@ mod tests {
         );
     }
 
+    // ---- v13: AUTO-FIRE (docs/INPUT-TRANSFORMS.md §3) ------------------
+
+    /// The legend badge says what the game will SEE, not what was typed. A
+    /// page that echoed an undeliverable number back would be lying about the
+    /// file on the file's behalf.
+    #[test]
+    fn the_legend_badge_states_the_effective_rate() {
+        let out = render_map(&page(), &sample(), None);
+        // The fixture's B auto-fires at 12 Hz, which IS deliverable: 83 ms a
+        // cycle splits into 42 pressed and 41 released, both over the floor.
+        assert!(out.html.contains("turbo 12 Hz"), "{}", out.html);
+
+        // 30 Hz is the fastest a file may ASK for and about 15 Hz is the
+        // fastest anything can be given, because each half of a cycle has to
+        // survive a 60 Hz poll. The badge says the second number.
+        let mut payload = sample();
+        for slot in &mut payload.mapper.slots {
+            slot.turbo.insert("B".to_owned(), 30);
+        }
+        let out = render_map(&page(), &payload, None);
+        assert!(out.html.contains("turbo ~15 Hz"), "{}", out.html);
+        assert!(
+            !out.html.contains("turbo 30 Hz"),
+            "the asked-for rate must not be echoed as if it were real: {}",
+            out.html
+        );
+    }
+
+    /// A control with no rate renders an EMPTY badge (CSS collapses it), never
+    /// a placeholder — and its title says where to set one.
+    #[test]
+    fn a_control_without_turbo_says_so_in_its_title() {
+        let out = render_map(&page(), &sample(), None);
+        assert!(out.html.contains("A does not auto-fire"), "{}", out.html);
+    }
+
+    /// The turbo arithmetic, pinned. These are the numbers
+    /// `ksx_core::TurboBinding` produces; this crate depends on no other ksx
+    /// crate, so they are repeated here and pinned rather than imported.
+    #[test]
+    fn the_turbo_arithmetic_is_the_engines() {
+        assert_eq!((turbo_on_ms(12), turbo_off_ms(12)), (42, 41));
+        assert_eq!(effective_turbo_hz(12), 12);
+        // At the ceiling both halves land on the floor: 33 + 33 = 66 ms.
+        assert_eq!((turbo_on_ms(30), turbo_off_ms(30)), (33, 33));
+        assert_eq!(effective_turbo_hz(30), 15);
+        // Above the ceiling is clamped, not refused, and lands in the same
+        // place — which is why the badge for 240 Hz reads the same as for 30.
+        assert_eq!(effective_turbo_hz(240), 15);
+        // 15 Hz is the fastest rate that is BOTH askable and deliverable.
+        assert_eq!(effective_turbo_hz(15), 15);
+        // Zero means "off" in a file, never a division by zero here.
+        assert_eq!(effective_turbo_hz(0), 1);
+    }
+
+    /// The macro card's own live math: the same "both numbers, always" promise
+    /// the duration field makes, applied to `repeat = "turbo"`.
+    #[test]
+    fn the_macro_turbo_math_states_both_numbers() {
+        let mut mac = hadouken(); // 200 ms of steps
+        mac.repeat = "turbo".to_owned();
+        mac.turbo_hz = Some(30);
+        let line = turbo_math(Some(&mac));
+        assert!(line.contains("Requested 30 Hz"), "{line}");
+        // 30 Hz asks for a 33 ms cycle; the sequence alone is 200 ms, so the
+        // gap falls to the floor and one cycle is 233 ms — about 4 Hz.
+        assert!(line.contains("effective ~4 Hz"), "{line}");
+        assert!(line.contains("200 ms long"), "{line}");
+        assert!(line.contains("33 ms"), "the floor is named: {line}");
+
+        // `once` and `while-held` explain themselves rather than showing a
+        // rate they do not have.
+        mac.repeat = "once".to_owned();
+        assert!(turbo_math(Some(&mac)).contains("One run per press"), "once");
+        mac.repeat = "while-held".to_owned();
+        assert!(turbo_math(Some(&mac)).contains("NO gap"), "while-held");
+    }
+
+    /// The policy line and the pasteable TOML both carry the repeat setting —
+    /// the readable half of the new selects, for a page with no JavaScript.
+    #[test]
+    fn the_repeat_policy_reaches_the_page_and_the_toml() {
+        let mut mac = hadouken();
+        mac.repeat = "turbo".to_owned();
+        mac.turbo_hz = Some(10);
+        assert!(
+            macro_policy_line(Some(&mac)).contains("repeat: turbo (10 Hz)"),
+            "{}",
+            macro_policy_line(Some(&mac))
+        );
+        let toml = macro_toml(&mac);
+        assert!(toml.contains("repeat = \"turbo\""), "{toml}");
+        assert!(toml.contains("turbo_hz = 10"), "{toml}");
+        assert!(!toml.contains("gap_ms"), "exactly one spelling: {toml}");
+
+        // A `once` macro emits neither — a preset that predates repeat still
+        // serializes to the block it always did.
+        let plain = hadouken();
+        let toml = macro_toml(&plain);
+        assert!(!toml.contains("repeat"), "{toml}");
+        assert!(!toml.contains("turbo_hz"), "{toml}");
+    }
+
     /// The columns follow the PERSONA, like every other reader on this page:
     /// the same control is `A` on an Xbox slot and `✕` on a DualShock one.
     #[test]
@@ -3274,14 +3602,21 @@ mod tests {
         let mut payload = sample();
         payload.selected = 3; // the PlayStation slot
         let out = render_map(&page(), &payload, None);
+        // The GLYPH follows the persona — the header still NAMES the control the
+        // way this pad does — but no `id-*` accent class comes with it.
         assert!(
-            out.html.contains(r#"class="maccolid id-pc""#),
+            out.html.contains(r#"class="maccolid" title="✕ (A)""#),
             "{}",
             out.html
         );
         assert!(
-            !out.html.contains(r#"class="maccolid id-xa""#),
-            "{}",
+            !out.html.contains(r#"title="A (A)""#),
+            "the Xbox spelling must not leak into a DS4 slot: {}",
+            out.html
+        );
+        assert!(
+            !out.html.contains("maccolid id-"),
+            "a grid header carries no identity accent: {}",
             out.html
         );
         assert!(out.html.contains("step 4 holds ✕ (A)"), "{}", out.html);

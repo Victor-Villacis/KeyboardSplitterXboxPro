@@ -39,7 +39,10 @@ import {
   macroSeededFrom,
   macroSetAllowShort,
   macroSetDuration,
+  macroRateUnit,
+  macroRepeatValue,
   macroSetPolicy,
+  macroSetTurboRate,
   macroSetUnit,
   macroStepAllowShort,
   macroStepUnit,
@@ -47,6 +50,7 @@ import {
   macroTargetRate,
   macroToggleCell,
   macroTomlText,
+  macroTurboBoxValue,
   markMacroSaved,
   newMacroBody,
   setMacroTargetRate,
@@ -72,8 +76,10 @@ import {
   setMultiMode,
   showConflict,
   showLearnMode,
+  showLearnTurbo,
   showListening,
   toggleSelected,
+  turboHzOf,
   updateCountdown,
   writableKeys,
   type BindOutcome,
@@ -376,6 +382,15 @@ async function startLearn(fns: string[]): Promise<void> {
       started.remaining_ms ?? LEARN_TOTAL_MS,
       LEARN_TOTAL_MS,
     );
+    // AUTO-FIRE lives beside Replace/Add/Clear, so the modal has to say what
+    // this control does today before anyone types a number into the box. A
+    // multi-control arm has N rates and no single answer, so it says nothing.
+    showLearnTurbo(single ? fns[0] : null);
+    const box = islandRoot?.querySelector<HTMLInputElement>(".mturboin");
+    if (box) {
+      const slot = currentSlot();
+      box.value = single && slot ? String(turboHzOf(slot, fns[0]) ?? "") : "";
+    }
     stopLearnTimer();
     learnTimer = window.setInterval(() => void pollLearn(), LEARN_POLL_MS);
   } catch {
@@ -503,12 +518,23 @@ async function bindKeys(
   fn: string,
   keys: string[],
   force: boolean,
+  turboHz?: number,
 ): Promise<BindOutcome> {
   try {
     return await fetchJSON<BindOutcome>("/api/bind/keys", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ preset, function: fn, keys, force, reload: true }),
+      // AUTO-FIRE (docs/INPUT-TRANSFORMS.md §3): OMITTED means "not asked
+      // about", which is what leaves an existing rate alone — so "Add another
+      // key" cannot silently switch a control's auto-fire off. 0 clears it.
+      body: JSON.stringify({
+        preset,
+        function: fn,
+        keys,
+        force,
+        reload: true,
+        ...(turboHz === undefined ? {} : { turbo_hz: turboHz }),
+      }),
     });
   } catch {
     return {
@@ -520,6 +546,62 @@ async function bindKeys(
       reloaded: false,
     };
   }
+}
+
+/** The number typed into the learn modal's turbo box, or `null` for a blank
+ *  one (which is a refusal, never a silent clear — “No turbo” is the clear). */
+function modalTurboInput(): number | null {
+  const raw = islandRoot?.querySelector<HTMLInputElement>(".mturboin")?.value.trim() ?? "";
+  if (raw === "") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+}
+
+/** Set (or clear) a control's AUTO-FIRE rate. Same toast + Undo shape as every
+ *  other write on this page: the Undo restores the rate that was there before,
+ *  because a rate is a binding property and losing one to a mis-tap must be as
+ *  recoverable as losing a key. */
+async function setTurbo(fn: string, hz: number | null): Promise<void> {
+  const slot = currentSlot();
+  if (!slot) return;
+  if (hz === null) {
+    pushToast(
+      "Type a number of presses a second first — or press “No turbo” to switch it off.",
+      { kind: "warn" },
+    );
+    return;
+  }
+  const name = identityLabel(fn);
+  const keys = previousKeys(fn);
+  if (keys.length === 0 && hz > 0) {
+    pushToast(`${name} has no keys, so there is nothing to auto-fire — bind one first.`, {
+      kind: "warn",
+    });
+    return;
+  }
+  const before = turboHzOf(slot, fn) ?? 0;
+  const outcome = await bindKeys(slot.preset, fn, keys, false, hz);
+  if (!outcome.ok) {
+    pushToast(outcome.error ?? `could not set turbo on ${name}`, { kind: "error" });
+    return;
+  }
+  const effective = outcome.turbo_effective_hz ?? null;
+  const line =
+    hz === 0
+      ? `${name} no longer auto-fires.`
+      : effective !== null && effective !== hz
+        ? `${name} auto-fires at about ${effective} Hz — ${hz} Hz was asked for, but a press ` +
+          "AND a release must each survive a 60 Hz poll."
+        : `${name} auto-fires at ${hz} Hz.`;
+  pushToast(line, {
+    kind: "ok",
+    undo: async () => {
+      await bindKeys(slot.preset, fn, keys, false, before);
+      await poll();
+    },
+  });
+  await poll();
+  showLearnTurbo(fn);
 }
 
 /** ADD a key to what a control already holds, instead of replacing it — the
@@ -988,6 +1070,9 @@ function syncMacroControls(): void {
   set('.macsel[data-macpol="on_release"]', mac.on_release);
   set('.macsel[data-macpol="retrigger"]', mac.retrigger);
   set('.macsel[data-macpol="interrupt"]', mac.interrupt);
+  set('.macsel[data-macpol="repeat"]', macroRepeatValue());
+  set(".macturboin", macroTurboBoxValue());
+  set(".macturbounit", macroRateUnit());
   const short = root.querySelector<HTMLInputElement>(".macshortin");
   if (short) short.checked = macroStepAllowShort();
 }
@@ -1026,6 +1111,15 @@ async function macroWrite(preset: string, mac: MacroView, remove = false): Promi
         on_release: mac.on_release,
         retrigger: mac.retrigger,
         interrupt: mac.interrupt,
+        repeat: mac.repeat,
+        // Two spellings of one number, so exactly ONE is sent: the daemon
+        // refuses a table that gives both, and a stale companion field would
+        // turn an editor slip into that refusal.
+        ...(mac.turbo_hz !== null
+          ? { turbo_hz: mac.turbo_hz }
+          : mac.gap_ms !== null
+            ? { gap_ms: mac.gap_ms }
+            : {}),
         delete: remove,
         // The server forces this on anyway; sent so the request says what it
         // means. A macro body is a binding change — the pads stay plugged.
@@ -1486,6 +1580,15 @@ function wire(root: HTMLElement): void {
       if (fn) void clearBinding(fn);
       return;
     }
+    // v13: AUTO-FIRE, in the modal's own Add/Replace/Clear vocabulary. It
+    // writes through the SAME `bind_keys` seam with the control's CURRENT key
+    // list — turbo belongs to the CONTROL, so setting it is that control's
+    // write with one more field, not a second writer.
+    if (act === "turbo-set" || act === "turbo-clear") {
+      const fn = selectedFnName();
+      if (fn) void setTurbo(fn, act === "turbo-clear" ? 0 : modalTurboInput());
+      return;
+    }
     if (act === "pause-map") {
       void pauseAndMap();
       return;
@@ -1678,6 +1781,20 @@ function wire(root: HTMLElement): void {
       // 50 of them. The unit is an authoring convenience, so changing it must
       // not change how long the step runs.
       macroSetUnit(el.value);
+      syncMacroControls();
+      return;
+    }
+    if (el.classList.contains("macturboin")) {
+      // A number box, so it commits on `change` for the same caret reason the
+      // duration box does.
+      if (committed) macroSetTurboRate(el.value, macroRateUnit());
+      return;
+    }
+    if (el.classList.contains("macturbounit")) {
+      // MOVES the value between the two spellings rather than adding a second
+      // field: a table giving both `turbo_hz` and `gap_ms` is refused.
+      const box = islandRoot?.querySelector<HTMLInputElement>(".macturboin");
+      macroSetTurboRate(box?.value ?? "", el.value);
       syncMacroControls();
       return;
     }

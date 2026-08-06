@@ -110,24 +110,42 @@ struct MacroRt {
     start: u64,
 }
 
-/// One armed macro deadline.
+/// What an armed deadline belongs to.
+///
+/// Turbo (docs/INPUT-TRANSFORMS.md §3) deliberately does NOT get a clock of its
+/// own: a second timer list would mean a second answer to
+/// [`Engine::next_deadline`], a second ordering rule, and two ways for a wake to
+/// be late. It shares this one, tagged, so a macro step and a turbo phase due in
+/// the same millisecond still fire in a fixed order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimerKind {
+    /// `id` is an index into [`SlotRuntime::macros`].
+    Macro,
+    /// `id` is an index into [`SlotRuntime::turbo`].
+    Turbo,
+}
+
+/// One armed deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Timer {
     /// Absolute milliseconds on the caller's clock.
     deadline: u64,
     slot: u8,
-    mac: u16,
+    kind: TimerKind,
+    /// Index within the slot, interpreted by `kind`.
+    id: u16,
 }
 
-/// **The** timer structure: one ordered list for every macro in every slot.
+/// **The** timer structure: one ordered list for every macro and every turbo
+/// endpoint in every slot.
 ///
 /// Not a thread per macro and not a per-step allocation: entries are `Copy`,
 /// the backing `Vec` is sized at [`EngineTables::build`] time to the total
-/// macro count, and arming is an insertion into an already-sorted list. With
-/// at most a handful of macros per cabinet the linear insert beats a heap on
+/// macro + turbo count, and arming is an insertion into an already-sorted list.
+/// With at most a handful of each per cabinet the linear insert beats a heap on
 /// both cache behavior and code you have to trust.
 ///
-/// Ties are FIFO (`partition_point` on `<=`), so two macros armed for the same
+/// Ties are FIFO (`partition_point` on `<=`), so two entries armed for the same
 /// millisecond always fire in the order they were armed — the determinism the
 /// replay corpus needs.
 #[derive(Debug, Default)]
@@ -137,30 +155,31 @@ struct Timers {
 }
 
 impl Timers {
-    fn with_capacity(macros: usize) -> Self {
+    fn with_capacity(entries: usize) -> Self {
         Self {
-            armed: Vec::with_capacity(macros),
+            armed: Vec::with_capacity(entries),
         }
     }
 
-    fn arm(&mut self, slot: u8, mac: u16, deadline: u64) {
-        self.cancel(slot, mac);
+    fn arm(&mut self, slot: u8, kind: TimerKind, id: u16, deadline: u64) {
+        self.cancel(slot, kind, id);
         let at = self.armed.partition_point(|t| t.deadline <= deadline);
         self.armed.insert(
             at,
             Timer {
                 deadline,
                 slot,
-                mac,
+                kind,
+                id,
             },
         );
     }
 
-    fn cancel(&mut self, slot: u8, mac: u16) {
+    fn cancel(&mut self, slot: u8, kind: TimerKind, id: u16) {
         if let Some(i) = self
             .armed
             .iter()
-            .position(|t| t.slot == slot && t.mac == mac)
+            .position(|t| t.slot == slot && t.kind == kind && t.id == id)
         {
             self.armed.remove(i);
         }
@@ -176,15 +195,47 @@ impl Timers {
     }
 
     /// Take the earliest timer that is due at `now`.
-    fn pop_due(&mut self, now: u64) -> Option<(u8, u16)> {
+    fn pop_due(&mut self, now: u64) -> Option<(u8, TimerKind, u16)> {
         match self.armed.first() {
             Some(t) if t.deadline <= now => {
                 let t = self.armed.remove(0);
-                Some((t.slot, t.mac))
+                Some((t.slot, t.kind, t.id))
             }
             _ => None,
         }
     }
+}
+
+/// One auto-firing endpoint (docs/INPUT-TRANSFORMS.md §3).
+///
+/// A turbo endpoint is a HOLDER like any other — it presses and releases
+/// through `apply_scan`, joins the all-keys-up and opposite-axis tables, and
+/// batches its deltas with everything else. What makes it turbo is only that
+/// its held bit is `running && on` instead of "a key is down": the sources say
+/// whether the player is asking for the button at all, and the phase says what
+/// the button is doing about it this instant.
+#[derive(Clone, Debug)]
+struct TurboRt {
+    /// The endpoint this drives. Its ONLY driver among binding rows: the keys
+    /// and chords that used to press it directly were rewired into `sources` at
+    /// build time, which is what stops a source from pinning the button down
+    /// through the released half of the cycle.
+    binding: Binding,
+    /// Milliseconds pressed, then released, per cycle. Resolved ONCE, off the
+    /// hot path, so the scheduler only ever adds a number.
+    on_ms: u32,
+    off_ms: u32,
+    /// Holders that ask for this endpoint: dense keys from `[bindings]` rows and
+    /// chord ids from guarded ones. Macro steps are never sources — a macro owns
+    /// its own timeline (see [`crate::TurboBinding`]).
+    sources: SmallVec<[u32; 4]>,
+    /// Is anything driving it at all? The all-keys-up rule, one level up: ONE
+    /// clock per endpoint however many keys point at it.
+    running: bool,
+    /// Which half of the cycle we are in. Always `true` on the instant the
+    /// first source goes down — an auto-fire whose first press arrives half a
+    /// cycle late is a button that feels broken.
+    on: bool,
 }
 
 struct SlotRuntime {
@@ -236,12 +287,22 @@ struct SlotRuntime {
     /// First macro-step holder id (`chord_base + chords.len()`). Holders at or
     /// above it are macro steps, below it chords, below that dense keys.
     macro_base: u32,
-    /// Holder ids whose macro state moved and have not been applied yet.
-    /// Drained into `scan`, so a trigger press and the step it starts land in
-    /// ONE delta batch. Sized to the slot's total step count at build time.
+    /// Holder ids whose SCHEDULED state moved and have not been applied yet —
+    /// macro steps and turbo phases alike. Drained into `scan`, so a trigger
+    /// press and the step it starts land in ONE delta batch. Sized to the
+    /// slot's total step + turbo count at build time.
     macro_dirty: Vec<u32>,
-    /// `false` ⇒ neither chords nor macros: this slot takes the pre-chord code
-    /// path end to end, exactly as it did before either feature existed.
+
+    // ---- turbo runtime -----------------------------------------------------
+    /// Auto-firing endpoints; EMPTY for a slot with none.
+    turbo: Vec<TurboRt>,
+    /// First turbo holder id (`macro_base` + total steps). Holders at or above
+    /// it are turbo endpoints, below it macro steps, below that chords, below
+    /// that dense keys.
+    turbo_base: u32,
+
+    /// `false` ⇒ no chords, macros or turbo: this slot takes the pre-chord code
+    /// path end to end, exactly as it did before any of them existed.
     stateful: bool,
 }
 
@@ -351,8 +412,21 @@ impl SlotRuntime {
     /// `event_key` is the key whose event triggered this (its own heldness is
     /// always rechecked). `full` rescans every holder — used when a device is
     /// yanked and everything on it must be released at once.
-    fn sync(&mut self, down: &[u64], event_key: Option<u32>, full: bool) {
+    fn sync(
+        &mut self,
+        down: &[u64],
+        event_key: Option<u32>,
+        full: bool,
+        si: u8,
+        now: u64,
+        timers: &mut Timers,
+    ) {
         self.recompute_chords(down);
+        // After consumption, before the scan is built: a turbo endpoint's
+        // sources are dense keys and chords, and both have their final answer
+        // by now. Whatever this starts or stops is `mark`ed and therefore joins
+        // the very same delta batch as the key press that caused it.
+        self.sync_turbo(down, si, now, timers);
 
         self.scan.clear();
         if full {
@@ -461,18 +535,32 @@ impl SlotRuntime {
     }
 
     /// Steps 2 and 3: recompute heldness for `self.scan`, then apply it.
+    /// Is holder `h` driving right now?
+    ///
+    /// One expression, four holder kinds, and the only place that ordering is
+    /// written down. Pure: it reads state the callers have already settled
+    /// (consumption, chord activation, macro step, turbo phase), which is what
+    /// lets `sync_turbo` ask about a source BEFORE `apply_scan` has written its
+    /// bit and still get the same answer.
+    fn holder_now(&self, h: u32, down: &[u64]) -> bool {
+        if h >= self.turbo_base {
+            let t = &self.turbo[(h - self.turbo_base) as usize];
+            t.running && t.on
+        } else if h >= self.macro_base {
+            let (m, step) = self.step_of(h);
+            self.macros[m].step == Some(step)
+        } else if h >= self.chord_base {
+            self.chords[(h - self.chord_base) as usize].active
+        } else {
+            bit(down, h) && !bit(&self.consumed, h)
+        }
+    }
+
     fn apply_scan(&mut self, down: &[u64]) {
         self.prev_held.copy_from_slice(&self.held);
         for i in 0..self.scan.len() {
             let h = self.scan[i];
-            let now = if h >= self.macro_base {
-                let (m, step) = self.step_of(h);
-                self.macros[m].step == Some(step)
-            } else if h >= self.chord_base {
-                self.chords[(h - self.chord_base) as usize].active
-            } else {
-                bit(down, h) && !bit(&self.consumed, h)
-            };
+            let now = self.holder_now(h, down);
             set_bit(&mut self.held, h, now);
         }
         // Releases before presses: an endpoint handed over from a consumed
@@ -508,6 +596,10 @@ impl SlotRuntime {
         for mac in &mut self.macros {
             mac.step = None;
             mac.gapping = false;
+        }
+        for t in &mut self.turbo {
+            t.running = false;
+            t.on = false;
         }
         self.macro_dirty.clear();
         self.held.iter_mut().for_each(|w| *w = 0);
@@ -589,7 +681,7 @@ impl SlotRuntime {
         self.macros[m].gapping = false;
         self.mark(first);
         let deadline = self.macro_deadline(m, 0, now);
-        timers.arm(si, m as u16, deadline);
+        timers.arm(si, TimerKind::Macro, m as u16, deadline);
     }
 
     /// Stop now and release everything this macro held. The one path that
@@ -602,7 +694,7 @@ impl SlotRuntime {
             self.mark(first + u32::from(step));
         }
         self.macros[m].gapping = false;
-        timers.cancel(si, m as u16);
+        timers.cancel(si, TimerKind::Macro, m as u16);
     }
 
     /// A deadline was reached: move to the next step, finish, or start the next
@@ -642,7 +734,7 @@ impl SlotRuntime {
             // ask for another one.
             self.macros[m].step = None;
             if !self.macros[m].repeat.repeats() || !trigger_held {
-                timers.cancel(si, m as u16);
+                timers.cancel(si, TimerKind::Macro, m as u16);
                 return;
             }
             if self.macros[m].repeat.wants_gap() {
@@ -651,7 +743,7 @@ impl SlotRuntime {
                 // (§0.2), which is why `gap_ms` is floored at build time.
                 self.macros[m].gapping = true;
                 let gap = u64::from(self.macros[m].gap_ms);
-                timers.arm(si, m as u16, now + gap);
+                timers.arm(si, TimerKind::Macro, m as u16, now + gap);
             } else {
                 // While-held: straight back to step 0 in the SAME delta batch,
                 // so a motion that ends and restarts never blinks an endpoint
@@ -663,7 +755,7 @@ impl SlotRuntime {
         self.macros[m].step = Some(next);
         self.mark(first + u32::from(next));
         let deadline = self.macro_deadline(m, next, now);
-        timers.arm(si, m as u16, deadline);
+        timers.arm(si, TimerKind::Macro, m as u16, deadline);
     }
 
     /// Is any key that starts macro `m` currently down on `down`?
@@ -752,6 +844,82 @@ impl SlotRuntime {
         }
         moved
     }
+
+    // ---- turbo ---------------------------------------------------------
+    //
+    // docs/INPUT-TRANSFORMS.md §3. Three transitions, and like the macro ones
+    // none of them touches `current`: they move a phase bit and `mark` the
+    // holder, and `apply_scan` does the pressing. A turbo therefore cannot
+    // invent a release path of its own, which is what makes "everything is
+    // released on every exit path" one guarantee instead of two.
+
+    /// Start or stop the clock for every turbo endpoint whose SOURCES moved.
+    ///
+    /// Called after chord consumption is settled and before the scan is
+    /// applied, so a press that satisfies a guard and the first turbo press it
+    /// causes land in the same delta batch.
+    fn sync_turbo(&mut self, down: &[u64], si: u8, now: u64, timers: &mut Timers) {
+        for t in 0..self.turbo.len() {
+            let driven = (0..self.turbo[t].sources.len())
+                .any(|i| self.holder_now(self.turbo[t].sources[i], down));
+            if driven == self.turbo[t].running {
+                continue;
+            }
+            self.turbo[t].running = driven;
+            // Starting: PRESSED, immediately. Stopping: released, immediately —
+            // a player who let go must not owe the game the rest of a cycle.
+            self.turbo[t].on = driven;
+            if driven {
+                let on_ms = u64::from(self.turbo[t].on_ms);
+                timers.arm(si, TimerKind::Turbo, t as u16, now + on_ms);
+            } else {
+                timers.cancel(si, TimerKind::Turbo, t as u16);
+            }
+            self.mark(self.turbo_base + t as u32);
+        }
+    }
+
+    /// A phase ended: flip, re-arm, publish.
+    ///
+    /// Re-armed from `now` rather than from the scheduled instant, unlike a
+    /// macro step: a macro has a fixed timeline to stay faithful to, while a
+    /// turbo has only a duty cycle — and re-arming from a late wake keeps each
+    /// half at its full sampled length instead of eating the lateness out of
+    /// the next press (§0.2).
+    fn turbo_advance(&mut self, t: usize, now: u64, si: u8, timers: &mut Timers) {
+        if !self.turbo[t].running {
+            return; // a stale timer; cannot happen, must not misbehave if it did
+        }
+        self.turbo[t].on = !self.turbo[t].on;
+        let ms = if self.turbo[t].on {
+            self.turbo[t].on_ms
+        } else {
+            self.turbo[t].off_ms
+        };
+        timers.arm(si, TimerKind::Turbo, t as u16, now + u64::from(ms));
+        self.mark(self.turbo_base + t as u32);
+    }
+
+    /// Stop every turbo of this slot and release what they held — the same
+    /// "everything releases on the way out" primitive [`SlotRuntime::cancel_all_macros`]
+    /// is, for the same four exits (stop, yank, hot-swap, escape). A turbo
+    /// resting in its released half holds nothing but is still armed, so it is
+    /// cancelled too: leaving it would press a button on a pad the player has
+    /// just been disconnected from.
+    fn cancel_all_turbo(&mut self, si: u8, timers: &mut Timers) -> bool {
+        let mut moved = false;
+        for t in 0..self.turbo.len() {
+            if !self.turbo[t].running && !self.turbo[t].on {
+                continue;
+            }
+            self.turbo[t].running = false;
+            self.turbo[t].on = false;
+            timers.cancel(si, TimerKind::Turbo, t as u16);
+            self.mark(self.turbo_base + t as u32);
+            moved = true;
+        }
+        moved
+    }
 }
 
 fn bit(words: &[u64], k: u32) -> bool {
@@ -793,6 +961,9 @@ pub struct EngineTables {
     /// `false` ⇒ the engine never looks at the clock or the timer list, and
     /// [`Engine::next_deadline`] is always `None`.
     has_macros: bool,
+    /// `false` ⇒ no endpoint auto-fires. Together with `has_macros` this is
+    /// the one branch turbo costs a configuration without it.
+    has_turbo: bool,
     /// Built here, off the hot path, so a hot swap moves it rather than
     /// allocating one on the engine thread.
     timers: Timers,
@@ -960,6 +1131,27 @@ impl EngineTables {
                 macros: macro_rts,
                 macro_base: 0,
                 macro_dirty: Vec::new(),
+                // Turbo rows whose endpoint nothing in this preset drives are
+                // dropped here (a rate on an unbound function auto-fires
+                // nothing) and reported by validation. `sources` is filled in
+                // the second pass, which knows the final holder ids.
+                turbo: rs
+                    .preset
+                    .turbo
+                    .iter()
+                    .filter(|t| t.binding != Binding::Consume)
+                    .map(|t| TurboRt {
+                        binding: t.binding,
+                        // The clamp, the halving and the sampling floor all
+                        // happen HERE, once, off the hot path.
+                        on_ms: t.on_ms(),
+                        off_ms: t.off_ms(),
+                        sources: SmallVec::new(),
+                        running: false,
+                        on: false,
+                    })
+                    .collect(),
+                turbo_base: 0,
                 stateful: false,
             });
         }
@@ -967,10 +1159,12 @@ impl EngineTables {
         let words = targets.len().div_ceil(64).max(1);
         let down = vec![0u64; words * devices.len()];
         for slot in &mut runtimes {
-            slot.stateful = !slot.chords.is_empty() || !slot.macros.is_empty();
+            slot.stateful =
+                !slot.chords.is_empty() || !slot.macros.is_empty() || !slot.turbo.is_empty();
         }
         let has_state = runtimes.iter().any(|s| s.stateful);
         let macro_count: usize = runtimes.iter().map(|s| s.macros.len()).sum();
+        let turbo_count: usize = runtimes.iter().map(|s| s.turbo.len()).sum();
 
         // Second pass: everything that needs the FINAL dense-key count. Only
         // chorded slots allocate any of it, so a chord-free build is byte-for
@@ -991,7 +1185,9 @@ impl EngineTables {
                     runtimes[si].macros[m].first_holder = macro_base + steps;
                     steps += runtimes[si].macros[m].ends.len() as u32;
                 }
-                let holders = (macro_base + steps) as usize;
+                // Turbo endpoints are holders too, one each, laid out last.
+                let turbo_base = macro_base + steps;
+                let holders = (turbo_base + runtimes[si].turbo.len() as u32) as usize;
                 let mut holder_bindings: Vec<SmallVec<[Binding; 2]>> =
                     vec![SmallVec::new(); holders];
                 for &(key, binding) in &rs.preset.entries {
@@ -1062,9 +1258,50 @@ impl EngineTables {
                     }
                 }
 
-                // Chords and macro steps are always holders even when they
-                // drive nothing, so a full rescan (device yank) still clears
-                // their `held` bit.
+                // Turbo (docs/INPUT-TRANSFORMS.md §3). The rewiring is the whole
+                // feature: the endpoint stops being driven DIRECTLY by its keys
+                // and chords and starts being driven by one holder whose bit is
+                // a phase — and those keys and chords become the sources that
+                // merely gate that phase's clock. Doing it here, once, is why
+                // the hot path never asks "is this binding turbo".
+                //
+                // Only holders below `macro_base` are rewired: a macro step
+                // that holds the same endpoint keeps driving it flat for the
+                // step's duration, because a sequence already owns a timeline
+                // and running it through a second clock would make it
+                // unreproducible.
+                for t in 0..runtimes[si].turbo.len() {
+                    let id = turbo_base + t as u32;
+                    let binding = runtimes[si].turbo[t].binding;
+                    let mut sources: SmallVec<[u32; 4]> = SmallVec::new();
+                    for h in 0..macro_base {
+                        let holds = &mut holder_bindings[h as usize];
+                        if let Some(p) = holds.iter().position(|b| *b == binding) {
+                            holds.remove(p);
+                            sources.push(h);
+                        }
+                    }
+                    // A rate on a function nothing binds auto-fires nothing:
+                    // the row stays (indices must line up with the holder ids)
+                    // and never runs. Validation names it.
+                    if !sources.is_empty() {
+                        holder_bindings[id as usize].push(binding);
+                        let keys = runtimes[si].endpoint_keys.entry(binding).or_default();
+                        keys.retain(|k| !sources.contains(k));
+                        keys.push(id);
+                        if let Binding::Axis { axis, value } = binding {
+                            runtimes[si].axis_entries.retain(|&(a, v, k)| {
+                                !(a == axis && v == value && sources.contains(&k))
+                            });
+                            runtimes[si].axis_entries.push((axis, value, id));
+                        }
+                    }
+                    runtimes[si].turbo[t].sources = sources;
+                }
+
+                // Chords, macro steps and turbo endpoints are always holders
+                // even when they drive nothing, so a full rescan (device yank)
+                // still clears their `held` bit.
                 let all_holders: Vec<u32> = (0..holders as u32)
                     .filter(|h| *h >= chord_base || !holder_bindings[*h as usize].is_empty())
                     .collect();
@@ -1084,6 +1321,13 @@ impl EngineTables {
                 for mac in &runtimes[si].macros {
                     touches.extend(mac.triggers.iter().copied());
                 }
+                // A key whose ONLY binding was rewired into a turbo now holds
+                // nothing directly, so it would have dropped out of the list
+                // above — and the slot would never resync on the very key that
+                // starts the auto-fire.
+                for t in &runtimes[si].turbo {
+                    touches.extend(t.sources.iter().copied().filter(|h| *h < chord_base));
+                }
                 touches.sort_unstable();
                 touches.dedup();
                 for key in touches {
@@ -1094,14 +1338,22 @@ impl EngineTables {
                 let slot = &mut runtimes[si];
                 slot.chord_base = chord_base;
                 slot.macro_base = macro_base;
-                // One entry per step is the worst case (`mark` dedupes), so the
-                // hot path can never reallocate this either.
-                slot.macro_dirty = Vec::with_capacity(steps as usize);
+                slot.turbo_base = turbo_base;
+                // One entry per step plus one per turbo endpoint is the worst
+                // case (`mark` dedupes), so the hot path can never reallocate
+                // this either.
+                slot.macro_dirty = Vec::with_capacity(steps as usize + slot.turbo.len());
                 // Big enough for BOTH scan shapes, so `scan.push` in the hot
                 // path can never reallocate.
                 let scan_cap = all_holders
                     .len()
-                    .max(chord_keys.len() + 1 + slot.chords.len() + steps as usize)
+                    .max(
+                        chord_keys.len()
+                            + 1
+                            + slot.chords.len()
+                            + steps as usize
+                            + slot.turbo.len(),
+                    )
                     .max(1);
                 slot.scan = Vec::with_capacity(scan_cap);
                 slot.holder_bindings = holder_bindings;
@@ -1125,7 +1377,8 @@ impl EngineTables {
             sync_slots,
             has_state,
             has_macros: macro_count > 0,
-            timers: Timers::with_capacity(macro_count),
+            has_turbo: turbo_count > 0,
+            timers: Timers::with_capacity(macro_count + turbo_count),
         }
     }
 
@@ -1187,7 +1440,8 @@ pub struct Engine {
     /// The one branch chords and macros cost a configuration with neither.
     has_state: bool,
     has_macros: bool,
-    /// Every armed macro deadline, in one ordered list.
+    has_turbo: bool,
+    /// Every armed macro and turbo deadline, in one ordered list.
     timers: Timers,
     /// The engine's notion of "now", in milliseconds, as last supplied by
     /// [`Engine::tick`] or [`Engine::handle_at`]. The engine never reads a
@@ -1220,6 +1474,7 @@ impl Engine {
             sync_slots,
             has_state,
             has_macros,
+            has_turbo,
             timers,
         } = tables;
         Self {
@@ -1233,6 +1488,7 @@ impl Engine {
             sync_slots,
             has_state,
             has_macros,
+            has_turbo,
             timers,
             now: 0,
         }
@@ -1274,6 +1530,7 @@ impl Engine {
             sync_slots,
             has_state,
             has_macros,
+            has_turbo,
             timers,
         } = tables;
         for slot in &mut slots {
@@ -1293,6 +1550,7 @@ impl Engine {
         self.sync_slots = sync_slots;
         self.has_state = has_state;
         self.has_macros = has_macros;
+        self.has_turbo = has_turbo;
         // Macros in flight are dropped with the old tables, and the neutral
         // deltas below release whatever they were holding. Carrying a run
         // across a rebind would mean stepping a sequence whose steps no longer
@@ -1400,7 +1658,7 @@ impl Engine {
                         }
                         slot.macro_key(dense, ev.down, now, si as u8, &mut self.timers);
                     }
-                    slot.sync(down, Some(dense), false);
+                    slot.sync(down, Some(dense), false, si as u8, now, &mut self.timers);
                 } else {
                     slot.sync_key(down, dense);
                 }
@@ -1462,6 +1720,7 @@ impl Engine {
         // stuck-key invariant. A macro is the one holder a yank could not
         // clear on its own: nobody is going to release its "key".
         if self.has_state {
+            let now = self.now;
             for si in 0..self.slots.len() {
                 let down = &self.down[base..base + self.words];
                 let slot = &mut self.slots[si];
@@ -1469,7 +1728,8 @@ impl Engine {
                     continue;
                 }
                 slot.cancel_all_macros(si as u8, &mut self.timers);
-                slot.sync(down, None, true);
+                slot.cancel_all_turbo(si as u8, &mut self.timers);
+                slot.sync(down, None, true, si as u8, now, &mut self.timers);
             }
         }
 
@@ -1487,20 +1747,35 @@ impl Engine {
     pub fn tick(&mut self, now: u64) -> Deltas {
         let mut deltas = Deltas::new();
         self.now = now;
-        if !self.has_macros || self.timers.next().is_none_or(|next| next > now) {
+        if (!self.has_macros && !self.has_turbo) || self.timers.next().is_none_or(|next| next > now)
+        {
             return deltas;
         }
-        while let Some((si, mac)) = self.timers.pop_due(now) {
-            // Read BEFORE the transition, because the only question `repeat`
-            // asks is "is the player still holding the button right now".
-            let held = self.trigger_held(si, mac);
-            self.slots[si as usize].macro_advance(
-                usize::from(mac),
-                now,
-                si,
-                held,
-                &mut self.timers,
-            );
+        while let Some((si, kind, id)) = self.timers.pop_due(now) {
+            match kind {
+                TimerKind::Macro => {
+                    // Read BEFORE the transition, because the only question
+                    // `repeat` asks is "is the player still holding the button
+                    // right now".
+                    let held = self.trigger_held(si, id);
+                    self.slots[si as usize].macro_advance(
+                        usize::from(id),
+                        now,
+                        si,
+                        held,
+                        &mut self.timers,
+                    );
+                }
+                // A turbo needs no such question: its sources are holders, and
+                // whether they hold was settled the last time a key moved. The
+                // phase just flips.
+                TimerKind::Turbo => self.slots[si as usize].turbo_advance(
+                    usize::from(id),
+                    now,
+                    si,
+                    &mut self.timers,
+                ),
+            }
         }
         self.apply_macro_moves(&mut deltas);
         deltas
@@ -1537,11 +1812,15 @@ impl Engine {
     /// through [`Engine::release_device`] and [`Engine::swap_tables`].
     pub fn cancel_macros(&mut self) -> Deltas {
         let mut deltas = Deltas::new();
-        if !self.has_macros {
+        if !self.has_macros && !self.has_turbo {
             return deltas;
         }
         for si in 0..self.slots.len() {
             self.slots[si].cancel_all_macros(si as u8, &mut self.timers);
+            // Turbo goes out the same door, and for the same reason: an
+            // auto-fire that keeps firing into a game the player just escaped
+            // from is the stuck-input failure this project refuses to ship.
+            self.slots[si].cancel_all_turbo(si as u8, &mut self.timers);
         }
         self.apply_macro_moves(&mut deltas);
         deltas

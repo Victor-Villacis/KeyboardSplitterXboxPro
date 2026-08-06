@@ -315,6 +315,12 @@ export function MapPage() {
   // trigger block's inert class while the preset holds no macro.
   const [macroSaveCls] = createSignal("btn btn-mini macsave off");
   const [macroMathLine] = createSignal("");
+  // v13: the repeat policy's own live math, and the rate box's value.
+  const [macroTurboLine] = createSignal("");
+  const [macroTurboValue] = createSignal("");
+  // Client-only: the learn modal's auto-fire sentence (an SSR paint has no
+  // modal open, so there is nothing to say about a control nobody picked).
+  const [modalTurboLine] = createSignal("");
   const [macroTrigCls] = createSignal("mactrigger off");
   // Booleans behind the createShow pairs (positional show:createShow slots —
   // render_map.rs MAP_SHOW_ORDER pins the document order). Default false:

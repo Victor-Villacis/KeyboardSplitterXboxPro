@@ -133,8 +133,9 @@ impl ksx_studio::ControlSource for PipeControlSource {
         keys: &[String],
         force: bool,
         reload: bool,
+        turbo_hz: Option<u32>,
     ) -> BindOutcome {
-        map_request(map_wire(preset, function, keys, force, reload))
+        map_request(map_wire(preset, function, keys, force, reload, turbo_hz))
     }
 
     /// The macro editor's save: ONE `map-macro` request carrying the whole
@@ -171,7 +172,17 @@ fn macro_wire(request: &MacroWrite) -> serde_json::Value {
         "on_release": policy(&request.on_release, "finish"),
         "retrigger": policy(&request.retrigger, "ignore"),
         "interrupt": policy(&request.interrupt, "none"),
+        "repeat": policy(&request.repeat, "once"),
     });
+    // The RATE is only sent when the file would carry one. Two spellings of
+    // one number, so exactly one goes on the wire; the daemon refuses both,
+    // and sending a stale companion field would turn an editor slip into that
+    // refusal.
+    if let Some(hz) = request.turbo_hz {
+        wire["turbo_hz"] = serde_json::json!(hz);
+    } else if let Some(ms) = request.gap_ms {
+        wire["gap_ms"] = serde_json::json!(ms);
+    }
     // A delete carries no body at all — the verb's own refusal for a missing
     // step list is what protects a WRITE from an editor that lost its grid.
     if !request.delete {
@@ -222,6 +233,7 @@ fn map_wire(
     keys: &[String],
     force: bool,
     reload: bool,
+    turbo_hz: Option<u32>,
 ) -> serde_json::Value {
     let mut wire = serde_json::json!({
         "verb": "map",
@@ -234,6 +246,12 @@ fn map_wire(
         [] => wire["clear"] = serde_json::json!(true),
         [only] => wire["key"] = serde_json::json!(only),
         many => wire["keys"] = serde_json::json!(many),
+    }
+    // AUTO-FIRE (docs/INPUT-TRANSFORMS.md §3). ABSENT means "not asked about",
+    // which is what leaves an existing rate alone — so the field is only put
+    // on the wire when the caller actually said something about it.
+    if let Some(hz) = turbo_hz {
+        wire["turbo_hz"] = serde_json::json!(hz);
     }
     wire
 }
@@ -272,6 +290,12 @@ fn map_request(wire: serde_json::Value) -> BindOutcome {
                         .collect()
                 })
                 .unwrap_or_default(),
+            turbo_hz: response["turbo_hz"]
+                .as_u64()
+                .and_then(|hz| u32::try_from(hz).ok()),
+            turbo_effective_hz: response["turbo_effective_hz"]
+                .as_u64()
+                .and_then(|hz| u32::try_from(hz).ok()),
             reloaded: response["reloaded"] == true,
         },
         Err(client::ClientError::NotRunning) => BindOutcome::failed(NO_CHANNEL),
@@ -445,6 +469,9 @@ fn collect_macros(store: &ksx_config::Store, preset_name: &str) -> MacroSnapshot
             on_release: def.on_release.as_str().to_owned(),
             retrigger: def.retrigger.as_str().to_owned(),
             interrupt: def.interrupt.as_str().to_owned(),
+            repeat: def.repeat.as_str().to_owned(),
+            turbo_hz: def.turbo_hz,
+            gap_ms: def.gap_ms,
             // The `macro.<name>` rows of `[bindings]` — many keys → one macro
             // is native, exactly like many keys → one button. Read through the
             // mapping writer's own helper, so the keys the card shows are the
@@ -526,6 +553,7 @@ fn collect_mapper() -> MapperSnapshot {
         .into_iter()
         .map(|(number, keyboard, preset_name, persona)| {
             let bindings = preset_bindings(&store, &preset_name);
+            let turbo = preset_turbo(&store, &preset_name);
             // The newest restore point, read from disk rather than from the
             // daemon: the label is still true (and still worth showing) when
             // nothing answers the pipe.
@@ -540,6 +568,7 @@ fn collect_mapper() -> MapperSnapshot {
                 keyboard,
                 bindings,
                 backup,
+                turbo,
             }
         })
         .collect();
@@ -575,6 +604,27 @@ fn preset_bindings(
         }
     }
     bindings
+}
+
+/// Canonical function name → its AUTO-FIRE rate, as authored
+/// (docs/INPUT-TRANSFORMS.md §3). Read from the same file and the same core
+/// model the bindings come from, so the legend's rate and the legend's keys
+/// can never disagree.
+fn preset_turbo(
+    store: &ksx_config::Store,
+    preset_name: &str,
+) -> std::collections::BTreeMap<String, u32> {
+    let mut rates = std::collections::BTreeMap::new();
+    let Ok(Some(loaded)) = store.load_preset(preset_name) else {
+        return rates;
+    };
+    let Ok(core) = loaded.value.to_core() else {
+        return rates;
+    };
+    for t in &core.turbo {
+        rates.insert(ksx_config::function_name(&t.binding), t.hz);
+    }
+    rates
 }
 
 fn collect_snapshot() -> StatusSnapshot {

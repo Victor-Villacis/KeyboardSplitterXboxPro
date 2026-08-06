@@ -75,6 +75,7 @@ pub fn parse_presets(text: &str, file: &str) -> ParsedPresets {
                                     // imported preset never has one.
                                     chords: Vec::new(),
                                     macros: Default::default(),
+                                    turbo: Vec::new(),
                                     protected: false,
                                 });
                             }
@@ -162,6 +163,7 @@ pub fn parse_presets(text: &str, file: &str) -> ParsedPresets {
                             entries: Vec::new(),
                             chords: Vec::new(),
                             macros: Default::default(),
+                            turbo: Vec::new(),
                             protected: false,
                         }),
                         Err(reason) => warnings.push(Warning::file_level(

@@ -31,6 +31,12 @@ pub enum ConfigError {
          chord that starts a sequence is not implemented (docs/INPUT-TRANSFORMS.md §1c)"
     )]
     GuardedMacroTrigger(String),
+    #[error(
+        "'macro.{0}' cannot carry `turbo_hz`: a macro repeats by saying `repeat = \"turbo\"` in \
+         its own [macros.{0}] table, and a second spelling for the same thing would make \
+         \"which one runs\" something a reader has to remember (docs/INPUT-TRANSFORMS.md §3)"
+    )]
+    TurboOnMacroTrigger(String),
     #[error("unknown device alias '{0}' (no [[device]] entry has this alias)")]
     UnknownDeviceAlias(String),
     #[error(transparent)]

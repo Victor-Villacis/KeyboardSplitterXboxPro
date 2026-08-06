@@ -146,6 +146,15 @@ pub struct MapperSlot {
     /// still true (and still worth showing) when nothing answers the pipe.
     #[serde(default)]
     pub backup: Option<String>,
+    /// Canonical function name → its AUTO-FIRE rate in hertz, as authored
+    /// (docs/INPUT-TRANSFORMS.md §3). Absent = the control does not auto-fire,
+    /// which is every control of every preset written before turbo existed.
+    ///
+    /// Keyed by FUNCTION, not by key, because that is what turbo is a property
+    /// of: several keys on one control share one clock, so there is exactly
+    /// one rate per row of the legend.
+    #[serde(default)]
+    pub turbo: std::collections::BTreeMap<String, u32>,
 }
 
 /// The macro editor's read side: every `[macros.<name>]` table of ONE preset,
@@ -206,6 +215,18 @@ pub struct MacroView {
     pub retrigger: String,
     /// `"none"` | `"any-input"` | `"opposing"`.
     pub interrupt: String,
+    /// `"once"` | `"while-held"` | `"turbo"` — what the END of a run does
+    /// while the trigger is still held (docs/INPUT-TRANSFORMS.md §1c).
+    #[serde(default)]
+    pub repeat: String,
+    /// The turbo rate as AUTHORED, in full cycles a second. Exactly one of
+    /// this and `gap_ms` is set in a valid file; the editor shows whichever
+    /// the file used rather than converting behind the author's back.
+    #[serde(default)]
+    pub turbo_hz: Option<u32>,
+    /// The same number said the other way: the neutral window BETWEEN runs.
+    #[serde(default)]
+    pub gap_ms: Option<u32>,
     /// Key names that START this macro (the `macro.<name>` rows in
     /// `[bindings]`). Many keys → one macro is native, like any binding.
     #[serde(default)]

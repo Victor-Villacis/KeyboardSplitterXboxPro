@@ -1473,14 +1473,17 @@ struct Limits {
 /// up when the first deadline is armed and comes down when the last one clears
 /// — and `Drop` puts it back on every exit path, panic included, so no ksx
 /// crash can leave the system timer raised.
+/// `pub(crate)` so `ksx macro trace` raises it the same way, from the same
+/// code: a tracer measuring the scheduler under a coarser timer than the daemon
+/// runs would be measuring the wrong machine.
 #[derive(Default)]
-struct TimerResolution {
+pub(crate) struct TimerResolution {
     raised: bool,
 }
 
 impl TimerResolution {
     /// `wanted` is "a macro is armed right now".
-    fn set(&mut self, wanted: bool) {
+    pub(crate) fn set(&mut self, wanted: bool) {
         if wanted == self.raised {
             return;
         }

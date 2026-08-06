@@ -390,6 +390,7 @@ mod tests {
             ],
             chords: Vec::new(),
             macros: Default::default(),
+            turbo: Vec::new(),
             protected: false,
         }
     }
@@ -475,6 +476,7 @@ mod tests {
             ],
             chords: Vec::new(),
             macros: Default::default(),
+            turbo: Vec::new(),
             protected: false,
         };
         let chords = generate(&preset, Socd::UpPriority);
@@ -512,6 +514,7 @@ mod tests {
             ],
             chords: Vec::new(),
             macros: Default::default(),
+            turbo: Vec::new(),
             protected: false,
         };
         let chords = generate(&preset, Socd::Neutral);
@@ -553,6 +556,7 @@ mod tests {
             ],
             chords: Vec::new(),
             macros: Default::default(),
+            turbo: Vec::new(),
             protected: false,
         };
         let chords = generate(&preset, Socd::UpPriority);
@@ -588,6 +592,7 @@ mod tests {
             ],
             chords: Vec::new(),
             macros: Default::default(),
+            turbo: Vec::new(),
             protected: false,
         };
         assert!(opposing_pairs(&preset).is_empty());
@@ -634,6 +639,7 @@ mod tests {
             ],
             chords: Vec::new(),
             macros: Default::default(),
+            turbo: Vec::new(),
             protected: false,
         };
         let pairs = opposing_pairs(&preset);

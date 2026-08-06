@@ -2,7 +2,7 @@
 //! `legacy/KeyboardSplitter/Presets/Preset.cs`.
 
 use crate::key::Key;
-use crate::macros::{Macro, MacroTrigger};
+use crate::macros::{Macro, MacroTrigger, MIN_STEP_MS, TURBO_MAX_HZ};
 use crate::pad::{Axis, DpadDirection, Trigger, XButton, AXIS_MAX, AXIS_MIN};
 
 /// One preset entry: a key drives one xbox function.
@@ -118,6 +118,117 @@ impl Chord {
     }
 }
 
+/// **Auto-fire on a plain binding** (docs/INPUT-TRANSFORMS.md §3).
+///
+/// Turbo used to be reachable only as [`crate::Repeat::Turbo`] on a macro,
+/// which meant "make A auto-fire" cost a named sequence, a step list and a
+/// scheduler entry per step. This is the cheap spelling: a rate written on the
+/// binding row itself.
+///
+/// ```toml
+/// [bindings]
+/// A = { key = "G", turbo_hz = 12 }   # hold G -> A auto-fires at 12 Hz
+/// ```
+///
+/// # Turbo is a property of the OUTPUT, not of the key
+///
+/// The file is keyed by function name, so one row — and therefore one rate —
+/// exists per endpoint, and the model matches: [`Preset::turbo`] maps a
+/// [`Binding`] to its rate. Three consequences, all of them the ones a player
+/// would guess:
+///
+/// - **Multi-bind** (`A = [{ key = "G", turbo_hz = 12 }, "H"]`) is ONE clock.
+///   Holding either key runs it, holding both runs it once, and it stops when
+///   the last one comes up — the all-keys-up rule, unchanged. Two keys cannot
+///   phase-fight over one button because there is only ever one phase.
+/// - **Chords compose** (`rt = { key = "A", when = ["B"], turbo_hz = 8 }`). The
+///   guard decides whether the chord is *driving*; turbo decides what the
+///   endpoint does while it is. Guard falls → the chord stops driving → the
+///   turbo stops and the endpoint releases, in the same delta batch.
+/// - **Macro steps are exempt.** A step that holds a turbo'd endpoint drives it
+///   flat for the step's duration. A macro already owns a timeline; running its
+///   step through a second clock would make the sequence unreproducible.
+///
+/// # The rate is a promise about SAMPLING, not about hertz
+///
+/// One cycle is a press AND a release, and each half must be visible to a 60 Hz
+/// poller ([`MIN_STEP_MS`]) or it never happened (§0.2). So the authored rate is
+/// clamped to [`TURBO_MAX_HZ`] and then each half is floored, which is why
+/// [`TurboBinding::effective_hz`] is the number worth printing rather than the
+/// one that was typed.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct TurboBinding {
+    /// The endpoint that auto-fires.
+    pub binding: Binding,
+    /// Requested full cycles (press + release) per second, as authored.
+    /// Clamped on use, never on the way in: a file keeps the number it wrote so
+    /// validation can say both it and the effective rate.
+    pub hz: u32,
+}
+
+impl TurboBinding {
+    pub const fn new(binding: Binding, hz: u32) -> Self {
+        Self { binding, hz }
+    }
+
+    /// The authored rate after the sampling ceiling, and never zero (a
+    /// `turbo_hz = 0` is a file that meant "off", not a division by zero —
+    /// validation names it and the engine gives it the slowest legal cycle).
+    pub const fn clamped_hz(self) -> u32 {
+        if self.hz < 1 {
+            1
+        } else if self.hz > TURBO_MAX_HZ {
+            TURBO_MAX_HZ
+        } else {
+            self.hz
+        }
+    }
+
+    /// How long the endpoint is PRESSED in one cycle, in milliseconds.
+    ///
+    /// Half the cycle, floored at [`MIN_STEP_MS`]: a press the game never
+    /// samples is not a press.
+    pub const fn on_ms(self) -> u32 {
+        let half = (1_000 / self.clamped_hz()).div_ceil(2);
+        if half < MIN_STEP_MS {
+            MIN_STEP_MS
+        } else {
+            half
+        }
+    }
+
+    /// How long it is RELEASED, same floor and same reason: a released window
+    /// nobody samples reads as one long hold, and the turbo silently does
+    /// nothing.
+    pub const fn off_ms(self) -> u32 {
+        let cycle = 1_000 / self.clamped_hz();
+        let rest = cycle.saturating_sub(self.on_ms());
+        if rest < MIN_STEP_MS {
+            MIN_STEP_MS
+        } else {
+            rest
+        }
+    }
+
+    /// Press plus release — the cycle the engine actually runs.
+    pub const fn cycle_ms(self) -> u32 {
+        self.on_ms() + self.off_ms()
+    }
+
+    /// The rate this binding ACTUALLY delivers, in hertz, rounded to nearest.
+    pub const fn effective_hz(self) -> u32 {
+        let cycle = self.cycle_ms();
+        (1_000 + cycle / 2) / cycle
+    }
+
+    /// Was the authored rate not deliverable? Returns `(asked, effective)` so
+    /// validation can say both numbers rather than quietly substituting one.
+    pub fn clamped(self) -> Option<(u32, u32)> {
+        let effective = self.effective_hz();
+        (effective != self.hz).then_some((self.hz, effective))
+    }
+}
+
 /// A preset's macro table: the definitions and the rows that start them
 /// (docs/INPUT-TRANSFORMS.md §1c).
 ///
@@ -190,6 +301,12 @@ pub struct Preset {
     /// (docs/INPUT-TRANSFORMS.md §1c). Empty in every preset that predates
     /// macros, which is exactly why the macro-free engine path is unchanged.
     pub macros: Macros,
+    /// Endpoints that AUTO-FIRE while something drives them
+    /// (docs/INPUT-TRANSFORMS.md §3), keyed by the output rather than by the
+    /// key — see [`TurboBinding`] for why that is the only spelling the file
+    /// format can produce. Empty in every preset that predates turbo, which is
+    /// the same regression guarantee `chords.is_empty()` gives.
+    pub turbo: Vec<TurboBinding>,
     /// Built-ins ship in code, are never saved, and cannot be edited/deleted
     /// (legacy `ImuttablePresets` semantics).
     pub protected: bool,
@@ -198,6 +315,20 @@ pub struct Preset {
 impl Preset {
     pub const DEFAULT_NAME: &'static str = "default";
     pub const EMPTY_NAME: &'static str = "empty";
+
+    /// The turbo row for `binding`, if it auto-fires.
+    ///
+    /// One row per endpoint by construction (the file is keyed by function), so
+    /// this is a lookup rather than a fold; a file that somehow says it twice
+    /// gets the first and a named issue from validation.
+    pub fn turbo_for(&self, binding: Binding) -> Option<TurboBinding> {
+        self.turbo.iter().copied().find(|t| t.binding == binding)
+    }
+
+    /// The authored rate for `binding`, if it auto-fires.
+    pub fn turbo_hz(&self, binding: Binding) -> Option<u32> {
+        self.turbo_for(binding).map(|t| t.hz)
+    }
 
     /// The protected `default` preset, ported entry-for-entry from legacy
     /// `Preset.CreateDefaultPreset()` including its custom-function quirk: the
@@ -286,6 +417,7 @@ impl Preset {
             entries,
             chords: Vec::new(),
             macros: Default::default(),
+            turbo: Vec::new(),
             protected: true,
         }
     }
@@ -327,6 +459,7 @@ impl Preset {
             entries,
             chords: Vec::new(),
             macros: Default::default(),
+            turbo: Vec::new(),
             protected: true,
         }
     }

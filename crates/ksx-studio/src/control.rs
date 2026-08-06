@@ -62,6 +62,12 @@ pub trait ControlSource: Send + Sync {
     /// wire shape at all there. Rather than write the first key and silently
     /// drop the rest — the Synapse-4 sin MAPPER-UX commandment 7 bans — it
     /// refuses in words that name the missing field.
+    /// `turbo_hz` is the AUTO-FIRE rate (docs/INPUT-TRANSFORMS.md §3), and it
+    /// has the same three states the `map` verb gives it: `None` leaves the
+    /// control's existing rate alone (so "Add another key" cannot silently
+    /// switch an auto-fire off), `Some(0)` clears it, `Some(n)` sets it. The
+    /// default implementation below has nowhere to put it and says so rather
+    /// than dropping it.
     fn bind_keys(
         &self,
         preset: &str,
@@ -69,7 +75,14 @@ pub trait ControlSource: Send + Sync {
         keys: &[String],
         force: bool,
         reload: bool,
+        turbo_hz: Option<u32>,
     ) -> BindOutcome {
+        if turbo_hz.is_some() {
+            return BindOutcome::failed(
+                "this control source cannot set a turbo rate (the `map` verb's `turbo_hz` \
+                 field is what carries it)",
+            );
+        }
         let one = |key: Option<String>| BindRequest {
             preset: preset.to_owned(),
             function: function.to_owned(),
@@ -137,6 +150,17 @@ pub struct MacroWrite {
     /// `"none"` | `"any-input"` | `"opposing"`.
     #[serde(default)]
     pub interrupt: String,
+    /// `"once"` | `"while-held"` | `"turbo"` — blank means the default
+    /// (`once`), as the file's own omitted-field rule does.
+    #[serde(default)]
+    pub repeat: String,
+    /// The turbo rate, in the unit the author chose. Exactly one of these two,
+    /// never both: they are two spellings of one number, and the daemon
+    /// refuses a table that gives both rather than picking a winner.
+    #[serde(default)]
+    pub turbo_hz: Option<u32>,
+    #[serde(default)]
+    pub gap_ms: Option<u32>,
     /// DELETE the table (and the `macro.<name>` trigger rows that would
     /// otherwise dangle) instead of writing it. An explicit flag on purpose:
     /// an empty `steps` list is a REFUSAL, so an editor that lost its grid
@@ -289,6 +313,15 @@ pub struct BindOutcome {
     /// own answer, so a caller can say it without waiting for the next poll.
     #[serde(default)]
     pub also_drives: Vec<String>,
+    /// AUTO-FIRE (docs/INPUT-TRANSFORMS.md §3): the rate this control now
+    /// holds, as authored, and the rate it will actually DELIVER. The second
+    /// is the one worth showing — a press AND a release must each survive a
+    /// 60 Hz poll, so a request above ~15 Hz cannot be met however it is
+    /// spelled, and the mapper says so rather than echoing the number back.
+    #[serde(default)]
+    pub turbo_hz: Option<u32>,
+    #[serde(default)]
+    pub turbo_effective_hz: Option<u32>,
     pub reloaded: bool,
 }
 
@@ -423,14 +456,14 @@ mod tests {
         }
 
         let control = Recorder::default();
-        assert!(control.bind_keys("P1", "A", &[], false, true).ok);
+        assert!(control.bind_keys("P1", "A", &[], false, true, None).ok);
         assert!(
             control
-                .bind_keys("P1", "A", &["G".to_owned()], false, true)
+                .bind_keys("P1", "A", &["G".to_owned()], false, true, None)
                 .ok
         );
         let two = vec!["S".to_owned(), "Enter".to_owned()];
-        let refused = control.bind_keys("P1", "A", &two, false, true);
+        let refused = control.bind_keys("P1", "A", &two, false, true, None);
         assert!(!refused.ok);
         let error = refused.error.unwrap();
         assert!(error.contains("S · Enter"), "{error}");

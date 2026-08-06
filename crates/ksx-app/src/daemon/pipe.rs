@@ -569,6 +569,12 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
         move_from: field("move_from"),
         when: list("when"),
         unless: list("unless"),
+        // AUTO-FIRE: absent means "not asked about" and leaves the rate alone;
+        // 0 clears it (docs/INPUT-TRANSFORMS.md §3).
+        turbo_hz: request
+            .get("turbo_hz")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|hz| u32::try_from(hz).ok()),
     };
     match (deps.map)(&spec) {
         Ok(applied) => {
@@ -587,6 +593,11 @@ fn handle_map(request: &serde_json::Value, deps: &PipeDeps, settle: Duration) ->
                 "keys": applied.keys,
                 "when": applied.when,
                 "unless": applied.unless,
+                // AUTO-FIRE (§3): the rate the control now holds and the rate
+                // it will actually deliver. Studio shows the second one on the
+                // legend row, because it is the one the game will see.
+                "turbo_hz": applied.turbo_hz,
+                "turbo_effective_hz": applied.turbo_effective_hz,
                 // MULTI-BIND: the other controls of this preset this key also
                 // drives. Studio renders it as the legend's "also A · B"
                 // badges (ksx-studio/src/render_map.rs `shared_labels`), which
@@ -1571,6 +1582,11 @@ mod tests {
             moved_from: None,
             overridden: Vec::new(),
             flash: Vec::new(),
+            turbo_hz: spec.turbo_hz.filter(|hz| *hz > 0),
+            turbo_effective_hz: spec.turbo_hz.filter(|hz| *hz > 0).map(|hz| {
+                ksx_core::TurboBinding::new(ksx_core::Binding::Button(ksx_core::XButton::A), hz)
+                    .effective_hz()
+            }),
         })
     }
 

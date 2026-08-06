@@ -34,6 +34,9 @@ pub enum Action {
         when: Vec<String>,
         /// CHORD: keys that must NOT be held (`--unless LeftShift`).
         unless: Vec<String>,
+        /// AUTO-FIRE: `--turbo-hz N`. `None` leaves any existing rate alone,
+        /// `Some(0)` clears it (docs/INPUT-TRANSFORMS.md §3).
+        turbo_hz: Option<u32>,
     },
     Restore(RestoreKind),
     /// Unbind every function of the preset (a timestamped backup first).
@@ -66,6 +69,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
             move_from,
             when,
             unless,
+            turbo_hz,
         } => mapping::apply(
             &store,
             &MapSpec {
@@ -79,6 +83,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                 move_from,
                 when,
                 unless,
+                turbo_hz,
             },
         )
         .map(|applied| {
@@ -97,6 +102,11 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                 "when": applied.when,
                 "unless": applied.unless,
                 "chord": applied.chord(),
+                // AUTO-FIRE: what the control now holds, and what it will
+                // actually deliver — both, always, because the second is
+                // capped by what a 60 Hz poller can see (§3).
+                "turbo_hz": applied.turbo_hz,
+                "turbo_effective_hz": applied.turbo_effective_hz,
                 // MULTI-BIND: the other controls of this preset the key drives
                 // now. Information, never an error — the write succeeded and
                 // none of them was touched (docs/INPUT-TRANSFORMS.md §1a).

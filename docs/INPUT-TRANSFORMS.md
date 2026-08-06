@@ -402,6 +402,20 @@ turbo_hz = 10          # or: gap_ms = 50
 steps = [{ hold = ["A"], frames = 2 }]
 ```
 
+**In Studio (2026-08-06).** The macro card now edits `repeat` and its rate
+beside `on_release` / `retrigger` / `interrupt`, with the same one-line
+explanations and the same LIVE MATH the duration field got: the card prints
+"Requested 30 Hz → effective ~4 Hz, because the sequence itself is 200 ms long
+and the neutral gap between runs is 33 ms" while the number is being typed,
+rather than letting Save be how the author finds out. The rate box carries
+both spellings (`turbo_hz` / `gap_ms`) and switching the unit MOVES the value,
+because a table giving both is refused. Turning `repeat` to `turbo` seeds a
+deliverable rate rather than writing a table the loader would reject; turning
+it back keeps the number, which is the file format's own rule.
+
+For "make THIS button auto-fire" — one number, no sequence — the answer is
+§3a's per-binding turbo, not this.
+
 #### Everything releases on the way out
 
 A macro STEP is an ordinary **holder**: `holder_bindings[first + i]` is step
@@ -478,7 +492,9 @@ surface can still *read* everything. A mapper UI for macros is a later pass.
 
 #### What did not ship
 
-- **No macro in the Studio mapper UI** — CLI + TOML only for now.
+- ~~**No macro in the Studio mapper UI**~~ — shipped: the `/map` page has the
+  piano-roll editor, and since 2026-08-06 the `repeat` policy and its rate
+  with it.
 - **No chord that starts a macro.** `macro.x = { key = "P", when = ["Q"] }`
   is refused rather than half-implemented; the guard would have to compose
   with consumption, and nothing asked for it yet.
@@ -507,9 +523,23 @@ Ordered by value on *this* machine, not by novelty.
    Escape-to-exit, F1 menus, coin insert, save-state, volume. Today ksx can
    only produce pad state, so admin actions have no home. This is arguably
    more urgent than macros: it is what makes the panel *self-sufficient*.
-3. **Turbo / autofire.** Shmups and NES-era games expect it. Hold → repeat
-   at N Hz, or toggle-turbo. Bounded by §0.2: above ~30 Hz it aliases into
-   nonsense at 60 Hz polling; the UI should cap and explain, not offer 100.
+3. ~~**Turbo / autofire.**~~ **SHIPPED 2026-08-06** — see §3a. Victor asked
+   it as a question about the UI ("where is the option to make buttons
+   turbo?"), and the answer was that there wasn't one: turbo existed only as
+   `repeat = "turbo"` on a MACRO, which is a named sequence, a step list and a
+   scheduler entry per step for what should be one number on a binding row.
+   It is now a property of the BINDING:
+
+   ```toml
+   [bindings]
+   A = { key = "G", turbo_hz = 12 }   # hold G -> A auto-fires at 12 Hz
+   ```
+
+   The cap turned out to be the interesting part, and it is arithmetic rather
+   than policy — exactly as predicted here. `TURBO_MAX_HZ` is 30 because one
+   cycle is a press AND a release, and the rate a preset actually GETS is
+   lower still because each half is floored at `MIN_STEP_MS`: ~15 Hz is the
+   real ceiling. Every surface says both numbers.
 4. **Tap vs hold (dual-role keys).** Tap = A, hold = LT. Doubles a small
    panel. Carries the same latency tax as chords — same honesty rule.
 5. **Digital → analog shaping.** An arcade stick is 8-way digital; many 3D
@@ -610,6 +640,8 @@ transform stage's job (§3), not a new binding shape, so it waits for it.
 Note that some tournament rulesets restrict last-wins anyway; the two
 modes that shipped are the ones those rules ask for.
 
+## 3. The transform stage — and its first tenant, per-binding TURBO
+
 Everything above is one of two additions to a currently-stateless mapping:
 
 - **Time** (chords, tap-hold, macros, turbo, double-tap, ramps)
@@ -635,6 +667,134 @@ them. Non-negotiable properties:
 - **Config stays hand-editable TOML** and every transform is expressible
   in `ksx map`-style verbs, so the AI/CLI surface keeps parity with the
   GUI (CONTROL-SURFACE rule).
+
+### 3a. Per-binding turbo — SHIPPED (2026-08-06)
+
+The first thing to live in the transform stage, and it needed none of the
+stage's machinery beyond the clock the macro scheduler already runs. Catalog
+item 3, answered.
+
+#### The file
+
+```toml
+[bindings]
+A  = { key = "G", turbo_hz = 12 }               # hold G -> A at 12 Hz
+B  = [{ key = "N", turbo_hz = 8 }, "M"]         # two keys, ONE 8 Hz clock
+rt = { key = "A", when = ["B"], turbo_hz = 6 }  # auto-fire, but only in chord
+```
+
+A guardless `{ key = … }` table is **not** a chord: `ksx-config` normalizes it
+to an ordinary entry plus a turbo row, so `A = { key = "G" }` still means
+exactly `A = "G"` and consumes nothing.
+
+#### Turbo is a property of the OUTPUT, not of the key
+
+This is the whole model, and it is forced by the file format rather than
+chosen: `[bindings]` is keyed by FUNCTION, so one row — and therefore one
+rate — exists per endpoint. `ksx_core::Preset::turbo` is a
+`Vec<TurboBinding>` mapping a `Binding` to its rate. Three consequences, all
+of them the ones a player would guess:
+
+- **Multi-bind is ONE clock.** Holding either key runs it, holding both runs
+  it once, and it stops when the last one comes up — the all-keys-up rule,
+  one level up. Two keys *cannot* phase-fight over one button, because there
+  is only ever one phase.
+- **Chords compose.** The GUARD decides whether the chord is driving the
+  endpoint; the TURBO decides what the endpoint does while it is. Guard falls
+  → the chord stops driving → the turbo stops and the endpoint releases, in
+  the same delta batch.
+- **Macro steps are exempt.** A step that holds a turbo'd endpoint drives it
+  FLAT for the step's duration. A macro already owns a timeline; running its
+  steps through a second clock would make the sequence unreproducible. (A
+  `turbo_hz` on a `macro.<name>` trigger row is refused outright — a macro
+  repeats by saying `repeat = "turbo"` in its own table, and two spellings for
+  one thing would make "which one runs" something a reader has to remember.)
+
+#### The rate is a promise about SAMPLING (§0.2 again)
+
+One cycle is a press AND a release, and each half must be visible to a 60 Hz
+poller or it never happened. So:
+
+- the authored rate is clamped to `TURBO_MAX_HZ` (30) — *a press+release costs
+  two samples at 60 Hz*;
+- each half is then floored at `MIN_STEP_MS` (33 ms), which is why **~15 Hz is
+  the fastest rate anything can actually be given**;
+- `TurboBinding::effective_hz` is the number worth printing, and every surface
+  prints it: `ksx map` says "asked 60 Hz, effective ~15 Hz", validation raises
+  the advisory `BindingTurboClamped` with both numbers, and Studio's legend
+  badge shows `turbo ~15 Hz` rather than echoing the request back.
+
+12 Hz is the doc's worked example because it is deliverable exactly: an 83 ms
+cycle splits into 42 ms pressed and 41 ms released.
+
+#### The engine: one more holder, no second clock
+
+A turbo endpoint is a **holder** like a key, a chord or a macro step — it
+presses and releases through the same `apply_scan`, joins the all-keys-up and
+opposite-axis tables, and batches its deltas with everything else. What makes
+it turbo is only that its held bit is `running && on`:
+
+- **sources** — the keys and chords that used to drive the endpoint directly.
+  `EngineTables::build` REWIRES them: the endpoint is removed from their
+  holder lists and they become the set that gates the clock. That rewiring is
+  the entire feature, done once, off the hot path, which is why the hot path
+  never asks "is this binding turbo".
+- **phase** — flipped by a deadline on **the same ordered timer list the macro
+  scheduler uses**, tagged `TimerKind::Turbo`. Not a second clock: a second
+  list would mean a second answer to `next_deadline`, a second ordering rule,
+  and two ways for a wake to be late.
+
+Nothing is allocated per event: the timer list is sized at build time to the
+total macro + turbo count, and a phase flip is one `mark` into a preallocated
+dirty list.
+
+The first press is on the DOWN EDGE, not half a cycle later; a release is
+immediate, mid-press — a player who let go does not owe the game the rest of
+a cycle. Keyboard autorepeat is not a new press (§1c's edge rule), so a held
+key cannot restart the cycle and starve its own released half.
+
+#### Everything releases on the way out
+
+The same four exits macros have, each with its own test: session stop /
+emergency escape (`Engine::cancel_macros`), device yank
+(`Engine::release_device`), binding hot-swap (`Engine::swap_tables`), and
+`Engine::reset`. A turbo resting in its RELEASED half holds nothing but is
+still armed, so it is cancelled too — leaving it would press a button on a pad
+the player has just been disconnected from.
+
+#### Surfaces
+
+```
+ksx map --preset "IPAC P1" --function A --key G --turbo-hz 12
+ksx map --preset "IPAC P1" --function A --key G --turbo-hz 0    # off
+```
+
+Omitting the flag leaves an existing rate alone (rebinding an auto-fire button
+must not silently switch the auto-fire off); `--clear` clears the rate with
+the keys. The pipe `map` verb takes the same `"turbo_hz"` field with the same
+three states, and Studio's mapper shows the effective rate on the legend row
+with Set/No-turbo beside Replace / Add another key / Clear in the learn
+dialog (and a `turbo_hz` box + `Turbo` submit on the row form, for a page with
+no JavaScript).
+
+#### Validation
+
+- `BindingTurboClamped` — advisory: the rate is not deliverable as written,
+  and both numbers are stated. The engine still runs the closest honest thing.
+- `ConflictingTurboRates` — refused: two rows on one function giving different
+  rates. Turbo belongs to the output, so picking a winner by file order is
+  exactly the silent decision this project does not make.
+- `TurboOnConsume` — advisory: a `consume` row drives no endpoint at all, so
+  there is nothing for a rate to auto-fire.
+- `GuardedMacroTurbo` — refused: `turbo_hz` on a `macro.<name>` trigger row.
+
+#### What did not ship
+
+- **Toggle-turbo** (press once, it auto-fires until pressed again). It needs
+  the sticky/latch vocabulary from catalog item 8, not a second turbo mode.
+- **Turbo on a macro STEP.** Deliberate, see above.
+- **Per-key rates on one function.** The file format cannot express two, and
+  the model matching the format exactly is what makes multi-bind one clock.
 
 ## 4. Sequencing (proposed)
 

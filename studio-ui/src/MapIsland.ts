@@ -61,6 +61,11 @@ export interface MapperSlot {
   bindings: Record<string, string[]>;
   /** Newest timestamped backup label, or null when there is none. */
   backup: string | null;
+  /** AUTO-FIRE (docs/INPUT-TRANSFORMS.md §3): canonical function name → the
+   *  rate it auto-fires at, as authored. Keyed by FUNCTION because that is
+   *  what turbo is a property of — several keys on one control share ONE
+   *  clock. Absent for every preset written before turbo existed. */
+  turbo?: Record<string, number>;
 }
 
 export interface MapperSnapshot {
@@ -106,6 +111,15 @@ export interface MacroView {
   retrigger: string;
   /** "none" | "any-input" | "opposing" */
   interrupt: string;
+  /** "once" | "while-held" | "turbo" — what the END of a run does while the
+   *  trigger is still held. */
+  repeat: string;
+  /** The turbo rate as AUTHORED. Exactly one of these two in a valid file:
+   *  `turbo_hz` is how a player says it, `gap_ms` is how a frame-counter does,
+   *  and the editor keeps whichever the file used rather than converting
+   *  behind the author's back. */
+  turbo_hz: number | null;
+  gap_ms: number | null;
   /** Key names that START this macro. */
   triggers: string[];
 }
@@ -292,6 +306,14 @@ interface LegendRow {
   slot: string;
   bindcls: string;
   bindtitle: string;
+  /** AUTO-FIRE (§3). `turbo` is the badge — the EFFECTIVE rate, because a
+   *  press and a release must each survive a 60 Hz poll and a badge echoing an
+   *  undeliverable number back would be the page lying on the file's behalf.
+   *  `turboval` seeds the row form's box (no-JS path). Empty = no turbo, and
+   *  CSS hides the badge rather than the row changing shape. */
+  turbo: string;
+  turbotitle: string;
+  turboval: string;
 }
 
 /** One toast in the stack (v8). Every field is a BARE per-item read in the
@@ -485,6 +507,17 @@ const [macroSaveCls, setMacroSaveCls] = createSignal("btn btn-mini macsave off")
  *  math"). Carries the sampling floor in the SAME units, so "too short" needs
  *  no other explanation. */
 const [macroMathLine, setMacroMathLine] = createSignal("");
+/** v13: the REPEAT policy's own live math — the answer to "where is the option
+ *  to turn autorepeat on?" and, once it is on, to "why is my 30 Hz turbo not
+ *  30 Hz?". Same treatment as the duration line above: both numbers, always,
+ *  never a silent substitution. */
+const [macroTurboLine, setMacroTurboLine] = createSignal("");
+/** The rate box's value, in whichever unit the file authored — `turbo_hz` or
+ *  `gap_ms`. Blank when the macro carries no rate at all. */
+const [macroTurboValue, setMacroTurboValue] = createSignal("");
+/** The learn modal's auto-fire line: what this control does today, and what a
+ *  rate typed into the box beside it would really deliver. */
+const [modalTurboLine, setModalTurboLine] = createSignal("");
 /** The trigger block's class: inert while the preset holds no macro, because
  *  a key that starts nothing is exactly the confusion this card had. */
 const [macroTrigCls, setMacroTrigCls] = createSignal("mactrigger off");
@@ -764,6 +797,60 @@ function legendLabel(fn: string, label: string): string {
   return `${legendGroup(fn)}${label}`;
 }
 
+/** The control's authored auto-fire rate, or null. */
+export function turboHzOf(slot: MapperSlot, fn: string): number | null {
+  const hz = slot.turbo?.[fn];
+  return typeof hz === "number" ? hz : null;
+}
+
+/** Mirror of `ksx_core::TurboBinding` — the arithmetic the ENGINE runs, so the
+ *  badge and the pad cannot disagree. Pinned against the Rust side in
+ *  render_map.rs. */
+const TURBO_MAX_HZ = 30;
+
+function turboOnMs(hz: number): number {
+  const clamped = Math.min(Math.max(hz, 1), TURBO_MAX_HZ);
+  return Math.max(Math.floor((Math.floor(1000 / clamped) + 1) / 2), MIN_STEP_MS);
+}
+
+function turboOffMs(hz: number): number {
+  const clamped = Math.min(Math.max(hz, 1), TURBO_MAX_HZ);
+  return Math.max(Math.floor(1000 / clamped) - turboOnMs(hz), MIN_STEP_MS);
+}
+
+export function effectiveTurboHz(hz: number): number {
+  const cycle = turboOnMs(hz) + turboOffMs(hz);
+  return Math.floor((1000 + Math.floor(cycle / 2)) / cycle);
+}
+
+function turboTag(slot: MapperSlot, fn: string): string {
+  const hz = turboHzOf(slot, fn);
+  if (hz === null) return "";
+  const effective = effectiveTurboHz(hz);
+  return effective === hz ? `turbo ${hz} Hz` : `turbo ~${effective} Hz`;
+}
+
+function turboTitle(slot: MapperSlot, fn: string): string {
+  const hz = turboHzOf(slot, fn);
+  if (hz === null) {
+    return (
+      `${fn} does not auto-fire — hold its key and it stays down. "Turbo" in the learn ` +
+      "dialog (or the box in this row without JavaScript) gives it a rate."
+    );
+  }
+  const effective = effectiveTurboHz(hz);
+  let line =
+    `${fn} AUTO-FIRES while any of its keys is held: ${turboOnMs(hz)} ms pressed, ` +
+    `${turboOffMs(hz)} ms released, one clock however many keys point at it.`;
+  if (effective !== hz) {
+    line +=
+      ` The file asks for ${hz} Hz and gets about ${effective} Hz: a press AND a release ` +
+      `must each survive a 60 Hz poll (${MIN_STEP_MS} ms), so ~15 Hz is the fastest ` +
+      "anything can be delivered.";
+  }
+  return line;
+}
+
 function legendRowsFor(slot: MapperSlot): LegendRow[] {
   const table = isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
   const shared = sharedLabels(slot);
@@ -837,6 +924,9 @@ function legendRowsFor(slot: MapperSlot): LegendRow[] {
       slot: String(slot.number),
       bindcls: canWrite ? "lbind nojs" : "lbind nojs off",
       bindtitle: `bind ${fn} (${legendLabel(fn, label)})`,
+      turbo: turboTag(slot, fn),
+      turbotitle: turboTitle(slot, fn),
+      turboval: turboHzOf(slot, fn) === null ? "" : String(turboHzOf(slot, fn)),
     };
   });
 }
@@ -1110,6 +1200,38 @@ export function showLearnMode(add: boolean, bindingText: string | null): void {
       : add
         ? `currently ${bindingText} — the next key is ADDED to it (either will press this control)`
         : `currently ${bindingText} — the next key REPLACES it`,
+  );
+}
+
+/** The modal's AUTO-FIRE line for one control: what it does today, said in the
+ *  rate the game will really see. map.ts calls it when the modal opens, and
+ *  again after a Set/No-turbo write lands, so the sentence is never a claim
+ *  about a file that has since changed. */
+export function showLearnTurbo(fn: string | null): void {
+  const slot = currentSlot();
+  if (slot === null || fn === null) {
+    setModalTurboLine("");
+    return;
+  }
+  const hz = turboHzOf(slot, fn);
+  if (hz === null) {
+    setModalTurboLine(
+      "This control does not auto-fire: hold its key and it stays down. Type a number of " +
+        "presses a second and press \u201cSet turbo\u201d to make it fire while the key is held \u2014 " +
+        "one clock for the control, however many keys point at it. 10\u201312 Hz is the usual " +
+        "cabinet setting; above ~15 Hz nothing more gets through, because a press AND a " +
+        "release must each survive a 60 Hz poll.",
+    );
+    return;
+  }
+  const effective = effectiveTurboHz(hz);
+  setModalTurboLine(
+    effective === hz
+      ? `This control auto-fires at ${hz} Hz while any of its keys is held. ` +
+          "\u201cNo turbo\u201d (or 0) turns it off."
+      : `This control asks for ${hz} Hz and actually fires at about ${effective} Hz \u2014 a ` +
+          "press AND a release must each survive a 60 Hz poll, so ~15 Hz is the ceiling. " +
+          "\u201cNo turbo\u201d (or 0) turns it off.",
   );
 }
 
@@ -1485,6 +1607,55 @@ function frameMath(step: MacroStepView | undefined, rate: number): string {
   return `${ms} ms = ${((ms * rate) / 1000).toFixed(1)} frames @ ${hz(rate)}. ${floor}`;
 }
 
+/** The macro's REPEAT arithmetic, in words — the same treatment the duration
+ *  field got, and for the same reason: `turbo_hz = 30` on a 50 ms sequence is
+ *  not 30 Hz and never could be. Mirrored in render_map.rs `turbo_math`. */
+function turboMath(mac: MacroView | null): string {
+  if (mac === null) return "";
+  if (mac.repeat === "while-held") {
+    return (
+      "Holding the trigger starts the sequence again the instant it ends, with NO gap " +
+      "between runs — the right shape for a MOTION whose last step flows into its first, " +
+      "and the wrong one for auto-fire (a game reads two touching runs as one long hold)."
+    );
+  }
+  if (mac.repeat !== "turbo") {
+    return (
+      "One run per press. Holding the trigger changes nothing, which is what stops a " +
+      "special move turning into a machine gun when a panel switch bounces."
+    );
+  }
+  const run = macroTotalMs(mac);
+  let asked: string;
+  let wanted: number;
+  if (mac.turbo_hz !== null) {
+    asked = `Requested ${mac.turbo_hz} Hz`;
+    const hz = Math.min(Math.max(mac.turbo_hz, 1), TURBO_MAX_HZ);
+    wanted = Math.max(Math.floor((1000 + Math.floor(hz / 2)) / hz) - run, 0);
+  } else if (mac.gap_ms !== null) {
+    asked = `Requested a ${mac.gap_ms} ms gap`;
+    wanted = mac.gap_ms;
+  } else {
+    asked = "No rate given — a turbo with no rate is refused by the loader";
+    wanted = MIN_STEP_MS;
+  }
+  const raised = wanted < MIN_STEP_MS;
+  const gap = raised ? MIN_STEP_MS : wanted;
+  const cycle = run + gap;
+  if (cycle === 0) return "This macro has no steps, so there is nothing to repeat.";
+  const effective = Math.floor((1000 + Math.floor(cycle / 2)) / cycle);
+  const why = raised
+    ? " (raised to the sampling floor — a gap the game never samples is not a gap, it " +
+      "reads as one long hold)"
+    : "";
+  return (
+    `${asked} → effective ~${effective} Hz, because the sequence itself is ${run} ms long ` +
+    `and the neutral gap between runs is ${gap} ms${why}: one full press/release cycle ` +
+    `takes ${cycle} ms. Each half has to survive a 60 Hz poll (${MIN_STEP_MS} ms), which ` +
+    "is what caps this — the rate is capped, never refused."
+  );
+}
+
 const MACRO_RULE_LINE =
   "Amber steps are shorter than ~2 poll intervals (33 ms at 60 Hz), which is the shortest " +
   "thing a game can be relied on to see — a 5 ms step is not unreliable, it is invisible. " +
@@ -1505,6 +1676,11 @@ export function newMacroBody(name: string): MacroView {
     on_release: "finish",
     retrigger: "ignore",
     interrupt: "none",
+    // A new macro runs ONCE. Auto-fire is asked for by name, never a default
+    // a starter body hands somebody who did not ask for it.
+    repeat: "once",
+    turbo_hz: null,
+    gap_ms: null,
     triggers: [],
   };
 }
@@ -1795,10 +1971,75 @@ export function macroSetPolicy(field: string, value: string): void {
     (value === "none" || value === "any-input" || value === "opposing")
   ) {
     mac.interrupt = value;
+  } else if (
+    field === "repeat" &&
+    (value === "once" || value === "while-held" || value === "turbo")
+  ) {
+    mac.repeat = value;
+    // Turning turbo ON with no rate would write a table the loader refuses
+    // ("is `repeat = \"turbo\"` but gives no rate"), so the editor seeds one
+    // that is actually deliverable rather than letting Save be the way the
+    // author finds out. Turning it OFF keeps the number: flipping the policy
+    // back and forth must not lose it, which is the file format's own rule.
+    if (value === "turbo" && mac.turbo_hz === null && mac.gap_ms === null) {
+      mac.turbo_hz = 10;
+    }
   } else {
     return;
   }
   macroEdited();
+}
+
+/** The turbo RATE, in the unit the box is currently showing.
+ *
+ *  Exactly one of `turbo_hz`/`gap_ms` survives, always: they are two spellings
+ *  of one number, and a table that gives both is refused — so switching the
+ *  unit MOVES the value rather than adding a second field. A blank box clears
+ *  the rate entirely (which validation then names, if the policy is turbo). */
+export function macroSetTurboRate(value: string, unit: string): void {
+  const mac = macroDraft;
+  if (!mac) return;
+  const text = value.trim();
+  if (text === "") {
+    mac.turbo_hz = null;
+    mac.gap_ms = null;
+    macroEdited();
+    return;
+  }
+  const n = Number(text);
+  if (!Number.isFinite(n) || n < 0) return;
+  const rounded = Math.round(n);
+  if (unit === "gap_ms") {
+    mac.turbo_hz = null;
+    mac.gap_ms = rounded;
+  } else {
+    mac.turbo_hz = rounded;
+    mac.gap_ms = null;
+  }
+  macroEdited();
+}
+
+/** The rate box's value, for map.ts (a value attribute cannot be written by a
+ *  binding once the user has typed into the box). */
+export function macroTurboBoxValue(): string {
+  const mac = macroDraft;
+  if (!mac) return "";
+  if (mac.turbo_hz !== null) return String(mac.turbo_hz);
+  if (mac.gap_ms !== null) return String(mac.gap_ms);
+  return "";
+}
+
+/** Which unit the rate box is showing — map.ts writes it onto the <select>,
+ *  which an attribute binding cannot do (same seam as `macroStepUnit`). */
+export function macroRateUnit(): string {
+  return macroDraft?.gap_ms !== null && macroDraft?.gap_ms !== undefined
+    ? "gap_ms"
+    : "turbo_hz";
+}
+
+/** The repeat policy the selects should show. */
+export function macroRepeatValue(): string {
+  return macroDraft?.repeat || "once";
 }
 
 /** The draft's TRIGGER keys, for a rename that must not lose them. */
@@ -1817,7 +2058,11 @@ function macroColsFor(slot: MapperSlot | null): MacroCol[] {
   return table.map(([fn, label, idk]) => ({
     fn,
     id: label,
-    idcls: `maccolid id-${idk}`,
+    // UNIFORM, deliberately: a header row of coloured discs at column width is
+    // noise rather than information. The identity colours earn their place on
+    // the controller art (where they map to physical buttons) and in the
+    // legend beside it — here the column is NAMED, not badged.
+    idcls: "maccolid",
     title: `${legendLabel(fn, label)} (${fn})`,
   }));
 }
@@ -1912,6 +2157,12 @@ function macroTomlFor(mac: MacroView): string {
   if (mac.on_release !== "finish") out += `on_release = ${tomlStr(mac.on_release)}\n`;
   if (mac.retrigger !== "ignore") out += `retrigger = ${tomlStr(mac.retrigger)}\n`;
   if (mac.interrupt !== "none") out += `interrupt = ${tomlStr(mac.interrupt)}\n`;
+  if (mac.repeat !== "" && mac.repeat !== "once") out += `repeat = ${tomlStr(mac.repeat)}\n`;
+  // Two spellings of one number, so exactly ONE is emitted: a block giving
+  // both is refused by the loader, and pasting one back must never be how a
+  // reader finds that out.
+  if (mac.turbo_hz !== null) out += `turbo_hz = ${mac.turbo_hz}\n`;
+  else if (mac.gap_ms !== null) out += `gap_ms = ${mac.gap_ms}\n`;
   out += "steps = [\n";
   for (const step of mac.steps) {
     const hold = step.hold.map(tomlStr).join(", ");
@@ -1995,6 +2246,8 @@ function refreshMacro(): void {
     );
     setMacroRuleLine(MACRO_RULE_LINE);
     setMacroPolicyLine("");
+    setMacroTurboLine("");
+    setMacroTurboValue("");
     setMacroTriggerLine("");
     setMacroFnName("");
     setMacroName("");
@@ -2019,7 +2272,21 @@ function refreshMacro(): void {
   );
   setMacroRuleLine(MACRO_RULE_LINE);
   setMacroPolicyLine(
-    `on release: ${mac.on_release} · retrigger: ${mac.retrigger} · interrupt: ${mac.interrupt}`,
+    `on release: ${mac.on_release} · retrigger: ${mac.retrigger} · ` +
+      `interrupt: ${mac.interrupt} · repeat: ${mac.repeat || "once"}` +
+      (mac.turbo_hz !== null
+        ? ` (${mac.turbo_hz} Hz)`
+        : mac.gap_ms !== null
+          ? ` (${mac.gap_ms} ms gap)`
+          : ""),
+  );
+  setMacroTurboLine(turboMath(mac));
+  setMacroTurboValue(
+    mac.turbo_hz !== null
+      ? String(mac.turbo_hz)
+      : mac.gap_ms !== null
+        ? String(mac.gap_ms)
+        : "",
   );
   setMacroNote(macroNoteFor(p, mac));
   setMacroTriggerLine(macroTriggerLineFor(mac));
@@ -2406,6 +2673,11 @@ export function MapIsland() {
                   // controls the same key drives, on its own line so a
                   // multi-bound row grows instead of squeezing.
                   h("span", { class: "lshare", title: l.sharetitle }, l.share),
+                  // AUTO-FIRE (§3). Its own badge on its own line, like the
+                  // shared-key one: a row that auto-fires GROWS instead of
+                  // squeezing, and a row that does not renders an empty span
+                  // the CSS collapses (never a show — ledger #13/#14).
+                  h("span", { class: "lturbo", title: l.turbotitle }, l.turbo),
                 ),
                 // ── v9: the row's own no-JS write path ──────────────────
                 // A real HTML form: pick a key, submit, the server writes it
@@ -2517,6 +2789,33 @@ export function MapIsland() {
                       title: l.cleartitle,
                     },
                     "Clear",
+                  ),
+                  // v13, no-JS parity for AUTO-FIRE. Same form, one more
+                  // destination and one more field: the number of presses a
+                  // second this control should fire at while its key is held.
+                  // `0` is off, in the same units as everything else, and the
+                  // key picker beside it is not consulted — turbo belongs to
+                  // the CONTROL, and the write keeps whatever keys it has.
+                  h("input", {
+                    class: "turboin",
+                    type: "number",
+                    name: "turbo_hz",
+                    min: "0",
+                    step: "1",
+                    value: l.turboval,
+                    placeholder: "Hz",
+                    "aria-label": l.turbotitle,
+                    title: l.turbotitle,
+                  }),
+                  h(
+                    "button",
+                    {
+                      class: "btn btn-mini",
+                      type: "submit",
+                      formaction: "/map/turbo",
+                      title: l.turbotitle,
+                    },
+                    "Turbo",
                   ),
                 ),
               ),
@@ -2882,6 +3181,65 @@ export function MapIsland() {
               "input that contradicts the macro — a direction against one the current ",
               "step holds, or a key that starts a different macro.",
             ),
+          ),
+          // ── v13: AUTOREPEAT — the option Victor went looking for ──────
+          // Same shape as the three above (a `.macsel` the generic
+          // `data-macpol` delegation already routes), plus a rate field,
+          // because "turbo" without a number is a table the loader refuses.
+          h(
+            "div",
+            { class: "macpol" },
+            h(
+              "label",
+              { class: "bindlabel macjs" },
+              "repeat",
+              h(
+                "select",
+                { class: "macsel", "data-macpol": "repeat" },
+                h("option", null, "once"),
+                h("option", null, "while-held"),
+                h("option", null, "turbo"),
+              ),
+            ),
+            h(
+              "span",
+              { class: "machint" },
+              "what the END of a run does while the trigger is STILL held: once ",
+              "stops (the default, and what keeps a special move from becoming a ",
+              "machine gun), while-held runs it again immediately with no gap — for ",
+              "a motion — and turbo runs it again with a deliberate NEUTRAL GAP, so ",
+              "the game sees two presses instead of one long hold. That gap is the ",
+              "whole difference, and it is why auto-fire needs a rate.",
+            ),
+            h(
+              "label",
+              { class: "bindlabel macjs" },
+              "rate",
+              h("input", {
+                class: "macturboin",
+                type: "number",
+                min: "0",
+                step: "1",
+                value: () => macroTurboValue(),
+                "aria-label": "turbo rate",
+              }),
+            ),
+            h(
+              "label",
+              { class: "bindlabel macjs" },
+              "unit",
+              h(
+                "select",
+                {
+                  class: "macturbounit",
+                  title: "two spellings of one number — switching moves the value, never doubles it",
+                },
+                h("option", { value: "turbo_hz" }, "presses/sec (turbo_hz)"),
+                h("option", { value: "gap_ms" }, "gap ms (gap_ms)"),
+              ),
+            ),
+            // THE MATH, live — the same promise the duration field makes.
+            h("p", { class: "macmath mono" }, () => macroTurboLine()),
           ),
         ),
         // ── The trigger: the ONE macro edit that is a real write ─────────
@@ -3317,6 +3675,40 @@ export function MapIsland() {
                     "next press an EXTRA key for this control — either key then presses ",
                     "it (MAME-style), instead of the new one taking the old one's place.",
                   ),
+                  // ── v13: AUTO-FIRE, in the same vocabulary ──────────────
+                  // "where is the option to make buttons turbo?" — here, on
+                  // the control you just clicked, beside Replace/Add/Clear.
+                  // It writes through the SAME map verb with the control's
+                  // current keys: turbo is a property of the CONTROL, so
+                  // setting it is that control's write with one more field.
+                  h(
+                    "div",
+                    { class: "mturbo" },
+                    h(
+                      "label",
+                      { class: "bindlabel" },
+                      "turbo",
+                      h("input", {
+                        class: "mturboin",
+                        type: "number",
+                        min: "0",
+                        step: "1",
+                        placeholder: "Hz",
+                        "aria-label": "auto-fire rate in presses per second",
+                      }),
+                    ),
+                    h(
+                      "button",
+                      { class: "btn", "data-act": "turbo-set", type: "button" },
+                      "Set turbo",
+                    ),
+                    h(
+                      "button",
+                      { class: "btn", "data-act": "turbo-clear", type: "button" },
+                      "No turbo",
+                    ),
+                  ),
+                  h("p", { class: "mhint" }, () => modalTurboLine()),
                 ),
             ),
             createShow(

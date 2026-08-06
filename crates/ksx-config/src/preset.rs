@@ -262,11 +262,22 @@ pub enum BindingEntry {
     Group(BTreeMap<String, BindingEntry>),
 }
 
-/// A guarded key — the file spelling of [`ksx_core::Chord`].
+/// A guarded key — the file spelling of [`ksx_core::Chord`] — and/or a key that
+/// AUTO-FIRES, the file spelling of [`ksx_core::TurboBinding`].
 ///
 /// `key` is the trigger; `when` keys must all be held, `unless` keys must not
 /// be. `deny_unknown_fields` is what keeps a dotted group (`lx = { min = … }`)
 /// from ever being mistaken for a guard.
+///
+/// A table with `turbo_hz` and no guard is NOT a chord: it is a plain binding
+/// that happens to auto-fire, and the caller normalizes it to one.
+///
+/// ```toml
+/// [bindings]
+/// A  = { key = "G", turbo_hz = 12 }               # hold G -> A at 12 Hz
+/// B  = [{ key = "N", turbo_hz = 8 }, "M"]         # two keys, ONE 8 Hz clock
+/// rt = { key = "A", when = ["B"], turbo_hz = 6 }  # auto-fire, but only in chord
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuardedEntry {
@@ -278,6 +289,15 @@ pub struct GuardedEntry {
     /// None of these may be held (MAME's `NOT`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unless: Vec<String>,
+    /// Auto-fire rate for this row's FUNCTION, in full press/release cycles per
+    /// second, clamped to [`ksx_core::TURBO_MAX_HZ`].
+    ///
+    /// Turbo belongs to the output, not to the key — the file is keyed by
+    /// function, so one rate exists per function whatever the row shape, and
+    /// several rows on one function that disagree are a named issue rather than
+    /// a race. Emission therefore writes the rate on the FIRST row only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turbo_hz: Option<u32>,
 }
 
 impl PresetFile {
@@ -295,14 +315,23 @@ impl PresetFile {
         }
         let mut entries = Vec::new();
         let mut chords = Vec::new();
+        let mut turbo = Vec::new();
         for (function, entry) in &self.bindings {
-            collect_entries(function, entry, &mut entries, &mut chords, &mut macros)?;
+            collect_entries(
+                function,
+                entry,
+                &mut entries,
+                &mut chords,
+                &mut macros,
+                &mut turbo,
+            )?;
         }
         Ok(ksx_core::Preset {
             name: self.name.clone(),
             entries,
             chords,
             macros,
+            turbo,
             protected: false,
         })
     }
@@ -332,6 +361,7 @@ impl PresetFile {
                     key: chord.key.name().to_owned(),
                     when: chord.when.iter().map(|k| k.name().to_owned()).collect(),
                     unless: chord.unless.iter().map(|k| k.name().to_owned()).collect(),
+                    turbo_hz: None,
                 });
         }
         // Macro triggers are ordinary `[bindings]` rows under a `macro.<name>`
@@ -347,19 +377,44 @@ impl PresetFile {
                 .0
                 .push(trigger.key.name().to_owned());
         }
+        // Turbo is a property of the FUNCTION, and the file has no place to put
+        // one except on a row — so it goes on the first row of that function
+        // and `to_core` reads it from wherever it finds it. A plain key with a
+        // rate is therefore emitted as a guardless table, which is exactly the
+        // shape §3 documents (`A = { key = "G", turbo_hz = 12 }`).
+        let rates: BTreeMap<String, u32> = preset
+            .turbo
+            .iter()
+            .map(|t| (function_name(&t.binding), t.hz))
+            .collect();
         let bindings = grouped
             .into_iter()
             .map(|(function, (mut keys, mut guards))| {
+                let hz = rates.get(&function).copied();
                 let entry = match (keys.len(), guards.len()) {
-                    (1, 0) => BindingEntry::Key(keys.remove(0)),
-                    (0, 1) => BindingEntry::Guarded(guards.remove(0)),
-                    (_, 0) => BindingEntry::Keys(keys),
-                    _ => BindingEntry::Many(
-                        keys.into_iter()
-                            .map(BindingEntry::Key)
-                            .chain(guards.into_iter().map(BindingEntry::Guarded))
-                            .collect(),
-                    ),
+                    (1, 0) if hz.is_none() => BindingEntry::Key(keys.remove(0)),
+                    (1, 0) => BindingEntry::Guarded(turbo_row(keys.remove(0), hz)),
+                    (0, 1) => {
+                        let mut guard = guards.remove(0);
+                        guard.turbo_hz = hz;
+                        BindingEntry::Guarded(guard)
+                    }
+                    (_, 0) if hz.is_none() => BindingEntry::Keys(keys),
+                    _ => {
+                        let mut rows: Vec<BindingEntry> = Vec::new();
+                        let mut rate = hz;
+                        for key in keys {
+                            rows.push(match rate.take() {
+                                Some(hz) => BindingEntry::Guarded(turbo_row(key, Some(hz))),
+                                None => BindingEntry::Key(key),
+                            });
+                        }
+                        for mut guard in guards {
+                            guard.turbo_hz = rate.take();
+                            rows.push(BindingEntry::Guarded(guard));
+                        }
+                        BindingEntry::Many(rows)
+                    }
                 };
                 (function, entry)
             })
@@ -383,6 +438,7 @@ fn collect_entries(
     out: &mut Vec<(ksx_core::Key, ksx_core::Binding)>,
     chords: &mut Vec<ksx_core::Chord>,
     macros: &mut Macros,
+    turbo: &mut Vec<ksx_core::TurboBinding>,
 ) -> Result<(), ConfigError> {
     match entry {
         BindingEntry::Key(key) => push_entry(function, key, out, macros),
@@ -393,22 +449,60 @@ fn collect_entries(
             Ok(())
         }
         BindingEntry::Guarded(guarded) if guarded.when.is_empty() && guarded.unless.is_empty() => {
+            push_turbo(function, guarded, turbo)?;
             push_entry(function, &guarded.key, out, macros)
         }
-        BindingEntry::Guarded(guarded) => push_chord(function, guarded, chords),
+        BindingEntry::Guarded(guarded) => {
+            push_turbo(function, guarded, turbo)?;
+            push_chord(function, guarded, chords)
+        }
         BindingEntry::Many(entries) => {
             for entry in entries {
-                collect_entries(function, entry, out, chords, macros)?;
+                collect_entries(function, entry, out, chords, macros, turbo)?;
             }
             Ok(())
         }
         BindingEntry::Group(group) => {
             for (sub, entry) in group {
-                collect_entries(&format!("{function}.{sub}"), entry, out, chords, macros)?;
+                collect_entries(
+                    &format!("{function}.{sub}"),
+                    entry,
+                    out,
+                    chords,
+                    macros,
+                    turbo,
+                )?;
             }
             Ok(())
         }
     }
+}
+
+/// Record this row's auto-fire rate against its FUNCTION.
+///
+/// One rate per endpoint, first row wins: the file cannot express two, so a
+/// preset that somehow says two different numbers on one function gets the
+/// first and a named issue from validation rather than a build-order accident.
+/// A rate on a `macro.<name>` row is refused outright — a macro's repeat rate is
+/// `repeat = "turbo"` inside its own table, and quietly accepting a second
+/// spelling for it would make "which one runs" something a reader has to
+/// remember.
+fn push_turbo(
+    function: &str,
+    guarded: &GuardedEntry,
+    turbo: &mut Vec<ksx_core::TurboBinding>,
+) -> Result<(), ConfigError> {
+    let Some(hz) = guarded.turbo_hz else {
+        return Ok(());
+    };
+    if let Some(name) = crate::function::macro_name(function) {
+        return Err(ConfigError::TurboOnMacroTrigger(name.to_owned()));
+    }
+    let binding = parse_function(function)?;
+    if !turbo.iter().any(|t| t.binding == binding) {
+        turbo.push(ksx_core::TurboBinding::new(binding, hz));
+    }
+    Ok(())
 }
 
 fn push_entry(
@@ -465,6 +559,17 @@ fn push_chord(
         unless,
     });
     Ok(())
+}
+
+/// A plain key that auto-fires: a guardless table, which `to_core` normalizes
+/// straight back to an ordinary entry plus a turbo row.
+fn turbo_row(key: String, turbo_hz: Option<u32>) -> GuardedEntry {
+    GuardedEntry {
+        key,
+        when: Vec::new(),
+        unless: Vec::new(),
+        turbo_hz,
+    }
 }
 
 fn key_named(name: &str) -> Result<ksx_core::Key, ConfigError> {
@@ -665,6 +770,7 @@ lb = { key = "A", when = ["B", "C"], unless = ["LeftShift"] }
                 vec![Key::B],
             )],
             macros: Default::default(),
+            turbo: Vec::new(),
             protected: false,
         };
         let file = PresetFile::from_core(&original);
@@ -696,6 +802,7 @@ lb = { key = "A", when = ["B", "C"], unless = ["LeftShift"] }
                 },
             ],
             macros: Default::default(),
+            turbo: Vec::new(),
             protected: false,
         };
         let text = toml::to_string(&PresetFile::from_core(&original)).unwrap();
@@ -725,6 +832,119 @@ lb = { key = "A", when = ["B", "C"], unless = ["LeftShift"] }
             assert!(!text.contains("when"), "{text}");
             assert!(!text.contains("unless"), "{text}");
             assert!(!text.contains("key ="), "{text}");
+        }
+    }
+
+    // ---- per-binding turbo (docs/INPUT-TRANSFORMS.md §3) ------------------
+
+    /// The headline spelling: a rate on a plain binding row. It is NOT a chord
+    /// — no guard, no consumption, just an ordinary entry that auto-fires.
+    #[test]
+    fn a_rate_on_a_plain_row_is_an_entry_plus_a_turbo() {
+        let file: PresetFile = toml::from_str(
+            r#"
+name = "autofire"
+[bindings]
+A = { key = "G", turbo_hz = 12 }
+B = "H"
+"#,
+        )
+        .unwrap();
+        let core = file.to_core().unwrap();
+        assert_eq!(
+            core.entries,
+            vec![
+                (Key::G, Binding::Button(XButton::A)),
+                (Key::H, Binding::Button(XButton::B)),
+            ]
+        );
+        assert!(core.chords.is_empty(), "a guardless row is not a chord");
+        assert_eq!(
+            core.turbo,
+            vec![ksx_core::TurboBinding::new(Binding::Button(XButton::A), 12)]
+        );
+        assert_eq!(core.turbo_hz(Binding::Button(XButton::B)), None);
+    }
+
+    /// Several keys on one function share ONE rate, and the emission puts it on
+    /// the first row rather than repeating it (repeating it would invite two
+    /// numbers that disagree, which is the one thing the model cannot express).
+    #[test]
+    fn several_keys_share_one_rate_and_round_trip() {
+        let original = Preset {
+            name: "multi".into(),
+            entries: vec![
+                (Key::G, Binding::Button(XButton::A)),
+                (Key::H, Binding::Button(XButton::A)),
+            ],
+            chords: Vec::new(),
+            macros: Default::default(),
+            turbo: vec![ksx_core::TurboBinding::new(Binding::Button(XButton::A), 8)],
+            protected: false,
+        };
+        let text = toml::to_string(&PresetFile::from_core(&original)).unwrap();
+        assert_eq!(text.matches("turbo_hz").count(), 1, "{text}");
+        let back: PresetFile = toml::from_str(&text).unwrap();
+        let back = back.to_core().unwrap();
+        assert_eq!(back.entries, original.entries, "{text}");
+        assert_eq!(back.turbo, original.turbo, "{text}");
+    }
+
+    /// A guard and a rate on one row: legal, and both survive. The guard says
+    /// WHEN the chord drives; the rate says what it does while it does.
+    #[test]
+    fn a_guarded_turbo_round_trips() {
+        let original = Preset {
+            name: "guarded".into(),
+            entries: Vec::new(),
+            chords: vec![ksx_core::Chord::new(
+                Key::A,
+                Binding::Trigger(Trigger::Right),
+                vec![Key::B],
+            )],
+            macros: Default::default(),
+            turbo: vec![ksx_core::TurboBinding::new(
+                Binding::Trigger(Trigger::Right),
+                6,
+            )],
+            protected: false,
+        };
+        let text = toml::to_string(&PresetFile::from_core(&original)).unwrap();
+        let back = toml::from_str::<PresetFile>(&text)
+            .unwrap()
+            .to_core()
+            .unwrap();
+        assert_eq!(back.chords, original.chords, "{text}");
+        assert_eq!(back.turbo, original.turbo, "{text}");
+    }
+
+    /// Turbo is not a second spelling of `repeat = "turbo"`: a rate on a macro
+    /// trigger row is refused rather than quietly meaning one of the two.
+    #[test]
+    fn a_rate_on_a_macro_trigger_is_refused() {
+        let file: PresetFile = toml::from_str(
+            r#"
+name = "no"
+[macros.jab]
+steps = [{ hold = ["A"], ms = 50 }]
+[bindings]
+"macro.jab" = { key = "P", turbo_hz = 10 }
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            file.to_core(),
+            Err(ConfigError::TurboOnMacroTrigger(_))
+        ));
+    }
+
+    /// The regression guarantee at the file layer: a preset without turbo
+    /// serializes to exactly the bytes it always did.
+    #[test]
+    fn a_turbo_free_preset_emits_no_rate() {
+        for preset in Preset::builtins() {
+            let text = toml::to_string(&PresetFile::from_core(&preset)).unwrap();
+            assert!(!text.contains("turbo_hz"), "{text}");
         }
     }
 
@@ -771,6 +991,7 @@ consume = { key = "Left", when = ["Right"] }
                 ksx_core::Chord::consuming(Key::Up, vec![Key::Down]),
             ],
             macros: Default::default(),
+            turbo: Vec::new(),
             protected: false,
         };
         let text = toml::to_string(&PresetFile::from_core(&original)).unwrap();

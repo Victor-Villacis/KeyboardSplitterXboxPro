@@ -102,6 +102,20 @@ pub struct MapSpec {
     pub when: Vec<String>,
     /// CHORD: keys that must NOT be held (MAME's `NOT`).
     pub unless: Vec<String>,
+    /// AUTO-FIRE (docs/INPUT-TRANSFORMS.md §3), in full press/release cycles a
+    /// second. Three states, and they are the Add/Replace/Clear vocabulary:
+    ///
+    /// - `None` — not asked about. The function keeps whatever rate it had, so
+    ///   rebinding an auto-fire button does not silently turn the auto-fire off.
+    /// - `Some(0)` — clear it. Zero cycles a second is off, which is the same
+    ///   thing the number means everywhere else.
+    /// - `Some(n)` — set it, replacing any previous rate. Turbo belongs to the
+    ///   OUTPUT, so this is one rate for the function however many keys it
+    ///   holds; it is clamped on use and the effective rate is reported.
+    ///
+    /// A `--clear` of the function clears its rate too: a blank control is
+    /// blank.
+    pub turbo_hz: Option<u32>,
 }
 
 /// One conflicting binding — always CROSS-SLOT.
@@ -192,6 +206,14 @@ pub struct AppliedMap {
     /// bound to on its own)`. ksx does not defer input, so that binding shows
     /// for a moment before the chord completes.
     pub flash: Vec<(String, String)>,
+    /// The auto-fire rate this function now holds, as authored, or `None` if it
+    /// does not auto-fire.
+    pub turbo_hz: Option<u32>,
+    /// The rate it will actually DELIVER, which is the number worth printing: a
+    /// press and a release must each survive a 60 Hz poll, so a request above
+    /// ~15 Hz cannot be met however it is spelled. `None` when there is no
+    /// turbo; equal to `turbo_hz` when the request was deliverable as written.
+    pub turbo_effective_hz: Option<u32>,
 }
 
 impl AppliedMap {
@@ -237,6 +259,19 @@ impl AppliedMap {
                     moved.function,
                     keys.join(", ")
                 ),
+            });
+        }
+        // AUTO-FIRE: say the rate, and say the EFFECTIVE rate whenever it is
+        // not the one that was asked for. A number that cannot survive a 60 Hz
+        // poll must never be echoed back as if it could.
+        if let (Some(hz), Some(effective)) = (self.turbo_hz, self.turbo_effective_hz) {
+            line.push_str(&if effective == hz {
+                format!(" (turbo {hz} Hz)")
+            } else {
+                format!(
+                    " (turbo: asked {hz} Hz, effective ~{effective} Hz — a press AND a release \
+                     must each survive a 60 Hz poll)"
+                )
             });
         }
         if self.key.is_some() {
@@ -604,12 +639,30 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         also_drives.dedup();
     }
 
+    // AUTO-FIRE (docs/INPUT-TRANSFORMS.md §3). Not asked about ⇒ not touched:
+    // rebinding the key of an auto-fire button must not silently turn the
+    // auto-fire off. Asked about ⇒ replaced, because turbo belongs to the
+    // OUTPUT and there is exactly one rate per function. A `--clear` clears it
+    // for the same reason it clears a chord: a blank control is blank.
+    let mut turbo = core.turbo;
+    match spec.turbo_hz {
+        Some(0) | None if keys.is_empty() => turbo.retain(|t| t.binding != binding),
+        None => {}
+        Some(0) => turbo.retain(|t| t.binding != binding),
+        Some(hz) => {
+            turbo.retain(|t| t.binding != binding);
+            turbo.push(ksx_core::TurboBinding::new(binding, hz));
+        }
+    }
+    let turbo_row = turbo.iter().copied().find(|t| t.binding == binding);
+
     let rewritten = PresetFile::from_core(&ksx_core::Preset {
         name: file.name.clone(),
         entries,
         chords,
         // Untouched: editing a binding never disturbs the preset's macros.
         macros: core.macros,
+        turbo,
         protected: false,
     });
     let path = store.save_preset(&rewritten)?;
@@ -625,6 +678,8 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         moved_from,
         overridden,
         flash,
+        turbo_hz: turbo_row.map(|t| t.hz),
+        turbo_effective_hz: turbo_row.map(|t| t.effective_hz()),
     })
 }
 
@@ -723,6 +778,10 @@ fn apply_macro_trigger(store: &Store, spec: &MapSpec, name: &str) -> Result<Appl
         unless: Vec::new(),
         also_drives,
         moved_from: None,
+        // A macro repeats by saying so in its own table; a trigger row has no
+        // rate of its own to report.
+        turbo_hz: None,
+        turbo_effective_hz: None,
         overridden,
         flash: Vec::new(),
     })
@@ -1180,6 +1239,7 @@ pub fn restore(
         // included: "restore" and "clear all" must not leave a guard behind.
         chords: Vec::new(),
         macros: Default::default(),
+        turbo: Vec::new(),
         protected: false,
     });
     let path = store.save_preset(&rewritten)?;
@@ -1208,6 +1268,7 @@ pub fn clear_all(store: &Store, preset_name: &str) -> Result<AppliedRestore, Map
         entries: ksx_core::Preset::builtin_empty().entries,
         chords: Vec::new(),
         macros: Default::default(),
+        turbo: Vec::new(),
         protected: false,
     });
     let path = store.save_preset(&rewritten)?;
@@ -2680,6 +2741,7 @@ preset = "Other"
             entries: ksx_core::Preset::builtin_default().entries,
             chords: Vec::new(),
             macros: Default::default(),
+            turbo: Vec::new(),
             protected: false,
         });
         assert_eq!(
@@ -3330,5 +3392,155 @@ steps = [{ hold = ["A"], ms = 50 }]
             })),
             serde_json::json!({ "function": "B", "remaining": ["H"], "unbound": false })
         );
+    }
+
+    // ---- --turbo-hz (docs/INPUT-TRANSFORMS.md §3) -------------------------
+
+    fn turbo_spec(preset: &str, function: &str, keys: &[&str], hz: Option<u32>) -> MapSpec {
+        MapSpec {
+            preset: preset.into(),
+            function: function.into(),
+            keys: keys.iter().map(|k| (*k).to_owned()).collect(),
+            turbo_hz: hz,
+            ..MapSpec::default()
+        }
+    }
+
+    #[test]
+    fn a_rate_is_written_and_reported() {
+        let root = TempRoot::new("turbo-write");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\n");
+
+        let applied = apply(&store, &turbo_spec("P1", "a", &["g"], Some(12))).unwrap();
+        assert_eq!(applied.turbo_hz, Some(12));
+        assert_eq!(applied.turbo_effective_hz, Some(12));
+        assert_eq!(applied.message(), "\"P1\": A = G (turbo 12 Hz)");
+
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(on_disk.contains("turbo_hz = 12"), "{on_disk}");
+        let core = store
+            .load_preset("P1")
+            .unwrap()
+            .unwrap()
+            .value
+            .to_core()
+            .unwrap();
+        assert_eq!(
+            core.turbo_hz(ksx_core::Binding::Button(ksx_core::XButton::A)),
+            Some(12)
+        );
+    }
+
+    /// A rate a 60 Hz poller cannot deliver is written as asked and REPORTED as
+    /// what it will really do. Never silently substituted, never refused.
+    #[test]
+    fn an_undeliverable_rate_says_both_numbers() {
+        let root = TempRoot::new("turbo-clamp");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\n");
+
+        let applied = apply(&store, &turbo_spec("P1", "a", &["g"], Some(60))).unwrap();
+        assert_eq!(applied.turbo_hz, Some(60));
+        assert_eq!(applied.turbo_effective_hz, Some(15));
+        let message = applied.message();
+        assert!(message.contains("asked 60 Hz"), "{message}");
+        assert!(message.contains("effective ~15 Hz"), "{message}");
+    }
+
+    /// Not asking about the rate leaves it alone: rebinding the KEY of an
+    /// auto-fire button must not silently switch the auto-fire off.
+    #[test]
+    fn a_rebind_without_the_flag_keeps_the_rate() {
+        let root = TempRoot::new("turbo-keep");
+        let store = root.store();
+        preset(&store, "P1", "A = { key = \"S\", turbo_hz = 10 }\n");
+
+        let applied = apply(&store, &keys_spec("P1", "a", &["G", "H"])).unwrap();
+        assert_eq!(applied.turbo_hz, Some(10));
+        assert_eq!(applied.keys, vec!["G".to_owned(), "H".to_owned()]);
+
+        // ...and both keys drive the ONE clock, which is the whole model.
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert_eq!(on_disk.matches("turbo_hz").count(), 1, "{on_disk}");
+    }
+
+    /// `--turbo-hz 0` is off, in the same units as every other rate.
+    #[test]
+    fn zero_clears_the_rate() {
+        let root = TempRoot::new("turbo-zero");
+        let store = root.store();
+        preset(&store, "P1", "A = { key = \"S\", turbo_hz = 10 }\n");
+
+        let applied = apply(&store, &turbo_spec("P1", "a", &["S"], Some(0))).unwrap();
+        assert_eq!(applied.turbo_hz, None);
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(!on_disk.contains("turbo_hz"), "{on_disk}");
+    }
+
+    /// Clearing the control clears its rate: a blank control is blank.
+    #[test]
+    fn clearing_the_control_clears_the_rate() {
+        let root = TempRoot::new("turbo-clear");
+        let store = root.store();
+        preset(&store, "P1", "A = { key = \"S\", turbo_hz = 10 }\n");
+
+        let applied = apply(&store, &keys_spec("P1", "a", &[])).unwrap();
+        assert!(applied.key.is_none());
+        assert_eq!(applied.turbo_hz, None);
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(!on_disk.contains("turbo_hz"), "{on_disk}");
+    }
+
+    /// A guard and a rate on one control: both are written, and the rate rides
+    /// on the guarded row rather than duplicating it.
+    #[test]
+    fn a_chord_can_carry_a_rate() {
+        let root = TempRoot::new("turbo-chord");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\n");
+
+        let applied = apply(
+            &store,
+            &MapSpec {
+                preset: "P1".into(),
+                function: "rt".into(),
+                keys: vec!["D".into()],
+                when: vec!["F".into()],
+                turbo_hz: Some(6),
+                ..MapSpec::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(applied.turbo_hz, Some(6));
+        let core = store
+            .load_preset("P1")
+            .unwrap()
+            .unwrap()
+            .value
+            .to_core()
+            .unwrap();
+        assert_eq!(core.chords.len(), 1);
+        assert_eq!(
+            core.turbo_hz(ksx_core::Binding::Trigger(ksx_core::Trigger::Right)),
+            Some(6)
+        );
+    }
+
+    /// Editing a DIFFERENT control never disturbs another control's rate.
+    #[test]
+    fn another_controls_rate_survives_an_unrelated_write() {
+        let root = TempRoot::new("turbo-sibling");
+        let store = root.store();
+        preset(
+            &store,
+            "P1",
+            "A = { key = \"S\", turbo_hz = 10 }\nB = \"D\"\n",
+        );
+
+        let applied = apply(&store, &spec("P1", "b", Some("F"), false)).unwrap();
+        assert_eq!(applied.turbo_hz, None, "B has no rate of its own");
+        let on_disk = std::fs::read_to_string(&applied.path).unwrap();
+        assert!(on_disk.contains("turbo_hz = 10"), "{on_disk}");
     }
 }

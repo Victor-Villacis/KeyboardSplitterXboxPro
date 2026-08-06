@@ -61,6 +61,9 @@ impl StatusSource for FixedStatus {
                 keyboard: "HID\\TEST".into(),
                 bindings,
                 backup: Some(BACKUP_LABEL.to_owned()),
+                // One AUTO-FIRING control, so the legend badge is covered by
+                // the ordinary page assertions.
+                turbo: std::collections::BTreeMap::from([("B".to_owned(), 12)]),
             }],
         }
     }
@@ -90,6 +93,9 @@ impl StatusSource for FixedStatus {
                 on_release: "finish".into(),
                 retrigger: "ignore".into(),
                 interrupt: "none".into(),
+                repeat: "once".into(),
+                turbo_hz: None,
+                gap_ms: None,
                 triggers: vec!["P".into()],
             }],
         )
@@ -312,6 +318,8 @@ impl ControlSource for ScriptedControl {
                     slot: Some(2),
                 }],
                 also_drives: Vec::new(),
+                turbo_hz: None,
+                turbo_effective_hz: None,
                 reloaded: false,
             }
         } else {
@@ -332,6 +340,8 @@ impl ControlSource for ScriptedControl {
                     Some("P") => vec!["A".into(), "B".into()],
                     _ => Vec::new(),
                 },
+                turbo_hz: None,
+                turbo_effective_hz: None,
                 reloaded: request.reload,
             }
         }
