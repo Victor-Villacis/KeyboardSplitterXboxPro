@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use ksx_core::{
-    Interrupt, Macro, MacroStep, MacroTrigger, Macros, OnRelease, Retrigger, StepDuration,
+    Interrupt, Macro, MacroStep, MacroTrigger, Macros, OnRelease, Repeat, Retrigger, StepDuration,
+    TurboRate,
 };
 
 use crate::error::ConfigError;
@@ -76,6 +77,51 @@ pub struct MacroFile {
         skip_serializing_if = "crate::macro_serde::interrupt::is_default"
     )]
     pub interrupt: Interrupt,
+    /// What the END of a run does while the trigger is still held: `once`
+    /// (default), `while-held` or `turbo`.
+    ///
+    /// ```toml
+    /// [macros.autofire]
+    /// repeat = "turbo"
+    /// turbo_hz = 10          # or: gap_ms = 50
+    /// steps = [{ hold = ["A"], frames = 2 }]
+    /// ```
+    #[serde(
+        default,
+        with = "crate::macro_serde::repeat",
+        skip_serializing_if = "crate::macro_serde::repeat::is_default"
+    )]
+    pub repeat: Repeat,
+    /// Turbo rate in full cycles per second, clamped to
+    /// [`ksx_core::TURBO_MAX_HZ`]. Mutually exclusive with `gap_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turbo_hz: Option<u32>,
+    /// The neutral window BETWEEN turbo runs, in milliseconds — the other way
+    /// to say the same number. Raised to [`ksx_core::MIN_STEP_MS`] for the same
+    /// reason a step is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_ms: Option<u32>,
+}
+
+impl MacroFile {
+    /// The authored turbo rate, or why it cannot be read.
+    ///
+    /// Both units at once is an error for the same reason `ms`+`frames` is. A
+    /// `turbo` with NEITHER is an error too: an auto-fire whose rate ksx picked
+    /// is an auto-fire nobody asked for. Outside `repeat = "turbo"` a rate is
+    /// simply carried (so flipping the policy back and forth does not lose the
+    /// number) and validation says it is doing nothing.
+    pub fn turbo_rate(&self) -> Result<Option<TurboRate>, &'static str> {
+        match (self.turbo_hz, self.gap_ms) {
+            (Some(_), Some(_)) => Err("says both `turbo_hz` and `gap_ms`; use exactly one"),
+            (Some(hz), None) => Ok(Some(TurboRate::Hz(hz))),
+            (None, Some(ms)) => Ok(Some(TurboRate::GapMs(ms))),
+            (None, None) if self.repeat == Repeat::Turbo => {
+                Err("is `repeat = \"turbo\"` but gives no rate")
+            }
+            (None, None) => Ok(None),
+        }
+    }
 }
 
 /// One step: the function names to hold, and for how long.
@@ -121,7 +167,7 @@ impl MacroStepFile {
 }
 
 impl MacroFile {
-    fn to_core(&self, name: &str) -> Result<Macro, ConfigError> {
+    pub(crate) fn to_core(&self, name: &str) -> Result<Macro, ConfigError> {
         let mut steps = Vec::with_capacity(self.steps.len());
         for (i, step) in self.steps.iter().enumerate() {
             let duration = step.duration().map_err(|reason| {
@@ -137,12 +183,17 @@ impl MacroFile {
                 allow_short: step.allow_short,
             });
         }
+        let turbo = self
+            .turbo_rate()
+            .map_err(|reason| ConfigError::MacroTurboRate(format!("macro '{name}' {reason}")))?;
         Ok(Macro {
             name: name.to_owned(),
             steps,
             on_release: self.on_release,
             retrigger: self.retrigger,
             interrupt: self.interrupt,
+            repeat: self.repeat,
+            turbo,
         })
     }
 
@@ -169,6 +220,17 @@ impl MacroFile {
             on_release: mac.on_release,
             retrigger: mac.retrigger,
             interrupt: mac.interrupt,
+            repeat: mac.repeat,
+            // Emitted in the unit it was authored in, like a step's duration:
+            // a turbo written as a rate must still read as a rate.
+            turbo_hz: match mac.turbo {
+                Some(TurboRate::Hz(hz)) => Some(hz),
+                _ => None,
+            },
+            gap_ms: match mac.turbo {
+                Some(TurboRate::GapMs(ms)) => Some(ms),
+                _ => None,
+            },
         }
     }
 }
@@ -896,5 +958,110 @@ steps = [
         let bad_key: PresetFile =
             toml::from_str("name = \"p\"\n[bindings]\nA = \"eight\"\n").unwrap();
         assert!(matches!(bad_key.to_core(), Err(ConfigError::UnknownKey(_))));
+    }
+
+    // ---- repeat / turbo (docs/INPUT-TRANSFORMS.md §1c) ---------------------
+
+    /// The file shape for an auto-fire button, and its round trip. The UI pass
+    /// is trivial exactly because this is the whole surface.
+    #[test]
+    fn repeat_and_the_turbo_rate_round_trip() {
+        let file: PresetFile = toml::from_str(
+            r#"
+name = "p"
+[bindings]
+macro.fire = "P"
+
+[macros.fire]
+repeat = "turbo"
+turbo_hz = 10
+steps = [{ hold = ["A"], frames = 2 }]
+"#,
+        )
+        .unwrap();
+        let core = file.to_core().unwrap();
+        let mac = &core.macros.defs[0];
+        assert_eq!(mac.repeat, ksx_core::Repeat::Turbo);
+        assert_eq!(mac.turbo, Some(ksx_core::TurboRate::Hz(10)));
+        // 10 Hz on a 33 ms run is a 100 ms cycle, so a 67 ms released window.
+        assert_eq!(mac.turbo_gap_ms(), 67);
+
+        let text = toml::to_string(&PresetFile::from_core(&core)).unwrap();
+        assert!(text.contains("repeat = \"turbo\""), "{text}");
+        assert!(text.contains("turbo_hz = 10"), "{text}");
+        assert_eq!(
+            toml::from_str::<PresetFile>(&text)
+                .unwrap()
+                .to_core()
+                .unwrap()
+                .macros,
+            core.macros,
+            "{text}"
+        );
+    }
+
+    /// `gap_ms` is the other spelling of the same number, and a round trip must
+    /// not silently rewrite one into the other.
+    #[test]
+    fn the_gap_spelling_survives_as_the_gap_spelling() {
+        let file: PresetFile = toml::from_str(
+            "name = \"p\"\n[macros.fire]\nrepeat = \"turbo\"\ngap_ms = 50\n\
+             steps = [{ hold = [\"A\"], ms = 50 }]\n",
+        )
+        .unwrap();
+        let core = file.to_core().unwrap();
+        assert_eq!(
+            core.macros.defs[0].turbo,
+            Some(ksx_core::TurboRate::GapMs(50))
+        );
+        let text = toml::to_string(&PresetFile::from_core(&core)).unwrap();
+        assert!(text.contains("gap_ms = 50"), "{text}");
+        assert!(!text.contains("turbo_hz"), "{text}");
+    }
+
+    /// `while-held` needs no rate at all, and the aliases people type parse.
+    #[test]
+    fn while_held_needs_no_rate() {
+        let file: PresetFile = toml::from_str(
+            "name = \"p\"\n[macros.m]\nrepeat = \"While_Held\"\n\
+             steps = [{ hold = [\"A\"], ms = 50 }]\n",
+        )
+        .unwrap();
+        let core = file.to_core().unwrap();
+        assert_eq!(core.macros.defs[0].repeat, ksx_core::Repeat::WhileHeld);
+        assert_eq!(core.macros.defs[0].turbo, None);
+        assert_eq!(core.macros.defs[0].turbo_gap_ms(), 0);
+    }
+
+    /// Two units, or none on a turbo. Both refused for the same reason a step's
+    /// duration is: an auto-fire whose rate ksx picked is one nobody asked for.
+    #[test]
+    fn a_turbo_needs_exactly_one_rate_unit() {
+        for extra in ["turbo_hz = 10\ngap_ms = 50", ""] {
+            let file: PresetFile = toml::from_str(&format!(
+                "name = \"p\"\n[macros.m]\nrepeat = \"turbo\"\n{extra}\n\
+                 steps = [{{ hold = [\"A\"], ms = 50 }}]\n"
+            ))
+            .unwrap();
+            let err = file.to_core().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::MacroTurboRate(_)),
+                "{extra:?} gave {err}"
+            );
+            assert!(err.to_string().contains("turbo_hz"), "{err}");
+        }
+    }
+
+    /// The regression guarantee: `once` is the default and is never written, so
+    /// every preset that predates the setting serializes to the bytes it did.
+    #[test]
+    fn a_macro_that_does_not_repeat_writes_no_repeat_syntax() {
+        let file: PresetFile = toml::from_str(HADOUKEN).unwrap();
+        let core = file.to_core().unwrap();
+        assert_eq!(core.macros.defs[0].repeat, ksx_core::Repeat::Once);
+        let text = toml::to_string(&PresetFile::from_core(&core)).unwrap();
+        assert!(!text.contains("repeat"), "{text}");
+        assert!(!text.contains("turbo"), "{text}");
+        assert!(!text.contains("gap_ms"), "{text}");
     }
 }

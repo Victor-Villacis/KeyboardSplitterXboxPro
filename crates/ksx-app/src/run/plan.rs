@@ -566,15 +566,29 @@ pub fn render_human(plan: &RunPlan) -> String {
                 .keys_for(i as u16)
                 .map(|k| k.name())
                 .collect();
+            // A repeating macro prints the rate it will ACTUALLY deliver, not
+            // the one the file asked for: the sampling ceiling is arithmetic
+            // and a preset should never learn about it from the game
+            // (docs/INPUT-TRANSFORMS.md §1c, "Repeating").
+            let repeat = match mac.repeat {
+                ksx_core::Repeat::Once => "once".to_owned(),
+                ksx_core::Repeat::WhileHeld => "while-held".to_owned(),
+                ksx_core::Repeat::Turbo => format!(
+                    "turbo (~{} Hz, {} ms gap)",
+                    mac.effective_turbo_hz(),
+                    mac.turbo_gap_ms()
+                ),
+            };
             let _ = writeln!(
                 out,
-                "           macro \"{}\" {} step(s), {} ms  on_release={} retrigger={} interrupt={}  key(s) {}",
+                "           macro \"{}\" {} step(s), {} ms  on_release={} retrigger={} interrupt={} repeat={}  key(s) {}",
                 mac.name,
                 mac.steps.len(),
                 mac.total_ms(),
                 mac.on_release,
                 mac.retrigger,
                 mac.interrupt,
+                repeat,
                 if keys.is_empty() {
                     "-  (defined but nothing starts it)".to_owned()
                 } else {
@@ -618,6 +632,11 @@ pub fn plan_json(plan: &RunPlan) -> serde_json::Value {
                     "on_release": mac.on_release.as_str(),
                     "retrigger": mac.retrigger.as_str(),
                     "interrupt": mac.interrupt.as_str(),
+                    "repeat": mac.repeat.as_str(),
+                    // Only meaningful for turbo, and always the EFFECTIVE
+                    // numbers — what the pad will do, not what was asked.
+                    "turbo_gap_ms": mac.turbo_gap_ms(),
+                    "turbo_hz": mac.effective_turbo_hz(),
                     "keys": s.preset.macros.keys_for(i as u16)
                         .map(|k| k.name())
                         .collect::<Vec<_>>(),

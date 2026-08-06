@@ -370,6 +370,107 @@ impl FromStr for Interrupt {
     }
 }
 
+/// The fastest turbo ksx will pretend to deliver, in hertz.
+///
+/// §0.2 again, and it is arithmetic rather than policy: one turbo cycle is a
+/// press AND a release, so at a 60 Hz poll the very best case is one sample
+/// pressed and one sample released — 30 cycles a second. Anything faster is a
+/// number that cannot survive contact with the game, so a file asking for it is
+/// CLAMPED to this and told why.
+///
+/// The honest ceiling is usually lower still: ksx's own step floor
+/// ([`MIN_STEP_MS`]) makes the shortest visible press 33 ms and the shortest
+/// visible gap another 33, so a one-step macro tops out near 15 Hz. That is not
+/// a second cap — it falls out of [`Macro::turbo_gap_ms`] — but it is why the
+/// *effective* rate a preset gets is reported rather than assumed.
+pub const TURBO_MAX_HZ: u32 = 30;
+
+/// How a turbo macro's REPEAT RATE was authored.
+///
+/// Two spellings of one number, exactly like [`StepDuration`], and for the same
+/// reason: `turbo_hz = 10` is how a player thinks about an auto-fire button and
+/// `gap_ms = 50` is how a frame-counter thinks about the released window
+/// between two presses. Giving both is refused by the config layer — two units
+/// for one number would make "which wins" something a reader has to remember.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum TurboRate {
+    /// Full cycles (run + gap) per second, clamped to [`TURBO_MAX_HZ`].
+    Hz(u32),
+    /// The neutral gap BETWEEN runs, in milliseconds. Raised to [`MIN_STEP_MS`]
+    /// for the same reason a step is: a gap the game never samples is not a
+    /// gap, it is one long hold.
+    GapMs(u32),
+}
+
+/// What a macro does when its last step ends and the trigger is STILL down.
+///
+/// [`Repeat::Once`] is the default and is the fighting-game expectation: you
+/// press the button, the quarter-circle comes out, and holding the button does
+/// not turn a special move into a machine gun. The other two exist because
+/// auto-fire is a real thing people want on a cabinet, and because wanting it
+/// should be something you *say* rather than something a stuck key does to you.
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Repeat {
+    /// One run per press. Holding the trigger changes nothing.
+    #[default]
+    Once,
+    /// Re-run from step 0 as soon as the last step ends, for as long as the
+    /// trigger is still down. The run in flight is never cut short — the
+    /// decision is taken at the END of a run, which is what makes this compose
+    /// with [`OnRelease::Finish`] instead of fighting it.
+    WhileHeld,
+    /// [`Repeat::WhileHeld`] with a deliberate neutral GAP between runs, so the
+    /// game sees a released frame and reads two presses instead of one hold.
+    /// The gap is [`Macro::turbo_gap_ms`].
+    Turbo,
+}
+
+impl Repeat {
+    pub const ALL: &'static [Repeat] = &[Repeat::Once, Repeat::WhileHeld, Repeat::Turbo];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Repeat::Once => "once",
+            Repeat::WhileHeld => "while-held",
+            Repeat::Turbo => "turbo",
+        }
+    }
+
+    /// Does this policy re-run at all? `false` is the zero-cost path, and the
+    /// behavior every preset written before this feature keeps.
+    pub const fn repeats(self) -> bool {
+        !matches!(self, Repeat::Once)
+    }
+
+    /// Does this policy put a released window between runs?
+    pub const fn wants_gap(self) -> bool {
+        matches!(self, Repeat::Turbo)
+    }
+}
+
+impl fmt::Display for Repeat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("unknown repeat policy '{0}' (expected one of: once, while-held, turbo)")]
+pub struct UnknownRepeat(pub String);
+
+impl FromStr for Repeat {
+    type Err = UnknownRepeat;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match normalize(s).as_str() {
+            "once" | "oneshot" | "single" => Ok(Repeat::Once),
+            "whileheld" | "held" | "hold" | "repeat" => Ok(Repeat::WhileHeld),
+            "turbo" | "autofire" | "rapid" => Ok(Repeat::Turbo),
+            _ => Err(UnknownRepeat(s.to_owned())),
+        }
+    }
+}
+
 /// Case- and separator-insensitive, like [`crate::Persona`] and [`crate::Socd`]:
 /// config files are hand-edited, so `On_Release = "Abort"` must work.
 fn normalize(s: &str) -> String {
@@ -381,9 +482,30 @@ fn normalize(s: &str) -> String {
 
 /// A named timed sequence.
 ///
-/// One-shot by design: the last step ends the run even if the trigger is still
-/// held. "Hold to repeat" is turbo (§2.3), a different feature with a different
-/// aliasing problem, and folding the two would make both harder to explain.
+/// One-shot BY DEFAULT: the last step ends the run even if the trigger is still
+/// held ([`Repeat::Once`]). Holding a key must never turn a special move into a
+/// machine gun by accident — the two ways to ask for that on purpose are
+/// [`Repeat::WhileHeld`] and [`Repeat::Turbo`].
+///
+/// # Precedence, when every policy has an opinion
+///
+/// The four settings answer four different questions and are evaluated in this
+/// order, which is the order the events happen in:
+///
+/// 1. [`Interrupt`] — *other* input arrived. An abort is an EXIT: the run stops,
+///    everything releases, and no repeat follows it. Interrupt beats everything.
+/// 2. [`OnRelease`] — the trigger came up. `abort` stops now (and therefore
+///    never repeats); `finish` lets the run in flight complete.
+/// 3. [`Repeat`] — the last step just ended. `once` stops. `while-held` and
+///    `turbo` re-run **only if the trigger is still down at that instant**,
+///    which is exactly why `finish` + `while-held` means "let go and it stops
+///    after this run" rather than a contradiction.
+/// 4. [`Retrigger`] — a NEW press arrived while a run was in flight. Unchanged
+///    by any of the above, and unrelated to repeat: repeat re-runs on its own
+///    schedule and never counts as a press.
+///
+/// Every exit path is the same one: pending steps cancelled, everything the
+/// macro held released, in one delta batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Macro {
     /// Unique within a preset, compared case-insensitively (function names are).
@@ -395,11 +517,17 @@ pub struct Macro {
     pub retrigger: Retrigger,
     /// What OTHER input does to a run in flight. Composes with `on_release`.
     pub interrupt: Interrupt,
+    /// What the END of a run does while the trigger is still held.
+    pub repeat: Repeat,
+    /// The turbo rate, as authored. Only [`Repeat::Turbo`] reads it; kept for
+    /// every policy so a file that experiments with the setting does not lose
+    /// the number when it flips back to `once`.
+    pub turbo: Option<TurboRate>,
 }
 
 impl Macro {
     /// A macro with the default policies: finish on release, ignore retrigger,
-    /// interrupt on nothing.
+    /// interrupt on nothing, run once.
     pub fn new(name: impl Into<String>, steps: Vec<MacroStep>) -> Self {
         Self {
             name: name.into(),
@@ -407,6 +535,8 @@ impl Macro {
             on_release: OnRelease::default(),
             retrigger: Retrigger::default(),
             interrupt: Interrupt::default(),
+            repeat: Repeat::default(),
+            turbo: None,
         }
     }
 
@@ -436,6 +566,91 @@ impl Macro {
     pub fn is_inert(&self) -> bool {
         self.steps.is_empty()
     }
+
+    /// The neutral window the engine leaves BETWEEN two runs, in milliseconds.
+    ///
+    /// Zero for everything but [`Repeat::Turbo`]: `while-held` deliberately has
+    /// no gap (it re-runs a *motion*, and a motion whose first step repeats its
+    /// own last step must not blink), while turbo's entire job is the gap.
+    ///
+    /// The rate is resolved here, once, so the engine, validation and any plan
+    /// printer agree by construction:
+    ///
+    /// - `turbo_hz` is clamped to [`TURBO_MAX_HZ`] and turned into a cycle
+    ///   length; the gap is whatever the cycle has left after the run;
+    /// - `gap_ms` is taken as written;
+    /// - either way the result is RAISED to [`MIN_STEP_MS`], because a gap a
+    ///   60 Hz poller cannot sample is not a gap — the game reads one long hold
+    ///   and the turbo silently does nothing (§0.2).
+    ///
+    /// A turbo with no rate at all falls back to the floor rather than guessing
+    /// a rate; the config layer refuses that file, and this keeps the model
+    /// total.
+    pub fn turbo_gap_ms(&self) -> u32 {
+        if !self.repeat.wants_gap() {
+            return 0;
+        }
+        let asked = match self.turbo {
+            None => MIN_STEP_MS,
+            Some(TurboRate::GapMs(ms)) => ms,
+            Some(TurboRate::Hz(hz)) => {
+                let cycle = cycle_ms(hz);
+                let run = u32::try_from(self.total_ms()).unwrap_or(u32::MAX);
+                cycle.saturating_sub(run)
+            }
+        };
+        asked.max(MIN_STEP_MS)
+    }
+
+    /// One full turbo cycle — a run plus its gap — in milliseconds.
+    pub fn turbo_cycle_ms(&self) -> u64 {
+        self.total_ms() + u64::from(self.turbo_gap_ms())
+    }
+
+    /// The rate a turbo macro ACTUALLY delivers, in hertz, rounded to nearest.
+    ///
+    /// This is the number worth printing: `turbo_hz = 30` on a 50 ms macro is
+    /// not 30 Hz and never could be, and saying so is the whole point of
+    /// resolving the rate in one place.
+    pub fn effective_turbo_hz(&self) -> u32 {
+        let cycle = self.turbo_cycle_ms();
+        if cycle == 0 {
+            return 0;
+        }
+        u32::try_from((1_000 + cycle / 2) / cycle).unwrap_or(u32::MAX)
+    }
+
+    /// Was the authored turbo rate not deliverable as written? Returns the
+    /// `(asked, effective)` hertz so validation can say both numbers.
+    ///
+    /// `None` when the macro is not a turbo, was authored as a `gap_ms` that
+    /// survived the floor, or asked for a rate it actually gets.
+    pub fn turbo_rate_clamped(&self) -> Option<(u32, u32)> {
+        let Some(TurboRate::Hz(asked)) = self.turbo else {
+            return None;
+        };
+        if !self.repeat.wants_gap() {
+            return None;
+        }
+        let effective = self.effective_turbo_hz();
+        (effective != asked).then_some((asked, effective))
+    }
+
+    /// Was an explicit `gap_ms` raised to the sampling floor?
+    pub fn turbo_gap_raised(&self) -> Option<(u32, u32)> {
+        let Some(TurboRate::GapMs(ms)) = self.turbo else {
+            return None;
+        };
+        (self.repeat.wants_gap() && ms < MIN_STEP_MS).then_some((ms, MIN_STEP_MS))
+    }
+}
+
+/// Milliseconds in one cycle at `hz`, with `hz` clamped to the sampling ceiling
+/// and to at least 1 (a 0 Hz turbo is a file that meant "off", not a division by
+/// zero).
+fn cycle_ms(hz: u32) -> u32 {
+    let hz = hz.clamp(1, TURBO_MAX_HZ);
+    (1_000 + hz / 2) / hz
 }
 
 /// A key that starts a macro: the file row `macro.<name> = "<key>"`.
@@ -615,6 +830,82 @@ mod tests {
         assert_eq!("AnyInput".parse(), Ok(Interrupt::AnyInput));
         let err = "sometimes".parse::<Interrupt>().unwrap_err();
         assert!(err.to_string().contains("opposing"), "{err}");
+    }
+
+    #[test]
+    fn repeat_policies_round_trip_and_default_to_once() {
+        for &policy in Repeat::ALL {
+            assert_eq!(policy.as_str().parse::<Repeat>(), Ok(policy));
+            assert_eq!(policy.to_string(), policy.as_str());
+        }
+        assert_eq!(Repeat::default(), Repeat::Once);
+        assert!(!Repeat::Once.repeats());
+        assert!(Repeat::WhileHeld.repeats() && Repeat::Turbo.repeats());
+        // Only turbo wants a released window between runs.
+        assert!(!Repeat::WhileHeld.wants_gap() && Repeat::Turbo.wants_gap());
+        assert_eq!("while_held".parse(), Ok(Repeat::WhileHeld));
+        assert_eq!("WhileHeld".parse(), Ok(Repeat::WhileHeld));
+        assert_eq!("auto-fire".parse(), Ok(Repeat::Turbo));
+        let err = "sometimes".parse::<Repeat>().unwrap_err();
+        assert!(err.to_string().contains("turbo"), "{err}");
+    }
+
+    /// The turbo arithmetic, and the two ceilings it runs into.
+    #[test]
+    fn a_turbo_rate_resolves_to_a_gap_the_game_can_see() {
+        let turbo = |rate: TurboRate| {
+            let mut m = Macro::new("t", vec![MacroStep::new(vec![], 50)]);
+            m.repeat = Repeat::Turbo;
+            m.turbo = Some(rate);
+            m
+        };
+
+        // 10 Hz on a 50 ms macro: a 100 ms cycle, so a 50 ms gap.
+        let m = turbo(TurboRate::Hz(10));
+        assert_eq!(m.turbo_gap_ms(), 50);
+        assert_eq!(m.turbo_cycle_ms(), 100);
+        assert_eq!(m.effective_turbo_hz(), 10);
+        assert_eq!(m.turbo_rate_clamped(), None);
+
+        // The gap spelling means exactly the same thing.
+        assert_eq!(turbo(TurboRate::GapMs(50)).turbo_gap_ms(), 50);
+
+        // Above the sampling ceiling the rate is CLAMPED, not refused — and
+        // what comes out is reported honestly (a 50 ms macro cannot do 30 Hz:
+        // one run alone is longer than a 33 ms cycle).
+        let fast = turbo(TurboRate::Hz(120));
+        assert_eq!(fast.turbo_gap_ms(), MIN_STEP_MS);
+        assert_eq!(fast.turbo_cycle_ms(), 50 + u64::from(MIN_STEP_MS));
+        assert_eq!(fast.turbo_rate_clamped(), Some((120, 12)));
+
+        // A gap below the floor is raised for the same reason a step is: an
+        // unsampled release is not a release, it is one long hold.
+        let tight = turbo(TurboRate::GapMs(5));
+        assert_eq!(tight.turbo_gap_ms(), MIN_STEP_MS);
+        assert_eq!(tight.turbo_gap_raised(), Some((5, MIN_STEP_MS)));
+
+        // The ceiling itself is 30 Hz, and it is arithmetic: a press plus a
+        // release is two samples at 60 Hz.
+        assert_eq!(TURBO_MAX_HZ, 30);
+        assert_eq!(cycle_ms(30), 33);
+        assert_eq!(cycle_ms(0), 1_000); // "0 Hz" means "off", never a panic
+    }
+
+    /// Every other policy has no gap at all — `while-held` re-runs a MOTION,
+    /// and a motion whose first step repeats its own last step must not blink.
+    #[test]
+    fn only_turbo_has_a_gap() {
+        let mut m = Macro::new("t", vec![MacroStep::new(vec![], 50)]);
+        assert_eq!(m.turbo_gap_ms(), 0);
+        m.repeat = Repeat::WhileHeld;
+        assert_eq!(m.turbo_gap_ms(), 0);
+        // A rate carried on a non-turbo macro changes nothing (validation says
+        // so out loud); flipping the policy is what turns it on.
+        m.turbo = Some(TurboRate::Hz(10));
+        assert_eq!(m.turbo_gap_ms(), 0);
+        assert_eq!(m.turbo_rate_clamped(), None);
+        m.repeat = Repeat::Turbo;
+        assert_eq!(m.turbo_gap_ms(), 50);
     }
 
     #[test]

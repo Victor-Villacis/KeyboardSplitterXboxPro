@@ -13,9 +13,12 @@ use crate::config::ConfigFile;
 use crate::error::ConfigError;
 use crate::function::{macro_name, parse_function, CONSUME, MACRO_PREFIX};
 use crate::games::GamesFile;
-use crate::preset::{BindingEntry, GuardedEntry, PresetFile};
+use crate::preset::{BindingEntry, GuardedEntry, MacroFile, PresetFile};
 use ksx_core::socd::{opposing_pairs, shadowing_chord};
-use ksx_core::{Binding, Key, Persona, Preset, Socd, MAX_SLOTS, MAX_XINPUT_SLOTS, MIN_STEP_MS};
+use ksx_core::{
+    Axis, Binding, Key, Persona, Preset, Repeat, Socd, MAX_SLOTS, MAX_XINPUT_SLOTS, MIN_STEP_MS,
+    TURBO_MAX_HZ,
+};
 
 /// One validation finding. All findings are non-fatal: the caller decides
 /// whether to refuse to start emulation (unknown preset ref) or just warn.
@@ -145,6 +148,54 @@ pub enum Issue {
         step: usize,
         ms: u32,
     },
+    /// Advisory, and the one that explains "the diagonal never comes out": a
+    /// macro step holds a DIRECTION on a mechanism this preset does not drive —
+    /// dpad bits in a preset whose stick is the left analog axes, or the
+    /// reverse. The engine publishes exactly what the step says; a game that
+    /// reads the other mechanism sees that step as neutral, so a ↓ / ↓→ / →
+    /// motion loses whichever step was written on the wrong one.
+    MacroHoldsOtherMechanism {
+        preset: String,
+        name: String,
+        step: usize,
+        function: String,
+        /// What the step drives, in words ("the dpad", "the left stick").
+        holds: String,
+        /// What this preset's own direction keys drive.
+        preset_drives: String,
+    },
+    /// A macro gives both `turbo_hz` and `gap_ms`, or is `repeat = "turbo"`
+    /// with neither.
+    MacroTurboBadRate {
+        preset: String,
+        name: String,
+        reason: String,
+    },
+    /// Advisory: the requested `turbo_hz` is not deliverable — either above the
+    /// [`ksx_core::TURBO_MAX_HZ`] sampling ceiling, or faster than the macro's
+    /// own run plus a gap a 60 Hz poller can see. The effective rate is stated.
+    TurboRateClamped {
+        preset: String,
+        name: String,
+        asked_hz: u32,
+        effective_hz: u32,
+    },
+    /// Advisory: an explicit `gap_ms` below the sampling floor was RAISED. A
+    /// gap the game never samples is not a gap — it reads one long hold.
+    TurboGapRaised {
+        preset: String,
+        name: String,
+        ms: u32,
+        raised_to: u32,
+    },
+    /// Advisory: `turbo_hz`/`gap_ms` on a macro that does not repeat. The
+    /// number is kept (flipping `repeat` back and forth must not lose it) and
+    /// does nothing until `repeat = "turbo"`.
+    TurboRateWithoutTurbo {
+        preset: String,
+        name: String,
+        repeat: String,
+    },
     /// Advisory: a slot's `socd` policy would have generated a rule for a key
     /// pair the preset already chords by hand. The hand-written one wins —
     /// a deliberate statement beats a default — and this says so out loud.
@@ -194,6 +245,13 @@ impl Issue {
                 | Issue::SocdShadowedByChord { .. }
                 | Issue::MacroStepRaised { .. }
                 | Issue::MacroStepMayBeMissed { .. }
+                // Advisory because the file is not WRONG — the engine does
+                // exactly what it says. It is the game that will not be
+                // looking there, and only the user knows what the game reads.
+                | Issue::MacroHoldsOtherMechanism { .. }
+                | Issue::TurboRateClamped { .. }
+                | Issue::TurboGapRaised { .. }
+                | Issue::TurboRateWithoutTurbo { .. }
         )
     }
 }
@@ -336,6 +394,64 @@ impl fmt::Display for Issue {
                 f,
                 "preset '{preset}': macro '{name}' step {step} holds '{function}', which is not \
                  a function name (try A, lt, dpad.down, lx.min)"
+            ),
+            Issue::MacroHoldsOtherMechanism {
+                preset,
+                name,
+                step,
+                function,
+                holds,
+                preset_drives,
+            } => write!(
+                f,
+                "preset '{preset}': macro '{name}' step {step} holds '{function}', which drives \
+                 {holds} — but this preset's own direction keys drive {preset_drives}. ksx \
+                 publishes the step exactly as written; a game reading {preset_drives} sees that \
+                 step as NEUTRAL, which is what makes a down/down-forward/forward motion come out \
+                 missing whichever step was written on the other one. Write the step's holds with \
+                 the same functions the [bindings] use (docs/INPUT-TRANSFORMS.md §1c)"
+            ),
+            Issue::MacroTurboBadRate {
+                preset,
+                name,
+                reason,
+            } => write!(
+                f,
+                "preset '{preset}': macro '{name}' {reason} — a turbo's rate is `turbo_hz = <n>` \
+                 or `gap_ms = <n>`, exactly one of them"
+            ),
+            Issue::TurboRateClamped {
+                preset,
+                name,
+                asked_hz,
+                effective_hz,
+            } => write!(
+                f,
+                "preset '{preset}': macro '{name}' asks for turbo_hz = {asked_hz} and will run at \
+                 about {effective_hz} Hz. A 60 Hz poller resolves at most {TURBO_MAX_HZ} press/\
+                 release pairs a second (§0.2), and each run plus its gap must survive being \
+                 sampled — so the rate is capped by the macro's own length, not refused"
+            ),
+            Issue::TurboGapRaised {
+                preset,
+                name,
+                ms,
+                raised_to,
+            } => write!(
+                f,
+                "preset '{preset}': macro '{name}' asks for a {ms} ms turbo gap and gets \
+                 {raised_to} ms — a released window a 60 Hz poller never samples is not a gap, \
+                 the game reads one long hold and the turbo does nothing (§0.2)"
+            ),
+            Issue::TurboRateWithoutTurbo {
+                preset,
+                name,
+                repeat,
+            } => write!(
+                f,
+                "preset '{preset}': macro '{name}' sets a turbo rate but is \
+                 `repeat = \"{repeat}\"`, so the rate does nothing until it says \
+                 `repeat = \"turbo\"` (the number is kept)"
             ),
             Issue::UnknownMacroRef {
                 preset,
@@ -677,8 +793,84 @@ fn validate_preset(preset: &PresetFile, issues: &mut Vec<Issue>) {
 ///
 /// The sampling rule (§0.2) is checked here and nowhere else: `MacroStep`
 /// decides what the engine *runs*, and this decides what the user is *told*.
+/// Which CONTROL a directional binding drives.
+///
+/// A pad has three ways to say "right", and a game reads whichever one it was
+/// written for. Buttons and triggers have no mechanism — they are read the same
+/// way whatever the preset does — so they never produce a mismatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mechanism {
+    Dpad,
+    LeftStick,
+    RightStick,
+}
+
+impl Mechanism {
+    fn of(binding: Binding) -> Option<Self> {
+        match binding {
+            Binding::Dpad(_) => Some(Mechanism::Dpad),
+            // A centred axis points nowhere; it is not a direction.
+            Binding::Axis { value: 0, .. } => None,
+            Binding::Axis {
+                axis: Axis::X | Axis::Y,
+                ..
+            } => Some(Mechanism::LeftStick),
+            Binding::Axis {
+                axis: Axis::Rx | Axis::Ry,
+                ..
+            } => Some(Mechanism::RightStick),
+            Binding::Button(_) | Binding::Trigger(_) | Binding::Consume => None,
+        }
+    }
+
+    const fn describe(self) -> &'static str {
+        match self {
+            Mechanism::Dpad => "the dpad",
+            Mechanism::LeftStick => "the left stick (lx/ly)",
+            Mechanism::RightStick => "the right stick (rx/ry)",
+        }
+    }
+}
+
+fn describe_all(mechanisms: &[Mechanism]) -> String {
+    let names: Vec<&str> = mechanisms.iter().map(|m| m.describe()).collect();
+    names.join(" and ")
+}
+
+/// Every mechanism this preset's own BOUND direction keys drive.
+///
+/// Inert rows (`Key::None`) do not count: a placeholder is a function the
+/// preset lists, not a direction the player can produce.
+fn driven_mechanisms(pairs: &[(String, Flat<'_>)]) -> Vec<Mechanism> {
+    let mut out: Vec<Mechanism> = Vec::new();
+    for (function, flat) in pairs {
+        if macro_name(function).is_some() {
+            continue;
+        }
+        let key = match flat {
+            Flat::Plain(key) => *key,
+            Flat::Guard(guard) => guard.key.as_str(),
+        };
+        if key.eq_ignore_ascii_case("None") {
+            continue;
+        }
+        let Ok(binding) = parse_function(function) else {
+            continue;
+        };
+        if let Some(mechanism) = Mechanism::of(binding) {
+            if !out.contains(&mechanism) {
+                out.push(mechanism);
+            }
+        }
+    }
+    out
+}
+
 fn validate_macros(preset: &PresetFile, pairs: &[(String, Flat<'_>)], issues: &mut Vec<Issue>) {
     let name = || preset.name.clone();
+    // What the PLAYER's own direction keys drive on this preset — the best
+    // available evidence for what the game on this slot actually reads.
+    let driven = driven_mechanisms(pairs);
 
     // Names are matched case-insensitively (function names are), so two tables
     // differing only in case would have one silently shadow the other.
@@ -699,15 +891,37 @@ fn validate_macros(preset: &PresetFile, pairs: &[(String, Flat<'_>)], issues: &m
                 name: macro_name.clone(),
             });
         }
+        validate_turbo(preset, macro_name, def, issues);
         for (i, step) in def.steps.iter().enumerate() {
             for function in &step.hold {
-                if parse_function(function).is_err() {
+                let Ok(binding) = parse_function(function) else {
                     issues.push(Issue::UnknownMacroHold {
                         preset: name(),
                         name: macro_name.clone(),
                         step: i,
                         function: function.clone(),
                     });
+                    continue;
+                };
+                // The "my diagonal never comes out" trap. A step that holds a
+                // direction on a mechanism this preset does not otherwise drive
+                // is published faithfully and read by nobody — and because it
+                // is usually ONE step of a motion that was written that way
+                // (the diagonal, copied from an example), the symptom is a
+                // motion with a hole in it rather than a macro that does
+                // nothing. Only reported when the preset gives us something to
+                // compare against.
+                if let Some(mechanism) = Mechanism::of(binding) {
+                    if !driven.is_empty() && !driven.contains(&mechanism) {
+                        issues.push(Issue::MacroHoldsOtherMechanism {
+                            preset: name(),
+                            name: macro_name.clone(),
+                            step: i,
+                            function: function.clone(),
+                            holds: mechanism.describe().to_owned(),
+                            preset_drives: describe_all(&driven),
+                        });
+                    }
                 }
             }
             // Exactly one unit, always. Neither is not "instant": it is a file
@@ -765,6 +979,57 @@ fn validate_macros(preset: &PresetFile, pairs: &[(String, Flat<'_>)], issues: &m
                 });
             }
         }
+    }
+}
+
+/// The repeat/turbo settings (docs/INPUT-TRANSFORMS.md §1c, "repeating").
+///
+/// The rate is never silently invented and never silently unachievable: a
+/// `turbo` with no rate is refused, a rate on a macro that does not repeat is
+/// named as inert, and a rate the sampling ceiling will not deliver is reported
+/// with the number the preset actually gets.
+fn validate_turbo(preset: &PresetFile, macro_name: &str, def: &MacroFile, issues: &mut Vec<Issue>) {
+    match def.turbo_rate() {
+        Err(reason) => {
+            issues.push(Issue::MacroTurboBadRate {
+                preset: preset.name.clone(),
+                name: macro_name.to_owned(),
+                reason: reason.to_owned(),
+            });
+            return;
+        }
+        Ok(None) => return,
+        Ok(Some(_)) if def.repeat != Repeat::Turbo => {
+            issues.push(Issue::TurboRateWithoutTurbo {
+                preset: preset.name.clone(),
+                name: macro_name.to_owned(),
+                repeat: def.repeat.to_string(),
+            });
+            return;
+        }
+        Ok(Some(_)) => {}
+    }
+    // The arithmetic lives in ksx-core and is done ONCE, so what validation
+    // reports and what the engine runs cannot drift apart. A body whose steps
+    // do not convert is already reported step by step; there is nothing to add.
+    let Ok(core) = def.to_core(macro_name) else {
+        return;
+    };
+    if let Some((asked_hz, effective_hz)) = core.turbo_rate_clamped() {
+        issues.push(Issue::TurboRateClamped {
+            preset: preset.name.clone(),
+            name: macro_name.to_owned(),
+            asked_hz,
+            effective_hz,
+        });
+    }
+    if let Some((ms, raised_to)) = core.turbo_gap_raised() {
+        issues.push(Issue::TurboGapRaised {
+            preset: preset.name.clone(),
+            name: macro_name.to_owned(),
+            ms,
+            raised_to,
+        });
     }
 }
 
@@ -1601,5 +1866,170 @@ preset = "empty"
             issue: &'a Issue,
         }
         toml::to_string(&Wrap { issue }).unwrap()
+    }
+
+    /// **The "my diagonal never comes out" advisory.** Victor's preset drives
+    /// its directions on the LEFT STICK with the dpad unbound; a macro whose
+    /// diagonal step was written with `dpad.*` publishes dpad bits his game
+    /// never reads, so the motion arrives with exactly that step missing. The
+    /// engine is right and the file is the trap — so validation names it.
+    #[test]
+    fn a_macro_holding_the_other_mechanism_is_reported() {
+        let presets = vec![macro_preset(
+            "[bindings]\n\"ly.min\" = \"Down\"\n\"lx.max\" = \"Right\"\nA = \"S\"\n\
+             macro.hadouken = \"P\"\n\
+             [macros.hadouken]\n\
+             steps = [{ hold = [\"ly.min\"], ms = 50 }, \
+                      { hold = [\"dpad.down\",\"dpad.right\"], ms = 50 }, \
+                      { hold = [\"lx.max\"], ms = 50 }, \
+                      { hold = [\"A\"], ms = 50 }]\n",
+        )];
+        let issues = validate(&ConfigFile::default(), &presets);
+        // One per offending hold, naming the step — the diagonal, step 1.
+        assert_eq!(issues.len(), 2, "{issues:?}");
+        for (i, issue) in issues.iter().enumerate() {
+            assert_eq!(
+                *issue,
+                Issue::MacroHoldsOtherMechanism {
+                    preset: "m".into(),
+                    name: "hadouken".into(),
+                    step: 1,
+                    function: if i == 0 { "dpad.down" } else { "dpad.right" }.into(),
+                    holds: "the dpad".into(),
+                    preset_drives: "the left stick (lx/ly)".into(),
+                },
+                "{issues:?}"
+            );
+            assert!(issue.is_advisory());
+        }
+        let text = issues[0].to_string();
+        assert!(text.contains("NEUTRAL"), "{text}");
+        assert!(text.contains("the left stick (lx/ly)"), "{text}");
+    }
+
+    /// ...and the same trap the other way round: a dpad preset with a macro
+    /// written on the stick.
+    #[test]
+    fn the_mechanism_advisory_works_in_both_directions() {
+        let presets = vec![macro_preset(
+            "[bindings]\n\"dpad.down\" = \"Down\"\n\"dpad.right\" = \"Right\"\n\
+             [macros.m]\nsteps = [{ hold = [\"lx.max\"], ms = 50 }]\n",
+        )];
+        assert!(matches!(
+            validate(&ConfigFile::default(), &presets).as_slice(),
+            [Issue::MacroHoldsOtherMechanism { step: 0, .. }]
+        ));
+    }
+
+    /// It must not cry wolf. A preset that drives BOTH mechanisms reads both,
+    /// buttons have no mechanism at all, and a preset with no direction keys
+    /// gives nothing to compare against.
+    #[test]
+    fn the_mechanism_advisory_stays_quiet_when_it_has_nothing_to_say() {
+        // Both driven: either spelling is fine.
+        let both = vec![macro_preset(
+            "[bindings]\n\"ly.min\" = \"Down\"\n\"dpad.down\" = \"Down\"\n\
+             [macros.m]\nsteps = [{ hold = [\"dpad.down\",\"ly.min\"], ms = 50 }]\n",
+        )];
+        assert_eq!(validate(&ConfigFile::default(), &both), Vec::new());
+
+        // Buttons and triggers are read the same way whatever the preset does.
+        let buttons = vec![macro_preset(
+            "[bindings]\n\"ly.min\" = \"Down\"\n\
+             [macros.m]\nsteps = [{ hold = [\"A\",\"rt\"], ms = 50 }]\n",
+        )];
+        assert_eq!(validate(&ConfigFile::default(), &buttons), Vec::new());
+
+        // No direction keys at all: nothing to compare against, so nothing said.
+        let silent = vec![macro_preset(
+            "[bindings]\nA = \"S\"\n[macros.m]\nsteps = [{ hold = [\"dpad.up\"], ms = 50 }]\n",
+        )];
+        assert_eq!(validate(&ConfigFile::default(), &silent), Vec::new());
+
+        // An UNBOUND direction row is a placeholder, not something the player
+        // can produce — it must not count as "this preset drives the stick".
+        let placeholder = vec![macro_preset(
+            "[bindings]\n\"ly.min\" = \"None\"\n\"dpad.down\" = \"Down\"\n\
+             [macros.m]\nsteps = [{ hold = [\"dpad.down\"], ms = 50 }]\n",
+        )];
+        assert_eq!(validate(&ConfigFile::default(), &placeholder), Vec::new());
+    }
+
+    /// The turbo rate: refused when it cannot be read, reported when it cannot
+    /// be delivered, and named as inert when nothing repeats.
+    #[test]
+    fn turbo_rates_are_reported_rather_than_silently_adjusted() {
+        // Above the ceiling: clamped, with both numbers stated.
+        let fast = vec![macro_preset(
+            "[macros.m]\nrepeat = \"turbo\"\nturbo_hz = 120\n\
+             steps = [{ hold = [\"A\"], ms = 50 }]\n",
+        )];
+        assert_eq!(
+            validate(&ConfigFile::default(), &fast),
+            vec![Issue::TurboRateClamped {
+                preset: "m".into(),
+                name: "m".into(),
+                asked_hz: 120,
+                effective_hz: 12,
+            }]
+        );
+
+        // A gap below the sampling floor is raised, loudly.
+        let tight = vec![macro_preset(
+            "[macros.m]\nrepeat = \"turbo\"\ngap_ms = 5\n\
+             steps = [{ hold = [\"A\"], ms = 50 }]\n",
+        )];
+        let issues = validate(&ConfigFile::default(), &tight);
+        assert_eq!(
+            issues,
+            vec![Issue::TurboGapRaised {
+                preset: "m".into(),
+                name: "m".into(),
+                ms: 5,
+                raised_to: MIN_STEP_MS,
+            }]
+        );
+        assert!(issues[0].to_string().contains("one long hold"));
+
+        // A rate on a macro that does not repeat does nothing, and says so.
+        let inert = vec![macro_preset(
+            "[macros.m]\nturbo_hz = 10\nsteps = [{ hold = [\"A\"], ms = 50 }]\n",
+        )];
+        assert_eq!(
+            validate(&ConfigFile::default(), &inert),
+            vec![Issue::TurboRateWithoutTurbo {
+                preset: "m".into(),
+                name: "m".into(),
+                repeat: "once".into(),
+            }]
+        );
+
+        // Both units, and a turbo with none: refused, not guessed.
+        for body in [
+            "repeat = \"turbo\"\nturbo_hz = 10\ngap_ms = 50\n",
+            "repeat = \"turbo\"\n",
+        ] {
+            let bad = vec![macro_preset(&format!(
+                "[macros.m]\n{body}steps = [{{ hold = [\"A\"], ms = 50 }}]\n"
+            ))];
+            let issues = validate(&ConfigFile::default(), &bad);
+            assert!(
+                matches!(issues.as_slice(), [Issue::MacroTurboBadRate { .. }]),
+                "{body:?} gave {issues:?}"
+            );
+            assert!(!issues[0].is_advisory());
+        }
+    }
+
+    /// A deliverable turbo is completely clean — no advisory for a rate that
+    /// arrives exactly as asked.
+    #[test]
+    fn a_deliverable_turbo_reports_nothing() {
+        let presets = vec![macro_preset(
+            "[bindings]\nA = \"S\"\nmacro.fire = \"P\"\n\
+             [macros.fire]\nrepeat = \"turbo\"\nturbo_hz = 10\n\
+             steps = [{ hold = [\"A\"], ms = 50 }]\n",
+        )];
+        assert_eq!(validate(&ConfigFile::default(), &presets), Vec::new());
     }
 }

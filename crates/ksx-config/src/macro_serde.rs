@@ -54,6 +54,28 @@ pub mod interrupt {
     }
 }
 
+pub mod repeat {
+    use std::str::FromStr;
+
+    use ksx_core::Repeat;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(policy: &Repeat, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(policy.as_str())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Repeat, D::Error> {
+        let raw = String::deserialize(d)?;
+        Repeat::from_str(&raw).map_err(serde::de::Error::custom)
+    }
+
+    /// `once` is the default and is never written — a preset that predates the
+    /// setting serializes to exactly the bytes it always did.
+    pub fn is_default(policy: &Repeat) -> bool {
+        *policy == Repeat::default()
+    }
+}
+
 pub mod retrigger {
     use std::str::FromStr;
 

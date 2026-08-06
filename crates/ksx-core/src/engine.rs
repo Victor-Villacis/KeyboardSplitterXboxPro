@@ -13,7 +13,7 @@ use smallvec::SmallVec;
 
 use crate::device::{DeviceId, KeyEvent};
 use crate::key::Key;
-use crate::macros::{Interrupt, OnRelease, Retrigger};
+use crate::macros::{Interrupt, OnRelease, Repeat, Retrigger};
 use crate::pad::{Axis, PadState, Trigger, AXIS_CENTER};
 use crate::preset::{Binding, Chord, Preset};
 use crate::slot::SlotSpec;
@@ -90,12 +90,21 @@ struct MacroRt {
     on_release: OnRelease,
     retrigger: Retrigger,
     interrupt: Interrupt,
+    /// What the end of a run does while the trigger is still down.
+    repeat: Repeat,
+    /// The neutral window between turbo runs, resolved and floored once by
+    /// [`crate::Macro::turbo_gap_ms`]. Zero for every other policy.
+    gap_ms: u32,
     /// Dense ids of the keys that start this macro (multi-bind: several keys
     /// may, and one key may start several macros).
     triggers: SmallVec<[u32; 2]>,
     /// Which step is live. `None` ⇒ not running, and every one of this macro's
     /// holders is down.
     step: Option<u16>,
+    /// Between two turbo runs: nothing is held, a timer is armed for the end of
+    /// the gap, and the macro is still very much alive. Distinct from `step ==
+    /// None` alone, which is how "not running at all" is spelled.
+    gapping: bool,
     /// When the current run began, on the caller's clock. The origin every
     /// deadline in `ends` is measured from.
     start: u64,
@@ -498,6 +507,7 @@ impl SlotRuntime {
         }
         for mac in &mut self.macros {
             mac.step = None;
+            mac.gapping = false;
         }
         self.macro_dirty.clear();
         self.held.iter_mut().for_each(|w| *w = 0);
@@ -547,6 +557,11 @@ impl SlotRuntime {
     }
 
     /// The trigger key went down.
+    ///
+    /// Only ever called on a genuine key EDGE ([`Engine::handle_at`] drops
+    /// key-downs for a key that is already down), so keyboard autorepeat cannot
+    /// re-arm a finished run. Repetition is [`Repeat`]'s job, and it is asked
+    /// for by name.
     fn macro_start(&mut self, m: usize, now: u64, si: u8, timers: &mut Timers) {
         let first = self.macros[m].first_holder;
         if self.macros[m].ends.is_empty() {
@@ -561,9 +576,17 @@ impl SlotRuntime {
                 Retrigger::Restart => self.mark(first + u32::from(step)),
             }
         }
-        // A run's whole timeline is fixed here, from THIS instant.
+        self.macro_begin(m, now, si, timers);
+    }
+
+    /// Put a run on step 0 starting at `now`. The one place a run's timeline is
+    /// fixed — a fresh press and a repeat go through exactly the same door, so
+    /// the second run of a turbo is the same shape as the first.
+    fn macro_begin(&mut self, m: usize, now: u64, si: u8, timers: &mut Timers) {
+        let first = self.macros[m].first_holder;
         self.macros[m].start = now;
         self.macros[m].step = Some(0);
+        self.macros[m].gapping = false;
         self.mark(first);
         let deadline = self.macro_deadline(m, 0, now);
         timers.arm(si, m as u16, deadline);
@@ -571,32 +594,81 @@ impl SlotRuntime {
 
     /// Stop now and release everything this macro held. The one path that
     /// [`OnRelease::Abort`], a device yank, a session stop and an escape
-    /// gesture all share.
+    /// gesture all share — and it ends the repeat loop too, because every one
+    /// of those means *this macro is done*, not *this run is done*.
     fn macro_cancel(&mut self, m: usize, si: u8, timers: &mut Timers) {
         let first = self.macros[m].first_holder;
         if let Some(step) = self.macros[m].step.take() {
             self.mark(first + u32::from(step));
         }
+        self.macros[m].gapping = false;
         timers.cancel(si, m as u16);
     }
 
-    /// A deadline was reached: move to the next step, or finish.
-    fn macro_advance(&mut self, m: usize, now: u64, si: u8, timers: &mut Timers) {
+    /// A deadline was reached: move to the next step, finish, or start the next
+    /// run.
+    ///
+    /// `trigger_held` is whether any of this macro's trigger keys is still
+    /// physically down, read by the caller from the slot's key bitset. It is
+    /// consulted at exactly one instant — the end of a run — which is what makes
+    /// [`Repeat`] compose with [`OnRelease::Finish`] rather than contradict it:
+    /// let go mid-run and the run finishes, but nothing follows it.
+    fn macro_advance(
+        &mut self,
+        m: usize,
+        now: u64,
+        si: u8,
+        trigger_held: bool,
+        timers: &mut Timers,
+    ) {
         let first = self.macros[m].first_holder;
         let Some(step) = self.macros[m].step else {
+            // Not on a step: either nothing is running (a stale timer, which
+            // cannot happen but must not misbehave if it did) or a turbo gap
+            // just ended.
+            if self.macros[m].gapping {
+                self.macros[m].gapping = false;
+                if trigger_held {
+                    self.macro_begin(m, now, si, timers);
+                }
+            }
             return;
         };
         self.mark(first + u32::from(step));
         let next = step + 1;
         if usize::from(next) >= self.macros[m].ends.len() {
+            // The run is over. Everything it held is released either way — the
+            // mark above is that release — and only then does `repeat` get to
+            // ask for another one.
             self.macros[m].step = None;
-            timers.cancel(si, m as u16);
+            if !self.macros[m].repeat.repeats() || !trigger_held {
+                timers.cancel(si, m as u16);
+                return;
+            }
+            if self.macros[m].repeat.wants_gap() {
+                // Turbo: publish the neutral gap as a real state for a real
+                // duration, then run again. A gap nobody samples is not a gap
+                // (§0.2), which is why `gap_ms` is floored at build time.
+                self.macros[m].gapping = true;
+                let gap = u64::from(self.macros[m].gap_ms);
+                timers.arm(si, m as u16, now + gap);
+            } else {
+                // While-held: straight back to step 0 in the SAME delta batch,
+                // so a motion that ends and restarts never blinks an endpoint
+                // the two runs share.
+                self.macro_begin(m, now, si, timers);
+            }
             return;
         }
         self.macros[m].step = Some(next);
         self.mark(first + u32::from(next));
         let deadline = self.macro_deadline(m, next, now);
         timers.arm(si, m as u16, deadline);
+    }
+
+    /// Is any key that starts macro `m` currently down on `down`?
+    fn macro_trigger_held(&self, m: usize, down: &[u64]) -> bool {
+        self.macros[m].triggers.iter().any(|&k| bit(down, k))
     }
 
     /// A key moved on this slot's chord device: start or abort whatever it
@@ -670,7 +742,10 @@ impl SlotRuntime {
     fn cancel_all_macros(&mut self, si: u8, timers: &mut Timers) -> bool {
         let mut moved = false;
         for m in 0..self.macros.len() {
-            if self.macros[m].step.is_some() {
+            // A macro resting in a turbo gap holds nothing, but it is still
+            // armed — leaving it would restart a sequence into a game the
+            // player has just been disconnected from.
+            if self.macros[m].step.is_some() || self.macros[m].gapping {
                 self.macro_cancel(m, si, timers);
                 moved = true;
             }
@@ -844,6 +919,11 @@ impl EngineTables {
                     on_release: def.on_release,
                     retrigger: def.retrigger,
                     interrupt: def.interrupt,
+                    repeat: def.repeat,
+                    // Resolved ONCE, off the hot path: the clamp, the cycle
+                    // arithmetic and the sampling floor all happen here, so the
+                    // scheduler only ever adds a number.
+                    gap_ms: def.turbo_gap_ms(),
                     triggers: rs
                         .preset
                         .macros
@@ -853,6 +933,7 @@ impl EngineTables {
                         .map(|t| intern_key(&mut index, &mut targets, t.key))
                         .collect(),
                     step: None,
+                    gapping: false,
                     start: 0,
                 })
                 .collect();
@@ -1258,6 +1339,17 @@ impl Engine {
         // this transition applied (legacy interceptor state worked the same).
         let word = dev * self.words + (dense / 64) as usize;
         let mask = 1u64 << (dense % 64);
+        // Did this event actually MOVE the key?
+        //
+        // Windows repeats a held key ~30 times a second, and every repeat
+        // arrives as another key-down for a key that is already down. For the
+        // key SET — buttons, axes, chords — that is harmless and idempotent,
+        // which is why nothing needed to know before. For an EDGE-triggered
+        // feature it is not: a macro restarted on every repeat is a macro that
+        // "acts like a turbo" for as long as the button is held, which is
+        // exactly the cabinet bug this flag fixes. Repetition is [`Repeat`]'s
+        // job and is asked for by name.
+        let edge = (self.down[word] & mask != 0) != ev.down;
         if ev.down {
             self.down[word] |= mask;
         } else {
@@ -1299,10 +1391,15 @@ impl Engine {
                     // panel, and "one device decides" is already the rule.
                     // Interrupts first, so one press can stop one sequence and
                     // start another inside a single delta batch.
-                    if ev.down {
-                        slot.macro_interrupt(dense, si as u8, &mut self.timers);
+                    //
+                    // EDGES only: an autorepeat is not a new press, so it
+                    // neither starts a macro nor interrupts one.
+                    if edge {
+                        if ev.down {
+                            slot.macro_interrupt(dense, si as u8, &mut self.timers);
+                        }
+                        slot.macro_key(dense, ev.down, now, si as u8, &mut self.timers);
                     }
-                    slot.macro_key(dense, ev.down, now, si as u8, &mut self.timers);
                     slot.sync(down, Some(dense), false);
                 } else {
                     slot.sync_key(down, dense);
@@ -1394,10 +1491,33 @@ impl Engine {
             return deltas;
         }
         while let Some((si, mac)) = self.timers.pop_due(now) {
-            self.slots[si as usize].macro_advance(usize::from(mac), now, si, &mut self.timers);
+            // Read BEFORE the transition, because the only question `repeat`
+            // asks is "is the player still holding the button right now".
+            let held = self.trigger_held(si, mac);
+            self.slots[si as usize].macro_advance(
+                usize::from(mac),
+                now,
+                si,
+                held,
+                &mut self.timers,
+            );
         }
         self.apply_macro_moves(&mut deltas);
         deltas
+    }
+
+    /// Is any trigger key of slot `si`'s macro `mac` still down?
+    ///
+    /// Read from the slot's CHORD device, the same device its triggers are
+    /// evaluated on. A slot with no input device answers `false`: nobody is
+    /// holding anything there, so nothing may repeat.
+    fn trigger_held(&self, si: u8, mac: u16) -> bool {
+        let slot = &self.slots[usize::from(si)];
+        let Some(dev) = slot.chord_device else {
+            return false;
+        };
+        let base = usize::from(dev) * self.words;
+        slot.macro_trigger_held(usize::from(mac), &self.down[base..base + self.words])
     }
 
     /// When [`Engine::tick`] next has something to do, in the same milliseconds

@@ -182,7 +182,7 @@ Guard evaluation is O(guard size) bit tests per event, allocation-free:
   `tests/engine_chords_alloc.rs` pins zero allocation on the chord path;
   `tests/engine_alloc.rs` and the replay corpus pin the chord-free one.
 
-### 1c. Macros — SHIPPED (2026-08-05)
+### 1c. Macros — SHIPPED (2026-08-05; `repeat` and the autorepeat fix 2026-08-06)
 
 Hadouken is ↓, ↘, → + punch **over time**. That is not a set, it is a
 timeline, and it needed three things the engine did not have: a clock, a
@@ -199,7 +199,9 @@ bindings — not two events, not a special case.
 ```rust
 pub struct MacroStep { hold: Vec<Binding>, duration: StepDuration, allow_short: bool }
 pub enum   StepDuration { Ms(u32), Frames(u32) }
-pub struct Macro { name, steps, on_release, retrigger, interrupt }
+pub struct Macro { name, steps, on_release, retrigger, interrupt, repeat, turbo }
+pub enum   Repeat { Once, WhileHeld, Turbo }
+pub enum   TurboRate { Hz(u32), GapMs(u32) }
 pub struct MacroTrigger { key: Key, index: u16 }   // key -> macro
 ```
 
@@ -322,6 +324,84 @@ A macro is never interrupted by its own trigger; that is a retrigger, and
 `retrigger` decides it. One press can abort one macro and start another,
 and both land in the single delta batch that event produces.
 
+#### A press is an EDGE, never an autorepeat (fixed 2026-08-06)
+
+Windows repeats a held key ~30 times a second, and every repeat arrives as
+another key-**down** for a key that is already down. For the key SET —
+buttons, axes, chords — that is harmless and idempotent, which is why
+nothing needed to know. For an edge-triggered feature it is not: every
+repeat used to re-arm a finished macro, so *holding* the trigger played the
+sequence over and over. On a cabinet that reads as "if I hold it, it never
+stops… it's acting like a turbo."
+
+`Engine::handle_at` now computes whether the event actually moved the key
+and only runs the macro trigger and interrupt paths on a genuine edge. The
+default is therefore exactly **one run per press**, and repetition is
+something you ask for by name (below). Everything else — the pad state, the
+all-keys-up rule, the delta diffing — is unchanged, because a repeated
+key-down never changed any of it anyway.
+
+#### Repeating — `once` / `while-held` / `turbo` (SHIPPED 2026-08-06)
+
+| Setting | Values | Default | Means |
+|---|---|---|---|
+| `repeat` | `once` \| `while-held` \| `turbo` | `once` | what the END of a run does while the trigger is still down |
+| `turbo_hz` | integer | — | full cycles (run + gap) per second |
+| `gap_ms` | integer | — | the released window between runs, directly |
+
+- **`once`** — one run per press. Holding the trigger changes nothing. This
+  is the default and the fighting-game expectation: a special move must not
+  become a machine gun because a switch stuck.
+- **`while-held`** — re-run from step 0 the instant the last step ends, for
+  as long as the trigger is down, **finishing the current run** either way.
+  No gap: the two runs are one continuous motion, so an endpoint the last
+  step and the first step share never blinks.
+- **`turbo`** — the same with a deliberate neutral **gap** between runs, so
+  the game samples a released frame and reads two presses instead of one
+  long hold. The gap is published state for a real duration, like any step.
+
+`turbo_hz` and `gap_ms` are two spellings of one number and giving both is
+refused, exactly like `ms`/`frames` on a step; a `repeat = "turbo"` with
+**neither** is refused too, because an auto-fire whose rate ksx picked is an
+auto-fire nobody asked for.
+
+**The rate has a ceiling, and it is arithmetic, not policy.** One turbo
+cycle is a press *and* a release, so at a 60 Hz poll the best case is one
+sample pressed and one released — `TURBO_MAX_HZ = 30`. Above it the rate is
+**clamped, not refused** (refusing a number that is merely optimistic would
+be unkind), and validation states both figures. The honest ceiling is
+usually lower: ksx's own step floor makes the shortest visible press 33 ms
+and the shortest visible gap another 33, so a one-step macro tops out near
+15 Hz. `turbo_hz = 30` on a 50 ms macro really runs at about 12 Hz, and
+`Macro::effective_turbo_hz()` is the number the preset actually gets —
+computed once in ksx-core so the engine, validation and any plan printer
+cannot drift apart.
+
+**Precedence, when every policy has an opinion.** They answer four different
+questions and are evaluated in the order the events happen:
+
+1. `interrupt` — other input arrived. An abort is an **exit**: the run
+   stops, everything releases, and *no repeat follows it*.
+2. `on_release` — the trigger came up. `abort` stops now (and therefore
+   never repeats); `finish` lets the run in flight complete.
+3. `repeat` — the last step just ended. `once` stops; `while-held` and
+   `turbo` re-run **only if the trigger is still down at that instant**.
+   That is why `finish` + `while-held` means "let go and it stops after this
+   run" rather than a contradiction.
+4. `retrigger` — a NEW press arrived mid-run. Unchanged by any of the above,
+   and unrelated to repeat: a repeat is not a press and never counts as one.
+
+Everything releases on stop, from a turbo **gap** too — a macro resting
+between runs holds nothing but is still armed, so `cancel_macros`, a device
+yank and a hot swap all disarm it.
+
+```toml
+[macros.autofire]
+repeat = "turbo"
+turbo_hz = 10          # or: gap_ms = 50
+steps = [{ hold = ["A"], frames = 2 }]
+```
+
 #### Everything releases on the way out
 
 A macro STEP is an ordinary **holder**: `holder_bindings[first + i]` is step
@@ -352,8 +432,33 @@ Every exit uses the same cancel-and-release path, and each has a test:
 macro the preset does not define), `GuardedMacroTrigger`,
 `DuplicateMacroName` (names match ignoring case, so two tables differing
 only in case would silently shadow), `MacroStepBadDuration` (both units or
-neither) — all faults. `MacroStepRaised` and `MacroStepMayBeMissed` are the
-two advisories, printed by the plan as `[WARN]`.
+neither), `MacroTurboBadRate` (both rate units, or a turbo with none) — all
+faults. `MacroStepRaised`, `MacroStepMayBeMissed`, `TurboRateClamped`,
+`TurboGapRaised`, `TurboRateWithoutTurbo` and `MacroHoldsOtherMechanism`
+are the advisories, printed by the plan as `[WARN]`.
+
+##### `MacroHoldsOtherMechanism` — "the diagonal never comes out"
+
+A pad has three ways to say *right*: the dpad, the left stick, the right
+stick. A game reads whichever one it was written for, and **ksx publishes
+exactly what the step says** — so a step holding `dpad.right` on a preset
+whose stick is `lx`/`ly` is faithfully published and read by nobody.
+
+The symptom is nastier than "the macro does nothing", because it is usually
+*one* step that was written that way — the diagonal, copied out of an
+example that used the dpad — into a motion whose other steps use the
+preset's own functions. The game then shows ↓ and →, and never ↘: a motion
+with a hole in it, which looks exactly like an engine bug and is not one.
+The engine was tested against this directly (`engine_macros.rs`: the axis
+diagonal is one stable published state for the step's whole duration, a
+60 Hz sampler sees it, SOCD never touches a perpendicular pair, and a step
+may even hold a dpad bit *and* an axis at once).
+
+So validation compares each step's directional holds against the mechanisms
+the preset's own **bound** direction keys drive, and names the mismatch,
+the step and both mechanisms. It stays quiet when it has nothing to say: a
+preset that drives both, a hold that is a button or trigger (no mechanism),
+an unbound placeholder row, or a preset with no direction keys at all.
 
 #### CLI surface — triggers only, on purpose
 
@@ -377,10 +482,10 @@ surface can still *read* everything. A mapper UI for macros is a later pass.
 - **No chord that starts a macro.** `macro.x = { key = "P", when = ["Q"] }`
   is refused rather than half-implemented; the guard would have to compose
   with consumption, and nothing asked for it yet.
-- **No looping / hold-to-repeat.** A macro is one-shot: the last step ends
-  the run even if the trigger is still held. That is turbo (§2.3), a
-  different feature with a different aliasing problem, and folding the two
-  would make both harder to explain.
+- ~~**No looping / hold-to-repeat.**~~ Shipped 2026-08-06 as `repeat`
+  (above). The aliasing problem it was deferred for is not solved by
+  avoiding it — it is `TURBO_MAX_HZ`, the effective-rate report, and the
+  sampling floor on the gap, all stated out loud.
 - **No `interrupt = "opposing"` beyond the two stated rules.** Anything
   fuzzier would be unpredictable on a cabinet, so it is direction
   opposition plus other-macro-triggers, and this document says so.

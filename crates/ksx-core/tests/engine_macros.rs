@@ -9,8 +9,8 @@ mod common;
 use common::{ev, ipac_device, preset, preset_with_macros};
 use ksx_core::{
     Axis, Binding, DpadDirection, Engine, EngineTables, Interrupt, Key, Macro, MacroStep,
-    MacroTrigger, Macros, OnRelease, PadState, ResolvedSlot, Retrigger, SlotSpec, Trigger, XButton,
-    XButtons, AXIS_MAX, MIN_STEP_MS,
+    MacroTrigger, Macros, OnRelease, PadState, Repeat, ResolvedSlot, Retrigger, SlotSpec, Trigger,
+    TurboRate, XButton, XButtons, AXIS_MAX, MIN_STEP_MS,
 };
 
 const DOWN: Binding = Binding::Dpad(DpadDirection::Down);
@@ -359,6 +359,10 @@ fn interrupt_any_input_aborts_on_any_other_bound_key() {
     assert_eq!(engine.next_deadline(), None);
 
     // A RELEASE is not "input" for this purpose — only a key going down is.
+    // (P has to come up first: a second key-down for a key that is already
+    // down is an autorepeat, and autorepeat starts nothing — see
+    // `an_autorepeated_trigger_runs_the_macro_exactly_once`.)
+    release(&mut engine, Key::P, 90);
     press(&mut engine, Key::P, 100);
     assert_eq!(release(&mut engine, Key::G, 110), 1);
     assert_eq!(engine.next_deadline(), Some(150));
@@ -695,4 +699,373 @@ fn a_macro_free_preset_never_arms_a_deadline() {
     }
     assert!(engine.tick(10_000).is_empty());
     assert!(engine.cancel_macros().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The diagonal, on the mechanism Victor's cabinet actually drives
+// ---------------------------------------------------------------------------
+//
+// His stick is bound to the LEFT ANALOG AXES (`lx.min/max`, `ly.min/max`) with
+// the dpad unbound, which is a different code path from the dpad hadouken
+// above: dpad directions are independent BITS in one field, while axes are
+// whole-field ASSIGNMENTS with an opposite-axis snap on release. A two-binding
+// step therefore has to survive a mechanism where "press" can overwrite and
+// "release" can snap — so it gets its own tests rather than an argument.
+
+const DOWN_AX: Binding = Binding::Axis {
+    axis: Axis::Y,
+    value: ksx_core::AXIS_MIN,
+};
+const RIGHT_AX: Binding = Binding::Axis {
+    axis: Axis::X,
+    value: AXIS_MAX,
+};
+
+/// The same motion as `hadouken()`, written the way his preset drives.
+fn axis_hadouken() -> Macro {
+    Macro::new(
+        "hadouken",
+        vec![
+            MacroStep::frames(vec![DOWN_AX], 3),
+            MacroStep::frames(vec![DOWN_AX, RIGHT_AX], 3),
+            MacroStep::frames(vec![RIGHT_AX], 3),
+            MacroStep::frames(vec![PUNCH], 3),
+        ],
+    )
+}
+
+/// His preset's own direction rows: axes bound, dpad unbound.
+fn axis_entries() -> Vec<(Key, Binding)> {
+    vec![
+        (Key::K, DOWN_AX),
+        (
+            Key::L,
+            Binding::Axis {
+                axis: Axis::Y,
+                value: AXIS_MAX,
+            },
+        ),
+        (
+            Key::M,
+            Binding::Axis {
+                axis: Axis::X,
+                value: ksx_core::AXIS_MIN,
+            },
+        ),
+        (Key::N, RIGHT_AX),
+    ]
+}
+
+/// ↘ written as ONE step holding two axis bindings is one published state with
+/// both axes deflected — and it stays that state for the step's whole duration,
+/// so a poller sampling anywhere inside the step reads the diagonal.
+#[test]
+fn an_axis_diagonal_is_one_stable_state_for_the_whole_step() {
+    let mut engine = engine_with_entries(axis_hadouken(), axis_entries());
+    press(&mut engine, Key::P, 0);
+    assert_eq!(
+        (state(&engine).lx, state(&engine).ly),
+        (0, ksx_core::AXIS_MIN)
+    );
+
+    // One delta for the transition, carrying BOTH deflections.
+    let deltas = engine.tick(50);
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0].state.lx, AXIS_MAX);
+    assert_eq!(deltas[0].state.ly, ksx_core::AXIS_MIN);
+
+    // Sampled every millisecond of the step, it never stops being the diagonal:
+    // no release-then-press hole, and the shared ly binding never blinks.
+    for t in 50..100 {
+        engine.tick(t);
+        assert_eq!(
+            (state(&engine).lx, state(&engine).ly),
+            (AXIS_MAX, ksx_core::AXIS_MIN),
+            "lost the diagonal at t={t}"
+        );
+    }
+    // ...and only then does the down half let go, snapping to centre.
+    engine.tick(100);
+    assert_eq!((state(&engine).lx, state(&engine).ly), (AXIS_MAX, 0));
+}
+
+/// A 60 Hz consumer — the one the sampling rule is written for — sees all three
+/// direction states, diagonal included.
+#[test]
+fn a_60hz_sampler_sees_every_step_of_an_axis_motion() {
+    let mut engine = engine_with_entries(axis_hadouken(), axis_entries());
+    press(&mut engine, Key::P, 0);
+    let mut sampled: Vec<(i16, i16)> = Vec::new();
+    for t in 0..250 {
+        engine.tick(t);
+        if t % 16 == 0 {
+            let s = state(&engine);
+            if sampled.last() != Some(&(s.lx, s.ly)) {
+                sampled.push((s.lx, s.ly));
+            }
+        }
+    }
+    assert!(
+        sampled.contains(&(AXIS_MAX, ksx_core::AXIS_MIN)),
+        "a 60 Hz sampler never saw the diagonal: {sampled:?}"
+    );
+}
+
+/// Perpendicular is not opposing: SOCD cleaning cancels ←+→ and ↑+↓, and must
+/// leave ↓+→ completely alone (`crate::socd::opposes` is the one definition,
+/// shared with `Interrupt::Opposing`).
+#[test]
+fn socd_cleaning_never_touches_a_perpendicular_diagonal() {
+    for policy in [ksx_core::Socd::Neutral, ksx_core::Socd::UpPriority] {
+        let mut p = preset_with_macros(
+            "socd",
+            axis_entries(),
+            macros(vec![axis_hadouken()], vec![MacroTrigger::new(Key::P, 0)]),
+        );
+        p.apply_socd(policy);
+        let mut engine = Engine::new(vec![ResolvedSlot {
+            spec: SlotSpec::new(1, Some(ipac_device()), None, p.name.clone()).expect("valid slot"),
+            preset: p,
+        }]);
+        press(&mut engine, Key::P, 0);
+        engine.tick(50);
+        assert_eq!(
+            (state(&engine).lx, state(&engine).ly),
+            (AXIS_MAX, ksx_core::AXIS_MIN),
+            "socd {policy} ate the diagonal"
+        );
+    }
+}
+
+/// A step may hold two DIFFERENT mechanisms at once (a dpad bit and a stick
+/// axis). Both are published; neither overwrites the other.
+#[test]
+fn a_step_may_hold_a_dpad_bit_and_an_axis_together() {
+    let mac = Macro::new(
+        "mixed",
+        vec![
+            MacroStep::new(vec![DOWN], 50),
+            MacroStep::new(vec![DOWN, RIGHT_AX], 50),
+            MacroStep::new(vec![RIGHT_AX], 50),
+        ],
+    );
+    let mut engine = engine_with_entries(mac, axis_entries());
+    press(&mut engine, Key::P, 0);
+    engine.tick(50);
+    let s = state(&engine);
+    assert!(
+        s.buttons.contains(XButtons::DPAD_DOWN) && s.lx == AXIS_MAX,
+        "{s:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Repeat: once (the default), while-held, turbo (docs/INPUT-TRANSFORMS.md §1c)
+// ---------------------------------------------------------------------------
+
+/// A one-step macro, so a run is one step long and the repeat arithmetic is
+/// readable at a glance.
+fn tap() -> Macro {
+    Macro::new("tap", vec![MacroStep::new(vec![PUNCH], 50)])
+}
+
+/// **The turbo bug.** Windows repeats a held key ~30 times a second, and every
+/// repeat is another key-DOWN for a key that is already down. Before this, each
+/// one re-armed a finished macro — "if I hold it, it never stops".
+///
+/// The default is one run per press, and a key that never came up never
+/// produced a second press.
+#[test]
+fn an_autorepeated_trigger_runs_the_macro_exactly_once() {
+    let mut engine = engine_with(hadouken());
+    press(&mut engine, Key::P, 0);
+
+    // Held down the whole time; autorepeat every 33 ms, as a real keyboard does.
+    let mut repeat = 33;
+    for t in 1..=400 {
+        if t == repeat {
+            assert_eq!(
+                press(&mut engine, Key::P, t),
+                0,
+                "autorepeat at {t} moved a pad"
+            );
+            repeat += 33;
+        }
+        engine.tick(t);
+    }
+    // One run, 200 ms, finished — and nothing armed, however long he leans on it.
+    assert_eq!(state(&engine), PadState::default());
+    assert_eq!(engine.next_deadline(), None);
+
+    // A genuine second press (key up, key down) still starts a second run.
+    release(&mut engine, Key::P, 500);
+    press(&mut engine, Key::P, 501);
+    assert_eq!(engine.next_deadline(), Some(551));
+}
+
+/// The same, said as an invariant: an autorepeat is not an interrupt either.
+/// `interrupt = "any-input"` must not abort a run because some other key is
+/// repeating under the player's thumb.
+#[test]
+fn an_autorepeat_of_another_key_does_not_interrupt() {
+    let mut mac = hadouken();
+    mac.interrupt = Interrupt::AnyInput;
+    let mut engine = engine_with_entries(mac, vec![(Key::G, Binding::Button(XButton::B))]);
+
+    press(&mut engine, Key::G, 0); // already leaning on B
+    press(&mut engine, Key::P, 10);
+    assert_eq!(engine.next_deadline(), Some(60));
+    // G repeats while held: not a new press, so not an interrupt.
+    assert_eq!(press(&mut engine, Key::G, 20), 0);
+    assert_eq!(engine.next_deadline(), Some(60));
+    // A genuine new press of G still aborts, exactly as documented.
+    release(&mut engine, Key::G, 30);
+    press(&mut engine, Key::G, 40);
+    assert_eq!(engine.next_deadline(), None);
+}
+
+/// `repeat = "while-held"`: the sequence runs again the instant it ends, for as
+/// long as the trigger is down — and the run in flight is never cut short.
+#[test]
+fn while_held_reruns_until_the_trigger_comes_up() {
+    let mut mac = tap();
+    mac.repeat = Repeat::WhileHeld;
+    let mut engine = engine_with(mac);
+
+    press(&mut engine, Key::P, 0);
+    assert_eq!(state(&engine).buttons, XButtons::A);
+    // End of run 1 goes straight into run 2, no gap: A never lets go.
+    engine.tick(50);
+    assert_eq!(state(&engine).buttons, XButtons::A);
+    assert_eq!(engine.next_deadline(), Some(100));
+    engine.tick(100);
+    assert_eq!(state(&engine).buttons, XButtons::A);
+
+    // Let go mid-run: `on_release = finish` (the default) means this run
+    // completes — and then nothing follows it.
+    release(&mut engine, Key::P, 120);
+    assert_eq!(engine.next_deadline(), Some(150));
+    assert_eq!(state(&engine).buttons, XButtons::A);
+    engine.tick(150);
+    assert_eq!(state(&engine), PadState::default());
+    assert_eq!(engine.next_deadline(), None);
+}
+
+/// `repeat = "turbo"`: the same, with a REAL released window between runs, so
+/// the game reads two presses instead of one hold.
+#[test]
+fn turbo_puts_a_visible_gap_between_runs() {
+    let mut mac = tap();
+    mac.repeat = Repeat::Turbo;
+    mac.turbo = Some(TurboRate::GapMs(50));
+    let mut engine = engine_with(mac);
+
+    press(&mut engine, Key::P, 0);
+    assert_eq!(state(&engine).buttons, XButtons::A);
+    // Run ends at 50: everything releases, and the gap is a published state.
+    assert_eq!(engine.tick(50).len(), 1);
+    assert_eq!(state(&engine), PadState::default());
+    assert_eq!(engine.next_deadline(), Some(100));
+    // Still neutral all the way through the gap — a gap nobody samples is not
+    // a gap (§0.2).
+    for t in 50..100 {
+        engine.tick(t);
+        assert_eq!(state(&engine), PadState::default(), "gap broke at t={t}");
+    }
+    // Gap over: run 2.
+    assert_eq!(engine.tick(100).len(), 1);
+    assert_eq!(state(&engine).buttons, XButtons::A);
+    assert_eq!(engine.next_deadline(), Some(150));
+
+    // Released during the gap: the next run never starts, nothing is armed,
+    // and nothing is left held.
+    release(&mut engine, Key::P, 160);
+    engine.tick(150);
+    engine.tick(200);
+    assert_eq!(state(&engine), PadState::default());
+    assert_eq!(engine.next_deadline(), None);
+}
+
+/// Everything releases on the way out — from a turbo GAP too, where the macro
+/// holds nothing but is still very much armed.
+#[test]
+fn cancelling_during_a_turbo_gap_disarms_it() {
+    let mut mac = tap();
+    mac.repeat = Repeat::Turbo;
+    mac.turbo = Some(TurboRate::Hz(10));
+    let mut engine = engine_with(mac);
+
+    press(&mut engine, Key::P, 0);
+    engine.tick(50);
+    assert_eq!(state(&engine), PadState::default());
+    assert!(engine.next_deadline().is_some(), "a gap is still armed");
+
+    engine.cancel_macros();
+    assert_eq!(engine.next_deadline(), None);
+    assert!(engine.tick(10_000).is_empty());
+    assert_eq!(state(&engine), PadState::default());
+}
+
+/// Precedence, as code: `interrupt` beats `repeat`. An abort is an EXIT, so no
+/// repeat follows it however hard the trigger is held.
+#[test]
+fn an_interrupt_ends_the_repeat_loop_not_just_the_run() {
+    let mut mac = tap();
+    mac.repeat = Repeat::WhileHeld;
+    mac.interrupt = Interrupt::AnyInput;
+    let mut engine = engine_with_entries(mac, vec![(Key::G, Binding::Button(XButton::B))]);
+
+    press(&mut engine, Key::P, 0);
+    engine.tick(50); // run 2 under way, trigger still held
+    assert_eq!(state(&engine).buttons, XButtons::A);
+    press(&mut engine, Key::G, 60);
+    assert_eq!(engine.next_deadline(), None);
+    assert_eq!(state(&engine).buttons, XButtons::B);
+    assert!(engine.tick(10_000).is_empty());
+}
+
+/// ...and so does `on_release = "abort"`: it stops the run, which stops the
+/// loop, in the same batch.
+#[test]
+fn abort_on_release_stops_a_while_held_loop_immediately() {
+    let mut mac = tap();
+    mac.repeat = Repeat::WhileHeld;
+    mac.on_release = OnRelease::Abort;
+    let mut engine = engine_with(mac);
+
+    press(&mut engine, Key::P, 0);
+    engine.tick(50);
+    assert_eq!(state(&engine).buttons, XButtons::A);
+    assert_eq!(release(&mut engine, Key::P, 60), 1);
+    assert_eq!(state(&engine), PadState::default());
+    assert_eq!(engine.next_deadline(), None);
+}
+
+/// A repeat is not a press: `retrigger` only ever decides what a NEW press does
+/// to a run in flight, and a while-held loop keeps running under either policy.
+#[test]
+fn repeat_and_retrigger_are_different_questions() {
+    for policy in [Retrigger::Ignore, Retrigger::Restart] {
+        let mut mac = tap();
+        mac.repeat = Repeat::WhileHeld;
+        mac.retrigger = policy;
+        let mut engine = engine_with(mac);
+        press(&mut engine, Key::P, 0);
+        engine.tick(50);
+        engine.tick(100);
+        assert_eq!(state(&engine).buttons, XButtons::A, "{policy}");
+        assert_eq!(engine.next_deadline(), Some(150), "{policy}");
+    }
+}
+
+/// The regression guarantee for the whole feature: `once` is the default, and a
+/// macro that does not ask to repeat behaves exactly as it always did.
+#[test]
+fn the_default_is_still_one_run_per_press() {
+    assert_eq!(Repeat::default(), Repeat::Once);
+    let mut engine = engine_with(tap());
+    press(&mut engine, Key::P, 0);
+    engine.tick(50);
+    assert_eq!(state(&engine), PadState::default());
+    assert_eq!(engine.next_deadline(), None);
 }

@@ -18,6 +18,12 @@ pub enum ConfigError {
         "{0} — a macro step's duration is `ms = <n>` or `frames = <n>` (60 Hz), exactly one of          them; a step with no duration would be an input no game could sample"
     )]
     MacroStepDuration(String),
+    #[error(
+        "{0} — a turbo macro's rate is `turbo_hz = <n>` or `gap_ms = <n>`, exactly one of them; \
+         guessing a rate would put an auto-fire on the wire that nobody asked for \
+         (docs/INPUT-TRANSFORMS.md §1c)"
+    )]
+    MacroTurboRate(String),
     #[error("no macro called '{0}' is defined in this preset (add a [macros.{0}] table)")]
     UnknownMacro(String),
     #[error(

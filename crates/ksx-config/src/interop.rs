@@ -590,6 +590,11 @@ mod tests {
                 on_release: ksx_core::macros::OnRelease::Abort,
                 retrigger: ksx_core::macros::Retrigger::Restart,
                 interrupt: ksx_core::macros::Interrupt::Opposing,
+                repeat: ksx_core::macros::Repeat::Turbo,
+                // The rate, in the unit it was authored in — `gap_ms` is the
+                // other spelling and the round-trip must not swap them.
+                turbo_hz: Some(12),
+                gap_ms: None,
             },
         )]
         .into_iter()

@@ -42,8 +42,9 @@ pub use engine::{Deltas, Engine, EngineTables, PadDelta, ResolvedSlot};
 pub use escape::{Escape, EscapeDetector};
 pub use key::Key;
 pub use macros::{
-    Interrupt, Macro, MacroStep, MacroTrigger, OnRelease, Retrigger, StepDuration,
-    UnknownInterrupt, UnknownOnRelease, UnknownRetrigger, MIN_STEP_MS,
+    Interrupt, Macro, MacroStep, MacroTrigger, OnRelease, Repeat, Retrigger, StepDuration,
+    TurboRate, UnknownInterrupt, UnknownOnRelease, UnknownRepeat, UnknownRetrigger, MIN_STEP_MS,
+    TURBO_MAX_HZ,
 };
 pub use pad::{
     Axis, DpadDirection, PadState, Trigger, XButton, XButtons, AXIS_CENTER, AXIS_MAX, AXIS_MIN,
