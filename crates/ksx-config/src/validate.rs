@@ -11,11 +11,11 @@ use serde::Serialize;
 
 use crate::config::ConfigFile;
 use crate::error::ConfigError;
-use crate::function::{parse_function, CONSUME};
+use crate::function::{macro_name, parse_function, CONSUME, MACRO_PREFIX};
 use crate::games::GamesFile;
 use crate::preset::{BindingEntry, GuardedEntry, PresetFile};
 use ksx_core::socd::{opposing_pairs, shadowing_chord};
-use ksx_core::{Binding, Key, Persona, Preset, Socd, MAX_SLOTS, MAX_XINPUT_SLOTS};
+use ksx_core::{Binding, Key, Persona, Preset, Socd, MAX_SLOTS, MAX_XINPUT_SLOTS, MIN_STEP_MS};
 
 /// One validation finding. All findings are non-fatal: the caller decides
 /// whether to refuse to start emulation (unknown preset ref) or just warn.
@@ -98,6 +98,53 @@ pub enum Issue {
     /// does; an unguarded row consumes nothing and drives nothing, so it is
     /// simply inert (docs/INPUT-TRANSFORMS.md §2.6).
     ConsumeWithoutGuard { preset: String, key: String },
+    /// A macro's `[macros.<name>]` table has no steps, so nothing can happen.
+    EmptyMacro { preset: String, name: String },
+    /// A step gives both `ms` and `frames`, or neither.
+    MacroStepBadDuration {
+        preset: String,
+        name: String,
+        step: usize,
+        reason: String,
+    },
+    /// A step's `hold` names something that is not a pad function.
+    UnknownMacroHold {
+        preset: String,
+        name: String,
+        step: usize,
+        function: String,
+    },
+    /// A `macro.<name>` binding row names a macro this preset does not define.
+    UnknownMacroRef {
+        preset: String,
+        function: String,
+        name: String,
+    },
+    /// A `macro.<name>` row carries a when/unless guard. A chord that starts a
+    /// sequence is not implemented; the guard would be silently ignored.
+    GuardedMacroTrigger { preset: String, name: String },
+    /// Two `[macros]` tables whose names differ only in case. Macro names are
+    /// matched case-insensitively (function names are), so one would shadow the
+    /// other and a trigger would silently start the wrong sequence.
+    DuplicateMacroName { preset: String, name: String },
+    /// Advisory: a step asked for less than [`ksx_core::MIN_STEP_MS`] and was
+    /// RAISED to it. The macro still works; it takes longer than the file says
+    /// (docs/INPUT-TRANSFORMS.md §0.2, the sampling rule).
+    MacroStepRaised {
+        preset: String,
+        name: String,
+        step: usize,
+        ms: u32,
+    },
+    /// Advisory: a step is shorter than [`ksx_core::MIN_STEP_MS`] and said
+    /// `allow_short`, so ksx runs it as written — and a 60 Hz poller may never
+    /// see it. This is the opt-out being honored, and said out loud.
+    MacroStepMayBeMissed {
+        preset: String,
+        name: String,
+        step: usize,
+        ms: u32,
+    },
     /// Advisory: a slot's `socd` policy would have generated a rule for a key
     /// pair the preset already chords by hand. The hand-written one wins —
     /// a deliberate statement beats a default — and this says so out loud.
@@ -135,12 +182,18 @@ impl Issue {
     /// already do something is a legitimate, deliberate choice), an inert
     /// `consume` row, and a hand-written chord winning over a generated SOCD
     /// rule. All three print as warnings and the session starts.
+    /// A short macro step is advisory on both sides on purpose: raising it
+    /// keeps the macro *correct* (it just runs longer), and honoring
+    /// `allow_short` is the author having been asked and having answered. What
+    /// is never allowed is silence — both print, every run.
     pub fn is_advisory(&self) -> bool {
         matches!(
             self,
             Issue::ChordConstituentAlsoBound { .. }
                 | Issue::ConsumeWithoutGuard { .. }
                 | Issue::SocdShadowedByChord { .. }
+                | Issue::MacroStepRaised { .. }
+                | Issue::MacroStepMayBeMissed { .. }
         )
     }
 }
@@ -259,6 +312,71 @@ impl fmt::Display for Issue {
                 "preset '{preset}': '{CONSUME}' is bound to '{key}' with no when/unless guard, \
                  so it does nothing — consumption is what a chord does, and a chord needs a \
                  guard (try `{CONSUME} = {{ key = \"{key}\", when = [\"<other key>\"] }}`)"
+            ),
+            Issue::EmptyMacro { preset, name } => write!(
+                f,
+                "preset '{preset}': macro '{name}' has no steps, so triggering it does nothing \
+                 (give [macros.{name}] a `steps` list)"
+            ),
+            Issue::MacroStepBadDuration {
+                preset,
+                name,
+                step,
+                reason,
+            } => write!(
+                f,
+                "preset '{preset}': macro '{name}' step {step} {reason} — `frames` is 60 Hz and                  is a readable unit, not a promise that the game samples exactly that many                  frames (docs/INPUT-TRANSFORMS.md §1c)"
+            ),
+            Issue::UnknownMacroHold {
+                preset,
+                name,
+                step,
+                function,
+            } => write!(
+                f,
+                "preset '{preset}': macro '{name}' step {step} holds '{function}', which is not \
+                 a function name (try A, lt, dpad.down, lx.min)"
+            ),
+            Issue::UnknownMacroRef {
+                preset,
+                function,
+                name,
+            } => write!(
+                f,
+                "preset '{preset}': '{function}' triggers macro '{name}', which this preset does \
+                 not define — add a [macros.{name}] table with a `steps` list"
+            ),
+            Issue::GuardedMacroTrigger { preset, name } => write!(
+                f,
+                "preset '{preset}': '{MACRO_PREFIX}{name}' carries a when/unless guard, but a \
+                 macro is started by a key — a chord that starts a sequence is not implemented"
+            ),
+            Issue::DuplicateMacroName { preset, name } => write!(
+                f,
+                "preset '{preset}': more than one [macros] table is called '{name}' (macro names \
+                 are matched ignoring case, so one would shadow the other)"
+            ),
+            Issue::MacroStepRaised {
+                preset,
+                name,
+                step,
+                ms,
+            } => write!(
+                f,
+                "preset '{preset}': macro '{name}' step {step} asks for {ms} ms and was raised to \
+                 {MIN_STEP_MS} ms — a game polling at 60 Hz samples every ~17 ms, so anything \
+                 shorter is not unreliable, it is invisible. Set `allow_short = true` on that \
+                 step if you really mean it"
+            ),
+            Issue::MacroStepMayBeMissed {
+                preset,
+                name,
+                step,
+                ms,
+            } => write!(
+                f,
+                "preset '{preset}': macro '{name}' step {step} is {ms} ms with `allow_short`, so \
+                 ksx runs it as written — a game polling at 60 Hz may never see it"
             ),
             Issue::SocdShadowedByChord {
                 slot,
@@ -505,9 +623,15 @@ fn validate_preset(preset: &PresetFile, issues: &mut Vec<Issue>) {
         flatten_bindings(function, entry, &mut pairs);
     }
 
+    validate_macros(preset, &pairs, issues);
+
     let mut checked_functions = BTreeSet::new();
     for (function, flat) in &pairs {
-        if checked_functions.insert(function.clone()) {
+        // Macro rows are their own grammar (`macro.<name>`), checked above and
+        // deliberately never fed to the pad-function vocabulary — the key name
+        // below is still checked, because a trigger is still a key.
+        let is_macro = macro_name(function).is_some();
+        if !is_macro && checked_functions.insert(function.clone()) {
             match parse_function(function) {
                 Ok(_) => {}
                 Err(ConfigError::InvalidAxisValue(_)) => issues.push(Issue::InvalidAxisValue {
@@ -548,6 +672,102 @@ fn validate_preset(preset: &PresetFile, issues: &mut Vec<Issue>) {
     validate_chords(preset, &pairs, issues);
 }
 
+/// Everything that can only go wrong once a preset carries a timed sequence
+/// (docs/INPUT-TRANSFORMS.md §1c).
+///
+/// The sampling rule (§0.2) is checked here and nowhere else: `MacroStep`
+/// decides what the engine *runs*, and this decides what the user is *told*.
+fn validate_macros(preset: &PresetFile, pairs: &[(String, Flat<'_>)], issues: &mut Vec<Issue>) {
+    let name = || preset.name.clone();
+
+    // Names are matched case-insensitively (function names are), so two tables
+    // differing only in case would have one silently shadow the other.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for macro_name in preset.macros.keys() {
+        if !seen.insert(macro_name.to_ascii_lowercase()) {
+            issues.push(Issue::DuplicateMacroName {
+                preset: name(),
+                name: macro_name.clone(),
+            });
+        }
+    }
+
+    for (macro_name, def) in &preset.macros {
+        if def.steps.is_empty() {
+            issues.push(Issue::EmptyMacro {
+                preset: name(),
+                name: macro_name.clone(),
+            });
+        }
+        for (i, step) in def.steps.iter().enumerate() {
+            for function in &step.hold {
+                if parse_function(function).is_err() {
+                    issues.push(Issue::UnknownMacroHold {
+                        preset: name(),
+                        name: macro_name.clone(),
+                        step: i,
+                        function: function.clone(),
+                    });
+                }
+            }
+            // Exactly one unit, always. Neither is not "instant": it is a file
+            // that forgot to say, and a zero-length step is an invisible input.
+            let ms = match step.duration() {
+                Ok(duration) => duration.ms(),
+                Err(reason) => {
+                    issues.push(Issue::MacroStepBadDuration {
+                        preset: name(),
+                        name: macro_name.clone(),
+                        step: i,
+                        reason: reason.to_owned(),
+                    });
+                    continue;
+                }
+            };
+            if ms >= MIN_STEP_MS {
+                continue;
+            }
+            issues.push(if step.allow_short {
+                Issue::MacroStepMayBeMissed {
+                    preset: name(),
+                    name: macro_name.clone(),
+                    step: i,
+                    ms,
+                }
+            } else {
+                Issue::MacroStepRaised {
+                    preset: name(),
+                    name: macro_name.clone(),
+                    step: i,
+                    ms,
+                }
+            });
+        }
+    }
+
+    // Trigger rows: the macro has to exist, and it cannot be a chord.
+    for (function, flat) in pairs {
+        let Some(target) = macro_name(function) else {
+            continue;
+        };
+        if !preset.macros.keys().any(|k| k.eq_ignore_ascii_case(target)) {
+            issues.push(Issue::UnknownMacroRef {
+                preset: name(),
+                function: function.clone(),
+                name: target.to_owned(),
+            });
+        }
+        if let Flat::Guard(guard) = flat {
+            if !guard.when.is_empty() || !guard.unless.is_empty() {
+                issues.push(Issue::GuardedMacroTrigger {
+                    preset: name(),
+                    name: target.to_owned(),
+                });
+            }
+        }
+    }
+}
+
 /// Everything that can only go wrong once a binding carries a guard
 /// (docs/INPUT-TRANSFORMS.md §1b).
 fn validate_chords(preset: &PresetFile, pairs: &[(String, Flat<'_>)], issues: &mut Vec<Issue>) {
@@ -567,8 +787,11 @@ fn validate_chords(preset: &PresetFile, pairs: &[(String, Flat<'_>)], issues: &m
             Flat::Plain(_) => None,
         })
         // An empty guard is a plain binding, not a chord (preset.rs
-        // normalizes it), so it carries none of these rules.
-        .filter(|(_, guard)| !(guard.when.is_empty() && guard.unless.is_empty()))
+        // normalizes it), so it carries none of these rules. Nor is a macro
+        // trigger a chord — `validate_macros` reports a guard on one.
+        .filter(|(function, guard)| {
+            !(guard.when.is_empty() && guard.unless.is_empty()) && macro_name(function).is_none()
+        })
         .collect();
 
     for (function, guard) in &chords {
@@ -1015,6 +1238,155 @@ preset = "default"
             "rt = { key = \"A\", when = [\"B\"] }\nlb = { key = \"A\", unless = [\"B\"] }",
         )];
         assert_eq!(validate(&ConfigFile::default(), &exclusive), Vec::new());
+    }
+
+    // ---- macros (docs/INPUT-TRANSFORMS.md §1c) ----------------------------
+
+    fn macro_preset(body: &str) -> PresetFile {
+        toml::from_str(&format!("name = \"m\"\n{body}")).unwrap()
+    }
+
+    /// A well-formed macro at honest durations is completely clean.
+    #[test]
+    fn a_well_formed_macro_reports_nothing() {
+        let presets = vec![macro_preset(
+            "[bindings]\n\"dpad.down\" = \"Down\"\nmacro.hadouken = \"P\"\n\
+             [macros.hadouken]\n\
+             steps = [{ hold = [\"dpad.down\"], ms = 50 }, { hold = [\"A\"], frames = 3 }]\n",
+        )];
+        assert_eq!(validate(&ConfigFile::default(), &presets), Vec::new());
+    }
+
+    /// The sampling rule (§0.2), both ways round. Neither is a refusal — one
+    /// keeps the macro correct, the other is the author having been asked and
+    /// having answered — but neither is ever silent.
+    #[test]
+    fn short_steps_are_reported_whichever_way_they_go() {
+        let presets = vec![macro_preset(
+            "[macros.m]\n\
+             steps = [{ hold = [\"A\"], ms = 5 }, { hold = [\"B\"], ms = 5, allow_short = true }]\n",
+        )];
+        let issues = validate(&ConfigFile::default(), &presets);
+        assert_eq!(
+            issues,
+            vec![
+                Issue::MacroStepRaised {
+                    preset: "m".into(),
+                    name: "m".into(),
+                    step: 0,
+                    ms: 5
+                },
+                Issue::MacroStepMayBeMissed {
+                    preset: "m".into(),
+                    name: "m".into(),
+                    step: 1,
+                    ms: 5
+                },
+            ],
+            "{issues:?}"
+        );
+        assert!(issues.iter().all(Issue::is_advisory));
+        assert!(issues[0].to_string().contains("invisible"), "{}", issues[0]);
+        assert!(issues[1].to_string().contains("may never see it"));
+
+        // One frame is below the floor too, and is reported in ms.
+        let framed = vec![macro_preset(
+            "[macros.m]\nsteps = [{ hold = [\"A\"], frames = 1 }]\n",
+        )];
+        assert!(matches!(
+            validate(&ConfigFile::default(), &framed).as_slice(),
+            [Issue::MacroStepRaised { ms: 17, .. }]
+        ));
+    }
+
+    /// Every structural mistake a macro can hold, named separately.
+    #[test]
+    fn macro_mistakes_are_reported() {
+        let presets = vec![macro_preset(
+            "[bindings]\nmacro.ghost = \"P\"\nmacro.m = { key = \"Q\", when = [\"R\"] }\n\
+             [macros.m]\n\
+             steps = [{ hold = [\"warp\"], ms = 50 }, { hold = [\"A\"], ms = 50, frames = 3 }]\n\
+             [macros.empty]\nsteps = []\n",
+        )];
+        let issues = validate(&ConfigFile::default(), &presets);
+        for expected in [
+            Issue::EmptyMacro {
+                preset: "m".into(),
+                name: "empty".into(),
+            },
+            Issue::UnknownMacroHold {
+                preset: "m".into(),
+                name: "m".into(),
+                step: 0,
+                function: "warp".into(),
+            },
+            Issue::UnknownMacroRef {
+                preset: "m".into(),
+                function: "macro.ghost".into(),
+                name: "ghost".into(),
+            },
+            Issue::GuardedMacroTrigger {
+                preset: "m".into(),
+                name: "m".into(),
+            },
+        ] {
+            assert!(
+                issues.contains(&expected),
+                "missing {expected:?} in {issues:?}"
+            );
+        }
+        assert!(
+            issues
+                .iter()
+                .any(|i| matches!(i, Issue::MacroStepBadDuration { step: 1, .. })),
+            "{issues:?}"
+        );
+        // None of these is advice: a macro that cannot run must not start.
+        assert!(!Issue::EmptyMacro {
+            preset: String::new(),
+            name: String::new()
+        }
+        .is_advisory());
+    }
+
+    /// Macro names are matched ignoring case, so two tables differing only in
+    /// case would silently shadow one another.
+    #[test]
+    fn macro_names_that_differ_only_in_case_collide() {
+        let presets = vec![macro_preset(
+            "[macros.hadouken]\nsteps = [{ hold = [\"A\"], ms = 50 }]\n\
+             [macros.Hadouken]\nsteps = [{ hold = [\"B\"], ms = 50 }]\n",
+        )];
+        let issues = validate(&ConfigFile::default(), &presets);
+        assert_eq!(
+            issues,
+            vec![Issue::DuplicateMacroName {
+                preset: "m".into(),
+                name: "hadouken".into()
+            }],
+            "{issues:?}"
+        );
+    }
+
+    /// A `macro.<name>` row must never be mistaken for a pad function or a
+    /// chord: it has its own grammar and its own checks.
+    #[test]
+    fn a_macro_row_is_never_checked_as_a_pad_function() {
+        let presets = vec![macro_preset(
+            "[bindings]\nmacro.m = \"NotAKey\"\n\
+             [macros.m]\nsteps = [{ hold = [\"A\"], ms = 50 }]\n",
+        )];
+        let issues = validate(&ConfigFile::default(), &presets);
+        // The KEY is still checked — a trigger is still a key.
+        assert_eq!(
+            issues,
+            vec![Issue::UnknownKeyName {
+                preset: "m".into(),
+                function: "macro.m".into(),
+                key: "NotAKey".into()
+            }],
+            "{issues:?}"
+        );
     }
 
     // ---- socd (docs/INPUT-TRANSFORMS.md §2.6) -----------------------------

@@ -11,6 +11,10 @@ rust-version.workspace = true
 ksx-core.workspace = true
 serde.workspace = true
 serde_ignored.workspace = true
+# JSON interop (`ksx config export|import`, `presets/*.json`). TOML stays
+# canonical — it carries the comments; JSON is the machine-readable twin, and
+# both go through the same serde types so they cannot drift (src/interop.rs).
+serde_json.workspace = true
 toml.workspace = true
 directories.workspace = true
 thiserror.workspace = true

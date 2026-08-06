@@ -248,6 +248,14 @@ pub enum MapError {
         key: String,
         conflicts: Vec<MapConflict>,
     },
+    /// `macro.<name>` for a macro this preset does not define. `ksx map` binds
+    /// a TRIGGER; the sequence itself is authored in the file's `[macros]`
+    /// table, so there is nothing sensible to create here.
+    UnknownMacro {
+        preset: String,
+        name: String,
+        known: Vec<String>,
+    },
     /// `restore session-backup` with no backup on disk: nothing was mapped
     /// through the daemon this session, so there is nothing to undo.
     NoSessionBackup {
@@ -307,6 +315,22 @@ impl std::fmt::Display for MapError {
                      edited)"
                 )
             }
+            MapError::UnknownMacro {
+                preset,
+                name,
+                known,
+            } => {
+                write!(
+                    f,
+                    "preset \"{preset}\" defines no macro called \"{name}\" — `ksx map` binds the \
+                     key that STARTS a macro; write the sequence itself as a [macros.{name}] \
+                     table in the preset file (docs/INPUT-TRANSFORMS.md §1c)"
+                )?;
+                if !known.is_empty() {
+                    write!(f, ". Macros in this preset: {}", known.join(", "))?;
+                }
+                Ok(())
+            }
             MapError::NoSessionBackup { preset } => write!(
                 f,
                 "no session backup for \"{preset}\" — nothing has been mapped through the \
@@ -343,6 +367,13 @@ impl From<ConfigError> for MapError {
 /// Load, validate, conflict-check, edit, write. See the module docs for the
 /// exact semantics of every step.
 pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
+    // A `macro.<name>` row is not a pad function at all — it starts a timed
+    // sequence the preset defines (docs/INPUT-TRANSFORMS.md §1c). Binding and
+    // clearing the TRIGGER is what `ksx map` does; authoring the steps stays
+    // TOML-only for now (the `[macros]` table is the editing surface).
+    if let Some(name) = ksx_config::macro_name(&spec.function) {
+        return apply_macro_trigger(store, spec, name);
+    }
     // Validate the function and key names FIRST — a typo must not depend on
     // which preset it was aimed at.
     let binding = parse_function(&spec.function)
@@ -477,6 +508,8 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         name: file.name.clone(),
         entries,
         chords,
+        // Untouched: editing a binding never disturbs the preset's macros.
+        macros: core.macros,
         protected: false,
     });
     let path = store.save_preset(&rewritten)?;
@@ -491,6 +524,101 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         moved_from,
         overridden,
         flash,
+    })
+}
+
+/// Bind (or clear) the key that STARTS a macro the preset already defines.
+///
+/// Deliberately narrow. `ksx map` owns the trigger because that is the part a
+/// player rebinds on a cabinet; the steps themselves are a timeline with
+/// durations and two interruption policies, and a flag-per-field CLI for that
+/// would be worse than the TOML it would write. Authoring stays in
+/// `[macros.<name>]`.
+fn apply_macro_trigger(store: &Store, spec: &MapSpec, name: &str) -> Result<AppliedMap, MapError> {
+    if !spec.when.is_empty() || !spec.unless.is_empty() {
+        return Err(MapError::InvalidGuard(
+            "a macro is started by a key; a chord that starts a sequence is not implemented \
+             (docs/INPUT-TRANSFORMS.md §1c)"
+                .to_owned(),
+        ));
+    }
+    if spec.move_from.is_some() {
+        return Err(MapError::BadMoveFrom(
+            "--move-from takes a key from another pad function; a macro trigger is not one"
+                .to_owned(),
+        ));
+    }
+    let key = spec.key.as_deref().map(resolve_key).transpose()?;
+
+    let file = load_preset_by_name(store, &spec.preset)?;
+    let mut core = file.to_core()?;
+    let Some(index) = core.macros.index_of(name) else {
+        return Err(MapError::UnknownMacro {
+            preset: file.name.clone(),
+            name: name.to_owned(),
+            known: core.macros.defs.iter().map(|m| m.name.clone()).collect(),
+        });
+    };
+    let canonical = ksx_config::macro_function_name(&core.macros.defs[usize::from(index)].name);
+
+    // A macro trigger is a key like any other, so the one conflict that
+    // survives — the key already doing something in ANOTHER slot's preset —
+    // is checked with exactly the same rule and the same `--force` escape.
+    let mut overridden = Vec::new();
+    if let Some(key) = key {
+        let conflicts = find_profile_conflicts(store, &spec.preset, key);
+        if !conflicts.is_empty() && !spec.force {
+            return Err(MapError::Conflicts {
+                key: key.name().to_owned(),
+                conflicts,
+            });
+        }
+        overridden = conflicts;
+    }
+
+    // Replace-per-function, as everywhere else: this macro's old triggers go,
+    // the new one arrives (or nothing, for a clear).
+    core.macros.triggers.retain(|t| t.index != index);
+    if let Some(key) = key {
+        core.macros
+            .triggers
+            .push(ksx_core::MacroTrigger::new(key, index));
+    }
+
+    // Multi-bind reads the same as anywhere: what else does this key do now?
+    let mut also_drives: Vec<String> = Vec::new();
+    if let Some(key) = key {
+        also_drives.extend(
+            core.entries
+                .iter()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, b)| ksx_config::function_name(b)),
+        );
+        also_drives.extend(
+            core.macros
+                .triggers
+                .iter()
+                .filter(|t| t.key == key && t.index != index)
+                .filter_map(|t| core.macros.get(t.index))
+                .map(|m| ksx_config::macro_function_name(&m.name)),
+        );
+        also_drives.sort();
+        also_drives.dedup();
+    }
+
+    let rewritten = PresetFile::from_core(&core);
+    let path = store.save_preset(&rewritten)?;
+    Ok(AppliedMap {
+        path,
+        preset: file.name,
+        function: canonical,
+        key: key.map(|k| k.name().to_owned()),
+        when: Vec::new(),
+        unless: Vec::new(),
+        also_drives,
+        moved_from: None,
+        overridden,
+        flash: Vec::new(),
     })
 }
 
@@ -915,6 +1043,7 @@ pub fn restore(
         // Whole-preset writes replace the bindings wholesale, chords
         // included: "restore" and "clear all" must not leave a guard behind.
         chords: Vec::new(),
+        macros: Default::default(),
         protected: false,
     });
     let path = store.save_preset(&rewritten)?;
@@ -942,6 +1071,7 @@ pub fn clear_all(store: &Store, preset_name: &str) -> Result<AppliedRestore, Map
         name: file.name.clone(),
         entries: ksx_core::Preset::builtin_empty().entries,
         chords: Vec::new(),
+        macros: Default::default(),
         protected: false,
     });
     let path = store.save_preset(&rewritten)?;
@@ -1802,6 +1932,7 @@ preset = "Other"
             name: "P1".into(),
             entries: ksx_core::Preset::builtin_default().entries,
             chords: Vec::new(),
+            macros: Default::default(),
             protected: false,
         });
         assert_eq!(

@@ -3,6 +3,7 @@
 mod autostart;
 #[cfg(windows)]
 mod capture;
+mod config_io;
 mod console;
 #[cfg(windows)]
 mod ctrl_c;
@@ -494,6 +495,36 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    /// Export / import the configuration as JSON (TOML stays canonical)
+    ///
+    /// TOML is the canonical format because it carries COMMENTS, and ksx
+    /// config files are annotated — the 0..12 range next to a deadzone, why a
+    /// cabinet's launcher_grace_ms is 20 s, which panel a [[device]] id
+    /// belongs to. Those notes are what makes a file maintainable a year
+    /// later, by a person or by an AI reading it, and JSON has no syntax that
+    /// could keep them.
+    ///
+    /// JSON exists for the readers that are not people: preset sharing,
+    /// AI-generated configs (docs/ENHANCEMENTS.md E5 — this verb is what makes
+    /// "write me a cabinet config" a real workflow), and anything that wants a
+    /// schema. Both formats go through the SAME serde types, so they cannot
+    /// drift: a field added to a config type is in both the moment it
+    /// compiles.
+    ///
+    /// The store also READS `.json` variants (`presets\Foo.json`,
+    /// `config.json`, `games.json`) when no TOML of that name is there, and
+    /// writes back whatever format the file already had. With both spellings
+    /// present the TOML wins and the JSON is ignored with a warning — never
+    /// merged.
+    ///
+    /// Exit codes: 0 = exported / imported / dry-run report, 1 = error,
+    /// 2 = refused (validation faults, an unreadable document, an unknown
+    /// --preset; nothing written), 3 = some files were written and then a
+    /// write failed.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Manage the WinUSB claim: which interfaces ksx can take, and how to give them back
     ///
     /// Claiming an interface rebinds it from the keyboard stack to Microsoft's
@@ -579,6 +610,97 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Write config / games / presets as one JSON document (stdout by default)
+    ///
+    /// The document goes to --out (stdout unless told otherwise), so
+    /// `ksx config export | jq` and `ksx config export --out cabinet.json`
+    /// both work; the human/`--json` SUMMARY goes to stderr so stdout stays
+    /// exactly the document.
+    Export {
+        /// What to export (default: everything, or just presets with --preset)
+        #[arg(long, value_enum, value_name = "PART")]
+        what: Option<ConfigPart>,
+        /// Export only this preset, by its `name` field (implies --what presets)
+        #[arg(long, value_name = "NAME")]
+        preset: Option<String>,
+        /// Destination file, or `-` for stdout (the default)
+        #[arg(long, value_name = "PATH", default_value = "-")]
+        out: String,
+        /// One line, no indentation (the default is pretty and diffable)
+        #[arg(long)]
+        compact: bool,
+        /// Machine-readable summary on stderr
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read a JSON document back into the config root (DRY RUN unless --yes)
+    ///
+    /// Accepts an enveloped document (one carrying `ksx_interop`, which
+    /// describes itself) or a BARE `ConfigFile` / `GamesFile` / `PresetFile` /
+    /// preset array — the kind an assistant writes — in which case --what must
+    /// name exactly which one it is. Nothing is guessed.
+    ///
+    /// The import is validated through the same checks `ksx run` and
+    /// `ksx doctor` apply, against the configuration it WOULD PRODUCE (imported
+    /// presets layered over the ones already on disk), and refuses on any
+    /// non-advisory finding — reported structurally, nothing written. --force
+    /// writes anyway.
+    ///
+    /// What lands on disk is CANONICAL TOML unless the target file is already
+    /// a `.json`, so hand-written comments in an overwritten file do not
+    /// survive: every overwritten file is copied to
+    /// `<file>.bak-YYYYMMDD-HHMMSS` first.
+    Import {
+        /// JSON file to read, or `-` for stdin
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Import only this part; also names a bare document's type
+        #[arg(long, value_enum, value_name = "PART")]
+        what: Option<ConfigPart>,
+        /// Validate and report; write nothing (the default, and it wins over --yes)
+        #[arg(long)]
+        dry_run: bool,
+        /// Actually write the files (each overwrite is backed up first)
+        #[arg(long)]
+        yes: bool,
+        /// Write even though validation found faults (advisories never block)
+        #[arg(long)]
+        force: bool,
+        /// One JSON object on stdout
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Which files `ksx config export|import` covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ConfigPart {
+    /// config.toml (settings, devices, slots)
+    Config,
+    /// games.toml (launch profiles)
+    Games,
+    /// presets/*.toml (bindings, chords, macros)
+    Presets,
+    /// all three
+    All,
+}
+
+impl ConfigPart {
+    /// `All` becomes the empty selection, which every consumer reads as
+    /// "whatever is there" — one spelling of "no narrowing", so `--what all`
+    /// and no flag at all cannot behave differently.
+    fn parts(self) -> Vec<ksx_config::Part> {
+        match self {
+            Self::Config => vec![ksx_config::Part::Config],
+            Self::Games => vec![ksx_config::Part::Games],
+            Self::Presets => vec![ksx_config::Part::Presets],
+            Self::All => Vec::new(),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -794,6 +916,48 @@ fn main() -> anyhow::Result<()> {
             }
             SessionCommand::Stop { json } => session::run(session::Verb::Stop, json),
             SessionCommand::Reload { json } => session::run(session::Verb::Reload, json),
+        },
+        Command::Config { command } => match command {
+            ConfigCommand::Export {
+                what,
+                preset,
+                out,
+                compact,
+                json,
+            } => config_io::export(config_io::ExportOptions {
+                what: what.map(ConfigPart::parts).unwrap_or_default(),
+                preset,
+                out: if out == "-" {
+                    config_io::Destination::Stdout
+                } else {
+                    config_io::Destination::File(out.into())
+                },
+                style: if compact {
+                    ksx_config::JsonStyle::Compact
+                } else {
+                    ksx_config::JsonStyle::Pretty
+                },
+                json,
+            }),
+            ConfigCommand::Import {
+                path,
+                what,
+                dry_run,
+                yes,
+                force,
+                json,
+            } => config_io::import(config_io::ImportOptions {
+                source: if path == "-" {
+                    config_io::Origin::Stdin
+                } else {
+                    config_io::Origin::File(path.into())
+                },
+                what: what.map(ConfigPart::parts).unwrap_or_default(),
+                dry_run,
+                yes,
+                force,
+                json,
+            }),
         },
         Command::Winusb { command } => match command {
             WinusbCommand::Status { json } => winusb::run(winusb::Options {
@@ -1933,6 +2097,125 @@ mod tests {
                 );
                 assert!(dry_run);
                 assert!(!json);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+    }
+
+    // ---- `ksx config export|import` (JSON interop) -----------------------
+
+    /// The pipeable default: everything, pretty, to stdout.
+    #[test]
+    fn config_export_defaults_to_the_whole_root_on_stdout() {
+        let cli = Cli::try_parse_from(["ksx", "config", "export"]).unwrap();
+        match cli.command {
+            Command::Config {
+                command:
+                    ConfigCommand::Export {
+                        what,
+                        preset,
+                        out,
+                        compact,
+                        json,
+                    },
+            } => {
+                assert_eq!(what, None);
+                assert_eq!(preset, None);
+                assert_eq!(out, "-");
+                assert!(!compact);
+                assert!(!json);
+                // No --what means no narrowing, exactly like `--what all`.
+                assert!(ConfigPart::All.parts().is_empty());
+                assert_eq!(ConfigPart::Presets.parts(), vec![ksx_config::Part::Presets]);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn config_export_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "ksx",
+            "config",
+            "export",
+            "--what",
+            "presets",
+            "--preset",
+            "IPAC P1",
+            "--out",
+            "cabinet.json",
+            "--compact",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Config {
+                command:
+                    ConfigCommand::Export {
+                        what,
+                        preset,
+                        out,
+                        compact,
+                        json,
+                    },
+            } => {
+                assert_eq!(what, Some(ConfigPart::Presets));
+                assert_eq!(preset.as_deref(), Some("IPAC P1"));
+                assert_eq!(out, "cabinet.json");
+                assert!(compact && json);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+    }
+
+    /// Import is a DRY RUN unless `--yes` — the `install-drivers` / `winusb`
+    /// consent shape, not a third one.
+    #[test]
+    fn config_import_is_a_report_until_yes() {
+        let cli = Cli::try_parse_from(["ksx", "config", "import", "cabinet.json"]).unwrap();
+        match cli.command {
+            Command::Config {
+                command:
+                    ConfigCommand::Import {
+                        path,
+                        what,
+                        dry_run,
+                        yes,
+                        force,
+                        json,
+                    },
+            } => {
+                assert_eq!(path, "cabinet.json");
+                assert_eq!(what, None);
+                assert!(!dry_run, "--dry-run is the explicit spelling...");
+                assert!(!yes, "...and the absence of --yes is the default");
+                assert!(!force && !json);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn config_import_reads_stdin_and_takes_a_bare_document_hint() {
+        let cli = Cli::try_parse_from([
+            "ksx", "config", "import", "-", "--what", "config", "--yes", "--force", "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Config {
+                command:
+                    ConfigCommand::Import {
+                        path,
+                        what,
+                        yes,
+                        force,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(path, "-");
+                assert_eq!(what, Some(ConfigPart::Config));
+                assert!(yes && force && json);
             }
             _ => panic!("parsed to the wrong subcommand"),
         }

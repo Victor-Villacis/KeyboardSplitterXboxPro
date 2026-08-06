@@ -10,6 +10,10 @@
 //! In both modes, presets live in `<root>\presets\*.toml`, games in
 //! `<root>\games.toml`, logs in `<root>\logs\`.
 //!
+//! Every config file has a JSON interop sibling (`config.json`, `games.json`,
+//! `presets\<name>.json`) that ksx reads only when the canonical TOML is
+//! absent. TOML wins; see [`crate::interop`] for why.
+//!
 //! [`ConfigRoot::discover`] performs the real lookup; [`ConfigRoot::resolve`]
 //! is the same decision with every input injectable for tests.
 
@@ -86,12 +90,30 @@ impl ConfigRoot {
         self.dir.join(name)
     }
 
+    /// The JSON interop sibling of [`ConfigRoot::config_path`]: `config.json`,
+    /// or `ksx.json` in portable mode. It is the file ksx reads only when the
+    /// canonical TOML is absent — see [`crate::interop`] for the precedence
+    /// rule and why the two are never merged.
+    pub fn config_json_path(&self) -> PathBuf {
+        let name = if self.portable {
+            "ksx.json"
+        } else {
+            "config.json"
+        };
+        self.dir.join(name)
+    }
+
     pub fn presets_dir(&self) -> PathBuf {
         self.dir.join("presets")
     }
 
     pub fn games_path(&self) -> PathBuf {
         self.dir.join("games.toml")
+    }
+
+    /// JSON interop sibling of [`ConfigRoot::games_path`].
+    pub fn games_json_path(&self) -> PathBuf {
+        self.dir.join("games.json")
     }
 
     pub fn logs_dir(&self) -> PathBuf {
@@ -159,5 +181,26 @@ mod tests {
             Path::new(r"D:\cab").join("ksx.toml")
         );
         assert_eq!(portable.presets_dir(), Path::new(r"D:\cab").join("presets"));
+    }
+
+    /// Every canonical file has a JSON interop sibling in the same place,
+    /// portable mode included.
+    #[test]
+    fn json_interop_siblings_sit_next_to_the_canonical_files() {
+        let root = ConfigRoot::at(r"C:\cfg\ksx");
+        assert_eq!(
+            root.config_json_path(),
+            Path::new(r"C:\cfg\ksx").join("config.json")
+        );
+        assert_eq!(
+            root.games_json_path(),
+            Path::new(r"C:\cfg\ksx").join("games.json")
+        );
+
+        let portable = ConfigRoot::portable(r"D:\cab");
+        assert_eq!(
+            portable.config_json_path(),
+            Path::new(r"D:\cab").join("ksx.json")
+        );
     }
 }

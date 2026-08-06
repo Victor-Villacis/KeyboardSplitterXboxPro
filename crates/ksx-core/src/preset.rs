@@ -2,6 +2,7 @@
 //! `legacy/KeyboardSplitter/Presets/Preset.cs`.
 
 use crate::key::Key;
+use crate::macros::{Macro, MacroTrigger};
 use crate::pad::{Axis, DpadDirection, Trigger, XButton, AXIS_MAX, AXIS_MIN};
 
 /// One preset entry: a key drives one xbox function.
@@ -117,6 +118,55 @@ impl Chord {
     }
 }
 
+/// A preset's macro table: the definitions and the rows that start them
+/// (docs/INPUT-TRANSFORMS.md §1c).
+///
+/// One struct rather than two [`Preset`] fields so `preset.macros.is_empty()`
+/// is the single check for "this preset predates macros, take the old path" —
+/// the same regression guarantee `chords.is_empty()` gives.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Macros {
+    /// Definitions, in file order. [`MacroTrigger::index`] indexes this.
+    pub defs: Vec<Macro>,
+    /// `key → macro` rows. Many keys → one macro and one key → several macros
+    /// are both native, exactly as for plain bindings.
+    pub triggers: Vec<MacroTrigger>,
+}
+
+impl Macros {
+    /// Nothing defined and nothing triggered — the byte-identical path.
+    pub fn is_empty(&self) -> bool {
+        self.defs.is_empty() && self.triggers.is_empty()
+    }
+
+    /// Position of the macro called `name`, compared case-insensitively (the
+    /// file's function names are).
+    pub fn index_of(&self, name: &str) -> Option<u16> {
+        self.defs
+            .iter()
+            .position(|m| m.name.eq_ignore_ascii_case(name))
+            .and_then(|i| u16::try_from(i).ok())
+    }
+
+    /// The macro a trigger points at, or `None` for a dangling index (which
+    /// validation reports and the engine ignores).
+    pub fn get(&self, index: u16) -> Option<&Macro> {
+        self.defs.get(usize::from(index))
+    }
+
+    pub fn named(&self, name: &str) -> Option<&Macro> {
+        self.index_of(name).and_then(|i| self.get(i))
+    }
+
+    /// Every key that starts `index`, in trigger order.
+    pub fn keys_for(&self, index: u16) -> impl Iterator<Item = Key> + '_ {
+        self.triggers
+            .iter()
+            .filter(move |t| t.index == index)
+            .map(|t| t.key)
+    }
+}
+
 /// A named set of key→function bindings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preset {
@@ -136,6 +186,10 @@ pub struct Preset {
     /// every preset that predates chords, which is exactly why the chord-free
     /// engine path is unchanged.
     pub chords: Vec<Chord>,
+    /// Timed sequences and the keys that start them
+    /// (docs/INPUT-TRANSFORMS.md §1c). Empty in every preset that predates
+    /// macros, which is exactly why the macro-free engine path is unchanged.
+    pub macros: Macros,
     /// Built-ins ship in code, are never saved, and cannot be edited/deleted
     /// (legacy `ImuttablePresets` semantics).
     pub protected: bool,
@@ -231,6 +285,7 @@ impl Preset {
             name: Self::DEFAULT_NAME.to_owned(),
             entries,
             chords: Vec::new(),
+            macros: Default::default(),
             protected: true,
         }
     }
@@ -271,6 +326,7 @@ impl Preset {
             name: Self::EMPTY_NAME.to_owned(),
             entries,
             chords: Vec::new(),
+            macros: Default::default(),
             protected: true,
         }
     }

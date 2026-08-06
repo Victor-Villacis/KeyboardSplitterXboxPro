@@ -29,6 +29,7 @@ pub fn preset(name: &str, entries: Vec<(Key, Binding)>) -> Preset {
         name: name.to_owned(),
         entries,
         chords: Vec::new(),
+        macros: Default::default(),
         protected: false,
     }
 }
@@ -43,6 +44,22 @@ pub fn preset_with_chords(
         name: name.to_owned(),
         entries,
         chords,
+        macros: Default::default(),
+        protected: false,
+    }
+}
+
+/// Same, plus macros (definitions and the keys that start them).
+pub fn preset_with_macros(
+    name: &str,
+    entries: Vec<(Key, Binding)>,
+    macros: ksx_core::Macros,
+) -> Preset {
+    Preset {
+        name: name.to_owned(),
+        entries,
+        chords: Vec::new(),
+        macros,
         protected: false,
     }
 }

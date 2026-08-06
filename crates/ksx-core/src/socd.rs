@@ -157,6 +157,26 @@ fn direction(binding: Binding) -> Option<(u8, bool)> {
     }
 }
 
+/// Do these two bindings point OPPOSITE ways along the same control?
+///
+/// The one definition of "opposing" in ksx: SOCD cleaning cancels such a pair
+/// (§2.6), and [`crate::Interrupt::Opposing`] aborts a macro when the player
+/// presses one against a direction the macro is holding (§1c). Two features,
+/// one relation — a diagonal that counts as opposing in one place must count in
+/// the other, or the cabinet behaves differently depending on which feature you
+/// read about.
+///
+/// Non-directional bindings (buttons, triggers, a centred axis, `Consume`)
+/// oppose nothing.
+pub fn opposes(a: Binding, b: Binding) -> bool {
+    match (direction(a), direction(b)) {
+        (Some((control_a, positive_a)), Some((control_b, positive_b))) => {
+            control_a == control_b && positive_a != positive_b
+        }
+        _ => false,
+    }
+}
+
 /// One key's directional footprint in a preset.
 struct KeyDirections {
     key: Key,
@@ -369,6 +389,7 @@ mod tests {
                 ),
             ],
             chords: Vec::new(),
+            macros: Default::default(),
             protected: false,
         }
     }
@@ -453,6 +474,7 @@ mod tests {
                 ),
             ],
             chords: Vec::new(),
+            macros: Default::default(),
             protected: false,
         };
         let chords = generate(&preset, Socd::UpPriority);
@@ -489,6 +511,7 @@ mod tests {
                 (Key::F, axis(16384)),
             ],
             chords: Vec::new(),
+            macros: Default::default(),
             protected: false,
         };
         let chords = generate(&preset, Socd::Neutral);
@@ -529,6 +552,7 @@ mod tests {
                 ),
             ],
             chords: Vec::new(),
+            macros: Default::default(),
             protected: false,
         };
         let chords = generate(&preset, Socd::UpPriority);
@@ -563,6 +587,7 @@ mod tests {
                 ),
             ],
             chords: Vec::new(),
+            macros: Default::default(),
             protected: false,
         };
         assert!(opposing_pairs(&preset).is_empty());
@@ -608,6 +633,7 @@ mod tests {
                 (Key::S, Binding::Dpad(DpadDirection::Down)),
             ],
             chords: Vec::new(),
+            macros: Default::default(),
             protected: false,
         };
         let pairs = opposing_pairs(&preset);

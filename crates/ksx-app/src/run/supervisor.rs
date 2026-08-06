@@ -768,6 +768,11 @@ pub(crate) enum EngineCtl {
     /// own thread, to be moved into the running engine. The pads, their
     /// handles and the capture filters are untouched.
     SwapTables(Box<EngineTables>),
+    /// Cancel every macro in flight and release what it held. Sent when the
+    /// player stops driving these pads without the session ending — today that
+    /// is the `LeftCtrl ×5` escape turning blocking off
+    /// (docs/INPUT-TRANSFORMS.md §1c, "everything releases on the way out").
+    CancelMacros,
     Stop,
 }
 
@@ -1144,6 +1149,7 @@ pub fn supervise(
         // processed before the stop check so a gesture in the same 50 ms window
         // as the emergency stop is still recorded.
         let escape = escapes.snapshot();
+        let was_blocking = blocking;
         mirror_escapes(
             &escape,
             &mut seen_escapes,
@@ -1153,6 +1159,13 @@ pub fn supervise(
             Some((&ctl_tx, &opts.trace, &present)),
             out,
         );
+        // The gesture just handed the keyboard back to Windows. A macro in
+        // flight would keep driving the pad from a panel the player is no
+        // longer using — so it is cancelled, and what it held is released
+        // (docs/INPUT-TRANSFORMS.md §1c).
+        if was_blocking && !blocking {
+            let _ = ectl_tx.send(EngineCtl::CancelMacros);
+        }
         if escape.stops > seen_escapes.stops {
             seen_escapes.stops = escape.stops;
             stop = Some(StopReason::EmergencyStop);
@@ -1444,6 +1457,57 @@ struct Limits {
     panic_after_events: Option<u64>,
 }
 
+/// Raises the Windows system timer resolution to 1 ms **while a macro is
+/// playing back**, and puts it straight back afterwards.
+///
+/// Why it is needed: the default timer resolution is ~15.6 ms, and a macro step
+/// is 33 ms. Waking 15 ms late every step is not a correctness bug — the
+/// absolute schedule in `ksx_core` corrects for it and the late-wake rule never
+/// lets a step go unpublished — but it turns a crisp quarter-circle into a
+/// mushy one, and on a fighting cabinet that is the whole point of the feature.
+///
+/// Why it is scoped: `timeBeginPeriod` is process-wide and, on Windows, its
+/// effect on the *system* is real. `ksx daemon` lives for the whole session, so
+/// holding 1 ms for its entire life to serve a macro somebody presses twice an
+/// hour would tax every other process's power management for nothing. It goes
+/// up when the first deadline is armed and comes down when the last one clears
+/// — and `Drop` puts it back on every exit path, panic included, so no ksx
+/// crash can leave the system timer raised.
+#[derive(Default)]
+struct TimerResolution {
+    raised: bool,
+}
+
+impl TimerResolution {
+    /// `wanted` is "a macro is armed right now".
+    fn set(&mut self, wanted: bool) {
+        if wanted == self.raised {
+            return;
+        }
+        self.raised = wanted;
+        #[cfg(windows)]
+        {
+            // SAFETY: timeBeginPeriod/timeEndPeriod take a scalar and are
+            // documented to be called in matched pairs, which `raised` is what
+            // guarantees. Failure is reported, never unsafe.
+            unsafe {
+                if wanted {
+                    windows_sys::Win32::Media::timeBeginPeriod(1);
+                } else {
+                    windows_sys::Win32::Media::timeEndPeriod(1);
+                }
+            }
+        }
+        tracing::debug!(raised = wanted, "macro playback timer resolution");
+    }
+}
+
+impl Drop for TimerResolution {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
+
 /// What the engine thread reports back at join.
 #[derive(Default)]
 struct EngineOutcome {
@@ -1473,6 +1537,15 @@ fn engine_thread(
     let mut deltas = DeltaTx::new(deltas);
     let mut seen: u64 = 0;
     let mut limit_signalled = false;
+    // The macro clock: milliseconds since this thread started. Monotonic, and
+    // supplied to the engine rather than read by it, so the whole scheduler
+    // stays a pure function of (events, clock) and the core tests can drive it
+    // with a fake one (docs/INPUT-TRANSFORMS.md §1c).
+    let started = Instant::now();
+    let clock = move || started.elapsed().as_millis() as u64;
+    // Raised only while a macro is actually playing; `Drop` restores it on
+    // every exit path, panic included.
+    let mut timer_resolution = TimerResolution::default();
 
     macro_rules! finish {
         () => {
@@ -1486,19 +1559,27 @@ fn engine_thread(
 
     loop {
         // Retry a stalled flush promptly, but idle at the normal poll rate when
-        // there is nothing waiting.
-        let idle = if deltas.has_pending() {
+        // there is nothing waiting...
+        let mut idle = if deltas.has_pending() {
             Duration::from_millis(1)
         } else {
             POLL
         };
+        // ...and never sleep past a macro step. This is the whole scheduler
+        // integration on this side: the loop already woke on input and on a
+        // timeout, so a macro is one more reason to wake, not a thread.
+        let next_deadline = engine.next_deadline();
+        timer_resolution.set(next_deadline.is_some());
+        if let Some(deadline) = next_deadline {
+            idle = idle.min(Duration::from_millis(deadline.saturating_sub(clock())));
+        }
         crossbeam_channel::select! {
             recv(events) -> event => {
                 let Ok(event) = event else {
                     // Capture is gone; the supervisor sees the thread finish.
                     finish!();
                 };
-                for delta in engine.handle(&event) {
+                for delta in engine.handle_at(&event, clock()) {
                     if deltas.send(OutMsg {
                         slot: delta.slot,
                         state: delta.state,
@@ -1547,12 +1628,56 @@ fn engine_thread(
                         }
                     }
                 }
-                Ok(EngineCtl::Stop) | Err(_) => finish!(),
+                Ok(EngineCtl::CancelMacros) => {
+                    for delta in engine.cancel_macros() {
+                        if deltas.send(OutMsg {
+                            slot: delta.slot,
+                            state: delta.state,
+                            t_capture: u64::MAX,
+                        }).is_err() {
+                            finish!();
+                        }
+                    }
+                }
+                Ok(EngineCtl::Stop) | Err(_) => {
+                    // Everything releases on the way out. The pads are about to
+                    // be unplugged anyway, but a macro half-way through a
+                    // quarter-circle must not be what the last frame says.
+                    for delta in engine.cancel_macros() {
+                        if deltas.send(OutMsg {
+                            slot: delta.slot,
+                            state: delta.state,
+                            t_capture: u64::MAX,
+                        }).is_err() {
+                            finish!();
+                        }
+                    }
+                    let _ = deltas.flush();
+                    finish!();
+                }
             },
             default(idle) => {
                 if deltas.flush().is_err() {
                     finish!();
                 }
+            }
+        }
+
+        // Macro deadlines, checked after EVERY wake — an input event, a poll,
+        // or the deadline itself. `tick` is a no-op with nothing armed, which
+        // is what keeps a macro-free session bit-for-bit what it was.
+        for delta in engine.tick(clock()) {
+            if deltas
+                .send(OutMsg {
+                    slot: delta.slot,
+                    state: delta.state,
+                    // No originating keystroke: a scheduled step is not a latency
+                    // sample (`u64::MAX` is the output thread's "synthetic" mark).
+                    t_capture: u64::MAX,
+                })
+                .is_err()
+            {
+                finish!();
             }
         }
     }

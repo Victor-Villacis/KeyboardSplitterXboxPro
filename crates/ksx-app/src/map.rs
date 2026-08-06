@@ -125,6 +125,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                 err,
                 MapError::UnknownPreset { .. }
                     | MapError::UnknownFunction(_)
+                    | MapError::UnknownMacro { .. }
                     | MapError::UnknownKey(_)
                     | MapError::InvalidGuard(_)
                     | MapError::BadMoveFrom(_)
@@ -185,6 +186,7 @@ pub fn error_code(err: &MapError) -> &'static str {
     match err {
         MapError::UnknownPreset { .. } => "unknown-preset",
         MapError::UnknownFunction(_) => "unknown-function",
+        MapError::UnknownMacro { .. } => "unknown-macro",
         MapError::UnknownKey(_) => "unknown-key",
         MapError::InvalidGuard(_) => "invalid-guard",
         MapError::BadMoveFrom(_) => "bad-move-from",

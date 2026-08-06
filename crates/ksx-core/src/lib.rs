@@ -17,6 +17,8 @@
 //! - [`device`] — [`DeviceId`] (instance-path identity) and [`KeyEvent`]
 //! - [`preset`] — [`Binding`], [`Chord`] (guarded bindings), [`Preset`], and
 //!   the `default`/`empty` built-ins
+//! - [`macros`] — [`Macro`]: timed sequences, the sampling floor, and the
+//!   interruption policies; the scheduler that runs them lives in [`engine`]
 //! - [`slot`] — [`SlotSpec`] and the 13-variant [`InvalidationReason`] taxonomy
 //! - [`socd`] — [`Socd`]: SOCD cleaning, generated as chords rather than as a
 //!   new engine rule
@@ -28,6 +30,7 @@ pub mod device;
 pub mod engine;
 pub mod escape;
 pub mod key;
+pub mod macros;
 pub mod pad;
 pub mod persona;
 pub mod preset;
@@ -38,10 +41,14 @@ pub use device::{DeviceId, KeyEvent};
 pub use engine::{Deltas, Engine, EngineTables, PadDelta, ResolvedSlot};
 pub use escape::{Escape, EscapeDetector};
 pub use key::Key;
+pub use macros::{
+    Interrupt, Macro, MacroStep, MacroTrigger, OnRelease, Retrigger, StepDuration,
+    UnknownInterrupt, UnknownOnRelease, UnknownRetrigger, MIN_STEP_MS,
+};
 pub use pad::{
     Axis, DpadDirection, PadState, Trigger, XButton, XButtons, AXIS_CENTER, AXIS_MAX, AXIS_MIN,
 };
 pub use persona::{Persona, UnknownPersona};
-pub use preset::{Binding, Chord, Preset};
+pub use preset::{Binding, Chord, Macros, Preset};
 pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS, MAX_XINPUT_SLOTS};
 pub use socd::{OpposingPair, Socd, UnknownSocd};

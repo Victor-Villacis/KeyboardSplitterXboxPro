@@ -31,7 +31,7 @@ Two consequences run through everything below:
 |---|---|---|
 | **Multi-bind** (one physical → many virtual, simultaneous) | P → A + B + RT | **WORKS TODAY** |
 | **Chord** (many physical → one virtual, simultaneous) | A + B → RT | **SHIPPED** (§1b) — `when`/`unless` guard, with consumption |
-| **Macro** (one physical → a timed SEQUENCE) | P → ↓, ↘, →, A (hadouken) | **Not expressible** — needs a scheduler |
+| **Macro** (one physical → a timed SEQUENCE) | P → ↓, ↘, →, A (hadouken) | **SHIPPED** (§1c) — engine-thread scheduler, one timer list |
 
 ### 1a. Multi-bind already works — try it now
 
@@ -182,29 +182,212 @@ Guard evaluation is O(guard size) bit tests per event, allocation-free:
   `tests/engine_chords_alloc.rs` pins zero allocation on the chord path;
   `tests/engine_alloc.rs` and the replay corpus pin the chord-free one.
 
-### 1c. Macros — a different subsystem, not a bigger binding
+### 1c. Macros — SHIPPED (2026-08-05)
 
 Hadouken is ↓, ↘, → + punch **over time**. That is not a set, it is a
-timeline, and it needs three things the engine does not have: a clock, a
-queue, and a policy for what happens when reality interrupts.
+timeline, and it needed three things the engine did not have: a clock, a
+queue, and a policy for what happens when reality interrupts. All three
+landed; what did not is listed at the end of this section.
 
-Design sketch:
-- A macro is a list of `(state-delta, hold-duration)` steps compiled ahead
-  of time; the output thread walks it on a timer, publishing states.
-- **Minimum step duration is a hard rule** (§0.2): default ≥33 ms, and the
-  editor should refuse shorter unless the user opts into "may be missed".
-- **Interruption policy must be explicit**: releasing the macro key
-  mid-run → finish, or abort-and-neutralize? (Fighting games want
-  *finish*; a "hold to auto-fire" macro wants *abort*.) Per-macro setting.
-- **Crash safety is non-negotiable**: a macro in flight when ksx dies must
-  not strand buttons. Our crash-only guarantee already releases everything
-  when the pads vanish, but a macro must also be cancelled — and released —
-  on session stop, escape gesture, and hot-swap (the same neutral-delta
-  path FIX 3 added).
-- **Fairness**: macros are a first-class arcade tradition (real cabinets
-  wire one button to multiple micro-switches) but online play and some
-  anti-cheat treat sequence automation differently. ksx should ship them
-  without apology for local/cabinet use and state the caveat once.
+#### The model
+
+A macro is a named list of steps, and a step is **a set of bindings to hold
+plus a duration** (`ksx-core/src/macros.rs`). Because combination is the
+natural state of a set (§0.1), the diagonal ↘ is one step holding two
+bindings — not two events, not a special case.
+
+```rust
+pub struct MacroStep { hold: Vec<Binding>, duration: StepDuration, allow_short: bool }
+pub enum   StepDuration { Ms(u32), Frames(u32) }
+pub struct Macro { name, steps, on_release, retrigger, interrupt }
+pub struct MacroTrigger { key: Key, index: u16 }   // key -> macro
+```
+
+Macros live in `Preset::macros`, beside `entries` and `chords` and never
+inside them — so `preset.macros.is_empty()` is a *checkable* "this preset
+predates macros", the M3 replay corpus still hashes to the same
+`SESSION_DIGEST`, and a macro-free preset file is byte-identical.
+
+#### The file
+
+```toml
+[macros.hadouken]
+steps = [
+  { hold = ["dpad.down"],              ms = 50 },
+  { hold = ["dpad.down","dpad.right"], ms = 50 },
+  { hold = ["dpad.right"],             ms = 50 },
+  { hold = ["A"],                      ms = 50 },
+]
+
+[bindings]
+macro.hadouken = "P"       # any number of keys; the usual multi-bind rules
+```
+
+`macro.<name>` is its own grammar, deliberately outside `parse_function`: a
+macro is named by the preset's own `[macros]` table, not by the fixed pad
+vocabulary, so the name cannot resolve to a `Binding` without knowing which
+preset it came from. An empty `hold = []` is legal and useful — it is a
+deliberate neutral gap, which is how a macro says "let go, then press
+again" so the game sees two presses instead of one long hold.
+
+#### `frames` — an ergonomic unit, and only that
+
+`{ hold = ["dpad.right"], frames = 3 }` is accepted and converted once at
+60 Hz (rounded to nearest: 1→17 ms, 2→33, 3→50, 4→67 — rounded *once*, so
+three frames is 50 ms and not 3×17). Exactly one of `ms` / `frames` per
+step; both, or neither, is refused rather than resolved.
+
+**It buys readability and nothing else.** ksx publishes STATE and the game
+samples it on its own schedule (§0), at a rate ksx does not know and a
+phase that drifts against ksx's clock every second the two run. `frames =
+3` means "held for the wall-clock duration of three 60 Hz frames", NOT "the
+game will read this on exactly three of its polls" — it may read it on two,
+or four, and on a 120 Hz or vsync-coupled emulator on some other number
+entirely. The stronger promise would need the game to tell us when it
+polls, which no game does. What the unit *does* inherit is the floor below:
+two frames is `MIN_STEP_MS`, and that is not a coincidence.
+
+#### The sampling rule, enforced (§0.2)
+
+A step shorter than ~33 ms is not unreliable at 60 Hz, it is **invisible**.
+So `MacroStep::effective_ms` **raises** anything below `MIN_STEP_MS = 33` —
+and validation says so every time (`MacroStepRaised`). The per-step opt-out
+is `allow_short = true`, which runs the duration as written and warns
+differently (`MacroStepMayBeMissed`). Both are advisories: one keeps the
+macro correct at the cost of running longer, the other is the author having
+been asked and having answered. **Neither is ever silent**, and there is no
+configuration in which ksx emits a step a poller cannot see.
+
+#### Scheduling: absolute, drift-free, one list
+
+The scheduler runs on the **engine thread** — the capture thread still only
+timestamps and forwards, so four players triggering macros at once cannot
+lock or allocate anywhere near the hot path. There is exactly **one ordered
+timer list for every macro in every slot** (`engine.rs::Timers`): entries
+are `Copy`, the backing `Vec` is sized at `EngineTables::build` time to the
+total macro count, arming is an insertion into an already-sorted list, and
+ties are FIFO so two macros armed for the same millisecond always fire in
+the order they were armed. No thread per macro, no allocation per step.
+
+Deadlines are **absolute offsets from the macro's start**, never `now +
+duration` accumulated per step. That is the real fix for jitter: a wake
+that is 3 ms late is corrected at the very next step instead of pushing the
+whole sequence back, so four 50 ms steps still end at 50/100/150/200 rather
+than accumulating four scheduler jitters.
+
+When a wake is *so* late that a step's whole window has already passed, the
+step is **not skipped** — a skipped step is an input the game never
+sampled, which §0.2 forbids. It is published for its sampling minimum
+(`MacroStep::min_visible_ms`) and the rest of the timeline slides. A macro
+may run long; no step is ever invisible.
+
+The engine exposes `tick(now) -> Deltas` and `next_deadline() -> Option<u64>`;
+the supervisor's engine loop already woke on input and on a poll timeout, so
+a macro is simply one more reason to wake (`select!`'s `default(idle)` is
+clamped to the next deadline). Time is **supplied, never read** — the engine
+holds no clock — which is what makes a macro a pure function of
+`(events, clock)`, reproducible to the millisecond in CI with a fake one.
+
+Windows' default timer resolution is ~15.6 ms and a step is 33 ms, so the
+engine thread raises it to 1 ms **only while a deadline is armed**
+(`supervisor::TimerResolution`) and restores it the moment the last one
+clears — with `Drop` covering every exit path, panic included. `ksx daemon`
+lives for hours; holding 1 ms for all of it to serve a macro pressed twice
+an hour would tax every other process's power management for nothing.
+
+#### Interruption policy — three axes, all explicit
+
+| Setting | Values | Default | Means |
+|---|---|---|---|
+| `on_release` | `finish` \| `abort` | `finish` | letting go of the trigger mid-run |
+| `retrigger` | `ignore` \| `restart` | `ignore` | pressing the trigger again mid-run |
+| `interrupt` | `none` \| `any-input` \| `opposing` | `none` | doing something *else* mid-run |
+
+`finish` is the fighting-game expectation: you tap the button and the
+quarter-circle comes out whole. `abort` is the hold-to-autofire shape.
+`ignore` is the default because `restart` stutters a sequence back to step
+0 on any switch bounce a real panel has.
+
+`interrupt` composes with `on_release`, and is deliberately narrow:
+
+- **`any-input`** — any other key *this slot* binds, going down, aborts.
+- **`opposing`** — abort only on input that contradicts the macro, which is
+  exactly two rules: (1) a key driving a direction **opposing** one the
+  current step is holding (`ksx_core::socd::opposes` — the same relation
+  SOCD cleans, so the two features cannot disagree), and (2) a key that
+  triggers a **different** macro on this slot. A punch during a motion is
+  neither, and passes straight through.
+
+A macro is never interrupted by its own trigger; that is a retrigger, and
+`retrigger` decides it. One press can abort one macro and start another,
+and both land in the single delta batch that event produces.
+
+#### Everything releases on the way out
+
+A macro STEP is an ordinary **holder**: `holder_bindings[first + i]` is step
+`i`'s hold set, and the step is "held" exactly while the macro is on it. So
+the all-keys-up rule, the opposite-axis snap, the releases-before-presses
+order and the one-batch discipline are the chord machinery unchanged — a
+macro cannot strand a button that a chord could not. Two consequences worth
+naming: an endpoint carried from one step to the next **never flickers**
+(step 0's ↓ is not released, because step 1 already holds it in the same
+pass), and an endpoint driven by both a key and a macro stays down while
+either drives it.
+
+Every exit uses the same cancel-and-release path, and each has a test:
+
+| Path | Mechanism |
+|---|---|
+| `on_release = "abort"`, `interrupt` | `macro_cancel` → one neutral batch |
+| device yank | `release_device` cancels the slot's macros, then full resync |
+| hot swap | `swap_tables` drops the run with its tables; neutral deltas follow |
+| session stop | engine thread runs `cancel_macros` before it finishes |
+| escape gesture (`LeftCtrl ×5` → blocking off) | supervisor sends `EngineCtl::CancelMacros` |
+| `reset` | clears macro state and every armed deadline |
+| process death | unchanged: the pads vanish and the driver releases everything |
+
+#### Validation
+
+`EmptyMacro`, `UnknownMacroHold`, `UnknownMacroRef` (a trigger naming a
+macro the preset does not define), `GuardedMacroTrigger`,
+`DuplicateMacroName` (names match ignoring case, so two tables differing
+only in case would silently shadow), `MacroStepBadDuration` (both units or
+neither) — all faults. `MacroStepRaised` and `MacroStepMayBeMissed` are the
+two advisories, printed by the plan as `[WARN]`.
+
+#### CLI surface — triggers only, on purpose
+
+`ksx map --preset "SF P1" --function macro.hadouken --key P` binds the key
+that STARTS a macro, and `--clear` unbinds it; cross-slot conflicts,
+`--force` and the `also_drives` multi-bind report all work exactly as they
+do for a pad function. `--when`/`--unless` and `--move-from` are refused
+with a reason.
+
+**Authoring the sequence itself stays TOML-only**, and that is a decision,
+not a gap: a step list is a timeline with durations, a hold set and three
+interruption policies, and a flag-per-field CLI for it would be worse than
+the `[macros]` table it would write. `ksx run --dry-run` prints every
+configured macro — step count, total ms, all three policies, and the keys
+that start it — in both the human and `--json` output, so the AI/CLI
+surface can still *read* everything. A mapper UI for macros is a later pass.
+
+#### What did not ship
+
+- **No macro in the Studio mapper UI** — CLI + TOML only for now.
+- **No chord that starts a macro.** `macro.x = { key = "P", when = ["Q"] }`
+  is refused rather than half-implemented; the guard would have to compose
+  with consumption, and nothing asked for it yet.
+- **No looping / hold-to-repeat.** A macro is one-shot: the last step ends
+  the run even if the trigger is still held. That is turbo (§2.3), a
+  different feature with a different aliasing problem, and folding the two
+  would make both harder to explain.
+- **No `interrupt = "opposing"` beyond the two stated rules.** Anything
+  fuzzier would be unpredictable on a cabinet, so it is direction
+  opposition plus other-macro-triggers, and this document says so.
+- **Fairness caveat, stated once**: macros are a first-class arcade
+  tradition (real cabinets wire one button to several micro-switches), but
+  online play and some anti-cheat treat sequence automation differently.
+  ksx ships them without apology for local/cabinet use.
 
 ## 2. What Victor is missing — the catalog, ranked for a cabinet
 
@@ -363,9 +546,13 @@ Nothing here blocks M6/M7. Suggested order, cheapest-and-most-useful first:
    double-tap, ramps — plus analog shaping, which needs neither. **SOCD
    cleaning also landed on top of chords** (§2.6), for the cost of one
    consume-only binding; only its last-wins mode still waits for history.
-5. **Macros** last of the big ones — they need the scheduler, the
-   interruption policy, and the sampling rule, and they are the easiest to
-   get subtly wrong.
+5. ~~**Macros**~~ — **DONE** (§1c). They did need the scheduler, and it
+   turned out to be small: one ordered timer list on the engine thread, and
+   a macro *step* modelled as an ordinary holder, so every release path
+   chords already had covered macros for free. What the transform stage
+   still owes §3 is the rest of the time-based half — turbo, tap-hold,
+   double-tap, ramps — plus SOCD's last-wins mode, which needs history
+   rather than a clock.
 6. **Input display** alongside whichever of the above ships first; it is
    how the user (and we) will debug all of it.
 

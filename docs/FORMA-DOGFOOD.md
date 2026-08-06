@@ -31,6 +31,7 @@ upstream the report/PR).
 | 14 | The `show:createShow` positional seam (#4) does not just risk drift — it **prices** UI work. The v6 pass added 6 shows to the mapper (18) and 1 to the status page (17); each one is a four-file edit (island tree, twin Page declaration, `*_SHOW_ORDER` label, boolean position in `show_values`) whose only guard is our own count assertion, and an insertion in the MIDDLE of the document silently shifts every show after it. Named show slots would make all four edits one. **v7 update**: the whole multi-select feature cost exactly ONE new show (19) — because it was APPENDED as the last element of the document rather than placed where it belongs visually (it is `position: fixed`, so it could be). That is the seam shaping the markup: a bar that renders at the bottom of the page is written at the bottom of the tree to avoid renumbering 15 booleans | reinforces the **OPEN ASK** in #4 with a cost measurement: 3 pages of seam is no longer hypothetical, and it now influences where elements are authored | `render_map.rs` MAP_SHOW_ORDER (19); `render.rs` SHOW_ORDER (17) |
 | 15 | Good news, and the pattern that made the v6 mapper affordable: **a per-item member read can carry a whole interaction**, not just presentation. The legend's ✕ clear accelerator is `h("span", { class: "lclear", "data-clear": l.fn, title: l.cleartitle }, l.clear)` — a bare `param.field` per #11, so SSR emits it and the client re-derives it per poll, and `map.ts` reads `data-clear` by delegation. Empty string = CSS-hidden, which is how "only offer the ✕ where clearing does something" costs zero shows. Same trick disables controls: `cls` carries `z-dead`/`l-dead` instead of a `disabled` attribute (which would swallow the click that owes the user an explanation) | confirms #11's contract holds for interaction attrs too — worth including in the upstream ask | `MapIsland.ts` legend list; `render_map.rs` `legend_rows` |
 | 16 | Ledger #13(b)'s patched show seam held under a much heavier load: the v6 mapper nests shows THREE deep inside a re-toggled branch (`modalOpen` → `modalListening` / `modalBound` / `modalConflict`) and re-toggles them dozens of times per session with no stale prompts or empty boxes. The `__ksxShowBranch` unowned-root rewrite is the reason; without it this design would have been unbuildable | evidence for the upstream fix's shape (**OURS-TO-SEND**, unchanged) | `build.mjs` ledger-#13 patch |
+| 17 | Good news with a catch, and what made v9's no-JavaScript mapper buildable: **`...CONST.map((x) => h(…))` spreads are EXPANDED AT COMPILE TIME** into static markup (`extractFileConstants` → `emitSpreadChild` → `substituteProperties`), so a 122-option `<select>` can be authored once and rendered on all 25 legend rows without a nested list (which the item-body seam does not offer) and without 122 literals per select. Three constraints, all silent when broken: (a) the constants are read from the **root `*Page` file only** — the same blind spot as #9 — and from plain top-level `const` declarations, so `export const` is invisible (declare bare, `export { … }` separately, import back from the island: single-sourced, unlike the signals); (b) substitution reaches **children only, not attribute values** — `h("option", { value: x.k }, x.t)` compiles the text but leaves `value` as an EMPTY dyn-attr slot, i.e. `<option value="">` on every option, which for a form is silently wrong data rather than missing decoration (we render `h("option", null, x.k)` and lean on HTML's option-text-is-the-value rule); (c) an unexpandable spread falls back to an ISLAND placeholder — the tell is the build line, `24 islands` where the page has one | **OURS-TO-SEND**: document the pattern as supported; extend substitution to attribute values (or warn); read file constants from island files too | `studio-ui/src/MapPage.ts` key tables; `MapIsland.ts` legend row form |
 
 ## Details for filing — mechanism, upstream location, local repro
 
@@ -218,6 +219,44 @@ means "hide this per-row control" (CSS `:empty`), and a class-string field
 click, and a click on an unmappable control is exactly the click that owes the
 user an explanation. Worth folding into the #11 upstream ask as the reason the
 contract matters.
+
+### #17 — compile-time spread expansion (and its three sharp edges)
+Discovered building v9's no-JS mapper (2026-08-05). **Upstream**: forma-tools
+→ `emitSpreadChild` / `extractFileConstants` / `substituteInExpr`.
+
+**The good part**: `...KEYS.map((k) => h("option", null, k.k))` where `KEYS` is
+a top-level array of object literals is unrolled INTO THE IR at build time —
+static markup, no slots, no islands, and the identical source still runs in
+the browser for the client re-render. That is the only reason a full 122-key
+picker on 25 legend rows is affordable: the alternative was a nested
+`createList` (the item-body seam has no such thing) or 3 000 hand-written
+literals.
+
+**Edge 1 — root-file only.** `extractFileConstants(componentSource)` is called
+with the entry's resolved `*Page` file, and the island's walk context inherits
+it unchanged (`islandWalkCtx = { ...walkCtx }`). Constants declared beside the
+markup in `MapIsland.ts` are invisible; the spread silently degrades to an
+island. It also scans `program.body` for `VariableDeclaration`, and an
+`export const` is an `ExportNamedDeclaration`, so exporting the constant hides
+it too. Local shape: declare bare in `MapPage.ts`, `export { … }` in a separate
+statement, `import` back into `MapIsland.ts`. The resulting MapPage → MapIsland
+→ MapPage cycle is inert (nothing reads the arrays before `MapIsland()` runs)
+and, unlike #9's signals, this is SINGLE-SOURCED.
+
+**Edge 2 — children only.** `substituteInCallExpr` walks the h() call's
+arguments and substitutes bare member reads, but an ObjectExpression argument
+(the props) is returned untouched. So `h("option", { value: k.k }, k.t)`
+emits the text and then an `attr:value` slot with nothing in it: every option
+renders `value=""`. For decoration that is invisible; for a FORM it is wrong
+data submitted silently — the worst failure mode in this ledger after #10.
+Local shape: no `value` attribute at all, and HTML's rule that an option's
+trimmed text IS its value. (Which turned out to be the honest design anyway:
+what you pick is character-for-character what the preset file will hold.)
+
+**Edge 3 — the tell.** An unexpandable spread emits an island placeholder, so
+the build's own line gives it away: `IR emitted (real): map.ir (13362 bytes,
+24 islands)` for a page with exactly one island was the first symptom. Worth
+a warning upstream; the byte count and island count are the only signal.
 
 ### #16 — the #13(b) patch held under three-deep nested shows
 The v6 learn modal nests shows three levels inside a re-toggled branch

@@ -14,6 +14,17 @@ pub enum ConfigError {
     UnknownKey(String),
     #[error("axis value '{0}' is not 'min', 'max' or a signed 16-bit integer")]
     InvalidAxisValue(String),
+    #[error(
+        "{0} — a macro step's duration is `ms = <n>` or `frames = <n>` (60 Hz), exactly one of          them; a step with no duration would be an input no game could sample"
+    )]
+    MacroStepDuration(String),
+    #[error("no macro called '{0}' is defined in this preset (add a [macros.{0}] table)")]
+    UnknownMacro(String),
+    #[error(
+        "'macro.{0}' cannot carry a when/unless guard: a macro is started by a key, and a \
+         chord that starts a sequence is not implemented (docs/INPUT-TRANSFORMS.md §1c)"
+    )]
+    GuardedMacroTrigger(String),
     #[error("unknown device alias '{0}' (no [[device]] entry has this alias)")]
     UnknownDeviceAlias(String),
     #[error(transparent)]
@@ -49,6 +60,24 @@ pub enum ConfigError {
     },
     #[error("preset name '{0}' cannot be turned into a file name")]
     InvalidPresetName(String),
+    /// JSON interop: rendering a document failed. No path, because the usual
+    /// destination is stdout.
+    #[error("cannot render the JSON document: {message}")]
+    JsonRender { message: String },
+    #[error(
+        "{path}: this JSON has no 'ksx_interop' field, so ksx cannot tell what it is; \
+         say so with --what config|games|presets"
+    )]
+    UntaggedJson { path: PathBuf },
+    #[error(
+        "{path}: ksx_interop {found} is not supported by this build (current: {supported}); \
+         a newer ksx wrote it"
+    )]
+    UnsupportedInteropVersion {
+        path: PathBuf,
+        found: u64,
+        supported: u32,
+    },
     #[error(
         "no usable configuration directory: no ksx.toml next to the exe and \
          no user config directory available"

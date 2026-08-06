@@ -19,6 +19,30 @@ use crate::error::ConfigError;
 /// is what it is called (docs/INPUT-TRANSFORMS.md §2.6).
 pub const CONSUME: &str = "consume";
 
+/// The prefix that makes a `[bindings]` row a MACRO TRIGGER rather than an
+/// endpoint: `macro.hadouken = "P"` (docs/INPUT-TRANSFORMS.md §1c).
+///
+/// Macros are deliberately outside [`parse_function`]: a macro is named by the
+/// preset's own `[macros]` table, not by the fixed pad vocabulary, so the name
+/// cannot resolve to a [`Binding`] without knowing which preset it came from.
+/// [`macro_name`] is the whole of the grammar.
+pub const MACRO_PREFIX: &str = "macro.";
+
+/// The macro a function name triggers, if it is a macro row at all.
+///
+/// Case-insensitive on the prefix, like every other function name; the macro
+/// name itself is returned verbatim so the file keeps the author's spelling
+/// (matching against the `[macros]` table is case-insensitive too).
+pub fn macro_name(function: &str) -> Option<&str> {
+    let (head, rest) = function.split_at_checked(MACRO_PREFIX.len())?;
+    head.eq_ignore_ascii_case(MACRO_PREFIX).then_some(rest)
+}
+
+/// The canonical function name that triggers `name`.
+pub fn macro_function_name(name: &str) -> String {
+    format!("{MACRO_PREFIX}{name}")
+}
+
 /// Canonical function name for a binding.
 pub fn function_name(binding: &Binding) -> String {
     match binding {
@@ -233,6 +257,25 @@ mod tests {
         for button in XButton::ALL {
             assert_ne!(function_name(&Binding::Button(*button)), CONSUME);
         }
+    }
+
+    /// Macro rows are recognized by prefix and never by the pad vocabulary —
+    /// `parse_function` must keep refusing them, or a macro trigger would
+    /// silently become "unknown function" instead of a macro.
+    #[test]
+    fn macro_rows_are_their_own_grammar() {
+        assert_eq!(macro_name("macro.hadouken"), Some("hadouken"));
+        assert_eq!(macro_name("MACRO.Hadouken"), Some("Hadouken"));
+        // Dots in a macro name are the author's business, not ours.
+        assert_eq!(macro_name("macro.super.combo"), Some("super.combo"));
+        assert_eq!(macro_name("macros.hadouken"), None);
+        assert_eq!(macro_name("macro"), None);
+        assert_eq!(macro_name("A"), None);
+        assert_eq!(macro_function_name("hadouken"), "macro.hadouken");
+        assert!(matches!(
+            parse_function("macro.hadouken"),
+            Err(ConfigError::UnknownFunction(_))
+        ));
     }
 
     #[test]

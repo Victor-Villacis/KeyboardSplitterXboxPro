@@ -30,7 +30,69 @@ list.
 | Autostart | `ksx autostart --enable/--disable/--status` (validates the config before registering) | M9: same verb in-process. M10: api | exists |
 | Install drivers | `ksx install-drivers [--dry-run] [--yes]` — the only elevated command (SealedFile pins, no self-elevation) | M9: same verb; the GUI never self-elevates either, it reports and stops exactly as the CLI does. M10: report-only over the api | exists |
 | Import legacy | `ksx import-legacy [--from DIR] [--dry-run] [--json]` | M9: same verb; the `--json` shape is already a GUI-renderable report | exists |
+| Export config as JSON | `ksx config export [--what config\|games\|presets\|all] [--preset NAME] [--out PATH\|-] [--compact] [--json]` — the document on stdout (so it pipes), the summary on stderr | M9: same verb in-process; the document IS the payload a form would populate. M10: read-only over the api — a whole cabinet in one GET | exists — CLI |
+| Import config from JSON | `ksx config import <PATH\|-> [--what …] [--dry-run] [--yes] [--force] [--json]` — validated first, DRY RUN unless `--yes`, timestamped `.bak` of every overwritten file | M9: same verb, preserving dry-run-first. M10: local only for now — a remote surface that can replace the whole config wants the pairing token first | exists — CLI |
 | Doctor | `ksx doctor [--latency] [--json]` — stable codes, `{report, advice}` | M9: same verb, render the JSON. M10: api | exists |
+
+## Config interop: TOML is canonical, JSON is for machines (2026-08-06)
+
+`ksx config export|import` (`ksx-app/src/config_io.rs`, over
+`ksx-config/src/interop.rs`). Both formats go through the **same serde types**,
+so there is no second schema to drift: a field added to a config type is in
+both the moment it compiles. `[macros.<name>]` landed while this was being
+written and cost the interop layer zero lines.
+
+**Why TOML stayed canonical: comments.** ksx config files are annotated —
+`mouse_move_deadzone = 5  # 0..12`, why a cabinet's `launcher_grace_ms` is
+20 s, which panel a `[[device]]` id belongs to. Those notes are the difference
+between a file that is maintainable a year later and one nobody dares touch,
+and they matter just as much to an AI reading the config, which gets the
+*intent* next to the value instead of having to infer it. JSON has no syntax
+that could keep them, so a JSON-canonical ksx would discard the annotations on
+every write. Nothing else came close as an argument.
+
+**Why JSON exists anyway: the readers that are not people.** Preset sharing
+(M7), AI-generated configs (E5 — "write me a cabinet config" is the workflow
+this verb makes real), and anything that wants a schema.
+
+```
+ksx config export                                  # whole root, pretty, stdout
+ksx config export --preset "IPAC P1" --out p1.json # one preset, shareable
+ksx config export --what games --compact | jq .    # stdout is ONLY the document
+ksx config import cabinet.json                     # DRY RUN — validated report
+ksx config import cabinet.json --yes               # writes, .bak first
+cat p1.json | ksx config import - --what presets --yes
+```
+
+| rule | why |
+|---|---|
+| **The document goes to stdout; the summary goes to stderr** (human, or one JSON object with `--json`) | `ksx config export > cabinet.json` and `\| jq` both work with no flag juggling |
+| **Import is a DRY RUN unless `--yes`** (`--dry-run` is the explicit spelling and wins over `--yes`) | the same consent shape as `ksx install-drivers` and `ksx winusb claim\|release` — not a third convention |
+| **Validated before anything is written**, against the configuration the import WOULD PRODUCE (imported presets layered over the ones on disk), through the same `ksx-config::validate` the run plan uses. Any non-advisory finding refuses, structurally (`issues[]`), with nothing written; `--force` writes anyway | a config that fails to resolve is a cabinet that boots to nothing |
+| **Every overwritten file is copied to `<file>.bak-YYYYMMDD-HHMMSS` first** (`-2`, `-3`… inside one second), the same convention and name shape the mapper uses, so `ksx map --list-backups` finds them | imports rewrite whole files; comments do not survive, so the road back has to exist |
+| **What lands on disk is canonical TOML**, unless the target file is already a `.json` | JSON is the transport, not the storage |
+| **A bare document must say what it is.** An enveloped document carries `ksx_interop` and describes itself; a bare `ConfigFile`/`GamesFile`/`PresetFile`/preset-array (what an assistant usually writes) needs `--what` to name its type | a preset and a games file are both just objects; importing the wrong file over the wrong file is the failure this verb exists to prevent, so it refuses rather than sniffs |
+
+**The store reads `.json` too.** `config.json` / `games.json` /
+`presets\<name>.json` are loaded when no TOML of that name exists, and a file
+is saved back in the format it already had. **Where both spellings exist the
+TOML wins and the JSON is ignored**, with a warning naming the ignored file —
+never a merge. A merge would need a conflict rule per field, and the first time
+it guessed wrong it would guess wrong silently, on a file the user believed was
+authoritative. One winner, said out loud.
+
+**The one thing JSON does not get is migration.** The store's migration steps
+operate on a raw `toml::Table` because the canonical file is the one that has
+to survive upgrades; a `.json` config at another `schema_version` is refused,
+not migrated (convert → let ksx migrate the TOML → export again). Costs nothing
+today — v1 is the first schema and the registry is empty — and is written down
+so it cannot surprise anyone later.
+
+Refusal codes (`--json` `code`, stable, exit 2 with nothing written):
+`untagged-json`, `unsupported-interop`, `unsupported-schema`, `bad-json`,
+`empty-selection`, `bad-selection`, `unknown-preset`, `validation-failed`.
+Exit 3 means some files were written and then a write failed — the report names
+both halves.
 
 ## The daemon control channel (M10a first slice — CLOSED the old gap 1)
 
@@ -166,8 +228,29 @@ it writes the `empty` built-in's SHAPE — all 25 functions present, each keyed
 control stays visible in the legend instead of vanishing.
 
 Refusal codes (`--json` `code`, stable): `unknown-preset`, `unknown-function`,
-`unknown-key`, `invalid-guard`, `bad-move-from`, `conflict` (cross-slot only),
-`no-session-backup`, `no-backup`, `bad-backup`, `config-error`. A corrupt backup is refused, never written.
+`unknown-macro`, `unknown-key`, `invalid-guard`, `bad-move-from`, `conflict`
+(cross-slot only), `no-session-backup`, `no-backup`, `bad-backup`,
+`config-error`. A corrupt backup is refused, never written.
+
+### Macros: `--function macro.<name>` (2026-08-05)
+
+```
+ksx map --preset "SF P1" --function macro.hadouken --key P    # bind the trigger
+ksx map --preset "SF P1" --function macro.hadouken --clear    # unbind it
+```
+
+`ksx map` binds the key that **starts** a macro; cross-slot conflicts,
+`--force` and the `also_drives` multi-bind report behave exactly as they do for
+a pad function. `--when`/`--unless` and `--move-from` are refused with a reason
+(`invalid-guard` / `bad-move-from`), and a name with no `[macros.<name>]` table
+behind it gives `unknown-macro` listing the macros the preset does have.
+
+**Authoring the sequence stays TOML-only** — a step list is a timeline with
+durations, a hold set and three interruption policies, and a flag-per-field CLI
+would be worse than the `[macros]` table it would write. `ksx run --dry-run`
+prints every configured macro (steps, total ms, `on_release`/`retrigger`/
+`interrupt`, and the keys that start it) in both human and `--json` form, so the
+CLI/AI surface can still read everything. See docs/INPUT-TRANSFORMS.md §1c.
 
 ### Chords: `--when` / `--unless` (2026-08-06)
 
@@ -379,11 +462,14 @@ gets the same channel for free.
 4. **learn-key still needs emulation stopped** — deliberately, for the four
    reasons in "learn-key semantics". Studio makes obeying it one click
    (Pause → map → Resume) rather than a dead end.
-5. **`ksx slot assign` (which preset a slot uses) is still a TOML edit.** The
-   mapper edits bindings inside a preset; pointing slot 2 at a different
-   preset is a games.toml/config.toml change today. Worth noting it is
-   nevertheless a HOT change at the engine level — only the binding table
-   moves — so it does not need a pad bounce once the verb exists.
+5. **`ksx slot assign` (which preset a slot uses) is still a TOML edit** — or
+   now a whole-file one: `ksx config export --what config`, edit the JSON,
+   `ksx config import --what config --yes` is validated, backed up and
+   scriptable, which is what E5 actually needed. A narrow per-slot verb is
+   still worth having (it would not rewrite the file's comments), so this stays
+   open. Worth noting the change is nevertheless HOT at the engine level — only
+   the binding table moves — so it does not need a pad bounce once the verb
+   exists.
 
 ## Invariants a GUI must not break
 
@@ -413,7 +499,10 @@ Each one maps to a legacy defect or a measured constraint
   (`ApplyBindings`), anything structural is still a clean stop + re-read +
   start (`Reload`). Both paths read the same TOML; neither patches a live
   pipeline's state in place, and the swap releases anything held so it cannot
-  strand a pressed control.
+  strand a pressed control. **JSON interop does not weaken this**: `ksx config
+  import` writes the same hand-editable TOML files through the same store, and
+  the change still lands by re-reading them. JSON is a transport, never a
+  parallel store — see "Config interop" above.
 - **A surface that cannot act must SAY so, per click.** No control may be a
   silent no-op. When the daemon is unreachable Studio shows a banner at the top
   of the page ("No daemon — ksx Studio can see your config but cannot change

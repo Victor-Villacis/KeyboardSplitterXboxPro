@@ -556,6 +556,32 @@ pub fn render_human(plan: &RunPlan) -> String {
         if let Some(mouse) = &slot.spec.mouse {
             let _ = writeln!(out, "           mouse {} (routed, never blocked)", mouse);
         }
+        // Macros are the one binding kind you cannot read off a key→function
+        // list: what matters is the sequence, how long it takes, and what
+        // happens when the player lets go (docs/INPUT-TRANSFORMS.md §1c).
+        for (i, mac) in slot.preset.macros.defs.iter().enumerate() {
+            let keys: Vec<&str> = slot
+                .preset
+                .macros
+                .keys_for(i as u16)
+                .map(|k| k.name())
+                .collect();
+            let _ = writeln!(
+                out,
+                "           macro \"{}\" {} step(s), {} ms  on_release={} retrigger={} interrupt={}  key(s) {}",
+                mac.name,
+                mac.steps.len(),
+                mac.total_ms(),
+                mac.on_release,
+                mac.retrigger,
+                mac.interrupt,
+                if keys.is_empty() {
+                    "-  (defined but nothing starts it)".to_owned()
+                } else {
+                    keys.join(", ")
+                }
+            );
+        }
     }
     let _ = writeln!(
         out,
@@ -585,6 +611,17 @@ pub fn plan_json(plan: &RunPlan) -> serde_json::Value {
                 "chords": s.preset.chords.len(),
                 "keyboard": s.spec.keyboard.as_ref().map(|d| d.as_str()),
                 "mouse": s.spec.mouse.as_ref().map(|d| d.as_str()),
+                "macros": s.preset.macros.defs.iter().enumerate().map(|(i, mac)| serde_json::json!({
+                    "name": mac.name,
+                    "steps": mac.steps.len(),
+                    "total_ms": mac.total_ms(),
+                    "on_release": mac.on_release.as_str(),
+                    "retrigger": mac.retrigger.as_str(),
+                    "interrupt": mac.interrupt.as_str(),
+                    "keys": s.preset.macros.keys_for(i as u16)
+                        .map(|k| k.name())
+                        .collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
             })
         })
         .collect();

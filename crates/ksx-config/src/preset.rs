@@ -5,8 +5,13 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use ksx_core::{
+    Interrupt, Macro, MacroStep, MacroTrigger, Macros, OnRelease, Retrigger, StepDuration,
+};
+
 use crate::error::ConfigError;
 use crate::function::{function_name, parse_function};
+use crate::macro_serde::is_false;
 
 /// One preset file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +21,156 @@ pub struct PresetFile {
     /// key-name strings or arrays of them.
     #[serde(default)]
     pub bindings: BTreeMap<String, BindingEntry>,
+    /// Timed sequences, keyed by macro name (docs/INPUT-TRANSFORMS.md §1c).
+    /// A preset with none serializes to exactly the bytes it always did.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub macros: BTreeMap<String, MacroFile>,
+}
+
+/// One `[macros.<name>]` table.
+///
+/// ```toml
+/// [macros.hadouken]
+/// steps = [
+///   { hold = ["dpad.down"],              ms = 50 },
+///   { hold = ["dpad.down","dpad.right"], ms = 50 },
+///   { hold = ["dpad.right"],             ms = 50 },
+///   { hold = ["A"],                      ms = 50 },
+/// ]
+///
+/// [bindings]
+/// macro.hadouken = "P"
+/// ```
+///
+/// `deny_unknown_fields` because a typo in `on_release` must not silently mean
+/// "the default" on a setting whose whole job is to decide what happens when
+/// the player lets go.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MacroFile {
+    /// Ordered steps. An empty list is accepted by the parser and reported by
+    /// validation — loading is lenient, validation is where it becomes
+    /// actionable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<MacroStepFile>,
+    /// What a release of the trigger key does: `finish` (default) or `abort`.
+    #[serde(
+        default,
+        with = "crate::macro_serde::on_release",
+        skip_serializing_if = "crate::macro_serde::on_release::is_default"
+    )]
+    pub on_release: OnRelease,
+    /// What a second press does while the macro runs: `ignore` (default) or
+    /// `restart`.
+    #[serde(
+        default,
+        with = "crate::macro_serde::retrigger",
+        skip_serializing_if = "crate::macro_serde::retrigger::is_default"
+    )]
+    pub retrigger: Retrigger,
+    /// What OTHER input does to a run in flight: `none` (default),
+    /// `any-input` or `opposing`.
+    #[serde(
+        default,
+        with = "crate::macro_serde::interrupt",
+        skip_serializing_if = "crate::macro_serde::interrupt::is_default"
+    )]
+    pub interrupt: Interrupt,
+}
+
+/// One step: the function names to hold, and for how long.
+///
+/// The duration is given as EITHER `ms` or `frames`, never both — two units for
+/// one number would make "which wins" a thing a reader has to remember.
+/// `frames` is 60 Hz and is an ergonomic unit only; see
+/// [`ksx_core::StepDuration::Frames`] for exactly how weak that promise is.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MacroStepFile {
+    /// Function names ([`crate::function`]), held together for the whole step.
+    /// Empty is legal and means a deliberate neutral gap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hold: Vec<String>,
+    /// Requested hold in milliseconds. Below [`ksx_core::MIN_STEP_MS`] it is
+    /// RAISED unless `allow_short` says otherwise (§0.2, the sampling rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u32>,
+    /// The same, in 60 Hz frames — the unit a fighting-game player thinks in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<u32>,
+    /// "I know this is shorter than a 60 Hz poller can see." Validation warns
+    /// every time this is set.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_short: bool,
+}
+
+impl MacroStepFile {
+    /// The authored duration, or why it cannot be read.
+    ///
+    /// Both units at once and neither unit at all are BOTH errors: a step with
+    /// no duration is not "instant", it is a file that forgot to say something,
+    /// and guessing a default here would put an invisible input on the wire.
+    pub fn duration(&self) -> Result<StepDuration, &'static str> {
+        match (self.ms, self.frames) {
+            (Some(_), Some(_)) => Err("says both `ms` and `frames`; use exactly one"),
+            (Some(ms), None) => Ok(StepDuration::Ms(ms)),
+            (None, Some(frames)) => Ok(StepDuration::Frames(frames)),
+            (None, None) => Err("has no duration; give it `ms` or `frames`"),
+        }
+    }
+}
+
+impl MacroFile {
+    fn to_core(&self, name: &str) -> Result<Macro, ConfigError> {
+        let mut steps = Vec::with_capacity(self.steps.len());
+        for (i, step) in self.steps.iter().enumerate() {
+            let duration = step.duration().map_err(|reason| {
+                ConfigError::MacroStepDuration(format!("macro '{name}' step {i} {reason}"))
+            })?;
+            steps.push(MacroStep {
+                hold: step
+                    .hold
+                    .iter()
+                    .map(|f| parse_function(f))
+                    .collect::<Result<Vec<_>, _>>()?,
+                duration,
+                allow_short: step.allow_short,
+            });
+        }
+        Ok(Macro {
+            name: name.to_owned(),
+            steps,
+            on_release: self.on_release,
+            retrigger: self.retrigger,
+            interrupt: self.interrupt,
+        })
+    }
+
+    fn from_core(mac: &Macro) -> Self {
+        Self {
+            steps: mac
+                .steps
+                .iter()
+                .map(|step| {
+                    // Emitted in the unit it was authored in: a sequence written
+                    // in frames must still read in frames after a round trip.
+                    let (ms, frames) = match step.duration {
+                        StepDuration::Ms(ms) => (Some(ms), None),
+                        StepDuration::Frames(frames) => (None, Some(frames)),
+                    };
+                    MacroStepFile {
+                        hold: step.hold.iter().map(function_name).collect(),
+                        ms,
+                        frames,
+                        allow_short: step.allow_short,
+                    }
+                })
+                .collect(),
+            on_release: mac.on_release,
+            retrigger: mac.retrigger,
+            interrupt: mac.interrupt,
+        }
+    }
 }
 
 /// Value side of a `[bindings]` entry: one key, several keys, a GUARDED key
@@ -68,16 +223,24 @@ impl PresetFile {
     /// (`Key::from_name`); `"None"` entries are preserved as inert
     /// placeholders. `protected` is always `false`: built-ins live in code,
     /// files are user presets.
+    /// Macro definitions are converted FIRST, because a `macro.<name>` binding
+    /// row is resolved to an index into them; an unknown name is a hard error
+    /// here and a named [`crate::Issue`] in validation.
     pub fn to_core(&self) -> Result<ksx_core::Preset, ConfigError> {
+        let mut macros = Macros::default();
+        for (name, def) in &self.macros {
+            macros.defs.push(def.to_core(name)?);
+        }
         let mut entries = Vec::new();
         let mut chords = Vec::new();
         for (function, entry) in &self.bindings {
-            collect_entries(function, entry, &mut entries, &mut chords)?;
+            collect_entries(function, entry, &mut entries, &mut chords, &mut macros)?;
         }
         Ok(ksx_core::Preset {
             name: self.name.clone(),
             entries,
             chords,
+            macros,
             protected: false,
         })
     }
@@ -109,6 +272,19 @@ impl PresetFile {
                     unless: chord.unless.iter().map(|k| k.name().to_owned()).collect(),
                 });
         }
+        // Macro triggers are ordinary `[bindings]` rows under a `macro.<name>`
+        // function, so several keys on one macro emit as an array exactly like
+        // several keys on one button.
+        for trigger in &preset.macros.triggers {
+            let Some(mac) = preset.macros.get(trigger.index) else {
+                continue; // dangling index: validation names it, we drop it
+            };
+            grouped
+                .entry(crate::function::macro_function_name(&mac.name))
+                .or_default()
+                .0
+                .push(trigger.key.name().to_owned());
+        }
         let bindings = grouped
             .into_iter()
             .map(|(function, (mut keys, mut guards))| {
@@ -129,6 +305,12 @@ impl PresetFile {
         Self {
             name: preset.name.clone(),
             bindings,
+            macros: preset
+                .macros
+                .defs
+                .iter()
+                .map(|mac| (mac.name.clone(), MacroFile::from_core(mac)))
+                .collect(),
         }
     }
 }
@@ -138,28 +320,29 @@ fn collect_entries(
     entry: &BindingEntry,
     out: &mut Vec<(ksx_core::Key, ksx_core::Binding)>,
     chords: &mut Vec<ksx_core::Chord>,
+    macros: &mut Macros,
 ) -> Result<(), ConfigError> {
     match entry {
-        BindingEntry::Key(key) => push_entry(function, key, out),
+        BindingEntry::Key(key) => push_entry(function, key, out, macros),
         BindingEntry::Keys(keys) => {
             for key in keys {
-                push_entry(function, key, out)?;
+                push_entry(function, key, out, macros)?;
             }
             Ok(())
         }
         BindingEntry::Guarded(guarded) if guarded.when.is_empty() && guarded.unless.is_empty() => {
-            push_entry(function, &guarded.key, out)
+            push_entry(function, &guarded.key, out, macros)
         }
         BindingEntry::Guarded(guarded) => push_chord(function, guarded, chords),
         BindingEntry::Many(entries) => {
             for entry in entries {
-                collect_entries(function, entry, out, chords)?;
+                collect_entries(function, entry, out, chords, macros)?;
             }
             Ok(())
         }
         BindingEntry::Group(group) => {
             for (sub, entry) in group {
-                collect_entries(&format!("{function}.{sub}"), entry, out, chords)?;
+                collect_entries(&format!("{function}.{sub}"), entry, out, chords, macros)?;
             }
             Ok(())
         }
@@ -170,7 +353,19 @@ fn push_entry(
     function: &str,
     key_name: &str,
     out: &mut Vec<(ksx_core::Key, ksx_core::Binding)>,
+    macros: &mut Macros,
 ) -> Result<(), ConfigError> {
+    // A `macro.<name>` row starts a sequence rather than driving an endpoint,
+    // so it never reaches the pad-function vocabulary at all.
+    if let Some(name) = crate::function::macro_name(function) {
+        let index = macros
+            .index_of(name)
+            .ok_or_else(|| ConfigError::UnknownMacro(name.to_owned()))?;
+        macros
+            .triggers
+            .push(MacroTrigger::new(key_named(key_name)?, index));
+        return Ok(());
+    }
     let binding = parse_function(function)?;
     let key = key_named(key_name)?;
     out.push((key, binding));
@@ -186,6 +381,9 @@ fn push_chord(
     guarded: &GuardedEntry,
     chords: &mut Vec<ksx_core::Chord>,
 ) -> Result<(), ConfigError> {
+    if let Some(name) = crate::function::macro_name(function) {
+        return Err(ConfigError::GuardedMacroTrigger(name.to_owned()));
+    }
     let binding = parse_function(function)?;
     let key = key_named(&guarded.key)?;
     let when = guarded
@@ -404,6 +602,7 @@ lb = { key = "A", when = ["B", "C"], unless = ["LeftShift"] }
                 Binding::Trigger(Trigger::Right),
                 vec![Key::B],
             )],
+            macros: Default::default(),
             protected: false,
         };
         let file = PresetFile::from_core(&original);
@@ -434,6 +633,7 @@ lb = { key = "A", when = ["B", "C"], unless = ["LeftShift"] }
                     unless: vec![Key::LeftShift],
                 },
             ],
+            macros: Default::default(),
             protected: false,
         };
         let text = toml::to_string(&PresetFile::from_core(&original)).unwrap();
@@ -508,11 +708,171 @@ consume = { key = "Left", when = ["Right"] }
                 ksx_core::Chord::consuming(Key::Left, vec![Key::Right]),
                 ksx_core::Chord::consuming(Key::Up, vec![Key::Down]),
             ],
+            macros: Default::default(),
             protected: false,
         };
         let text = toml::to_string(&PresetFile::from_core(&original)).unwrap();
         let back: PresetFile = toml::from_str(&text).unwrap();
         assert_eq!(back.to_core().unwrap().chords, original.chords, "{text}");
+    }
+
+    // ---- macros (docs/INPUT-TRANSFORMS.md §1c) ----------------------------
+
+    /// The documented file shape, exactly as the doc writes it.
+    const HADOUKEN: &str = r#"
+name = "sf-p1"
+
+[bindings]
+"dpad.down" = "Down"
+"dpad.right" = "Right"
+A = "S"
+macro.hadouken = "P"
+
+[macros.hadouken]
+steps = [
+  { hold = ["dpad.down"],                ms = 50 },
+  { hold = ["dpad.down","dpad.right"],   ms = 50 },
+  { hold = ["dpad.right"],               ms = 50 },
+  { hold = ["A"],                        ms = 50 },
+]
+"#;
+
+    #[test]
+    fn the_documented_macro_shape_parses() {
+        let file: PresetFile = toml::from_str(HADOUKEN).unwrap();
+        let core = file.to_core().unwrap();
+
+        assert_eq!(core.macros.defs.len(), 1);
+        let mac = &core.macros.defs[0];
+        assert_eq!(mac.name, "hadouken");
+        assert_eq!(mac.steps.len(), 4);
+        assert_eq!(mac.total_ms(), 200);
+        // Defaults are the fighting-game behavior and are never written.
+        assert_eq!(mac.on_release, ksx_core::OnRelease::Finish);
+        assert_eq!(mac.retrigger, ksx_core::Retrigger::Ignore);
+        assert_eq!(mac.interrupt, ksx_core::Interrupt::None);
+        // ↘ is one step holding two bindings, not two steps.
+        assert_eq!(
+            mac.steps[1].hold,
+            vec![
+                Binding::Dpad(DpadDirection::Down),
+                Binding::Dpad(DpadDirection::Right)
+            ]
+        );
+        // The trigger row is a MACRO row, never a pad function.
+        assert_eq!(
+            core.macros.triggers,
+            vec![ksx_core::MacroTrigger::new(Key::P, 0)]
+        );
+        // ...and the ordinary bindings beside it are untouched.
+        assert_eq!(core.entries.len(), 3);
+    }
+
+    #[test]
+    fn macros_round_trip_through_toml() {
+        let file: PresetFile = toml::from_str(HADOUKEN).unwrap();
+        let core = file.to_core().unwrap();
+        let text = toml::to_string(&PresetFile::from_core(&core)).unwrap();
+        let back: PresetFile = toml::from_str(&text).unwrap();
+        let again = back.to_core().unwrap();
+        assert_eq!(again.macros, core.macros, "{text}");
+        assert_eq!(again.entries, core.entries, "{text}");
+    }
+
+    /// Policies and the frame unit survive the trip, and a sequence written in
+    /// frames still reads in frames afterwards.
+    #[test]
+    fn policies_and_the_frame_unit_survive_a_round_trip() {
+        let file: PresetFile = toml::from_str(
+            r#"
+name = "p"
+[bindings]
+macro.dp = "P"
+
+[macros.dp]
+on_release = "abort"
+retrigger = "restart"
+interrupt = "opposing"
+steps = [
+  { hold = ["dpad.right"], frames = 3 },
+  { hold = ["A"], ms = 20, allow_short = true },
+]
+"#,
+        )
+        .unwrap();
+        let core = file.to_core().unwrap();
+        let mac = &core.macros.defs[0];
+        assert_eq!(mac.on_release, ksx_core::OnRelease::Abort);
+        assert_eq!(mac.retrigger, ksx_core::Retrigger::Restart);
+        assert_eq!(mac.interrupt, ksx_core::Interrupt::Opposing);
+        assert_eq!(mac.steps[0].duration, ksx_core::StepDuration::Frames(3));
+        assert_eq!(mac.steps[0].requested_ms(), 50);
+        assert!(mac.steps[1].allow_short);
+
+        let text = toml::to_string(&PresetFile::from_core(&core)).unwrap();
+        assert!(text.contains("frames = 3"), "{text}");
+        assert!(text.contains("allow_short = true"), "{text}");
+        assert_eq!(
+            toml::from_str::<PresetFile>(&text)
+                .unwrap()
+                .to_core()
+                .unwrap()
+                .macros,
+            core.macros,
+            "{text}"
+        );
+    }
+
+    /// A trigger with no `[macros]` table behind it is a hard error, not a
+    /// silently inert row.
+    #[test]
+    fn a_trigger_for_an_undefined_macro_is_an_error() {
+        let file: PresetFile =
+            toml::from_str("name = \"p\"\n[bindings]\nmacro.nope = \"P\"\n").unwrap();
+        assert!(matches!(file.to_core(), Err(ConfigError::UnknownMacro(_))));
+    }
+
+    /// Two units, or none, on one step. Both refused: guessing would put an
+    /// input on the wire that no game could sample.
+    #[test]
+    fn a_step_needs_exactly_one_duration_unit() {
+        for steps in [
+            "{ hold = [\"A\"], ms = 50, frames = 3 }",
+            "{ hold = [\"A\"] }",
+        ] {
+            let file: PresetFile =
+                toml::from_str(&format!("name = \"p\"\n[macros.m]\nsteps = [{steps}]\n")).unwrap();
+            let err = file.to_core().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::MacroStepDuration(_)),
+                "{steps} gave {err}"
+            );
+            assert!(err.to_string().contains("frames"), "{err}");
+        }
+    }
+
+    /// A macro trigger cannot be a chord — a sequence is started by a key.
+    #[test]
+    fn a_guarded_macro_trigger_is_refused() {
+        let file: PresetFile = toml::from_str(
+            "name = \"p\"\n[macros.m]\nsteps = [{ hold = [\"A\"], ms = 50 }]\n\
+             [bindings]\n\"macro.m\" = { key = \"P\", when = [\"Q\"] }\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            file.to_core(),
+            Err(ConfigError::GuardedMacroTrigger(_))
+        ));
+    }
+
+    /// The regression guarantee at the file layer: a preset without macros
+    /// emits exactly the bytes it always did.
+    #[test]
+    fn a_macro_free_preset_emits_no_macro_syntax() {
+        for preset in Preset::builtins() {
+            let text = toml::to_string(&PresetFile::from_core(&preset)).unwrap();
+            assert!(!text.contains("macro"), "{text}");
+        }
     }
 
     #[test]
