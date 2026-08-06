@@ -8,6 +8,13 @@
 //! — plain HTML forms remain the baseline (`form-action 'self'`), which the
 //! client optionally upgrades to fetch-submits that read the redirect's
 //! flash without a reload.
+//!
+//! v9 gives the MAPPER the same baseline: `/map/*` are form-encoded twins of
+//! the `/api/*` mapper verbs (bind, clear, restore, clear-all, pause), each
+//! calling the identical [`ControlSource`] method and 303-ing back to
+//! `/map?slot=N&flash=…`. With JavaScript the island intercepts the submit
+//! and reports through its toast stack instead; with JavaScript off the page
+//! is still fully operable, which is the whole point of the shape.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,7 +26,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
 
-use crate::control::{BindRequest, ControlSource, SessionView};
+use crate::control::{BindOutcome, BindRequest, ControlSource, SessionView};
 use crate::error::StudioError;
 use crate::render::{render_status, Assets, EmbeddedPage};
 use crate::render_map::render_map;
@@ -85,6 +92,13 @@ pub fn serve(
             .route("/api/learn/start", post(api_learn_start))
             .route("/api/learn/cancel", post(api_learn_cancel))
             .route("/api/bind", post(api_bind))
+            // v10: write a control's WHOLE key list (many keys → one
+            // control). The island computes the new set from the payload it
+            // is already polling — add = ∪ {k}, per-key ✕ = ∖ {k} — and posts
+            // it here; `bind_keys` is what knows how to spell that on the
+            // wire. Not a new daemon verb: today it composes the same `map`
+            // the button beside it uses.
+            .route("/api/bind/keys", post(api_bind_keys))
             .route("/api/preset/restore", post(api_preset_restore))
             .route("/api/preset/clear-all", post(api_preset_clear_all))
             // The mapper's own session controls (FIX 0): "Pause emulation &
@@ -94,6 +108,25 @@ pub fn serve(
             // loses the user's place.
             .route("/api/session/stop", post(api_session_stop))
             .route("/api/session/start", post(api_session_start))
+            // v9 — the NO-JAVASCRIPT write path. Same verbs, same
+            // ControlSource methods as the /api/* routes beside them; the
+            // only difference is the wire shape (form-encoded in, 303 out
+            // instead of JSON in and JSON back). A browser with scripting
+            // switched off can bind, clear, restore and pause with these,
+            // and the island fetch-enhances them on top (map.ts) so a page
+            // WITH scripting never navigates.
+            .route("/map/bind", post(map_form_bind))
+            // v10 — MANY KEYS → ONE CONTROL, without JavaScript. Same row
+            // form, same key picker, two more submits: `add` appends the
+            // picked key to the control's list, `key/remove` takes just that
+            // one off it. Both are read-modify-write on the key SET and land
+            // through `ControlSource::bind_keys` — no new daemon verb.
+            .route("/map/add", post(map_form_add))
+            .route("/map/key/remove", post(map_form_remove_key))
+            .route("/map/clear", post(map_form_clear))
+            .route("/map/preset/restore", post(map_form_restore))
+            .route("/map/preset/clear-all", post(map_form_clear_all))
+            .route("/map/session/stop", post(map_form_session_stop))
             // Canon helper: correct no-cache + Service-Worker-Allowed
             // headers for free (replaced a hand-rolled handler).
             .route("/sw.js", get(forma_server::sw::serve_sw::<Assets>))
@@ -232,11 +265,15 @@ async fn collect_map(state: &Arc<AppState>, selected: Option<u8>) -> MapPayload 
 #[derive(Deserialize)]
 struct MapQuery {
     slot: Option<u8>,
+    /// v9: the outcome of the no-JS form POST that redirected here. Same
+    /// post-redirect-get channel `/` has always used for its session forms.
+    flash: Option<String>,
 }
 
 async fn map_page(State(state): State<Arc<AppState>>, Query(query): Query<MapQuery>) -> Response {
     let payload = collect_map(&state, query.slot).await;
-    let out = render_map(&state.map_page, &payload);
+    let flash = query.flash.as_deref().filter(|f| !f.trim().is_empty());
+    let out = render_map(&state.map_page, &payload, flash);
     (
         [
             (
@@ -304,6 +341,41 @@ async fn api_bind(
     axum::Json(request): axum::Json<BindRequest>,
 ) -> Response {
     control_json(state, move |control| control.bind(&request)).await
+}
+
+/// POST /api/bind/keys — the JSON twin of `/map/add` + `/map/key/remove`.
+/// The caller sends the FULL key list it wants the control to hold; what the
+/// island computed and what a form computed therefore go through the same
+/// [`ControlSource::bind_keys`], which is the one place that knows what the
+/// daemon can express.
+#[derive(Deserialize)]
+struct BindKeysRequest {
+    preset: String,
+    function: String,
+    /// Empty = clear the control. There is no null-vs-empty distinction here:
+    /// "hold no keys" and "be unbound" are the same state.
+    #[serde(default)]
+    keys: Vec<String>,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    reload: bool,
+}
+
+async fn api_bind_keys(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<BindKeysRequest>,
+) -> Response {
+    control_json(state, move |control| {
+        control.bind_keys(
+            &request.preset,
+            &request.function,
+            &request.keys,
+            request.force,
+            request.reload,
+        )
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -401,6 +473,357 @@ async fn api_session_start(
         }
     })
     .await
+}
+
+// ── v9: the no-JavaScript mapper forms ─────────────────────────────────────
+// Everything below is the SAME ControlSource verb the /api/* route above it
+// calls — no new daemon surface, no second writer. What differs is only the
+// wire shape a browser without scripting can produce: an
+// `application/x-www-form-urlencoded` body in, a 303 to
+// `/map?slot=N&flash=…` out. The flash is the page's whole feedback channel
+// when there is no toast stack to write to.
+//
+// A form body names a SLOT NUMBER, never a preset: the server resolves one
+// from the other against the config it just read, so a hand-made POST can
+// only ever address a slot this cabinet actually has.
+
+#[derive(Deserialize)]
+struct MapSlotForm {
+    slot: Option<u8>,
+}
+
+#[derive(Deserialize)]
+struct MapBindForm {
+    slot: Option<u8>,
+    function: String,
+    /// The `<select name="key">` value. The empty placeholder means "nothing
+    /// picked" — an honest refusal, never a silent clear (that is what the
+    /// Clear button beside it is for).
+    #[serde(default)]
+    key: Option<String>,
+    /// The panel's checkbox. Present at all = ticked (HTML omits an unchecked
+    /// box entirely), which is this path's answer to a cross-slot refusal.
+    #[serde(default)]
+    force: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MapRestoreForm {
+    slot: Option<u8>,
+    mode: String,
+}
+
+/// 303 back to the mapper, carrying the outcome as the flash. Errors are
+/// flashed exactly like successes — the no-JS page must never fail silently.
+fn map_redirect(slot: u8, outcome: Result<String, String>) -> Response {
+    let flash = match outcome {
+        Ok(message) => message,
+        Err(error) => format!("error: {error}"),
+    };
+    Redirect::to(&format!("/map?slot={slot}&flash={}", urlencode(&flash))).into_response()
+}
+
+/// Run one slot-scoped verb for the slot a form named. Blocking work (a
+/// config read plus one pipe request) off the async workers, like [`act`].
+///
+/// The whole SLOT is handed to the verb, not just its preset name, because
+/// v10's add/remove-one are read-modify-write on the control's key list: the
+/// same config read that resolves the preset already carries the bindings the
+/// edit has to be computed against, so nothing reads the file twice and no
+/// form has to be trusted with a key list it made up.
+async fn map_act_slot<F>(state: Arc<AppState>, slot: Option<u8>, verb: F) -> Response
+where
+    F: FnOnce(&dyn ControlSource, &crate::snapshot::MapperSlot) -> Result<String, String>
+        + Send
+        + 'static,
+{
+    let (number, outcome) = tokio::task::spawn_blocking(move || {
+        let mapper = state.source.mapper();
+        let chosen = slot
+            .and_then(|n| mapper.slots.iter().find(|s| s.number == n))
+            .or_else(|| mapper.slots.first());
+        match chosen {
+            Some(slot) => (slot.number, verb(state.control.as_ref(), slot)),
+            None => (0, Err(format!("nothing to map — {}", mapper.source))),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| (0, Err("the control call panicked".to_owned())));
+    map_redirect(number, outcome)
+}
+
+/// [`map_act_slot`] for the verbs that need nothing but the preset name.
+async fn map_act<F>(state: Arc<AppState>, slot: Option<u8>, verb: F) -> Response
+where
+    F: FnOnce(&dyn ControlSource, &str) -> Result<String, String> + Send + 'static,
+{
+    map_act_slot(state, slot, move |control, slot| {
+        verb(control, &slot.preset)
+    })
+    .await
+}
+
+/// One [`BindOutcome`] as the sentence a page with no JavaScript reads.
+///
+/// A cross-slot refusal names the other slot AND the way to say yes to it:
+/// the learn flow asks with a Replace dialog, a form asks with the panel's
+/// checkbox. Either way the answer is never "nothing happened".
+fn bind_flash(function: &str, key: Option<&str>, outcome: BindOutcome) -> Result<String, String> {
+    if outcome.ok {
+        let mut line = match key {
+            Some(key) => format!("{function} is now {key}"),
+            None => format!("{function} is now unbound"),
+        };
+        if !outcome.also_drives.is_empty() {
+            line.push_str(&format!(
+                " — that key also drives {}",
+                outcome.also_drives.join(", ")
+            ));
+        }
+        line.push('.');
+        return Ok(line);
+    }
+    Err(bind_refusal(function, key, outcome))
+}
+
+/// The refusal half of every write on this page, in one voice: a cross-slot
+/// conflict names the other slot AND the checkbox that says yes to it, and
+/// anything else quotes the daemon (or [`crate::control::multi_key_refusal`],
+/// which already explains itself).
+fn bind_refusal(function: &str, key: Option<&str>, outcome: BindOutcome) -> String {
+    if outcome.code.as_deref() == Some("conflict") && !outcome.conflicts.is_empty() {
+        let named = key.unwrap_or("that key");
+        let who: Vec<String> = outcome
+            .conflicts
+            .iter()
+            .map(|c| c.describe(named))
+            .collect();
+        return format!(
+            "{function} was not changed: {} — tick \"let this key drive another slot's \
+             control too\" in the Bind by name panel and submit again",
+            who.join("; ")
+        );
+    }
+    format!(
+        "{function} was not changed: {}",
+        outcome
+            .error
+            .unwrap_or_else(|| "the daemon refused the write".to_owned())
+    )
+}
+
+/// One key-SET write as the sentence a page with no JavaScript reads. It
+/// reports the control's whole list, because that is the thing that changed —
+/// and it says out loud that the keys are alternatives, which is the fact a
+/// row of two key tags does not carry on its own.
+fn keys_flash(
+    function: &str,
+    key: Option<&str>,
+    after: &[String],
+    outcome: BindOutcome,
+) -> Result<String, String> {
+    if !outcome.ok {
+        return Err(bind_refusal(function, key, outcome));
+    }
+    let mut line = match after {
+        [] => format!("{function} is now unbound"),
+        [one] => format!("{function} is now {one}"),
+        _ => format!(
+            "{function} now has {} — any one of them presses it",
+            after.join(" · ")
+        ),
+    };
+    if !outcome.also_drives.is_empty() {
+        line.push_str(&format!(
+            " — that key also drives {}",
+            outcome.also_drives.join(", ")
+        ));
+    }
+    line.push('.');
+    Ok(line)
+}
+
+/// The key a form picked, or the refusal that names what to do instead.
+/// Shared by every route that needs one, so "I forgot to pick a key" is the
+/// same sentence everywhere.
+fn picked_key(form: &MapBindForm, function: &str, verb: &str) -> Result<String, String> {
+    form.key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!("no key picked for {function} — choose one from the list before \"{verb}\"")
+        })
+}
+
+/// POST /map/add — ADD the picked key to what the control already has,
+/// instead of replacing it (MAME-style OR-chaining: either key presses the
+/// control, docs/INPUT-TRANSFORMS.md §1a). Read-modify-write on the key list
+/// the config read already carries; the whole set goes to `bind_keys`.
+async fn map_form_add(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<MapBindForm>,
+) -> Response {
+    let function = form.function.trim().to_owned();
+    let force = form.force.is_some();
+    let key = match picked_key(&form, &function, "Add") {
+        Ok(key) => key,
+        Err(refusal) => return map_redirect(form.slot.unwrap_or(0), Err(refusal)),
+    };
+    map_act_slot(state, form.slot, move |control, slot| {
+        let current = slot.bindings.get(&function).cloned().unwrap_or_default();
+        let next = crate::control::with_key(&current, &key);
+        if next.len() == current.len() {
+            return Ok(format!(
+                "{function} already has {key} — nothing to add (it has {}).",
+                current.join(" · ")
+            ));
+        }
+        let outcome = control.bind_keys(&slot.preset, &function, &next, force, true);
+        keys_flash(&function, Some(&key), &next, outcome)
+    })
+    .await
+}
+
+/// POST /map/key/remove — take ONE key off a control and leave the others.
+/// The no-JS twin of the legend chips' per-key ✕: the row's key picker says
+/// WHICH key goes, so removing one of several never needs JavaScript.
+async fn map_form_remove_key(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<MapBindForm>,
+) -> Response {
+    let function = form.function.trim().to_owned();
+    let key = match picked_key(&form, &function, "Remove key") {
+        Ok(key) => key,
+        Err(refusal) => return map_redirect(form.slot.unwrap_or(0), Err(refusal)),
+    };
+    map_act_slot(state, form.slot, move |control, slot| {
+        let current = slot.bindings.get(&function).cloned().unwrap_or_default();
+        let next = crate::control::without_key(&current, &key);
+        if next.len() == current.len() {
+            return Err(format!(
+                "{function} was not changed: it is not bound to {key}{}",
+                if current.is_empty() {
+                    " (it is unbound)".to_owned()
+                } else {
+                    format!(" (it has {})", current.join(" · "))
+                }
+            ));
+        }
+        let outcome = control.bind_keys(&slot.preset, &function, &next, false, true);
+        // The removed key is named in the sentence, because "A is now S" on
+        // its own does not say what just left.
+        keys_flash(&function, Some(&key), &next, outcome)
+            .map(|line| format!("{key} removed. {line}"))
+    })
+    .await
+}
+
+/// POST /map/bind — the form twin of `/api/bind`.
+async fn map_form_bind(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<MapBindForm>,
+) -> Response {
+    let function = form.function.trim().to_owned();
+    let key = form
+        .key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_owned);
+    let force = form.force.is_some();
+    if key.is_none() {
+        return map_redirect(
+            form.slot.unwrap_or(0),
+            Err(format!(
+                "no key picked for {function} — choose one from the list (\"Clear\" is how \
+                 you unbind it)"
+            )),
+        );
+    }
+    map_act(state, form.slot, move |control, preset| {
+        let request = BindRequest {
+            preset: preset.to_owned(),
+            function: function.clone(),
+            key: key.clone(),
+            force,
+            // A binding-only edit is hot-swapped into a running session — the
+            // pads stay plugged in (ksx-app `apply_bindings`).
+            reload: true,
+        };
+        bind_flash(&function, key.as_deref(), control.bind(&request))
+    })
+    .await
+}
+
+/// POST /map/clear — the same `map` verb with a null key, which is exactly
+/// what `ksx map --clear` writes. No second unbind path.
+async fn map_form_clear(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<MapBindForm>,
+) -> Response {
+    let function = form.function.trim().to_owned();
+    map_act(state, form.slot, move |control, preset| {
+        let request = BindRequest {
+            preset: preset.to_owned(),
+            function: function.clone(),
+            key: None,
+            force: false,
+            reload: true,
+        };
+        bind_flash(&function, None, control.bind(&request))
+    })
+    .await
+}
+
+/// POST /map/preset/restore — the form twin of `/api/preset/restore`, same
+/// three destinations, same validation before any daemon round trip.
+async fn map_form_restore(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<MapRestoreForm>,
+) -> Response {
+    let mode = form.mode.trim().to_owned();
+    if !crate::control::RESTORE_MODES.contains(&mode.as_str()) {
+        return map_redirect(
+            form.slot.unwrap_or(0),
+            Err(format!(
+                "unknown restore mode \"{mode}\" ({})",
+                crate::control::RESTORE_MODES.join(" | ")
+            )),
+        );
+    }
+    map_act(state, form.slot, move |control, preset| {
+        control.restore(preset, &mode)
+    })
+    .await
+}
+
+/// POST /map/preset/clear-all — the form twin of `/api/preset/clear-all`.
+async fn map_form_clear_all(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<MapSlotForm>,
+) -> Response {
+    map_act(state, form.slot, move |control, preset| {
+        control.clear_all(preset)
+    })
+    .await
+}
+
+/// POST /map/session/stop — "Pause emulation & map" without JavaScript. The
+/// same `stop` verb the status page's form posts; it just comes back to /map
+/// so the user keeps their place. (There is no form twin for Resume: the
+/// resume bar is client-only state — this page having paused something — so
+/// a no-JS page never shows it. `/` starts a session back up.)
+async fn map_form_session_stop(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<MapSlotForm>,
+) -> Response {
+    let slot = form.slot.unwrap_or(0);
+    let outcome = tokio::task::spawn_blocking(move || state.control.stop())
+        .await
+        .unwrap_or_else(|_| Err("the control call panicked".to_owned()));
+    map_redirect(slot, outcome)
 }
 
 #[derive(Deserialize)]

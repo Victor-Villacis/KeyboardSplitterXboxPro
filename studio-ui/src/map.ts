@@ -28,6 +28,7 @@ import {
   identityLabel,
   isMultiMode,
   isPaused,
+  keyList,
   learnAllowed,
   liveProfile,
   markPaused,
@@ -48,9 +49,11 @@ import {
   setHot,
   setMultiMode,
   showConflict,
+  showLearnMode,
   showListening,
   toggleSelected,
   updateCountdown,
+  writableKeys,
   type BindOutcome,
   type LearnView,
   type MapPayload,
@@ -139,21 +142,50 @@ function chordAdvisory(message: string | null): string {
   return ` Heads up: ${note}.${CHORD_FLASH_RISK}`;
 }
 
-/** Re-map one control to the key it held before, or clear it if it held
- *  none — the undo of a single binding edit, in one existing verb. */
+/** Put one control back on the exact key LIST it held before — the undo of
+ *  any single-control edit (replace, add, remove-one, clear), through the one
+ *  writer that takes a whole set. Whether the offer is made at all is
+ *  [`writableKeys`]'s call, made before the toast is pushed. */
 function undoOneBinding(
   preset: string,
   fn: string,
   keys: string[],
 ): () => Promise<string | null> {
   return async () => {
-    const outcome = await bindOnce(preset, fn, keys[0] ?? null, true);
+    const outcome = await bindKeys(preset, fn, keys, true);
     if (!outcome.ok) {
       return outcome.error ?? outcome.code ?? "the daemon refused the write";
     }
     markSaved();
     await poll();
     return null;
+  };
+}
+
+/** The sentence a toast adds when the edit LANDED but cannot be taken back —
+ *  because putting the control's old keys back would need a multi-key write
+ *  this daemon has no shape for. Named once: it is the only honest reason an
+ *  Undo button is missing from a successful single-control edit. */
+const NO_UNDO_MULTI =
+  " (Putting several keys back is one write this daemon's map verb cannot make, " +
+  "so there is no Undo here — the Preset card's restore options are the way back.)";
+
+/** The toast options for a single-control edit: an Undo when the previous key
+ *  list can honestly be restored, and nothing pretending otherwise when it
+ *  cannot. */
+function undoOptions(
+  preset: string,
+  fn: string,
+  before: string[],
+  name: string,
+): ToastOptions {
+  if (!writableKeys(before)) return {};
+  return {
+    undo: undoOneBinding(preset, fn, before),
+    undone:
+      before.length === 0
+        ? `${name} is unbound again.`
+        : `${name} is back on ${keyList(before)}.`,
   };
 }
 
@@ -166,7 +198,7 @@ function undoGroup(
   return async () => {
     const failed: string[] = [];
     for (const [fn, keys] of before) {
-      const outcome = await bindOnce(preset, fn, keys[0] ?? null, true);
+      const outcome = await bindKeys(preset, fn, keys, true);
       if (!outcome.ok) {
         failed.push(`${identityLabel(fn)} (${outcome.error ?? outcome.code ?? "refused"})`);
       }
@@ -177,11 +209,11 @@ function undoGroup(
   };
 }
 
-/** A group can only be undone if every control in it held at most one key
- *  (see previousKeys) — otherwise one member would come back wrong, and a
- *  half-true Undo is worse than none. */
+/** A group can only be undone if every control in it can be written back as
+ *  it was ([`writableKeys`]) — otherwise one member would come back with half
+ *  its keys, and a half-true Undo is worse than none. */
 function groupUndoable(before: Map<string, string[]>): boolean {
-  return Array.from(before.values()).every((keys) => keys.length <= 1);
+  return Array.from(before.values()).every(writableKeys);
 }
 
 /** The undo of a whole-preset write: restore the backup it just took. Only
@@ -215,6 +247,15 @@ let learnGen = 0;
 let learnTimer: number | undefined;
 /** The hit waiting on the conflict dialog's verdict. */
 let pendingKey: string | null = null;
+/** What the next captured key DOES to a control that already has one.
+ *
+ *  "replace" is the default on every arm, deliberately: it is what every
+ *  mapper in the field study does on a rebind, it is what a user who clicked a
+ *  bound control almost always means, and it is the one that always has a
+ *  wire shape. "add" is chosen per-capture in the modal and reverts the moment
+ *  the modal closes — a sticky mode would silently turn the NEXT rebind into a
+ *  fan-out nobody asked for. */
+let learnMode: "replace" | "add" = "replace";
 
 function learning(): boolean {
   return learnTargets.length > 0;
@@ -289,6 +330,7 @@ async function startLearn(fns: string[]): Promise<void> {
   learnTargets = fns;
   const gen = ++learnGen;
   pendingKey = null;
+  learnMode = "replace";
   selectFn(fns[0]);
   armFocusGuard();
   try {
@@ -343,8 +385,10 @@ async function pollLearn(): Promise<void> {
       disarmFocusGuard();
       closeModal();
       if (learn.key) {
-        if (targets.length === 1) await saveBinding(targets[0], learn.key, false);
-        else await mapAll(targets, learn.key);
+        if (targets.length !== 1) await mapAll(targets, learn.key);
+        // The modal's own choice: join the control's key list, or take it over.
+        else if (learnMode === "add") await addKey(targets[0], learn.key);
+        else await saveBinding(targets[0], learn.key, false);
       }
       break;
     case "timeout":
@@ -376,6 +420,7 @@ async function cancelLearn(): Promise<void> {
   learnTargets = [];
   learnGen += 1;
   pendingKey = null;
+  learnMode = "replace";
   disarmFocusGuard();
   closeModal();
   try {
@@ -419,6 +464,107 @@ async function bindOnce(
   }
 }
 
+/** Write a control's WHOLE key list — MANY KEYS → ONE CONTROL.
+ *
+ *  Read-modify-write, computed HERE from the payload the page is already
+ *  polling: add = current ∪ {k}, per-key ✕ = current ∖ {k}, undo = whatever
+ *  the list was before. The server's `/api/bind/keys` hands the set to
+ *  `ControlSource::bind_keys`, the one place that knows how to spell it on the
+ *  wire — today by composing the same single-key `map` verb, which is why a
+ *  set of two or more comes back as an honest refusal instead of a write that
+ *  drops keys. Same never-throws shape as [`bindOnce`]. */
+async function bindKeys(
+  preset: string,
+  fn: string,
+  keys: string[],
+  force: boolean,
+): Promise<BindOutcome> {
+  try {
+    return await fetchJSON<BindOutcome>("/api/bind/keys", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ preset, function: fn, keys, force, reload: true }),
+    });
+  } catch {
+    return {
+      ok: false,
+      message: null,
+      error: "bind request failed — is ksx studio still running?",
+      code: null,
+      conflicts: [],
+      reloaded: false,
+    };
+  }
+}
+
+/** ADD a key to what a control already holds, instead of replacing it — the
+ *  MAME-style OR-chain (`A = ["S", "Enter"]`, press either;
+ *  docs/INPUT-TRANSFORMS.md §1a). `force` is true for the same reason the
+ *  multi-select arm forces: this is a DELIBERATE fan-out, and force removes
+ *  nothing from anybody — it only says yes to a cross-slot duplicate. */
+async function addKey(fn: string, key: string): Promise<void> {
+  const slot = currentSlot();
+  if (!slot) return;
+  const before = previousKeys(fn);
+  const name = identityLabel(fn);
+  if (before.some((k) => k.toLowerCase() === key.toLowerCase())) {
+    pushToast(`${name} already has ${key} — nothing to add.`, { kind: "warn" });
+    void poll();
+    return;
+  }
+  const after = [...before, key];
+  const outcome = await bindKeys(slot.preset, fn, after, true);
+  if (!outcome.ok) {
+    oops(`${name} was not changed: ${outcome.error ?? "the daemon refused the write"}`);
+    void poll();
+    return;
+  }
+  markSaved();
+  const opts = undoOptions(slot.preset, fn, before, name);
+  let line =
+    after.length > 1
+      ? `${name} now has ${keyList(after)} — any one of them presses it.`
+      : `${name} is now ${key}.`;
+  if (isPaused()) line += " Resume emulation when you're done.";
+  if (!opts.undo) line += NO_UNDO_MULTI;
+  pushToast(line, opts);
+  void poll();
+}
+
+/** Remove ONE key from a control and leave the others — the legend chips' ✕.
+ *  Taking the last one is an ordinary clear, said in those words. */
+async function removeKey(fn: string, key: string): Promise<void> {
+  const slot = currentSlot();
+  if (!slot) return;
+  const before = previousKeys(fn);
+  const after = before.filter((k) => k.toLowerCase() !== key.toLowerCase());
+  const name = identityLabel(fn);
+  if (after.length === before.length) {
+    pushToast(
+      `${name} is not bound to ${key}${before.length > 0 ? ` (it has ${keyList(before)})` : ""}.`,
+      { kind: "warn" },
+    );
+    void poll();
+    return;
+  }
+  const outcome = await bindKeys(slot.preset, fn, after, false);
+  if (!outcome.ok) {
+    oops(`${name} was not changed: ${outcome.error ?? "the daemon refused the write"}`);
+    void poll();
+    return;
+  }
+  markSaved();
+  const opts = undoOptions(slot.preset, fn, before, name);
+  let line =
+    after.length > 0
+      ? `${key} removed — ${name} still has ${keyList(after)}.`
+      : `${key} removed — ${name} is now unbound.`;
+  if (isPaused()) line += " Resume emulation when you're done.";
+  if (!opts.undo) line += NO_UNDO_MULTI;
+  pushToast(line, opts);
+  void poll();
+}
+
 /** Write one binding — `key: null` CLEARS it (the `ksx map --clear` verb, same
  *  writer, no GUI-only path). */
 async function saveBinding(fn: string, key: string | null, force: boolean): Promise<void> {
@@ -427,7 +573,7 @@ async function saveBinding(fn: string, key: string | null, force: boolean): Prom
   // Remembered BEFORE the write — this is the entire undo. (Re-entry through
   // the conflict retry below re-reads it, which is still pre-write.)
   const before = previousKeys(fn);
-  const was = before.join("+");
+  const was = keyList(before);
   const name = identityLabel(fn);
   const outcome = await bindOnce(slot.preset, fn, key, force);
   if (outcome.ok) {
@@ -440,15 +586,15 @@ async function saveBinding(fn: string, key: string | null, force: boolean): Prom
         : `${name} is now ${key}${was ? ` — it was ${was}` : ""}.`;
     if (isPaused()) line += " Resume emulation when you're done.";
     line += chordAdvisory(outcome.message);
-    // Undo needs to put back exactly what was there. One key (or none) can
-    // be re-written with the same `map` verb; several cannot (see
-    // previousKeys), and a write that changed nothing has nothing to undo.
+    // Undo needs to put back exactly what was there — the whole key LIST, not
+    // its first entry ([`writableKeys`] is what decides whether that write
+    // exists). A write that changed nothing has nothing to undo either.
     const changed = was !== (key ?? "");
-    const undoable = changed && before.length <= 1;
+    const opts = changed ? undoOptions(slot.preset, fn, before, name) : {};
+    if (changed && !opts.undo && before.length > 1) line += NO_UNDO_MULTI;
     pushToast(line, {
+      ...opts,
       kind: outcome.message?.includes(CHORD_FLASH_MARK) ? "warn" : "ok",
-      undo: undoable ? undoOneBinding(slot.preset, fn, before) : null,
-      undone: before.length === 0 ? `${name} is unbound again.` : `${name} is back on ${was}.`,
     });
   } else if (outcome.code === "conflict" && outcome.conflicts.length > 0) {
     // FEATURE 3. A key already used by ANOTHER CONTROL IN THIS PRESET is a
@@ -744,6 +890,37 @@ async function clearAll(): Promise<void> {
   );
 }
 
+/** Submit one plain HTML form the way a browser would — form-encoded body,
+ *  the submitter's `formaction` honoured — but over fetch, so the page never
+ *  navigates. The outcome rides the redirect's `?flash=` (server.rs's
+ *  `map_act`), which is the same sentence a no-JS user would have read on the
+ *  reloaded page; here it becomes a toast. */
+async function submitNoJsForm(
+  form: HTMLFormElement,
+  submitter: HTMLElement | null,
+): Promise<void> {
+  const action =
+    submitter instanceof HTMLButtonElement && submitter.formAction
+      ? submitter.formAction
+      : form.action;
+  try {
+    const body = new URLSearchParams();
+    new FormData(form).forEach((value, key) => {
+      if (typeof value === "string") body.append(key, value);
+    });
+    if (submitter instanceof HTMLButtonElement && submitter.name) {
+      body.append(submitter.name, submitter.value);
+    }
+    const res = await fetch(action, { method: "POST", body, redirect: "follow" });
+    const flash = new URL(res.url).searchParams.get("flash") ?? "done.";
+    pushToast(flash, { kind: flash.startsWith("error") ? "err" : "ok" });
+  } catch {
+    oops("The request failed — is ksx studio still running?");
+  }
+  markSaved();
+  void poll();
+}
+
 // ── Wiring: delegated events on the island root ────────────────────────────
 
 function wire(root: HTMLElement): void {
@@ -771,6 +948,24 @@ function wire(root: HTMLElement): void {
       return;
     }
 
+    // The per-key ✕ (v10), checked before BOTH the row's clear and its
+    // data-fn: all three live inside the same row button, and this is the
+    // most specific of them. Payload is `function|KEY` — the key can contain
+    // no `|` (Key::name() spellings are alphanumeric), so the FIRST separator
+    // splits it.
+    const rmkey = target.closest<HTMLElement>("[data-rmkey]")?.dataset.rmkey;
+    if (rmkey) {
+      ev.preventDefault();
+      const at = rmkey.indexOf("|");
+      if (at > 0) {
+        const fn = rmkey.slice(0, at);
+        const key = rmkey.slice(at + 1);
+        if (learnAllowed()) void removeKey(fn, key);
+        else refuse(fn);
+      }
+      return;
+    }
+
     // The legend's ✕ accelerator, checked BEFORE the row's own data-fn: the
     // span lives inside the row button, so both would match otherwise.
     const clear = target.closest<HTMLElement>("[data-clear]")?.dataset.clear;
@@ -788,6 +983,15 @@ function wire(root: HTMLElement): void {
     }
     if (act === "cancel") {
       void cancelLearn();
+      return;
+    }
+    // v10: pick what the press that is being waited for will DO. Nothing is
+    // written here — the capture is still running, this only arms it, and the
+    // "currently …" line re-states the choice so the mode is never hidden.
+    if (act === "mode-add" || act === "mode-replace") {
+      learnMode = act === "mode-add" ? "add" : "replace";
+      const fn = selectedFnName();
+      showLearnMode(learnMode === "add", fn ? currentBinding(fn) : null);
       return;
     }
     if (act === "clear-one") {
@@ -855,8 +1059,13 @@ function wire(root: HTMLElement): void {
 
     const tab = target.closest<HTMLElement>("[data-slot]");
     if (tab?.dataset.slot) {
+      // v9: the tab is an <a href="/map?slot=N"> so it works with JS off.
+      // With JS on we switch in place — no navigation, no lost scroll — and
+      // keep the URL honest so a reload lands on the same slot.
+      ev.preventDefault();
       void cancelLearn();
       selectSlot(Number(tab.dataset.slot));
+      window.history.replaceState(null, "", `/map?slot=${tab.dataset.slot}`);
       return;
     }
 
@@ -887,6 +1096,27 @@ function wire(root: HTMLElement): void {
         refuse(fn);
       }
     }
+  });
+
+  // ── v9: the no-JS forms, fetch-enhanced ────────────────────────────────
+  // Every mapper action is a real <form method="post"> now (see MapIsland's
+  // `.nojs` surfaces and the preset card), so the page works with JavaScript
+  // switched off: POST → 303 → /map?slot=N&flash=… → the server-rendered
+  // flash line. With JavaScript on, nothing may navigate:
+  //
+  //   • a form whose button carries `data-act` was ALREADY handled by the
+  //     click delegation above (richer path: optimistic write, toast, Undo),
+  //     so here we only cancel the navigation — reporting it twice would be
+  //     worse than not reporting it at all;
+  //   • the rest (the row forms and the bind-by-name panel — hidden by CSS
+  //     under `.js`, but reachable by a stray Enter) are submitted by fetch
+  //     and their redirect's ?flash= becomes a toast.
+  root.addEventListener("submit", (ev) => {
+    const form = ev.target as HTMLFormElement | null;
+    if (!form) return;
+    ev.preventDefault();
+    if (form.querySelector("[data-act]")) return;
+    void submitNoJsForm(form, (ev as SubmitEvent).submitter);
   });
 
   // Right-click on a zone or legend row is a DESKTOP BONUS path to clear —
@@ -985,10 +1215,25 @@ activateIslands({
     if (props) {
       const seed = props as unknown as MapPayload;
       // Honour /map?slot=N on first paint (the server already did for SSR).
-      const fromQuery = new URLSearchParams(window.location.search).get("slot");
+      const query = new URLSearchParams(window.location.search);
+      const fromQuery = query.get("slot");
       if (fromQuery) seed.selected = Number(fromQuery) || seed.selected;
       selectSlot(seed.selected);
       applyMap(seed);
+      // v9: we landed on a no-JS POST's redirect (JS came back, or the user
+      // reloaded that URL). The server already rendered the flash line, but
+      // adoption blanks it — the client's channel is the toast stack — so
+      // re-report it there ONCE and clean the URL, or a reload would replay
+      // feedback for an action nobody just took.
+      const flash = (query.get("flash") ?? "").trim();
+      if (flash !== "") {
+        pushToast(flash, { kind: flash.startsWith("error") ? "err" : "ok" });
+        window.history.replaceState(
+          null,
+          "",
+          fromQuery ? `/map?slot=${fromQuery}` : "/map",
+        );
+      }
     }
     wire(el);
     window.setInterval(() => void poll(), POLL_MS);

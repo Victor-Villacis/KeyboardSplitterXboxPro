@@ -43,6 +43,11 @@ impl StatusSource for FixedStatus {
     fn mapper(&self) -> MapperSnapshot {
         let mut bindings = std::collections::BTreeMap::new();
         bindings.insert("A".to_owned(), vec!["G".to_owned()]);
+        // MANY KEYS → ONE CONTROL, exactly as a preset file can hold it
+        // (docs/INPUT-TRANSFORMS.md §1a) — the shape Victor's imported preset
+        // already had, and the one the add/remove-one routes are computed
+        // against.
+        bindings.insert("B".to_owned(), vec!["S".to_owned(), "Enter".to_owned()]);
         MapperSnapshot {
             generated_at: "test".into(),
             source: "slots of profile \"Steam\" (games.toml)".into(),
@@ -617,6 +622,26 @@ fn the_mapper_can_pause_and_resume_emulation_over_json() {
     let map = body_of(&get(addr, "/map")).to_owned();
     assert!(map.contains("Emulation is running"), "{map}");
     assert!(map.contains(r#"data-act="pause-map""#), "{map}");
+    // v9: and it is a real form, so the pause is not a dead button on a page
+    // without JavaScript — same `stop` verb, 303'd back to /map.
+    assert!(map.contains(r#"action="/map/session/stop""#), "{map}");
+    let response = post_form(addr, "/map/session/stop", "slot=1");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(
+        response.contains("location: /map?slot=1&flash=stopped"),
+        "{response}"
+    );
+    assert!(
+        !control.session().running,
+        "the form POST really stopped it"
+    );
+    let started = post_json(
+        addr,
+        "/api/session/start",
+        r#"{"profile":"Street Fighter"}"#,
+    );
+    let out: serde_json::Value = serde_json::from_str(body_of(&started)).expect("json");
+    assert_eq!(out["ok"], true, "{out}");
 
     let paused = post_json(addr, "/api/session/stop", "");
     let out: serde_json::Value = serde_json::from_str(body_of(&paused)).expect("json");
@@ -696,6 +721,262 @@ fn clearing_one_binding_goes_through_the_bind_verb_with_a_null_key() {
     let bound = control.bound_with.lock().unwrap().clone().expect("bind");
     assert_eq!(bound.function, "A");
     assert_eq!(bound.key, None, "a null key is a CLEAR");
+}
+
+/// v9, over real HTTP and with no JavaScript anywhere in sight: the mapper
+/// page ships forms, and posting one form-encoded body writes a binding and
+/// 303s back to /map with the outcome flashed. This is the whole no-JS
+/// contract — if it holds here, a browser with scripting off can map a
+/// cabinet.
+#[test]
+fn the_mapper_is_fully_operable_with_form_posts_only() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control.clone());
+
+    // The page a scripting-off browser gets: real forms, real action URLs,
+    // real key options, and slot switching as links.
+    let page = body_of(&get(addr, "/map")).to_owned();
+    assert!(page.contains(r#"action="/map/bind""#), "{page}");
+    assert!(page.contains(r#"formaction="/map/clear""#), "{page}");
+    assert!(page.contains(r#"action="/map/preset/restore""#), "{page}");
+    assert!(page.contains(r#"action="/map/preset/clear-all""#), "{page}");
+    assert!(
+        page.contains(r#"<select class="keysel" name="key""#),
+        "{page}"
+    );
+    assert!(page.contains("<option>NumpadEnter</option>"), "{page}");
+    assert!(page.contains(r#"href="/map?slot=1""#), "{page}");
+
+    // Bind: form-encoded in, 303 back to the slot we were on, outcome flashed.
+    let response = post_form(addr, "/map/bind", "slot=1&function=B&key=H");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(
+        response.contains("location: /map?slot=1&flash=B%20is%20now%20H."),
+        "{response}"
+    );
+    let bound = control.bound_with.lock().unwrap().clone().expect("bind");
+    assert_eq!(bound.preset, "IPAC P1", "the slot resolved to its preset");
+    assert_eq!(bound.function, "B");
+    assert_eq!(bound.key.as_deref(), Some("H"));
+    assert!(
+        bound.reload,
+        "a binding edit is hot-swapped, pads stay plugged"
+    );
+    assert!(!bound.force, "the row form never forces on its own");
+
+    // Clear: the same `map` verb with a null key — no second unbind path.
+    let response = post_form(addr, "/map/clear", "slot=1&function=A");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(
+        response.contains("location: /map?slot=1&flash=A%20is%20now%20unbound."),
+        "{response}"
+    );
+    assert_eq!(
+        control.bound_with.lock().unwrap().clone().unwrap().key,
+        None,
+        "a null key is a CLEAR"
+    );
+
+    // The empty placeholder is refused in words, never read as a clear.
+    let response = post_form(addr, "/map/bind", "slot=1&function=B&key=");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(
+        response.contains("flash=error%3A%20no%20key%20picked"),
+        "{response}"
+    );
+
+    // Cross-slot refusal: the flash names the other slot AND the checkbox
+    // that says yes to it — a form's version of the Replace dialog.
+    let response = post_form(addr, "/map/bind", "slot=1&function=B&key=G");
+    assert!(
+        response.contains("location: /map?slot=1&flash=error"),
+        "{response}"
+    );
+    assert!(response.contains("IPAC%20P2"), "{response}");
+    let response = post_form(addr, "/map/bind", "slot=1&function=B&key=G&force=1");
+    assert!(response.contains("flash=B%20is%20now%20G."), "{response}");
+    assert!(control.bound_with.lock().unwrap().clone().unwrap().force);
+
+    // The preset writes and the pause, same shape.
+    let response = post_form(addr, "/map/preset/clear-all", "slot=1");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert_eq!(
+        control.cleared.lock().unwrap().clone(),
+        Some("IPAC P1".to_owned())
+    );
+    let response = post_form(addr, "/map/preset/restore", "slot=1&mode=latest-backup");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert_eq!(
+        control.restored_with.lock().unwrap().clone(),
+        Some(("IPAC P1".to_owned(), "latest-backup".to_owned()))
+    );
+    // A junk mode is refused before the daemon is ever asked.
+    let response = post_form(addr, "/map/preset/restore", "slot=1&mode=yolo");
+    assert!(
+        response.contains("flash=error%3A%20unknown%20restore%20mode"),
+        "{response}"
+    );
+    assert_eq!(
+        control.restored_with.lock().unwrap().clone(),
+        Some(("IPAC P1".to_owned(), "latest-backup".to_owned())),
+        "the junk mode must not have reached the control source"
+    );
+
+    // Following the redirect renders the outcome — the no-JS feedback loop
+    // closed, exactly like the status page's.
+    let page = body_of(&get(addr, "/map?slot=1&flash=B%20is%20now%20H.")).to_owned();
+    assert!(page.contains("B is now H."), "{page}");
+    assert!(page.contains("flash flash-ok"), "{page}");
+    let page = body_of(&get(addr, "/map?slot=1&flash=error%3A%20nope")).to_owned();
+    assert!(page.contains("flash flash-err"), "{page}");
+}
+
+/// v10, MANY KEYS → ONE CONTROL over real HTTP and with no JavaScript: the
+/// same row form that binds can also ADD the picked key to what a control
+/// already holds, and REMOVE just one of the keys it holds. Both are
+/// read-modify-write on the key list the page already read, so a form body
+/// never carries a key list it made up.
+#[test]
+fn the_no_js_forms_add_and_remove_one_key_at_a_time() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control.clone());
+
+    let page = body_of(&get(addr, "/map")).to_owned();
+    assert!(page.contains(r#"formaction="/map/add""#), "{page}");
+    assert!(page.contains(r#"formaction="/map/key/remove""#), "{page}");
+    // The fixture's B holds two keys: both are on the page, each with its own
+    // remove payload, and neither reader spells them as a chord.
+    assert!(page.contains(r#"data-rmkey="B|S""#), "{page}");
+    assert!(page.contains(r#"data-rmkey="B|Enter""#), "{page}");
+    assert!(!page.contains("S+Enter"), "{page}");
+
+    // REMOVE ONE: B keeps S, loses Enter — and because one key is left, this
+    // daemon's single-key `map` verb can express it exactly.
+    let response = post_form(addr, "/map/key/remove", "slot=1&function=B&key=Enter");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(
+        response.contains("flash=Enter%20removed.%20B%20is%20now%20S."),
+        "{response}"
+    );
+    assert_eq!(
+        control
+            .bound_with
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap()
+            .key
+            .as_deref(),
+        Some("S"),
+        "the survivor is what gets written"
+    );
+
+    // A key the control does not have is a refusal that names what it DOES
+    // have — never a silent no-op, and never a write.
+    let response = post_form(addr, "/map/key/remove", "slot=1&function=B&key=J");
+    assert!(response.contains("flash=error%3A"), "{response}");
+    assert!(
+        response.contains("it%20has%20S%20%C2%B7%20Enter"),
+        "{response}"
+    );
+
+    // ADD onto an UNBOUND control is an ordinary bind: nothing to keep.
+    let response = post_form(addr, "/map/add", "slot=1&function=X&key=J");
+    assert!(response.contains("flash=X%20is%20now%20J."), "{response}");
+
+    // ADD onto a control that already has keys is the OR-chain the engine
+    // executes — and the honest limit of today's wire: the map verb writes one
+    // key per control and would drop the rest, so the write is REFUSED in
+    // words rather than made silently lossy. (The day the verb takes a key
+    // list, `ControlSource::bind_keys` writes it and this flash becomes the
+    // success sentence, with nothing else on the page changing.)
+    let before = control.bound_with.lock().unwrap().clone();
+    let response = post_form(addr, "/map/add", "slot=1&function=B&key=J");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(response.contains("flash=error%3A"), "{response}");
+    assert!(response.contains("ONE%20key%20per%20control"), "{response}");
+    assert_eq!(
+        control.bound_with.lock().unwrap().clone().map(|b| b.key),
+        before.map(|b| b.key),
+        "a refused multi-key write must not have written anything"
+    );
+
+    // Adding a key the control already has changes nothing and says so.
+    let response = post_form(addr, "/map/add", "slot=1&function=A&key=G");
+    assert!(response.contains("already%20has%20G"), "{response}");
+
+    // No key picked: the same honest refusal the Bind button gives.
+    let response = post_form(addr, "/map/add", "slot=1&function=B&key=");
+    assert!(
+        response.contains("flash=error%3A%20no%20key%20picked"),
+        "{response}"
+    );
+}
+
+/// The JSON twin: the island computes the SET it wants and posts it whole, so
+/// add, remove-one and undo all land through one writer.
+#[test]
+fn the_key_list_route_writes_a_whole_set() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control.clone());
+
+    // One key: an ordinary bind.
+    let response = post_json(
+        addr,
+        "/api/bind/keys",
+        r#"{"preset":"IPAC P1","function":"B","keys":["H"],"force":false,"reload":true}"#,
+    );
+    assert!(body_of(&response).contains(r#""ok":true"#), "{response}");
+    let bound = control.bound_with.lock().unwrap().clone().unwrap();
+    assert_eq!(bound.key.as_deref(), Some("H"));
+    assert!(bound.reload);
+
+    // No keys: a clear, through the same `map` verb.
+    let response = post_json(
+        addr,
+        "/api/bind/keys",
+        r#"{"preset":"IPAC P1","function":"B","keys":[],"reload":true}"#,
+    );
+    assert!(body_of(&response).contains(r#""ok":true"#), "{response}");
+    assert_eq!(
+        control.bound_with.lock().unwrap().clone().unwrap().key,
+        None
+    );
+
+    // Two keys: refused, in words that name the missing wire field — and
+    // nothing was written.
+    let response = post_json(
+        addr,
+        "/api/bind/keys",
+        r#"{"preset":"IPAC P1","function":"B","keys":["S","Enter"],"reload":true}"#,
+    );
+    let body = body_of(&response);
+    assert!(body.contains(r#""ok":false"#), "{response}");
+    assert!(body.contains("ONE key per control"), "{response}");
+    assert_eq!(
+        control.bound_with.lock().unwrap().clone().unwrap().key,
+        None,
+        "the refusal must not have written the first key"
+    );
+}
+
+/// No daemon: the forms are still there (dimmed by CSS, never removed) and a
+/// post still answers with the reason — the no-JS half of FIX 1's "never a
+/// silent no-op".
+#[test]
+fn a_no_js_post_without_a_daemon_flashes_the_reason() {
+    let addr = start_server(Arc::new(ScriptedControl::dead()));
+    let page = body_of(&get(addr, "/map")).to_owned();
+    assert!(page.contains(r#"class="lbind nojs off""#), "{page}");
+    assert!(page.contains(r#"action="/map/bind""#), "{page}");
+
+    let response = post_form(addr, "/map/preset/clear-all", "slot=1");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(response.contains("flash=error%3A"), "{response}");
+    assert!(
+        response.contains("no%20daemon%20control%20channel"),
+        "{response}"
+    );
 }
 
 #[test]

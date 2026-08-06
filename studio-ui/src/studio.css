@@ -521,9 +521,13 @@ select,
   margin-bottom: 0.5rem;
 }
 
+/* v9: an <a href="/map?slot=N">, so switching slots survives JavaScript being
+   off. Styled to sit in the flex row exactly as the old <button> did. */
 .tab {
+  display: inline-block;
   font: 600 0.78rem/1 var(--mono);
   color: var(--muted);
+  text-decoration: none;
   background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 999px;
@@ -1271,6 +1275,93 @@ footer p {
   }
 }
 
+/* ── MANY KEYS → ONE CONTROL: the legend's per-key chips ───────────────────
+   One key = one chip, and every chip carries its own ✕ that removes JUST that
+   key (the row's own ✕ still clears the whole control). Absence is a CLASS,
+   never `:empty` — an SSR text slot leaves marker comments inside the span, so
+   `:empty` never matches (dogfood ledger #15). The first chip takes the
+   `margin-left: auto` the single `.lkey` used to have, so a row with one key
+   looks exactly as it always did. */
+.lkc {
+  flex: 0 0 auto;
+  font: 700 0.78rem/1.2 var(--mono);
+  color: var(--accent);
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Only the FIRST chip takes the free space (`:first-of-type` cannot: every
+   part of the row is a span), which is why the chip's class field carries
+   `lk1`. `margin-left: auto` on several flex items would spread them out
+   instead of grouping them at the right edge. */
+.lkc.lk1 {
+  margin-left: auto;
+}
+
+.lkc.off,
+.lkx.off {
+  display: none;
+}
+
+/* A chip's own ✕. Same hover-reveal manners as `.lclear`, one shade smaller —
+   it removes one key, not the binding. */
+.lkx {
+  flex: 0 0 auto;
+  width: 0.85rem;
+  text-align: center;
+  font-size: 0.65rem;
+  line-height: 1;
+  color: var(--muted);
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 90ms ease;
+}
+
+.lrow:hover .lkx,
+.lrow:focus-visible .lkx,
+.lrow.l-hot .lkx {
+  opacity: 1;
+}
+
+.lkx:hover {
+  color: var(--danger);
+}
+
+@media (hover: none) {
+  .lkx {
+    opacity: 0.75;
+  }
+}
+
+/* The tail counter for a control with more keys than there are chips. */
+.lkmore {
+  flex: 0 0 auto;
+  font: 700 0.68rem/1.2 var(--mono);
+  color: var(--cool);
+}
+
+.lkmore.off {
+  display: none;
+}
+
+/* A multi-key control reads as a GROUP of alternatives, like a shared key
+   does — same steel-blue tone, applied to its own chips. */
+.l-multi .lkc {
+  color: var(--cool);
+}
+
+/* `.lkey` is now only the unbound row's honest "—": bound rows say it in
+   chips, and saying it twice would be noise. */
+.lkey {
+  display: none;
+}
+
+.l-unbound .lkey {
+  display: block;
+}
+
 /* ── The preset card's header row: heading + the auto-save receipt ─────────*/
 .phead {
   display: flex;
@@ -1515,4 +1606,93 @@ footer p {
     bottom: 4.75rem;
     width: auto;
   }
+}
+
+/* ── v9: the no-JavaScript write path ──────────────────────────────────────
+   The mapper's click-a-control-then-press-a-key flow needs a poller, so with
+   JavaScript off it cannot exist. What CAN exist is picking: every legend row
+   carries a real <form> with a key <select>, and the "Bind by name" card does
+   the same with a control picker beside it. Both POST and take a 303 back to
+   /map?slot=N&flash=… — the same progressive-enhancement shape the status
+   page's session forms have always had.
+
+   `.nojs` is the switch. map.ts marks the island root `.js` the moment it
+   wires up, which hides every one of these — with JavaScript the learn flow
+   is better in every way (it hears the real panel button, and it never
+   navigates). The inverse of the `.seltoggle` rule above, same mechanism. */
+.studio.js .nojs {
+  display: none;
+}
+
+/* The legend row grew a form under it, so the grid cell is now a wrapper.
+   The row itself keeps every rule it had (it is still the `.lrow` button). */
+.lrowwrap {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.lbind {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0 0.55rem 0.35rem;
+  min-width: 0;
+}
+
+.lbind .keysel {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.75rem;
+  padding: 0.2rem 0.35rem;
+}
+
+.btn-mini {
+  flex: 0 0 auto;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.5rem;
+}
+
+/* No daemon: the forms stay, dimmed. They are NOT disabled — a POST that the
+   daemon refuses comes back as a flash sentence naming the reason, which is
+   worth more than a control that is not there (the same rule the zone's
+   `z-dead` look follows). */
+.lbind.off,
+.pactions.off .pactform {
+  opacity: 0.55;
+}
+
+/* ── Bind by name: the no-JS panel that is not 25 inline forms ──────────── */
+.bindform {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.6rem;
+}
+
+.bindlabel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font: 600 0.72rem/1.4 var(--mono);
+  color: var(--muted);
+}
+
+.bindlabel select {
+  max-width: 18rem;
+}
+
+.bindforce {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+/* The preset actions are four forms now; `display: contents` keeps the row's
+   flex layout byte-for-byte what it was when they were bare buttons. */
+.pactform {
+  display: contents;
 }

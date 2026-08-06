@@ -21,3 +21,11 @@ tracing.workspace = true
 [dev-dependencies]
 # The HTTP integration tests parse /api/* bodies.
 serde_json.workspace = true
+# TEST-ONLY, deliberately: this crate renders and routes and knows nothing
+# about the key vocabulary at runtime (the ControlSource trait is the whole
+# boundary). But v9's no-JS <select> has to OFFER every bindable key, and the
+# option list lives in the TypeScript twin — so the pinning test reads the one
+# true vocabulary, `Key::ALL`, and checks the rendered page against it. A
+# key added to ksx-core and not to the page is a test failure, not a control
+# nobody can bind without a shell.
+ksx-core.workspace = true

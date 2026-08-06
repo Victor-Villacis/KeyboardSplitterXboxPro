@@ -774,6 +774,7 @@ dependencies = [
  "ksx-core",
  "serde",
  "serde_ignored",
+ "serde_json",
  "thiserror",
  "toml",
 ]
@@ -855,6 +856,7 @@ dependencies = [
  "axum",
  "forma-ir",
  "forma-server",
+ "ksx-core",
  "rust-embed",
  "serde",
  "serde_json",

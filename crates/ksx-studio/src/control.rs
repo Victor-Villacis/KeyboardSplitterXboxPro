@@ -41,6 +41,49 @@ pub trait ControlSource: Send + Sync {
     fn bind(&self, _request: &BindRequest) -> BindOutcome {
         BindOutcome::failed("this control source cannot write bindings")
     }
+
+    /// Write the control's WHOLE key list — MANY KEYS → ONE CONTROL, the
+    /// MAME-style OR-chain the engine has always executed
+    /// (docs/INPUT-TRANSFORMS.md §1a: `A = ["S", "Enter"]`, press either).
+    ///
+    /// This is the seam the mapper's "Add another key" and per-key ✕ compute
+    /// against: both are read-modify-write on a SET (current keys ∪ {k},
+    /// current keys ∖ {k}), and the whole set is what gets written, so a
+    /// caller never has to know how the writer spells the edit.
+    ///
+    /// The default implementation composes it from [`ControlSource::bind`],
+    /// which is all today's daemon offers — and that is exactly where it runs
+    /// out: the pipe `map` verb takes ONE `"key"` and is replace-per-function
+    /// (`ksx-app/src/mapping.rs`: "out with every old key for this function"),
+    /// so an empty set is a clear, a one-key set is an ordinary bind, and a
+    /// two-key set has no wire shape at all. Rather than write the first key
+    /// and silently drop the rest — the Synapse-4 sin MAPPER-UX commandment 7
+    /// bans — it refuses in words that name the missing field. An
+    /// implementation that CAN write a list (a `"keys": [...]` on the map
+    /// verb, or an `"add"`/`"remove"` mode) overrides this and makes every
+    /// edit atomic; nothing else on the page changes when it does.
+    fn bind_keys(
+        &self,
+        preset: &str,
+        function: &str,
+        keys: &[String],
+        force: bool,
+        reload: bool,
+    ) -> BindOutcome {
+        let one = |key: Option<String>| BindRequest {
+            preset: preset.to_owned(),
+            function: function.to_owned(),
+            key,
+            force,
+            reload,
+        };
+        match keys {
+            [] => self.bind(&one(None)),
+            [only] => self.bind(&one(Some(only.clone()))),
+            _ => BindOutcome::failed(multi_key_refusal(function, keys)),
+        }
+    }
+
     /// Restore a whole preset (pipe `map-restore`): `mode` is one of
     /// [`RESTORE_MODES`]. `Ok` is the daemon's confirmation line — which
     /// already names what was written and what was backed up first.
@@ -53,6 +96,40 @@ pub trait ControlSource: Send + Sync {
     fn clear_all(&self, _preset: &str) -> Result<String, String> {
         Err("this control source cannot clear presets".to_owned())
     }
+}
+
+/// Why a multi-key write cannot land on this daemon, in one sentence a page
+/// can flash verbatim. Named here (not formatted at three call sites) so the
+/// day the wire grows a key list there is exactly one place to delete.
+pub fn multi_key_refusal(function: &str, keys: &[String]) -> String {
+    format!(
+        "{function} would have to hold {} keys at once ({}), and this daemon's map verb writes \
+         ONE key per control — it replaces the whole binding, so the other keys would be lost. \
+         Nothing was changed. (A \"keys\" list on the map verb would make this one atomic write; \
+         until then, more than one key per control is a preset-file edit.)",
+        keys.len(),
+        keys.join(" · ")
+    )
+}
+
+/// `keys` with `key` appended — the "Add another key" edit. Already there
+/// (case-insensitively: the vocabulary is canonical, a hand-made POST is not)
+/// = unchanged, so adding twice is not an error and never a duplicate row.
+pub fn with_key(keys: &[String], key: &str) -> Vec<String> {
+    let mut next: Vec<String> = keys.to_vec();
+    if !next.iter().any(|k| k.eq_ignore_ascii_case(key)) {
+        next.push(key.to_owned());
+    }
+    next
+}
+
+/// `keys` without `key` — the per-key ✕. Removing the last one leaves an
+/// empty set, which [`ControlSource::bind_keys`] writes as an honest clear.
+pub fn without_key(keys: &[String], key: &str) -> Vec<String> {
+    keys.iter()
+        .filter(|k| !k.eq_ignore_ascii_case(key))
+        .cloned()
+        .collect()
 }
 
 /// The three restore destinations, as the wire spells them. Validated at the
@@ -209,6 +286,69 @@ impl SessionView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The set arithmetic behind "Add another key" and the per-key ✕. Both
+    /// are read-modify-write on the control's key LIST, so the order the file
+    /// holds is preserved and an add that changes nothing is a no-op, not a
+    /// second row.
+    #[test]
+    fn the_key_set_helpers_add_and_remove_exactly_one_key() {
+        let keys = vec!["S".to_owned(), "Enter".to_owned()];
+        assert_eq!(with_key(&keys, "G"), ["S", "Enter", "G"]);
+        assert_eq!(with_key(&keys, "S"), ["S", "Enter"], "already there");
+        assert_eq!(with_key(&keys, "enter"), ["S", "Enter"], "case-insensitive");
+        assert_eq!(without_key(&keys, "S"), ["Enter"]);
+        assert_eq!(without_key(&keys, "enter"), ["S"]);
+        assert!(without_key(&["S".to_owned()], "S").is_empty());
+        assert_eq!(without_key(&keys, "G"), ["S", "Enter"], "not there");
+    }
+
+    /// The default [`ControlSource::bind_keys`] composition: a set of nothing
+    /// is a clear, a set of one is an ordinary bind — and a set of two is
+    /// REFUSED in words, never written as its first key with the rest
+    /// silently dropped (MAPPER-UX commandment 7).
+    #[test]
+    fn bind_keys_composes_what_the_map_verb_can_express_and_refuses_the_rest() {
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<Option<String>>>);
+        impl ControlSource for Recorder {
+            fn session(&self) -> SessionView {
+                SessionView::unreachable("test")
+            }
+            fn start(&self, _profile: Option<&str>) -> Result<String, String> {
+                Err("test".into())
+            }
+            fn stop(&self) -> Result<String, String> {
+                Err("test".into())
+            }
+            fn reload(&self) -> Result<String, String> {
+                Err("test".into())
+            }
+            fn bind(&self, request: &BindRequest) -> BindOutcome {
+                self.0.lock().unwrap().push(request.key.clone());
+                BindOutcome {
+                    ok: true,
+                    ..BindOutcome::default()
+                }
+            }
+        }
+
+        let control = Recorder::default();
+        assert!(control.bind_keys("P1", "A", &[], false, true).ok);
+        assert!(
+            control
+                .bind_keys("P1", "A", &["G".to_owned()], false, true)
+                .ok
+        );
+        let two = vec!["S".to_owned(), "Enter".to_owned()];
+        let refused = control.bind_keys("P1", "A", &two, false, true);
+        assert!(!refused.ok);
+        let error = refused.error.unwrap();
+        assert!(error.contains("S · Enter"), "{error}");
+        assert!(error.contains("Nothing was changed"), "{error}");
+        // The refusal must not have written anything at all.
+        assert_eq!(*control.0.lock().unwrap(), [None, Some("G".to_owned())]);
+    }
 
     #[test]
     fn unreachable_carries_the_reason_and_disables_everything() {

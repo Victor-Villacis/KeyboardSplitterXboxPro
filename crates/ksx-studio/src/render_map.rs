@@ -99,6 +99,10 @@ const MAP_SHOW_ORDER: [&str; 19] = [
     "stage: ds4 art (+ zone layer)",
     // FIX 2: the third restore destination only exists when a backup does.
     "preset actions: restore-backup button",
+    // v9: SERVER-driven now. A no-JS form POST 303s back to
+    // /map?slot=N&flash=…, and these two are how that outcome reaches the
+    // page (the client keeps reporting through the toast stack instead —
+    // map.ts blanks these on adoption, so nothing is said twice).
     "saved flash: ok",
     "saved flash: error",
     "modal: overlay open",
@@ -266,13 +270,70 @@ fn selected_slot(payload: &MapPayload) -> Option<&MapperSlot> {
         .or_else(|| payload.mapper.slots.first())
 }
 
-/// "G", "S+Enter", or "—" for unbound. The inert "None" placeholder was
-/// already filtered by the provider.
+/// Every key bound to `function`, in file order. The inert "None" placeholder
+/// was already filtered by the provider, so an empty list IS unbound.
+///
+/// v10: this — not a joined string — is the unit the mapper works in. MANY
+/// KEYS → ONE CONTROL is native to the engine and to the TOML
+/// (docs/INPUT-TRANSFORMS.md §1a: `A = ["S", "Enter"]`, press either), and
+/// Victor's own imported preset uses it; the page had been folding the list
+/// into one tag and the writer had been replacing it.
+fn keys_of(slot: &MapperSlot, function: &str) -> Vec<String> {
+    slot.bindings.get(function).cloned().unwrap_or_default()
+}
+
+/// The separator between a control's keys, on both readers. A MIDDOT, never
+/// `+`: `S+Enter` reads as the chord it is not (a chord is `--when`, §1b) —
+/// these keys are alternatives, either one presses the control.
+const KEY_SEP: &str = " · ";
+
+/// "G", "S · Enter", or "—" for unbound — every key, for the tooltip/aria
+/// text and the legend's own reading.
 fn key_tag(slot: &MapperSlot, function: &str) -> String {
-    match slot.bindings.get(function) {
-        Some(keys) if !keys.is_empty() => keys.join("+"),
-        _ => "—".to_owned(),
+    let keys = keys_of(slot, function);
+    if keys.is_empty() {
+        "—".to_owned()
+    } else {
+        keys.join(KEY_SEP)
     }
+}
+
+/// The ON-ART tag: the first key, plus `+N` for the ones that do not fit. The
+/// zone is a few millimetres of controller drawing — the legend below carries
+/// the full set, and so does the zone's title/aria text.
+fn zone_tag(keys: &[String]) -> String {
+    match keys {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first, rest @ ..] => format!("{first} +{}", rest.len()),
+    }
+}
+
+/// How many key chips a legend row draws before it summarizes the tail. Same
+/// budget as [`SHARE_MAX`], and the same reason: a row that grows without
+/// bound stops being scannable.
+const KEY_CHIPS: usize = 3;
+
+/// The note that turns two key tags into a fact: they are ALTERNATIVES.
+/// Without it "G · J" is just as readable as "both at once", which is the
+/// chord semantics this is not.
+fn either_note(count: usize) -> String {
+    if count > 1 {
+        format!(" ({count} keys — any one of them presses it)")
+    } else {
+        String::new()
+    }
+}
+
+/// A zone's tooltip and aria-label: the control, EVERY key on it (the art
+/// itself only had room for the first), whether they are alternatives, and
+/// which other controls the same key drives.
+fn zone_title(function: &str, keys: &[String], tag: &str, share: &[String]) -> String {
+    let mut title = format!("{function} — {tag}{}", either_note(keys.len()));
+    if !share.is_empty() {
+        title.push_str(&format!(" ({})", share_title(tag, share)));
+    }
+    title
 }
 
 /// How many co-bound controls a shared-key badge names before it summarizes.
@@ -285,19 +346,23 @@ const SHARE_MAX: usize = 3;
 /// conflict here — the engine applies both (docs/INPUT-TRANSFORMS.md §1a) — so
 /// the page's job is to name what a key drives, not to complain about it.
 /// Unbound controls (`—`) never "share" anything.
+/// v10: two controls share when their key SETS INTERSECT — one key in common
+/// is one key that drives both, whether or not either control has others. (It
+/// used to compare the joined tags, which quietly stopped noticing the moment
+/// a control held more than one key.)
 fn shared_labels(slot: &MapperSlot) -> Vec<Vec<String>> {
     let zones = zones_for(&slot.persona);
-    let tags: Vec<String> = zones.iter().map(|z| key_tag(slot, z.fn_name)).collect();
-    tags.iter()
+    let keys: Vec<Vec<String>> = zones.iter().map(|z| keys_of(slot, z.fn_name)).collect();
+    keys.iter()
         .enumerate()
-        .map(|(i, tag)| {
-            if tag == "—" {
+        .map(|(i, mine)| {
+            if mine.is_empty() {
                 return Vec::new();
             }
             zones
                 .iter()
                 .enumerate()
-                .filter(|(j, _)| *j != i && &tags[*j] == tag)
+                .filter(|(j, _)| *j != i && keys[*j].iter().any(|k| mine.iter().any(|m| m == k)))
                 .map(|(_, z)| legend_label(z))
                 .collect()
         })
@@ -345,6 +410,7 @@ fn zone_rows(slot: &MapperSlot, live: bool) -> SlotValue {
             .iter()
             .zip(shared)
             .map(|(z, share)| {
+                let keys = keys_of(slot, z.fn_name);
                 let key = key_tag(slot, z.fn_name);
                 // z-unbound hides the tag pill via CSS (`:empty` cannot: the
                 // SSR text slot leaves marker nodes inside the span).
@@ -375,16 +441,11 @@ fn zone_rows(slot: &MapperSlot, live: bool) -> SlotValue {
                     ),
                     (
                         "title".to_owned(),
-                        SlotValue::Text(if share.is_empty() {
-                            format!("{} — {}", z.fn_name, key)
-                        } else {
-                            format!("{} — {} ({})", z.fn_name, key, share_title(&key, &share))
-                        }),
+                        SlotValue::Text(zone_title(z.fn_name, &keys, &key, &share)),
                     ),
-                    (
-                        "tag".to_owned(),
-                        SlotValue::Text(if key == "—" { String::new() } else { key }),
-                    ),
+                    // The art shows the first key and counts the rest; the
+                    // title above and the legend below name every one.
+                    ("tag".to_owned(), SlotValue::Text(zone_tag(&keys))),
                 ])
             })
             .collect(),
@@ -420,13 +481,17 @@ fn legend_label(z: &Zone) -> String {
 /// v7: the row leads with the same identity glyph the art now wears (so the
 /// two readers are visibly the same control) and ends with the shared-key
 /// badge — FEATURE 3's "P also drives A · B", stated as information.
-fn legend_rows(slot: &MapperSlot, live: bool) -> SlotValue {
+///
+/// v9: it also carries the row's own no-JS `<form>` fields. `write` is
+/// [`writable`], deliberately wider than `live` — see there.
+fn legend_rows(slot: &MapperSlot, live: bool, write: bool) -> SlotValue {
     let shared = shared_labels(slot);
     SlotValue::Array(
         zones_for(&slot.persona)
             .iter()
             .zip(shared)
             .map(|(z, share)| {
+                let keys = keys_of(slot, z.fn_name);
                 let key = key_tag(slot, z.fn_name);
                 let unbound = key == "—";
                 let mut cls = String::from("lrow");
@@ -439,7 +504,10 @@ fn legend_rows(slot: &MapperSlot, live: bool) -> SlotValue {
                 if !share.is_empty() {
                     cls.push_str(" l-shared");
                 }
-                SlotValue::Object(vec![
+                if keys.len() > 1 {
+                    cls.push_str(" l-multi");
+                }
+                let mut fields: Vec<(String, SlotValue)> = vec![
                     ("fn".to_owned(), SlotValue::Text(z.fn_name.to_owned())),
                     ("label".to_owned(), SlotValue::Text(legend_label(z))),
                     ("id".to_owned(), SlotValue::Text(z.label.to_owned())),
@@ -460,24 +528,166 @@ fn legend_rows(slot: &MapperSlot, live: bool) -> SlotValue {
                     ),
                     (
                         "title".to_owned(),
-                        SlotValue::Text(format!("{} — {}", z.fn_name, key)),
+                        SlotValue::Text(format!(
+                            "{} — {}{}",
+                            z.fn_name,
+                            key,
+                            either_note(keys.len())
+                        )),
                     ),
                     // The ✕ accelerator: only offered where clearing would
                     // actually do something (a bound function on a live page).
                     // Empty string = the CSS hides it, so the row layout does
-                    // not jump between states.
+                    // not jump between states. This one clears the CONTROL —
+                    // every key at once; the per-key ✕ chips below take one.
                     (
                         "clear".to_owned(),
                         SlotValue::Text(if live && !unbound { "✕" } else { "" }.to_owned()),
                     ),
                     (
                         "cleartitle".to_owned(),
-                        SlotValue::Text(format!("clear {}", z.fn_name)),
+                        SlotValue::Text(if keys.len() > 1 {
+                            format!("clear {} (all {} keys)", z.fn_name, keys.len())
+                        } else {
+                            format!("clear {}", z.fn_name)
+                        }),
                     ),
-                ])
+                    // v9's no-JS row form. The slot NUMBER travels, never the
+                    // preset name: the server resolves one from the other, so
+                    // a form body can only ever name a slot this cabinet has.
+                    ("slot".to_owned(), SlotValue::Text(slot.number.to_string())),
+                    (
+                        "bindcls".to_owned(),
+                        SlotValue::Text(
+                            if write {
+                                "lbind nojs"
+                            } else {
+                                "lbind nojs off"
+                            }
+                            .to_owned(),
+                        ),
+                    ),
+                    (
+                        "bindtitle".to_owned(),
+                        SlotValue::Text(format!("bind {} ({})", z.fn_name, legend_label(z))),
+                    ),
+                    // v10's two extra no-JS verbs on the same row form: the
+                    // picked key is ADDED to the control's list, or REMOVED
+                    // from it, instead of replacing the whole binding.
+                    (
+                        "addtitle".to_owned(),
+                        SlotValue::Text(format!(
+                            "add the picked key to {} — it keeps {}",
+                            z.fn_name,
+                            if unbound { "nothing yet" } else { key.as_str() }
+                        )),
+                    ),
+                    (
+                        "rmtitle".to_owned(),
+                        SlotValue::Text(format!(
+                            "remove just the picked key from {} ({})",
+                            z.fn_name, key
+                        )),
+                    ),
+                ];
+                fields.extend(key_chip_fields(z.fn_name, &keys, live));
+                SlotValue::Object(fields)
             })
             .collect(),
     )
+}
+
+/// The legend row's per-key chips — FEATURE: **remove ONE key**, leaving the
+/// others alone.
+///
+/// [`KEY_CHIPS`] fixed slots, not a nested list: the compiled item body has no
+/// inner `createList` seam (dogfood ledger #17's neighbour — a list inside a
+/// list item is not expressible), so the shape is fixed fields and the tail is
+/// summarized like [`share_text`] does. Every chip carries its own remove
+/// payload `function|KEY`, which is what the client's `data-rmkey` delegation
+/// parses; the row's title still names every key, chipped or not.
+///
+/// `cls` is how a chip disappears — `:empty` cannot work on an SSR text slot
+/// (the marker comments live inside the node), so absence is a class string,
+/// exactly like the toast stack's Undo button (ledger #15).
+fn key_chip_fields(function: &str, keys: &[String], live: bool) -> Vec<(String, SlotValue)> {
+    let mut fields = Vec::new();
+    for i in 0..KEY_CHIPS {
+        let key = keys.get(i);
+        fields.push((
+            format!("k{}", i + 1),
+            SlotValue::Text(key.cloned().unwrap_or_default()),
+        ));
+        // `lk1` is what right-aligns the group (see studio.css): only the
+        // first chip may take the row's free space.
+        let first = if i == 0 { " lk1" } else { "" };
+        fields.push((
+            format!("k{}cls", i + 1),
+            SlotValue::Text(if key.is_some() {
+                format!("lkc{first}")
+            } else {
+                format!("lkc{first} off")
+            }),
+        ));
+        // The ✕ is a SIBLING of the key tag, not the tag itself: clicking a
+        // key must never be what deletes it. A chip whose page cannot write is
+        // still a chip — the key is the truth, only the accelerator goes.
+        fields.push((
+            format!("k{}xcls", i + 1),
+            SlotValue::Text(
+                if key.is_some() && live {
+                    "lkx"
+                } else {
+                    "lkx off"
+                }
+                .to_owned(),
+            ),
+        ));
+        fields.push((
+            format!("k{}rm", i + 1),
+            SlotValue::Text(match key {
+                Some(key) => format!("{function}|{key}"),
+                None => String::new(),
+            }),
+        ));
+        fields.push((
+            format!("k{}title", i + 1),
+            SlotValue::Text(match key {
+                Some(key) if keys.len() > 1 => format!(
+                    "remove {key} from {function} — it keeps {}",
+                    keys.iter()
+                        .filter(|k| *k != key)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(KEY_SEP)
+                ),
+                Some(key) => format!("remove {key} from {function} — it is the only key"),
+                None => String::new(),
+            }),
+        ));
+    }
+    let extra = keys.len().saturating_sub(KEY_CHIPS);
+    fields.push((
+        "kmore".to_owned(),
+        SlotValue::Text(if extra > 0 {
+            format!("+{extra}")
+        } else {
+            String::new()
+        }),
+    ));
+    fields.push((
+        "kmorecls".to_owned(),
+        SlotValue::Text(if extra > 0 { "lkmore" } else { "lkmore off" }.to_owned()),
+    ));
+    fields.push((
+        "kmoretitle".to_owned(),
+        SlotValue::Text(if extra > 0 {
+            format!("{} more key(s): {}", extra, keys.join(KEY_SEP))
+        } else {
+            String::new()
+        }),
+    ));
+    fields
 }
 
 fn slot_tabs(payload: &MapPayload, selected: Option<&MapperSlot>) -> SlotValue {
@@ -494,6 +704,12 @@ fn slot_tabs(payload: &MapPayload, selected: Option<&MapperSlot>) -> SlotValue {
                         "label".to_owned(),
                         SlotValue::Text(format!("P{} · {}", s.number, s.preset)),
                     ),
+                    // v9: the tab is an anchor, so slot switching is a plain
+                    // GET when there is no JavaScript to intercept it.
+                    (
+                        "href".to_owned(),
+                        SlotValue::Text(format!("/map?slot={}", s.number)),
+                    ),
                     (
                         "cls".to_owned(),
                         SlotValue::Text(if active { "tab active" } else { "tab" }.to_owned()),
@@ -509,6 +725,19 @@ fn slot_tabs(payload: &MapPayload, selected: Option<&MapperSlot>) -> SlotValue {
 /// that knows the learn verbs at all.
 fn learnable(payload: &MapPayload) -> bool {
     payload.session.reachable && !payload.session.running && payload.learn.state != "unavailable"
+}
+
+/// Can a binding be WRITTEN right now? Deliberately wider than [`learnable`]:
+/// learning needs the panel's keys to reach the daemon's listener (so it
+/// refuses while a session captures them, and needs a daemon new enough to
+/// have the verbs at all), while writing needs only a daemon — a running
+/// session takes a binding change hot (`apply_bindings`, no unplugged pads),
+/// and the `map` verb predates the learn verbs.
+///
+/// This is what gates v9's no-JS forms, which PICK a key from the vocabulary
+/// instead of listening for one. Mirrored in MapIsland.ts as `canWrite`.
+fn writable(payload: &MapPayload) -> bool {
+    payload.session.reachable
 }
 
 /// The read-only reason — one honest sentence, worst problem first. Empty
@@ -569,7 +798,11 @@ fn backup_line(selected: Option<&MapperSlot>) -> String {
 const SEL_TOGGLE_OFF: &str = "btn btn-row seltoggle";
 const SEL_TOGGLE_LABEL_OFF: &str = "Select multiple";
 
-fn scalar_slots(payload: &MapPayload, selected: Option<&MapperSlot>) -> serde_json::Value {
+fn scalar_slots(
+    payload: &MapPayload,
+    selected: Option<&MapperSlot>,
+    flash: Option<&str>,
+) -> serde_json::Value {
     let slot_line = match selected {
         Some(s) => format!("P{} · {} · {}", s.number, s.persona_label, s.preset),
         None => "no mappable slots".to_owned(),
@@ -590,7 +823,12 @@ fn scalar_slots(payload: &MapPayload, selected: Option<&MapperSlot>) -> serde_js
         "countdownText": "",
         "barStyle": "width:100%",
         "conflictLine": "",
-        "savedLine": "",
+        // v9: the no-JS action report. A form POST 303s back here with the
+        // outcome in `?flash=`, and this line is where the page says it — the
+        // only feedback channel a page without JavaScript has.
+        "savedLine": flash.unwrap_or(""),
+        // Which slot every no-JS form outside the legend list posts about.
+        "slotNum": selected.map(|s| s.number).unwrap_or(payload.selected).to_string(),
         // Auto-save is invisible until it says so (Victor: "where is save?").
         // Empty on SSR — the page has not written anything yet.
         "savedAt": "",
@@ -612,10 +850,18 @@ fn scalar_slots(payload: &MapPayload, selected: Option<&MapperSlot>) -> serde_js
     })
 }
 
-fn show_values(payload: &MapPayload, selected: Option<&MapperSlot>) -> [bool; MAP_SHOW_COUNT] {
+fn show_values(
+    payload: &MapPayload,
+    selected: Option<&MapperSlot>,
+    flash: Option<&str>,
+) -> [bool; MAP_SHOW_COUNT] {
     let art = selected.map(|s| art_for(&s.persona));
     let live = learnable(payload) && selected.is_some();
     let running = payload.session.reachable && payload.session.running;
+    // Same rule as the status page's flash: an outcome that starts with
+    // "error" is reported as one, everything else as a plain confirmation.
+    let flash = flash.map(str::trim).filter(|f| !f.is_empty());
+    let flash_err = flash.is_some_and(|f| f.starts_with("error"));
     [
         running,
         payload.session.reachable && !payload.session.running,
@@ -629,8 +875,9 @@ fn show_values(payload: &MapPayload, selected: Option<&MapperSlot>) -> [bool; MA
         art == Some(crate::render::ART_XBOX),
         art == Some(crate::render::ART_DS4),
         selected.is_some_and(|s| s.backup.is_some()),
-        false, // saved flashes: client-only
-        false,
+        // v9: the no-JS flash, server-rendered from ?flash=.
+        flash.is_some() && !flash_err,
+        flash_err,
         false, // modal: client-only, never SSR-open
         false,
         false,
@@ -650,19 +897,20 @@ fn named_slot_ids(module: &IrModule, name: &str) -> Vec<u16> {
         .collect()
 }
 
-fn build_slots(module: &IrModule, payload: &MapPayload) -> SlotData {
+fn build_slots(module: &IrModule, payload: &MapPayload, flash: Option<&str>) -> SlotData {
     let selected = selected_slot(payload);
-    let scalars = scalar_slots(payload, selected).to_string();
+    let scalars = scalar_slots(payload, selected, flash).to_string();
     let mut slots = SlotData::from_json(&scalars, module)
         .unwrap_or_else(|_| SlotData::new_from_defaults(&module.slots));
 
     let tabs = slot_tabs(payload, selected);
     let live = learnable(payload) && selected.is_some();
+    let write = writable(payload) && selected.is_some();
     let zones = selected
         .map(|slot| zone_rows(slot, live))
         .unwrap_or(SlotValue::Array(Vec::new()));
     let legend = selected
-        .map(|slot| legend_rows(slot, live))
+        .map(|slot| legend_rows(slot, live, write))
         .unwrap_or(SlotValue::Array(Vec::new()));
     for (name, value) in [
         (LIST_SLOT_TABS, tabs),
@@ -678,7 +926,7 @@ fn build_slots(module: &IrModule, payload: &MapPayload) -> SlotData {
     }
     for (id, value) in named_slot_ids(module, SHOW_SLOT_NAME)
         .into_iter()
-        .zip(show_values(payload, selected))
+        .zip(show_values(payload, selected, flash))
     {
         slots.set(id, SlotValue::Bool(value));
     }
@@ -691,8 +939,15 @@ const PERSONALITY_CSS: &str = "body{background:#0b0e14;color:#dbe2ef;margin:0}\
 
 /// Render `/map` for one payload. The `selected` inside the payload drives
 /// the SSR slot pick; the client keeps its own selection after hydration.
-pub(crate) fn render_map(page: &EmbeddedPage, payload: &MapPayload) -> PageOutput {
-    let slots = build_slots(&page.module, payload);
+///
+/// `flash` is the outcome of the no-JS form POST that redirected here (v9) —
+/// the same post-redirect-get shape the status page has always used.
+pub(crate) fn render_map(
+    page: &EmbeddedPage,
+    payload: &MapPayload,
+    flash: Option<&str>,
+) -> PageOutput {
+    let slots = build_slots(&page.module, payload, flash);
     let prefix = body_prefix(payload, "/map");
     render_page(&PageConfig {
         title: "ksx Studio — mapper",
@@ -736,7 +991,7 @@ mod tests {
         }
     }
 
-    fn sample() -> MapPayload {
+    pub(super) fn sample() -> MapPayload {
         MapPayload {
             mapper: MapperSnapshot {
                 generated_at: "2026-08-05 12:00:00 UTC".into(),
@@ -863,7 +1118,7 @@ mod tests {
             .filter_map(|e| module.strings.get(e.name_str_idx).ok())
             .collect();
 
-        let scalars = scalar_slots(&sample(), None);
+        let scalars = scalar_slots(&sample(), None, None);
         for key in scalars.as_object().unwrap().keys() {
             assert!(
                 names.contains(&key.as_str()),
@@ -909,7 +1164,7 @@ mod tests {
     /// the slot strip shows the context.
     #[test]
     fn render_puts_bindings_in_the_legend_and_on_the_zones() {
-        let out = render_map(&page(), &sample());
+        let out = render_map(&page(), &sample(), None);
         assert!(out.html.contains("data-forma-ssr"), "{}", out.html);
         // Slot context strip.
         assert!(out.html.contains("P1 · Xbox 360 · IPAC P1"), "{}", out.html);
@@ -1032,7 +1287,7 @@ mod tests {
     /// to A but I can't see the A xbox button".
     #[test]
     fn every_xbox_zone_wears_its_identity_in_the_canonical_palette() {
-        let out = render_map(&page(), &sample());
+        let out = render_map(&page(), &sample(), None);
         for (idk, glyph) in [("xa", "A"), ("xb", "B"), ("xx", "X"), ("xy", "Y")] {
             assert_eq!(
                 text_in(&out.html, &format!("zid id-{idk}")).as_deref(),
@@ -1087,7 +1342,7 @@ mod tests {
     fn every_playstation_zone_wears_the_sony_glyphs() {
         let mut payload = sample();
         payload.selected = 3;
-        let out = render_map(&page(), &payload);
+        let out = render_map(&page(), &payload, None);
         for (idk, glyph) in [("pc", "✕"), ("po", "○"), ("pt", "△"), ("psq", "□")] {
             assert_eq!(
                 text_in(&out.html, &format!("zid id-{idk}")).as_deref(),
@@ -1123,7 +1378,7 @@ mod tests {
         payload.mapper.slots[0]
             .bindings
             .insert("rt".into(), vec!["G".into()]);
-        let out = render_map(&page(), &payload);
+        let out = render_map(&page(), &payload, None);
         assert!(out.html.contains("z-shared"), "{}", out.html);
         assert!(out.html.contains("l-shared"), "{}", out.html);
         // Every co-bound control names its partners, in ZONE-TABLE order (the
@@ -1146,6 +1401,86 @@ mod tests {
         );
     }
 
+    /// MANY KEYS → ONE CONTROL, the read half. The engine and the TOML have
+    /// always allowed `A = ["S", "Enter"]` (docs/INPUT-TRANSFORMS.md §1a —
+    /// Victor's own imported preset used it) and the page used to fold it into
+    /// one tag. Now: the art shows the first key and counts the rest, the
+    /// legend gives every key its own chip and its own ✕, and the tooltip
+    /// names all of them AND says they are alternatives, not a chord.
+    #[test]
+    fn a_control_with_several_keys_shows_every_one_of_them() {
+        let mut payload = sample();
+        payload.mapper.slots[0]
+            .bindings
+            .insert("A".into(), vec!["S".into(), "Enter".into()]);
+        let out = render_map(&page(), &payload, None);
+        let html = &out.html;
+
+        // The art: first key + how many more.
+        assert!(html.contains(">S +1<"), "{html}");
+        // Every reader names both, and neither says "S+Enter" — that reads as
+        // the chord this is not.
+        assert!(
+            html.contains("A — S · Enter (2 keys — any one of them presses it)"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("S+Enter"),
+            "the chord spelling came back: {html}"
+        );
+        // The legend: one chip per key, each carrying its own remove payload.
+        assert!(html.contains(r#"data-rmkey="A|S""#), "{html}");
+        assert!(html.contains(r#"data-rmkey="A|Enter""#), "{html}");
+        assert!(
+            html.contains("remove S from A — it keeps Enter"),
+            "the ✕ says what SURVIVES it: {html}"
+        );
+        // A control with one key keeps exactly one chip; the rest are off.
+        assert!(html.contains(r#"data-rmkey="B|F""#), "{html}");
+        assert!(html.contains(r#"class="lkc lk1 off""#), "{html}");
+        assert!(html.contains("l-multi"), "{html}");
+    }
+
+    /// The chips summarize instead of growing without bound — same rule as the
+    /// shared-key badge, and the tail is still named in the tooltip.
+    #[test]
+    fn more_keys_than_chips_are_counted_and_still_named() {
+        let mut payload = sample();
+        payload.mapper.slots[0].bindings.insert(
+            "A".into(),
+            ["S", "Enter", "Space", "J"]
+                .iter()
+                .map(|k| (*k).to_owned())
+                .collect(),
+        );
+        let out = render_map(&page(), &payload, None);
+        let html = &out.html;
+        assert!(html.contains(">S +3<"), "the art counts them: {html}");
+        assert!(html.contains(">+1<"), "the legend's tail counter: {html}");
+        assert!(
+            html.contains("1 more key(s): S · Enter · Space · J"),
+            "the tail is still named in full: {html}"
+        );
+    }
+
+    /// Two controls share when their key SETS INTERSECT. The old rule compared
+    /// the joined tags, so a control that grew a second key silently stopped
+    /// reporting the fan-out it was still part of.
+    #[test]
+    fn a_multi_key_control_still_reports_the_key_it_shares() {
+        let mut payload = sample();
+        // A has G (as the sample binds it) plus Enter; B has G alone.
+        payload.mapper.slots[0]
+            .bindings
+            .insert("A".into(), vec!["G".into(), "Enter".into()]);
+        payload.mapper.slots[0]
+            .bindings
+            .insert("B".into(), vec!["G".into()]);
+        let out = render_map(&page(), &payload, None);
+        assert!(out.html.contains(">also B<"), "A's row: {}", out.html);
+        assert!(out.html.contains(">also A<"), "B's row: {}", out.html);
+    }
+
     /// The badge summarizes instead of growing without bound.
     #[test]
     fn a_key_on_many_controls_summarizes_the_tail() {
@@ -1164,7 +1499,7 @@ mod tests {
     fn selected_slot_drives_art_and_labels() {
         let mut payload = sample();
         payload.selected = 3;
-        let out = render_map(&page(), &payload);
+        let out = render_map(&page(), &payload, None);
         assert!(
             out.html.contains("P3 · PlayStation (DS4) · IPAC P3"),
             "{}",
@@ -1194,7 +1529,7 @@ mod tests {
         let mut payload = sample();
         payload.session = SessionView::unreachable("no daemon control channel");
         payload.learn = LearnView::unavailable("no daemon control channel");
-        let out = render_map(&page(), &payload);
+        let out = render_map(&page(), &payload, None);
         assert!(
             out.html.contains("read-only: no daemon control channel"),
             "{}",
@@ -1226,7 +1561,7 @@ mod tests {
         payload.session.running = true;
         payload.session.line = "running — 4 pad(s)".into();
         payload.session.profile = Some("Steam".into());
-        let out = render_map(&page(), &payload);
+        let out = render_map(&page(), &payload, None);
         assert!(
             out.html
                 .contains("Emulation is running: panel keys are captured"),
@@ -1259,7 +1594,7 @@ mod tests {
             ..SessionView::unreachable("no daemon control channel")
         };
         payload.learn = LearnView::unavailable("no daemon control channel");
-        let out = render_map(&page(), &payload);
+        let out = render_map(&page(), &payload, None);
 
         assert!(
             out.html.contains(crate::render::NO_DAEMON_HEADLINE),
@@ -1293,13 +1628,13 @@ mod tests {
     #[test]
     fn the_backup_restore_button_appears_only_when_a_backup_exists() {
         let mut payload = sample();
-        let out = render_map(&page(), &payload);
+        let out = render_map(&page(), &payload, None);
         assert!(out.html.contains(r#"data-act="restore-latest""#));
 
         for slot in &mut payload.mapper.slots {
             slot.backup = None;
         }
-        let out = render_map(&page(), &payload);
+        let out = render_map(&page(), &payload, None);
         assert!(
             !out.html.contains(r#"data-act="restore-latest""#),
             "{}",
@@ -1316,7 +1651,7 @@ mod tests {
     /// Undo, and the restore options are the wider road home.
     #[test]
     fn the_preset_card_states_the_save_model_plainly() {
-        let out = render_map(&page(), &sample());
+        let out = render_map(&page(), &sample(), None);
         assert!(
             out.html.contains("Every binding saves immediately"),
             "{}",
@@ -1342,7 +1677,7 @@ mod tests {
     /// a page with no JavaScript at all.
     #[test]
     fn the_toast_stack_ships_empty_and_the_no_js_flash_line_survives() {
-        let out = render_map(&page(), &sample());
+        let out = render_map(&page(), &sample(), None);
         let at = out
             .html
             .find(r#"class="toasts""#)
@@ -1369,7 +1704,7 @@ mod tests {
         // The server-rendered flash channel (savedLine + its two shows) is
         // still part of the seam — that is the no-JS page's only feedback.
         assert!(
-            scalar_slots(&sample(), None)
+            scalar_slots(&sample(), None, None)
                 .as_object()
                 .unwrap()
                 .contains_key("savedLine"),
@@ -1383,7 +1718,7 @@ mod tests {
     fn a_pre_mapper_daemon_is_reported_not_hidden() {
         let mut payload = sample();
         payload.learn = LearnView::unavailable("unknown verb 'learn-poll'");
-        let out = render_map(&page(), &payload);
+        let out = render_map(&page(), &payload, None);
         assert!(
             out.html.contains("does not answer the learn verbs"),
             "{}",
@@ -1404,7 +1739,7 @@ mod tests {
             serde_json::to_value(&payload).unwrap(),
             "island props must be byte-compatible with what /api/map serves"
         );
-        let out = render_map(&page(), &payload);
+        let out = render_map(&page(), &payload, None);
         assert!(out.html.contains(&props), "{}", out.html);
     }
 
@@ -1412,10 +1747,199 @@ mod tests {
     /// page (both pages carry it; render.rs pins the status page).
     #[test]
     fn the_mapper_page_credits_the_controller_art() {
-        let out = render_map(&page(), &sample());
+        let out = render_map(&page(), &sample(), None);
         assert!(
             out.html.contains("Gamepad-Asset-Pack (MIT) by AL2009man"),
             "{}",
+            out.html
+        );
+    }
+
+    /// v9, the headline: with JavaScript switched off the page is still a
+    /// working mapper. Every control owns a real `<form method="post">` — a
+    /// key picker, a Bind submit and a Clear submit — and every other action
+    /// on the page (the four preset writes, the pause, the slot strip) is a
+    /// form or a link too. No `data-act` button is left as the only way to
+    /// do anything.
+    #[test]
+    fn every_mapper_action_has_a_no_js_form_or_link() {
+        let out = render_map(&page(), &sample(), None);
+        let html = &out.html;
+
+        // One row form per mappable control, plus the bind-by-name panel.
+        assert_eq!(
+            html.matches(r#"class="lrowwrap""#).count(),
+            25,
+            "one wrapper per legend row: {html}"
+        );
+        assert_eq!(
+            html.matches(r#"action="/map/bind""#).count(),
+            26,
+            "25 row forms + the bind-by-name panel: {html}"
+        );
+        // The row form carries the slot (the server resolves the preset from
+        // it), the function, a key select and both verbs. Clear rides the
+        // same form through formaction — one form, two destinations.
+        assert!(
+            html.contains(r#"<input type="hidden" name="slot" value="1">"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<input type="hidden" name="function" value="A">"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<select class="keysel" name="key""#),
+            "{html}"
+        );
+        assert_eq!(
+            html.matches(r#"formaction="/map/clear""#).count(),
+            26,
+            "every bind form offers Clear without JavaScript: {html}"
+        );
+        // v10: the same form, two more verbs — ADD the picked key to what the
+        // control has, or REMOVE just that one. Removing one key of several
+        // without JavaScript needs to name WHICH key, and the row's own
+        // picker is that name (no per-key form, 25 rows over).
+        for action in ["/map/add", "/map/key/remove"] {
+            assert_eq!(
+                html.matches(&format!(r#"formaction="{action}""#)).count(),
+                26,
+                "25 row forms + the bind-by-name panel offer {action}: {html}"
+            );
+        }
+        // The four preset writes and the pause are forms, not bare buttons.
+        for (action, mode) in [
+            ("/map/preset/clear-all", None),
+            ("/map/preset/restore", Some("session-backup")),
+            ("/map/preset/restore", Some("latest-backup")),
+            ("/map/preset/restore", Some("defaults")),
+        ] {
+            assert!(
+                html.contains(&format!(r#"method="post" action="{action}""#)),
+                "{action} is not a form: {html}"
+            );
+            if let Some(mode) = mode {
+                assert!(
+                    html.contains(&format!(r#"name="mode" value="{mode}""#)),
+                    "{mode}: {html}"
+                );
+            }
+        }
+        // Slot switching is a link — `?slot=N` was always a route.
+        assert!(html.contains(r#"href="/map?slot=2""#), "{html}");
+        assert!(html.contains(r#"href="/map?slot=3""#), "{html}");
+        // …and the JS hooks survive on the same elements, so the island can
+        // still intercept every one of them.
+        assert!(html.contains(r#"data-slot="2""#), "{html}");
+        assert!(html.contains(r#"data-act="clear-all""#), "{html}");
+    }
+
+    /// The no-JS select must offer EVERY key a preset can hold — the whole
+    /// point of picking instead of learning. The vocabulary lives in the
+    /// TypeScript twin (MapPage.ts), so this test reads the one true source,
+    /// `Key::ALL`, and checks the rendered page against it: a key added to
+    /// ksx-core and not to the page fails here rather than silently becoming
+    /// unbindable without a shell.
+    ///
+    /// An `<option>` with no `value` attribute submits its own text, which is
+    /// why the assertion is on the text and not on an attribute.
+    #[test]
+    fn every_bindable_key_name_is_offered_by_the_no_js_selects() {
+        use ksx_core::key::Key;
+        let out = render_map(&page(), &sample(), None);
+        let html = &out.html;
+        for key in Key::ALL {
+            let name = key.name();
+            let offered = html.contains(&format!("<option>{name}</option>"));
+            // The three exclusions, stated as an assertion rather than a
+            // comment: the inert placeholder (Clear is how you unbind), the
+            // sentinel, and the mouse pseudo-keys no capture path produces.
+            let excluded = matches!(*key, Key::None | Key::Unknown) || key.is_mouse_pseudo();
+            assert_eq!(
+                offered, !excluded,
+                "key {name}: offered={offered}, expected={}",
+                !excluded
+            );
+        }
+        // Every mappable FUNCTION is pickable too, canonical spelling.
+        for z in ZONE_XBOX.iter() {
+            assert!(
+                html.contains(&format!("<option>{}</option>", z.fn_name)),
+                "function {} is not in the bind-by-name picker: {html}",
+                z.fn_name
+            );
+        }
+    }
+
+    /// The post-redirect-get seam: `/map?flash=…` renders the outcome in the
+    /// SSR flash line, ok and error styled apart — the only feedback channel
+    /// a page without JavaScript has. (With JavaScript, map.ts re-reports it
+    /// as a toast and blanks this, so nothing is said twice.)
+    #[test]
+    fn a_flash_query_renders_the_server_side_outcome() {
+        let out = render_map(&page(), &sample(), Some("A is now G."));
+        assert!(
+            out.html.contains(r#"class="flash flash-ok""#),
+            "{}",
+            out.html
+        );
+        assert!(out.html.contains("A is now G."), "{}", out.html);
+        assert!(
+            !out.html.contains(r#"class="flash flash-err""#),
+            "{}",
+            out.html
+        );
+
+        let out = render_map(&page(), &sample(), Some("error: the daemon refused"));
+        assert!(
+            out.html.contains(r#"class="flash flash-err""#),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains("error: the daemon refused"),
+            "{}",
+            out.html
+        );
+
+        // No flash, no line: a fresh GET has taken no action.
+        let out = render_map(&page(), &sample(), None);
+        assert!(!out.html.contains("flash flash-ok"), "{}", out.html);
+        assert!(!out.html.contains("flash flash-err"), "{}", out.html);
+    }
+
+    /// `writable` is deliberately WIDER than `learnable`: the no-JS forms
+    /// pick a key rather than listening for one, so they work while a session
+    /// runs (a binding edit is hot-swapped) and on a daemon too old to know
+    /// the learn verbs. Only a missing daemon dims them — and even then they
+    /// are still submittable, because a refusal that names the reason beats a
+    /// control that is not there.
+    #[test]
+    fn the_no_js_forms_stay_live_wherever_a_write_can_land() {
+        let mut running = sample();
+        running.session.running = true;
+        let out = render_map(&page(), &running, None);
+        assert!(out.html.contains(r#"class="lbind nojs""#), "{}", out.html);
+        assert!(out.html.contains("z-dead"), "the LEARN path is still off");
+
+        let mut old = sample();
+        old.learn = LearnView::unavailable("unknown verb 'learn-poll'");
+        let out = render_map(&page(), &old, None);
+        assert!(out.html.contains(r#"class="lbind nojs""#), "{}", out.html);
+
+        let mut dead = sample();
+        dead.session = SessionView::unreachable("no daemon control channel");
+        dead.learn = LearnView::unavailable("no daemon control channel");
+        let out = render_map(&page(), &dead, None);
+        assert!(
+            out.html.contains(r#"class="lbind nojs off""#),
+            "no daemon = the inert look, never a removed form: {}",
+            out.html
+        );
+        assert!(
+            out.html.contains(r#"action="/map/bind""#),
+            "the form itself must survive: {}",
             out.html
         );
     }
@@ -1427,7 +1951,7 @@ mod tests {
         payload.mapper.slots[0]
             .bindings
             .insert("X".into(), vec!["<script>alert(1)</script>".into()]);
-        let out = render_map(&page(), &payload);
+        let out = render_map(&page(), &payload, None);
         assert!(
             !out.html.contains("<script>alert(1)</script>"),
             "{}",

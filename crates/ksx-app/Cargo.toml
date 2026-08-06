@@ -45,6 +45,11 @@ tracing-appender.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    # timeBeginPeriod/timeEndPeriod: the engine thread raises the system timer
+    # resolution to 1 ms only WHILE a macro is playing back (a 33 ms step on a
+    # ~15.6 ms default timer is mushy), and restores it the moment the last
+    # deadline clears. See supervisor::TimerResolution.
+    "Win32_Media",
     # FreeConsole/SetStdHandle + CreateFileW("NUL"): `ksx daemon` releases its
     # console once the tray icon exists, and points the standard handles at the
     # null device so later writes are a silent no-op instead of an I/O error.

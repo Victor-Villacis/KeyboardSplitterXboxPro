@@ -115,8 +115,17 @@ the 3D viewer later — one stream, three consumers.
 
 ## Explicitly deferred (recorded so they're chosen, not forgotten)
 
-- MAME-style OR-chaining (multiple physical keys per control) — the preset
-  model can express it; UI later.
+- ~~MAME-style OR-chaining (multiple physical keys per control)~~ — **UI
+  SHIPPED (v10)**: every reader shows a control's whole key list (the art
+  shows the first plus `+N`, the legend one chip per key), the learn modal
+  offers "Add another key" beside "Replace binding", each chip has its own ✕
+  that removes just that key, and the no-JS row form carries Add / Remove key
+  beside Bind / Clear. What is still deferred is the WRITE half: the daemon's
+  `map` verb takes one `"key"` and is replace-per-function, so Studio can
+  express a set of nothing (clear) or one, and refuses a two-key write in
+  words instead of dropping keys (`ControlSource::bind_keys`). A `"keys"`
+  list on that verb makes add/remove-one atomic — and undoable — with no
+  further UI change.
 - Steam-style activators (hold/double-press) — engine feature first, UI
   after; belongs with shift-layers vocabulary from the PadForge audit.
 - Community preset sharing (Steam's playtime-ranked configs) — M7+.

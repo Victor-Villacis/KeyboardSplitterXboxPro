@@ -1,4 +1,23 @@
 import { h, createSignal, createList, createShow } from "@getforma/core";
+// v9's no-JS vocabulary tables. They are DECLARED in MapPage.ts because the
+// compiler expands `...CONST.map(…)` spreads at build time from the root
+// *Page file's constants only (ledger #17, explained there); this import is
+// the runtime half of that single source. The cycle is inert — nothing here
+// reads them before MapIsland() runs.
+import {
+  KEYS_LETTER,
+  KEYS_DIGIT,
+  KEYS_FN,
+  KEYS_NUMPAD,
+  KEYS_ARROW,
+  KEYS_NAV,
+  KEYS_EDIT,
+  KEYS_MOD,
+  KEYS_SYMBOL,
+  KEYS_MEDIA,
+  KEYS_OEM,
+  FUNCTIONS,
+} from "./MapPage";
 
 // THE MAPPER (v5): click a control on the pad art, press the panel key,
 // binding saved. One island, same architecture as StatusIsland.ts — the
@@ -98,6 +117,10 @@ interface SlotTab {
   num: string;
   label: string;
   cls: string;
+  /** v9: the tab is an ANCHOR, so slot switching works with JS off —
+   *  `/map?slot=N` is a route the server already understands. map.ts still
+   *  intercepts the click and switches in place. */
+  href: string;
 }
 
 interface ZoneRow {
@@ -128,9 +151,46 @@ interface LegendRow {
   /** FEATURE 3: "also A · B" when this key drives other controls too. */
   share: string;
   sharetitle: string;
-  /** "✕" on a bound row of a live page, "" otherwise (CSS hides empty). */
+  /** "✕" on a bound row of a live page, "" otherwise (CSS hides empty).
+   *  This one clears the CONTROL — every key at once. */
   clear: string;
   cleartitle: string;
+  /** v10, MANY KEYS → ONE CONTROL: up to KEY_CHIPS fixed key chips, each with
+   *  its own ✕ that removes JUST that key. Fixed fields rather than a nested
+   *  list because a `createList` inside a list item has no seam (ledger #17's
+   *  neighbour); the tail is summarized in `kmore`, and the row title always
+   *  names every key. `k1rm` is the `data-rmkey` payload, `function|KEY`. */
+  k1: string;
+  k1cls: string;
+  k1xcls: string;
+  k1rm: string;
+  k1title: string;
+  k2: string;
+  k2cls: string;
+  k2xcls: string;
+  k2rm: string;
+  k2title: string;
+  k3: string;
+  k3cls: string;
+  k3xcls: string;
+  k3rm: string;
+  k3title: string;
+  /** "+2" when more keys exist than there are chips, "" otherwise. */
+  kmore: string;
+  kmorecls: string;
+  kmoretitle: string;
+  /** The row form's two v10 submits: append the picked key, or take just that
+   *  one away. */
+  addtitle: string;
+  rmtitle: string;
+  /** v9, the no-JS write path. The row's own <form> posts these: the slot
+   *  number (the server resolves the preset from it — a form never has to be
+   *  trusted with a preset name) and the function. `bindcls` carries the
+   *  inert look when nothing can be written, `bindtitle` names the control
+   *  for the select's accessible name. */
+  slot: string;
+  bindcls: string;
+  bindtitle: string;
 }
 
 /** One toast in the stack (v8). Every field is a BARE per-item read in the
@@ -231,6 +291,10 @@ const [cliLine, setCliLine] = createSignal(
 );
 const [daemonCmd, setDaemonCmd] = createSignal("ksx daemon");
 const [backupLine, setBackupLine] = createSignal("Restore backup");
+/** v9: the selected slot NUMBER as a string — the hidden field every no-JS
+ *  form outside the legend list carries (preset actions, the bind-by-name
+ *  panel). The server resolves the preset from it. */
+const [slotNum, setSlotNum] = createSignal("1");
 const [modalPrompt, setModalPrompt] = createSignal("");
 const [modalBinding, setModalBinding] = createSignal("");
 const [countdownText, setCountdownText] = createSignal("");
@@ -296,6 +360,13 @@ let hotFn: string | null = null;
 /** Mirrors render_map.rs `learnable`: can a click actually record right now?
  *  Drives the z-dead / l-dead look and the ✕ accelerator. */
 let liveMapping = false;
+/** Mirrors render_map.rs `writable`: can a binding be WRITTEN right now? A
+ *  wider condition than [`liveMapping`] on purpose — learning needs the
+ *  panel's keys to reach the daemon's listener, writing needs only a daemon
+ *  (a running session takes a binding change hot, and a daemon that predates
+ *  the learn verbs still has `map`). This is what gates the no-JS forms,
+ *  which pick a key instead of listening for one. */
+let canWrite = false;
 
 // ── v7 multi-select (FEATURE 2) ────────────────────────────────────────────
 // Victor's file-explorer analogy: Ctrl/Shift-click ADDS a control to a
@@ -421,9 +492,38 @@ function refreshCliLine(): void {
 
 // ── Derivations (mirror render_map.rs; pinned there by unit tests) ─────────
 
+/** Every key bound to `fn`, file order — the unit the mapper works in.
+ *  MANY KEYS → ONE CONTROL is native to the engine and to the TOML
+ *  (`A = ["S", "Enter"]`, press either; docs/INPUT-TRANSFORMS.md §1a). */
+export function keysOf(slot: MapperSlot, fn: string): string[] {
+  return slot.bindings[fn] ?? [];
+}
+
+/** The separator between a control's keys. A MIDDOT, never `+`: `S+Enter`
+ *  reads as the chord it is not — these are alternatives. */
+const KEY_SEP = " · ";
+
+/** "G", "S · Enter", or "—" — every key, for tooltips and prompts. */
 function keyTag(slot: MapperSlot, fn: string): string {
-  const keys = slot.bindings[fn];
-  return keys && keys.length > 0 ? keys.join("+") : "—";
+  const keys = keysOf(slot, fn);
+  return keys.length > 0 ? keys.join(KEY_SEP) : "—";
+}
+
+/** The ON-ART tag: the first key plus `+N` for the ones that do not fit. */
+function zoneTag(keys: string[]): string {
+  if (keys.length === 0) return "";
+  return keys.length === 1 ? keys[0] : `${keys[0]} +${keys.length - 1}`;
+}
+
+/** How many key chips a legend row draws before summarizing the tail —
+ *  mirrors render_map.rs KEY_CHIPS. */
+const KEY_CHIPS = 3;
+
+/** " (2 keys — any one of them presses it)", or "". Two key tags side by side
+ *  read just as easily as "both at once", which is chord semantics and wrong;
+ *  this says which one it is. */
+function eitherNote(count: number): string {
+  return count > 1 ? ` (${count} keys — any one of them presses it)` : "";
 }
 
 /** The zone table of the slot on screen. */
@@ -441,12 +541,16 @@ const SHARE_MAX = 3;
  *  the data that lets both readers say so. */
 function sharedLabels(slot: MapperSlot): string[][] {
   const table = isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
-  const tags = table.map(([fn]) => keyTag(slot, fn));
-  return tags.map((tag, i) =>
-    tag === "—"
+  const keys = table.map(([fn]) => keysOf(slot, fn));
+  // v10: two controls share when their key SETS INTERSECT. One key in common
+  // is one key that drives both, whether or not either control has others —
+  // comparing the joined tags (as this did) stopped noticing the moment a
+  // control held more than one key.
+  return keys.map((mine, i) =>
+    mine.length === 0
       ? []
       : table
-          .filter((_, j) => j !== i && tags[j] === tag)
+          .filter((_, j) => j !== i && keys[j].some((k) => mine.includes(k)))
           .map(([fn, label]) => legendLabel(fn, label)),
   );
 }
@@ -467,6 +571,7 @@ function zoneRows(slot: MapperSlot): ZoneRow[] {
   const dead = liveMapping ? "" : " z-dead";
   const shared = sharedLabels(slot);
   return table.map(([fn, label, idk, cx, cy, w, h, kind], i) => {
+    const keys = keysOf(slot, fn);
     const key = keyTag(slot, fn);
     const share = shared[i];
     // z-unbound hides the tag pill via CSS: `:empty` cannot work, the SSR
@@ -486,10 +591,11 @@ function zoneRows(slot: MapperSlot): ZoneRow[] {
         `left:${(cx - w / 2).toFixed(1)}%;top:${(cy - h / 2).toFixed(1)}%;` +
         `width:${w.toFixed(1)}%;height:${h.toFixed(1)}%`,
       title:
-        share.length > 0
-          ? `${fn} — ${key} (${shareTitle(key, share)})`
-          : `${fn} — ${key}`,
-      tag: key === "—" ? "" : key,
+        `${fn} — ${key}${eitherNote(keys.length)}` +
+        (share.length > 0 ? ` (${shareTitle(key, share)})` : ""),
+      // The art shows the first key and counts the rest; the title above and
+      // the legend below name every one.
+      tag: zoneTag(keys),
     };
   });
 }
@@ -512,9 +618,29 @@ function legendRowsFor(slot: MapperSlot): LegendRow[] {
   const table = isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
   const shared = sharedLabels(slot);
   return table.map(([fn, label, idk], i) => {
+    const keys = keysOf(slot, fn);
     const key = keyTag(slot, fn);
     const unbound = key === "—";
     const share = shared[i];
+    const chip = (n: number): string => keys[n] ?? "";
+    // `lk1` right-aligns the group: only the first chip may take the row's
+    // free space (studio.css).
+    const chipCls = (n: number): string =>
+      `lkc${n === 0 ? " lk1" : ""}${keys[n] === undefined ? " off" : ""}`;
+    // The ✕ is a SIBLING of the key tag, never the tag itself: clicking a key
+    // must not be what deletes it.
+    const chipX = (n: number): string =>
+      keys[n] !== undefined && liveMapping ? "lkx" : "lkx off";
+    const chipRm = (n: number): string => (keys[n] === undefined ? "" : `${fn}|${keys[n]}`);
+    const chipTitle = (n: number): string => {
+      const k = keys[n];
+      if (k === undefined) return "";
+      const rest = keys.filter((other) => other !== k);
+      return rest.length > 0
+        ? `remove ${k} from ${fn} — it keeps ${rest.join(KEY_SEP)}`
+        : `remove ${k} from ${fn} — it is the only key`;
+    };
+    const extra = Math.max(0, keys.length - KEY_CHIPS);
     return {
       fn,
       label: legendLabel(fn, label),
@@ -524,15 +650,43 @@ function legendRowsFor(slot: MapperSlot): LegendRow[] {
       key,
       cls:
         `lrow${unbound ? " l-unbound" : ""}${liveMapping ? "" : " l-dead"}` +
-        `${share.length > 0 ? " l-shared" : ""}${fn === hotFn ? " l-hot" : ""}` +
-        `${selection.has(fn) ? " l-sel" : ""}`,
-      title: `${fn} — ${key}`,
+        `${share.length > 0 ? " l-shared" : ""}${keys.length > 1 ? " l-multi" : ""}` +
+        `${fn === hotFn ? " l-hot" : ""}${selection.has(fn) ? " l-sel" : ""}`,
+      title: `${fn} — ${key}${eitherNote(keys.length)}`,
       share: shareText(share),
       sharetitle: shareTitle(key, share),
       // The desktop accelerator. Only where clearing would do something; the
       // learn modal's "Clear binding" is the primary, touch-first path.
       clear: liveMapping && !unbound ? "✕" : "",
-      cleartitle: `clear ${fn}`,
+      cleartitle:
+        keys.length > 1 ? `clear ${fn} (all ${keys.length} keys)` : `clear ${fn}`,
+      k1: chip(0),
+      k1cls: chipCls(0),
+      k1xcls: chipX(0),
+      k1rm: chipRm(0),
+      k1title: chipTitle(0),
+      k2: chip(1),
+      k2cls: chipCls(1),
+      k2xcls: chipX(1),
+      k2rm: chipRm(1),
+      k2title: chipTitle(1),
+      k3: chip(2),
+      k3cls: chipCls(2),
+      k3xcls: chipX(2),
+      k3rm: chipRm(2),
+      k3title: chipTitle(2),
+      kmore: extra > 0 ? `+${extra}` : "",
+      kmorecls: extra > 0 ? "lkmore" : "lkmore off",
+      kmoretitle: extra > 0 ? `${extra} more key(s): ${keys.join(KEY_SEP)}` : "",
+      addtitle: `add the picked key to ${fn} — it keeps ${unbound ? "nothing yet" : key}`,
+      rmtitle: `remove just the picked key from ${fn} (${key})`,
+      // v9's no-JS form fields. `bindcls` is a class string, never a show
+      // (ledger #13/#15) — the form is always there, dimmed when nothing can
+      // be written, because a POST that the daemon refuses still comes back
+      // as a flash sentence, which beats a control that is not there.
+      slot: String(slot.number),
+      bindcls: canWrite ? "lbind nojs" : "lbind nojs off",
+      bindtitle: `bind ${fn} (${legendLabel(fn, label)})`,
     };
   });
 }
@@ -574,6 +728,7 @@ export function applyMap(p: MapPayload): void {
   const slot = currentSlot();
   // Derived BEFORE the row builders run — they read it for the dead look.
   liveMapping = learnable(p) && slot !== null;
+  canWrite = p.session.reachable && slot !== null;
   // The daemon is answering and running again: whatever we paused has been
   // started back up, so drop the paused affordance.
   if (p.session.reachable && p.session.running) {
@@ -586,8 +741,10 @@ export function applyMap(p: MapPayload): void {
       num: String(s.number),
       label: `P${s.number} · ${s.preset}`,
       cls: slot && s.number === slot.number ? "tab active" : "tab",
+      href: `/map?slot=${s.number}`,
     })),
   );
+  setSlotNum(String(slot ? slot.number : p.selected));
   setZones(slot ? zoneRows(slot) : []);
   setLegendRows(slot ? legendRowsFor(slot) : []);
   setSlotLine(
@@ -679,17 +836,39 @@ export function currentPreset(): string | null {
 export function currentBinding(fn: string): string | null {
   const slot = currentSlot();
   if (!slot) return null;
-  const keys = slot.bindings[fn];
-  return keys && keys.length > 0 ? keys.join("+") : null;
+  const keys = keysOf(slot, fn);
+  return keys.length > 0 ? keys.join(KEY_SEP) : null;
 }
 
-/** The raw key list bound to `fn` right now — what an UNDO has to put back.
- *  Kept separate from [`currentBinding`] (which joins for display) because
- *  `/api/bind` takes ONE key: a control holding several keys cannot be
- *  restored by a single call, so the toast for that edit is rendered without
- *  an Undo button rather than offering one that would silently drop keys. */
+/** The raw key list bound to `fn` right now — the set every edit is computed
+ *  against (add = ∪ {k}, per-key ✕ = ∖ {k}) and what an UNDO has to put back.
+ *  Kept separate from [`currentBinding`], which joins it for display. */
 export function previousKeys(fn: string): string[] {
   return currentSlot()?.bindings[fn]?.slice() ?? [];
+}
+
+/** Can this exact key list be written back through `/api/bind/keys`?
+ *
+ *  Mirrors ksx-studio's `ControlSource::bind_keys`: the daemon's `map` verb
+ *  takes ONE key and replaces the control, so a set of none (a clear) and a
+ *  set of one are expressible and a set of two or more is not — the server
+ *  refuses it in words rather than writing the first key and dropping the
+ *  rest.
+ *
+ *  This is the single rule behind every Undo offer on the page. It is why an
+ *  add onto an unbound control undoes cleanly (back to nothing), why removing
+ *  a control's only key undoes cleanly (back to that key), and why undoing a
+ *  removal that would restore TWO keys is not offered — offering it would be
+ *  a button that silently puts back half the binding. The moment a daemon can
+ *  write a key list, this returns true for everything and every one of those
+ *  paths becomes undoable with no other change. */
+export function writableKeys(keys: string[]): boolean {
+  return keys.length <= 1;
+}
+
+/** "S · Enter" — a key list as this page says it out loud. */
+export function keyList(keys: string[]): string {
+  return keys.join(KEY_SEP);
 }
 
 /** Why a click cannot record right now — one clause, worst problem first.
@@ -710,6 +889,7 @@ export function applyMapUnreachable(): void {
   setReadOnly(true);
   setCanLearn(false);
   liveMapping = false;
+  canWrite = false;
   setActionsCls("card pactions off");
   setPillRunning(false);
   setPillIdle(false);
@@ -740,12 +920,27 @@ export function showListening(
   setModalPrompt(promptText);
   // MAME's UI Clear lives inside the capture prompt; so does ours. Showing the
   // current binding next to it is what makes "Clear binding" obviously safe.
-  setModalBinding(bindingText === null ? "" : `currently ${bindingText}`);
+  showLearnMode(false, bindingText);
   setModalBound(bindingText !== null);
   setModalOpen(true);
   setModalListening(true);
   setModalConflict(false);
   updateCountdown(remainingMs, totalMs);
+}
+
+/** Echo what the NEXT press will do to a control that already has keys —
+ *  replace them, or join them. The armed choice lives in the same line as the
+ *  current binding, so the modal never has a hidden mode: the buttons pick,
+ *  this sentence confirms. (Unbound controls have no choice to make, so they
+ *  get no line at all.) */
+export function showLearnMode(add: boolean, bindingText: string | null): void {
+  setModalBinding(
+    bindingText === null
+      ? ""
+      : add
+        ? `currently ${bindingText} — the next key is ADDED to it (either will press this control)`
+        : `currently ${bindingText} — the next key REPLACES it`,
+  );
 }
 
 export function updateCountdown(remainingMs: number, totalMs: number): void {
@@ -1066,10 +1261,17 @@ export function MapIsland() {
             h(
               "div",
               { class: "pactrow" },
+              // v9: a real form too, so this is never a dead button on a
+              // page without JavaScript (the same ControlSource `stop` verb
+              // the status page's form uses, 303'd back to /map).
               h(
-                "button",
-                { class: "btn btn-primary", "data-act": "pause-map", type: "button" },
-                "Pause emulation & map",
+                "form",
+                { class: "pactform", method: "post", action: "/map/session/stop" },
+                h(
+                  "button",
+                  { class: "btn btn-primary", "data-act": "pause-map", type: "submit" },
+                  "Pause emulation & map",
+                ),
               ),
             ),
           ),
@@ -1109,7 +1311,11 @@ export function MapIsland() {
           createList(
             () => slotTabs(),
             (t) => t.num + "|" + t.label + "|" + t.cls,
-            (t) => h("button", { class: t.cls, "data-slot": t.num, type: "button" }, t.label),
+            // v9: an ANCHOR, not a button. `/map?slot=N` is a route the
+            // server has always understood, so switching slots is one GET
+            // with JavaScript off; map.ts intercepts the click and switches
+            // in place (no navigation, no lost scroll position) with it on.
+            (t) => h("a", { class: t.cls, href: t.href, "data-slot": t.num }, t.label),
           ),
         ),
         h("p", { class: "slotline" }, () => slotLine()),
@@ -1133,7 +1339,10 @@ export function MapIsland() {
             "p",
             { class: "hint" },
             "Click a control, then press the panel key for it — Esc or a click ",
-            "outside cancels, Delete clears. Ctrl-click (or “Select multiple”) ",
+            "outside cancels, Delete clears. A control that already has a key ",
+            "offers “Add another key” too, so several keys can drive one ",
+            "control (press any of them); each key in the Bindings list below ",
+            "carries its own ✕ that removes only that key. Ctrl-click (or “Select multiple”) ",
             "picks several controls and maps them all to ONE key. Saves are ",
             "immediate — nothing asks “are you sure?”; every action reports ",
             "itself with an Undo button (Ctrl-Z undoes the newest) — and a ",
@@ -1257,26 +1466,304 @@ export function MapIsland() {
               l.fn + "|" + l.label + "|" + l.key + "|" + l.cls + "|" + l.clear + "|" + l.share,
             (l) =>
               h(
-                "button",
-                { class: l.cls, "data-fn": l.fn, type: "button", title: l.title },
-                // The same identity glyph the art wears, so the two readers
-                // are visibly the same control.
-                h("span", { class: l.idcls }, l.id),
-                h("span", { class: "llabel" }, l.group),
-                h("span", { class: "lkey" }, l.key),
-                // The desktop accelerator (revealed on hover/focus, always
-                // present for keyboard and AT users). Never the ONLY way to
-                // clear: the learn modal's button is the touch-first path.
+                "div",
+                { class: "lrowwrap" },
                 h(
-                  "span",
-                  { class: "lclear", "data-clear": l.fn, title: l.cleartitle },
-                  l.clear,
+                  "button",
+                  { class: l.cls, "data-fn": l.fn, type: "button", title: l.title },
+                  // The same identity glyph the art wears, so the two readers
+                  // are visibly the same control.
+                  h("span", { class: l.idcls }, l.id),
+                  h("span", { class: "llabel" }, l.group),
+                  // MANY KEYS → ONE CONTROL: one chip per key, each with its
+                  // own ✕ that removes JUST that key and leaves the others.
+                  // Fixed chips, not a nested list — a `createList` inside a
+                  // list item has no seam — and `lkc off` is how an unused
+                  // chip disappears (`:empty` cannot: the SSR text slot leaves
+                  // marker nodes inside the span; ledger #15).
+                  h("span", { class: l.k1cls, title: l.k1title }, l.k1),
+                  h("span", { class: l.k1xcls, "data-rmkey": l.k1rm, title: l.k1title }, "✕"),
+                  h("span", { class: l.k2cls, title: l.k2title }, l.k2),
+                  h("span", { class: l.k2xcls, "data-rmkey": l.k2rm, title: l.k2title }, "✕"),
+                  h("span", { class: l.k3cls, title: l.k3title }, l.k3),
+                  h("span", { class: l.k3xcls, "data-rmkey": l.k3rm, title: l.k3title }, "✕"),
+                  h("span", { class: l.kmorecls, title: l.kmoretitle }, l.kmore),
+                  // Unbound rows still say so in words; the chips above are
+                  // empty and CSS keeps this one for exactly that case.
+                  h("span", { class: "lkey" }, l.key),
+                  // The desktop accelerator (revealed on hover/focus, always
+                  // present for keyboard and AT users). Never the ONLY way to
+                  // clear: the learn modal's button is the touch-first path.
+                  h(
+                    "span",
+                    { class: "lclear", "data-clear": l.fn, title: l.cleartitle },
+                    l.clear,
+                  ),
+                  // FEATURE 3: a shared key is information. This names the other
+                  // controls the same key drives, on its own line so a
+                  // multi-bound row grows instead of squeezing.
+                  h("span", { class: "lshare", title: l.sharetitle }, l.share),
                 ),
-                // FEATURE 3: a shared key is information. This names the other
-                // controls the same key drives, on its own line so a
-                // multi-bound row grows instead of squeezing.
-                h("span", { class: "lshare", title: l.sharetitle }, l.share),
+                // ── v9: the row's own no-JS write path ──────────────────
+                // A real HTML form: pick a key, submit, the server writes it
+                // and 303s back with the outcome as ?flash=. `.nojs` is
+                // hidden the moment map.ts marks the island `.js`, because
+                // with JavaScript the click-to-learn flow above is better in
+                // every way (it hears the actual panel button). Clear rides
+                // the same form through `formaction` — one form, two verbs,
+                // no duplicated hidden fields.
+                h(
+                  "form",
+                  { class: l.bindcls, method: "post", action: "/map/bind" },
+                  h("input", { type: "hidden", name: "slot", value: l.slot }),
+                  h("input", { type: "hidden", name: "function", value: l.fn }),
+                  h(
+                    "select",
+                    { class: "keysel", name: "key", title: l.bindtitle, "aria-label": l.bindtitle },
+                    h("option", { value: "" }, "key…"),
+                    h(
+                      "optgroup",
+                      { label: "Letters" },
+                      ...KEYS_LETTER.map((ko) => h("option", null, ko.k)),
+                    ),
+                    h(
+                      "optgroup",
+                      { label: "Digits (One = the 1 key)" },
+                      ...KEYS_DIGIT.map((ko) => h("option", null, ko.k)),
+                    ),
+                    h(
+                      "optgroup",
+                      { label: "Arrows" },
+                      ...KEYS_ARROW.map((ko) => h("option", null, ko.k)),
+                    ),
+                    h(
+                      "optgroup",
+                      { label: "Numpad" },
+                      ...KEYS_NUMPAD.map((ko) => h("option", null, ko.k)),
+                    ),
+                    h(
+                      "optgroup",
+                      { label: "Function keys" },
+                      ...KEYS_FN.map((ko) => h("option", null, ko.k)),
+                    ),
+                    h(
+                      "optgroup",
+                      { label: "Editing" },
+                      ...KEYS_EDIT.map((ko) => h("option", null, ko.k)),
+                    ),
+                    h(
+                      "optgroup",
+                      { label: "Navigation" },
+                      ...KEYS_NAV.map((ko) => h("option", null, ko.k)),
+                    ),
+                    h(
+                      "optgroup",
+                      { label: "Modifiers" },
+                      ...KEYS_MOD.map((ko) => h("option", null, ko.k)),
+                    ),
+                    h(
+                      "optgroup",
+                      { label: "Symbols (DashUnderscore = the - key)" },
+                      ...KEYS_SYMBOL.map((ko) => h("option", null, ko.k)),
+                    ),
+                    h(
+                      "optgroup",
+                      { label: "Media and system" },
+                      ...KEYS_MEDIA.map((ko) => h("option", null, ko.k)),
+                    ),
+                    h(
+                      "optgroup",
+                      { label: "OEM / regional" },
+                      ...KEYS_OEM.map((ko) => h("option", null, ko.k)),
+                    ),
+                  ),
+                  h("button", { class: "btn btn-mini", type: "submit" }, "Bind"),
+                  // v10, no-JS parity for MANY KEYS → ONE CONTROL. Same form,
+                  // same picker, two more destinations: Add appends the picked
+                  // key to what the control already holds, Remove takes just
+                  // that one off it. (Removing one of several without
+                  // JavaScript needs to name WHICH key — the picker beside
+                  // these buttons is that name, so no second control is
+                  // needed and no per-key form has to be rendered 25 times.)
+                  h(
+                    "button",
+                    {
+                      class: "btn btn-mini",
+                      type: "submit",
+                      formaction: "/map/add",
+                      title: l.addtitle,
+                    },
+                    "Add",
+                  ),
+                  h(
+                    "button",
+                    {
+                      class: "btn btn-mini",
+                      type: "submit",
+                      formaction: "/map/key/remove",
+                      title: l.rmtitle,
+                    },
+                    "Remove key",
+                  ),
+                  h(
+                    "button",
+                    {
+                      class: "btn btn-mini",
+                      type: "submit",
+                      formaction: "/map/clear",
+                      title: l.cleartitle,
+                    },
+                    "Clear",
+                  ),
+                ),
               ),
+          ),
+        ),
+      ),
+      // ── v9: bind by name (no-JavaScript panel) ────────────────────────
+      // The row forms above are the precise path; this is the one that does
+      // not make you hunt through 25 of them. Same two verbs, same 303 →
+      // ?flash= report. Hidden the moment the island is marked `.js`.
+      // Not a createShow — a plain section whose visibility is CSS, so it
+      // costs zero MAP_SHOW_ORDER entries (ledger #4/#14).
+      h(
+        "section",
+        { class: "card nojs bindcard" },
+        h("h2", null, "Bind by name"),
+        h(
+          "p",
+          { class: "savenote" },
+          "This panel exists so the mapper works with JavaScript switched off: ",
+          "clicking a control and pressing its panel key needs a live poller, ",
+          "picking a key from a list does not. Every row in the Bindings list ",
+          "above carries the same four buttons. Writes go over the same daemon ",
+          "verb as everything else and are saved immediately. Bind REPLACES ",
+          "whatever the control had; Add keeps it and adds one more key, so ",
+          "several keys can drive one control (press any of them); Remove that ",
+          "key takes only the key picked above and leaves the rest.",
+        ),
+        h(
+          "p",
+          { class: "savenote" },
+          "Both lists spell things exactly as the preset file and ",
+          "`ksx map` do: lx / ly are the left stick and rx / ry the right, ",
+          ".min is left or down and .max is right or up, and a key is its ",
+          "legacy name (DashUnderscore is the - key, CommaLeftArrow the comma). ",
+          "What you pick here is character-for-character what gets written.",
+        ),
+        h(
+          "form",
+          { class: "bindform", method: "post", action: "/map/bind" },
+          h("input", { type: "hidden", name: "slot", value: () => slotNum() }),
+          h(
+            "label",
+            { class: "bindlabel", for: "bindfn" },
+            "control",
+            h(
+              "select",
+              { id: "bindfn", name: "function" },
+              ...FUNCTIONS.map((fo) => h("option", null, fo.k)),
+            ),
+          ),
+          h(
+            "label",
+            { class: "bindlabel", for: "bindkey" },
+            "key",
+            h(
+              "select",
+              { id: "bindkey", name: "key" },
+              h("option", { value: "" }, "key…"),
+              h(
+                "optgroup",
+                { label: "Letters" },
+                ...KEYS_LETTER.map((ko) => h("option", null, ko.k)),
+              ),
+              h(
+                "optgroup",
+                { label: "Digits (One = the 1 key)" },
+                ...KEYS_DIGIT.map((ko) => h("option", null, ko.k)),
+              ),
+              h(
+                "optgroup",
+                { label: "Arrows" },
+                ...KEYS_ARROW.map((ko) => h("option", null, ko.k)),
+              ),
+              h(
+                "optgroup",
+                { label: "Numpad" },
+                ...KEYS_NUMPAD.map((ko) => h("option", null, ko.k)),
+              ),
+              h(
+                "optgroup",
+                { label: "Function keys" },
+                ...KEYS_FN.map((ko) => h("option", null, ko.k)),
+              ),
+              h(
+                "optgroup",
+                { label: "Editing" },
+                ...KEYS_EDIT.map((ko) => h("option", null, ko.k)),
+              ),
+              h(
+                "optgroup",
+                { label: "Navigation" },
+                ...KEYS_NAV.map((ko) => h("option", null, ko.k)),
+              ),
+              h(
+                "optgroup",
+                { label: "Modifiers" },
+                ...KEYS_MOD.map((ko) => h("option", null, ko.k)),
+              ),
+              h(
+                "optgroup",
+                { label: "Symbols (DashUnderscore = the - key)" },
+                ...KEYS_SYMBOL.map((ko) => h("option", null, ko.k)),
+              ),
+              h(
+                "optgroup",
+                { label: "Media and system" },
+                ...KEYS_MEDIA.map((ko) => h("option", null, ko.k)),
+              ),
+              h(
+                "optgroup",
+                { label: "OEM / regional" },
+                ...KEYS_OEM.map((ko) => h("option", null, ko.k)),
+              ),
+            ),
+          ),
+          h("button", { class: "btn btn-primary", type: "submit" }, "Bind"),
+          h(
+            "button",
+            {
+              class: "btn",
+              type: "submit",
+              formaction: "/map/add",
+              title: "keep the keys this control already has and add the one picked above",
+            },
+            "Add another key",
+          ),
+          h(
+            "button",
+            {
+              class: "btn",
+              type: "submit",
+              formaction: "/map/key/remove",
+              title: "remove only the key picked above, leaving the control's other keys",
+            },
+            "Remove that key",
+          ),
+          h(
+            "button",
+            { class: "btn", type: "submit", formaction: "/map/clear" },
+            "Clear this control",
+          ),
+          // The no-JS answer to "that key is already another slot's". The
+          // learn flow asks with a dialog; a form asks with a checkbox, and
+          // the refusal sentence tells you it is here.
+          h(
+            "label",
+            { class: "bindforce" },
+            h("input", { type: "checkbox", name: "force", value: "1" }),
+            "let this key drive another slot's control too",
           ),
         ),
       ),
@@ -1303,18 +1790,35 @@ export function MapIsland() {
           "below are the wider road home, and every one of them writes a ",
           "timestamped backup first.",
         ),
+        // v9: every one of these is a REAL form now — method=post, a hidden
+        // slot number, a submit button. With JavaScript off they POST and
+        // 303 back with the outcome flashed; with it on, map.ts's data-act
+        // delegation runs the richer toast+Undo path and the submit handler
+        // stops the navigation. `.pactform { display: contents }` keeps the
+        // row's flex layout exactly as it was.
         h(
           "div",
           { class: "pactrow" },
           h(
-            "button",
-            { class: "btn btn-row", "data-act": "clear-all", type: "button" },
-            "Clear all bindings",
+            "form",
+            { class: "pactform", method: "post", action: "/map/preset/clear-all" },
+            h("input", { type: "hidden", name: "slot", value: () => slotNum() }),
+            h(
+              "button",
+              { class: "btn btn-row", "data-act": "clear-all", type: "submit" },
+              "Clear all bindings",
+            ),
           ),
           h(
-            "button",
-            { class: "btn btn-row", "data-act": "restore-backup", type: "button" },
-            "Undo this session",
+            "form",
+            { class: "pactform", method: "post", action: "/map/preset/restore" },
+            h("input", { type: "hidden", name: "slot", value: () => slotNum() }),
+            h("input", { type: "hidden", name: "mode", value: "session-backup" }),
+            h(
+              "button",
+              { class: "btn btn-row", "data-act": "restore-backup", type: "submit" },
+              "Undo this session",
+            ),
           ),
           // FIX 2's third destination — only rendered when a backup exists,
           // because an offer of a road home that is not there is worse than
@@ -1323,18 +1827,34 @@ export function MapIsland() {
             () => hasBackup(),
             () =>
               h(
-                "button",
-                { class: "btn btn-row", "data-act": "restore-latest", type: "button" },
-                () => backupLine(),
+                "form",
+                { class: "pactform", method: "post", action: "/map/preset/restore" },
+                h("input", { type: "hidden", name: "slot", value: () => slotNum() }),
+                h("input", { type: "hidden", name: "mode", value: "latest-backup" }),
+                h(
+                  "button",
+                  { class: "btn btn-row", "data-act": "restore-latest", type: "submit" },
+                  () => backupLine(),
+                ),
               ),
           ),
           // FIX 2: the label names the LAYOUT it writes. "Restore built-in
           // defaults" read, to Victor, as "put my I-PAC map back" — and wrote
           // a desktop-keyboard layout over it.
           h(
-            "button",
-            { class: "btn btn-row btn-danger-ghost", "data-act": "restore-defaults", type: "button" },
-            "Reset to generic keyboard layout (S/D/A/W…)",
+            "form",
+            { class: "pactform", method: "post", action: "/map/preset/restore" },
+            h("input", { type: "hidden", name: "slot", value: () => slotNum() }),
+            h("input", { type: "hidden", name: "mode", value: "defaults" }),
+            h(
+              "button",
+              {
+                class: "btn btn-row btn-danger-ghost",
+                "data-act": "restore-defaults",
+                type: "submit",
+              },
+              "Reset to generic keyboard layout (S/D/A/W…)",
+            ),
           ),
         ),
       ),
@@ -1388,9 +1908,29 @@ export function MapIsland() {
                   "div",
                   { class: "mbody mbound" },
                   h("p", { class: "mcurrent mono" }, () => modalBinding()),
+                  // v10: an already-bound control offers BOTH outcomes for the
+                  // key that is about to be pressed. REPLACE stays the primary
+                  // and stays the default arm — it is what every mapper in the
+                  // field study does on a rebind, it is what the user who
+                  // clicked a bound control almost always means, and (unlike
+                  // Add) it is expressible on every daemon. Add is the clearly
+                  // labelled second option: press it, then press the panel key,
+                  // and the control keeps what it had AND gains the new key.
+                  // The armed choice is echoed in the line above so the modal
+                  // never has a hidden mode.
                   h(
                     "div",
                     { class: "mbtns" },
+                    h(
+                      "button",
+                      { class: "btn btn-primary", "data-act": "mode-replace", type: "button" },
+                      "Replace binding",
+                    ),
+                    h(
+                      "button",
+                      { class: "btn", "data-act": "mode-add", type: "button" },
+                      "Add another key",
+                    ),
                     h(
                       "button",
                       { class: "btn", "data-act": "clear-one", type: "button" },
@@ -1398,7 +1938,13 @@ export function MapIsland() {
                     ),
                     h("button", { class: "btn", "data-act": "cancel", type: "button" }, "Cancel"),
                   ),
-                  h("p", { class: "mhint" }, "Delete or Backspace also clears it."),
+                  h(
+                    "p",
+                    { class: "mhint" },
+                    "Delete or Backspace also clears it. “Add another key” makes the ",
+                    "next press an EXTRA key for this control — either key then presses ",
+                    "it (MAME-style), instead of the new one taking the old one's place.",
+                  ),
                 ),
             ),
             createShow(
