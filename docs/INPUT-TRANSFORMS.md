@@ -368,3 +368,65 @@ Nothing here blocks M6/M7. Suggested order, cheapest-and-most-useful first:
    get subtly wrong.
 6. **Input display** alongside whichever of the above ships first; it is
    how the user (and we) will debug all of it.
+
+## 5. Sequencing after the current batch (Victor's directives, 2026-08-06)
+
+His four review points and four enhancements, folded in — with one
+correction that changes what we promise.
+
+### The frames correction (important, say it out loud)
+
+Victor's jitter concern is real: wall-clock `ms` steps drift with the OS
+scheduler. But `frames = N` **cannot** make a macro frame-exact from the
+game's point of view, because we never learn the game's polling phase —
+it samples on its own clock, unsynchronized with ours, and drifting. So:
+
+- `frames = N` ships as an **ergonomic unit** (N × 16.667 ms) because
+  fighting-game users think in frames. It is not a guarantee.
+- The actual fix for jitter is **absolute-deadline scheduling**: every
+  step's end is computed from the macro's start instant, never
+  accumulated per step, so a late wake cannot compound across a 4-step
+  macro. Combined with the §0.2 sampling minimum (≥2 poll intervals per
+  step), that is as deterministic as an out-of-process mapper can be.
+- Anyone needing true frame-exactness needs to be inside the game's
+  frame loop; that is not a thing ksx can be, and pretending otherwise
+  would be the dishonest kind of feature.
+
+### Accepted as specified
+
+- **Macro interruption beyond `on_release`**: `interrupt = "none" |
+  "any-input" | "opposing"`. Aborts release everything in the same batch.
+- **Many-key display cap**: the on-art tag shows the primary key plus a
+  `+N` indicator; the legend carries the full list. (Already the design
+  in the current build — his instinct matched it.)
+- **JSON in / commented TOML out**: exactly the shipping design. The AI
+  emits JSON (no malformed array-of-tables), the daemon validates and
+  applies, disk keeps annotated TOML for humans and for the next session
+  to read.
+- **4-player concurrency**: one timer structure on the ENGINE thread for
+  every slot; the capture thread never locks or allocates for a macro.
+
+### The four enhancements, ranked and sequenced
+
+1. **Turbo / auto-fire** — rides the macro scheduler, so it is nearly
+   free once macros land. Capped and explained at the 60 Hz sampling
+   ceiling (≈30 Hz on/off is the practical maximum; above that it
+   aliases into dropped or phantom inputs).
+2. **Layers + key output (E3)** — still the biggest cabinet win per line
+   of code: hold P1-Start and the panel becomes an admin layer (save
+   state, load state, volume, exit) emitting KEYSTROKES, which ksx
+   cannot produce at all today. Layers without key output only get you
+   half the value.
+3. **Live input debugger — "the truth stream"** — Victor's sharpest
+   framing: chords, SOCD and macros are *widening the gap* between what
+   was pressed and what the game sees, and nothing on screen closes it.
+   Split view: raw I-PAC feed on the left, published pad state on the
+   right, timestamped. This is the only way to tell a hardware polling
+   drop from a transform-stage logic bug. Cheaper than it looks — the
+   virtual half is readable in the browser via the Gamepad API (§2026
+   layer, item 1); only the physical half needs the live socket.
+4. **Visual SOCD intervention** — amber D-pad highlight while the engine
+   is actively scrubbing an illegal input, rather than rendering it as
+   merely unpressed. Falls out of #3's state stream almost free, and it
+   is the difference between "the engine did something" and "the engine
+   did nothing".
