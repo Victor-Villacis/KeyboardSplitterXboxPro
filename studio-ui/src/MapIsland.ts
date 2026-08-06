@@ -160,8 +160,24 @@ export interface MapPayload {
 interface MacroRow {
   n: string;
   cls: string;
+  /** The duration as WORDS — "50 ms", "3 fr · 50 ms". The no-JS readout; with
+   *  JavaScript the editable box beside it takes over (see `durval`). */
   dur: string;
   durtitle: string;
+  /** FIX 2 — THE DURATION, INLINE AND EDITABLE ON EVERY ROW. The number in the
+   *  unit this step was authored in, the row index the box writes to, the
+   *  box's own warn class, and the unit toggle beside it. There is no
+   *  select-a-step-first mode any more: a time is edited where it is read. */
+  durval: string;
+  durrow: string;
+  durcls: string;
+  /** "ms" / "fr" — the unit BUTTON's label, because a `<select>` inside a list
+   *  item cannot be given its value by an attribute binding (map.ts has to
+   *  write every one of those by hand after each poll). A two-state button is
+   *  its own readout. */
+  unit: string;
+  unitact: string;
+  unittitle: string;
   /** The plain-language readout of everything this row holds — "D-pad ↘ + A",
    *  "(nothing — neutral gap)". A diagonal reads as ONE control, because that
    *  is what the player picked and what the player means. */
@@ -184,6 +200,10 @@ interface MacroRow {
   iaact: string;
   ibact: string;
   delact: string;
+  /** FIX 1 — the ✕ on the LAST REMAINING step clears its holds instead of
+   *  removing the row, so the editor cannot construct the zero-step macro
+   *  `mapping::save_macro` refuses. The title says which one it is doing. */
+  deltitle: string;
   upcls: string;
   dncls: string;
 }
@@ -544,15 +564,13 @@ const [macroToml, setMacroToml] = createSignal("");
 const [macroCardCls, setMacroCardCls] = createSignal("card macrocard off");
 const [macroGridCls, setMacroGridCls] = createSignal("macgrid empty");
 const [macroDirtyLine, setMacroDirtyLine] = createSignal("");
+/** The DETAIL line under the grid: which step the frame maths and the
+ *  allow-short box are about. FIX 2 took the duration editor out of this panel
+ *  and put it on every row, so this line no longer instructs anybody to select
+ *  anything — it reports what is focused, and says where a time is edited. */
 const [macroStepLine, setMacroStepLine] = createSignal(
-  "click a step's ⏱ to edit its duration",
+  "every step's time is its own box on its own row — type in the row you want",
 );
-const [macroDurValue, setMacroDurValue] = createSignal("50");
-/** v15/FIX 2: the duration BOX's own class. A below-floor step is not a fact
- *  about some row elsewhere in the card — it is a fact about the number in
- *  this field, so the field itself wears it. (Every variant keeps `macdurin`:
- *  map.ts finds the box by that class after every poll.) */
-const [macroDurCls, setMacroDurCls] = createSignal("macdurin");
 /** v12: the Save button's own look — "btn macsave" when there is nothing to
  *  write, "… dirty" the moment the draft differs from the file. A class
  *  string, never a show (ledger #13/#14). */
@@ -1844,10 +1862,15 @@ const MACRO_RULE_LINE =
 const MACRO_RING_LINE =
   "Each direction group runs ↑ ↖ ← ↙ ↓ ↘ → ↗ (numpad 8 7 4 1 2 3 6 9), so a motion is a " +
   "SHAPE: a quarter-circle forward is a staircase, a half-circle a straight line, a dragon " +
-  "punch a hook. The four diagonals are picks, not new bindings — ticking ↘ (down-right, d/f, " +
-  "numpad 3) stores dpad.down + dpad.right on that step, which is what a diagonal has always " +
-  "been in this file. Tick it on the group your preset's own direction keys drive; each row " +
-  "spells the pair it wrote beside its name.";
+  "punch a hook. The four diagonals are picks, not new bindings — ticking ↘ (down-right, " +
+  "numpad 3; a move list spells it d/f, which is only down-FORWARD while you face right — ksx " +
+  "has no idea which way you are facing) stores dpad.down + dpad.right on that step, which is " +
+  "what a diagonal has always been in this file. THERE ARE THREE OF THESE GROUPS — D-PAD, " +
+  "LEFT STICK and RIGHT STICK — and the grid scrolls sideways to reach them, so the one you " +
+  "want may be off the edge; the band above the arrows names whichever you are looking at. " +
+  "Tick the diagonal on the group your preset's own direction keys drive, because a motion " +
+  "written on the other one is published faithfully and read by nobody. Each row spells the " +
+  "pair it wrote beside its name.";
 
 /** The body "＋ New macro" WRITES: one real 50 ms step, at the default
  *  policies. A macro with no steps is refused by the loader (and by the
@@ -1899,6 +1922,14 @@ let macroLastUnit: StepUnit = "ms";
  *  read from a value, and it happens once, when a draft is seeded. */
 function fileUnitOf(step: MacroStepView): StepUnit {
   return step.frames !== null && step.ms === null ? "frames" : "ms";
+}
+
+/** The unit ONE step is authored in — the author's choice when they made one,
+ *  the file's spelling otherwise. Per step, because since FIX 2 every row
+ *  carries its own duration control and there is no "the selected step" left
+ *  to ask about. */
+function unitOfStep(step: MacroStepView): StepUnit {
+  return stepUnits.get(step) ?? fileUnitOf(step);
 }
 
 function cloneMacro(mac: MacroView): MacroView {
@@ -2138,6 +2169,8 @@ export function macroSelectStep(index: number): void {
 export function macroToggleCell(index: number, fn: string): MacroCellOutcome | null {
   const step = macroDraft?.steps[index];
   if (!step) return null;
+  // The undo below closes over the STEP OBJECT, not this index — the index is
+  // only good for the length of the click. See `macroRestoreHold`.
   const before = [...step.hold];
   const d = parseDiagToken(fn);
   if (d) {
@@ -2146,32 +2179,54 @@ export function macroToggleCell(index: number, fn: string): MacroCellOutcome | n
       mechanismFunction(d.mechanism, true, up),
       mechanismFunction(d.mechanism, false, right),
     ];
-    const want = pair.map((p) => pointing(p)!);
-    const has = want.every((w) => step.hold.some((f) => pointsSameWay(f, w)));
+    // IS THIS CELL LIT? Asked of `fold` — the SAME function that painted it —
+    // and never of "does the hold contain both halves".
+    //
+    // THE BUG THAT SETTLES IT (found by driving the real page): those two
+    // questions disagree on exactly one shape, and it is a shape real files
+    // carry. `dpad.down + dpad.right + dpad.up` CONTAINS both halves of ↘, but
+    // it does not fold — it contradicts itself, so the cell paints OFF and its
+    // own title says "step 4 does not hold D-pad ↘". Under "contains both",
+    // one click on that off cell took the untick branch: it wiped all three
+    // holds, left the step empty, and reported *"cleared D-pad ↘ — removed
+    // dpad.down + dpad.right"*. A cell that says it does not hold ↘, answering
+    // a click by clearing ↘, naming two of the three things it took, and
+    // handing back a step that holds nothing — in the one feature whose whole
+    // job is that picking a diagonal gives you a diagonal.
+    //
+    // Paint and click now read one function, so a cell can only ever do what
+    // it looks like it will do: off → tick it on, lit → clear it.
+    const on = fold(step.hold).some(
+      (h) => h.kind === "diag" && h.diag === d.diag && h.mechanisms.includes(d.mechanism),
+    );
+    // Everything this mechanism holds RIGHT NOW, however the file spells it —
+    // what an untick really removes and what a tick really replaces.
+    const mine = before.filter((f) => pointing(f)?.mechanism === d.mechanism);
     // Drop every direction this mechanism is currently holding, then (when
     // this was a tick rather than an untick) say the diagonal.
     step.hold = step.hold.filter((f) => {
       const p = pointing(f);
       return p === null || p.mechanism !== d.mechanism;
     });
-    if (!has) step.hold.push(...pair);
+    if (!on) step.hold.push(...pair);
     macroStep = index;
     macroEdited();
     const glyph = DIAG_GLYPH[d.diag];
-    const displaced = before.filter((f) => {
-      const p = pointing(f);
-      return p !== null && p.mechanism === d.mechanism && !pair.includes(f);
-    });
-    const said = has
+    // Named from the hold as WRITTEN, not from the canonical pair: unticking a
+    // hand-written `ly.-16384 + lx.max` must not claim it removed `ly.min`.
+    const displaced = mine.filter(
+      (f) => !pair.some((p) => p.toLowerCase() === f.toLowerCase()),
+    );
+    const said = on
       ? `Step ${index + 1}: cleared ${mechanismGroup(d.mechanism)}${glyph} — removed ` +
-        `${pair.join(" + ")}.`
+        `${mine.join(" + ")}.`
       : `Step ${index + 1}: ${mechanismGroup(d.mechanism)}${glyph} (${DIAG_WORDS[d.diag]}, ` +
         `numpad ${DIAG_NUMPAD[d.diag]}) — ksx wrote ${pair.join(" + ")}, because that is ` +
         `what a diagonal is in the file.` +
         (displaced.length > 0
           ? ` Replaced ${displaced.join(" + ")} on ${mechanismLabel(d.mechanism)}.`
           : "");
-    return { said, undo: () => macroRestoreHold(index, before) };
+    return { said, undo: () => macroRestoreHold(step, before) };
   }
 
   const want = pointing(fn);
@@ -2183,7 +2238,75 @@ export function macroToggleCell(index: number, fn: string): MacroCellOutcome | n
   else step.hold.push(fn);
   macroStep = index;
   macroEdited();
-  return null;
+  // THE FOLD MOMENT — see `shapeChange`. A plain cardinal toggle usually says
+  // nothing, because the cell you hit is the whole report. The exception is the
+  // click that makes or breaks a diagonal, where the cell you hit is precisely
+  // NOT the report.
+  const said = shapeChange(index, before, step.hold);
+  return said === null ? null : { said, undo: () => macroRestoreHold(step, before) };
+}
+
+/** Did this click change the SHAPE of the row — did two cardinals just become a
+ *  diagonal, or did a diagonal just come apart?
+ *
+ *  **This is the sentence Victor lost an evening to, and it was the one report
+ *  nobody got.** Ticking `→` on a step already holding `↓` does four things at
+ *  once: the cell just clicked goes to a subordinate `·` instead of a filled
+ *  mark, a cell twelve columns away lights up, the row's words change from
+ *  "D-pad ↓" to "D-pad ↘", and a ledger appears. All of it silent. What a user
+ *  can reasonably conclude from that is either that the grid is broken or that
+ *  ksx quietly rewrote their input — and the truth, that their two holds ARE a
+ *  diagonal and the file still spells both, is the one thing the page never
+ *  said out loud.
+ *
+ *  Note which way round this is. PICKING ↘ is self-explanatory — you clicked ↘
+ *  and you got ↘; the report there is a courtesy. The FOLD is the surprising
+ *  one, so the fold is what has to speak.
+ *
+ *  Null when the row's shape is unchanged, which is the overwhelmingly common
+ *  case (every button, every cardinal that neither completes nor breaks a
+ *  pair). */
+function shapeChange(index: number, before: string[], after: string[]): string | null {
+  const shapeOf = (hold: string[]): Map<Mechanism, { diag: Diag; names: string[] }> => {
+    const out = new Map<Mechanism, { diag: Diag; names: string[] }>();
+    for (const h of fold(hold)) {
+      if (h.kind !== "diag") continue;
+      const names = h.members.map((m) => hold[m]);
+      for (const mechanism of h.mechanisms) {
+        out.set(
+          mechanism,
+          // A coalesced diagonal lists every mechanism's members together, so
+          // narrow the names back down to the ones this mechanism owns.
+          { diag: h.diag, names: names.filter((n) => pointing(n)?.mechanism === mechanism) },
+        );
+      }
+    }
+    return out;
+  };
+  const was = shapeOf(before);
+  const now = shapeOf(after);
+  const said: string[] = [];
+  for (const [mechanism, made] of now) {
+    if (was.get(mechanism)?.diag === made.diag) continue;
+    said.push(
+      `${mechanismGroup(mechanism)}${DIAG_GLYPH[made.diag]} — holding ` +
+        `${made.names.join(" and ")} at the same time IS the diagonal ` +
+        `(${DIAG_WORDS[made.diag]}, numpad ${DIAG_NUMPAD[made.diag]}), so the row now reads it ` +
+        `as one control. Nothing was rewritten: the file still says ${made.names.join(" + ")}.`,
+    );
+  }
+  for (const [mechanism, lost] of was) {
+    if (now.get(mechanism)?.diag === lost.diag) continue;
+    const left = after.filter((f) => pointing(f)?.mechanism === mechanism);
+    said.push(
+      `${mechanismGroup(mechanism)}${DIAG_GLYPH[lost.diag]} is no longer a diagonal — ` +
+        (left.length === 0
+          ? `this step holds no direction on ${mechanismLabel(mechanism)} now.`
+          : `${mechanismLabel(mechanism)} is left holding ${left.join(" + ")}, which ` +
+            `${left.length === 1 ? "is one direction, not two" : "does not point one way"}.`),
+    );
+  }
+  return said.length === 0 ? null : `Step ${index + 1}: ${said.join(" ")}`;
 }
 
 /** What a cell click did, and the road back. */
@@ -2195,14 +2318,31 @@ export interface MacroCellOutcome {
   undo: () => string | null;
 }
 
-/** Restore one step's hold, byte for byte. The undo half of a diagonal pick. */
-export function macroRestoreHold(index: number, hold: string[]): string | null {
-  const step = macroDraft?.steps[index];
-  if (!step) {
-    return "that step is gone — the draft was reloaded, so there is nothing to put back.";
+/** Restore one step's hold, byte for byte. The undo half of a diagonal pick.
+ *
+ *  **Addressed by the STEP OBJECT, never by its index.** An undo is a closure
+ *  that outlives its click by `TOAST_MS`, and in those eight seconds the draft
+ *  it is about can be replaced entirely — a macro tab, a slot switch and
+ *  "Revert to file" all call `seedMacro`, which the editor allows while dirty
+ *  (it warns, and discards). "Does step 1 exist?" is true in the NEXT macro
+ *  too, so an index-addressed undo answered by writing one sequence's hold into
+ *  a different sequence's step 1: silently, on a row the user was looking at,
+ *  marking that macro dirty, and reporting "Undone."
+ *
+ *  The object is the exact test, because `cloneMacro` mints fresh step objects
+ *  on every seed — so any re-seed misses, and a step that merely MOVED (⬆/⬇, an
+ *  insert above) is still found, at its new index, which is the row that undo
+ *  was always about. Same WeakMap-keyed-by-step reasoning as [`stepUnits`]. */
+export function macroRestoreHold(target: MacroStepView, hold: string[]): string | null {
+  const at = macroDraft?.steps.indexOf(target) ?? -1;
+  if (at < 0) {
+    return (
+      "that step is gone — the draft was reloaded (a macro switch, a slot switch, or " +
+      "Revert to file), so there is nothing to put back."
+    );
   }
-  step.hold = [...hold];
-  macroStep = index;
+  target.hold = [...hold];
+  macroStep = at;
   macroEdited();
   return null;
 }
@@ -2607,9 +2747,16 @@ function macroColumns(slot: MapperSlot | null): MacroColumn[] {
           token: diagToken(mechanism, pos.diag),
           glyph: DIAG_GLYPH[pos.diag],
           idcls: "maccolid diag",
+          // `DIAG_MOVELIST` is FACING-RELATIVE and is labelled as such. ksx has
+          // no notion of facing — it publishes a direction, not a side of the
+          // screen — and it already ships the mirrored spelling of every motion
+          // because player 2 is not an edge case. A bare "d/f" beside a compass
+          // name reads as a second name for the same fact; it is a second name
+          // for the fact HALF the time, and is d/b for the player on the right.
           title:
-            `${mechanismGroup(mechanism)}${DIAG_GLYPH[pos.diag]} · ${DIAG_WORDS[pos.diag]} ` +
-            `(${DIAG_MOVELIST[pos.diag]}) · numpad ${DIAG_NUMPAD[pos.diag]} · one pick, and ` +
+            `${mechanismGroup(mechanism)}${DIAG_GLYPH[pos.diag]} · ${DIAG_WORDS[pos.diag]} · ` +
+            `numpad ${DIAG_NUMPAD[pos.diag]} · ${DIAG_MOVELIST[pos.diag]} in a move list, ` +
+            `facing right · one pick, and ` +
             `ksx writes ${mechanismFunction(mechanism, true, up)} + ` +
             `${mechanismFunction(mechanism, false, right)}`,
           band: mechanismBand(mechanism),
@@ -2773,18 +2920,19 @@ export function macroInsertMotion(name: string): string | null {
   const diagonals = motion.steps
     .map((dirs, i) => [dirs, i] as const)
     .filter(([dirs]) => dirs.length > 1);
-  const [firstDirs, firstAt] = diagonals[0];
-  const stored = firstDirs.map((d) => fns[d]).join(" + ");
   const which =
     diagonals.length === 1
-      ? `Step ${first + firstAt + 1} is the diagonal`
+      ? `Step ${first + diagonals[0][1] + 1} is the diagonal`
       : `Steps ${diagonals.map(([, i]) => first + i + 1).join(", ")} are the diagonals`;
+  // FIX 3: the toast speaks the SHAPE, in diagonals, like the button that
+  // produced it. What a diagonal is stored as is said once — on the row
+  // itself, in `.macexp`, for every one of these steps — instead of being
+  // repeated in every label and every toast until it reads as noise.
   return (
     `Added ${motion.steps.length} steps for the ${motion.label}, at 50 ms each, on ` +
-    `${mechanismLabel(m)}: ${shape}. ${which} — ONE step each, the first stored as ` +
-    `${stored}, which is what a diagonal is in the file. You can tick the same cells ` +
-    "yourself in that group's ↖ ↗ ↙ ↘ columns. Add the attack button as a final step, " +
-    "then press Save macro."
+    `${mechanismLabel(m)}: ${shape}. ${which} — ONE step each, and each one spells the ` +
+    "pair it stores beside its name. You can tick the same cells yourself in that " +
+    "group's ↖ ↗ ↙ ↘ columns. Add the attack button as a final step, then press Save macro."
   );
 }
 
@@ -2810,9 +2958,32 @@ export function macroStepVerb(verb: string, index: number): void {
       break;
     case "del": {
       if (index < 0 || index >= n) return;
+      // FIX 1 — THE DEAD END, made unreachable. Victor: "when I remove all the
+      // steps by pressing x there is no way to add them back."
+      //
+      // `mapping::save_macro` REFUSES a zero-step table (empty steps is a
+      // refusal, not a delete — deliberate, so a UI that loses its grid cannot
+      // silently erase a macro). So zero steps is invalid by construction and
+      // this editor must not be able to reach it: deleting the LAST remaining
+      // step empties it instead of removing it. The author lands on a step
+      // holding nothing — a legal, meaningful neutral gap — never on a blank
+      // grid whose every add affordance lived on a row that no longer exists.
+      if (n === 1) {
+        mac.steps[0].hold = [];
+        macroStep = 0;
+        break;
+      }
       mac.steps.splice(index, 1);
       macroStep = mac.steps.length === 0 ? null : Math.min(index, mac.steps.length - 1);
       break;
+    }
+    // FIX 2: the row's own unit toggle. Same conversion rule as the old panel
+    // select — 50 ms picked as frames is 3 frames, not 50 of them.
+    case "unit": {
+      if (index < 0 || index >= n) return;
+      macroStep = index;
+      macroSetUnitAt(index, unitOfStep(mac.steps[index]) === "frames" ? "ms" : "frames");
+      return;
     }
     case "up": {
       if (index <= 0 || index >= n) return;
@@ -2837,18 +3008,28 @@ export function macroStepVerb(verb: string, index: number): void {
   macroEdited();
 }
 
-/** The selected step's duration, in whichever unit is asked for. `value <= 0`
- *  is ignored rather than written — a zero-length step is not a shorter step,
- *  it is a step the loader refuses. */
-export function macroSetDuration(value: number, unit: string): void {
-  const step = macroStep === null ? undefined : macroDraft?.steps[macroStep];
+/** ONE ROW's duration, in the unit that row is authored in. `value <= 0` is
+ *  ignored rather than written — a zero-length step is not a shorter step, it
+ *  is a step the loader refuses.
+ *
+ *  FIX 2 — THE MODE IS GONE. This used to be "the SELECTED step's duration",
+ *  which made changing a time a two-part gesture (pick the row, then find the
+ *  one box under the grid) and made every poll that dropped the selection a
+ *  silent way to lose the edit — the bug the pwtest suite's first three cases
+ *  are about. Every row now carries its own box, so `index` is simply the row
+ *  the author typed in. Selection still exists (the detail line and the frame
+ *  maths have to be ABOUT something), but it now FOLLOWS the edit instead of
+ *  gating it. */
+export function macroSetDurationAt(index: number, value: number): void {
+  const step = macroDraft?.steps[index];
   if (!step || !Number.isFinite(value) || value <= 0) return;
   const n = Math.round(value);
-  const want: StepUnit = unit === "frames" ? "frames" : "ms";
-  // A number typed into the box is authored in whatever unit is showing, so
-  // the write records BOTH halves — the value and the unit it was meant in.
+  const want = unitOfStep(step);
+  // A number typed into a row's box is authored in whatever unit that row is
+  // showing, so the write records BOTH halves — value and unit.
   stepUnits.set(step, want);
   macroLastUnit = want;
+  macroStep = index;
   if (want === "frames") {
     step.frames = n;
     step.ms = null;
@@ -2859,16 +3040,15 @@ export function macroSetDuration(value: number, unit: string): void {
   macroEdited();
 }
 
-/** Switch the selected step between `ms` and `frames`, CONVERTING rather than
+/** Switch ONE ROW between `ms` and `frames`, CONVERTING rather than
  *  reinterpreting: 50 ms picked as frames is 3 frames, not 50 of them. The
  *  unit is an authoring convenience (§1c — it buys readability and nothing
  *  else), so changing it must not change how long the step runs. */
-export function macroSetUnit(unit: string): void {
-  const want: StepUnit = unit === "frames" ? "frames" : "ms";
-  // Remembered even when it lands on nothing, so the control keeps showing
-  // what the author picked instead of snapping back to a unit nobody chose.
+function macroSetUnitAt(index: number, want: StepUnit): void {
+  // Remembered even when it lands on nothing, so a fresh step starts in the
+  // unit the author has been working in.
   macroLastUnit = want;
-  const step = macroStep === null ? undefined : macroDraft?.steps[macroStep];
+  const step = macroDraft?.steps[index];
   if (!step) {
     refreshMacro();
     return;
@@ -2891,6 +3071,15 @@ export function macroSetUnit(unit: string): void {
     return;
   }
   macroEdited();
+}
+
+/** What map.ts writes into row `index`'s duration box after every edit and
+ *  every poll (a dirty form control ignores its attribute, so the value cannot
+ *  come from the markup). Empty string for a row that is not there. */
+export function macroRowDuration(index: number): string {
+  const step = macroDraft?.steps[index];
+  if (!step) return "";
+  return String(unitOfStep(step) === "frames" ? (step.frames ?? 1) : (step.ms ?? 50));
 }
 
 export function macroSetAllowShort(on: boolean): void {
@@ -3027,10 +3216,21 @@ function macroGroupsFor(slot: MapperSlot | null): MacroGroup[] {
   return runs.map((r) => ({ label: r.label, cls: `macgrp g${r.span}` }));
 }
 
-/** How one PRESENTED control is named on this pad. */
+/** How one PRESENTED control is named on this pad.
+ *
+ *  A coalesced diagonal (the hat+stick double-binding every in-box template
+ *  writes) joins its mechanisms with **"and"**, never with `+`. `+` is this
+ *  row's separator for ANOTHER CONTROL — "D-pad ↘ + A" is two things held at
+ *  once — so `"D-pad + LS ↘"` read as a control called "D-pad" and a control
+ *  called "LS ↘", which is two lies in four words: the D-pad is pointing ↘ too,
+ *  and there is only one control here. It also collided with the `· together`
+ *  tail, which that row does not get (it folds to one presented control), so
+ *  the row that holds the MOST bindings looked like the row that holds two.
+ *  "D-pad and LS ↘" is one control, said on two mechanisms — the same joiner
+ *  `macroMotionLine` already uses for exactly this list. */
 function heldLabel(slot: MapperSlot | null, hold: string[], held: Held): string {
   if (held.kind === "diag") {
-    return `${held.mechanisms.map((m) => mechanismGroup(m).trim()).join(" + ")} ${DIAG_GLYPH[held.diag]}`;
+    return `${held.mechanisms.map((m) => mechanismGroup(m).trim()).join(" and ")} ${DIAG_GLYPH[held.diag]}`;
   }
   const table = slot && isPlaystation(slot.persona) ? ZONE_DS4 : ZONE_XBOX;
   const f = hold[held.member];
@@ -3076,17 +3276,50 @@ function holdCls(hold: string[]): string {
   return n > 1 ? "machold both" : "machold";
 }
 
+/** The row's hover text — what it holds, how long, and the stored pair when a
+ *  diagonal is on it. Mirror of render_map.rs `row_title`, which carries the
+ *  reasoning. */
+function rowTitle(slot: MapperSlot | null, step: MacroStepView, i: number): string {
+  const base =
+    `step ${i + 1} holds ${holdText(slot, step.hold)} for ${durationText(step)} ` +
+    `(the engine runs it for ${effectiveMs(step)} ms)`;
+  const expand = holdExpand(step.hold);
+  return expand === "" ? base : `${base} — ${expand}`;
+}
+
 function macroRowsFor(mac: MacroView, slot: MapperSlot | null): MacroRow[] {
   const last = mac.steps.length - 1;
+  const only = mac.steps.length === 1;
   return mac.steps.map((step, i) => {
     const warn = stepWarning(step);
+    const unit = unitOfStep(step);
     return {
       n: String(i + 1),
       cls: `macrow${warn === "" ? "" : " short"}${macroStep === i ? " sel" : ""}`,
       dur: durationText(step),
-      durtitle:
-        `step ${i + 1} holds ${holdText(slot, step.hold)} for ${durationText(step)} ` +
-        `(the engine runs it for ${effectiveMs(step)} ms)`,
+      // FIX 2: the number, in the unit this step was authored in, in this
+      // row's own box. The box's VALUE is written by map.ts after every edit
+      // and every poll (a dirty form control ignores its attribute), so it is
+      // the row index that travels in the markup, not the number.
+      durval: String(unit === "frames" ? (step.frames ?? 1) : (step.ms ?? 50)),
+      durrow: String(i),
+      durcls: stepIsShort(step) ? "macrowdur short" : "macrowdur",
+      unit: unit === "frames" ? "fr" : "ms",
+      unitact: `unit|${i}`,
+      unittitle:
+        unit === "frames"
+          ? `step ${i + 1} is authored in FRAMES — click to switch it to ms (the length is ` +
+            "converted, never reinterpreted)"
+          : `step ${i + 1} is authored in MILLISECONDS — click to switch it to frames (the ` +
+            "length is converted, never reinterpreted; ksx counts frames at 60 Hz)",
+      // The ledger is said TWICE — see render_map.rs `row_title`. The `.macexp`
+      // span beside the words is the primary place, but it is the first thing
+      // the bar gives up as the card narrows and it gives it up silently (154px
+      // at a 1440 viewport, 60px at 1100, ZERO at 820, `display: block`
+      // throughout). The row title cannot be truncated, so it carries the pair
+      // as well and the narrow-width drop becomes a layout choice instead of
+      // the quiet loss of the only statement of what a pick wrote.
+      durtitle: rowTitle(slot, step, i),
       hold: holdText(slot, step.hold),
       holdcls: holdCls(step.hold),
       exp: holdExpand(step.hold),
@@ -3100,6 +3333,14 @@ function macroRowsFor(mac: MacroView, slot: MapperSlot | null): MacroRow[] {
       iaact: `insa|${i}`,
       ibact: `insb|${i}`,
       delact: `del|${i}`,
+      // FIX 1: on the last remaining step this button EMPTIES the row rather
+      // than removing it — and says so, so it does not read as a broken
+      // delete. A macro with no steps is refused by the writer, so the editor
+      // is not allowed to build one.
+      deltitle: only
+        ? "clear this step (a macro needs at least one — this empties the row instead of " +
+          "removing it, which is a legal neutral gap)"
+        : "delete this step",
       upcls: i === 0 ? "macbtn off" : "macbtn",
       dncls: i === last ? "macbtn off" : "macbtn",
     };
@@ -3334,8 +3575,6 @@ function refreshMacro(): void {
     setMacroEnableLabel("Enabled");
     setSlotMacrosLine(slotMacrosLineFor(slot));
     setMacroStepLine("");
-    setMacroDurValue("50");
-    setMacroDurCls("macdurin");
     setMacroConfirmCls("macconfirm off");
     setMacroConfirmLine("");
     setMacroMotionLine(macroMotionLineFor(slot));
@@ -3399,16 +3638,9 @@ function refreshMacro(): void {
   const step = macroStep === null ? undefined : mac.steps[macroStep];
   setMacroStepLine(
     step === undefined
-      ? "click a step's ⏱ to edit its duration"
+      ? "every step's time is its own box on its own row — type in the row you want"
       : `step ${(macroStep ?? 0) + 1} of ${mac.steps.length} — ${durationText(step)}` +
         (stepWarningLong(step) === "" ? "" : ` · ${stepWarningLong(step)}`),
-  );
-  setMacroDurValue(
-    step === undefined ? "50" : String(step.frames ?? step.ms ?? 50),
-  );
-  // FIX 2: the field itself, not just an advisory somewhere under the grid.
-  setMacroDurCls(
-    step !== undefined && stepIsShort(step) ? "macdurin short" : "macdurin",
   );
   setMacroMotionLine(macroMotionLineFor(slot));
   // The question is only ever on screen because Save asked it — and it is
@@ -3456,18 +3688,15 @@ export function macroShortStepQuestion(): string {
   return macroDraft === null ? "" : shortStepQuestion(macroDraft);
 }
 
-/** The unit the duration editor should show for the selected step. map.ts
- *  writes it onto the <select>, which an attribute binding cannot do.
- *
- *  Read from [`stepUnits`] — the authored choice — and NEVER re-derived from
- *  the value. With no step selected it answers the last unit the author
- *  picked, so the control cannot contradict them while they are looking at it.
- *  (The `??` is a safety net for a step object that never came through
- *  `cloneMacro`/`newStep`; nothing in this file produces one.) */
+/** The unit the FOCUSED step is authored in — what the detail line under the
+ *  grid is talking about. Read from [`stepUnits`] (the authored choice) and
+ *  NEVER re-derived from the value; with nothing focused it answers the last
+ *  unit the author picked. Each ROW's own unit is [`unitOfStep`], which is what
+ *  the row's toggle reads and writes since FIX 2. */
 export function macroStepUnit(): StepUnit {
   const step = macroStep === null ? undefined : macroDraft?.steps[macroStep];
   if (!step) return macroLastUnit;
-  return stepUnits.get(step) ?? fileUnitOf(step);
+  return unitOfStep(step);
 }
 
 export function macroStepAllowShort(): boolean {
@@ -4163,8 +4392,17 @@ export function MapIsland() {
         // this slot's own direction keys drive — see `macroMotionLineFor`, and
         // `Issue::MacroHoldsOtherMechanism` for the trap it sidesteps.
         //
-        // JS-only, like every other draft edit here; the labels spell the
-        // holds so the shape is legible before anything is clicked.
+        // JS-only, like every other draft edit here.
+        //
+        // FIX 3 — THE LABELS SPEAK DIAGONALS. They used to spell the holds
+        // ("¼ → · ↓ · ↓+→ · →") because an earlier pass wanted the buttons to
+        // teach that one row can hold several controls. First-class diagonals
+        // landed since, and `↓+→` now CONTRADICTS the abstraction the grid,
+        // the row readout and the ↘ column all use: a diagonal is one control,
+        // not two held together. So a motion reads as the shape a player
+        // already knows — `↓ ↘ →` — and the model is taught in exactly one
+        // place, the row's own expansion ledger (`↘ = dpad.down + dpad.right`),
+        // which every generated step carries the moment the button is pressed.
         h(
           "div",
           { class: "macmotions" },
@@ -4175,9 +4413,15 @@ export function MapIsland() {
               class: "btn btn-mini macmot",
               "data-macmotion": "qcf",
               type: "button",
-              title: "append a quarter-circle forward: ↓, then ↓+→ held together, then →",
+              // ⚠ ONE STRING LITERAL, like every other title on this card. A
+              // concatenation in ATTRIBUTE position is not folded by the
+              // compiler — the attribute is emitted with NO VALUE AT ALL, so
+              // the tooltip silently disappears (it had been missing from both
+              // 360 buttons for exactly this reason until FIX 3's pwtest case
+              // read the titles back and found `null`).
+              title: "append a quarter-circle forward: ↓ ↘ → — three steps, the middle one the diagonal (each row spells the pair it stores)",
             },
-            "¼ → · ↓ · ↓+→ · →",
+            "¼ → · ↓ ↘ →",
           ),
           h(
             "button",
@@ -4185,9 +4429,9 @@ export function MapIsland() {
               class: "btn btn-mini macmot",
               "data-macmotion": "qcb",
               type: "button",
-              title: "append a quarter-circle back: ↓, then ↓+← held together, then ←",
+              title: "append a quarter-circle back: ↓ ↙ ← — three steps, the middle one the diagonal (each row spells the pair it stores)",
             },
-            "¼ ← · ↓ · ↓+← · ←",
+            "¼ ← · ↓ ↙ ←",
           ),
           h(
             "button",
@@ -4195,9 +4439,9 @@ export function MapIsland() {
               class: "btn btn-mini macmot",
               "data-macmotion": "hcf",
               type: "button",
-              title: "append a half-circle forward: ←, ↓+←, ↓, ↓+→, →",
+              title: "append a half-circle forward: ← ↙ ↓ ↘ → — five steps, two of them diagonals",
             },
-            "½ → · ← · ↓+← · ↓ · ↓+→ · →",
+            "½ → · ← ↙ ↓ ↘ →",
           ),
           h(
             "button",
@@ -4205,9 +4449,9 @@ export function MapIsland() {
               class: "btn btn-mini macmot",
               "data-macmotion": "hcb",
               type: "button",
-              title: "append a half-circle back: →, ↓+→, ↓, ↓+←, ←",
+              title: "append a half-circle back: → ↘ ↓ ↙ ← — five steps, two of them diagonals",
             },
-            "½ ← · → · ↓+→ · ↓ · ↓+← · ←",
+            "½ ← · → ↘ ↓ ↙ ←",
           ),
           h(
             "button",
@@ -4215,9 +4459,9 @@ export function MapIsland() {
               class: "btn btn-mini macmot",
               "data-macmotion": "dpf",
               type: "button",
-              title: "append a dragon punch forward: →, ↓, then ↓+→ held together",
+              title: "append a dragon punch forward: → ↓ ↘ — three steps, the last one the diagonal",
             },
-            "DP → · → · ↓ · ↓+→",
+            "DP → · → ↓ ↘",
           ),
           h(
             "button",
@@ -4225,9 +4469,9 @@ export function MapIsland() {
               class: "btn btn-mini macmot",
               "data-macmotion": "dpb",
               type: "button",
-              title: "append a dragon punch back: ←, ↓, then ↓+← held together",
+              title: "append a dragon punch back: ← ↓ ↙ — three steps, the last one the diagonal",
             },
-            "DP ← · ← · ↓ · ↓+←",
+            "DP ← · ← ↓ ↙",
           ),
           // THE FULL CIRCLE — the motion that needs all four diagonals, and the
           // reason they are first-class rather than just ↘. Eight steps, one
@@ -4238,9 +4482,7 @@ export function MapIsland() {
               class: "btn btn-mini macmot",
               "data-macmotion": "spdf",
               type: "button",
-              title:
-                "append a full 360 (spinning piledriver), clockwise from →: " +
-                "→ ↘ ↓ ↙ ← ↖ ↑ ↗ — eight steps, four of them diagonals",
+              title: "append a full 360 (spinning piledriver), clockwise from →: → ↘ ↓ ↙ ← ↖ ↑ ↗ — eight steps, four of them diagonals",
             },
             "360 → · → ↘ ↓ ↙ ← ↖ ↑ ↗",
           ),
@@ -4250,13 +4492,53 @@ export function MapIsland() {
               class: "btn btn-mini macmot",
               "data-macmotion": "spdb",
               type: "button",
-              title:
-                "append a full 360 the other way round, from ←: " +
-                "← ↙ ↓ ↘ → ↗ ↑ ↖ — eight steps, four of them diagonals",
+              title: "append a full 360 the other way round, from ←: ← ↙ ↓ ↘ → ↗ ↑ ↖ — eight steps, four of them diagonals",
             },
             "360 ← · ← ↙ ↓ ↘ → ↗ ↑ ↖",
           ),
           h("p", { class: "macmotnote" }, () => macroMotionLine()),
+        ),
+        // FIX 1 — THE STEP TOOLBAR, and the rule it exists for: an add
+        // affordance must not live on a row. Every other way to grow a macro
+        // (insert-above, insert-below) hangs off an existing step, which is
+        // fine as long as one exists — and Victor pressed ✕ until none did.
+        // Deleting the last step no longer empties the grid (`macroStepVerb`
+        // says why), so this bar is no longer the ONLY road back; it is still
+        // the one that does not depend on the grid having anything in it, and
+        // it sits ABOVE the grid where the thing it adds to is visible.
+        //
+        // NOT a multi-select bar, deliberately. Bulk editing of rows was
+        // floated and refused: multi-select is a MODE, and the mode
+        // (select-then-edit) is precisely what FIX 2 just removed from the
+        // duration editor. If bulk edits are ever really needed, drag-select
+        // across rows is the gesture — no toolbar toggle.
+        h(
+          "div",
+          { class: "macsteptools" },
+          h(
+            "button",
+            {
+              class: "btn btn-mini macaddstep",
+              "data-act": "macro-addstep",
+              type: "button",
+              title: "append a new 50 ms step, holding nothing yet, at the end of the macro",
+            },
+            "＋ Add step",
+          ),
+          // ⚠ SEPARATE STRING CHILDREN, never `"a" + "b"`. A concatenation in
+          // ATTRIBUTE position is folded by the compiler (the motion titles
+          // above do it), but as a CHILD it is a BinaryExpression the h-tree
+          // walker cannot fold, and it emits an anonymous SECOND ISLAND —
+          // which `embedded_map_ir_slot_layout_matches_the_seam` catches as
+          // "expected exactly one island". Same rule the long paragraphs on
+          // this card already follow.
+          h(
+            "span",
+            { class: "macstephint" },
+            "…or ＋↑ / ＋↓ on a row to insert next to it. ✕ deletes a step — on the ",
+            "last one it empties it instead, because a macro with no steps is not ",
+            "something ksx can save.",
+          ),
         ),
         // The grid. Two aligned columns: the row bar (step number, duration,
         // amber flag, the five step verbs) and the scrollable matrix with its
@@ -4270,12 +4552,22 @@ export function MapIsland() {
             h("div", { class: "macrowhead" }, "step"),
             createList(
               () => macroRows(),
+              // The KEY, and what is deliberately not in it: the row rebuilds
+              // when its words change (`dur` carries the unit conversion the
+              // `unit` toggle performs, and `deltitle` flips on the last
+              // remaining step), but the duration BOX's value never comes from
+              // here — map.ts writes it, skipping whichever box has the caret,
+              // exactly like every other form control on this card.
               (r) =>
                 r.n +
                 "|" +
                 r.cls +
                 "|" +
                 r.dur +
+                "|" +
+                r.unit +
+                "|" +
+                r.deltitle +
                 "|" +
                 r.warn +
                 "|" +
@@ -4299,7 +4591,35 @@ export function MapIsland() {
                   // for that diagonal. The lens is honest only if the storage
                   // is visible without opening the TOML.
                   h("span", { class: r.expcls, title: r.exp }, r.exp),
+                  // THE DURATION, on the row it belongs to. The words are the
+                  // no-JS readout; with JavaScript the box beside them takes
+                  // over (CSS swaps the two on `.studio.js`) so a time is
+                  // edited exactly where it is read — no step to select first,
+                  // no single field under the grid to go and find.
                   h("span", { class: "macdur" }, r.dur),
+                  h(
+                    "span",
+                    { class: "macdured" },
+                    h("input", {
+                      class: r.durcls,
+                      "data-durrow": r.durrow,
+                      type: "number",
+                      min: "1",
+                      step: "1",
+                      value: r.durval,
+                      title: r.durtitle,
+                    }),
+                    h(
+                      "button",
+                      {
+                        class: "macrowunit",
+                        "data-macact": r.unitact,
+                        type: "button",
+                        title: r.unittitle,
+                      },
+                      r.unit,
+                    ),
+                  ),
                   // FLAGGED INLINE, in amber, with the reason — never a
                   // silent accept and never a silent rewrite (§0.2). The
                   // short form always fits; the whole sentence is the title,
@@ -4328,14 +4648,23 @@ export function MapIsland() {
                       { class: "macbtn", "data-macact": r.ibact, type: "button", title: "insert a step below this one" },
                       "＋↓",
                     ),
+                    // NOT "edit this step's duration" any more — that is what
+                    // the box two elements left of here is for. This focuses
+                    // the row so the detail line under the grid (its frame
+                    // maths, its allow-short box) is about it.
                     h(
                       "button",
-                      { class: "macbtn", "data-macact": r.selact, type: "button", title: "edit this step's duration" },
+                      {
+                        class: "macbtn",
+                        "data-macact": r.selact,
+                        type: "button",
+                        title: "show this step's frame maths below the grid",
+                      },
                       "⏱",
                     ),
                     h(
                       "button",
-                      { class: "macbtn macdel", "data-macact": r.delact, type: "button", title: "delete this step" },
+                      { class: "macbtn macdel", "data-macact": r.delact, type: "button", title: r.deltitle },
                       "✕",
                     ),
                   ),
@@ -4397,33 +4726,14 @@ export function MapIsland() {
           "div",
           { class: "macedit" },
           h("span", { class: "macsteplbl" }, () => macroStepLine()),
-          h(
-            "label",
-            { class: "bindlabel" },
-            "duration",
-            // FIX 2: the BOX turns warn-coloured when the number in it is
-            // below the sampling floor. An advisory two elements away was read
-            // as decoration; the field that holds the offending number cannot
-            // be.
-            h("input", {
-              class: () => macroDurCls(),
-              type: "number",
-              min: "1",
-              step: "1",
-              value: () => macroDurValue(),
-            }),
-          ),
-          h(
-            "label",
-            { class: "bindlabel" },
-            "unit",
-            h(
-              "select",
-              { class: "macunit" },
-              h("option", null, "ms"),
-              h("option", null, "frames"),
-            ),
-          ),
+          // FIX 2: the duration field and the unit select USED TO LIVE HERE,
+          // pointed at whichever step was selected. That was the mode — a time
+          // could not be changed without first picking a row, and every poll
+          // that dropped the selection dropped the edit with it. Both controls
+          // are now on every row (`.macdured`), where the number they change
+          // is the number being read. What stays here is what is genuinely
+          // ABOUT one step at a time: its frame maths, and its allow-short
+          // flag, which follow the row you last touched rather than gating it.
           // The target rate the AUTHOR is thinking in. Display-only — nothing
           // stores a rate, and ksx counts `frames` at 60 Hz — which the math
           // line below says out loud whenever this is not 60.
@@ -4448,15 +4758,14 @@ export function MapIsland() {
             h("input", { class: "macshortin", type: "checkbox" }),
             "allow short (run it as written even below 33 ms)",
           ),
-          // THE MATH, live (Victor: "maybe we can show that math"). Full-width
-          // under the duration controls, and it carries the sampling floor in
-          // the same units, so an amber row explains itself.
+          // THE MATH, live (Victor: "maybe we can show that math"). It carries
+          // the sampling floor in the same units the focused row is authored
+          // in, so an amber row explains itself.
           h("p", { class: "macmath mono" }, () => macroMathLine()),
-          h(
-            "button",
-            { class: "btn btn-mini", "data-act": "macro-addstep", type: "button" },
-            "Add step at end",
-          ),
+          // "Add step at end" used to be here, at the bottom of a panel below
+          // the grid. It is now the step toolbar ABOVE the grid — one add
+          // button, in the place where somebody who has just emptied a row is
+          // already looking.
           h(
             "button",
             { class: "btn btn-mini", "data-act": "macro-revert", type: "button" },
@@ -4496,10 +4805,9 @@ export function MapIsland() {
               class: () => macroEnableCls(),
               "data-act": "macro-enable",
               type: "button",
-              title:
-                "switch this macro off (or back on) without losing it — the steps and the " +
-                "key that starts it stay exactly where they are. Disable one to TEST the " +
-                "others, or the lot for a tournament",
+              // One literal — a concatenation here emits the attribute with no
+              // value at all (see the motion buttons above).
+              title: "switch this macro off (or back on) without losing it — the steps and the key that starts it stay exactly where they are. Disable one to TEST the others, or the lot for a tournament",
             },
             () => macroEnableLabel(),
           ),

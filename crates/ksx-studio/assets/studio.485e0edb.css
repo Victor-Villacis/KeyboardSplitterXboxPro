@@ -3045,6 +3045,74 @@ a.strow:hover {
   color: var(--accent);
 }
 
+/* FIX 2 — THE DURATION, EDITABLE ON ITS OWN ROW.
+   The words above are the no-JS readout; with JavaScript this pair replaces
+   them in the same column, so the number is changed exactly where it is read
+   and no step has to be "selected" first. Same fixed basis as `.macdur`, for
+   the same reason: the durations are compared down the list. */
+.macdured {
+  display: none;
+  flex: 0 0 6rem;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.studio.js .macdured {
+  display: flex;
+}
+
+.studio.js .macdur {
+  display: none;
+}
+
+.macrowdur {
+  width: 3.4rem;
+  padding: 1px var(--sp-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-xs);
+  background: var(--surface-base);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-bold);
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+
+.macrowdur:focus {
+  border-color: var(--accent-line);
+  outline: none;
+}
+
+/* The offending FIELD wears the warning — a below-floor step is a fact about
+   the number in this box, not about a note somewhere under the grid. */
+.macrowdur.short {
+  border-color: var(--warn);
+  background: var(--warn-dim);
+  color: var(--warn);
+}
+
+/* The unit, as a two-state BUTTON: it reads as the unit the step is authored
+   in and switches it on click (converting, never reinterpreting). A <select>
+   here would need its value written by hand on every row after every poll. */
+.macrowunit {
+  flex: 0 0 auto;
+  min-width: 1.6rem;
+  padding: 1px var(--sp-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-xs);
+  background: transparent;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+
+.macrowunit:hover {
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+
 .macwarn {
   flex: 0 1 auto;
   min-width: 0;
@@ -3082,10 +3150,44 @@ a.strow:hover {
   color: var(--warn);
 }
 
+/* FIX 1 — THE STEP TOOLBAR. Above the grid, and deliberately NOT attached to a
+   row: every other way to grow a macro (＋↑ / ＋↓) hangs off a step that
+   exists, which is exactly the affordance that disappears when somebody
+   presses ✕ enough times. */
+.macsteptools {
+  display: none;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-2);
+}
+
+.studio.js .macsteptools {
+  display: flex;
+}
+
+.macstephint {
+  min-width: 0;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  color: var(--text-tertiary);
+}
+
 /* FIX 1 — WHAT THE ROW HOLDS, in words. First-class text: this is the row's
    MEANING, and it used to be tertiary-grey filler at the end of the line. */
 .machold {
-  flex: 0 0 10rem;
+  /* 14rem, not 10rem: the widest honest readout on this card is the
+     CONTRADICTORY row — "D-pad ↓ + D-pad → + D-pad ↑ · together", the step that
+     must never fold — and at 10rem it ellipsized to "D-pad ↓ + D-pad → + D-pa…"
+     at every viewport tested, 1920 included. The row whose whole point is that
+     it is three separate directions was the one row you could not read.
+
+     STILL `flex-shrink: 0`. Making it shrinkable looked tidier and was worse:
+     with `.macexp` holding a min-width beside it, a 420px viewport squeezed the
+     readout to LITERALLY ZERO pixels — the words gone entirely rather than
+     merely clipped. A fixed basis that overflows the bar is clipped by
+     `.macgrid`'s `overflow: hidden` and still shows its first words, which on
+     this row is the difference between "D-pad ↘…" and nothing at all. */
+  flex: 0 0 14rem;
   min-width: 0;
   font-size: var(--fs-xs);
   font-weight: var(--fw-semibold);
@@ -3302,11 +3404,16 @@ a.strow:hover {
    right beside the words — "↘" and "dpad.down + dpad.right" are the same fact
    said twice, which is the only way the presentation stays honest. */
 .macexp {
-  /* Takes whatever the bar has left: the pair is the point, and a column that
-     always truncated would be a ledger nobody could read. Its own `title`
-     carries the whole line when the bar is narrow anyway. */
+  /* Takes whatever the bar has left, but never less than `min-width`. The old
+     `min-width: 0` let flex shrink it to a sliver and then to NOTHING while it
+     stayed `display: block` — measured on the real page at 154px (1440
+     viewport), 60px (1100) and 0px (820). A ledger that silently becomes
+     invisible is not a ledger, and this one is the whole reason the fold is
+     allowed to call two holds one control. Below the width where any of it can
+     be read it is dropped DELIBERATELY (see the media rule), and the row's own
+     title carries the pair either way — see render_map.rs `row_title`. */
   flex: 1 1 auto;
-  min-width: 0;
+  min-width: 11ch;
   font-family: var(--mono);
   font-size: var(--fs-micro);
   color: var(--text-tertiary);
@@ -3367,18 +3474,11 @@ a.strow:hover {
   color: var(--cool);
 }
 
-.macdurin,
+/* `.macdurin` (the panel's one duration field) and its `.short` amber lived
+   here until FIX 2 moved the duration editor onto every row — see `.macrowdur`
+   up beside `.macrow`, which is where the number it warns about now is. */
 .macturboin {
   width: 5.5rem;
-}
-
-/* FIX 2 — the OFFENDING FIELD, not a note elsewhere. The number in this box is
-   what is below the sampling floor, so this box is what turns amber. */
-.macdurin.short {
-  border-color: var(--warn);
-  background: var(--warn-dim);
-  color: var(--warn);
-  font-weight: var(--fw-semibold);
 }
 
 .macturbounit {
@@ -3713,13 +3813,34 @@ a.strow:hover {
      narrow window showing exactly the piano roll that taught nobody what a
      diagonal is. It stays; the MATRIX gives up the width instead (it scrolls,
      and the row height stays fixed so the two columns keep their alignment).
-     Only the "· held together" tail goes, because the accent already says it. */
+     Only the "· held together" tail goes, because the accent already says it.
+
+     KEPT, and worth defending, because at this width the matrix loses badly:
+     measured at a 420px viewport it is 89px of a 889px grid — three columns,
+     all of them shoulder buttons, not one direction reachable. Giving it a
+     bigger slice would not rescue it (a single eight-position ring is 12rem)
+     and would cost the only thing that still works here. So below 45rem this
+     card is a READOUT, and the job is to make the readout honest rather than to
+     pretend the instrument still fits. Which is why the two rules below exist:
+     both of the things the readout is FOR were being lost silently. */
   .macrowbar {
-    max-width: 70%;
+    max-width: 78%;
   }
 
+  /* Was 8rem, which truncated the contradictory row — the one row whose meaning
+     IS that it did not fold — to "D-pad ↓ + D-pad → + D-pa…". 11rem is as far
+     as it goes here: past that it pushes the duration off the card, and a step
+     with no visible duration is its own kind of lie. */
   .machold {
-    flex-basis: 8rem;
+    flex-basis: 11rem;
+  }
+
+  /* DROPPED ON PURPOSE, and this is the difference that matters: it was already
+     gone here (flex-shrunk to 0px while still `display: block`), so the page
+     was losing the ledger without deciding to. Now the drop is a decision, and
+     the pair survives it in the row's title — see render_map.rs `row_title`. */
+  .macexp {
+    display: none;
   }
 
   .macdur {

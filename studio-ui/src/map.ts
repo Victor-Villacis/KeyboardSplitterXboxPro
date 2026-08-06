@@ -42,14 +42,13 @@ import {
   macroShortStepQuestion,
   macroSeededFrom,
   macroSetAllowShort,
-  macroSetDuration,
+  macroSetDurationAt,
   macroRateUnit,
   macroRepeatValue,
+  macroRowDuration,
   macroSetPolicy,
   macroSetTurboRate,
-  macroSetUnit,
   macroStepAllowShort,
-  macroStepUnit,
   macroStepVerb,
   macroTargetRate,
   macroToggleCell,
@@ -64,7 +63,6 @@ import {
   newestUndoable,
   previousKeys,
   currentMacro,
-  currentMacroStep,
   seedMacro,
   profileToResume,
   pushToast,
@@ -1076,8 +1074,14 @@ function syncMacroControls(): void {
     set(".macnamein", "");
     return;
   }
-  set(".macdurin", String(macroDurationValue()));
-  set(".macunit", macroStepUnit());
+  // FIX 2: one box per ROW, so this is a loop rather than a field. Same rule
+  // as `set` above — never over the box the caret is in — which is what lets
+  // somebody type a duration straight through a 2 s poll.
+  for (const box of root.querySelectorAll<HTMLInputElement>(".macrowdur")) {
+    const want = macroRowDuration(Number(box.dataset.durrow));
+    if (want === "" || box.value === want || box === document.activeElement) continue;
+    box.value = want;
+  }
   set(".macnamein", mac.name);
   set('.macsel[data-macpol="on_release"]', mac.on_release);
   set('.macsel[data-macpol="retrigger"]', mac.retrigger);
@@ -1523,15 +1527,6 @@ async function macroDelete(): Promise<void> {
   );
 }
 
-/** The number the duration box should show for the selected step, in the unit
- *  it was authored in. */
-function macroDurationValue(): number {
-  const at = currentMacroStep();
-  const step = at === null ? undefined : currentMacro()?.steps[at];
-  if (!step) return 50;
-  return step.frames ?? step.ms ?? 50;
-}
-
 /** Any editable control in the island holds the caret. Hover highlighting
  *  re-derives the zone and legend lists, which REBUILDS their DOM — and a
  *  rebuild under a focused control takes the focus with it. A highlight is
@@ -1953,19 +1948,22 @@ function wire(root: HTMLElement): void {
     // into, and a caret that jumps to the end on every character is not an
     // editor. The selects and the checkbox have no caret, so they are live.
     const committed = ev.type === "change";
-    if (el.classList.contains("macdurin")) {
-      // The unit comes from the DRAFT, not from reading it back off the
-      // <select>: the model is where the authored unit lives, and a control
-      // that had drifted would otherwise decide what the typed number means.
-      if (committed) macroSetDuration(Number(el.value), macroStepUnit());
-      return;
-    }
-    if (el.classList.contains("macunit")) {
-      // CONVERTS, never reinterprets: 50 ms picked as frames is 3 frames, not
-      // 50 of them. The unit is an authoring convenience, so changing it must
-      // not change how long the step runs.
-      macroSetUnit(el.value);
+    if (el.classList.contains("macrowdur")) {
+      // FIX 2: the row's OWN duration box — no step has to be selected first,
+      // and the row index rides on the element rather than in a mode. The
+      // unit comes from the DRAFT (that row's authored unit), never from
+      // reading a control back, which is where the old "it just resets" came
+      // from. Committing repaints the row (the words beside the box, the amber
+      // class), which rebuilds it — so the caret is put back where it was, and
+      // Enter-to-commit stays a thing you can do twice in a row.
+      if (!committed) return;
+      const row = Number(el.dataset.durrow);
+      macroSetDurationAt(row, Number(el.value));
       syncMacroControls();
+      const again = islandRoot?.querySelector<HTMLInputElement>(
+        `.macrowdur[data-durrow="${row}"]`,
+      );
+      if (again && again !== el) again.focus();
       return;
     }
     if (el.classList.contains("macturboin")) {

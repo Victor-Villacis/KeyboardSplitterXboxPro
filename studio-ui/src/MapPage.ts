@@ -317,13 +317,17 @@ export function MapPage() {
   const [macroCardCls] = createSignal("card macrocard off");
   const [macroGridCls] = createSignal("macgrid empty");
   const [macroDirtyLine] = createSignal("");
-  const [macroStepLine] = createSignal("click a step's ⏱ to edit its duration");
-  const [macroDurValue] = createSignal("50");
-  // v15/FIX 2: the duration BOX's own class (a below-floor step is a fact
-  // about the number in that field), and Save's inline question about short
-  // steps — a class string plus its sentence, never a show (ledger #13/#14).
-  // An SSR paint has asked nothing, so the bar renders off and empty.
-  const [macroDurCls] = createSignal("macdurin");
+  // FIX 2 dropped `macroDurValue` / `macroDurCls`: the duration editor is no
+  // longer one field under the grid pointed at a selected step, so there is no
+  // single value or class for the card to hold. Every row carries its own box
+  // (a list-item field, not a signal), and this line only reports which step
+  // the frame maths is about.
+  const [macroStepLine] = createSignal(
+    "every step's time is its own box on its own row — type in the row you want",
+  );
+  // v15/FIX 2: Save's inline question about short steps — a class string plus
+  // its sentence, never a show (ledger #13/#14). An SSR paint has asked
+  // nothing, so the bar renders off and empty.
   const [macroConfirmCls] = createSignal("macconfirm off");
   const [macroConfirmLine] = createSignal("");
   // v15/FIX 1c: which mechanism the "common motions" buttons write, and why.

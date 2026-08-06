@@ -1011,6 +1011,50 @@ fn step_is_short(step: &MacroStepView) -> bool {
     requested_ms(step).is_some_and(|ms| ms < MIN_STEP_MS)
 }
 
+/// The number in the row's own duration box, in the unit the FILE spells this
+/// step in. Mirrors MapIsland.ts's `macroRowsFor` / `unitOfStep`, with the one
+/// difference the client alone can have: the client also remembers a unit the
+/// AUTHOR picked for a step whose value has not been retyped yet, and an SSR
+/// paint has no author to remember.
+fn dur_value(step: &MacroStepView) -> String {
+    match (step.ms, step.frames) {
+        (_, Some(frames)) if step.ms.is_none() => frames.to_string(),
+        (Some(ms), _) => ms.to_string(),
+        // Both or neither — the row's amber flag already says so; the box
+        // shows the default a new step would take rather than a blank that
+        // would write nothing.
+        _ => "50".to_owned(),
+    }
+}
+
+/// `ms` / `fr` — the unit TOGGLE's label. A two-state button, not a `<select>`:
+/// a select inside a list item cannot be given its value by an attribute
+/// binding (map.ts would have to write every one of them by hand after every
+/// poll), and a button's label is its own readout.
+fn unit_tag(step: &MacroStepView) -> String {
+    if step.frames.is_some() && step.ms.is_none() {
+        "fr".to_owned()
+    } else {
+        "ms".to_owned()
+    }
+}
+
+fn unit_title(step: &MacroStepView, i: usize) -> String {
+    if unit_tag(step) == "fr" {
+        format!(
+            "step {} is authored in FRAMES — click to switch it to ms (the length is converted, \
+             never reinterpreted)",
+            i + 1
+        )
+    } else {
+        format!(
+            "step {} is authored in MILLISECONDS — click to switch it to frames (the length is \
+             converted, never reinterpreted; ksx counts frames at 60 Hz)",
+            i + 1
+        )
+    }
+}
+
 /// The INLINE amber flag — short enough to always fit on the row beside the
 /// duration, because a truncated warning is a warning nobody reads. The rule
 /// it is short for is stated once, in full, in the card's own note; the whole
@@ -1113,10 +1157,15 @@ pub(crate) const MACRO_RULE_LINE: &str =
 pub(crate) const MACRO_RING_LINE: &str =
     "Each direction group runs ↑ ↖ ← ↙ ↓ ↘ → ↗ (numpad 8 7 4 1 2 3 6 9), so a motion is a \
      SHAPE: a quarter-circle forward is a staircase, a half-circle a straight line, a dragon \
-     punch a hook. The four diagonals are picks, not new bindings — ticking ↘ (down-right, d/f, \
-     numpad 3) stores dpad.down + dpad.right on that step, which is what a diagonal has always \
-     been in this file. Tick it on the group your preset's own direction keys drive; each row \
-     spells the pair it wrote beside its name.";
+     punch a hook. The four diagonals are picks, not new bindings — ticking ↘ (down-right, \
+     numpad 3; a move list spells it d/f, which is only down-FORWARD while you face right — ksx \
+     has no idea which way you are facing) stores dpad.down + dpad.right on that step, which is \
+     what a diagonal has always been in this file. THERE ARE THREE OF THESE GROUPS — D-PAD, \
+     LEFT STICK and RIGHT STICK — and the grid scrolls sideways to reach them, so the one you \
+     want may be off the edge; the band above the arrows names whichever you are looking at. \
+     Tick the diagonal on the group your preset's own direction keys drive, because a motion \
+     written on the other one is published faithfully and read by nobody. Each row spells the \
+     pair it wrote beside its name.";
 
 /// A macro's run length at the durations the engine will use.
 fn total_ms(mac: &MacroView) -> u32 {
@@ -1375,6 +1424,17 @@ fn macro_groups(slot: Option<&MapperSlot>) -> SlotValue {
 }
 
 /// How one PRESENTED control is named on this pad.
+///
+/// A coalesced diagonal (the hat+stick double-binding every in-box template
+/// writes) joins its mechanisms with **"and"**, never with `+`. `+` is this
+/// row's separator for ANOTHER CONTROL — "D-pad ↘ + A" is two things held at
+/// once — so `"D-pad + LS ↘"` read as a control called "D-pad" and a control
+/// called "LS ↘", which is two lies in four words: the D-pad is pointing ↘ too,
+/// and there is only one control here. It also collided with [`hold_cls`]'s
+/// `· together` tail, which that row does not get (it folds to ONE presented
+/// control) — so the row holding the MOST bindings looked like the row holding
+/// two. "D-pad and LS ↘" is one control, said on two mechanisms, and "and" is
+/// the joiner [`macro_motion_line`] already uses for exactly this list.
 fn held_label(zones: &[Zone], hold: &[String], held: &Held) -> String {
     match held {
         Held::Diagonal {
@@ -1385,7 +1445,7 @@ fn held_label(zones: &[Zone], hold: &[String], held: &Held) -> String {
                 .iter()
                 .map(|m| m.group().trim_end())
                 .collect::<Vec<_>>()
-                .join(" + "),
+                .join(" and "),
             format_args!(" {}", diag.glyph()),
         ),
         Held::Plain { member } => {
@@ -1444,6 +1504,34 @@ fn hold_expand(hold: &[String]) -> String {
         .join(" · ")
 }
 
+/// The row's hover text: what it holds, how long the engine runs it — and, when
+/// a diagonal is on the row, the pair the file stores.
+///
+/// **Why the ledger is said twice.** The `.macexp` span beside the words is the
+/// primary place, but it is the first thing the row bar gives up as the card
+/// narrows, and it gives it up SILENTLY: measured on the real page it is 154px
+/// at a 1440 viewport, 60px at 1100 and **zero** at 820 — still `display:
+/// block`, still in the DOM, hoverable by nobody. An honesty line that
+/// disappears without saying so is not an honesty line, and this row is the one
+/// place on the card that cannot be truncated. So the title carries it too, and
+/// the narrow-width drop of the span becomes a deliberate layout choice rather
+/// than the quiet loss of the only statement of what a pick wrote.
+fn row_title(slot: Option<&MapperSlot>, step: &MacroStepView, i: usize) -> String {
+    let base = format!(
+        "step {} holds {} for {} (the engine runs it for {} ms)",
+        i + 1,
+        hold_text(slot, &step.hold),
+        duration_text(step),
+        effective_ms(step)
+    );
+    let expand = hold_expand(&step.hold);
+    if expand.is_empty() {
+        base
+    } else {
+        format!("{base} — {expand}")
+    }
+}
+
 fn hold_expand_cls(hold: &[String]) -> &'static str {
     if hold_expand(hold).is_empty() {
         "macexp off"
@@ -1479,6 +1567,7 @@ fn macro_rows(
         return SlotValue::Array(Vec::new());
     };
     let last = mac.steps.len().saturating_sub(1);
+    let only = mac.steps.len() == 1;
     SlotValue::Array(
         mac.steps
             .iter()
@@ -1498,14 +1587,32 @@ fn macro_rows(
                     ("dur".to_owned(), SlotValue::Text(duration_text(step))),
                     (
                         "durtitle".to_owned(),
-                        SlotValue::Text(format!(
-                            "step {} holds {} for {} (the engine runs it for {} ms)",
-                            i + 1,
-                            hold_text(slot, &step.hold),
-                            duration_text(step),
-                            effective_ms(step)
-                        )),
+                        SlotValue::Text(row_title(slot, step, i)),
                     ),
+                    // FIX 2: THE DURATION IS EDITED ON THE ROW. It used to be
+                    // one field under the grid pointed at whichever step was
+                    // "selected" — so changing a time meant picking a row
+                    // first, and anything that dropped the selection (a poll,
+                    // a re-seed) silently took the editor with it. Every row
+                    // now carries its own number, its own unit toggle and its
+                    // own warn class; `durrow` is the index the box writes to,
+                    // which is all the state the gesture needs.
+                    ("durval".to_owned(), SlotValue::Text(dur_value(step))),
+                    ("durrow".to_owned(), SlotValue::Text(i.to_string())),
+                    (
+                        "durcls".to_owned(),
+                        SlotValue::Text(
+                            if step_is_short(step) {
+                                "macrowdur short"
+                            } else {
+                                "macrowdur"
+                            }
+                            .to_owned(),
+                        ),
+                    ),
+                    ("unit".to_owned(), SlotValue::Text(unit_tag(step))),
+                    ("unitact".to_owned(), SlotValue::Text(format!("unit|{i}"))),
+                    ("unittitle".to_owned(), SlotValue::Text(unit_title(step, i))),
                     (
                         "hold".to_owned(),
                         SlotValue::Text(hold_text(slot, &step.hold)),
@@ -1546,6 +1653,23 @@ fn macro_rows(
                     ("iaact".to_owned(), SlotValue::Text(format!("insa|{i}"))),
                     ("ibact".to_owned(), SlotValue::Text(format!("insb|{i}"))),
                     ("delact".to_owned(), SlotValue::Text(format!("del|{i}"))),
+                    // FIX 1: on the LAST remaining step the ✕ empties the row
+                    // instead of removing it, so the editor cannot build the
+                    // zero-step macro `mapping::save_macro` refuses — and the
+                    // title says which of the two it is about to do, so it
+                    // never reads as a delete that did not work.
+                    (
+                        "deltitle".to_owned(),
+                        SlotValue::Text(
+                            if only {
+                                "clear this step (a macro needs at least one — this empties the \
+                                 row instead of removing it, which is a legal neutral gap)"
+                            } else {
+                                "delete this step"
+                            }
+                            .to_owned(),
+                        ),
+                    ),
                     (
                         "upcls".to_owned(),
                         SlotValue::Text(if i == 0 { "macbtn off" } else { "macbtn" }.to_owned()),
@@ -2397,13 +2521,22 @@ fn macro_columns(persona: &str) -> Vec<MacroColumn> {
                     token: diag_token(mechanism, diag),
                     glyph: diag.glyph().to_owned(),
                     idcls: "maccolid diag",
+                    // `move_list` is FACING-RELATIVE and is labelled as such.
+                    // ksx has no notion of facing — it publishes a direction,
+                    // not a side of the screen — and it already ships the
+                    // mirrored spelling of every motion because player 2 is
+                    // not an edge case. Printing a bare "d/f" beside a compass
+                    // name reads as a second name for the same fact; it is a
+                    // second name for the fact HALF THE TIME, and is d/b for
+                    // the player standing on the right.
                     title: format!(
-                        "{}{} · {} ({}) · numpad {} · one pick, and ksx writes {} + {}",
+                        "{}{} · {} · numpad {} · {} in a move list, facing right · one pick, and \
+                         ksx writes {} + {}",
                         mechanism.group(),
                         diag.glyph(),
                         diag.words(),
-                        diag.move_list(),
                         diag.numpad(),
+                        diag.move_list(),
                         mechanism.function(true, diag.halves().0),
                         mechanism.function(false, diag.halves().1),
                     ),
@@ -2791,13 +2924,13 @@ fn scalar_slots(
         // lives in config.toml, and Studio has no config writer. See
         // `slot_macros_line`.
         "slotMacrosLine": slot_macros_line(selected),
-        "macroStepLine": "click a step's ⏱ to edit its duration",
-        "macroDurValue": "50",
-        // v15/FIX 2: the duration BOX's own class — a below-floor step is a
-        // fact about the number in that field, not about a note two elements
-        // away. SSR has no step selected, so it is the plain box. (Every
-        // variant keeps `macdurin`: map.ts finds the box by that class.)
-        "macroDurCls": "macdurin",
+        // FIX 2: this line REPORTS which step the frame maths is about; it no
+        // longer instructs anybody to select one, because a duration is now
+        // edited in the row's own box. `macroDurValue`/`macroDurCls` went with
+        // the panel field they described — the number and the warn class are
+        // per-ROW now (`macro_rows`), which is where the number is.
+        "macroStepLine": "every step's time is its own box on its own row — type in the row you \
+                          want",
         // v15/FIX 2: Save's inline question about short steps. A class string
         // plus its sentence and no show, like everything else here. An SSR
         // paint has asked nothing — every write on this card is a fetch.
@@ -4427,10 +4560,14 @@ mod tests {
             // A hand-written partial deflection: still the diagonal.
             (vec!["ly.-16384", "lx.max"], "LS ↘", "diag:ls:dr"),
             // The hat+stick double-binding EVERY in-box template writes: one
-            // presented diagonal naming both mechanisms.
+            // presented diagonal naming both mechanisms — joined by "and", not
+            // by `+`. `+` on this row means ANOTHER CONTROL ("D-pad ↘ + A"), so
+            // "D-pad + LS ↘" read as a control called "D-pad" and a control
+            // called "LS ↘": the mechanism holding half the diagonal lost its
+            // direction, and one control looked like two. See `held_label`.
             (
                 vec!["dpad.down", "dpad.right", "ly.min", "lx.max"],
-                "D-pad + LS ↘",
+                "D-pad and LS ↘",
                 "diag:dpad:dr",
             ),
         ];
@@ -4516,6 +4653,50 @@ mod tests {
         );
     }
 
+    /// THE LEDGER SURVIVES A NARROW CARD.
+    ///
+    /// `.macexp` — the span that says `↘ = dpad.down + dpad.right`, and the
+    /// only reason the fold is allowed to call two holds one control — is a
+    /// flex child of a bar capped at 52% of the card. Driven on the real page
+    /// it measured 154px at a 1440 viewport, 60px at 1100 and **0px at 820**,
+    /// `display: block` the whole way down: the honesty line disappeared with
+    /// no rule saying it should and nothing left to hover.
+    ///
+    /// So the pair is stated in the row's own `title` as well, which is the one
+    /// thing on this row that cannot be truncated — and the narrow-width drop
+    /// of the span (studio.css, `@media (max-width: 45rem)`) is now a decision
+    /// instead of an accident.
+    #[test]
+    fn the_stored_pair_is_on_the_row_itself_not_only_in_the_ledger_span() {
+        let mut payload = sample();
+        payload.macros.macros[0].steps = vec![
+            step(&["dpad.down", "dpad.right", "A"], Some(50), None, false),
+            step(&["ly.-16384", "lx.max"], Some(50), None, false),
+            step(&["B"], Some(50), None, false),
+        ];
+        let out = render_map(&page(), &payload, None);
+        let html = &out.html;
+        // The row title carries what it holds AND what the file stores.
+        assert!(
+            html.contains(
+                "step 1 holds D-pad ↘ + A for 50 ms (the engine runs it for 50 ms) \
+                 — ↘ = dpad.down + dpad.right"
+            ),
+            "the row title must carry the stored pair: {html}"
+        );
+        // …spelled as the FILE spells it, not as the canonical pair.
+        assert!(
+            html.contains("— ↘ = ly.-16384 + lx.max"),
+            "the title must quote the file, not rewrite it: {html}"
+        );
+        // A row with no diagonal gains nothing — no dangling em dash.
+        assert!(
+            html.contains("step 3 holds B for 50 ms (the engine runs it for 50 ms)\"")
+                || html.contains("step 3 holds B for 50 ms (the engine runs it for 50 ms)'"),
+            "a plain row's title is unchanged: {html}"
+        );
+    }
+
     /// The ring is STATED, under the grid, on the page a reader with no
     /// JavaScript gets — they cannot tick a cell, but they can read what the
     /// columns mean and hand-write the pair into the TOML block below.
@@ -4553,10 +4734,34 @@ mod tests {
                 column.glyph
             );
         }
-        // …but every diagonal tooltip carries it, beside the move-list form.
+        // …but every diagonal tooltip carries it, beside the move-list form —
+        // and the move-list form is LABELLED AS FACING-RELATIVE. ksx has no
+        // notion of facing (it publishes a direction, not a side of the screen)
+        // and already ships the mirrored spelling of every motion because
+        // player 2 is not an edge case. A bare "(d/f)" beside "down-right" read
+        // as a second name for the same fact; for the player standing on the
+        // right it is d/b, so it was a second name for the fact half the time.
         assert!(
-            html.contains("down-right (d/f) · numpad 3"),
-            "the tooltip is the lookup: {html}"
+            html.contains("down-right · numpad 3 · d/f in a move list, facing right"),
+            "the tooltip is the lookup, and says which way it assumes you face: {html}"
+        );
+        // …and the ring line says the same thing once, for the whole card.
+        assert!(
+            html.contains("only down-FORWARD while you face right")
+                && html.contains("ksx has no idea which way you are facing"),
+            "the ring line owns the facing caveat: {html}"
+        );
+        // THE OFF-SCREEN GROUP. 37 columns do not fit: measured on the real
+        // page the matrix is 551px of an 889px grid at a 1440 viewport, so
+        // D-PAD and RIGHT STICK are both past the edge — and the D-pad is what
+        // the motion buttons write by default. A user who sees only LEFT
+        // STICK's ring ticks LEFT STICK's ↘ on a preset whose game reads the
+        // hat, which is `Issue::MacroHoldsOtherMechanism` arriving after a
+        // save. The page has to say the other groups are there.
+        assert!(
+            html.contains("THERE ARE THREE OF THESE GROUPS")
+                && html.contains("the grid scrolls sideways to reach them"),
+            "the ring line says the groups off the edge exist: {html}"
         );
     }
 
@@ -5233,11 +5438,12 @@ mod tests {
             Some("\u{200b}"),
             "{html}"
         );
-        // The duration box is a plain box until a short step is selected.
-        assert!(html.contains(r#"class="macdurin""#), "{html}");
+        // FIX 2: the duration box is per ROW now, and it is a plain box until
+        // the number in it is below the floor.
+        assert!(html.contains(r#"class="macrowdur""#), "{html}");
         assert!(
-            !html.contains("macdurin short"),
-            "SSR selects no step: {html}"
+            !html.contains("macrowdur short"),
+            "nothing in the sample is short: {html}"
         );
         // The six motion buttons, each carrying its own payload.
         for m in ["qcf", "qcb", "hcf", "hcb", "dpf", "dpb"] {
@@ -5246,9 +5452,113 @@ mod tests {
                 "{m}: {html}"
             );
         }
-        // The labels spell the holds, so the shape is legible before a click —
-        // and the middle step of the quarter-circle is written as a chord.
-        assert!(html.contains("¼ → · ↓ · ↓+→ · →"), "{html}");
+        // FIX 3 — THE LABELS SPEAK DIAGONALS. They used to spell the pair a
+        // diagonal is stored as ("¼ → · ↓ · ↓+→ · →"), which was the right
+        // teaching move before diagonals were first-class and contradicts the
+        // abstraction now: the grid has a ↘ column, the row readout calls it
+        // one control, and only the buttons still called it two. The pair is
+        // taught in exactly ONE place — the row's expansion ledger, asserted
+        // just below.
+        assert!(html.contains("¼ → · ↓ ↘ →"), "{html}");
+        assert!(html.contains("DP → · → ↓ ↘"), "{html}");
+        assert!(
+            !html.contains("↓+→") && !html.contains("↓ + →"),
+            "a motion label still spells a diagonal as its pair: {html}"
+        );
+    }
+
+    /// FIX 1 — the editor cannot construct the zero-step macro the writer
+    /// refuses (`mapping::save_macro`: empty steps is a refusal, not a delete).
+    /// The ✕ on the LAST remaining step empties it instead of removing it, and
+    /// says so; the "＋ Add step" toolbar is above the grid and belongs to no
+    /// row, so growing a macro never depends on one already being there.
+    #[test]
+    fn the_editor_cannot_reach_a_zero_step_macro() {
+        // A macro with several steps: every ✕ is an ordinary delete.
+        let out = render_map(&page(), &sample(), None);
+        assert!(
+            out.html.contains(r#"title="delete this step""#),
+            "{}",
+            out.html
+        );
+        assert!(
+            !out.html.contains("a macro needs at least one"),
+            "a multi-step macro must not offer the clear wording: {}",
+            out.html
+        );
+
+        // …and with exactly one step left, the same button says what it will
+        // really do. A delete that silently became a clear would read as a
+        // broken delete, which is the other half of this fix.
+        let mut payload = sample();
+        payload.macros.macros[0].steps.truncate(1);
+        let out = render_map(&page(), &payload, None);
+        assert!(
+            out.html
+                .contains("clear this step (a macro needs at least one"),
+            "{}",
+            out.html
+        );
+        assert!(
+            !out.html.contains(r#"title="delete this step""#),
+            "the last step still claims it deletes: {}",
+            out.html
+        );
+
+        // The add affordance that does not live on a row — SSR'd like every
+        // other control here (hidden without JavaScript, because it edits a
+        // draft), so the seam is pinned even though the click is client-only.
+        assert!(out.html.contains(r#"class="macsteptools""#), "{}", out.html);
+        assert!(out.html.contains("＋ Add step"), "{}", out.html);
+    }
+
+    /// FIX 2 — a duration is edited ON ITS ROW: every row carries its own
+    /// number, its own `unit|N` toggle and its own index. There is no
+    /// select-a-step-first mode left to lose to a poll.
+    #[test]
+    fn every_row_carries_its_own_duration_editor() {
+        let mut payload = sample();
+        payload.macros.macros[0].steps = vec![
+            MacroStepView {
+                hold: vec!["dpad.down".to_owned()],
+                ms: Some(50),
+                frames: None,
+                allow_short: false,
+            },
+            MacroStepView {
+                hold: vec!["A".to_owned()],
+                ms: None,
+                frames: Some(3),
+                allow_short: false,
+            },
+        ];
+        let out = render_map(&page(), &payload, None);
+        let html = &out.html;
+        for (i, (value, unit)) in [("50", "ms"), ("3", "fr")].iter().enumerate() {
+            assert!(
+                html.contains(&format!(r#"data-durrow="{i}""#)),
+                "row {i} has no duration box: {html}"
+            );
+            assert!(
+                html.contains(&format!(r#"data-macact="unit|{i}""#)),
+                "row {i} has no unit toggle: {html}"
+            );
+            assert!(
+                html.contains(&format!(r#"value="{value}""#)),
+                "row {i}: {html}"
+            );
+            assert!(
+                html.contains(&format!(">{unit}<")),
+                "row {i} does not read as {unit}: {html}"
+            );
+        }
+        // The unit is the AUTHOR's, both ways round — a frames row says frames
+        // and offers ms, never the other way about.
+        assert!(html.contains("step 2 is authored in FRAMES"), "{html}");
+        assert!(
+            html.contains("step 1 is authored in MILLISECONDS"),
+            "{html}"
+        );
     }
 
     /// The copy-and-paste path is still there and is no longer the point: a

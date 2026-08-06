@@ -386,6 +386,77 @@ mod tests {
         );
     }
 
+    /// ⚠ **"CONTAINS BOTH HALVES" IS NOT "FOLDS", and the difference is a
+    /// working grid.**
+    ///
+    /// It is the obvious shortcut for anything that has to answer *is this
+    /// diagonal on?* — a mapper deciding whether a click on `↘` is a tick or an
+    /// untick, a report deciding whether to mention one — and it is wrong on
+    /// exactly the shape [`fold`] refuses: a mechanism holding BOTH polarities
+    /// of an axis. `down + right + up` contains `dpad.down` and `dpad.right`,
+    /// so contains-both says the diagonal is there; [`fold`] says it is not,
+    /// and [`fold`] is right, because which diagonal it means depends on the
+    /// slot's `socd` policy resolved at plan time.
+    ///
+    /// ksx-studio's macro grid shipped that shortcut in `macroToggleCell` and
+    /// it did what the disagreement predicts: a `↘` cell painted OFF (by
+    /// `fold`), whose own tooltip said "does not hold D-pad ↘", answered a
+    /// click by taking the UNTICK branch — wiping all three holds, leaving the
+    /// step empty and the cell still dark, and reporting that it had removed
+    /// two holds when it removed three. In the one feature whose entire promise
+    /// is that picking a diagonal gives you a diagonal.
+    ///
+    /// So the rule, stated where both mirrors read it: **ask `fold`.** The
+    /// predicate that decides what a click does has to be the predicate that
+    /// decided what the cell looks like, and there is only one of those.
+    #[test]
+    fn containing_both_halves_does_not_mean_it_folds() {
+        let both = members_of(Diag::DownRight, DirMechanism::Dpad);
+        let contradictory = [
+            dpad(DpadDirection::Down),
+            dpad(DpadDirection::Right),
+            dpad(DpadDirection::Up),
+        ];
+        // Contains-both says yes…
+        assert!(both.iter().all(|b| contradictory.contains(b)));
+        // …and the fold — the thing a grid is painted from — says no.
+        assert!(diags(&fold(&contradictory)).is_empty());
+
+        // Reachable without a hand-written file: tick ←, then →, then reach for
+        // ↘. Every one of these contains both halves of some diagonal and folds
+        // to nothing, on every mechanism.
+        for &mechanism in DirMechanism::ALL {
+            let [up, right] = members_of(Diag::UpRight, mechanism);
+            let [down, left] = members_of(Diag::DownLeft, mechanism);
+            for hold in [
+                vec![down, left, right],
+                vec![up, right, down],
+                vec![down, right, up, left],
+            ] {
+                assert!(
+                    diags(&fold(&hold)).is_empty(),
+                    "{mechanism:?}: {hold:?} folded"
+                );
+            }
+        }
+
+        // The predicate that IS correct, and the one a mirror must re-derive:
+        // does the view PRESENT this diagonal on this mechanism?
+        let shown = |hold: &[Binding], diag: Diag, mechanism: DirMechanism| {
+            fold(hold).iter().any(|h| match h {
+                Held::Diagonal {
+                    diag: d,
+                    mechanisms,
+                    ..
+                } => *d == diag && mechanisms.contains(&mechanism),
+                Held::Plain { .. } => false,
+            })
+        };
+        assert!(!shown(&contradictory, Diag::DownRight, DirMechanism::Dpad));
+        assert!(shown(&both, Diag::DownRight, DirMechanism::Dpad));
+        assert!(!shown(&both, Diag::DownRight, DirMechanism::LeftStick));
+    }
+
     #[test]
     fn duplicates_are_polarities_not_bindings() {
         let hold = [
