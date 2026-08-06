@@ -117,6 +117,9 @@ impl ksx_studio::ControlSource for PipeControlSource {
             &keys,
             request.force,
             request.reload,
+            // `bind` edits keys, never the turbo rate: None leaves whatever
+            // rate the binding already has alone.
+            None,
         ))
     }
 
@@ -798,7 +801,7 @@ mod tests {
     #[test]
     fn bind_keys_sends_the_whole_list_in_one_map_request() {
         let two = vec!["S".to_owned(), "Enter".to_owned()];
-        let wire = map_wire("IPAC P1", "A", &two, false, true);
+        let wire = map_wire("IPAC P1", "A", &two, false, true, None);
         assert_eq!(wire["verb"], "map");
         assert_eq!(wire["preset"], "IPAC P1");
         assert_eq!(wire["function"], "A");
@@ -808,14 +811,14 @@ mod tests {
         assert_eq!(wire["reload"], true);
 
         // One key: the single-key request, unchanged.
-        let one = map_wire("IPAC P1", "A", &["G".to_owned()], true, false);
+        let one = map_wire("IPAC P1", "A", &["G".to_owned()], true, false, None);
         assert_eq!(one["key"], "G");
         assert!(one.get("keys").is_none(), "{one}");
         assert_eq!(one["force"], true);
 
         // The empty list is the clear — removing a control's last key must
         // leave the inert "None" placeholder, not a silently missing row.
-        let none = map_wire("IPAC P1", "A", &[], false, true);
+        let none = map_wire("IPAC P1", "A", &[], false, true, None);
         assert_eq!(none["clear"], true);
         assert!(none.get("key").is_none(), "{none}");
         assert!(none.get("keys").is_none(), "{none}");
@@ -828,6 +831,7 @@ mod tests {
             &Some("G".to_owned()).into_iter().collect::<Vec<_>>(),
             true,
             false,
+            None,
         );
         assert_eq!(via_bind, one);
     }
