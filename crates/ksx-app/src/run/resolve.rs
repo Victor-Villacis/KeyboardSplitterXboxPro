@@ -182,6 +182,7 @@ pub fn apply(
     // to start a one-player game because an unrelated `[[device]]` is unplugged
     // would be the same unhelpfulness this module exists to delete.
     let mut resolved: Vec<(&DeviceEntry, DeviceId)> = Vec::new();
+    let mut missing: Vec<&DeviceEntry> = Vec::new();
     for device in devices {
         let written = device.id.as_device_id();
         if !used.contains(&written) || !needs_matching(device.id.selector()) {
@@ -189,13 +190,7 @@ pub fn apply(
         }
         match device.id.selector().match_against(connected) {
             Match::One(facts) => resolved.push((device, facts.id.clone())),
-            Match::None => {
-                return Err(ResolveError::Missing {
-                    alias: device.alias.clone(),
-                    written: device.id.raw().to_owned(),
-                    replug_proof: device.id.selector().survives_replug(),
-                })
-            }
+            Match::None => missing.push(device),
             Match::Ambiguous(hits) => {
                 return Err(ResolveError::Ambiguous {
                     alias: device.alias.clone(),
@@ -210,6 +205,7 @@ pub fn apply(
     }
 
     collision_check(&resolved)?;
+    drop_missing(plan, &missing)?;
 
     // Identity mappings are the common case (a legacy full instance path
     // resolves to itself), and they must not be reported as a change.
@@ -250,6 +246,89 @@ pub fn apply(
                 device.id.raw()
             ));
         }
+    }
+    Ok(())
+}
+
+/// A board a slot names is not connected: drop what cannot work, keep what can.
+///
+/// Refusing the whole session here is the wrong trade for an arcade cabinet.
+/// One unplugged trackball would take all eight players down, and before this
+/// module existed an absent device took down only what actually needed it — so
+/// a blanket refusal would be a regression wearing a safety check's clothes.
+///
+/// The mouse case is the sharpest: M4 never sets the mouse class filter at all
+/// (see [`crate::run::plan`]), so a slot's mouse is parsed, stored and never
+/// read. Refusing eight players over a device ksx does not yet even capture is
+/// indefensible. A missing mouse is therefore dropped silently-but-noted, and
+/// that slot keeps playing on its keyboard.
+///
+/// A missing *keyboard* is different — that player has no input at all — so the
+/// slot goes, and its number is named so it is obvious who lost their controls.
+/// Everyone else still plays.
+///
+/// The one case that still refuses outright is a plan with **no slots left**.
+/// There is then nothing to run, and starting silently would look like success
+/// while the panel stayed dead — the exact failure this module exists to end.
+fn drop_missing(plan: &mut RunPlan, missing: &[&DeviceEntry]) -> Result<(), ResolveError> {
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let gone: BTreeSet<DeviceId> = missing.iter().map(|d| d.id.as_device_id()).collect();
+
+    let mut lost_mice: Vec<u8> = Vec::new();
+    for slot in &mut plan.slots {
+        if slot.spec.mouse.as_ref().is_some_and(|m| gone.contains(m)) {
+            slot.spec.mouse = None;
+            lost_mice.push(slot.spec.number);
+        }
+    }
+
+    let lost_slots: Vec<u8> = plan
+        .slots
+        .iter()
+        .filter(|s| s.spec.keyboard.as_ref().is_some_and(|k| gone.contains(k)))
+        .map(|s| s.spec.number)
+        .collect();
+    plan.slots
+        .retain(|s| !s.spec.keyboard.as_ref().is_some_and(|k| gone.contains(k)));
+
+    plan.captureable.retain(|id| !gone.contains(id));
+    plan.winusb.retain(|id| !gone.contains(id));
+
+    if plan.slots.is_empty() {
+        let first = missing[0];
+        return Err(ResolveError::Missing {
+            alias: first.alias.clone(),
+            written: first.id.raw().to_owned(),
+            replug_proof: first.id.selector().survives_replug(),
+        });
+    }
+
+    for device in missing {
+        plan.notes.push(format!(
+            "[WARN] device \"{}\" (id = '{}') is not connected{}",
+            device.alias,
+            device.id.raw(),
+            if device.id.selector().survives_replug() {
+                ""
+            } else {
+                " — this id names one specific USB socket, so moving the board \
+                 to another port breaks it (docs/DEVICE-IDENTITY.md §1)"
+            }
+        ));
+    }
+    if !lost_slots.is_empty() {
+        plan.notes.push(format!(
+            "[WARN] slot(s) {lost_slots:?} have no keyboard and will NOT play this session; \
+             the remaining slots start normally"
+        ));
+    }
+    if !lost_mice.is_empty() {
+        plan.notes.push(format!(
+            "[WARN] slot(s) {lost_mice:?} lost their mouse, which M4 never reads anyway; \
+             those slots play on their keyboard as usual"
+        ));
     }
     Ok(())
 }
@@ -369,6 +448,108 @@ mod tests {
         let (mut plan, config) = plan_for(id);
         apply(&mut plan, &config.devices, connected)?;
         Ok(plan)
+    }
+
+    /// A board that is NOT in `connected` in any of these tests — a second
+    /// panel, or a trackball, that is simply unplugged tonight.
+    const ABSENT: &str = r"USB\VID_D209&PID_0430&MI_00\7&DEADBEEF&0&0000";
+
+    fn resolve_config(toml_src: &str, connected: &[DeviceFacts]) -> Result<RunPlan, ResolveError> {
+        let config: ConfigFile = toml::from_str(toml_src).unwrap();
+        let mut plan =
+            crate::run::plan::build_plan(&config, &GamesFile::default(), &presets(), None).unwrap();
+        apply(&mut plan, &config.devices, connected)?;
+        Ok(plan)
+    }
+
+    /// **The eight-players-down bug.** An unplugged second panel must cost its
+    /// own slot and nothing else. Refusing here would mean one loose cable in
+    /// the back of the cabinet blanks the whole machine for everybody.
+    #[test]
+    fn an_unplugged_second_panel_drops_only_its_own_slot_and_everyone_else_plays() {
+        let plan = resolve_config(
+            &format!(
+                "schema_version = 1\n\n\
+                 [[device]]\nid = '{LIVE_PATH}'\nalias = \"ipac\"\nbackend = \"winusb\"\n\n\
+                 [[device]]\nid = '{ABSENT}'\nalias = \"panel2\"\nbackend = \"winusb\"\n\n\
+                 [[slot]]\nnumber = 1\nkeyboard = \"ipac\"\npreset = \"P1\"\n\n\
+                 [[slot]]\nnumber = 2\nkeyboard = \"panel2\"\npreset = \"P1\"\n"
+            ),
+            &[ipac("7&25EEA38C&0&0000")],
+        )
+        .expect("one unplugged panel must not refuse the session");
+
+        let numbers: Vec<u8> = plan.slots.iter().map(|s| s.spec.number).collect();
+        assert_eq!(
+            numbers,
+            vec![1],
+            "slot 1 keeps playing; only slot 2 is lost"
+        );
+        // The absent board must not survive anywhere the session would act on.
+        assert!(!plan.captureable.iter().any(|id| id.as_str() == ABSENT));
+        assert!(!plan.winusb.iter().any(|id| id.as_str() == ABSENT));
+        // ...and losing a player is never silent.
+        assert!(
+            plan.notes.iter().any(|n| n.contains("panel2")),
+            "the missing board must be named: {:?}",
+            plan.notes
+        );
+        assert!(
+            plan.notes.iter().any(|n| n.contains("[2]")),
+            "the slot that lost its controls must be named: {:?}",
+            plan.notes
+        );
+    }
+
+    /// **The sharpest case in the audit.** M4 never sets the mouse class filter,
+    /// so a slot's mouse is stored and never read — refusing a session over one
+    /// would take players down for a device ksx does not even capture yet.
+    #[test]
+    fn an_unplugged_mouse_never_costs_a_player_their_keyboard() {
+        let plan = resolve_config(
+            &format!(
+                "schema_version = 1\n\n\
+                 [[device]]\nid = '{LIVE_PATH}'\nalias = \"ipac\"\nbackend = \"winusb\"\n\n\
+                 [[device]]\nid = '{ABSENT}'\nalias = \"ball\"\n\n\
+                 [[slot]]\nnumber = 1\nkeyboard = \"ipac\"\nmouse = \"ball\"\npreset = \"P1\"\n"
+            ),
+            &[ipac("7&25EEA38C&0&0000")],
+        )
+        .expect("an unplugged trackball must not refuse the session");
+
+        assert_eq!(plan.slots.len(), 1, "the player keeps playing");
+        assert_eq!(plan.slots[0].spec.number, 1);
+        assert!(plan.slots[0].spec.mouse.is_none(), "the dead mouse is gone");
+        assert_eq!(
+            plan.slots[0].spec.keyboard.as_ref().map(|k| k.as_str()),
+            Some(LIVE_PATH),
+            "their keyboard is untouched"
+        );
+        assert!(
+            plan.notes.iter().any(|n| n.contains("ball")),
+            "still reported: {:?}",
+            plan.notes
+        );
+    }
+
+    /// Degrading is not the same as pretending. With nothing left that could
+    /// play, a "successful" start is a dead panel with no error anywhere — the
+    /// precise failure this module was written to end.
+    #[test]
+    fn when_no_slot_survives_it_still_refuses_rather_than_starting_dead() {
+        let err = resolve_config(
+            &format!(
+                "schema_version = 1\n\n\
+                 [[device]]\nid = '{ABSENT}'\nalias = \"ipac\"\nbackend = \"winusb\"\n\n\
+                 [[slot]]\nnumber = 1\nkeyboard = \"ipac\"\npreset = \"P1\"\n"
+            ),
+            &[ipac("7&25EEA38C&0&0000")],
+        )
+        .expect_err("no playable slot left must refuse");
+        let ResolveError::Missing { alias, .. } = &err else {
+            panic!("expected Missing, got {err:?}");
+        };
+        assert_eq!(alias, "ipac");
     }
 
     /// **The owner's live config.** A legacy port-pinned entry whose board has
