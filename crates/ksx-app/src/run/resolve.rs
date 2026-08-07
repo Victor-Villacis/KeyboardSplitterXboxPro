@@ -171,9 +171,19 @@ pub fn connected() -> std::io::Result<Vec<DeviceFacts>> {
 /// where the USB tree may not even be readable.
 pub fn needs_enumeration(plan: &RunPlan, devices: &[DeviceEntry]) -> bool {
     let used = used_ids(plan);
-    devices
-        .iter()
-        .any(|d| used.contains(&d.id.as_device_id()) && needs_matching(d.id.selector()))
+    devices.iter().any(|d| {
+        needs_matching(d.id.selector())
+            // A slot names this entry by the spelling it was written with...
+            && (used.contains(&d.id.as_device_id())
+                // ...or the entry declares a WinUSB board, which must be
+                // classified against the live tree no matter how a slot spells
+                // it. Without this clause an entry a slot names longhand is
+                // invisible here, enumeration is skipped, `classify_backends`
+                // never runs, and the session quietly falls back to Interception
+                // on a claimed board — a dead panel that reports success.
+                // Interception-only configurations still never enumerate.
+                || d.backend == ksx_config::Backend::Winusb)
+    })
 }
 
 /// Rewrite every configured spelling in `plan` to the concrete interface that
@@ -223,6 +233,7 @@ pub fn apply(
         .map(|(device, id)| (device.id.as_device_id(), id.clone()))
         .collect();
     if rewrites.is_empty() {
+        classify_backends(plan, devices, connected);
         return Ok(());
     }
 
@@ -255,7 +266,46 @@ pub fn apply(
             ));
         }
     }
+    classify_backends(plan, devices, connected);
     Ok(())
+}
+
+/// Which captured boards are on `winusb.sys`, decided by **identity** rather
+/// than by spelling.
+///
+/// `build_plan` seeds `plan.winusb` by comparing a `[[device]]` entry's written
+/// id against a slot's, as strings. That is correct only while both spell the
+/// board the same way — and they routinely do not. A slot may name a board by
+/// alias, or spell its devnode out longhand; `games.toml` files written before
+/// `ksx device pick` existed hold the longhand path, while the `[[device]]`
+/// entry `pick` writes holds a `usb:` selector. Two spellings, one board, no
+/// string match.
+///
+/// Found on the cabinet 2026-08-07, and the consequence is not cosmetic:
+/// `winusb` came back empty, so the session fell back to Interception — which
+/// **cannot see a WinUSB-claimed board at all**. It would have started cleanly,
+/// reported success, and left the panel completely dead.
+///
+/// A `[[device]]` entry declares what a board *is*, including which driver owns
+/// it, so that declaration has to reach the board however a slot happens to name
+/// it. Runs after the rewrites above, when every id is concrete.
+fn classify_backends(plan: &mut RunPlan, devices: &[DeviceEntry], connected: &[DeviceFacts]) {
+    for device in devices {
+        if device.backend != ksx_config::Backend::Winusb || !needs_matching(device.id.selector()) {
+            continue;
+        }
+        // Post-rewrite the entry may already be listed; matching is idempotent.
+        let id = match device.id.selector().match_against(connected) {
+            Match::One(facts) => facts.id.clone(),
+            // Ambiguous and None are refusals when a slot needs this entry, and
+            // that already happened above. An entry no slot uses is simply not
+            // this session's business.
+            _ => continue,
+        };
+        if plan.captureable.contains(&id) && !plan.winusb.contains(&id) {
+            plan.winusb.push(id);
+        }
+    }
 }
 
 /// A board a slot names is not connected: drop what cannot work, keep what can.
@@ -537,6 +587,48 @@ mod tests {
             plan.notes.iter().any(|n| n.contains("ball")),
             "still reported: {:?}",
             plan.notes
+        );
+    }
+
+    /// **The dead-panel bug, found on the cabinet.** A game profile written
+    /// before `device pick` existed spells the board out longhand, while the
+    /// `[[device]]` entry now holds a `usb:` selector. `build_plan` compares
+    /// those as strings, finds no match, and leaves `winusb` empty — so the
+    /// session falls back to Interception, which cannot see a claimed board.
+    /// It starts, reports success, and nothing works.
+    #[test]
+    fn a_slot_that_spells_the_board_longhand_still_gets_its_winusb_backend() {
+        let config: ConfigFile = toml::from_str(&format!(
+            "schema_version = 1\n\n\
+             [[device]]\nid = 'usb:d209:0430:00'\nalias = \"ipac\"\nbackend = \"winusb\"\n\n\
+             [[slot]]\nnumber = 1\nkeyboard = '{LIVE_PATH}'\npreset = \"P1\"\n"
+        ))
+        .unwrap();
+        let mut plan =
+            crate::run::plan::build_plan(&config, &GamesFile::default(), &presets(), None).unwrap();
+        // The defect, before resolution: one board, two spellings, no match.
+        assert!(
+            plan.winusb.is_empty(),
+            "precondition: build_plan cannot match two spellings"
+        );
+        // ...and the half that made the first fix silently do nothing: the
+        // entry is not in `used_ids` under this spelling, so without the
+        // backend clause nothing would enumerate and `apply` would never run.
+        assert!(
+            needs_enumeration(&plan, &config.devices),
+            "a winusb entry must force enumeration however a slot spells it"
+        );
+
+        apply(&mut plan, &config.devices, &[ipac("7&25EEA38C&0&0000")]).unwrap();
+
+        assert_eq!(
+            plan.winusb,
+            vec![DeviceId::from(LIVE_PATH)],
+            "the [[device]] entry's backend must reach the board a slot named longhand"
+        );
+        assert!(
+            !plan.needs_interception(),
+            "falling back to Interception on a claimed board is the dead panel"
         );
     }
 
