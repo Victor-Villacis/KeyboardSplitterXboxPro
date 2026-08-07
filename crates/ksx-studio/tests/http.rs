@@ -854,8 +854,8 @@ impl ksx_api::MachineSource for ScriptedMachine {
     // THIS machine; the pad answers are the fixed fixture's, so every pads
     // assertion reads one fixture regardless of which harness built the
     // server.
-    fn pads_view(&self) -> Result<ksx_api::PadsView, Refusal> {
-        FixedMachine.pads_view()
+    fn pads_view(&self, session_running: bool) -> Result<ksx_api::PadsView, Refusal> {
+        FixedMachine.pads_view(session_running)
     }
 
     fn pads(&self, spec: &ksx_api::PadsSpawnSpec) -> Result<String, Refusal> {
@@ -878,11 +878,19 @@ struct FixedMachine;
 
 /// One count option over the ceiling, so the page's warning has something real
 /// to render. The label is the PROVIDER's — the whole point of task #16's
-/// warning is that the backend writes that sentence, not the page.
-const OVER_CEILING_LABEL: &str = "8 pads — only 3 readable, 5 invisible to games (XInput)";
+/// warning is that the backend writes that sentence, not the page — and it
+/// NAMES the persona it applies to, because the same click costs nothing on a
+/// HID pad.
+const OVER_CEILING_LABEL: &str = "8 pads — only 3 readable as xbox360, all 8 as playstation";
+
+/// A machine whose read FAILS. Not an empty bus — a bus ksx never managed to
+/// look at, which is a different page and a different sentence.
+struct UnreadableMachine;
+
+impl ksx_api::MachineSource for UnreadableMachine {}
 
 impl ksx_api::MachineSource for FixedMachine {
-    fn pads_view(&self) -> Result<ksx_api::PadsView, Refusal> {
+    fn pads_view(&self, session_running: bool) -> Result<ksx_api::PadsView, Refusal> {
         Ok(ksx_api::PadsView {
             generated_at: "test".into(),
             summary: "2 virtual pads on the ViGEm bus:".into(),
@@ -901,14 +909,25 @@ impl ksx_api::MachineSource for FixedMachine {
                     xinput: false,
                 },
             ],
+            bus_line: "ROOT\\SYSTEM\\0002".into(),
             owners: vec!["ksx.exe (pid 1)".into()],
-            session_running: false,
+            owners_line: "ksx.exe (pid 1)".into(),
+            // Echoed, so a test can prove ONE session read fed both the header
+            // pill and the spawn panel rather than two round-trips that can
+            // disagree inside a single render.
+            session_running,
             xinput_ceiling: 4,
-            xinput_in_use: 1,
+            xinput_in_use: Some(1),
             xinput_line: "Windows exposes exactly 4 XInput slots and no virtual bus can create \
                           a fifth."
                 .into(),
             elevated: Some(false),
+            elevation_line: "ksx is NOT running elevated, and ksx never self-elevates — this \
+                             prune will be refused."
+                .into(),
+            confirm_line: "This removes 2 pad(s) by restarting the ViGEmBus devnode. Every pad \
+                           listed here goes, at once:"
+                .into(),
             prune: ksx_api::PrunePlanView {
                 kind: "restart".into(),
                 count: 2,
@@ -935,7 +954,7 @@ impl ksx_api::MachineSource for FixedMachine {
                     label: "10 seconds".into(),
                 }],
                 note: "A spawn is a TEST".into(),
-                refused: None,
+                refused: session_running.then(|| "a session is running".to_owned()),
             },
         })
     }
@@ -966,6 +985,17 @@ impl ksx_api::MachineSource for FixedMachine {
 /// race is acceptable in a local test.
 fn start_server(control: Arc<ScriptedControl>) -> SocketAddr {
     start_server_with_machine(control, Arc::new(ScriptedMachine::default()))
+}
+
+/// The same server with a chosen machine provider, boxed — the only axis any
+/// /pads test needs to vary. Sugar over [`start_server_with_machine`], kept
+/// because the pads fixtures are stateless and a `Box::new(UnreadableMachine)`
+/// at the call site reads better than an `Arc` it will never share.
+fn start_server_with(
+    control: Arc<ScriptedControl>,
+    machine: Box<dyn ksx_api::MachineSource>,
+) -> SocketAddr {
+    start_server_with_machine(control, Arc::from(machine))
 }
 
 /// …with a MACHINE provider of the caller's choosing — the seam a refused
@@ -1060,6 +1090,19 @@ fn start_server_with_machine(
             request: &ksx_api::ImportRequest,
         ) -> Result<ksx_api::ImportReport, Refusal> {
             self.0.config_import(request)
+        }
+        // The /pads verbs. A wrapper that forgot these would hand every pads
+        // test the trait's default refusals — the page would render its
+        // banner and every assertion about the bus would fail against a
+        // fixture that answered perfectly well.
+        fn pads_view(&self, session_running: bool) -> Result<ksx_api::PadsView, Refusal> {
+            self.0.pads_view(session_running)
+        }
+        fn pads(&self, spec: &ksx_api::PadsSpawnSpec) -> Result<String, Refusal> {
+            self.0.pads(spec)
+        }
+        fn pads_prune(&self, confirm: bool) -> Result<String, Refusal> {
+            self.0.pads_prune(confirm)
         }
     }
     std::thread::spawn(move || {
@@ -3303,6 +3346,94 @@ fn the_pads_page_warns_about_the_xinput_ceiling_before_the_button_is_pressed() {
         body.contains(OVER_CEILING_LABEL),
         "the over-ceiling count must warn in its own option label: {body}"
     );
+    // The warning has to name the persona it applies to. A persona-blind "4
+    // invisible to games" contradicts the persona `<select>` beside it, the
+    // card paragraph above it and the post-submit flash — three sentences on
+    // one screen disagreeing about one click.
+    assert!(
+        body.contains("as xbox360") && body.contains("as playstation"),
+        "the count warning must say which persona it applies to: {body}"
+    );
+}
+
+/// **One session read feeds the whole render.**
+///
+/// Fails against the version this replaced, where `collect_pads` called
+/// `control.session()` and then `pads_view()` dialled the daemon pipe a second
+/// time on its own. Two round-trips are two points in time: a session starting
+/// between them painted an "idle" header pill beside a spawn panel refused
+/// because a session was running — or, worse, the reverse, offering a Spawn
+/// button the verb would refuse. Here the fixture ECHOES what it was told, so
+/// the two halves of the page can only agree if one read produced both.
+#[test]
+fn the_page_reads_the_session_once_and_both_halves_agree() {
+    for running in [false, true] {
+        let control = Arc::new(ScriptedControl::new(true));
+        control.running.store(running, Ordering::SeqCst);
+        let addr = start_server(control);
+        let response = get(addr, "/pads");
+        let body = body_of(&response);
+
+        let value: serde_json::Value =
+            serde_json::from_str(body_of(&get(addr, "/api/pads"))).expect("json");
+        assert_eq!(
+            value["pads"]["session_running"],
+            serde_json::json!(running),
+            "the machine view must have been told what the control read said"
+        );
+        assert_eq!(value["session"]["running"], serde_json::json!(running));
+
+        if running {
+            // The panel is refused AND the pill says running — one answer.
+            assert!(body.contains("a session is running"), "{body}");
+            assert!(
+                !body.contains(r#"action="/pads/spawn""#),
+                "a running session must not be offered a Spawn button: {body}"
+            );
+        } else {
+            assert!(body.contains(r#"action="/pads/spawn""#), "{body}");
+        }
+    }
+}
+
+/// **A refused read is not an empty bus.**
+///
+/// The default `MachineSource` refuses every verb in words, which is what a
+/// surface with no provider wired sees. Fails against the version this
+/// replaced, which rendered a `PadsView::default()` through the same seam: the
+/// devnode line asserted "ViGEmBus is not installed", four ghost tiles drew an
+/// empty four-slot cabinet, and the prune panel said there was nothing to do —
+/// three claims about a machine ksx had never managed to look at, under a
+/// banner saying the read had failed.
+#[test]
+fn a_provider_that_cannot_answer_says_so_instead_of_showing_a_clean_bus() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server_with(control, Box::new(UnreadableMachine));
+    let response = get(addr, "/pads");
+    let body = body_of(&response);
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "never a 500: {response}"
+    );
+    assert!(
+        body.contains("ksx could not read the ViGEm bus"),
+        "the banner must say the read failed: {body}"
+    );
+    for absence in [
+        "not installed",
+        ">empty<",
+        "Nothing for this panel to do",
+        "no virtual pads on the ViGEm bus",
+    ] {
+        assert!(
+            !body.contains(absence),
+            "a failed read rendered '{absence}', a claim about a machine never read: {body}"
+        );
+    }
+    // …and neither verb is offered, because neither can be described.
+    assert!(!body.contains(r#"action="/pads/spawn""#), "{body}");
+    assert!(!body.contains(r#"href="/pads?confirm=1""#), "{body}");
 }
 
 /// The spawn form's values reach the verb intact — the echo proves all three.
@@ -3361,6 +3492,18 @@ fn prune_is_absent_until_armed_and_then_names_every_pad() {
     assert!(armed.contains(r"USB\TEST\PAD2"), "{armed}");
     // Elevation is stated before the click, not discovered after the refusal.
     assert!(armed.contains("NOT running elevated"), "{armed}");
+    // …and the confirmation does not navigate itself away while it is being
+    // read. The no-JS refresh targets "/pads" with no query string, so it
+    // would drop `?confirm=1` and drop the reader back to the disarmed view
+    // five seconds in — every time, on a list that can be fifteen rows long.
+    assert!(
+        !armed.contains("http-equiv=\"refresh\""),
+        "an armed confirmation must not carry a refresh timer: {armed}"
+    );
+    assert!(
+        unarmed.contains(r#"content="5; url=/pads""#),
+        "the unarmed page is a live view and keeps its refresh: {unarmed}"
+    );
 }
 
 /// `confirm` is what turns a dry run into a bus restart, and a POST that did

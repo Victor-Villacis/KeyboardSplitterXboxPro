@@ -536,7 +536,7 @@ pub fn prune(_yes: bool, _json: bool) -> anyhow::Result<()> {
 /// Windows-only thing in the module is [`plug_and_hold`], which is the driver
 /// plumbing the decision authorises.
 ///
-/// Two properties the console versions got for free and a surface does not:
+/// Three properties the console versions got for free and a surface does not:
 ///
 /// - **An end.** `ksx pads` holds the pattern until `--hold-secs` expires or
 ///   the user presses Ctrl+C. A web page has neither, so the hold is part of
@@ -545,13 +545,20 @@ pub fn prune(_yes: bool, _json: bool) -> anyhow::Result<()> {
 ///   command to know emulation is stopped. Nothing on a page carries that
 ///   knowledge, so [`plan_spawn`] refuses while a session is live — the same
 ///   refusal, and for the same reason, [`plan_prune`] already makes.
+/// - **A total.** A console operator sees the pads accumulate and stops. A
+///   button does not: five submits of `count=16` leave eighty pads on the bus
+///   for two minutes, and the recovery — a prune — is refused to the
+///   unelevated process a browser-launched Studio usually is. So
+///   [`SpawnPlan::BusFull`] bounds the TOTAL, not the request, and
+///   [`spawn_offer`] stops offering counts that would not fit.
 ///
 /// What it deliberately does NOT do is refuse a count above the XInput
 /// ceiling. `ksx pads --count 8 --persona xbox360` plugs eight pads today and
 /// four of them are invisible to every game (open task #16); changing that is
 /// that task's job. What this adds is the sentence saying so, attached to the
 /// option that would cause it, so a surface can warn BEFORE the click without
-/// knowing why four is the number.
+/// knowing why four is the number — and NAMING the persona it applies to,
+/// because the same click costs nothing on a HID pad.
 #[cfg_attr(not(any(feature = "studio", feature = "cabinet")), allow(dead_code))]
 pub mod surface {
     use ksx_core::{Persona, MAX_SLOTS, MAX_XINPUT_SLOTS};
@@ -581,30 +588,46 @@ pub mod surface {
         BadCount { given: u8 },
         /// Outside `1..=MAX_HOLD_SECS`.
         BadHold { given: u64 },
+        /// The bus already carries enough pads that this spawn would push the
+        /// total past [`MAX_SLOTS`].
+        ///
+        /// A per-call bound is not a bound: nothing stopped five submits of
+        /// `count=16` from leaving eighty pads on the bus for two minutes,
+        /// and the only cleanup is a prune that an unelevated Studio cannot
+        /// perform. So the ceiling is on the TOTAL, not on the request.
+        BusFull { on_bus: usize, requested: u8 },
         /// Plug them, hold the pattern, unplug.
         Plug {
             count: u8,
             persona: Persona,
             hold_secs: u64,
             /// How many of the requested pads no game will be able to read,
-            /// because the XInput slots ran out. Zero for HID personas, and
-            /// zero is the normal answer.
-            unreadable: u8,
+            /// because the XInput slots ran out. `Some(0)` for HID personas,
+            /// and `Some(0)` is the normal answer.
+            ///
+            /// `None` means the XInput slots could not be READ — which is a
+            /// different sentence from "none are taken" and must render as a
+            /// different sentence (see [`crate::pads::surface::xinput_line`]).
+            unreadable: Option<u8>,
         },
     }
 
     /// Decide, given what the caller asked for and what the machine is doing.
     ///
-    /// `xinput_in_use` is the count of pads ALREADY on the bus that hold an
-    /// XInput slot — the input a page cannot compute for itself, and the one
-    /// that makes "4 pads" a different promise on a busy cabinet than on an
-    /// idle one.
+    /// `xinput_in_use` is how many of Windows' four XInput slots hold a pad
+    /// right now — from [`ksx_platform::xinput::slots_in_use`], which asks
+    /// XInput itself rather than counting ViGEmBus children. `None` is
+    /// "could not ask", never "none".
+    ///
+    /// `on_bus` is how many pads the ViGEm bus is already carrying, and it is
+    /// what makes the ceiling a ceiling rather than a per-click suggestion.
     pub fn plan_spawn(
         count: u8,
         persona: Persona,
         hold_secs: u64,
         session_running: bool,
-        xinput_in_use: u8,
+        xinput_in_use: Option<u8>,
+        on_bus: usize,
     ) -> SpawnPlan {
         if session_running {
             return SpawnPlan::SessionRunning;
@@ -618,26 +641,40 @@ pub mod surface {
         if !persona.can_plug() {
             return SpawnPlan::PersonaNotImplemented { persona };
         }
+        if on_bus.saturating_add(usize::from(count)) > usize::from(MAX_SLOTS) {
+            return SpawnPlan::BusFull {
+                on_bus,
+                requested: count,
+            };
+        }
         SpawnPlan::Plug {
             count,
             persona,
             hold_secs,
-            unreadable: unreadable_count(count, persona, xinput_in_use),
+            unreadable: unreadable_count(count, persona, xinput_free(xinput_in_use)),
         }
     }
 
-    /// XInput slots still free for a NEW pad.
-    pub fn xinput_free(xinput_in_use: u8) -> u8 {
-        MAX_XINPUT_SLOTS.saturating_sub(xinput_in_use)
+    /// XInput slots still free for a NEW pad. `None` in, `None` out — a
+    /// reading that failed cannot be turned into a free count by arithmetic.
+    pub fn xinput_free(xinput_in_use: Option<u8>) -> Option<u8> {
+        xinput_in_use.map(|used| MAX_XINPUT_SLOTS.saturating_sub(used))
+    }
+
+    /// How many pads a spawn may still add before the total on the bus passes
+    /// [`MAX_SLOTS`].
+    pub fn spawn_headroom(on_bus: usize) -> u8 {
+        MAX_SLOTS.saturating_sub(u8::try_from(on_bus).unwrap_or(u8::MAX))
     }
 
     /// How many of `count` pads of this persona no game could read.
-    fn unreadable_count(count: u8, persona: Persona, xinput_in_use: u8) -> u8 {
-        if persona.is_xinput() {
-            count.saturating_sub(xinput_free(xinput_in_use))
-        } else {
-            0
+    fn unreadable_count(count: u8, persona: Persona, free: Option<u8>) -> Option<u8> {
+        if !persona.is_xinput() {
+            // Nothing to read and nothing to fail to read: a HID pad takes no
+            // XInput slot, so this answer does not depend on the reading.
+            return Some(0);
         }
+        free.map(|free| count.saturating_sub(free))
     }
 
     impl SpawnPlan {
@@ -648,6 +685,7 @@ pub mod surface {
                 SpawnPlan::PersonaNotImplemented { .. } => Some("persona-not-implemented"),
                 SpawnPlan::BadCount { .. } => Some("bad-count"),
                 SpawnPlan::BadHold { .. } => Some("bad-hold"),
+                SpawnPlan::BusFull { .. } => Some("bus-full"),
                 SpawnPlan::Plug { .. } => None,
             }
         }
@@ -669,6 +707,10 @@ pub mod surface {
                 SpawnPlan::BadHold { given } => {
                     format!("hold must be 1..={MAX_HOLD_SECS} seconds, got {given}")
                 }
+                SpawnPlan::BusFull { on_bus, requested } => format!(
+                    "the bus already carries {on_bus} pad(s) and ksx's ceiling is {MAX_SLOTS}, \
+                     so {requested} more will not fit — prune first"
+                ),
                 SpawnPlan::Plug {
                     count,
                     persona,
@@ -680,10 +722,15 @@ pub mod surface {
                         persona.as_str()
                     );
                     match unreadable {
-                        0 => format!("{head}."),
-                        n => format!(
+                        Some(0) => format!("{head}."),
+                        Some(n) => format!(
                             "{head}. {n} of them are past Windows' {MAX_XINPUT_SLOTS} XInput \
                              slots and no game can read those."
+                        ),
+                        // Not "all of them are readable". ksx did not look.
+                        None => format!(
+                            "{head}. ksx could not read the XInput slots, so it cannot say how \
+                             many of them a game will see."
                         ),
                     }
                 }
@@ -699,6 +746,9 @@ pub mod surface {
                 SpawnPlan::BadCount { .. } | SpawnPlan::BadHold { .. } => {
                     Some("pick a value from the list".to_owned())
                 }
+                SpawnPlan::BusFull { .. } => {
+                    Some("clear the bus first (`ksx pads --prune`), or ask for fewer".to_owned())
+                }
                 SpawnPlan::Plug { .. } => None,
             }
         }
@@ -707,48 +757,86 @@ pub mod surface {
     /// The XInput ceiling, stated for THIS machine right now — the sentence
     /// task #16 exists because nothing said.
     ///
-    /// `unknown` is how many pads the bus reports that ksx could not classify.
-    /// They are not counted as XInput (guessing would be worse), but a free
-    /// count computed without them is optimistic and the sentence says so
-    /// rather than quietly being wrong.
-    pub fn xinput_line(xinput_in_use: u8, unknown: usize) -> String {
-        let free = xinput_free(xinput_in_use);
-        let mut line = format!(
+    /// `xinput_in_use` comes from XInput itself, not from the ViGEm bus's
+    /// child list, and the difference is the whole point. The bus can only
+    /// ever show ksx its OWN virtual pads (`ksx_platform::virtual_pads`'s
+    /// module header says so); a cabinet with two real wired Xbox pads and no
+    /// virtual ones would report zero, and "so four more will be readable"
+    /// would be wrong by two with nothing on the page hedging it.
+    ///
+    /// `None` is a FAILED READING and says so. It does not become zero, and
+    /// the sentence does not promise a free count it never obtained.
+    ///
+    /// Even a successful reading only supports "at most": another process can
+    /// take a slot between this read and the plug.
+    pub fn xinput_line(xinput_in_use: Option<u8>) -> String {
+        let head = format!(
             "Windows exposes exactly {MAX_XINPUT_SLOTS} XInput slots and no virtual bus can \
-             create a fifth. {xinput_in_use} of them {} held by pads already on the bus, so {} \
-             more xbox360 pad(s) will be readable. PlayStation pads are plain HID and use none \
-             of the four.",
-            if xinput_in_use == 1 { "is" } else { "are" },
-            free
+             create a fifth."
+        );
+        let tail = "PlayStation pads are plain HID and use none of the four.";
+        let Some(in_use) = xinput_in_use else {
+            return format!(
+                "{head} ksx could not read how many of them are in use, so it cannot say how \
+                 many more xbox360 pad(s) a game would see — that is a reading that failed, not \
+                 an empty machine. {tail}"
+            );
+        };
+        let free = MAX_XINPUT_SLOTS.saturating_sub(in_use);
+        let mut line = format!(
+            "{head} {in_use} of them {} in use right now — by any pad on this machine, real or \
+             virtual — so at most {free} more xbox360 pad(s) will be readable. {tail}",
+            if in_use == 1 { "is" } else { "are" },
         );
         if free == 0 {
             line.push_str(" Anything asked for now still plugs — and no game will see it.");
-        }
-        if unknown > 0 {
-            line.push_str(&format!(
-                " {unknown} pad(s) on the bus could not be classified; if any of them are XInput \
-                 the free count above is optimistic."
-            ));
         }
         line
     }
 
     /// One `<option>` label for a pad count, with its consequence attached.
     ///
-    /// This is the whole point of the offer being backend-owned: the label for
-    /// "8" is different on a machine with two XInput pads already plugged, and
-    /// no surface should have to know that.
-    pub fn count_label(count: u8, free: u8) -> String {
+    /// **The consequence names the persona**, because it is not the same
+    /// consequence for both. A persona-blind "8 pads — 4 invisible to games"
+    /// contradicts the persona `<select>` sitting beside it ("playstation —
+    /// plain HID, takes no XInput slot"), the card paragraph above it, and
+    /// [`SpawnPlan::message`], which reports no warning at all after an
+    /// eight-pad PlayStation spawn. Four sentences on one screen cannot
+    /// disagree about one click.
+    ///
+    /// Naming both personas rather than tracking the `<select>` is deliberate:
+    /// the no-JS paint is this page's baseline, and a label that only became
+    /// correct once JavaScript rewired it would be wrong exactly where the
+    /// page promises to still work.
+    pub fn count_label(
+        count: u8,
+        free: Option<u8>,
+        xinput_name: Option<&str>,
+        hid_name: Option<&str>,
+    ) -> String {
         let noun = if count == 1 { "pad" } else { "pads" };
+        let head = format!("{count} {noun}");
+        // No XInput persona on offer means no count of any persona can be
+        // unreadable, and a warning would be crying wolf.
+        let Some(xinput) = xinput_name else {
+            return head;
+        };
+        let Some(free) = free else {
+            return format!(
+                "{head} — ksx could not read the XInput slots, so it cannot say how many a game \
+                 would see"
+            );
+        };
         if count <= free {
-            return format!("{count} {noun}");
+            return head;
         }
-        match free {
-            0 => format!("{count} {noun} — none readable (XInput slots are full)"),
-            n => format!(
-                "{count} {noun} — only {n} readable, {} invisible to games (XInput)",
-                count - n
-            ),
+        let readable = match free {
+            0 => format!("none readable as {xinput}"),
+            n => format!("only {n} readable as {xinput}"),
+        };
+        match hid_name {
+            Some(hid) => format!("{head} — {readable}, all {count} as {hid}"),
+            None => format!("{head} — {readable}"),
         }
     }
 
@@ -770,6 +858,11 @@ pub mod surface {
     }
 
     /// One line: how many pads the bus is carrying.
+    ///
+    /// The zero case ends in a full stop and the others in a colon, and that
+    /// is load-bearing: the colon introduces the list of pads underneath it,
+    /// so "0 virtual pads:" above nothing reads as a list that failed to
+    /// render rather than as an empty bus.
     pub fn summary_line(count: usize) -> String {
         match count {
             0 => "no virtual pads on the ViGEm bus".to_owned(),
@@ -778,23 +871,91 @@ pub mod surface {
         }
     }
 
+    /// The ViGEmBus devnode, or why there is not one.
+    ///
+    /// `None` is not an error and must not read like one: a machine that never
+    /// installed ViGEmBus has no devnode and also has no pads, which is a
+    /// perfectly healthy state for a cabinet that has not been set up yet.
+    /// (A devnode ksx could not *look* for is a different thing entirely, and
+    /// is carried by [`ksx_api::PadsView::unreadable`], not by this.)
+    pub fn bus_line(bus: Option<&str>) -> String {
+        match bus {
+            Some(id) => id.to_owned(),
+            None => "none present — ViGEmBus is not installed, or its devnode has gone".to_owned(),
+        }
+    }
+
+    /// Who is holding the pads, with the heuristic's limit stated rather than
+    /// hidden — the collector matches known splitter process NAMES, so a
+    /// third-party ViGEm feeder is invisible to it and "no owner" would be a
+    /// stronger claim than the evidence supports.
+    pub fn owners_line(owners: &[String]) -> String {
+        if owners.is_empty() {
+            return "no known splitter process is alive — a third-party ViGEm feeder would be \
+                    invisible here"
+                .to_owned();
+        }
+        owners.join(", ")
+    }
+
+    /// Whether a prune can work from this process, said before the click
+    /// rather than after the refusal.
+    pub fn elevation_line(elevated: Option<bool>) -> String {
+        match elevated {
+            Some(true) => "ksx is running elevated — it can restart the bus itself.".to_owned(),
+            Some(false) => "ksx is NOT running elevated, and ksx never self-elevates — this \
+                            prune will be refused. Run the command below from an elevated prompt \
+                            instead."
+                .to_owned(),
+            None => "whether ksx is elevated could not be determined; if the prune is refused, \
+                     run the command below from an elevated prompt."
+                .to_owned(),
+        }
+    }
+
+    /// The confirm panel's lead. Says "every pad listed here", because a bus
+    /// restart cannot remove one pad and keep the others and a user about to
+    /// press this needs that to be the sentence, not a footnote.
+    pub fn confirm_line(count: usize) -> String {
+        format!(
+            "This removes {count} pad(s) by restarting the ViGEmBus devnode. Every pad listed \
+             here goes, at once:"
+        )
+    }
+
     /// The whole spawn offer, every option already labelled.
-    pub fn spawn_offer(session_running: bool, xinput_in_use: u8) -> ksx_api::SpawnOffer {
+    ///
+    /// The counts stop at the bus's remaining headroom, so the menu can never
+    /// offer a click [`plan_spawn`] would refuse — the same invariant that
+    /// keeps unimplementable personas out of the persona list.
+    pub fn spawn_offer(
+        session_running: bool,
+        xinput_in_use: Option<u8>,
+        on_bus: usize,
+    ) -> ksx_api::SpawnOffer {
         let free = xinput_free(xinput_in_use);
+        let headroom = spawn_headroom(on_bus);
+        let offered: Vec<Persona> = Persona::ALL
+            .iter()
+            .copied()
+            .filter(|p| p.can_plug())
+            .collect();
+        // Whichever personas this build can actually create decide the wording
+        // — nothing here spells "xbox360" or "playstation" by hand.
+        let xinput_name = offered.iter().find(|p| p.is_xinput()).map(|p| p.as_str());
+        let hid_name = offered.iter().find(|p| !p.is_xinput()).map(|p| p.as_str());
         ksx_api::SpawnOffer {
-            counts: (1..=MAX_SLOTS)
+            counts: (1..=headroom)
                 .map(|n| ksx_api::SpawnOption {
                     value: n.to_string(),
-                    label: count_label(n, free),
+                    label: count_label(n, free, xinput_name, hid_name),
                 })
                 .collect(),
-            personas: Persona::ALL
+            personas: offered
                 .iter()
-                .copied()
-                .filter(|p| p.can_plug())
                 .map(|p| ksx_api::SpawnOption {
                     value: p.as_str().to_owned(),
-                    label: persona_label(p),
+                    label: persona_label(*p),
                 })
                 .collect(),
             holds: HOLD_CHOICES
@@ -807,9 +968,22 @@ pub mod surface {
             note: format!(
                 "A spawn is a TEST: the pads plug, run the A/B/X/Y + stick pattern so you can \
                  see them move in joy.cpl, then unplug themselves when the hold expires. \
-                 Nothing is written to config, and the longest hold is {MAX_HOLD_SECS}s."
+                 Nothing is written to config, the longest hold is {MAX_HOLD_SECS}s, and the \
+                 bus is never allowed past {MAX_SLOTS} pads in total."
             ),
-            refused: session_running.then(|| SpawnPlan::SessionRunning.message()),
+            refused: if session_running {
+                Some(SpawnPlan::SessionRunning.message())
+            } else if headroom == 0 {
+                Some(
+                    SpawnPlan::BusFull {
+                        on_bus,
+                        requested: 1,
+                    }
+                    .message(),
+                )
+            } else {
+                None
+            },
         }
     }
 
@@ -834,12 +1008,15 @@ pub mod surface {
     mod tests {
         use super::*;
 
+        /// An idle machine with all four XInput slots free and an empty bus.
+        const IDLE: (Option<u8>, usize) = (Some(0), 0);
+
         /// The refusal that matters, and the one the CLI never had to make:
         /// whoever typed `ksx pads` knew emulation was stopped. A page click
         /// carries no such knowledge, so the plan makes the judgement.
         #[test]
         fn a_running_session_refuses_a_spawn_before_the_bus_is_opened() {
-            let plan = plan_spawn(4, Persona::Xbox360, 30, true, 0);
+            let plan = plan_spawn(4, Persona::Xbox360, 30, true, IDLE.0, IDLE.1);
             assert_eq!(plan, SpawnPlan::SessionRunning);
             assert_eq!(plan.code(), Some("session-running"));
             assert!(
@@ -853,14 +1030,14 @@ pub mod surface {
         /// refusal. Changing that is #16's job; saying it is this module's.
         #[test]
         fn eight_xbox_pads_are_allowed_and_four_of_them_are_named_unreadable() {
-            let plan = plan_spawn(8, Persona::Xbox360, 30, false, 0);
+            let plan = plan_spawn(8, Persona::Xbox360, 30, false, IDLE.0, IDLE.1);
             assert_eq!(
                 plan,
                 SpawnPlan::Plug {
                     count: 8,
                     persona: Persona::Xbox360,
                     hold_secs: 30,
-                    unreadable: 4,
+                    unreadable: Some(4),
                 }
             );
             assert_eq!(plan.code(), None, "over the ceiling is not a refusal");
@@ -869,16 +1046,64 @@ pub mod surface {
             assert!(message.contains("no game can read"), "{message}");
         }
 
-        /// Pads already on the bus eat the same four slots.
+        /// Slots already taken — by ANY pad on the machine, which is why this
+        /// number comes from XInput and not from the ViGEm bus's child list.
         #[test]
-        fn pads_already_on_the_bus_reduce_what_a_new_spawn_can_be_read_as() {
-            let plan = plan_spawn(4, Persona::Xbox360, 30, false, 2);
+        fn xinput_slots_already_taken_reduce_what_a_new_spawn_can_be_read_as() {
+            let plan = plan_spawn(4, Persona::Xbox360, 30, false, Some(2), 0);
             let SpawnPlan::Plug { unreadable, .. } = plan else {
                 panic!("expected a plug: {plan:?}");
             };
-            assert_eq!(unreadable, 2);
-            assert_eq!(xinput_free(2), 2);
-            assert_eq!(xinput_free(9), 0, "saturating, never wrapping");
+            assert_eq!(unreadable, Some(2));
+            assert_eq!(xinput_free(Some(2)), Some(2));
+            assert_eq!(xinput_free(Some(9)), Some(0), "saturating, never wrapping");
+        }
+
+        /// **A reading that failed is not a reading of zero.**
+        ///
+        /// Fails against the version this replaced, which counted ViGEmBus
+        /// children into a plain `u8`: there was no way to express "could not
+        /// ask", so an unanswerable machine reported four free slots and the
+        /// plan promised that four more pads would be readable.
+        #[test]
+        fn an_unreadable_xinput_ceiling_is_never_folded_into_zero_in_use() {
+            assert_eq!(xinput_free(None), None, "unknown in, unknown out");
+
+            let plan = plan_spawn(4, Persona::Xbox360, 30, false, None, 0);
+            let SpawnPlan::Plug { unreadable, .. } = plan.clone() else {
+                panic!("expected a plug: {plan:?}");
+            };
+            assert_eq!(
+                unreadable, None,
+                "an unread ceiling must not report 0 pads unreadable"
+            );
+            let message = plan.message();
+            assert!(message.contains("could not read"), "{message}");
+
+            let line = xinput_line(None);
+            assert!(line.contains("could not read"), "{line}");
+            assert!(
+                !line.contains("at most 4 more"),
+                "a failed reading must not promise four free slots: {line}"
+            );
+
+            // …and the count labels must not promise either.
+            let offer = spawn_offer(false, None, 0);
+            for option in &offer.counts {
+                assert!(
+                    option.label.contains("could not read"),
+                    "an unread ceiling must be said, not assumed: {}",
+                    option.label
+                );
+            }
+
+            // A HID pad's answer never depended on the reading, so it stays
+            // knowable even when the slots are not.
+            let hid = plan_spawn(8, Persona::PlayStation, 30, false, None, 0);
+            let SpawnPlan::Plug { unreadable, .. } = hid else {
+                panic!("expected a plug: {hid:?}");
+            };
+            assert_eq!(unreadable, Some(0));
         }
 
         /// PlayStation pads are plain HID: eight of them is eight readable
@@ -886,11 +1111,11 @@ pub mod surface {
         /// different numbers.
         #[test]
         fn playstation_pads_never_count_against_the_xinput_ceiling() {
-            let plan = plan_spawn(8, Persona::PlayStation, 30, false, 4);
+            let plan = plan_spawn(8, Persona::PlayStation, 30, false, Some(4), 0);
             let SpawnPlan::Plug { unreadable, .. } = plan else {
                 panic!("expected a plug: {plan:?}");
             };
-            assert_eq!(unreadable, 0);
+            assert_eq!(unreadable, Some(0));
         }
 
         /// A persona this build cannot create is refused before ViGEmBus is
@@ -898,9 +1123,9 @@ pub mod surface {
         /// problem (the same ordering `run` keeps).
         #[test]
         fn an_unimplementable_persona_is_refused_and_not_offered() {
-            let plan = plan_spawn(1, Persona::DualSense, 30, false, 0);
+            let plan = plan_spawn(1, Persona::DualSense, 30, false, IDLE.0, IDLE.1);
             assert_eq!(plan.code(), Some("persona-not-implemented"));
-            let offered: Vec<String> = spawn_offer(false, 0)
+            let offered: Vec<String> = spawn_offer(false, IDLE.0, IDLE.1)
                 .personas
                 .into_iter()
                 .map(|o| o.value)
@@ -915,55 +1140,181 @@ pub mod surface {
         #[test]
         fn counts_and_holds_are_bounded() {
             assert_eq!(
-                plan_spawn(0, Persona::Xbox360, 30, false, 0).code(),
+                plan_spawn(0, Persona::Xbox360, 30, false, IDLE.0, IDLE.1).code(),
                 Some("bad-count")
             );
             assert_eq!(
-                plan_spawn(MAX_SLOTS + 1, Persona::Xbox360, 30, false, 0).code(),
+                plan_spawn(MAX_SLOTS + 1, Persona::Xbox360, 30, false, IDLE.0, IDLE.1).code(),
                 Some("bad-count")
             );
             assert_eq!(
-                plan_spawn(4, Persona::Xbox360, 0, false, 0).code(),
+                plan_spawn(4, Persona::Xbox360, 0, false, IDLE.0, IDLE.1).code(),
                 Some("bad-hold")
             );
             assert_eq!(
-                plan_spawn(4, Persona::Xbox360, MAX_HOLD_SECS + 1, false, 0).code(),
+                plan_spawn(
+                    4,
+                    Persona::Xbox360,
+                    MAX_HOLD_SECS + 1,
+                    false,
+                    IDLE.0,
+                    IDLE.1
+                )
+                .code(),
                 Some("bad-hold")
             );
         }
 
-        /// The warning has to reach the user BEFORE the click, and a dropdown
-        /// entry reading "8" says nothing. Every offered count above the free
-        /// slots carries its own consequence.
+        /// **Nothing bounded what repeated Spawns left on the bus.**
+        ///
+        /// Fails against the version this replaced, where `plan_spawn` capped
+        /// a SINGLE call at `1..=MAX_SLOTS` and nothing looked at the total:
+        /// five submits of `count=16` left eighty pads on the bus for two
+        /// minutes, and the only cleanup was a prune an unelevated Studio
+        /// cannot perform. The ceiling has to be on the total.
         #[test]
-        fn every_over_ceiling_count_option_says_so_in_its_own_label() {
-            let offer = spawn_offer(false, 0);
-            assert_eq!(offer.counts.len(), usize::from(MAX_SLOTS));
-            for option in &offer.counts {
-                let count: u8 = option.value.parse().unwrap();
-                if count > MAX_XINPUT_SLOTS {
-                    assert!(
-                        option.label.contains("invisible to games"),
-                        "count {count} must warn in its own label: {}",
-                        option.label
-                    );
-                } else {
-                    assert!(
-                        !option.label.contains("invisible"),
-                        "count {count} is readable and must not cry wolf: {}",
-                        option.label
+        fn the_total_on_the_bus_is_bounded_not_just_one_request() {
+            let plan = plan_spawn(
+                MAX_SLOTS,
+                Persona::Xbox360,
+                30,
+                false,
+                Some(0),
+                usize::from(MAX_SLOTS),
+            );
+            assert_eq!(plan.code(), Some("bus-full"), "{plan:?}");
+            assert!(
+                plan.remedy().is_some_and(|r| r.contains("prune")),
+                "the way back must be named: {:?}",
+                plan.remedy()
+            );
+
+            // One under the ceiling: exactly one more pad fits, and no more.
+            let headroom = usize::from(MAX_SLOTS) - 1;
+            assert_eq!(
+                plan_spawn(1, Persona::Xbox360, 30, false, Some(0), headroom).code(),
+                None
+            );
+            assert_eq!(
+                plan_spawn(2, Persona::Xbox360, 30, false, Some(0), headroom).code(),
+                Some("bus-full")
+            );
+        }
+
+        /// The menu is the other half of that bound: a `<select>` must never
+        /// offer a click the plan would refuse. Fails against the version that
+        /// always offered `1..=MAX_SLOTS` whatever the bus was already
+        /// carrying.
+        #[test]
+        fn the_menu_never_offers_a_count_the_plan_would_refuse() {
+            for on_bus in [0usize, 1, 9, usize::from(MAX_SLOTS) - 1] {
+                let offer = spawn_offer(false, Some(0), on_bus);
+                assert_eq!(
+                    offer.counts.len(),
+                    usize::from(spawn_headroom(on_bus)),
+                    "on_bus {on_bus}"
+                );
+                for option in &offer.counts {
+                    let count: u8 = option.value.parse().unwrap();
+                    assert_eq!(
+                        plan_spawn(count, Persona::Xbox360, 30, false, Some(0), on_bus).code(),
+                        None,
+                        "on_bus {on_bus} offers {count}, which the plan refuses"
                     );
                 }
+                assert!(offer.refused.is_none(), "on_bus {on_bus}");
+            }
+
+            // A full bus offers nothing at all, and says why rather than
+            // rendering an empty dropdown beside a live button.
+            let full = spawn_offer(false, Some(0), usize::from(MAX_SLOTS));
+            assert!(full.counts.is_empty());
+            assert!(
+                full.refused.is_some_and(|r| r.contains("prune")),
+                "a full bus must refuse the offer in words"
+            );
+        }
+
+        /// **The count label must name the persona its warning applies to.**
+        ///
+        /// Fails against the version this replaced, whose labels were
+        /// persona-blind: with `persona=playstation, count=8` the dropdown
+        /// said "8 pads — only 4 readable, 4 invisible to games (XInput)"
+        /// while the persona option beside it said "playstation — plain HID,
+        /// takes no XInput slot", the card above said eight players is eight
+        /// readable pads, and the post-submit flash reported no warning at
+        /// all. Four sentences, one click, three of them wrong.
+        #[test]
+        fn count_labels_name_the_persona_the_warning_applies_to() {
+            let offer = spawn_offer(false, Some(0), 0);
+            let hid: Vec<&str> = offer
+                .personas
+                .iter()
+                .filter(|p| p.label.contains("plain HID"))
+                .map(|p| p.value.as_str())
+                .collect();
+            assert!(!hid.is_empty(), "the fixture needs a HID persona on offer");
+
+            for option in &offer.counts {
+                let count: u8 = option.value.parse().unwrap();
+                if count <= MAX_XINPUT_SLOTS {
+                    assert_eq!(
+                        option.label,
+                        format!("{count} {}", if count == 1 { "pad" } else { "pads" }),
+                        "a count every persona can serve must not cry wolf"
+                    );
+                    continue;
+                }
+                assert!(
+                    option.label.contains("as xbox360"),
+                    "the warning must name the persona it applies to: {}",
+                    option.label
+                );
+                assert!(
+                    hid.iter().any(|h| option.label.contains(*h)),
+                    "…and must say the HID persona is unaffected: {}",
+                    option.label
+                );
+                // The label and the plan cannot disagree about the same click.
+                let xbox = plan_spawn(count, Persona::Xbox360, 30, false, Some(0), 0);
+                let SpawnPlan::Plug { unreadable, .. } = xbox else {
+                    panic!("expected a plug: {xbox:?}");
+                };
+                assert_eq!(unreadable, Some(count - MAX_XINPUT_SLOTS));
+                let ps = plan_spawn(count, Persona::PlayStation, 30, false, Some(0), 0);
+                let SpawnPlan::Plug { unreadable, .. } = ps else {
+                    panic!("expected a plug: {ps:?}");
+                };
+                assert_eq!(
+                    unreadable,
+                    Some(0),
+                    "the label promises the HID persona is readable; the plan must agree"
+                );
             }
         }
 
-        /// A full bus makes EVERY count unreadable, and the label says "none"
-        /// rather than "0 readable".
+        /// A full XInput ceiling makes every XInput count unreadable — and
+        /// still must not claim a HID pad is invisible. Fails against the
+        /// version this replaced, where a full bus labelled EVERY count "none
+        /// readable (XInput slots are full)" including for the persona where
+        /// every one of them is readable.
         #[test]
-        fn a_full_bus_labels_every_count_as_unreadable() {
-            let offer = spawn_offer(false, MAX_XINPUT_SLOTS);
+        fn a_full_xinput_ceiling_does_not_cry_wolf_about_the_hid_persona() {
+            let offer = spawn_offer(false, Some(MAX_XINPUT_SLOTS), 0);
             for option in &offer.counts {
-                assert!(option.label.contains("none readable"), "{}", option.label);
+                let count: u8 = option.value.parse().unwrap();
+                assert!(
+                    option.label.contains("none readable as xbox360"),
+                    "{}",
+                    option.label
+                );
+                assert!(
+                    option
+                        .label
+                        .contains(&format!("all {count} as playstation")),
+                    "{}",
+                    option.label
+                );
             }
         }
 
@@ -971,23 +1322,24 @@ pub mod surface {
         /// submit — the offer says so itself.
         #[test]
         fn a_running_session_refuses_the_offer_not_just_the_submit() {
-            assert!(spawn_offer(true, 0).refused.is_some());
-            assert!(spawn_offer(false, 0).refused.is_none());
+            assert!(spawn_offer(true, IDLE.0, IDLE.1).refused.is_some());
+            assert!(spawn_offer(false, IDLE.0, IDLE.1).refused.is_none());
         }
 
-        /// The ceiling sentence must name the number, the pads holding it and
-        /// what is left — and must not silently ignore pads it cannot classify.
+        /// The ceiling sentence names the number, what is holding it and what
+        /// is left — and never promises more than "at most", because another
+        /// process can take a slot between this read and the plug.
         #[test]
-        fn the_ceiling_sentence_states_the_numbers_and_owns_its_uncertainty() {
-            let clean = xinput_line(2, 0);
+        fn the_ceiling_sentence_states_the_numbers_and_promises_no_more_than_it_can() {
+            let clean = xinput_line(Some(2));
             assert!(clean.contains('4'), "{clean}");
-            assert!(clean.contains("2 of them are held"), "{clean}");
-            assert!(!clean.contains("optimistic"), "{clean}");
+            assert!(clean.contains("2 of them are in use"), "{clean}");
+            assert!(
+                clean.contains("at most 2 more"),
+                "a slot count is a ceiling, not a promise: {clean}"
+            );
 
-            let murky = xinput_line(2, 3);
-            assert!(murky.contains("optimistic"), "{murky}");
-
-            let full = xinput_line(4, 0);
+            let full = xinput_line(Some(4));
             assert!(full.contains("no game will see it"), "{full}");
         }
 
@@ -996,11 +1348,13 @@ pub mod surface {
         #[test]
         fn every_spawn_message_survives_a_flash() {
             for plan in [
-                plan_spawn(4, Persona::Xbox360, 30, true, 0),
-                plan_spawn(0, Persona::Xbox360, 30, false, 0),
-                plan_spawn(4, Persona::Xbox360, 0, false, 0),
-                plan_spawn(1, Persona::DualSense, 30, false, 0),
-                plan_spawn(16, Persona::Xbox360, 120, false, 0),
+                plan_spawn(4, Persona::Xbox360, 30, true, Some(0), 0),
+                plan_spawn(0, Persona::Xbox360, 30, false, Some(0), 0),
+                plan_spawn(4, Persona::Xbox360, 0, false, Some(0), 0),
+                plan_spawn(1, Persona::DualSense, 30, false, Some(0), 0),
+                plan_spawn(16, Persona::Xbox360, 120, false, Some(0), 0),
+                plan_spawn(16, Persona::Xbox360, 120, false, None, 0),
+                plan_spawn(16, Persona::Xbox360, 120, false, Some(0), 99),
             ] {
                 let message = plan.message();
                 assert!(message.chars().count() <= 300, "{message}");
@@ -1036,11 +1390,49 @@ pub mod surface {
             );
         }
 
+        /// An empty bus must not open a list it has no rows for. The colon is
+        /// the tell: it introduces the pad tiles underneath, so a summary that
+        /// ends in one above nothing reads as a render that broke.
+        ///
+        /// Fails against the obvious one-arm implementation
+        /// (`format!("{n} virtual pads on the ViGEm bus:")`), which is what
+        /// this replaced a test that just restated the three match arms with.
         #[test]
-        fn summary_line_counts_in_words() {
-            assert_eq!(summary_line(0), "no virtual pads on the ViGEm bus");
-            assert!(summary_line(1).starts_with("1 virtual pad on"));
-            assert!(summary_line(7).starts_with("7 virtual pads on"));
+        fn an_empty_bus_summary_does_not_open_a_list_it_has_no_rows_for() {
+            assert!(!summary_line(0).ends_with(':'), "{}", summary_line(0));
+            for count in [1usize, 2, 15] {
+                assert!(
+                    summary_line(count).ends_with(':'),
+                    "a non-empty bus introduces its rows: {}",
+                    summary_line(count)
+                );
+                assert!(summary_line(count).contains(&count.to_string()));
+            }
+            // Singular/plural, because "1 virtual pads" is the kind of thing
+            // that makes a user doubt the number itself.
+            assert!(summary_line(1).contains("1 virtual pad on"));
+            assert!(summary_line(7).contains("7 virtual pads on"));
+        }
+
+        /// The four worded helpers. Each has a case that must not read like an
+        /// error, and one that must not read like an absence.
+        #[test]
+        fn the_worded_helpers_stay_honest_about_absence() {
+            assert_eq!(bus_line(Some("ROOT\\X")), "ROOT\\X");
+            assert!(bus_line(None).contains("not installed"));
+
+            assert_eq!(owners_line(&["a".to_owned(), "b".to_owned()]), "a, b");
+            assert!(
+                owners_line(&[]).contains("no known splitter"),
+                "never claim there is no owner — the collector matches process NAMES"
+            );
+
+            assert!(elevation_line(Some(true)).contains("is running elevated"));
+            assert!(elevation_line(Some(false)).contains("NOT running elevated"));
+            assert!(elevation_line(None).contains("could not be determined"));
+
+            assert!(confirm_line(15).contains("15 pad(s)"));
+            assert!(confirm_line(15).contains("at once"));
         }
     }
 

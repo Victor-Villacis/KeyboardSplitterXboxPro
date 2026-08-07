@@ -212,6 +212,26 @@ self-elevates. So Studio SAYS so before the click (`PadsView::elevated`) and
 the backend refuses with the elevated command attached. That is a better
 outcome than the surface pretending the verb does not exist.
 
+Two rules fell out of building it, and both generalise past this page.
+
+**A verb a surface can repeat needs a total, not a per-call bound.** A console
+operator watches the pads accumulate and stops; a button does not. `ksx pads
+--count 16` five times over leaves eighty pads on the bus, and the recovery —
+a prune — is refused to the unelevated process a browser-launched Studio
+usually is. So the bound is on the state (`SpawnPlan::BusFull`), and the menu
+stops offering what the plan would refuse.
+
+**A read that FAILED is not a reading of nothing.** "I could not look" and
+"there is nothing there" are different sentences and a user acts on them
+differently: the first sends them to `ksx doctor`, the second tells them the
+machine is fine. So an unanswerable count is `Option<u8>` all the way to the
+page rather than a `0` some layer invented, and a refused
+`MachineSource::pads_view` renders `PadsView::unreadable` — every composed
+sentence saying the read failed — instead of a default view whose devnode line
+asserts a driver is not installed and whose empty pad grid draws a clean bus.
+This is the shape of the failure that once let a session report success while
+the arcade panel was dead.
+
 What is unchanged: the dry-run-first consent shape is the backend's, not the
 surface's. `pads_prune(confirm)` is `--yes`, spelled the same way and refusing
 the same things, and a POST that did not come from the confirm screen gets the

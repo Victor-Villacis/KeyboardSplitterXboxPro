@@ -32,12 +32,13 @@ pub mod sealed;
 pub mod sha256;
 pub mod virtual_pads;
 pub mod winusb;
+pub mod xinput;
 
 #[cfg(windows)]
 mod win;
 
 #[cfg(windows)]
-pub use win::collect;
+pub use win::{collect, collect_virtual_pads};
 
 pub use advice::{summarize, Advice, Severity};
 pub use report::{

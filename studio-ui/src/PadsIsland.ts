@@ -7,15 +7,21 @@ import { h, createSignal, createList, createShow } from "@getforma/core";
 // pads.ts. Read that file's header for the protocol; this comment is only
 // about what is different here.
 //
-// **This page decides nothing.** Every sentence it shows arrives composed from
-// `MachineSource::pads_view` — the summary, the XInput ceiling paragraph, the
-// prune plan, and the label on every single `<option>`. That is deliberate and
-// it is the point of the page: "eight pads, four of which no game can read" is
-// a fact about ksx's own limits, and a web page that worked it out for itself
-// would be a second answer to a question the CLI already answers
-// (docs/SURFACES.md §1). `applyPads` below is a copier, not a deriver — the
-// four small format helpers it does own are mirrored in render_pads.rs and
-// pinned by unit tests there.
+// **This page decides nothing and words nothing.** Every sentence it shows
+// arrives composed from `MachineSource::pads_view` — the summary, the devnode
+// line, the owner line, the elevation warning, the confirm lead, the XInput
+// ceiling paragraph, the prune plan, and the label on every single
+// `<option>`. That is deliberate and it is the point of the page: "eight pads,
+// four of which no game can read" is a fact about ksx's own limits, and a web
+// page that worked it out for itself would be a second answer to a question
+// the CLI already answers (docs/SURFACES.md §1). `applyPads` below is a
+// copier, not a deriver, and it owns no wording at all.
+//
+// Four sentences used to live here AND in render_pads.rs, in two languages,
+// with only the Rust half tested: the server painted one and the 2 s poller
+// overwrote it with the other. They were not neutral formatting either — one
+// asserted "this prune WILL be refused" and another "Every pad listed here
+// goes, at once". They are `PadsView` fields now.
 //
 // Compiler constraints honored below (see render.rs):
 // - dynamic text/attrs must be bare `() => signalName()` calls;
@@ -61,13 +67,20 @@ export interface PadsView {
   generated_at: string;
   summary: string;
   bus_instance_id: string | null;
+  bus_line: string;
   pads: VirtualPadRow[];
   owners: string[];
+  owners_line: string;
   session_running: boolean;
   xinput_ceiling: number;
-  xinput_in_use: number;
+  /** How many XInput slots hold a pad — `null` means the reading FAILED, and
+   *  that is not the same as zero. Rendered through `xinput_line`; nothing
+   *  here does arithmetic on it. */
+  xinput_in_use: number | null;
   xinput_line: string;
   elevated: boolean | null;
+  elevation_line: string;
+  confirm_line: string;
   prune: PrunePlanView;
   spawn: SpawnOffer;
 }
@@ -148,33 +161,6 @@ const [personaOptions, setPersonaOptions] = createSignal<SpawnOption[]>([]);
 const [holdOptions, setHoldOptions] = createSignal<SpawnOption[]>([]);
 const [pruneRows, setPruneRows] = createSignal<PruneRow[]>([]);
 
-// ── The four format helpers (mirrored in render_pads.rs, pinned there) ─────
-
-function busLineOf(bus: string | null): string {
-  return bus ?? "none present — ViGEmBus is not installed, or its devnode has gone";
-}
-
-function ownersLineOf(owners: string[]): string {
-  if (owners.length === 0) {
-    return "no known splitter process is alive — a third-party ViGEm feeder would be invisible here";
-  }
-  return owners.join(", ");
-}
-
-function elevationLineOf(elevated: boolean | null): string {
-  if (elevated === true) {
-    return "ksx Studio is running elevated — it can restart the bus itself.";
-  }
-  if (elevated === false) {
-    return "ksx Studio is NOT running elevated, and ksx never self-elevates — this prune will be refused. Run the command below from an elevated prompt instead.";
-  }
-  return "whether ksx Studio is elevated could not be determined; if the prune is refused, run the command below from an elevated prompt.";
-}
-
-function confirmLineOf(count: number): string {
-  return `This removes ${count} pad(s) by restarting the ViGEmBus devnode. Every pad listed here goes, at once:`;
-}
-
 // ── Applying a payload ──────────────────────────────────────────────────────
 
 /** Whether the destructive panel is armed, kept by the CLIENT.
@@ -205,27 +191,31 @@ export function applyPads(p: PadsPayload): void {
 
   setGeneratedAt(v.generated_at);
   setPadsSummary(v.summary);
-  setBusLine(busLineOf(v.bus_instance_id));
-  setOwnersLine(ownersLineOf(v.owners));
+  setBusLine(v.bus_line);
+  setOwnersLine(v.owners_line);
   setXinputLine(v.xinput_line);
   setSessionLine(session.line);
   setPruneDetail(v.prune.detail);
   setPruneCommand(v.prune.command ?? "");
-  setElevationLine(elevationLineOf(v.elevated));
+  setElevationLine(v.elevation_line);
   setSpawnNote(v.spawn.note);
   setSpawnRefusal(v.spawn.refused ?? "");
-  setConfirmLine(confirmLineOf(v.prune.count));
+  setConfirmLine(v.confirm_line);
   setUnavailableLine(p.unavailable ?? "");
 
   if (p.confirm) armed = true;
+  const readable = p.unavailable === null || p.unavailable === undefined;
   const restart = v.prune.kind === "restart";
   setPillRunning(session.reachable && session.running);
   setPillIdle(session.reachable && !session.running);
   setPillDown(!session.reachable);
-  setUnavailable(p.unavailable !== null && p.unavailable !== undefined);
+  setUnavailable(!readable);
   setCanSpawn(v.spawn.refused === null || v.spawn.refused === undefined);
   setSpawnBlocked(v.spawn.refused !== null && v.spawn.refused !== undefined);
-  setPruneIdle(!restart);
+  // "Nothing for this panel to do right now" is an assertion of absence, so it
+  // is gated on the read having HAPPENED. Mirrors show_values() in
+  // render_pads.rs, which the slot-layout test pins name for name.
+  setPruneIdle(!restart && readable);
   setPruneArm(restart && !armed);
   setPruneArmed(restart && armed);
   setNotElevated(restart && v.elevated === false);
@@ -249,9 +239,14 @@ export function applyPads(p: PadsPayload): void {
         : "/_assets/pad-xbox.svg",
     })),
   );
+  // Ghost tiles draw "this cabinet has four slots and they are empty", which
+  // is a CLAIM. A read that failed shows none of them; the banner says what
+  // actually happened instead.
   const ghosts: GhostTile[] = [];
-  for (let i = v.pads.length; i < PAD_TILE_FLOOR; i++) {
-    ghosts.push({ slot: `P${i + 1}` });
+  if (readable) {
+    for (let i = v.pads.length; i < PAD_TILE_FLOOR; i++) {
+      ghosts.push({ slot: `P${i + 1}` });
+    }
   }
   setGhostTiles(ghosts);
 }
@@ -269,6 +264,16 @@ export function applyUnreachable(): void {
   setSpawnRefusal("ksx Studio is not answering — nothing can be spawned until it does");
   setPruneArm(false);
   setPruneArmed(false);
+  // The prune plan on screen is the last one that was READ, and with all three
+  // prune panels hidden nothing on the card would say so — it would just sit
+  // there looking current. This is the only wording this file owns, and it has
+  // no backend twin by definition: the backend is the thing not answering.
+  setPruneDetail(
+    "ksx Studio is not answering — the plan above is the last one it read, and nothing can be pruned until it answers again.",
+  );
+  setPruneIdle(false);
+  setNotElevated(false);
+  setHasCommand(false);
 }
 
 /** One-shot action feedback (POST outcome or the seed's ?flash= value). */
@@ -368,9 +373,15 @@ export function PadsIsland() {
         h(
           "div",
           { class: "padgrid" },
+          // KEY EVERY FIELD THE ROW RENDERS. forma reconciles by key and does
+          // NOT patch a row whose key matched (`updateOnItemChange` defaults to
+          // "none" — "reused rows keep their DOM"), so any member missing from
+          // the key freezes at its first paint. render_pads.rs's
+          // `every_list_row_reconciles_on_every_field_it_renders` reads this
+          // file and fails on one that is.
           createList(
             () => padTiles(),
-            (p) => p.player + "|" + p.persona + "|" + p.instance,
+            (p) => p.player + "|" + p.persona + "|" + p.instance + "|" + p.art,
             (p) =>
               h(
                 "div",
@@ -463,7 +474,7 @@ export function PadsIsland() {
                   { id: "count", name: "count" },
                   createList(
                     () => countOptions(),
-                    (o) => o.value,
+                    (o) => o.value + "|" + o.label,
                     (o) => h("option", { value: o.value }, o.label),
                   ),
                 ),
@@ -477,7 +488,7 @@ export function PadsIsland() {
                   { id: "persona", name: "persona" },
                   createList(
                     () => personaOptions(),
-                    (o) => o.value,
+                    (o) => o.value + "|" + o.label,
                     (o) => h("option", { value: o.value }, o.label),
                   ),
                 ),
@@ -491,7 +502,7 @@ export function PadsIsland() {
                   { id: "hold_secs", name: "hold_secs" },
                   createList(
                     () => holdOptions(),
-                    (o) => o.value,
+                    (o) => o.value + "|" + o.label,
                     (o) => h("option", { value: o.value }, o.label),
                   ),
                 ),
@@ -574,7 +585,7 @@ export function PadsIsland() {
                 { class: "plist" },
                 createList(
                   () => pruneRows(),
-                  (r) => r.instance,
+                  (r) => r.instance + "|" + r.persona,
                   (r) =>
                     h(
                       "li",

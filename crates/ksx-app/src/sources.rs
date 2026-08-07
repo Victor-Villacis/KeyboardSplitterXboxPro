@@ -737,32 +737,36 @@ impl ksx_api::MachineSource for LocalMachine {
     /// the two DECISIONS pre-computed — the prune plan, and what a spawn may
     /// legally offer — so no surface re-derives "is a bus restart allowed" or
     /// "how many of these will a game actually see" (docs/SURFACES.md §1).
-    fn pads_view(&self) -> Result<ksx_api::PadsView, Refusal> {
+    fn pads_view(&self, session_running: bool) -> Result<ksx_api::PadsView, Refusal> {
         use crate::pads::surface;
 
-        let report = ksx_platform::collect().virtual_pads;
-        let session_running = session_is_running();
-        let xinput_in_use = u8::try_from(
-            report
-                .pads
-                .iter()
-                .filter(|p| p.persona_guess == ksx_platform::PersonaGuess::Xbox360)
-                .count(),
-        )
-        .unwrap_or(u8::MAX);
-        let unknown = report
-            .pads
+        // The bus's children ONLY — not `collect()`, which also reads two
+        // service keys, walks the Interception class filters, probes for
+        // HIDMaestro's DLL and snapshots the process table. Studio polls this
+        // every 2 s and throws five sixths of that away.
+        let report = ksx_platform::collect_virtual_pads();
+        // From XInput, not from the bus: the bus can only ever show ksx its
+        // OWN virtual pads, so a real wired Xbox pad is invisible to it and
+        // every "N more will be readable" built on that count is wrong by
+        // however many real pads are plugged in. `None` stays `None` all the
+        // way to the page — see `PadsView::xinput_in_use`.
+        let xinput_in_use = ksx_platform::xinput::slots_in_use();
+        let owners: Vec<String> = report
+            .owners
             .iter()
-            .filter(|p| p.persona_guess == ksx_platform::PersonaGuess::Unknown)
-            .count();
+            .map(|o| format!("{} (pid {})", o.name, o.pid))
+            .collect();
+        let elevated = ksx_platform::process::is_elevated();
         let plan = crate::pads::plan_prune(
             report.bus_instance_id.as_deref(),
             report.count,
             session_running,
         );
+        let prune = surface::prune_plan_view(&plan);
         Ok(ksx_api::PadsView {
             generated_at: now_utc(),
             summary: surface::summary_line(report.count),
+            bus_line: surface::bus_line(report.bus_instance_id.as_deref()),
             bus_instance_id: report.bus_instance_id.clone(),
             pads: report
                 .pads
@@ -774,18 +778,17 @@ impl ksx_api::MachineSource for LocalMachine {
                     xinput: p.persona_guess == ksx_platform::PersonaGuess::Xbox360,
                 })
                 .collect(),
-            owners: report
-                .owners
-                .iter()
-                .map(|o| format!("{} (pid {})", o.name, o.pid))
-                .collect(),
+            owners_line: surface::owners_line(&owners),
+            owners,
             session_running,
             xinput_ceiling: ksx_core::MAX_XINPUT_SLOTS,
             xinput_in_use,
-            xinput_line: surface::xinput_line(xinput_in_use, unknown),
-            elevated: ksx_platform::process::is_elevated(),
-            prune: surface::prune_plan_view(&plan),
-            spawn: surface::spawn_offer(session_running, xinput_in_use),
+            xinput_line: surface::xinput_line(xinput_in_use),
+            elevated,
+            elevation_line: surface::elevation_line(elevated),
+            confirm_line: surface::confirm_line(prune.count),
+            prune,
+            spawn: surface::spawn_offer(session_running, xinput_in_use, report.count),
         })
     }
 
@@ -804,21 +807,17 @@ impl ksx_api::MachineSource for LocalMachine {
                 "pick a persona from the list",
             )
         })?;
-        let report = ksx_platform::collect().virtual_pads;
-        let xinput_in_use = u8::try_from(
-            report
-                .pads
-                .iter()
-                .filter(|p| p.persona_guess == ksx_platform::PersonaGuess::Xbox360)
-                .count(),
-        )
-        .unwrap_or(u8::MAX);
+        // Re-read at ACTION time, deliberately: the view a page is rendering
+        // may be two seconds old, and two seconds is long enough for a
+        // session to start or for another submit's pads to land on the bus.
+        let report = ksx_platform::collect_virtual_pads();
         let plan = surface::plan_spawn(
             spec.count,
             persona,
             spec.hold_secs,
             session_is_running(),
-            xinput_in_use,
+            ksx_platform::xinput::slots_in_use(),
+            report.count,
         );
         let SpawnPlan::Plug {
             count,
@@ -853,7 +852,7 @@ impl ksx_api::MachineSource for LocalMachine {
     fn pads_prune(&self, confirm: bool) -> Result<String, Refusal> {
         use crate::pads::PrunePlan;
 
-        let report = ksx_platform::collect().virtual_pads;
+        let report = ksx_platform::collect_virtual_pads();
         let plan = crate::pads::plan_prune(
             report.bus_instance_id.as_deref(),
             report.count,

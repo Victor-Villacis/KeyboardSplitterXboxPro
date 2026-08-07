@@ -1642,13 +1642,19 @@ struct PadsQuery {
 }
 
 /// One fresh pads payload. `MachineSource::pads_view` enumerates devnodes and
-/// dials the daemon pipe — blocking work, kept off the async workers like
-/// [`collect`] and [`collect_map`].
+/// reads XInput — blocking work, kept off the async workers like [`collect`]
+/// and [`collect_map`].
+///
+/// **The session is read ONCE and fed to the view.** It appears twice on this
+/// screen — the header pill, and the spawn panel's refusal — and two separate
+/// pipe round-trips inside one render are two separate points in time: a
+/// session that starts between them paints "idle" beside "a session is
+/// running", or offers a Spawn button the verb will refuse.
 async fn collect_pads(state: &Arc<AppState>, confirm: bool) -> PadsPayload {
     let pads_state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
         let session = pads_state.control.session();
-        match pads_state.machine.pads_view() {
+        match pads_state.machine.pads_view(session.running) {
             Ok(pads) => PadsPayload {
                 pads,
                 session,
@@ -1657,22 +1663,29 @@ async fn collect_pads(state: &Arc<AppState>, confirm: bool) -> PadsPayload {
                 flash: None,
             },
             // A provider that cannot answer renders a banner, never a 500 and
-            // never an empty pad list that reads as "your bus is clean".
-            Err(refusal) => PadsPayload {
-                pads: ksx_api::PadsView::default(),
-                session,
-                confirm,
-                unavailable: Some(match refusal.remedy.as_deref() {
+            // never an empty pad list that reads as "your bus is clean" — and
+            // `unreadable` is what makes the difference, because a
+            // `PadsView::default()` here would render four empty pad tiles and
+            // a devnode line asserting ViGEmBus is not installed, about a bus
+            // ksx never managed to look at.
+            Err(refusal) => {
+                let reason = match refusal.remedy.as_deref() {
                     Some(remedy) => format!("{} — {remedy}", refusal.message),
                     None => refusal.message,
-                }),
-                flash: None,
-            },
+                };
+                PadsPayload {
+                    pads: ksx_api::PadsView::unreadable(&reason),
+                    session,
+                    confirm,
+                    unavailable: Some(reason),
+                    flash: None,
+                }
+            }
         }
     })
     .await
     .unwrap_or_else(|_| PadsPayload {
-        pads: ksx_api::PadsView::default(),
+        pads: ksx_api::PadsView::unreadable("the pad collection panicked"),
         session: SessionView::unreachable("pad collection panicked"),
         confirm,
         unavailable: Some("the pad collection panicked".to_owned()),
