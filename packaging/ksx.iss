@@ -147,8 +147,14 @@ Filename: "{app}\{#AppExe}"; Parameters: "doctor"; Description: "Check drivers a
 Filename: "{app}\{#AppExe}"; Parameters: "autostart --disable"; Flags: runhidden skipifdoesntexist; RunOnceId: "ksxAutostartOff"
 
 [Code]
-{ True when {app} is not already on the machine PATH. Case-insensitive and
-  separator-anchored, so "C:\ksx" does not match "C:\ksx-old". }
+// True when the install dir is not already on the machine PATH.
+// Case-insensitive and separator-anchored, so "C:\ksx" does not match
+// "C:\ksx-old".
+//
+// NOTE: `//` and not a { } comment. Pascal Script ends a brace comment at the
+// FIRST `}`, so writing {app} inside one closes it early and the rest of the
+// sentence is parsed as code — which is exactly how this file failed to
+// compile the first time anything actually ran ISCC against it.
 function NeedsAddPath(Param: string): Boolean;
 var
   OldPath: string;
