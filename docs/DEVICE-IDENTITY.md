@@ -75,8 +75,8 @@ encoders needs to know which of their boards that applies to.
 Measured on the cabinet, not assumed:
 
 ```
-USB\VID_D209&PID_0430\4                          <- composite parent, instance "4"
-USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000    <- keyboard interface, port-derived
+USB\VID_D209&PID_0430\4                          <- composite parent, serial "4"
+USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000    <- keyboard interface
 ```
 
 The I-PAC 4X reports `iSerialNumber` = `"4"`. The Ultimarc SpinTrak next to it
@@ -84,11 +84,43 @@ reports `"6"`. Those are one-character constants that look like model or board
 indices, not per-unit serials — so **two I-PAC 4X boards very probably both
 answer `"4"`**.
 
-A serial-bearing device would show `USB\VID_D209&PID_0430\<SERIAL>` as its
-composite parent instance. This one shows an enumerator counter. So the serial
-rung is *verified at match time*, never trusted at write time: `match_against`
-compares it against every connected interface, and if two answer, it says so
-rather than picking.
+### The instance path is NOT always port-derived — measured 2026-08-07
+
+An earlier draft of this section called the parent instance "an enumerator
+counter" and the interface path "port-derived". **Both were wrong**, and the
+correction matters because a diagnostic was built on them.
+
+Windows keys a USB devnode off the **serial number when the device reports one**,
+and off the socket only when it does not. A bare instance with no `&`
+(`…PID_0430\4`) is the serial form; the `6&1a2b3c&0&4` shape is the generated
+one. The I-PAC 4X reports a serial, so its whole devnode chain is anchored to it.
+
+Tested directly on the cabinet by moving the board between root ports:
+
+| | interface instance | `DEVPKEY_Device_LocationPaths` |
+|---|---|---|
+| before | `7&25EEA38C&0&0000` | `USBROOT(0)#USB(5)#USB(4)` |
+| after | `7&25EEA38C&0&0000` | `USBROOT(0)#USB(7)#USB(4)` |
+
+The board demonstrably moved; the id did not change by one character.
+
+Two consequences:
+
+1. **A refusal must not claim the board moved.** When an entry matches nothing
+   the device is *absent*, so ksx cannot read its serial and cannot know which
+   kind of path it holds. `ResolveError::Missing` therefore offers both causes
+   and asserts neither — asserting "you moved it" sends someone hunting a port
+   problem they do not have. `survives_replug()` answers by selector *shape*,
+   which is still the right input for choosing a `usb:` spelling, but it is
+   **not** evidence that an instance path is fragile.
+2. **The twin-board risk gets sharper, not softer.** Two I-PAC 4X boards both
+   reporting `"4"` collide in Windows' own instance namespace, before ksx sees
+   anything — a stronger failure than the ambiguity §1 describes. Untested until
+   a second board exists; test it before relying on either board's id.
+
+So the serial rung is *verified at match time*, never trusted at write time:
+`match_against` compares it against every connected interface, and if two
+answer, it says so rather than picking.
 
 ## §4 ContainerId groups interfaces into boards
 

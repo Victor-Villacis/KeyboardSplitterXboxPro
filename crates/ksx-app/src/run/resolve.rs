@@ -89,13 +89,21 @@ impl std::fmt::Display for ResolveError {
                          `ksx devices` lists what is actually there"
                     )
                 } else {
-                    // The whole reason selectors exist. Say it here, because
-                    // this is the moment the user meets the failure.
+                    // Measured on the cabinet 2026-08-07, and the reason this
+                    // does not simply say "you moved it": an instance path is
+                    // port-derived ONLY for boards with no USB serial. The
+                    // I-PAC 4X reports serial "4", so Windows keys its devnode
+                    // off the serial and the path survived a move from root
+                    // port 5 to port 7 byte-for-byte. Asserting "you moved it"
+                    // would send someone hunting a port problem they do not
+                    // have, when the board is simply unplugged. State both, let
+                    // `ksx devices` settle it.
                     write!(
                         f,
-                        ". This id names one specific USB SOCKET, so moving the board to another \
-                         port breaks it. `ksx devices` prints the id it has now, and the \
-                         replug-proof `usb:` selector that would survive the next move \
+                        ". Either the board is unplugged, or it moved: a full instance path is \
+                         port-derived only for boards that report no USB serial (boards that do \
+                         keep the same path across sockets). `ksx devices` prints the id it has \
+                         now, and the `usb:` selector that names the board either way \
                          (docs/DEVICE-IDENTITY.md §1)"
                     )
                 }
@@ -607,9 +615,19 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("\"ipac\""), "name the board: {text}");
         assert!(text.contains(LIVE_PATH), "quote the id in the file: {text}");
+        // Measured on the cabinet 2026-08-07: an instance path is port-derived
+        // only when the board reports no USB serial. The I-PAC 4X reports "4",
+        // and its path survived root port 5 -> 7 unchanged. So this must offer
+        // BOTH causes and assert neither, or it sends someone hunting a port
+        // problem they do not have.
+        assert!(text.contains("unplugged"), "offer the other cause: {text}");
         assert!(
-            text.contains("one specific USB SOCKET"),
-            "say why it broke: {text}"
+            text.contains("port-derived only for boards that report no USB serial"),
+            "say what actually decides it: {text}"
+        );
+        assert!(
+            !text.contains("one specific USB SOCKET"),
+            "must not assert a move it cannot know happened: {text}"
         );
         assert!(text.contains("ksx devices"), "say what to run: {text}");
     }
