@@ -84,7 +84,7 @@ impl LiveFrame {
 /// One slot's published pad state, plus what it has done recently.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotLive {
-    /// Slot NUMBER (1..=8), never an XInput user index.
+    /// Slot NUMBER (1..=`ksx_core::MAX_SLOTS`), never an XInput user index.
     pub slot: u8,
     /// Canonical control names currently held — `"A"`, `"dpad.up"`, `"lt"`.
     /// The vocabulary presets are written in, so a legend and a live light

@@ -13,9 +13,22 @@ use crate::socd::Socd;
 /// (`docs/research/m6.5-ds4-findings.md`), the two limits are now different
 /// things: [`MAX_XINPUT_SLOTS`] is imposed by Windows, this one is ours.
 ///
-/// 8 because that is where cabinet hardware stops: an 8-player panel is the
-/// largest anyone builds, and every extra slot costs a real device node.
-pub const MAX_SLOTS: u8 = 8;
+/// Was then 8, on the guess that an 8-player panel is the largest anyone
+/// builds. The guess was the only thing holding the number down — nothing in
+/// the pipeline degrades past it. Every slot-keyed structure is a `Vec` or a
+/// `SmallVec` that spills to the heap rather than truncating, and the one hard
+/// limit is the `u8` a slot index is carried in and indexed by
+/// (`engine.rs::handle_at`), which stops at 255. Meanwhile four I-PAC4 boards
+/// on one cabinet is sixteen players, and the guess was refusing them.
+///
+/// 16 is therefore a headroom number, not a hardware one: high enough to stop
+/// being the thing that says no, low enough that a per-slot array is still
+/// nothing. Raise it again freely — but only with the derived limits in
+/// mind, because they do not all track it automatically:
+/// `ksx-app`'s clap ranges and `ksx-api`'s refusal wording read this constant
+/// (both have tests that pin that), while the engine's `SmallVec` inline
+/// capacities size themselves off it for speed only.
+pub const MAX_SLOTS: u8 = 16;
 
 /// How many slots may use an XInput persona at once — a Windows limit, not ours.
 ///
@@ -216,6 +229,29 @@ mod tests {
             assert_eq!(spec.number, n);
             assert_eq!(spec.preset, "p");
         }
+    }
+
+    /// The raise past the old eight-player guess is real, and the ceiling
+    /// still exists above it.
+    ///
+    /// Slot 9 is the whole point: it is the first number the 8-slot build
+    /// refused, so this test fails against that build — and the `MAX_SLOTS + 1`
+    /// half proves the raise did not turn the check off, which is the way a
+    /// "just make the number bigger" change goes wrong.
+    #[test]
+    fn a_ninth_player_is_configurable_and_one_past_the_ceiling_still_is_not() {
+        assert!(SlotSpec::new(9, None, None, "p").is_ok());
+        assert!(SlotSpec::new(MAX_SLOTS, None, None, "p").is_ok());
+        assert_eq!(
+            SlotSpec::new(MAX_SLOTS + 1, None, None, "p"),
+            Err(InvalidSlotNumber(MAX_SLOTS + 1))
+        );
+        // The refusal names the live bound, so a raise cannot leave the
+        // sentence advertising a ceiling that moved.
+        assert_eq!(
+            InvalidSlotNumber(MAX_SLOTS + 1).to_string(),
+            format!("slot number must be 1..={MAX_SLOTS}, got {}", MAX_SLOTS + 1)
+        );
     }
 
     #[test]

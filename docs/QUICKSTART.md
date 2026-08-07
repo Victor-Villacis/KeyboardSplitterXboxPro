@@ -220,7 +220,7 @@ Four players is four `[[slot]]` blocks. One board can feed all of them; several
 boards can feed one each (give each its own `[[device]]` and alias); a mix is
 fine.
 
-Slots 5–8 exist too, but XInput only has four user indices — pads beyond four
+Slots 5–16 exist too, but XInput only has four user indices — pads beyond four
 need `persona = "playstation"` on the slot (`ksx pads --help` explains the
 difference).
 

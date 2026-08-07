@@ -38,6 +38,43 @@ mod winusb;
 
 use clap::{Parser, Subcommand};
 
+/// Everything a slot-numbered flag needs, read off [`ksx_core::MAX_SLOTS`]
+/// instead of repeating its value.
+///
+/// Clap rejects an out-of-range value before `main` is entered, which makes a
+/// hardcoded range the *effective* ceiling no matter what the constant says:
+/// with `1..=8` frozen at three call sites, raising `MAX_SLOTS` left `ksx
+/// setup --slot 9` dying at the parser having read no file and consulted no
+/// constant. The help text is derived for the same reason — a stale number in
+/// `--help` is worse than no number, because it tells the owner of a
+/// 16-player cabinet that ksx cannot drive it.
+mod slot_arg {
+    use std::sync::LazyLock;
+
+    use ksx_core::MAX_SLOTS;
+
+    /// The accepted range, in the `i64` clap's ranged integer parsers speak.
+    pub fn range() -> std::ops::RangeInclusive<i64> {
+        1..=i64::from(MAX_SLOTS)
+    }
+
+    /// These are `help =` rather than `///` doc comments because the number in
+    /// them is computed; a doc comment can only hold a literal.
+    pub static SETUP_SLOT: LazyLock<String> = LazyLock::new(|| {
+        format!("Slot to set up first; later players continue from it (1..={MAX_SLOTS})")
+    });
+
+    pub static PADS_COUNT: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            "Pads to plug (1..={MAX_SLOTS}; XInput has 4 slots, so pads 5 and up need \
+             --persona playstation)"
+        )
+    });
+
+    pub static ASSIGN_SLOT: LazyLock<String> =
+        LazyLock::new(|| format!("Slot number (1..={MAX_SLOTS})"));
+}
+
 #[derive(Parser)]
 #[command(name = "ksx", version, about, long_about = None)]
 struct Cli {
@@ -88,8 +125,12 @@ enum Command {
     /// Exit codes: 0 = written, discarded or a dry run, 1 = error, 2 = refused
     /// (no panel identified, nothing bound, an unknown --profile).
     Setup {
-        /// Slot to set up first; later players continue from it (1..=8)
-        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
+        #[arg(
+            long,
+            default_value_t = 1,
+            value_parser = clap::value_parser!(u8).range(slot_arg::range()),
+            help = slot_arg::SETUP_SLOT.as_str(),
+        )]
         slot: u8,
         /// Name the preset it writes (default: "Player <N>")
         #[arg(long, value_name = "NAME")]
@@ -260,8 +301,12 @@ enum Command {
     /// Exit codes: 0 = pads plugged and unplugged cleanly, 1 = error,
     /// 2 = ViGEmBus driver is not installed.
     Pads {
-        /// Pads to plug (XInput has 4 slots; pads 5..=8 need --persona playstation)
-        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=8))]
+        #[arg(
+            long,
+            default_value_t = 4,
+            value_parser = clap::value_parser!(u8).range(slot_arg::range()),
+            help = slot_arg::PADS_COUNT.as_str(),
+        )]
         count: u8,
         /// Controller type for every pad: xbox360 (default) or playstation
         /// (aliases ds4/ps4 accepted). PlayStation pads are HID/DirectInput —
@@ -1237,8 +1282,12 @@ enum SlotCommand {
     /// blunt stop, re-read, start. Without --reload nothing is disturbed and
     /// the next session start reads the file.
     Assign {
-        /// Slot number (1..=8)
-        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=8))]
+        #[arg(
+            long,
+            value_name = "N",
+            value_parser = clap::value_parser!(u8).range(slot_arg::range()),
+            help = slot_arg::ASSIGN_SLOT.as_str(),
+        )]
         slot: u8,
         /// Preset name — `ksx preset list` names them (case-insensitive)
         #[arg(long, value_name = "NAME")]
@@ -1692,9 +1741,96 @@ mod tests {
 
     use super::*;
 
+    /// The highest slot number every slot flag must ACCEPT, and the lowest it
+    /// must REFUSE — read off the constant, because a test that spells the
+    /// ceiling out keeps passing after the ceiling moves.
+    fn max_slot() -> String {
+        ksx_core::MAX_SLOTS.to_string()
+    }
+
+    /// Widened to `u16` so this stays honest if `MAX_SLOTS` ever reaches the
+    /// `u8` ceiling the engine's slot index imposes.
+    fn past_max_slot() -> String {
+        (u16::from(ksx_core::MAX_SLOTS) + 1).to_string()
+    }
+
     #[test]
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    /// Every flag that names a slot ranges over `MAX_SLOTS` — and prints it.
+    ///
+    /// Clap refuses an out-of-range value before `main` is entered, so these
+    /// ranges ARE the ceiling regardless of what ksx-core says. They were
+    /// frozen at `1..=8`, and raising `MAX_SLOTS` to 16 left `ksx setup --slot
+    /// 9` failing at the parser against a config file it never opened. Nothing
+    /// here names a number: the assertions are against the constant, so the
+    /// next raise cannot quietly reopen the gap.
+    #[test]
+    fn every_slot_flag_ranges_over_the_constant_and_says_so() {
+        let max = max_slot();
+        let past = past_max_slot();
+
+        let sites: [(&str, &[&str], &[&str]); 3] = [
+            ("setup --slot", &["ksx", "setup", "--slot"], &[]),
+            ("pads --count", &["ksx", "pads", "--count"], &[]),
+            (
+                "slot assign --slot",
+                &["ksx", "slot", "assign", "--slot"],
+                &["--preset", "P"],
+            ),
+        ];
+        for (label, prefix, suffix) in sites {
+            let argv = |n: &str| -> Vec<String> {
+                prefix
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(n))
+                    .chain(suffix.iter().copied())
+                    .map(str::to_owned)
+                    .collect()
+            };
+            assert!(Cli::try_parse_from(argv("0")).is_err(), "{label} took 0");
+            assert!(Cli::try_parse_from(argv("1")).is_ok(), "{label} refused 1");
+            assert!(
+                Cli::try_parse_from(argv(&max)).is_ok(),
+                "{label} refused {max} — its range is a literal, not MAX_SLOTS"
+            );
+            assert!(
+                Cli::try_parse_from(argv(&past)).is_err(),
+                "{label} took {past}, one past MAX_SLOTS"
+            );
+        }
+
+        // And each one SAYS the real bound. A `--help` frozen at the old
+        // number is worse than a silent one: it tells the owner of a 16-player
+        // cabinet that ksx stops at eight.
+        let bound = format!("1..={}", ksx_core::MAX_SLOTS);
+        let mut cmd = Cli::command();
+        let setup = cmd
+            .find_subcommand_mut("setup")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        let pads = cmd
+            .find_subcommand_mut("pads")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        let assign = cmd
+            .find_subcommand_mut("slot")
+            .unwrap()
+            .find_subcommand_mut("assign")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for (label, help) in [("setup", setup), ("pads", pads), ("slot assign", assign)] {
+            assert!(
+                help.contains(&bound),
+                "{label} --help never says {bound}:\n{help}"
+            );
+        }
     }
 
     #[test]
@@ -1775,17 +1911,11 @@ mod tests {
         assert!(msg.contains("playstation"), "must name the options: {msg}");
     }
 
-    #[test]
-    fn pads_count_range_is_1_to_8() {
-        assert!(Cli::try_parse_from(["ksx", "pads", "--count", "0"]).is_err());
-        assert!(Cli::try_parse_from(["ksx", "pads", "--count", "9"]).is_err());
-        for ok in ["1", "8"] {
-            assert!(
-                Cli::try_parse_from(["ksx", "pads", "--count", ok]).is_ok(),
-                "{ok}"
-            );
-        }
-    }
+    // `--count`'s range used to be pinned here, by a test whose NAME was the
+    // literal ("pads_count_range_is_1_to_8") — which is how it survived a
+    // grep for `1..=8` and outlived the constant it was describing. It lives
+    // in `every_slot_flag_ranges_over_the_constant_and_says_so` now, next to
+    // the two other flags that share the same failure.
 
     #[test]
     fn pads_help_documents_exit_codes() {
@@ -2900,9 +3030,11 @@ mod tests {
             _ => panic!("parsed to the wrong subcommand"),
         }
 
-        // Slots are 1..=8 (5..=8 need a PlayStation persona; XInput has four).
+        // Slots are 1..=MAX_SLOTS (slots past the fourth need a PlayStation
+        // persona; XInput has four). The range itself is pinned to the
+        // constant by `every_slot_flag_ranges_over_the_constant_and_says_so`.
         assert!(Cli::try_parse_from(["ksx", "setup", "--slot", "0"]).is_err());
-        assert!(Cli::try_parse_from(["ksx", "setup", "--slot", "9"]).is_err());
+        assert!(Cli::try_parse_from(["ksx", "setup", "--slot", &past_max_slot()]).is_err());
     }
 
     /// The wizard's `--help` has to carry the promises the design rests on:
@@ -2961,9 +3093,16 @@ mod tests {
         assert!(
             Cli::try_parse_from(["ksx", "slot", "assign", "--slot", "0", "--preset", "P"]).is_err()
         );
-        assert!(
-            Cli::try_parse_from(["ksx", "slot", "assign", "--slot", "9", "--preset", "P"]).is_err()
-        );
+        assert!(Cli::try_parse_from([
+            "ksx",
+            "slot",
+            "assign",
+            "--slot",
+            &past_max_slot(),
+            "--preset",
+            "P"
+        ])
+        .is_err());
     }
 
     /// The pad bounce is in `--help`, because it is the one consequence a user
