@@ -365,7 +365,7 @@ impl ControlSource for ScriptedControl {
     }
 }
 
-/// The MACHINE provider, scripted: one reference cabinet, and the two writes
+/// The MACHINE provider, scripted: one reference cabinet, and every write
 /// RECORDED rather than performed.
 ///
 /// Recorded rather than performed for the reason the cross-site test below
@@ -388,6 +388,10 @@ struct ScriptedMachine {
     /// `refuse` and from an actually-empty cabinet, and the one the page
     /// shipped without a single test reaching it.
     blind: bool,
+    /// The last `profile_new` spec this provider was asked for, so a test can
+    /// prove the FORM's values reached the verb rather than a default.
+    created_profile: Mutex<Option<ksx_api::NewProfile>>,
+    created_preset: Mutex<Option<ksx_api::NewPreset>>,
 }
 
 const IPAC_KB: &str = r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000";
@@ -563,6 +567,86 @@ impl ksx_api::MachineSource for ScriptedMachine {
             ),
         })
     }
+
+    /// The profile list is the reference cabinet's as of 2026-08-07, including
+    /// the one that is actually broken there: "MAME 4P" points at a mame.exe
+    /// that is not on the disk. The provider — not the page — is what decides
+    /// that, which is why the fixture states it as `state: "broken"` with the
+    /// path, exactly as `LocalMachine::profiles` composes it from
+    /// `ksx_games::preflight`.
+    fn profiles(&self) -> Result<ksx_api::ProfilesView, Refusal> {
+        Ok(ksx_api::ProfilesView {
+            generated_at: "test".into(),
+            config_root: "C:\\cfg".into(),
+            games_path: "C:\\cfg\\games.toml".into(),
+            profiles: vec![
+                ksx_api::ProfileDetail {
+                    title: "Street Fighter".into(),
+                    path: "C:\\sf.exe".into(),
+                    arguments: String::new(),
+                    slots: 2,
+                    presets: vec!["Arcade".into()],
+                    state: "ok".into(),
+                    verdict: "the program is there".into(),
+                    broken_path: None,
+                },
+                ksx_api::ProfileDetail {
+                    title: "MAME 4P".into(),
+                    path: "D:\\emu\\mame\\mame.exe".into(),
+                    arguments: String::new(),
+                    slots: 4,
+                    presets: vec!["Arcade".into()],
+                    state: "broken".into(),
+                    verdict: "game profile 'MAME 4P' points at 'D:\\emu\\mame\\mame.exe', \
+                              which does not exist"
+                        .into(),
+                    broken_path: Some("D:\\emu\\mame\\mame.exe".into()),
+                },
+            ],
+            notes: Vec::new(),
+        })
+    }
+
+    fn presets(&self) -> Result<ksx_api::PresetsView, Refusal> {
+        Ok(ksx_api::PresetsView {
+            config_root: "C:\\cfg\\presets".into(),
+            presets: vec![ksx_api::PresetRow {
+                name: "Arcade".into(),
+                bound: 25,
+                macros: 0,
+                protected: false,
+                source: "C:\\cfg\\presets\\Arcade.toml".into(),
+            }],
+            templates: vec![ksx_api::TemplateRow {
+                id: "keyboard-2p".into(),
+                label: "Two players sharing ONE keyboard: WASD vs the arrows".into(),
+                detail: "Two people on one ordinary keyboard, no encoder.".into(),
+                players: vec![1, 2],
+            }],
+        })
+    }
+
+    fn profile_new(&self, spec: &ksx_api::NewProfile) -> Result<String, Refusal> {
+        *self.created_profile.lock().unwrap() = Some(spec.clone());
+        if spec.title.trim().is_empty() {
+            return Err(Refusal::new(
+                ksx_api::codes::REFUSED,
+                "a profile needs a title — it is the name `ksx run --game` takes",
+            ));
+        }
+        Ok(format!(
+            "created profile \"{}\" — {} slot(s) on preset \"{}\" → {}",
+            spec.title, spec.slots, spec.preset, spec.path
+        ))
+    }
+
+    fn preset_new(&self, spec: &ksx_api::NewPreset) -> Result<String, Refusal> {
+        *self.created_preset.lock().unwrap() = Some(spec.clone());
+        Ok(format!(
+            "created preset \"{}\" — 30 controls from \"{}\" (player {})",
+            spec.name, spec.template, spec.player
+        ))
+    }
 }
 
 /// Bind port 0 to learn a free port, release it, and serve there. The tiny
@@ -630,6 +714,18 @@ fn start_server_with_machine(
             spec: &ksx_api::DeviceRemoveSpec,
         ) -> Result<ksx_api::DeviceRemoveView, Refusal> {
             self.0.device_remove(spec)
+        }
+        fn profiles(&self) -> Result<ksx_api::ProfilesView, Refusal> {
+            self.0.profiles()
+        }
+        fn presets(&self) -> Result<ksx_api::PresetsView, Refusal> {
+            self.0.presets()
+        }
+        fn profile_new(&self, spec: &ksx_api::NewProfile) -> Result<String, Refusal> {
+            self.0.profile_new(spec)
+        }
+        fn preset_new(&self, spec: &ksx_api::NewPreset) -> Result<String, Refusal> {
+            self.0.preset_new(spec)
         }
     }
     std::thread::spawn(move || {
@@ -1995,5 +2091,256 @@ fn every_page_links_to_the_device_picker() {
             body.contains(r#"href="/devices""#),
             "{route} has no link to the device picker: {body}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /profiles — the games.toml profiles and the presets (v15)
+// ---------------------------------------------------------------------------
+
+/// The page renders both machine reads, and a profile whose program is gone is
+/// broken ON THE PAGE with the path that is wrong — the whole reason this
+/// screen exists. That fact used to surface only when a session refused to
+/// start.
+#[test]
+fn the_profiles_page_shows_a_broken_profile_with_its_path() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    let response = get(addr, "/profiles");
+    let body = body_of(&response);
+
+    assert!(body.contains("Broken profiles"), "{body}");
+    assert!(body.contains("MAME 4P"), "{body}");
+    assert!(body.contains("D:\\emu\\mame\\mame.exe"), "{body}");
+    assert!(body.contains("which does not exist"), "{body}");
+    // The healthy one is listed too.
+    assert!(body.contains("Street Fighter"), "{body}");
+    // The presets and the in-box templates both arrived — the second is what
+    // `LocalMachine::presets` used to answer with an empty list.
+    assert!(body.contains("Arcade"), "{body}");
+    assert!(body.contains("keyboard-2p"), "{body}");
+}
+
+/// The JSON twin serves the same shape the page embeds — one struct, one
+/// serializer, like `/api/status` and `/api/map`.
+#[test]
+fn the_profiles_api_serves_the_pages_own_payload() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    let response = get(addr, "/api/profiles");
+    assert!(response.contains("no-store"), "{response}");
+
+    let value: serde_json::Value = serde_json::from_str(body_of(&response)).expect("json");
+    assert_eq!(
+        value.pointer("/profiles/profiles/1/state"),
+        Some(&serde_json::json!("broken"))
+    );
+    assert_eq!(
+        value.pointer("/profiles/profiles/1/broken_path"),
+        Some(&serde_json::json!("D:\\emu\\mame\\mame.exe"))
+    );
+    assert_eq!(
+        value.pointer("/presets/templates/0/id"),
+        Some(&serde_json::json!("keyboard-2p"))
+    );
+    // A poll is not an action.
+    assert_eq!(value.pointer("/flash"), Some(&serde_json::json!(null)));
+}
+
+/// Creating a profile: the form's own values reach the backend verb, and the
+/// outcome comes back as a flash on a 303 — never HTML from a POST.
+#[test]
+fn creating_a_profile_reaches_the_verb_and_flashes_the_outcome() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let machine = Arc::new(ScriptedMachine::default());
+    let addr = start_server_with_machine(control, machine.clone());
+
+    let response = post_form(
+        addr,
+        "/profiles/new",
+        "title=Tekken&path=C%3A%5Cgames%5Ctekken.exe&arguments=-windowed&slots=4&preset=Arcade",
+    );
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(response.contains("/profiles?flash="), "{response}");
+    assert!(response.contains("created%20profile"), "{response}");
+
+    let spec = machine
+        .created_profile
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("spec");
+    assert_eq!(spec.title, "Tekken");
+    assert_eq!(spec.path, "C:\\games\\tekken.exe");
+    assert_eq!(spec.arguments, "-windowed");
+    assert_eq!(spec.slots, 4);
+    assert_eq!(spec.preset, "Arcade");
+}
+
+/// A refusal flashes too, prefixed `error:` so the page's `show:flashError`
+/// pair picks the red side. Nothing fails silently.
+#[test]
+fn a_refused_profile_create_flashes_the_reason() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    let response = post_form(
+        addr,
+        "/profiles/new",
+        "title=&path=C%3A%5Cx.exe&slots=1&preset=Arcade",
+    );
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(response.contains("flash=error%3A"), "{response}");
+}
+
+/// A post missing a field entirely still comes back as a 303 with a worded
+/// flash, NOT a 422.
+///
+/// The distinction is not pedantry. The island fetch-submits and reads its
+/// outcome out of the redirect's `?flash=` — a 422 carries no `Location`, so
+/// the page would show nothing whatsoever and the user would be left pressing
+/// a button that appears to do nothing. That is the failure mode this whole
+/// screen replaced; it must not come back through the extractor.
+#[test]
+fn a_post_missing_fields_still_flashes_instead_of_422() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    for (path, body) in [
+        ("/profiles/new", "path=C%3A%5Cx.exe"),
+        ("/profiles/preset/new", "name=Couch"),
+    ] {
+        let response = post_form(addr, path, body);
+        assert!(
+            response.starts_with("HTTP/1.1 303"),
+            "{path} must redirect with a flash, not reject the body: {response}"
+        );
+        assert!(response.contains("flash="), "{path}: {response}");
+    }
+}
+
+/// Creating a preset from a template, through the same `preset_new` verb
+/// `ksx preset new` performs.
+#[test]
+fn creating_a_preset_from_a_template_reaches_the_verb() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let machine = Arc::new(ScriptedMachine::default());
+    let addr = start_server_with_machine(control, machine.clone());
+
+    let response = post_form(
+        addr,
+        "/profiles/preset/new",
+        "name=Couch&template=keyboard-2p&player=2",
+    );
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    let spec = machine
+        .created_preset
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("spec");
+    assert_eq!(spec.name, "Couch");
+    assert_eq!(spec.template, "keyboard-2p");
+    assert_eq!(spec.player, 2);
+    // Overwriting a 25-binding mapping is not something a web form may do by
+    // accident; `--force` stays the CLI's consent step.
+    assert!(!spec.force);
+}
+
+/// Switching profile is the SAME `ControlSource::start` the status page posts
+/// — one backend verb, no second "switch" path — and it comes back to
+/// /profiles so the user keeps their place.
+#[test]
+fn switching_profile_calls_start_and_returns_to_profiles() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control.clone());
+
+    let response = post_form(addr, "/profiles/switch", "profile=MAME+4P");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("location: /profiles?flash="),
+        "the redirect must come back HERE, not to / like the status page's \
+         twin of this verb: {response}"
+    );
+    assert_eq!(
+        control.started_with.lock().unwrap().clone(),
+        Some(Some("MAME 4P".to_owned())),
+        "the profile the row named must reach `start`"
+    );
+}
+
+/// The guard is a router-wide layer, so a route declared in the same chain is
+/// guarded by construction — but "by construction" is exactly the claim worth
+/// testing, once, per new mutating route.
+#[test]
+fn the_profiles_write_routes_refuse_a_cross_site_post() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let machine = Arc::new(ScriptedMachine::default());
+    let addr = start_server_with_machine(control.clone(), machine.clone());
+
+    for (path, body) in [
+        (
+            "/profiles/new",
+            "title=Evil&path=C%3A%5Cevil.exe&slots=1&preset=Arcade",
+        ),
+        (
+            "/profiles/preset/new",
+            "name=Evil&template=keyboard-2p&player=1",
+        ),
+        ("/profiles/switch", "profile=MAME+4P"),
+    ] {
+        let response = http(
+            addr,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+                 Origin: http://evil.example\r\nConnection: close\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {len}\r\n\r\n{body}",
+                port = addr.port(),
+                len = body.len(),
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "{path} must refuse a cross-site POST: {response}"
+        );
+    }
+    // Not "it returned 403" — that no write happened.
+    assert!(machine.created_profile.lock().unwrap().is_none());
+    assert!(machine.created_preset.lock().unwrap().is_none());
+    assert!(control.started_with.lock().unwrap().is_none());
+}
+
+/// A rebound host cannot even READ the profile list. The same Host check
+/// covers every route; it is asserted on this one because a page that lists
+/// filesystem paths is worth naming explicitly.
+#[test]
+fn a_rebound_host_cannot_read_the_profiles() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    let response = http(
+        addr,
+        "GET /api/profiles HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 421"), "{response}");
+}
+
+/// Every page's nav must list every page, or a screen is unreachable. The nav
+/// is static markup INSIDE each island — not server-injected, not a shared
+/// component — so this is one edit per island, and exactly the kind that gets
+/// forgotten.
+#[test]
+fn every_page_links_to_every_other_page() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    for route in ["/", "/map", "/profiles"] {
+        let response = get(addr, route);
+        let body = body_of(&response);
+        for link in [r#"href="/""#, r#"href="/map""#, r#"href="/profiles""#] {
+            assert!(
+                body.contains(link),
+                "{route} does not link to {link} — the page is unreachable from it"
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 //! `ksx studio` — the localhost control room (feature `studio`).
 //!
-//! Two providers, both thin, and neither of them Studio's:
+//! Three providers, all thin, and none of them Studio's:
 //!
 //! - [`ksx_api::StatusSource`] from the EXISTING collectors, which live in
 //!   [`crate::sources`] because the cabinet reads the same facts and a
@@ -14,6 +14,14 @@
 //!   `DaemonCommand` a tray click would (docs/CONTROL-SURFACE.md — no GUI-only
 //!   code paths). No daemon on the pipe → the panel says so and the controls
 //!   render disabled; this process never becomes a daemon itself.
+//! - [`ksx_api::MachineSource`] as [`crate::sources::LocalMachine`]: the reads
+//!   and writes that are neither a snapshot nor a `DaemonCommand` — the
+//!   device scan and the two `[[device]]` writes behind `/devices`, the
+//!   preflighted games.toml profile list, the presets with their in-box
+//!   templates, and the two creates behind `/profiles`. Daemon-free by
+//!   construction (it is the config store, the USB tree and the filesystem),
+//!   which is what lets a first-run cabinet pick its board and make its first
+//!   profile and preset before anything is running.
 //!
 //! **The control implementation used to live here**, as ~250 lines that built
 //! each request with `serde_json::json!` and read each answer with
@@ -35,10 +43,11 @@ pub fn run(port: u16) -> anyhow::Result<()> {
         bind,
         Box::new(CollectorSource),
         Box::new(control_source()),
-        // The third provider (v17): the MACHINE verbs the `/devices` picker
-        // needs. Daemon-free by construction — it walks the USB tree and the
-        // config store directly — which is why the picker keeps working behind
-        // the "No daemon" banner that disables every session control.
+        // The third provider: the MACHINE verbs behind `/devices` and
+        // `/profiles`. Daemon-free by construction — it walks the USB tree
+        // and the config store directly — which is why both pages keep
+        // working behind the "No daemon" banner that disables every session
+        // control.
         Box::new(LocalMachine),
     )?;
     Ok(())

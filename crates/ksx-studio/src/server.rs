@@ -31,20 +31,26 @@ use crate::error::StudioError;
 use crate::render::{render_status, Assets, BrandAssets, EmbeddedPage};
 use crate::render_devices::render_devices;
 use crate::render_map::render_map;
-use crate::snapshot::{DevicesPayload, MapPayload, StatusPayload, StatusSnapshot, StatusSource};
+use crate::snapshot::{
+    DevicesPayload, MapPayload, ProfilesPayload, StatusPayload, StatusSnapshot, StatusSource,
+};
 
 struct AppState {
     page: EmbeddedPage,
     map_page: EmbeddedPage,
     devices_page: EmbeddedPage,
+    profiles_page: EmbeddedPage,
     source: Box<dyn StatusSource>,
     control: Box<dyn ControlSource>,
-    /// The MACHINE verbs — device enumeration and the two `[[device]]` writes.
-    ///
-    /// A THIRD provider rather than more methods on the two above, because it
-    /// answers a different question and answers it with no daemon: `machine`
-    /// reads the USB tree and the config store directly, so `/devices` works
-    /// while the pipe is dead, exactly as the read-only mapper does.
+    /// The MACHINE reads and writes that are not a `DaemonCommand`: the
+    /// device enumeration and the two `[[device]]` writes behind `/devices`,
+    /// the preflighted profile list, the preset list with its templates, and
+    /// the two creates behind `/profiles`. A THIRD provider rather than more
+    /// methods on the other two, because that is the split `ksx-api` already
+    /// draws — status is what the box looks like, control is what the daemon
+    /// can be told, and this is what is on the machine itself (the USB tree
+    /// and the config store), readable while the pipe is dead, exactly as the
+    /// read-only mapper is.
     machine: Box<dyn ksx_api::MachineSource>,
 }
 
@@ -69,10 +75,12 @@ pub fn serve(
     let page = EmbeddedPage::load("/")?;
     let mapper = EmbeddedPage::load("/map")?;
     let devices = EmbeddedPage::load("/devices")?;
+    let profiles = EmbeddedPage::load("/profiles")?;
     let state = Arc::new(AppState {
         page,
         map_page: mapper,
         devices_page: devices,
+        profiles_page: profiles,
         source,
         control,
         machine,
@@ -158,6 +166,20 @@ pub fn serve(
             .route("/api/devices", get(api_devices))
             .route("/devices/pick", post(devices_form_pick))
             .route("/devices/remove", post(devices_form_remove))
+            // PROFILES & PRESETS. The read is `MachineSource::profiles`
+            // (games.toml with `ksx_games::preflight` already run, so a
+            // profile whose .exe moved is a broken ROW instead of a cabinet
+            // that does nothing when the button is pressed) plus
+            // `MachineSource::presets`. The three writes are one backend verb
+            // each: `profile_new`, `preset_new`, and — for "switch to this" —
+            // the SAME `ControlSource::start` the status page's forms post,
+            // 303-ing back here so the user keeps their place, exactly as
+            // `/map/session/stop` reuses `stop`.
+            .route("/profiles", get(profiles_page))
+            .route("/api/profiles", get(api_profiles))
+            .route("/profiles/new", post(profiles_form_new))
+            .route("/profiles/switch", post(profiles_form_switch))
+            .route("/profiles/preset/new", post(profiles_form_preset_new))
             // Canon helper: correct no-cache + Service-Worker-Allowed
             // headers for free (replaced a hand-rolled handler).
             .route("/sw.js", get(forma_server::sw::serve_sw::<Assets>))
@@ -1194,6 +1216,233 @@ async fn session_stop(State(state): State<Arc<AppState>>) -> Response {
 
 async fn config_reload(State(state): State<Arc<AppState>>) -> Response {
     act(state, |control| control.reload().map_err(flash_of)).await
+}
+
+// ---------------------------------------------------------------------------
+// /profiles — the games.toml profiles and the presets, with the two creates
+// ---------------------------------------------------------------------------
+
+/// One fresh profiles payload. Both machine reads hit the config store, which
+/// blocks; kept off the async workers like [`collect`] and [`collect_map`].
+///
+/// A read that REFUSES becomes a note, not an exception: "no profiles" and
+/// "games.toml is unreadable" are not the same sentence, and a page that
+/// renders the first when the second is true is the failure this whole page
+/// exists to stop repeating.
+async fn collect_profiles(state: &Arc<AppState>) -> ProfilesPayload {
+    let read_state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let session = read_state.control.session();
+        let mut notes = Vec::new();
+        let profiles = match read_state.machine.profiles() {
+            Ok(view) => {
+                notes.extend(view.notes.iter().cloned());
+                view
+            }
+            Err(refusal) => {
+                notes.push(refusal.message.clone());
+                if let Some(remedy) = &refusal.remedy {
+                    notes.push(remedy.clone());
+                }
+                ksx_api::ProfilesView::default()
+            }
+        };
+        let presets = match read_state.machine.presets() {
+            Ok(view) => view,
+            Err(refusal) => {
+                notes.push(refusal.message.clone());
+                ksx_api::PresetsView::default()
+            }
+        };
+        // Both reads discover the config root independently, so a machine with
+        // no config root refuses BOTH with the identical sentence. Printing it
+        // twice reads as two problems, and the client keys its note list by the
+        // line — duplicate keys are a reconcile hazard as well as a lie.
+        // `Vec::dedup` would not do it: the duplicates are not adjacent (the
+        // first read contributes a message AND its remedy before the second
+        // read's message arrives).
+        let mut seen = std::collections::BTreeSet::new();
+        notes.retain(|line| seen.insert(line.clone()));
+        ProfilesPayload {
+            profiles,
+            presets,
+            session,
+            notes,
+            flash: None,
+        }
+    })
+    .await
+    .unwrap_or_else(|_| ProfilesPayload {
+        session: SessionView::unreachable("profile collection panicked"),
+        notes: vec!["profile collection panicked".to_owned()],
+        ..ProfilesPayload::default()
+    })
+}
+
+async fn profiles_page(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PageQuery>,
+) -> Response {
+    let payload = collect_profiles(&state).await;
+    let flash = query.flash.as_deref().filter(|f| !f.trim().is_empty());
+    let out = crate::render_profiles::render_profiles(&state.profiles_page, &payload, flash);
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_str(&out.csp)
+                    .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'")),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        out.html,
+    )
+        .into_response()
+}
+
+/// The Profiles poller's endpoint — the same [`ProfilesPayload`] the page
+/// embeds (parity unit-tested in render_profiles.rs).
+async fn api_profiles(State(state): State<Arc<AppState>>) -> Response {
+    let payload = collect_profiles(&state).await;
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        axum::Json(payload),
+    )
+        .into_response()
+}
+
+/// 303 back to /profiles, carrying the outcome as the flash. Errors flash
+/// exactly like successes — the no-JS page must never fail silently.
+fn profiles_redirect(outcome: Result<String, String>) -> Response {
+    let flash = match outcome {
+        Ok(message) => message,
+        Err(error) => format!("error: {error}"),
+    };
+    Redirect::to(&format!("/profiles?flash={}", urlencode(&flash))).into_response()
+}
+
+/// Run one [`ksx_api::MachineSource`] verb off the async workers, then 303
+/// back to /profiles. The [`act`] of this page.
+async fn machine_act<F>(state: Arc<AppState>, verb: F) -> Response
+where
+    F: FnOnce(&dyn ksx_api::MachineSource) -> Result<String, String> + Send + 'static,
+{
+    let outcome = tokio::task::spawn_blocking(move || verb(state.machine.as_ref()))
+        .await
+        .unwrap_or_else(|_| Err("the machine call panicked".to_owned()));
+    profiles_redirect(outcome)
+}
+
+/// Every field defaults, deliberately — including the two that are required.
+///
+/// Not laxity: an extraction FAILURE is a 422 with no `Location`, and the
+/// island's fetch-submit reads its outcome out of the redirect's `?flash=`
+/// (`profiles.ts`). A 422 therefore arrives as `flash = null`, which the page
+/// renders as nothing at all — the exact silent failure every route here is
+/// written to avoid. Defaulting hands an empty spec to the planner instead,
+/// which refuses in words and 303s like everything else.
+#[derive(Deserialize)]
+struct NewProfileForm {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    arguments: String,
+    /// The form's `<input type="number">`. Absent falls through to the
+    /// planner's own refusal rather than a silent default: "how many players"
+    /// is not a question this layer may answer on the user's behalf.
+    #[serde(default)]
+    slots: Option<u8>,
+    #[serde(default)]
+    preset: String,
+}
+
+/// POST /profiles/new — the verb that did not exist.
+///
+/// `ksx setup` writes INTO a profile and bails when the title is absent;
+/// `ksx config import` replaces the whole file. Neither creates one, which is
+/// why "I can't create a new profile" was a true statement about every surface
+/// ksx had. One `MachineSource::profile_new` call, one plan, one write with a
+/// timestamped backup.
+async fn profiles_form_new(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<NewProfileForm>,
+) -> Response {
+    machine_act(state, move |machine| {
+        machine
+            .profile_new(&ksx_api::NewProfile {
+                title: form.title,
+                path: form.path,
+                arguments: form.arguments,
+                slots: form.slots.unwrap_or(0),
+                preset: form.preset,
+            })
+            .map_err(flash_of)
+    })
+    .await
+}
+
+/// Defaulted for the same reason as [`NewProfileForm`].
+#[derive(Deserialize)]
+struct NewPresetForm {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    template: String,
+    #[serde(default)]
+    player: Option<u8>,
+}
+
+/// POST /profiles/preset/new — `ksx preset new`, through the same writer.
+///
+/// No `force` field, deliberately: overwriting a preset is destructive and the
+/// consent shape for it is the CLI's `--force`. A web form that could clobber
+/// a 25-binding mapping because a name collided is not a form this page wants;
+/// the refusal names the preset it protected and the flag that means yes.
+async fn profiles_form_preset_new(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<NewPresetForm>,
+) -> Response {
+    machine_act(state, move |machine| {
+        machine
+            .preset_new(&ksx_api::NewPreset {
+                name: form.name,
+                template: form.template,
+                player: form.player.unwrap_or(1),
+                force: false,
+            })
+            .map_err(flash_of)
+    })
+    .await
+}
+
+/// POST /profiles/switch — start a session under one profile.
+///
+/// The SAME `ControlSource::start` the status page's forms post and the tray
+/// enqueues; the only difference is that this one comes back to /profiles, so
+/// the user keeps their place. Exactly the shape `/map/session/stop` already
+/// has. There is no second "switch profile" verb and there must not be.
+async fn profiles_form_switch(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<StartForm>,
+) -> Response {
+    let profile = form
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned);
+    let outcome = tokio::task::spawn_blocking(move || {
+        state.control.start(profile.as_deref()).map_err(flash_of)
+    })
+    .await
+    .unwrap_or_else(|_| Err("the control call panicked".to_owned()));
+    profiles_redirect(outcome)
 }
 
 /// One [`ksx_api::Refusal`] as the sentence this page flashes.

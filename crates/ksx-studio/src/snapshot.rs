@@ -80,6 +80,30 @@ pub struct DevicesPayload {
     pub flash: Option<String>,
 }
 
+/// What `GET /api/profiles` serves AND what the Profiles island's props carry
+/// — the same one-struct-one-serializer rule as [`StatusPayload`], parity
+/// pinned in `render_profiles.rs`.
+///
+/// Two machine views side by side rather than one flattened shape, because
+/// they are two backend reads with two failure modes: games.toml can be
+/// unreadable while the presets folder is fine, and the page has to be able to
+/// say which. [`notes`](Self::notes) is where either read's complaint lands —
+/// a refusal renders as a note beside an empty list, never as an empty list on
+/// its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfilesPayload {
+    pub profiles: ksx_api::ProfilesView,
+    pub presets: ksx_api::PresetsView,
+    pub session: crate::control::SessionView,
+    /// Anything either read had to say out loud, including a whole read that
+    /// refused. Rendered; never swallowed.
+    #[serde(default)]
+    pub notes: Vec<String>,
+    /// One-shot action feedback (the `?flash=` query). Always `None` from
+    /// `/api/profiles` — a poll is not an action.
+    pub flash: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

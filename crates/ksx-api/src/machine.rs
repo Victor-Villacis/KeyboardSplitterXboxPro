@@ -100,6 +100,48 @@ pub trait MachineSource: Send + Sync {
         ))
     }
 
+    /// The `[[game]]` profiles in games.toml, **with the launch preflight
+    /// already run**.
+    ///
+    /// That last clause is the whole reason this is not just
+    /// [`StatusSnapshot::profiles`](crate::status::StatusSnapshot::profiles),
+    /// which carries a title and a composed line and nothing a surface can
+    /// branch on. `ksx_games::preflight` has always been able to say "that
+    /// .exe is not there" — it just ran at LAUNCH time, so a profile pointing
+    /// at a moved emulator looked perfectly healthy in every list until the
+    /// moment someone tried to play. Running the same check on the read side
+    /// costs one `is_file()` per row and turns a mystery into a row with the
+    /// wrong path printed on it.
+    fn profiles(&self) -> Result<ProfilesView, Refusal> {
+        Err(Refusal::not_here(
+            "listing games.toml profiles",
+            "run `ksx config export --what games`",
+        ))
+    }
+
+    /// Add a `[[game]]` profile to games.toml.
+    ///
+    /// The remedy names Studio rather than a CLI verb because there is no CLI
+    /// verb: `ksx setup` writes INTO an existing profile and refuses when the
+    /// title is absent, and `ksx config import` replaces the whole file. This
+    /// is the surface docs/SURFACES.md §3 gives "Edit config, profiles" to,
+    /// and until a `ksx games new` exists the honest remedy is to say so.
+    fn profile_new(&self, _spec: &NewProfile) -> Result<String, Refusal> {
+        Err(Refusal::not_here(
+            "creating a games.toml profile",
+            "run `ksx studio` and use its Profiles page",
+        ))
+    }
+
+    /// `ksx preset new <NAME> --from-template <ID>` — one atomic write that
+    /// turns an in-box template into an ordinary, editable preset file.
+    fn preset_new(&self, _spec: &NewPreset) -> Result<String, Refusal> {
+        Err(Refusal::not_here(
+            "creating a preset",
+            "run `ksx preset new \"<NAME>\" --from-template <ID>`",
+        ))
+    }
+
     /// `ksx autostart --status` — the logon-task registration.
     fn autostart(&self) -> Result<AutostartView, Refusal> {
         Err(Refusal::not_here(
@@ -789,6 +831,87 @@ pub struct PresetRow {
     pub source: String,
 }
 
+/// The games.toml profiles, preflighted.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfilesView {
+    pub generated_at: String,
+    /// The config root these were read from.
+    pub config_root: String,
+    /// games.toml's own path — the file a broken row has to be fixed in, and
+    /// therefore the one string a "this is wrong" row cannot leave out.
+    pub games_path: String,
+    pub profiles: Vec<ProfileDetail>,
+    /// Anything the read has to say out loud (an unreadable file, a profile
+    /// with no slots) — rendered, never swallowed.
+    pub notes: Vec<String>,
+}
+
+/// One `[[game]]` profile, as a surface can see it — including whether the
+/// program it names is actually on this disk.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileDetail {
+    pub title: String,
+    /// The `path` key verbatim: an executable, or a `steam://`-style URL.
+    pub path: String,
+    pub arguments: String,
+    /// How many `[[game.slot]]` entries it hands out.
+    pub slots: usize,
+    /// The presets those slots name, de-duplicated, in slot order.
+    pub presets: Vec<String>,
+    /// `ok` | `broken` | `launcher`.
+    ///
+    /// `launcher` is NOT a weaker `ok`, and collapsing the two would be a lie
+    /// in the direction that matters: a `steam://` URL is unverifiable by
+    /// construction — only the shell knows whether `rungameid/9999` names a
+    /// real game — so ksx cannot promise it works and must not imply it has
+    /// checked (`ksx_games::preflight`'s own words).
+    pub state: String,
+    /// The one sentence that says what that means for a launch.
+    pub verdict: String,
+    /// The path that does not resolve. `Some` **only** when
+    /// `state == "broken"`, because a row that says "broken" without printing
+    /// the string it is complaining about sends the user back to the file to
+    /// guess which of two paths moved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broken_path: Option<String>,
+}
+
+/// A new `[[game]]` profile, as a surface asks for one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewProfile {
+    pub title: String,
+    /// The program to launch: a full path to an .exe, or a launcher URL.
+    pub path: String,
+    /// Command line for it, split the way `CommandLineToArgvW` would.
+    #[serde(default)]
+    pub arguments: String,
+    /// How many `[[game.slot]]` entries to seed, `1..=ksx_core::MAX_SLOTS`.
+    ///
+    /// Seeding is not a convenience. A profile with no slots hands out no
+    /// pads, and `ksx run --game` refuses it — so "create" that produced an
+    /// empty shell would answer "I can't make a profile" with a profile that
+    /// cannot be used.
+    pub slots: u8,
+    /// The preset every seeded slot starts on. The device stays unset —
+    /// wiring a board to a slot is `ksx setup`'s job and the /devices page's,
+    /// not something a create form should guess.
+    pub preset: String,
+}
+
+/// A new preset, seeded from an in-box template.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewPreset {
+    pub name: String,
+    /// The template id ([`TemplateRow::id`]).
+    pub template: String,
+    /// Which player block to instantiate, `1..=`[`TemplateRow::players`].
+    pub player: u8,
+    /// Overwrite an existing preset of that name. A timestamped backup is
+    /// taken first — same consent shape as `ksx preset new --force`.
+    #[serde(default)]
+    pub force: bool,
+}
+
 /// One preset template (`ksx-core/src/templates.rs`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemplateRow {
@@ -868,6 +991,18 @@ mod tests {
                     .unwrap_err(),
             ),
             ("ksx preset list", Nothing.presets().unwrap_err()),
+            (
+                "ksx preset new",
+                Nothing.preset_new(&NewPreset::default()).unwrap_err(),
+            ),
+            ("ksx config export", Nothing.profiles().unwrap_err()),
+            // The one row whose remedy names a SURFACE rather than a verb,
+            // because no CLI verb creates a profile yet. It still names
+            // something a person can run, which is the invariant.
+            (
+                "ksx studio",
+                Nothing.profile_new(&NewProfile::default()).unwrap_err(),
+            ),
             ("ksx autostart", Nothing.autostart().unwrap_err()),
             ("ksx doctor", Nothing.doctor().unwrap_err()),
             ("ksx winusb status", Nothing.winusb().unwrap_err()),

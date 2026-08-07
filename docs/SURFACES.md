@@ -292,6 +292,17 @@ crossing is a design smell worth a second look.
   field.
 - **Device pick UI** — Studio, following the existing CLI verb (§3). Also the
   egui: §3 row 3 no longer claims a view exists there.
+- **`ksx games new` — the CLI half of profile creation, owed.** Studio's
+  `/profiles` page creates a games.toml profile through
+  `MachineSource::profile_new` over a pure plan in `ksx-app`'s `profile_edit`
+  — but there is no CLI verb for it, so §2's build order ran 1 → 3 with 2
+  skipped. That is backwards and it shows: `profile_edit` is gated
+  `#[cfg(any(feature = "studio", feature = "cabinet"))]` because Studio is its
+  only caller, which is a backend module whose existence depends on a UI
+  feature flag. `plan_new` / `apply_new` are pure and already carry the
+  refusals; the CLI verb is a thin driver over them, and it removes the gate.
+  Until then §3's "Edit config, profiles | CLI owns" row is aspirational for
+  the CREATE half.
 - **Cabinet slot list scrolling** — egui, operating surface, still broken above
   four slots. The body *is* inside a `ScrollArea`; what is missing is any
   scroll-to-focus call, so the joystick can move the cursor to a row that is

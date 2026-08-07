@@ -24,6 +24,15 @@ mod mapping;
 mod monitor;
 mod pads;
 mod preset_cli;
+mod preset_edit;
+// Gated exactly like `sources` below, and for the same `-D warnings` reason:
+// this is the write half of games.toml and Studio's Profiles page is its only
+// caller today, so a default build would carry it as dead code. The gate comes
+// off the day a `ksx games new` CLI verb exists — which is where it belongs
+// per docs/SURFACES.md §2, and which is the one thing this change-set did not
+// also do.
+#[cfg(any(feature = "studio", feature = "cabinet"))]
+mod profile_edit;
 mod run;
 mod session;
 mod setup;
