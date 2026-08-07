@@ -241,10 +241,18 @@ impl Focus {
         match nav {
             Nav::Up => {
                 if self.rows > 0 {
-                    // Wrapping, both ways. On a list of four slots, "up from
-                    // the top" meaning "the bottom" saves three presses and
-                    // costs nothing — there is no scrollbar to lose your place
-                    // in.
+                    // Wrapping, both ways, and it earns more the longer the
+                    // list gets: on four slots "up from the top" meaning "the
+                    // bottom" saved three presses, and on sixteen it saves
+                    // fifteen. It is what keeps the ceiling reachable in the
+                    // ten seconds this surface is allowed — no row of a
+                    // `MAX_SLOTS` list is ever more than half a list away, and
+                    // there is still no page key to be told about.
+                    //
+                    // It does jump the page under the cursor (`crate::list`),
+                    // which is fine: the page follows the cursor, so wrapping
+                    // lands on a screen with the focused row on it. The cursor
+                    // is never in a place the panel is not showing.
                     self.row = (self.row + self.rows - 1) % self.rows;
                 }
                 Action::Moved
@@ -330,6 +338,41 @@ mod tests {
         // presses apart.
         focus.apply(Nav::Left);
         assert_eq!(focus.screen, Screen::Presets);
+    }
+
+    /// **A `MAX_SLOTS` list is still walkable in the ten seconds this surface
+    /// gets.**
+    ///
+    /// The ceiling moved from 8 to 16 and nothing here was allowed to grow a
+    /// page key for it — `nav`'s whole premise is that there are four moves and
+    /// two verbs, and every accelerator is a thing somebody has to be TOLD.
+    /// What makes 16 tolerable is the wrap: every row is reachable in at most
+    /// half the list, from either end, with the one stick a cabinet has.
+    #[test]
+    fn every_row_of_a_max_slots_list_is_within_half_a_list_of_the_top() {
+        let rows = usize::from(ksx_api::MAX_SLOTS);
+        for target in 0..rows {
+            let down = target;
+            let up = rows - target;
+            let presses = down.min(up);
+            assert!(
+                presses <= rows / 2,
+                "slot {} takes {presses} presses to reach",
+                target + 1
+            );
+
+            // ...and the short way round actually lands there.
+            let mut focus = on(Screen::Presets, rows);
+            let nav = if down <= up { Nav::Down } else { Nav::Up };
+            for _ in 0..presses {
+                focus.apply(nav);
+            }
+            assert_eq!(
+                focus.row(),
+                target,
+                "{presses} x {nav:?} missed slot {target}"
+            );
+        }
     }
 
     #[test]

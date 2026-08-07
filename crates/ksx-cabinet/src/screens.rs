@@ -10,11 +10,13 @@
 //! Nothing in this file decides anything a CLI verb does not already decide.
 //! It places rows and colours them.
 
+use std::ops::Range;
 use std::time::Instant;
 
 use egui::{Align, Color32, Layout, RichText, Sense, Stroke, Vec2};
 
 use crate::app::{flash_alive, App, Ask, Lit, Slow, Tone};
+use crate::list;
 use crate::nav::{Confirm, Screen};
 use crate::theme::{ctl, fs, radius, role, sp, FOCUS_OFFSET, FOCUS_STROKE};
 
@@ -37,6 +39,13 @@ pub fn foot(ui: &mut egui::Ui, app: &App, slow: &Slow, now: Instant) {
 }
 
 /// The screen itself, in whatever is left.
+///
+/// **The scroll area is not how a long list is read here** — see
+/// [`crate::list`]. It is a backstop for a panel shorter than anything this
+/// surface was designed for, and it is what gives the screens inside a finite
+/// [`egui::Ui::available_height`] to page against; a cabinet has no wheel to
+/// turn it with. Anything that is a LIST goes through [`walk`], which never
+/// draws a row the panel cannot show.
 pub fn body(ui: &mut egui::Ui, app: &mut App, slow: &Slow, now: Instant) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -279,6 +288,98 @@ fn row(ui: &mut egui::Ui, focused: bool, height: f32, draw: impl FnOnce(&mut egu
     draw(&mut child, text);
 }
 
+/// The height one "N more" line costs, reserved whether it is drawn or not.
+///
+/// One `fs::SM` line plus its spacing, rounded up rather than measured: over-
+/// reserving by a few pixels loses nothing (it is far less than a row's pitch),
+/// and under-reserving would shave the bottom row's focus ring, which is the
+/// one pixel this surface cannot afford to lose (`theme`'s module docs).
+const HINT: f32 = fs::SM + sp::S4;
+
+/// The vertical distance from one row's top to the next.
+///
+/// Three terms, and the third is the one that is easy to forget: `row_h` is the
+/// plate, `gap` is the [`egui::Ui::add_space`] the caller puts between rows,
+/// and `item_spacing.y` is what egui inserts between two allocated widgets
+/// whether anybody asked for it or not (`Ui::add_space`'s own docs: "this will
+/// be in addition to the `item_spacing` that is always added"). Leave it out
+/// and every page claims one row more than fits.
+fn pitch(ui: &egui::Ui, row_h: f32, gap: f32) -> f32 {
+    row_h + gap + ui.spacing().item_spacing.y
+}
+
+/// **Draw a list that may be taller than the panel, one page at a time.**
+///
+/// Every list on this surface goes through here, because every list on this
+/// surface is walked by a joystick and by nothing else (docs/SURFACES.md §4).
+/// [`crate::list`] decides *which* rows; this places them, and says in words
+/// how many are above and below — a 12 px scroll bar is a rumour at six feet,
+/// and it is a rumour about a wheel that does not exist.
+///
+/// The space for both hint lines is held whether or not there is anything to
+/// say in it, so that stepping off the first page does not shove every row
+/// down by a line. A cabinet list that twitches as the cursor crosses a page
+/// boundary is harder to read than one that is simply long.
+///
+/// Returns the slice it drew, which is what the tests assert on.
+fn walk(
+    ui: &mut egui::Ui,
+    focus: usize,
+    count: usize,
+    row_h: f32,
+    gap: f32,
+    mut draw: impl FnMut(&mut egui::Ui, usize),
+) -> Range<usize> {
+    let pitch = pitch(ui, row_h, gap);
+    let available = ui.available_height();
+    // Measured twice on purpose. The hints are only worth their height when
+    // there is something off screen to point at, so the question "does the
+    // whole list fit?" is asked WITHOUT them — otherwise a list of exactly the
+    // page size would page itself to make room for a "0 more below".
+    let window = if list::per_page(available, pitch) >= count {
+        0..count
+    } else {
+        list::window(count, focus, list::per_page(available - 2.0 * HINT, pitch))
+    };
+    let paged = window.len() < count;
+
+    if paged {
+        more(ui, window.start, true);
+    }
+    for index in window.clone() {
+        draw(ui, index);
+        ui.add_space(gap);
+    }
+    if paged {
+        more(ui, count.saturating_sub(window.end), false);
+    }
+    window
+}
+
+/// "`^   4 more above`" / "`v   9 more below`" — and the room for it either
+/// way.
+///
+/// The glyphs are the legend's own (`footer`): ASCII, because egui's bundled
+/// fonts cover a specific set and nothing warns you when a codepoint is outside
+/// it, and because `^` and `v` are what an arcade panel is labelled with.
+fn more(ui: &mut egui::Ui, rows: usize, above: bool) {
+    if rows == 0 {
+        ui.add_space(HINT);
+        return;
+    }
+    let (arrow, side) = if above {
+        ("^", "above")
+    } else {
+        ("v", "below")
+    };
+    ui.label(
+        RichText::new(format!("{arrow}   {rows} more {side}"))
+            .size(fs::SM)
+            .color(role::TEXT_2),
+    );
+    ui.add_space(sp::S1);
+}
+
 /// One line of key-value text, for the facts that are read rather than
 /// pressed.
 fn fact(ui: &mut egui::Ui, name: &str, value: &str, colour: Color32) {
@@ -399,32 +500,45 @@ fn pad_column(ui: &mut egui::Ui, app: &App, numbers: &[u8], now: Instant) {
     // wrong for the screen: four slots plus their chips ran past the bottom of
     // the panel, so P3 and P4 — the two a cabinet operator is most often
     // checking, because P1 obviously works — were below the fold with nothing
-    // saying they existed. Every slot fits now, which is the requirement.
-    for (index, number) in numbers.iter().enumerate() {
-        let focused = app.focus.is_on(index);
-        let lit = app.lit_controls(*number, now);
-        row(ui, focused, ctl::ROW, |ui, text| {
-            ui.label(
-                RichText::new(format!("P{number}"))
-                    .size(fs::LG)
-                    .color(if focused { text } else { role::COOL })
-                    .strong(),
-            );
-            ui.add_space(sp::S3);
-            if lit.is_empty() {
-                // An honest "nothing", not an empty row: a blank plate reads
-                // as a rendering bug, a dash reads as a fact.
-                ui.label(RichText::new("--").size(fs::BASE).color(if focused {
-                    text
-                } else {
-                    role::TEXT_3
-                }));
-            }
-            for (control, how) in &lit {
-                light(ui, control, *how, focused);
-            }
-        });
-    }
+    // saying they existed.
+    //
+    // That bought four. Sixteen needs the page (`walk`): on a sixteen-slot
+    // cabinet this column is the button check, and a button check that cannot
+    // show P12 is a button check P12 cannot use.
+    let focus = &app.focus;
+    walk(
+        ui,
+        focus.row(),
+        numbers.len(),
+        ctl::ROW,
+        0.0,
+        |ui, index| {
+            let number = numbers[index];
+            let focused = focus.is_on(index);
+            let lit = app.lit_controls(number, now);
+            row(ui, focused, ctl::ROW, |ui, text| {
+                ui.label(
+                    RichText::new(format!("P{number}"))
+                        .size(fs::LG)
+                        .color(if focused { text } else { role::COOL })
+                        .strong(),
+                );
+                ui.add_space(sp::S3);
+                if lit.is_empty() {
+                    // An honest "nothing", not an empty row: a blank plate reads
+                    // as a rendering bug, a dash reads as a fact.
+                    ui.label(RichText::new("--").size(fs::BASE).color(if focused {
+                        text
+                    } else {
+                        role::TEXT_3
+                    }));
+                }
+                for (control, how) in &lit {
+                    light(ui, control, *how, focused);
+                }
+            });
+        },
+    );
     if app.dropped > 0 {
         ui.add_space(sp::S2);
         fact(
@@ -707,24 +821,34 @@ fn profiles(ui: &mut egui::Ui, app: &mut App, slow: &Slow) {
         );
         return;
     }
-    for (index, profile) in rows.iter().enumerate() {
-        let current = slow.session.profile.as_deref() == Some(profile.title.as_str());
-        row(ui, app.focus.is_on(index), ctl::ROW, |ui, text| {
-            ui.label(
-                RichText::new(&profile.title)
-                    .size(fs::LG)
-                    .color(text)
-                    .strong(),
-            );
-            ui.add_space(sp::S3);
-            ui.label(RichText::new(&profile.detail).size(fs::XS).color(text));
-            if current {
+    // games.toml holds as many profiles as somebody cares to write, so this
+    // list is long on any cabinet with a shelf of emulators.
+    let focus = &app.focus;
+    walk(
+        ui,
+        focus.row(),
+        rows.len(),
+        ctl::ROW,
+        sp::S2,
+        |ui, index| {
+            let profile = &rows[index];
+            let current = slow.session.profile.as_deref() == Some(profile.title.as_str());
+            row(ui, focus.is_on(index), ctl::ROW, |ui, text| {
+                ui.label(
+                    RichText::new(&profile.title)
+                        .size(fs::LG)
+                        .color(text)
+                        .strong(),
+                );
                 ui.add_space(sp::S3);
-                ui.label(RichText::new("[ IN USE ]").size(fs::SM).color(text));
-            }
-        });
-        ui.add_space(sp::S2);
-    }
+                ui.label(RichText::new(&profile.detail).size(fs::XS).color(text));
+                if current {
+                    ui.add_space(sp::S3);
+                    ui.label(RichText::new("[ IN USE ]").size(fs::SM).color(text));
+                }
+            });
+        },
+    );
 }
 
 fn presets(ui: &mut egui::Ui, app: &mut App, slow: &Slow) {
@@ -751,25 +875,37 @@ fn preset_slots(ui: &mut egui::Ui, app: &mut App, slow: &Slow) {
         ui.label(RichText::new(warning).size(fs::XS).color(role::WARN));
     }
     ui.add_space(sp::S2);
-    for (index, slot) in slots.iter().enumerate() {
-        row(ui, app.focus.is_on(index), ctl::ROW, |ui, text| {
-            ui.label(
-                RichText::new(format!("P{}", slot.number))
-                    .size(fs::LG)
-                    .color(text)
-                    .strong(),
-            );
-            ui.add_space(sp::S3);
-            ui.label(RichText::new(&slot.preset).size(fs::LG).color(text));
-            ui.add_space(sp::S3);
-            ui.label(
-                RichText::new(format!("{} · {}", slot.persona_label, slot.keyboard))
-                    .size(fs::XS)
-                    .color(text),
-            );
-        });
-        ui.add_space(sp::S2);
-    }
+    // **The screen this whole page mechanism exists for.** `MAX_SLOTS` is 16
+    // and a 72 px row is 72 px; the list has not fitted on a cabinet panel
+    // since the ceiling moved, and every row past the fold was drawn,
+    // focusable, activatable and invisible.
+    let focus = &app.focus;
+    walk(
+        ui,
+        focus.row(),
+        slots.len(),
+        ctl::ROW,
+        sp::S2,
+        |ui, index| {
+            let slot = &slots[index];
+            row(ui, focus.is_on(index), ctl::ROW, |ui, text| {
+                ui.label(
+                    RichText::new(format!("P{}", slot.number))
+                        .size(fs::LG)
+                        .color(text)
+                        .strong(),
+                );
+                ui.add_space(sp::S3);
+                ui.label(RichText::new(&slot.preset).size(fs::LG).color(text));
+                ui.add_space(sp::S3);
+                ui.label(
+                    RichText::new(format!("{} · {}", slot.persona_label, slot.keyboard))
+                        .size(fs::XS)
+                        .color(text),
+                );
+            });
+        },
+    );
 }
 
 fn preset_choices(ui: &mut egui::Ui, app: &mut App, slow: &Slow, slot: u8) {
@@ -799,17 +935,28 @@ fn preset_choices(ui: &mut egui::Ui, app: &mut App, slow: &Slow, slot: u8) {
         .find(|s| s.number == slot)
         .map(|s| s.preset.clone())
         .unwrap_or_default();
-    for (index, preset) in slow.presets.iter().enumerate() {
-        let in_use = *preset == current;
-        row(ui, app.focus.is_on(index), ctl::ROW, |ui, text| {
-            ui.label(RichText::new(preset).size(fs::LG).color(text));
-            if in_use {
-                ui.add_space(sp::S3);
-                ui.label(RichText::new("[ IN USE ]").size(fs::SM).color(text));
-            }
-        });
-        ui.add_space(sp::S1);
-    }
+    // Presets on disk are unbounded — a cabinet with a preset per game has
+    // dozens — so this list has always been able to run off the bottom. It
+    // just was not the one anybody hit first.
+    let focus = &app.focus;
+    walk(
+        ui,
+        focus.row(),
+        slow.presets.len(),
+        ctl::ROW,
+        sp::S1,
+        |ui, index| {
+            let preset = &slow.presets[index];
+            let in_use = *preset == current;
+            row(ui, focus.is_on(index), ctl::ROW, |ui, text| {
+                ui.label(RichText::new(preset).size(fs::LG).color(text));
+                if in_use {
+                    ui.add_space(sp::S3);
+                    ui.label(RichText::new("[ IN USE ]").size(fs::SM).color(text));
+                }
+            });
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,7 +1165,231 @@ fn answer(ui: &mut egui::Ui, text: &str, focused: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ksx_api::{MapperSnapshot, SessionView};
+    use ksx_api::{MapperSnapshot, SessionView, MAX_SLOTS};
+
+    /// A 1080p cabinet panel, which is what these are.
+    const PANEL: Vec2 = Vec2::new(1920.0, 1080.0);
+
+    /// Run one screen's worth of list against a real (headless) egui frame and
+    /// report where every row landed, and how much room the panel had.
+    ///
+    /// The `ScrollArea` is here because [`body`] puts one there, and it is the
+    /// container whose [`egui::Ui::available_height`] the whole page mechanism
+    /// reads. A harness that measured a bare panel would be testing an
+    /// arithmetic this surface does not perform.
+    ///
+    /// Two frames, because egui settles some layout on the second and a
+    /// cabinet that is only right on frame 1 is not right.
+    fn frame(count: usize, focus: usize, mut on_row: impl FnMut(usize, egui::Rect)) -> egui::Rect {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, PANEL)),
+            ..Default::default()
+        };
+        let mut panel = egui::Rect::ZERO;
+        let mut second = false;
+        for _ in 0..2 {
+            let _ = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            panel = ui.max_rect();
+                            walk(ui, focus, count, ctl::ROW, sp::S2, |ui, index| {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    Vec2::new(ui.available_width(), ctl::ROW),
+                                    Sense::hover(),
+                                );
+                                if second {
+                                    on_row(index, rect);
+                                }
+                            });
+                        });
+                });
+            });
+            second = true;
+        }
+        panel
+    }
+
+    /// [`frame`], collected: the panel, and where every row landed on it.
+    fn drawn(count: usize, focus: usize) -> (egui::Rect, Vec<(usize, egui::Rect)>) {
+        let mut rows = Vec::new();
+        let panel = frame(count, focus, |index, rect| rows.push((index, rect)));
+        (panel, rows)
+    }
+
+    /// **The bug this file shipped with, asserted against a real frame.**
+    ///
+    /// `MAX_SLOTS` went from 8 to 16 and this file kept drawing every row into
+    /// a `ScrollArea` that nothing on a cabinet can turn. The rows past the
+    /// fold were drawn, focusable and activatable — and not on the screen. A
+    /// player whose slot is row 7 could not see their own controls, and the
+    /// surface said nothing about the rows it was hiding.
+    ///
+    /// So: for every one of the sixteen slots, put the cursor on it, draw the
+    /// list the way the Slots screen draws it, and require that the row is
+    /// inside the panel. Against the version this replaces, slots 7 and up
+    /// fail — they are drawn below `panel.bottom()`.
+    #[test]
+    fn every_slot_is_drawn_inside_the_panel_when_the_cursor_is_on_it() {
+        let count = usize::from(MAX_SLOTS);
+        for focus in 0..count {
+            let (panel, rows) = drawn(count, focus);
+            let (_, rect) = rows
+                .iter()
+                .find(|(index, _)| *index == focus)
+                .unwrap_or_else(|| {
+                    panic!("P{} of {count} was never drawn at all", focus + 1);
+                });
+            // Half a pixel of tolerance: this is a layout assertion, not a
+            // float-equality one.
+            let panel = panel.expand(0.5);
+            assert!(
+                panel.contains_rect(*rect),
+                "P{} of {count} is focused and off the panel: the row is {rect:?}, the panel \
+                 is {panel:?}",
+                focus + 1
+            );
+            for (index, rect) in &rows {
+                assert!(
+                    panel.contains_rect(*rect),
+                    "P{} of {count} was drawn off the panel: {rect:?} vs {panel:?}",
+                    index + 1
+                );
+            }
+        }
+    }
+
+    /// ...and the test above is not vacuous.
+    ///
+    /// It would pass trivially on a panel tall enough for sixteen 72 px rows,
+    /// so this pins the premise: on a 1080p cabinet screen they do not fit,
+    /// which is exactly why they have to be paged. If a future theme ever
+    /// shrinks the row until they DO fit, this fails and says so — because
+    /// "make the rows smaller until 16 fit" is the fix this surface is not
+    /// allowed to make.
+    #[test]
+    fn sixteen_rows_do_not_fit_on_a_cabinet_panel() {
+        let count = usize::from(MAX_SLOTS);
+        let (panel, rows) = drawn(count, 0);
+        assert!(
+            rows.len() < count,
+            "all {count} rows of {} px went onto a {} px panel, so the test above proves \
+             nothing. Either `walk` stopped paging, or the row shrank until 16 fit - and \
+             shrinking the row is the fix this surface is not allowed to make.",
+            ctl::ROW,
+            panel.height()
+        );
+        assert!(
+            !rows.is_empty(),
+            "the panel showed no rows at all: {panel:?}"
+        );
+    }
+
+    /// The other half of the requirement: the surface SAYS what it is hiding.
+    ///
+    /// A page that silently drops eight slots is the same failure with fewer
+    /// pixels. A scroll bar is not the answer either — it is 12 px wide, and on
+    /// a cabinet it is a rumour about a wheel that does not exist. So the count
+    /// is drawn in words, at reading size, and this reads it back out of the
+    /// frame's own text shapes.
+    #[test]
+    fn a_paged_list_says_in_words_how_many_rows_are_off_screen() {
+        let count = usize::from(MAX_SLOTS);
+
+        // Top of the list: nothing above, the remainder below.
+        let (shown, words) = paged_text(count, 0);
+        assert!(shown < count, "premise: the list is paged");
+        assert!(
+            words
+                .iter()
+                .any(|line| line == &format!("v   {} more below", count - shown)),
+            "the top of a {count}-row list does not say what is below it: {words:?}"
+        );
+
+        // Bottom of the list: the remainder above, nothing below.
+        let (shown, words) = paged_text(count, count - 1);
+        assert!(
+            words
+                .iter()
+                .any(|line| line == &format!("^   {} more above", count - shown)),
+            "the bottom of a {count}-row list does not say what is above it: {words:?}"
+        );
+        assert!(
+            !words.iter().any(|line| line.contains("more below")),
+            "the last page claims there is more below it: {words:?}"
+        );
+    }
+
+    /// How many rows one page of `count` shows with the cursor on `focus`, and
+    /// every line of text the frame drew.
+    fn paged_text(count: usize, focus: usize) -> (usize, Vec<String>) {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, PANEL)),
+            ..Default::default()
+        };
+        let mut shown = 0;
+        let mut output = None;
+        for _ in 0..2 {
+            shown = 0;
+            output = Some(ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            walk(ui, focus, count, ctl::ROW, sp::S2, |ui, _| {
+                                shown += 1;
+                                ui.allocate_exact_size(
+                                    Vec2::new(ui.available_width(), ctl::ROW),
+                                    Sense::hover(),
+                                );
+                            });
+                        });
+                });
+            }));
+        }
+        let mut words = Vec::new();
+        for clipped in output.expect("two frames were run").shapes {
+            collect_text(&clipped.shape, &mut words);
+        }
+        (shown, words)
+    }
+
+    /// Every string a frame actually put on the screen. `Shape::Vec` nests, so
+    /// this recurses rather than assuming a flat list.
+    fn collect_text(shape: &egui::Shape, into: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => into.push(text.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text(shape, into);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A list that fits is not paged, and grows no hint lines: four slots on a
+    /// cabinet panel must look exactly as they always did.
+    #[test]
+    fn a_list_that_fits_is_drawn_whole() {
+        let (panel, rows) = drawn(4, 3);
+        assert_eq!(rows.len(), 4, "all four, on one page");
+        let indexes: Vec<usize> = rows.iter().map(|(index, _)| *index).collect();
+        assert_eq!(indexes, vec![0, 1, 2, 3]);
+        let panel = panel.expand(0.5);
+        for (index, rect) in &rows {
+            assert!(
+                panel.contains_rect(*rect),
+                "P{} was drawn off the panel: {rect:?}",
+                index + 1
+            );
+        }
+    }
 
     /// `session` declares how many rows it draws and `session_verb` says what
     /// each one does. They live in different functions, so adding a row is
