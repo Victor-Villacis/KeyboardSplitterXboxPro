@@ -22,6 +22,14 @@ import { readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { brotliCompressSync, gzipSync, constants as zlibConstants } from "zlib";
 
+// NOTHING BUT THIS SCRIPT'S OUTPUT MAY LIVE HERE. `build()` below calls
+// `rmSync(outputDir, { recursive: true, force: true })` before it emits
+// anything, so any file parked in this directory by another tool disappears
+// at the next UI build — silently, and only on the machine that ran it.
+//
+// That is why the brand icons (tools/icongen) go to
+// `crates/ksx-studio/brand/` and are embedded from there as a second
+// rust-embed folder. See assets/brand/README.md.
 const outputDir = "../crates/ksx-studio/assets";
 
 // ---------------------------------------------------------------------------
@@ -186,18 +194,29 @@ for (const logical of ["map.js", "status.js"]) {
 // /_assets/pad-ds4.svg; the status page's .tileart uses the same files.
 // ---------------------------------------------------------------------------
 
-// Palette sheet: dark values echo --panel-2/--muted/--text territory from
+// Palette sheet: dark values echo --panel-3/--text-3/--text-2 territory from
 // studio.css; light values echo its light scheme. vector-effect keeps the
 // silhouette outline ~1.5 px whatever size the <img> renders at.
+//
+// These are HAND-MIRRORED from studio.css and cannot use var() — an <img>
+// SVG is its own document and inherits no custom properties from the page.
+// That makes them a drift risk, so `contrast.rs` parses this sheet too and
+// checks it against the same floors as everything else.
+//
+// Violet family as of the Street Fighter palette pass: the art used to be
+// blue-steel (#1d2534/#8593ad), which read as a foreign hue sitting on a
+// purple ground — the one place on the page where "the picture doesn't
+// belong to the app" was visible. Separations are held at the outgoing
+// art's values (detail/body 9.08 vs 9.44, body/page 1.20 vs 1.27).
 const PAD_SHEET =
   "<style>" +
-  ".pad-body{fill:#1d2534;stroke:#8593ad;stroke-width:1.5;stroke-linejoin:round;vector-effect:non-scaling-stroke}" +
-  ".pad-detail{fill:#c3cbdc}" +
-  ".pad-inset{fill:#2c3549}" +
+  ".pad-body{fill:#261c3b;stroke:#8f83a3;stroke-width:1.5;stroke-linejoin:round;vector-effect:non-scaling-stroke}" +
+  ".pad-detail{fill:#c9bfd6}" +
+  ".pad-inset{fill:#37294e}" +
   "@media (prefers-color-scheme:light){" +
-  ".pad-body{fill:#e7ebf2;stroke:#55617a}" +
-  ".pad-detail{fill:#3c4660}" +
-  ".pad-inset{fill:#d3d9e5}" +
+  ".pad-body{fill:#efe9e2;stroke:#685c7a}" +
+  ".pad-detail{fill:#4c4059}" +
+  ".pad-inset{fill:#dcd2c8}" +
   "}</style>";
 
 // Inline declarations that would defeat the injected sheet on reclassed

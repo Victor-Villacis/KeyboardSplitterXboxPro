@@ -96,26 +96,75 @@
   --z-selbar: 8;
   --z-toast: 9;
   --z-modal: 20;
+
+  /* ── Hardware markings ────────────────────────────────────────────────
+     The colours PRINTED ON THE PHYSICAL PADS, reproduced on the controller
+     art. Theme-independent on purpose: a real Xbox B is that red under any
+     stylesheet, so these do not belong in either theme block.
+
+     These are NOT the palette and NOT slot identity. Slot identity is
+     `--cool` and only `--cool` — colouring slot 2 red because P2 is red on
+     the mark would read as "slot 2 has failed", since red means danger
+     everywhere else in this app.
+
+     CONTRAST EXEMPTION, deliberate: `--hw-xbox-b` and `--hw-xbox-x` carry
+     white letters at 4.00:1 and 3.94:1, under the 4.5 floor. They stay,
+     because this is a PICTURE of a device — repainting it would make the
+     drawing wrong — and because the letter is not the accessible name:
+     every hit zone gets an `aria-label` naming the control and every key
+     bound to it (`render_map.rs`, `zone_label`). The floor applies to text
+     that carries meaning; this glyph is decoration on top of a label that
+     already exists. The contrast gate encodes this exemption explicitly so
+     it is a decision on record, not an oversight. */
+  --hw-xbox-a: #57c04a;
+  --hw-xbox-a-on: #08170a;
+  --hw-xbox-b: #e04b3f;
+  --hw-xbox-x: #3f7fe0;
+  --hw-xbox-y: #f0b429;
+  --hw-xbox-y-on: #201603;
+  --hw-xbox-on: #ffffff; /* B and X take white, as the hardware does */
+
+  /* The DS4 prints coloured SHAPES on grey plastic, so the glyph carries the
+     colour and the disc stays neutral. The disc is the one value here that is
+     ours rather than the hardware's — it was blue-grey (#2b3346), which read
+     as a second hue against a violet ground; it is now the same violet-grey
+     family as the rest of the page. All four glyphs gained contrast on it
+     (4.60→5.17 worst, the cross). */
+  --hw-ps-disc: #2e2740;
+  --hw-ps-circle: #6ea8ff;
+  --hw-ps-cross: #ff6b7d;
+  --hw-ps-triangle: #46d6a8;
+  --hw-ps-square: #f083c6;
 }
 
-/* ── Dark: the default. A near-black blue-steel ground; surfaces climb by
-   LIGHTNESS, borders do the separating, shadows only mark true depth. ──── */
+/* ── Dark: the default. A deep violet ground — the app's own colour, taken
+   from the mark; surfaces climb by LIGHTNESS, borders do the separating,
+   shadows only mark true depth.
+
+   PURPLE IS THE GROUND, NOT THE ACCENT. That is a measured decision, not a
+   taste: `#8b5cf6` as an accent scores 4.20:1 on `--panel` and fails the
+   4.5 floor, and every lavender that passes is the same hue as the ground,
+   so it stops reading as "live". Teal stays the accent and scores BETTER
+   here than it did on the old blue-steel (9.96:1 vs 9.75:1) because teal
+   and violet are near-complementary. See DESIGN-SYSTEM §3. ─────────────── */
 :root {
   color-scheme: dark;
 
-  --bg: #0a0d13;
-  --bg-2: #0d111a;
-  --panel: #141a26;
-  --panel-2: #1a2130;
-  --panel-3: #212a3c;
+  --bg: #120c1c;
+  --bg-2: #0b0714;
+  --panel: #1c1428;
+  --panel-2: #171021;
+  --panel-3: #241a33;
 
-  --line: #263047;
-  --line-soft: #1c2434;
-  --line-strong: #35415c;
+  --line: #3b2c52;
+  --line-soft: #2a1f3a;
+  --line-strong: #54406f;
 
-  --text: #e3e9f4;
-  --text-2: #a9b4ca;
-  --text-3: #7d8aa3;
+  /* Cream, not blue-white: on a violet ground a cool white reads as a second
+     hue. It is also not pure white — that blooms on a cabinet panel. */
+  --text: #f0ebe0;
+  --text-2: #bcb0c9;
+  --text-3: #8f83a3;
 
   --accent: #2fd8c5;
   --accent-strong: #4ee5d4;
@@ -126,8 +175,11 @@
   --accent-line: rgba(47, 216, 197, 0.42);
   --accent-glow: rgba(47, 216, 197, 0.16);
 
-  --cool: #6fc0ea; /* identity: device / persona / group */
-  --cool-line: rgba(111, 192, 234, 0.45);
+  /* Identity: a device, a persona, a group of keys. Violet, so it belongs to
+     the ground's family — identity is NOT liveness and must not compete with
+     the accent for that meaning. */
+  --cool: #a98ae0;
+  --cool-line: rgba(169, 138, 224, 0.45);
 
   --ok: #4ed185;
   --ok-dim: rgba(78, 209, 133, 0.12);
@@ -138,14 +190,17 @@
   --warn-line: rgba(237, 187, 70, 0.42);
 
   --danger: #f4675f;
-  --danger-fill: #d93f36;
+  /* Was #d93f36, which put `--danger-on` at 4.16:1 — below the floor, and it
+     had been that way since before this palette (the fill is ground
+     independent, so no theme ever caught it). 5.10:1 now. */
+  --danger-fill: #c5312a;
   --danger-on: #fff5f4;
   --danger-dim: rgba(244, 103, 95, 0.12);
   --danger-line: rgba(244, 103, 95, 0.44);
 
   --focus: #5ee0d0;
-  --overlay-scrim: rgba(3, 5, 9, 0.72);
-  --sel-tint: rgba(127, 140, 170, 0.06);
+  --overlay-scrim: rgba(7, 4, 13, 0.72);
+  --sel-tint: rgba(169, 138, 224, 0.07);
 
   --e-1: 0 1px 2px rgba(0, 0, 0, 0.4);
   --e-2:
@@ -159,69 +214,84 @@
      screen a top and a bottom, which is most of why a dark UI reads as a
      surface rather than as "the app failed to paint". */
   --ground:
-    radial-gradient(1200px 620px at 50% -10%, #131b2a 0%, transparent 70%),
-    linear-gradient(180deg, #0a0d13 0%, #090c11 100%);
+    radial-gradient(1200px 620px at 50% -10%, #1e1530 0%, transparent 70%),
+    linear-gradient(180deg, #120c1c 0%, #0d0817 100%);
 }
 
+/* ── Light: warm paper, not cool grey — the same violet family read as a
+   tint rather than a ground. Every coloured role here is DARKER than its
+   pre-purple value, because a cream ground has less luminance headroom than
+   the blue-white one it replaces; the numbers are in DESIGN-SYSTEM §3. ─── */
 @media (prefers-color-scheme: light) {
   :root {
     color-scheme: light;
 
-    --bg: #f3f5f9;
-    --bg-2: #eaeef5;
+    --bg: #f6f3ee;
+    --bg-2: #ece7df;
     --panel: #ffffff;
-    --panel-2: #f5f7fb;
-    --panel-3: #ecf0f7;
+    --panel-2: #efe9e2;
+    --panel-3: #e8e1d8;
 
-    --line: #d8dee9;
-    --line-soft: #e6eaf2;
-    --line-strong: #b9c2d3;
+    --line: #ddd3ca;
+    --line-soft: #eae3da;
+    --line-strong: #bfb2a4;
 
-    --text: #131826;
-    --text-2: #4b566b;
-    --text-3: #5f6b80;
+    --text: #1c1428;
+    --text-2: #4c4059;
+    /* Was #6d6180, which clears 4.5 on every ground EXCEPT `--panel-3` — the
+       hover fill — where it lands at 4.41. The gate used to skip that one
+       pair on the grounds that "every rule that sets --panel-3 also sets
+       --text or --text-2"; `.tab .tabnum` is a counter-example that already
+       exists in this stylesheet, so the claim was one markup change away from
+       being false. Fixed the token instead of the exclusion (rule 13.6):
+       4.76:1 on `--panel-3`, and every other tertiary pair gains with it. */
+    --text-3: #685c7a;
 
-    --accent: #0b7d72;
-    --accent-strong: #096a61;
-    --accent-fill: #0b7d72;
+    /* Was #0b7d72. That is 4.53:1 on `--bg` — the number this palette was
+       specified against — but only 3.33:1 once the accent's own 16 % tint
+       sits on `--bg-2`, which is exactly what `.btn-undo:hover` inside a
+       sunken card draws. Darkened until the WORST composition clears 4.5. */
+    --accent: #09645c;
+    --accent-strong: #074f49;
+    --accent-fill: #09645c;
     --accent-on: #ffffff;
-    --accent-dim: rgba(11, 125, 114, 0.09);
-    --accent-dim-2: rgba(11, 125, 114, 0.16);
-    --accent-line: rgba(11, 125, 114, 0.4);
-    --accent-glow: rgba(11, 125, 114, 0.14);
+    --accent-dim: rgba(9, 100, 92, 0.09);
+    --accent-dim-2: rgba(9, 100, 92, 0.16);
+    --accent-line: rgba(9, 100, 92, 0.4);
+    --accent-glow: rgba(9, 100, 92, 0.14);
 
-    --cool: #1a6fa3;
-    --cool-line: rgba(26, 111, 163, 0.4);
+    --cool: #6b3fa8;
+    --cool-line: rgba(107, 63, 168, 0.4);
 
-    --ok: #17784a;
-    --ok-dim: rgba(23, 120, 74, 0.1);
-    --ok-line: rgba(23, 120, 74, 0.35);
+    --ok: #156c43;
+    --ok-dim: rgba(21, 108, 67, 0.1);
+    --ok-line: rgba(21, 108, 67, 0.35);
 
-    --warn: #8a6205;
-    --warn-dim: rgba(138, 98, 5, 0.1);
-    --warn-line: rgba(138, 98, 5, 0.35);
+    --warn: #7c5805;
+    --warn-dim: rgba(124, 88, 5, 0.1);
+    --warn-line: rgba(124, 88, 5, 0.35);
 
-    --danger: #bf2f27;
+    --danger: #ac2a23;
     --danger-fill: #c0342b;
     --danger-on: #ffffff;
-    --danger-dim: rgba(191, 47, 39, 0.08);
-    --danger-line: rgba(191, 47, 39, 0.35);
+    --danger-dim: rgba(172, 42, 35, 0.08);
+    --danger-line: rgba(172, 42, 35, 0.35);
 
-    --focus: #0b7d72;
-    --overlay-scrim: rgba(24, 30, 44, 0.42);
-    --sel-tint: rgba(20, 30, 60, 0.035);
+    --focus: #09645c;
+    --overlay-scrim: rgba(28, 20, 40, 0.42);
+    --sel-tint: rgba(60, 30, 90, 0.04);
 
-    --e-1: 0 1px 2px rgba(19, 24, 38, 0.06);
+    --e-1: 0 1px 2px rgba(28, 20, 40, 0.06);
     --e-2:
-      0 1px 2px rgba(19, 24, 38, 0.06), 0 4px 12px -4px rgba(19, 24, 38, 0.1);
+      0 1px 2px rgba(28, 20, 40, 0.06), 0 4px 12px -4px rgba(28, 20, 40, 0.1);
     --e-3:
-      0 2px 6px rgba(19, 24, 38, 0.08), 0 12px 28px -8px rgba(19, 24, 38, 0.16);
+      0 2px 6px rgba(28, 20, 40, 0.08), 0 12px 28px -8px rgba(28, 20, 40, 0.16);
     --e-4:
-      0 4px 10px rgba(19, 24, 38, 0.1), 0 28px 64px -16px rgba(19, 24, 38, 0.28);
+      0 4px 10px rgba(28, 20, 40, 0.1), 0 28px 64px -16px rgba(28, 20, 40, 0.28);
 
     --ground:
       radial-gradient(1200px 620px at 50% -10%, #ffffff 0%, transparent 70%),
-      linear-gradient(180deg, #f3f5f9 0%, #eef1f7 100%);
+      linear-gradient(180deg, #f6f3ee 0%, #f0ebe3 100%);
   }
 }
 
@@ -985,11 +1055,23 @@ input[type="checkbox"] {
   margin-left: auto;
 }
 
+/* A reported FACT, so it takes the neutral ramp — this card's own subtitle
+   says "Nothing here is a control — it is what the machine reports right
+   now", and §3.4 gives the accent exactly one job (live / primary /
+   selected / the current binding).
+
+   It was `--accent`, which is only defensible for the "yes" case: the same
+   rule painted "no" and "unknown" in the primary-action colour, so on the
+   no-daemon page a red banner reading "No daemon — ksx Studio can see your
+   config but cannot change anything" sat directly above the word "no" in
+   the brightest, most alive colour on the page. Colour has to mean the same
+   thing every time it appears or it means nothing. Weight and the mono face
+   still make this the value in its row. */
 .dvalue {
   font-family: var(--mono);
   font-size: var(--fs-sm);
   font-weight: var(--fw-semibold);
-  color: var(--accent);
+  color: var(--text-primary);
 }
 
 .dvalue.mono {
@@ -2079,23 +2161,23 @@ details.card[open] > summary::before,
 }
 
 .id-xa {
-  background: #57c04a;
-  color: #08170a;
+  background: var(--hw-xbox-a);
+  color: var(--hw-xbox-a-on);
 }
 
 .id-xb {
-  background: #e04b3f;
-  color: #fff;
+  background: var(--hw-xbox-b);
+  color: var(--hw-xbox-on);
 }
 
 .id-xx {
-  background: #3f7fe0;
-  color: #fff;
+  background: var(--hw-xbox-x);
+  color: var(--hw-xbox-on);
 }
 
 .id-xy {
-  background: #f0b429;
-  color: #201603;
+  background: var(--hw-xbox-y);
+  color: var(--hw-xbox-y-on);
 }
 
 /* Sony glyph colours: the DS4 prints coloured shapes on grey buttons, so the
@@ -2104,25 +2186,25 @@ details.card[open] > summary::before,
 .id-po,
 .id-pt,
 .id-psq {
-  background: #2b3346;
+  background: var(--hw-ps-disc);
   font-size: 1rem;
   font-size: 3.4cqh;
 }
 
 .id-pc {
-  color: #6ea8ff;
+  color: var(--hw-ps-circle);
 }
 
 .id-po {
-  color: #ff6b7d;
+  color: var(--hw-ps-cross);
 }
 
 .id-pt {
-  color: #46d6a8;
+  color: var(--hw-ps-triangle);
 }
 
 .id-psq {
-  color: #f083c6;
+  color: var(--hw-ps-square);
 }
 
 /* Dpad + stick arrows, hubs, small named chips and the shoulders sit ON the
@@ -3070,7 +3152,10 @@ a.strow:hover {
   padding: 1px var(--sp-1);
   border: 1px solid var(--border-subtle);
   border-radius: var(--r-xs);
-  background: var(--surface-base);
+  /* Was `--surface-base`, which is not a token in this file and resolved to
+     transparent — the one editable field in the piano roll had no field
+     ground at all. Every other input uses `--surface-inset`. */
+  background: var(--surface-inset);
   font-family: var(--mono);
   font-size: var(--fs-xs);
   font-weight: var(--fw-bold);

@@ -1,0 +1,99 @@
+ksx — third-party material vendored into this repository
+========================================================
+
+ksx itself is dual-licensed MIT OR Apache-2.0 (LICENSE-MIT, LICENSE-APACHE).
+The entries below cover material by other authors that is COPIED INTO this
+tree — art traced or embedded into ksx's own files, and source vendored under
+`crates/`. Ordinary crates.io dependencies are not listed here; their licenses
+travel with them in `Cargo.lock` and in the registry.
+
+Each entry says what was taken, where it now lives, and what the license asks
+for. If you cut a new asset from one of these sources, extend the entry — a
+NOTICE that has to be reconstructed from `git log` is not a NOTICE.
+
+
+--------------------------------------------------------------------------
+1. Lucide — `gamepad-2` icon (ISC)
+--------------------------------------------------------------------------
+
+    Upstream: https://lucide.dev  ·  https://github.com/lucide-icons/lucide
+    License:  ISC
+    Used in:  assets/brand/ksx-detailed.svg  (the two pad silhouettes)
+
+The ksx brand mark's two overlapping gamepads are Lucide's `gamepad-2` BODY
+path, filled and outlined rather than stroked as Lucide draws it, placed at
+`translate(29.4 5) scale(.8)` and `translate(40.4 12.5) scale(.8)` in the
+64×64 mark. The path data is reproduced verbatim in that file.
+
+Everything downstream of that SVG carries the path too, because it is all
+generated from it by `tools/icongen`:
+
+    assets/brand/dist/ksx-{48,64,128,256}.png
+    assets/brand/dist/apple-touch-icon.png
+    assets/brand/dist/ksx-256.rgba          (the egui cabinet window icon)
+    assets/brand/dist/ksx.ico               (its 48/64/128/256 entries)
+    crates/ksx-studio/brand/favicon.ico     (a copy of ksx.ico)
+
+and, from there, the `.ico` compiled into `ksx.exe` as a Win32 resource
+(`crates/ksx-app/build.rs`).
+
+The simplified mark — `assets/brand/ksx-simple.svg`, and therefore the
+16/20/24/32 `.ico` entries, the same-sized PNGs and `favicon.svg` — contains
+NO Lucide geometry: at those sizes the silhouette is gone anyway and the pads
+are plain rounded rectangles.
+
+ISC requires the copyright notice and permission notice to accompany the
+software. That text follows in full.
+
+    ISC License
+
+    Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as
+    part of Feather (MIT). All other copyright (c) for Lucide are held by
+    Lucide Contributors 2022.
+
+    Permission to use, copy, modify, and/or distribute this software for any
+    purpose with or without fee is hereby granted, provided that the above
+    copyright notice and this permission notice appear in all copies.
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+
+--------------------------------------------------------------------------
+2. Gamepad-Asset-Pack by AL2009man (MIT)
+--------------------------------------------------------------------------
+
+    Upstream: https://github.com/AL2009man/Gamepad-Asset-Pack
+    License:  MIT
+    Used in:  studio-ui/art/src-xboxseries.svg   (upstream, byte-identical)
+              studio-ui/art/src-ds4.svg          (upstream, byte-identical)
+              crates/ksx-studio/assets/pad-xbox.svg   (recoloured build output)
+              crates/ksx-studio/assets/pad-ds4.svg    (recoloured build output)
+
+The controller drawings ksx Studio renders — the status page's pad tiles and
+the `/map` mapper stage. `studio-ui/build.mjs` strips editor metadata and
+recolours them to the Studio palette; the geometry is upstream's.
+
+Per the pack's credit request, both Studio pages carry a visible footer line
+("controller art: Gamepad-Asset-Pack (MIT) by AL2009man"), pinned by a test
+in `crates/ksx-studio/src/render.rs`. See `studio-ui/art/README.md` for the
+per-file provenance and the trade-dress note.
+
+
+--------------------------------------------------------------------------
+3. vigem-client by Casper (CasualX) (MIT)
+--------------------------------------------------------------------------
+
+    Upstream: https://github.com/CasualX/vigem-client
+    License:  MIT — full text in crates/vigem-client/license.txt
+    Used in:  crates/vigem-client/   (vendored source, a workspace member)
+
+The user-mode client for the ViGEmBus virtual-pad driver. Vendored rather
+than depended on because ksx needs two of its unstable features
+(`unstable_xtarget_notification`, `unstable_ds4`); it is excluded from the
+workspace's default members because its integration tests require the driver.

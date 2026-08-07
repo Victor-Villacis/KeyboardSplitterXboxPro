@@ -95,21 +95,41 @@ pub mod ctl {
 pub mod role {
     use egui::Color32;
 
+    // ── The Street Fighter palette, 10-foot translation ──────────────────
+    //
+    // Same decision as the web surface and for the same measured reason:
+    // **purple is the GROUND, not the accent.** Violet-as-accent scores
+    // 4.20:1 on the panel and fails the 4.5 floor; the lavenders that pass
+    // are the ground's own hue, so they stop reading as "not the ground".
+    // Teal stays, and near-complementary teal on violet actually measures
+    // BETTER than it did on the old blue-steel (9.96:1 vs 9.75:1).
+    //
+    // What does NOT come across from the mark: its four player colours. P2
+    // is red there, and red means Stop on this surface — a red slot 2 would
+    // read as "slot 2 has failed". Slot identity is `COOL`, as it was.
+    //
+    // Every pair below is measured by `ksx-cabinet/tests/contrast.rs`,
+    // including the composed ones (a state colour on its own `tint()`, text
+    // on the focus plate), because those are what a person actually reads
+    // and they are not visible in a list of constants.
+
     /// Page ground.
-    pub const SURFACE: Color32 = Color32::from_rgb(0x0d, 0x11, 0x17);
+    pub const SURFACE: Color32 = Color32::from_rgb(0x12, 0x0c, 0x1c);
     /// A panel.
-    pub const RAISED: Color32 = Color32::from_rgb(0x15, 0x1b, 0x24);
+    pub const RAISED: Color32 = Color32::from_rgb(0x1c, 0x14, 0x28);
     /// Something nested inside a panel — a list row, a key chip.
-    pub const INSET: Color32 = Color32::from_rgb(0x1d, 0x25, 0x30);
+    pub const INSET: Color32 = Color32::from_rgb(0x24, 0x1a, 0x33);
 
     /// Never pure white: it blooms on a TV panel, which is what this is
     /// (DESIGN-SYSTEM §3 "Contrast", stated there for the same reason).
-    pub const TEXT: Color32 = Color32::from_rgb(0xe3, 0xe9, 0xf4);
-    pub const TEXT_2: Color32 = Color32::from_rgb(0xa8, 0xb4, 0xc8);
-    pub const TEXT_3: Color32 = Color32::from_rgb(0x7d, 0x8a, 0xa3);
+    /// Cream rather than blue-white, because on a violet ground a cool white
+    /// reads as a second hue rather than as "unstyled text".
+    pub const TEXT: Color32 = Color32::from_rgb(0xf0, 0xeb, 0xe0);
+    pub const TEXT_2: Color32 = Color32::from_rgb(0xbc, 0xb0, 0xc9);
+    pub const TEXT_3: Color32 = Color32::from_rgb(0x8f, 0x83, 0xa3);
 
-    pub const BORDER: Color32 = Color32::from_rgb(0x27, 0x31, 0x3f);
-    pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x3a, 0x47, 0x59);
+    pub const BORDER: Color32 = Color32::from_rgb(0x3b, 0x2c, 0x52);
+    pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x54, 0x40, 0x6f);
 
     /// **Accent — and on this surface it means ONE thing: where you are.**
     ///
@@ -119,19 +139,35 @@ pub mod role {
     /// is a second thing that looks like the cursor. So: live is `OK`,
     /// selected-but-not-focused is a border, and the accent is the focus and
     /// nothing else.
-    pub const ACCENT: Color32 = Color32::from_rgb(0x2f, 0xd4, 0xc1);
-    /// Text drawn ON the accent plate.
-    pub const ACCENT_ON: Color32 = Color32::from_rgb(0x04, 0x14, 0x13);
+    ///
+    /// Now byte-identical to the web `--accent`. It used to be `#2fd4c1`, a
+    /// shade off `#2fd8c5` for no recorded reason — two surfaces of one app
+    /// disagreeing about the colour of "you are here" by an amount too small
+    /// to be intentional and too large to be nothing.
+    pub const ACCENT: Color32 = Color32::from_rgb(0x2f, 0xd8, 0xc5);
+    /// Text drawn ON the accent plate. 9.20:1 — this pair is the cursor, so
+    /// it is the one that must never soften.
+    pub const ACCENT_ON: Color32 = Color32::from_rgb(0x04, 0x24, 0x1f);
 
     /// State. Dot + tint + full-strength text, never a large solid fill —
     /// except `DANGER_FILL`, which exists for exactly one control (Stop).
-    pub const OK: Color32 = Color32::from_rgb(0x3f, 0xd6, 0x7a);
-    pub const WARN: Color32 = Color32::from_rgb(0xf2, 0xb1, 0x3c);
+    pub const OK: Color32 = Color32::from_rgb(0x4e, 0xd1, 0x85);
+    pub const WARN: Color32 = Color32::from_rgb(0xed, 0xbb, 0x46);
+    /// **Deliberately lighter than the web's `--danger` (`#f4675f`)** and
+    /// left where it was. The web value measures 4.44:1 against its own
+    /// 15 % tint on `INSET` — under the floor — because this surface tints
+    /// harder than the page does (`tint(colour, 38)`, ~15 %, over a plate
+    /// that is already lifted). At 10 feet the lighter red is the right call
+    /// anyway; the number just confirms it.
     pub const DANGER: Color32 = Color32::from_rgb(0xff, 0x6b, 0x6b);
+    /// Reserved for `Stop`, and currently drawn by nothing — kept because
+    /// the role exists in the system. 7.44:1 against `TEXT`.
     pub const DANGER_FILL: Color32 = Color32::from_rgb(0x8e, 0x1f, 0x25);
     /// Identity — a device, a persona, a slot. NOT the accent, because "which
-    /// player is this?" and "where am I?" are different questions.
-    pub const COOL: Color32 = Color32::from_rgb(0x6f, 0x9a, 0xd8);
+    /// player is this?" and "where am I?" are different questions. Violet, so
+    /// identity belongs to the ground's family and cannot be mistaken for the
+    /// cursor.
+    pub const COOL: Color32 = Color32::from_rgb(0xa9, 0x8a, 0xe0);
 
     /// A tint of `colour` at `alpha`, for the state triad's middle term.
     pub fn tint(colour: Color32, alpha: u8) -> Color32 {

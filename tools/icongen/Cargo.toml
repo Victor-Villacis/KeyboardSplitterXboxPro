@@ -1,0 +1,39 @@
+# NOTE: `[workspace]` below is deliberate and load-bearing.
+#
+# This crate is a BUILD-TIME TOOL, not part of ksx. Detaching it into its own
+# workspace keeps resvg's dependency tree (≈70 crates: usvg, tiny-skia,
+# fontdb, rustybuzz, …) out of the ksx `Cargo.lock`, out of
+# `cargo clippy --workspace --all-targets`, and out of every `cargo test`
+# the gate runs. The alternative — a member under `crates/` — would make
+# every ksx build and every gate run pay for a tool that is executed by hand
+# perhaps twice a year.
+#
+# It also means `cargo fmt --all` does NOT reach this file's crate; run
+# `cargo fmt --manifest-path tools/icongen/Cargo.toml` if you edit it.
+[workspace]
+
+[package]
+name = "icongen"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "Renders the ksx brand SVGs into every raster ksx ships — size-specific, not scaled."
+
+[dependencies]
+# SVG → RGBA. `resvg` re-exports the exact `usvg` and `tiny-skia` it was built
+# against, so we name only resvg and reach the other two through it: there is
+# no way to end up with two incompatible tiny-skia versions in this tree.
+resvg = "0.48"
+# ICO container writing. Its `encode` heuristic picks PNG over BMP for images
+# with non-binary alpha — which is every entry here, because the plate's
+# rounded corners are antialiased — so all eight land as PNG. That is the
+# modern layout: Windows has read PNG-compressed icon entries since Vista,
+# and so has every browser that will ever fetch `favicon.ico`. It is also why
+# the 8-entry file is 68 KB rather than the ~350 KB the BMP encoding costs.
+ico = "0.5"
+# PNG writing. Deliberately not `tiny_skia::Pixmap::encode_png`: this tool
+# demultiplies alpha itself (once, in `render`) because the ICO and the raw
+# egui blob both need straight-alpha bytes, and having the PNG path share
+# that buffer is what guarantees all three outputs are the same pixels.
+png = "0.18"

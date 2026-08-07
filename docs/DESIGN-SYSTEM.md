@@ -140,7 +140,86 @@ nothing.
 
 ~90 % of both themes is the neutral ramp. Colour is spent, not decorated.
 
-### Roles
+The ramp is **violet**, taken from the app's own mark. Everything in this
+section is measured, and re-measured on every `cargo test` — see §3.6.
+
+### 3.1 Why purple is the GROUND and not the accent
+
+This is the decision most likely to be re-opened by somebody who looks at the
+icon, sees a purple app, and reaches for purple as the accent colour. It was
+tried, it was measured, and it fails. The numbers, so nobody has to guess:
+
+| Candidate accent | On `--panel` `#1c1428` | Verdict |
+| --- | --- | --- |
+| `#8b5cf6` — the mark's violet | **4.20:1** | **FAILS** the 4.5 floor |
+| `#a98ae0` — a lavender that passes | 6.27:1 | Passes, and is **the same hue as the ground** |
+| `#2fd8c5` — teal, unchanged | **9.96:1** | Passes with room to spare |
+
+Two separate problems, and the second is the one that matters:
+
+1. **`#8b5cf6` is not legible enough.** 4.20:1 on the panel, under the floor.
+   It clears 4.5 on `--bg` (4.53:1) and fails on the panel — i.e. it fails
+   exactly where most text actually sits.
+2. **The lavenders that pass stop meaning anything.** A colour is an accent
+   because it is *not the ground*. `#a98ae0` reads 6.27:1 and is perfectly
+   legible, but it is the ground's own hue at a different lightness, so "this
+   control is live" becomes "this control is slightly brighter" — which is
+   what §11 says is invisible from across a room.
+
+So the ground took the purple and **the accent stayed teal** — and it got
+*better*, not worse: teal is near-complementary to violet, so `#2fd8c5` scores
+**9.96:1** on the new panel against **9.75:1** on the blue-steel it replaced.
+That is also why this was a token swap and not a rewrite: `render.rs`,
+`render_map.rs` and `MapIsland.ts` needed no semantic change, because no
+colour changed *meaning*.
+
+**The mark's four player colours do not come into the UI.** The icon uses
+red/blue/green/yellow because a static image has no other way to say "four
+players". The UI already has a token for that question — `--cool`, identity —
+and it has `--danger` for red. Colouring slot 2 red because P2 is red on the
+mark would read as *"slot 2 has failed"*.
+
+### 3.2 The ramp
+
+**Dark** — the default.
+
+| Token | Value | Role |
+| --- | --- | --- |
+| `--bg` | `#120c1c` | page ground |
+| `--bg-2` | `#0b0714` | recessed ground (also a real card ground) |
+| `--panel` | `#1c1428` | a panel |
+| `--panel-2` | `#171021` | nested inside a panel |
+| `--panel-3` | `#241a33` | a control under the cursor |
+| `--line-soft` / `--line` / `--line-strong` | `#2a1f3a` / `#3b2c52` / `#54406f` | separation ladder |
+| `--text` / `--text-2` / `--text-3` | `#f0ebe0` / `#bcb0c9` / `#8f83a3` | the three tiers |
+| `--accent` | `#2fd8c5` | **unchanged** |
+| `--cool` | `#a98ae0` | identity |
+| `--ok` / `--warn` / `--danger` | `#4ed185` / `#edbb46` / `#f4675f` | state |
+| `--danger-fill` | `#c5312a` | Stop (was `#d93f36` — see §3.5) |
+
+Text is **cream, not blue-white**: on a violet ground a cool white reads as a
+second hue. It is still not pure white, for the cabinet reason below.
+
+**Light** — warm paper, the same family read as a tint.
+
+| Token | Value | Role |
+| --- | --- | --- |
+| `--bg` | `#f6f3ee` | page ground |
+| `--bg-2` | `#ece7df` | recessed ground |
+| `--panel` | `#ffffff` | a panel |
+| `--panel-2` | `#efe9e2` | nested |
+| `--panel-3` | `#e8e1d8` | hovered control |
+| `--line-soft` / `--line` / `--line-strong` | `#eae3da` / `#ddd3ca` / `#bfb2a4` | separation ladder |
+| `--text` / `--text-2` / `--text-3` | `#1c1428` / `#4c4059` / `#6d6180` | the three tiers |
+| `--accent` | `#09645c` | see §3.5 |
+| `--cool` | `#6b3fa8` | identity |
+| `--ok` / `--warn` / `--danger` | `#156c43` / `#7c5805` / `#ac2a23` | state |
+
+Every coloured role in the light theme is **darker than its pre-purple value**.
+A cream ground has less luminance headroom than the blue-white one it replaced,
+and the old values were tuned against `#ffffff`/`#f3f5f9`.
+
+### 3.3 Roles
 
 Components reference **roles**, never the ramp — that is what makes both themes
 come out right from one rule.
@@ -158,28 +237,156 @@ come out right from one rule.
 | `--cool` | identity — a device, a persona, a group of keys |
 | `--focus` | the focus ring, and nothing else |
 
-### What each colour is allowed to mean
+### 3.4 What each colour is allowed to mean
 
 - **Accent (teal)** — *live, primary, selected, and the current binding.* It is
   the Start button's fill, the running pill, the active slot tab, a bound
   control's ring, a bound key's chip. It is **not** used for decoration, card
   chrome, or "make it pop".
-- **`--cool` (steel blue)** — *identity*: a persona name, a macro name, the
+- **`--cool` (violet)** — *identity*: a persona name, a macro name, the
   badge that says "these keys are a group". Distinct from accent because
-  "which device is this?" and "is this live?" are different questions.
-- **ok / warn / danger** — state only, and always as the **dot + 12 %-tint +
+  "which device is this?" and "is this live?" are different questions. It is
+  the ground's hue on purpose: identity is a *label*, not a state, and it must
+  not compete with the accent for "live".
+- **ok / warn / danger** — state only, and always as the **dot + tint +
   full-strength text** triad, never a large solid fill. `--danger-fill` (a solid)
   exists for exactly one control: `Stop`.
 - Everything else is the neutral ramp.
 
-### Contrast
+### 3.5 Contrast — the measured floors
 
-Text is ≥ 4.5:1 against the surface it sits on, in both themes. Two values moved
-for this pass: dark `--text-3` is `#7d8aa3` (≈ 4.8:1 on `--panel`), and the
-light accent dropped from `#0e9c8d` (3.4:1 on white — it was failing as text and
-as a button fill) to `#0b7d72` (≈ 5.0:1 both as text on white and as white text
-on it). Dark text is `#e3e9f4`, never pure white — pure white blooms on a TV
-panel, which is what a cabinet screen is.
+Text is ≥ 4.5:1 against the surface it sits on, in both themes. Dark text is
+cream, never pure white — pure white blooms on a TV panel, which is what a
+cabinet screen is.
+
+**The pair that matters is the composed one.** A pill is not accent-on-panel,
+it is accent on `--accent-dim` *over* a panel — §3.4's triad. Measuring the
+token against the panel and calling it done is how three of the four defects
+below survived review:
+
+| Floor | Applies to | Why |
+| --- | --- | --- |
+| **4.5:1** | anything that renders as text, **including a role on its own tint** | WCAG 2.2 AA |
+| **3.0:1** | the focus ring against every ground it can land on | WCAG 2.2 AA non-text (1.4.11) |
+| **1.12:1** | hairline separators | *calibrated, not WCAG* — see below |
+
+The 1.12 separator floor is not an accessibility threshold and does not pretend
+to be one. Hairlines here are decorative (§5: "dark mode separates by surface
+lightness + a hairline border"); the perceivable boundary 1.4.11 cares about is
+the focus ring, held to 3.0. 1.12 is the faintest separator the *outgoing,
+reviewed* theme shipped (dark `--line-soft` on `--panel`), so it encodes "no
+worse than what we already accepted" and catches a token going flat.
+
+#### The tightest numbers in the set
+
+The whole table is printed by the gate (§3.6); these are the ones with the
+least room:
+
+| Pair | Ratio |
+| --- | --- |
+| light `--accent` on `--accent-dim-2` over `--bg-2` | **4.52** |
+| light `--ok` on `--ok-dim` over `--bg-2` | 4.57 |
+| light `--warn` on `--warn-dim` over `--bg-2` | 4.59 |
+| light `--text-3` on `--panel-3` | 4.76 |
+| light `--text-3` on `--bg-2` | 5.02 |
+| dark `--text-3` on `--panel` | 5.04 |
+| dark `--accent` on `--panel` | 9.96 |
+| dark `--accent-on` on `--accent-fill` | 9.20 |
+
+#### Four defects this pass found and fixed
+
+1. **light `--accent` `#0b7d72` → `#09645c`.** The specified value measures
+   4.53:1 on `--bg` — fine — but **3.33:1** once the accent's own 16 % tint
+   sits on `--bg-2`, and 4.16:1 as plain text on `--panel-2`. That composition
+   is `.pill-run`, `.pill-paused`, `.flash-ok`, `.btn-undo` and `.macdur`, i.e.
+   the running-status pill. Darkened until the worst composition clears 4.5.
+2. **dark `--danger-fill` `#d93f36` → `#c5312a`.** `--danger-on` on it was
+   **4.16:1** — and had been since before this palette. It is a text-on-fill
+   pair, independent of any ground, so no theme change was ever going to
+   surface it. 5.10:1 now.
+3. **light `--ok`/`--warn`/`--danger` darkened** (`#17784a`→`#156c43`,
+   `#8a6205`→`#7c5805`, `#bf2f27`→`#ac2a23`): all three fell to ~3.9:1 on their
+   own tint over the new cream `--bg-2`.
+4. **`--surface-base` did not exist.** `.macrowdur` — the one editable field in
+   the macro grid — set `background: var(--surface-base)`, an undefined token,
+   which resolves to transparent. Every other input uses `--surface-inset`.
+
+#### A fifth defect, found by the adversarial pass
+
+5. **light `--text-3` `#6d6180` → `#685c7a`.** It cleared 4.5 on every ground
+   except `--panel-3`, the hover fill, where it measured **4.41:1**. The gate
+   had not caught it because the tier loop deliberately skipped that one pair,
+   justified in a comment by "every rule that sets `--panel-3` also sets
+   `--text` or `--text-2`" — an unreachability claim about markup, which is
+   exactly the kind of reasoning §13.7 says must not live in a comment. The
+   stylesheet already held the counter-example: `.tab .tabnum` is a descendant
+   with its own `--text-tertiary`, so `.tab:hover`'s `color:` never reaches it.
+   That element is not rendered today, so nothing was shipping at 4.41 — but
+   the rule sat in the stylesheet one markup change away from it. Fixed the
+   token (§13.6), deleted the carve-out, and the tier loop now checks all
+   three tiers on all five grounds.
+
+#### Recorded exemption: disabled controls
+
+The status page's daemon-down block renders a dimmed `<select>` and a dimmed
+`Start` button (`.controls.off`, `opacity: 0.40`). The label measures
+**3.45:1** in dark and **2.36:1** in light, and both stay.
+
+WCAG 2.2 SC 1.4.3 exempts text that is part of an *inactive* user interface
+component, and the exemption is the right call rather than a loophole here:
+"dimmer than the live controls" is the entire signal that the control is
+unavailable, so raising it to 4.5 would remove the affordance it exists to
+provide. Two things make it safe — the **reason** is not dimmed (the
+`<p class="warn">` in the same block sits outside both opacity selectors and
+is measured at full strength), and the control is genuinely inert rather than
+merely styled to look it.
+
+Worth knowing if you touch it: two rules set opacity on that button,
+`.controls.off .btn` (0.40) and `.btn:disabled` (0.42). The three-class
+selector wins, so **0.40 renders**. And because CSS `opacity` composites the
+element's whole buffer over its parent, the text and the field fade *together*
+— the pair cannot be measured as two tokens, which is why it went unmeasured
+until now. The gate pins both numbers.
+
+#### Recorded exemption: the controller art's printed markings
+
+`--hw-xbox-b` and `--hw-xbox-x` carry white letters at **4.00:1** and
+**3.94:1**, under the floor, and they stay. The art is a *picture of a device*,
+not a label — repainting an Xbox B button would make the drawing wrong — and
+the letter is not the accessible name: every hit zone gets an `aria-label`
+naming the control and every key bound to it (`render_map.rs`). The gate pins
+both ratios, so changing them is a decision somebody makes on purpose rather
+than a regression.
+
+The DS4 disc is the one value there that is *ours* rather than the hardware's;
+it moved from blue-grey `#2b3346` to `#2e2740`, and all four Sony glyphs gained
+contrast (worst: cross, 4.60 → 5.17).
+
+### 3.6 The gate
+
+Numbers in a document do not defend themselves, so these are re-derived on
+every `cargo test`:
+
+- **`crates/ksx-studio/tests/contrast.rs`** — parses `studio-ui/src/studio.css`
+  (it does *not* restate the palette; a test that hardcodes the values is a
+  second copy that drifts the same way), composites every tint over every
+  ground, and checks 154 pairs across both themes. It also pins two
+  hand-mirrored copies of the tokens that had **already drifted**: the
+  anti-flash `PERSONALITY_CSS` in `render.rs`/`render_map.rs` (which was
+  painting `#0b0e14` while the stylesheet had moved to `#0a0d13` — a wrong
+  anti-flash colour looks exactly like the flash it exists to prevent), and
+  the controller-art palette in `build.mjs` (an `<img>`-embedded SVG is its own
+  document and cannot inherit a custom property).
+- **`crates/ksx-cabinet/tests/contrast.rs`** — reads `theme::role` directly,
+  because there the Rust constants *are* the theme, and checks the composed
+  pairs that only exist on that surface: the focus plate, a state colour on
+  `tint(colour, 38)`, `ACCENT_ON` on `OK`. 58 pairs. It also asserts the two
+  surfaces agree on `--accent` — they diverge on *size* on purpose (body 28 vs
+  14, hero 68 vs 38) and must not diverge on what "you are here" looks like.
+
+Both print their full table under `--nocapture`; the failure message names the
+pair, the ratio and the floor, and says to fix the **token**, not the component
+rule that revealed it.
 
 ---
 
@@ -322,7 +529,11 @@ This app is read from six feet away on an arcade panel. What that changes:
 - Focus/selection is border **and** fill **and** colour together (the console-UI
   rule), because at distance a hue shift alone is invisible.
 - Hit targets grow to 40 px under `pointer: coarse`.
-- Text is `#e3e9f4`, not `#ffffff`.
+- Text is `#f0ebe0` (cream), not `#ffffff`.
+- The cabinet's own theme (`crates/ksx-cabinet/src/theme.rs`) carries the same
+  palette, and deliberately keeps a **lighter `DANGER`** (`#ff6b6b`, not the
+  web's `#f4675f`): that surface tints harder — `tint(colour, 38)` over a plate
+  that is already lifted — and the web red measures 4.44:1 there.
 
 ---
 
@@ -390,3 +601,10 @@ lists already use.
    looks nice", it does not go in.
 5. Verify by looking, in both themes, at 1600 / 1100 / 420, in every state the
    screen can be in.
+6. **If you are editing a component rule to fix a colour, the token was
+   wrong.** Fix the token. A component that needs a colour the roles cannot
+   express is either a new role (name it, justify it, add it) or a bug.
+7. **A new colour ships with its ratio, or it does not ship.** Add the pair to
+   §3.6's gate. If a pair is a deliberate exemption it goes in the gate *as*
+   an exemption, with the reason and the pinned number — not in a comment
+   somewhere else, and not nowhere.

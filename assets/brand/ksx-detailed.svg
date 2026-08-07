@@ -1,0 +1,58 @@
+<!--
+  ksx — the detailed mark. Rendered at 48 px and up (see assets/brand/README.md
+  for the size table). Half a keyboard on the left, two pads and two buttons
+  spilling off the right: one input becoming four players.
+
+  Palette (Street Fighter, locked):
+    PLATE   #331a4d   OUTLINE #140a1f   KB    #f4f1e6   BEZEL #d8d2bd
+    KEY     #463456   C1 #e03c31        C2 #3d8de8      C3 #3fae52   C4 #f5b81c
+
+  The two pad silhouettes are Lucide's `gamepad-2` body path, ISC licensed —
+  recorded in /NOTICE. Do not redesign this file: the geometry is signed off,
+  and tools/icongen is the only thing that should ever read it.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="ksx">
+  <title>ksx</title>
+
+  <!-- plate -->
+  <rect x="1" y="1" width="62" height="62" rx="14" fill="#331a4d"/>
+
+  <!-- keyboard: case, then the recessed bezel it holds -->
+  <rect x="5" y="6" width="23" height="52" rx="5" fill="#f4f1e6" stroke="#140a1f" stroke-width="2.4" stroke-linejoin="round"/>
+  <rect x="6.8" y="7.8" width="19.4" height="48.4" rx="3.5" fill="#d8d2bd"/>
+
+  <!-- keys: the outer spacebar rail, then two columns of five -->
+  <g fill="#463456">
+    <rect x="7.8" y="10" width="3.6" height="44" rx="1.8"/>
+
+    <rect x="12.7" y="10" width="6" height="7.6" rx="1.9"/>
+    <rect x="12.7" y="19.1" width="6" height="7.6" rx="1.9"/>
+    <rect x="12.7" y="28.2" width="6" height="7.6" rx="1.9"/>
+    <rect x="12.7" y="37.3" width="6" height="7.6" rx="1.9"/>
+    <rect x="12.7" y="46.4" width="6" height="7.6" rx="1.9"/>
+
+    <rect x="20" y="10" width="6" height="7.6" rx="1.9"/>
+    <rect x="20" y="19.1" width="6" height="7.6" rx="1.9"/>
+    <rect x="20" y="28.2" width="6" height="7.6" rx="1.9"/>
+    <rect x="20" y="37.3" width="6" height="7.6" rx="1.9"/>
+    <rect x="20" y="46.4" width="6" height="7.6" rx="1.9"/>
+  </g>
+
+  <!--
+    Pads. stroke-width is 3 inside a scale(.8), which renders as the 2.4 every
+    other outline on this mark uses — the scale is compensated for, not ignored.
+    P2 is drawn second so it overlaps P1: the overlap is the "split" idea.
+  -->
+  <path fill="#e03c31" stroke="#140a1f" stroke-width="3" stroke-linejoin="round" transform="translate(29.4 5) scale(.8)"
+        d="M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.545-.604-6.584-.685-7.258-.007-.05-.011-.1-.017-.151A4 4 0 0 0 17.32 5z"/>
+  <path fill="#3d8de8" stroke="#140a1f" stroke-width="3" stroke-linejoin="round" transform="translate(40.4 12.5) scale(.8)"
+        d="M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.545-.604-6.584-.685-7.258-.007-.05-.011-.1-.017-.151A4 4 0 0 0 17.32 5z"/>
+
+  <!-- buttons, same overlap rule: P4 over P3 -->
+  <circle cx="39" cy="42" r="7.5" fill="#3fae52" stroke="#140a1f" stroke-width="2.4" stroke-linejoin="round"/>
+  <circle cx="50" cy="48" r="7.5" fill="#f5b81c" stroke="#140a1f" stroke-width="2.4" stroke-linejoin="round"/>
+
+  <!-- specular highlights: the buttons read as domed plastic, not flat dots -->
+  <ellipse cx="35.9" cy="38.9" rx="2.4" ry="1.6" fill="#ffffff" opacity=".4" transform="rotate(-38 35.9 38.9)"/>
+  <ellipse cx="46.9" cy="44.9" rx="2.4" ry="1.6" fill="#ffffff" opacity=".4" transform="rotate(-38 46.9 44.9)"/>
+</svg>

@@ -61,3 +61,17 @@
 #*.PDF   diff=astextplain
 #*.rtf   diff=astextplain
 #*.RTF   diff=astextplain
+
+###############################################################################
+# Generated brand rasters — assets/brand/dist/ and crates/ksx-studio/brand/
+# (see assets/brand/README.md).
+#
+# `* text=auto` at the top would normally detect these as binary from their NUL
+# bytes, but "normally" is not a guarantee, and one CRLF rewrite inside an .ico
+# or a raw .rgba blob corrupts the icon with no error anywhere — it just draws
+# wrong, on someone else's machine, after a fresh clone. Be explicit.
+###############################################################################
+*.ico   binary
+*.png   binary
+*.rgba  binary
+

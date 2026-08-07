@@ -1,0 +1,54 @@
+<!--
+  ksx — the simplified mark. Rendered at 32 px and below, and served as the
+  web /favicon.svg (a browser tab is a 16–32 px surface).
+
+  It is not the detailed mark scaled down; it is a different drawing of the
+  same idea, and that handoff is the point:
+
+    - NO outline anywhere. A 2.4-unit stroke on a 16 px raster is 0.6 px of
+      grey mud over every edge.
+    - One key row fewer, fatter keys, a fatter rail — 7.6-unit keys at 16 px
+      are 1.9 px tall and vanish into the bezel.
+    - No bezel at all, for the same reason.
+    - The pads become plain rounded rects. The gamepad silhouette is already
+      gone at this size; what still reads is TWO OF THEM, OVERLAPPING, so that
+      is all this draws.
+
+  Palette (Street Fighter, locked):
+    PLATE #331a4d   KB #f4f1e6   KEY #463456
+    C1 #e03c31      C2 #3d8de8   C3 #3fae52   C4 #f5b81c
+
+  Signed-off geometry. tools/icongen is the only thing that should read it.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="ksx">
+  <title>ksx</title>
+
+  <!-- plate -->
+  <rect x="1" y="1" width="62" height="62" rx="14" fill="#331a4d"/>
+
+  <!-- keyboard case (no bezel, no outline) -->
+  <rect x="5" y="7" width="22" height="50" rx="6" fill="#f4f1e6"/>
+
+  <!-- keys: rail + two columns of four -->
+  <g fill="#463456">
+    <rect x="8" y="13" width="4" height="40" rx="2"/>
+
+    <rect x="13.5" y="13" width="5.5" height="8.5" rx="2.2"/>
+    <rect x="13.5" y="23.5" width="5.5" height="8.5" rx="2.2"/>
+    <rect x="13.5" y="34" width="5.5" height="8.5" rx="2.2"/>
+    <rect x="13.5" y="44.5" width="5.5" height="8.5" rx="2.2"/>
+
+    <rect x="20" y="13" width="5.5" height="8.5" rx="2.2"/>
+    <rect x="20" y="23.5" width="5.5" height="8.5" rx="2.2"/>
+    <rect x="20" y="34" width="5.5" height="8.5" rx="2.2"/>
+    <rect x="20" y="44.5" width="5.5" height="8.5" rx="2.2"/>
+  </g>
+
+  <!-- pads as silhouettes; the overlap is what survives at 16 px -->
+  <rect x="31" y="10" width="19" height="11" rx="5.5" fill="#e03c31"/>
+  <rect x="40" y="18" width="19" height="11" rx="5.5" fill="#3d8de8"/>
+
+  <!-- buttons, one unit fatter than the detailed mark's -->
+  <circle cx="39" cy="42" r="8.5" fill="#3fae52"/>
+  <circle cx="50" cy="48" r="8.5" fill="#f5b81c"/>
+</svg>
