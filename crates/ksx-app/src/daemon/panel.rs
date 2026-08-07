@@ -368,6 +368,13 @@ fn session_loop(panel: &Panel, ctl: &Receiver<CaptureCtl>) -> ExitReason {
                 // and an absent board emits nothing to mute or type.
                 panel.set_emulating(ids.iter().any(|id| panel.covers(id)));
             }
+            // A WinUSB-claimed panel is already off the input stack, so a
+            // per-key `Take` has nothing to act on here — a partial take is
+            // meaningless for a board Windows cannot see at all. The question
+            // is the same one: is this panel bound to a slot.
+            Ok(CaptureCtl::SetCapturedWith(takes)) => {
+                panel.set_emulating(takes.iter().any(|(id, _)| panel.covers(id)));
+            }
             Ok(CaptureCtl::SetPassthrough) => panel.set_emulating(false),
             Ok(CaptureCtl::Shutdown) => return ExitReason::Shutdown,
             Err(RecvTimeoutError::Timeout) => {

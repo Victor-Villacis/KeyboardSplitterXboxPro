@@ -9,6 +9,7 @@
 use crossbeam_channel::{Receiver, Sender};
 use ksx_core::{DeviceId, KeyEvent};
 
+use crate::decision::Take;
 use crate::escape::EscapeHandle;
 use crate::health::HealthHandle;
 use crate::presence::PresenceHandle;
@@ -53,7 +54,14 @@ pub enum CaptureCtl {
     /// OS (swallowed, still reported); strokes from every other device are
     /// re-sent verbatim. Captured == blocked, per the legacy blocking-scope rule
     /// (only assigned devices are ever blocked, risk review §3 item 3).
+    ///
+    /// Takes each device WHOLE. Kept as the plain spelling because it is what
+    /// a cabinet wants and what every existing caller means.
     SetCaptured(Vec<DeviceId>),
+    /// Enter capturing mode with an explicit [`Take`] per device, so a desk
+    /// keyboard can drive pads with its bound keys and still type with the
+    /// rest. See [`Take`] for why both shapes are legitimate.
+    SetCapturedWith(Vec<(DeviceId, Take)>),
     /// Enter observe-only mode: report AND re-send everything.
     SetPassthrough,
     /// Leave the loop; the drop guard resets the driver filter on the way out.
