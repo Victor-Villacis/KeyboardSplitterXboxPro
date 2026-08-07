@@ -234,7 +234,7 @@ fn escape_plan() -> RunPlan {
                 .expect("valid slot"),
             preset,
         }],
-        block_keyboards: true,
+        block_keyboards: ksx_core::Blocking::Whole,
         block_mice: false,
         captureable: vec![DeviceId::from(IPAC)],
         // These plans drive mock backends; no board is WinUSB-claimed, so the
@@ -276,7 +276,7 @@ fn cabinet_plan() -> RunPlan {
         source: PlanSource::Config,
         config_path: PathBuf::from("test"),
         slots: cabinet_slots(),
-        block_keyboards: true,
+        block_keyboards: ksx_core::Blocking::Whole,
         block_mice: false,
         captureable: vec![DeviceId::from(IPAC)],
         // These plans drive mock backends; no board is WinUSB-claimed, so the
@@ -1566,7 +1566,7 @@ fn every_pre_capture_plug_failure_refuses_with_exit_2() {
 #[test]
 fn block_keyboards_false_runs_the_pads_without_ever_capturing() {
     let mut plan = escape_plan();
-    plan.block_keyboards = false;
+    plan.block_keyboards = ksx_core::Blocking::Off;
     let devices = vec![keyboard(IPAC, 1)];
     let script = vec![key_stroke(0, Key::A, true)];
 
@@ -1580,6 +1580,85 @@ fn block_keyboards_false_runs_the_pads_without_ever_capturing() {
         session.trace
     );
     assert!(session.output.contains("passthrough"), "{}", session.output);
+}
+
+/// One desk keyboard, two slots, `block_keyboards = "bound-keys"` — the whole
+/// feature, through the real supervisor and a real capture loop.
+///
+/// `W` drives slot 1 and `Up` drives slot 2, so both must be swallowed on that
+/// ONE device; `Enter` is bound by neither slot and must still reach Windows.
+/// Before the union existed the second slot's keys were nobody's business and
+/// `Up` would have typed while it moved a stick; before per-key passthrough
+/// existed `Enter` was lost for the length of the session.
+#[test]
+fn a_shared_desk_keyboard_swallows_both_slots_keys_and_still_types_the_rest() {
+    let slot_preset = |name: &str, key: Key, button: ksx_core::XButton| {
+        let mut preset = ksx_core::Preset::builtin_empty();
+        preset.name = name.to_owned();
+        preset.protected = false;
+        preset
+            .entries
+            .push((key, ksx_core::Binding::Button(button)));
+        preset
+    };
+    let p1 = slot_preset("desk-p1", Key::W, ksx_core::XButton::Y);
+    let p2 = slot_preset("desk-p2", Key::Up, ksx_core::XButton::A);
+    let plan = RunPlan {
+        source: PlanSource::Config,
+        config_path: PathBuf::from("test"),
+        slots: vec![
+            ResolvedSlot {
+                spec: SlotSpec::new(1, Some(DeviceId::from(DESK)), None, p1.name.clone())
+                    .expect("valid slot"),
+                preset: p1,
+            },
+            ResolvedSlot {
+                spec: SlotSpec::new(2, Some(DeviceId::from(DESK)), None, p2.name.clone())
+                    .expect("valid slot"),
+                preset: p2,
+            },
+        ],
+        block_keyboards: ksx_core::Blocking::BoundKeys,
+        block_mice: false,
+        captureable: vec![DeviceId::from(DESK)],
+        winusb: Vec::new(),
+        notes: Vec::new(),
+    };
+
+    let script = vec![
+        key_stroke(0, Key::W, true),
+        key_stroke(0, Key::Up, true),
+        key_stroke(0, Key::Enter, true),
+    ];
+    // Paced, so the capture set is in force before the first stroke.
+    let session = run_session(
+        &plan,
+        vec![keyboard(DESK, 1)],
+        script,
+        Some(Duration::from_millis(15)),
+        |opts, _| opts.max_events = Some(3),
+    );
+
+    assert!(
+        session.trace.contains(&Step::BlockingEnabled),
+        "the device must actually be captured: {:?}",
+        session.trace
+    );
+    let typed: Vec<Key> = session
+        .resent
+        .iter()
+        .map(|r| corrected_key(r.code, r.state))
+        .collect();
+    assert_eq!(
+        typed,
+        vec![Key::Enter],
+        "only the key neither slot binds may reach Windows"
+    );
+    assert!(
+        session.output.contains("bound keys only"),
+        "the session must say which mode it is in: {}",
+        session.output
+    );
 }
 
 #[test]
@@ -1704,7 +1783,7 @@ fn game_spec() -> ksx_games::LaunchSpec {
         arguments: String::new(),
         process_name: None,
         launcher_grace_ms: None,
-        block_keyboards: true,
+        block_keyboards: ksx_core::Blocking::Whole,
         block_mice: false,
         slots: Vec::new(),
     })

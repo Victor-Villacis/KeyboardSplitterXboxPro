@@ -1,7 +1,7 @@
 //! Main config file schema: `%APPDATA%\ksx\config.toml`
 //! (`docs/research/design-architecture.md` §4.1).
 
-use ksx_core::{DeviceId, MacroSwitch, Persona, SlotSpec, Socd};
+use ksx_core::{Blocking, DeviceId, MacroSwitch, Persona, SlotSpec, Socd};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
@@ -33,8 +33,14 @@ impl Default for ConfigFile {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Legacy `ShouldBlockKeyboards` (default true).
-    pub block_keyboards: bool,
+    /// Legacy `ShouldBlockKeyboards` (default true — the whole device).
+    ///
+    /// Three states, two of which are still spelled as the bool this used to
+    /// be: `true` takes the whole keyboard, `false` takes nothing, and
+    /// `"bound-keys"` takes only the keys the slots on that device bind, so a
+    /// desk keyboard driving two pads still types. See [`Blocking`].
+    #[serde(with = "crate::blocking_serde")]
+    pub block_keyboards: Blocking,
     /// Legacy `ShouldBlockMice` (default false).
     pub block_mice: bool,
     /// Legacy `MouseMoveDeadZone`, 0..=12.
@@ -46,7 +52,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            block_keyboards: true,
+            block_keyboards: Blocking::Whole,
             block_mice: false,
             mouse_move_deadzone: 5,
             starting_user_index: 1,
@@ -267,7 +273,7 @@ preset = "street-fighter-p1"
         let cfg: ConfigFile =
             toml::from_str("schema_version = 1\nfuture_option = \"ignored\"\n").unwrap();
         assert_eq!(cfg.settings, Settings::default());
-        assert!(cfg.settings.block_keyboards);
+        assert_eq!(cfg.settings.block_keyboards, Blocking::Whole);
         assert!(!cfg.settings.block_mice);
         assert_eq!(cfg.settings.mouse_move_deadzone, 5);
         assert_eq!(cfg.settings.starting_user_index, 1);
@@ -303,6 +309,42 @@ preset = "street-fighter-p1"
             off.slot_entry(&off.slot_spec(&off.slots[0]).unwrap()),
             off.slots[0]
         );
+    }
+
+    /// `block_keyboards` gained a third state, and the two it already had must
+    /// not have moved a byte. The doc example says `true`; it has to still mean
+    /// "the whole device" and still be written as `true`, because every
+    /// config.toml on every machine ksx runs on says exactly that.
+    #[test]
+    fn block_keyboards_true_still_means_the_whole_device_and_still_writes_as_true() {
+        let cfg: ConfigFile = toml::from_str(DOC_EXAMPLE).unwrap();
+        assert_eq!(cfg.settings.block_keyboards, Blocking::Whole);
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("block_keyboards = true"), "{text}");
+        assert!(!text.contains("whole"), "{text}");
+
+        let off: ConfigFile = toml::from_str(
+            &DOC_EXAMPLE.replace("block_keyboards = true", "block_keyboards = false"),
+        )
+        .unwrap();
+        assert_eq!(off.settings.block_keyboards, Blocking::Off);
+        assert!(toml::to_string(&off)
+            .unwrap()
+            .contains("block_keyboards = false"));
+    }
+
+    /// The new state: the desk-keyboard mode, from the file to the struct and
+    /// back with nothing lost.
+    #[test]
+    fn block_keyboards_can_ask_for_bound_keys_only() {
+        let cfg: ConfigFile = toml::from_str(
+            &DOC_EXAMPLE.replace("block_keyboards = true", "block_keyboards = \"bound-keys\""),
+        )
+        .unwrap();
+        assert_eq!(cfg.settings.block_keyboards, Blocking::BoundKeys);
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("block_keyboards = \"bound-keys\""), "{text}");
+        assert_eq!(toml::from_str::<ConfigFile>(&text).unwrap(), cfg);
     }
 
     #[test]

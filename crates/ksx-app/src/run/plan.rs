@@ -19,10 +19,11 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use ksx_capture::{KeySet, Take};
 use ksx_config::{
     validate, validate_games, ConfigFile, ConfigRoot, GamesFile, Issue, PresetFile, Store,
 };
-use ksx_core::{DeviceId, InvalidationReason, Preset, ResolvedSlot};
+use ksx_core::{Blocking, DeviceId, InvalidationReason, Preset, ResolvedSlot};
 
 /// Where the slot layout came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +50,10 @@ pub struct RunPlan {
     pub config_path: PathBuf,
     /// Sorted by slot number; every entry has at least one input device.
     pub slots: Vec<ResolvedSlot>,
-    pub block_keyboards: bool,
+    /// How much of each captured keyboard this session takes away from Windows.
+    /// [`RunPlan::take_for`] turns it into the per-device answer the capture
+    /// backend is actually told.
+    pub block_keyboards: Blocking,
     /// Parsed and reported, but never acted on in M4 (see module docs).
     pub block_mice: bool,
     /// Distinct keyboards bound to slots — exactly the `SetCaptured` set.
@@ -87,6 +91,40 @@ impl RunPlan {
             })
             .map(|s| s.spec.number)
             .collect()
+    }
+
+    /// Every key `device` drives — the UNION across every slot it feeds.
+    ///
+    /// The union is the load-bearing part. One keyboard legitimately drives
+    /// several slots (that is what a splitter *is*), and a key bound in ANY of
+    /// them has to be suppressed on that one physical device: a per-slot answer
+    /// would let player 1's `W` type into the chat window at the same moment it
+    /// was moving player 2's stick.
+    ///
+    /// Built through [`Self::slots_using`] rather than re-deriving the filter,
+    /// so "which slots does this device feed" has exactly one definition here.
+    /// If the suppression set and the unplug-invalidation set could disagree
+    /// about that, one of them would be wrong about a live panel.
+    pub fn bound_keys(&self, device: &DeviceId) -> KeySet {
+        let numbers = self.slots_using(device);
+        self.slots
+            .iter()
+            .filter(|s| numbers.contains(&s.spec.number))
+            .flat_map(|s| s.preset.bound_keys())
+            .collect()
+    }
+
+    /// How much of `device` the capture backend should take.
+    ///
+    /// Only meaningful for a device that is actually captured;
+    /// [`Blocking::Off`] never reaches here because the supervisor sends
+    /// `SetPassthrough` instead of a capture set at all.
+    pub fn take_for(&self, device: &DeviceId) -> Take {
+        if self.block_keyboards.is_per_key() {
+            Take::BoundKeys(self.bound_keys(device))
+        } else {
+            Take::Whole
+        }
     }
 }
 
@@ -479,12 +517,18 @@ pub fn build_plan(
                 .to_owned(),
         );
     }
-    if !block_keyboards {
-        notes.push(
+    match block_keyboards {
+        Blocking::Whole => {}
+        Blocking::BoundKeys => notes.push(
+            "[INFO] block_keyboards is \"bound-keys\": only the keys a slot binds are taken \
+             from an assigned keyboard; every other key still types into Windows"
+                .to_owned(),
+        ),
+        Blocking::Off => notes.push(
             "[INFO] block_keyboards is false: pads are driven, but assigned keyboards keep \
              typing into Windows as well"
                 .to_owned(),
-        );
+        ),
     }
 
     // Deduplicate while keeping slot order — one I-PAC feeding four slots must
@@ -584,7 +628,7 @@ pub fn render_human(plan: &RunPlan) -> String {
     let _ = writeln!(
         out,
         "  block keyboards: {}    block mice: {} (never applied in M4)",
-        yes_no(plan.block_keyboards),
+        plan.block_keyboards.label(),
         yes_no(plan.block_mice)
     );
     // Which capture drivers this session would touch. Worth a line of its own:
@@ -683,7 +727,19 @@ pub fn render_human(plan: &RunPlan) -> String {
     );
     for device in &plan.captureable {
         let slots = plan.slots_using(device);
-        let _ = writeln!(out, "    {device}  -> slot(s) {slots:?}");
+        // In bound-keys mode the interesting number is how much of the keyboard
+        // survives, and it is only knowable once the presets are resolved — so
+        // it belongs on the dry-run line rather than in the user's head. A
+        // device whose slots bind NOTHING would be captured and suppress
+        // nothing, which reads as broken unless the report says so here.
+        let take = match plan.take_for(device) {
+            Take::Whole => String::new(),
+            Take::BoundKeys(keys) => format!(
+                "  ({} bound key(s) suppressed; every other key still types)",
+                keys.len()
+            ),
+        };
+        let _ = writeln!(out, "    {device}  -> slot(s) {slots:?}{take}");
     }
     for note in &plan.notes {
         let _ = writeln!(out, "  {note}");
@@ -739,10 +795,30 @@ pub fn plan_json(plan: &RunPlan) -> serde_json::Value {
             PlanSource::Game(title) => serde_json::json!({"kind": "game", "title": title}),
         },
         "config_path": plan.config_path.display().to_string(),
-        "block_keyboards": plan.block_keyboards,
+        // A string, not a bool: the setting has three states and a bool can
+        // only carry two of them. Readers that want "is anything captured at
+        // all" have `captures`, so nobody has to compare against a name.
+        "block_keyboards": plan.block_keyboards.as_str(),
+        "captures": plan.block_keyboards.captures(),
         "block_mice": plan.block_mice,
         "slots": slots,
         "captureable": plan.captureable.iter().map(|d| d.as_str()).collect::<Vec<_>>(),
+        // What each captured device actually loses, resolved. `keys` is null
+        // for a whole-device take because "every key" is not a number, and
+        // reporting the preset's binding count there would be a different
+        // quantity wearing the same name.
+        "takes": plan.captureable.iter().map(|device| {
+            let (take, keys) = match plan.take_for(device) {
+                Take::Whole => ("whole", None),
+                Take::BoundKeys(set) => ("bound-keys", Some(set.len())),
+            };
+            serde_json::json!({
+                "device": device.as_str(),
+                "take": take,
+                "keys": keys,
+                "slots": plan.slots_using(device),
+            })
+        }).collect::<Vec<_>>(),
         "winusb": plan.winusb.iter().map(|d| d.as_str()).collect::<Vec<_>>(),
         "needs_interception": plan.needs_interception(),
         "notes": plan.notes,
@@ -760,6 +836,7 @@ fn yes_no(b: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ksx_core::Key;
 
     const IPAC: &str = r"HID\VID_D209&PID_0430&REV_0056&MI_00";
 
@@ -812,7 +889,7 @@ preset = "IPAC P1"
         // capture set (risk review R6 trap 1).
         assert_eq!(plan.captureable, vec![DeviceId::from(IPAC)]);
         assert_eq!(plan.slots_using(&DeviceId::from(IPAC)), vec![1, 2]);
-        assert!(plan.block_keyboards);
+        assert_eq!(plan.block_keyboards, Blocking::Whole);
         assert!(!plan.block_mice);
     }
 
@@ -839,7 +916,7 @@ preset = "IPAC P2"
             vec![3],
             "the game's slots replace the config's, they do not merge"
         );
-        assert!(!plan.block_keyboards);
+        assert_eq!(plan.block_keyboards, Blocking::Off);
         assert!(plan.block_mice);
         assert!(
             plan.notes.iter().any(|n| n.contains("block_mice")),
@@ -1378,6 +1455,167 @@ preset = "running"
             v.pointer("/slots/2/macros/0/runs"),
             Some(&serde_json::json!(true))
         );
+    }
+
+    // -----------------------------------------------------------------
+    // block_keyboards = "bound-keys" — the desk-keyboard mode
+    // -----------------------------------------------------------------
+
+    /// **The union, and the reason it is a union.**
+    ///
+    /// One desk keyboard, two slots: WASD drives player 1, the arrows drive
+    /// player 2. Both sets have to come off that ONE device — a per-slot answer
+    /// would let player 1's `W` type into whatever has focus at the same moment
+    /// it was moving player 2's stick. Everything neither slot binds still
+    /// types, which is the whole point of the mode.
+    #[test]
+    fn two_slots_on_one_keyboard_suppress_the_union_of_both_their_keys() {
+        let presets = vec![
+            toml::from_str(
+                "name = \"P1\"\n[bindings]\nA = \"S\"\nY = \"W\"\nX = \"A\"\nB = \"D\"\n",
+            )
+            .unwrap(),
+            toml::from_str("name = \"P2\"\n[bindings]\ndpad.up = \"Up\"\ndpad.down = \"Down\"\n")
+                .unwrap(),
+        ];
+        let cfg = config(
+            r#"
+schema_version = 1
+
+[settings]
+block_keyboards = "bound-keys"
+
+[[device]]
+id = 'HID\VID_D209&PID_0430&REV_0056&MI_00'
+alias = "desk"
+
+[[slot]]
+number = 1
+keyboard = "desk"
+preset = "P1"
+
+[[slot]]
+number = 2
+keyboard = "desk"
+preset = "P2"
+"#,
+        );
+        let plan = build_plan(&cfg, &GamesFile::default(), &presets, None).unwrap();
+        let desk = DeviceId::from(IPAC);
+        assert_eq!(
+            plan.slots_using(&desk),
+            vec![1, 2],
+            "one keyboard, two slots — the case the union exists for"
+        );
+
+        let Take::BoundKeys(keys) = plan.take_for(&desk) else {
+            panic!("bound-keys mode must produce a per-key take");
+        };
+        for key in [Key::W, Key::A, Key::S, Key::D] {
+            assert!(keys.contains(key), "player 1's {key:?} must be suppressed");
+        }
+        for key in [Key::Up, Key::Down] {
+            assert!(keys.contains(key), "player 2's {key:?} must be suppressed");
+        }
+        assert_eq!(keys.len(), 6, "both slots' keys, each counted once");
+        for key in [Key::Enter, Key::Escape, Key::Q] {
+            assert!(
+                !keys.contains(key),
+                "{key:?} is bound by neither slot and must still type"
+            );
+        }
+    }
+
+    /// The compatibility half: a config that says nothing new means exactly
+    /// what it always meant, and the capture backend is told the same thing it
+    /// has always been told.
+    #[test]
+    fn a_default_config_still_takes_every_captured_device_whole() {
+        let plan =
+            build_plan(&config(CAB_CONFIG), &GamesFile::default(), &presets(), None).unwrap();
+        assert_eq!(plan.block_keyboards, Blocking::Whole);
+        assert_eq!(plan.take_for(&DeviceId::from(IPAC)), Take::Whole);
+        // ...and no per-key set is computed for it, so a preset that binds
+        // nothing cannot accidentally free a cabinet encoder.
+        assert!(!plan.block_keyboards.is_per_key());
+    }
+
+    /// A game profile carries its own answer: the same panel is taken whole for
+    /// a fighting game and by bound keys for a title with a chat box.
+    #[test]
+    fn a_game_profile_can_ask_for_bound_keys_on_its_own() {
+        let games = games(
+            r#"
+[[game]]
+title = "Chatty"
+path = 'C:\chat.exe'
+block_keyboards = "bound-keys"
+
+[[game.slot]]
+number = 1
+keyboard = "cab"
+preset = "IPAC P1"
+"#,
+        );
+        let plan = build_plan(&config(CAB_CONFIG), &games, &presets(), Some("Chatty")).unwrap();
+        assert_eq!(plan.block_keyboards, Blocking::BoundKeys);
+        let Take::BoundKeys(keys) = plan.take_for(&DeviceId::from(IPAC)) else {
+            panic!("the profile asked for a per-key take");
+        };
+        assert!(keys.contains(Key::S), "IPAC P1 binds S");
+        assert!(!keys.contains(Key::Enter));
+        assert!(
+            plan.notes.iter().any(|n| n.contains("bound-keys")),
+            "the mode must be said out loud: {:?}",
+            plan.notes
+        );
+    }
+
+    /// The mode has to be readable BEFORE a session starts — that is what
+    /// `--dry-run` is for, and "will my keyboard still work" is the only
+    /// question this feature raises.
+    #[test]
+    fn the_dry_run_says_which_mode_and_how_many_keys_go() {
+        let presets = vec![
+            toml::from_str("name = \"IPAC P1\"\n[bindings]\nA = \"S\"\n").unwrap(),
+            toml::from_str("name = \"IPAC P2\"\n[bindings]\nB = \"D\"\n").unwrap(),
+        ];
+        let cfg = config(&CAB_CONFIG.replace(
+            "schema_version = 1",
+            "schema_version = 1\n[settings]\nblock_keyboards = \"bound-keys\"",
+        ));
+        let plan = build_plan(&cfg, &GamesFile::default(), &presets, None).unwrap();
+
+        let text = render_human(&plan);
+        assert!(text.contains("bound keys only"), "{text}");
+        assert!(text.contains("2 bound key(s) suppressed"), "{text}");
+
+        let v = plan_json(&plan);
+        assert_eq!(
+            v.pointer("/block_keyboards"),
+            Some(&serde_json::json!("bound-keys"))
+        );
+        assert_eq!(v.pointer("/captures"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            v.pointer("/takes/0/take"),
+            Some(&serde_json::json!("bound-keys"))
+        );
+        assert_eq!(v.pointer("/takes/0/keys"), Some(&serde_json::json!(2)));
+
+        // ...and the default plan reports the whole-device take, with no key
+        // count, because "every key" is not a number.
+        let whole = build_plan(&config(CAB_CONFIG), &GamesFile::default(), &presets, None).unwrap();
+        let v = plan_json(&whole);
+        assert_eq!(
+            v.pointer("/block_keyboards"),
+            Some(&serde_json::json!("whole"))
+        );
+        assert_eq!(
+            v.pointer("/takes/0/take"),
+            Some(&serde_json::json!("whole"))
+        );
+        assert_eq!(v.pointer("/takes/0/keys"), Some(&serde_json::Value::Null));
+        assert!(!render_human(&whole).contains("bound key(s)"));
     }
 
     #[test]

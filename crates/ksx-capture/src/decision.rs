@@ -72,6 +72,13 @@ impl KeySet {
     pub fn is_empty(&self) -> bool {
         self.words.iter().all(|w| *w == 0)
     }
+
+    /// How many keys are in the set. Not used on the hot path — it exists so
+    /// `ksx run --dry-run` can say how many keys a device will stop typing
+    /// before anyone starts a session and finds out by typing.
+    pub fn len(&self) -> usize {
+        self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
 }
 
 impl FromIterator<Key> for KeySet {
@@ -417,5 +424,12 @@ mod tests {
         assert!(!KeySet::new().contains(Key::A));
         assert!(KeySet::new().is_empty());
         assert!(!set.is_empty());
+        assert_eq!(set.len(), keys.len(), "each key counted once");
+        // Re-inserting is idempotent — the count is of KEYS, not of writes, and
+        // the union that builds it hands the same key over once per slot.
+        let mut twice = set.clone();
+        twice.insert(Key::A);
+        assert_eq!(twice.len(), keys.len());
+        assert_eq!(KeySet::new().len(), 0);
     }
 }

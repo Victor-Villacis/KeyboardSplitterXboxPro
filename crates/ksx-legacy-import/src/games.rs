@@ -168,7 +168,11 @@ fn parse_game(
             },
         }
     };
-    let block_keyboards = parse_flag("BlockKeyboards", true, warnings);
+    // Legacy had one bit here, so an imported profile can only ever be
+    // whole-device or nothing; `Blocking::from` is the single place that
+    // mapping is written down. Bound-keys mode is a ksx addition and is opted
+    // into by editing games.toml, never inferred from an XML that predates it.
+    let block_keyboards = ksx_core::Blocking::from(parse_flag("BlockKeyboards", true, warnings));
     let block_mice = parse_flag("BlockMice", false, warnings);
     Some(ksx_config::GameEntry {
         title,
@@ -296,7 +300,10 @@ mod tests {
         let xml = r#"<Games><Game Title="T" Path="C:\g.exe"/></Games>"#;
         let parsed = parse_games(xml, "f.xml");
         assert!(parsed.warnings.is_empty());
-        assert!(parsed.games.games[0].block_keyboards);
+        assert_eq!(
+            parsed.games.games[0].block_keyboards,
+            ksx_core::Blocking::Whole
+        );
         assert!(!parsed.games.games[0].block_mice);
     }
 

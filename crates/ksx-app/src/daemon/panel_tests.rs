@@ -211,7 +211,7 @@ fn panel_plan() -> RunPlan {
                 .expect("valid slot"),
             preset,
         }],
-        block_keyboards: true,
+        block_keyboards: ksx_core::Blocking::Whole,
         block_mice: false,
         captureable: vec![DeviceId::from(PANEL)],
         // The whole point: this device is claimed, so the session must borrow

@@ -31,9 +31,12 @@
 //! - [`templates`] — in-box preset [`Template`]s for standard panels: the
 //!   zero-mapping out-of-box experience (`docs/MAPPER-UX.md` commandment 9)
 //! - [`persona`] — [`Persona`]: which controller a slot presents itself as
+//! - [`blocking`] — [`Blocking`]: how much of a bound keyboard a session takes
+//!   away from Windows (whole device / bound keys only / nothing)
 //! - [`engine`] — the [`Engine`]: precompiled dispatch, per-device key state, diffing
 //! - [`escape`] — [`EscapeDetector`], emergency-escape detection (policy lives upstream)
 
+pub mod blocking;
 pub mod device;
 pub mod diagonal;
 pub mod engine;
@@ -49,6 +52,7 @@ pub mod socd;
 pub mod templates;
 pub mod vendors;
 
+pub use blocking::{Blocking, UnknownBlocking};
 pub use device::{DeviceId, KeyEvent};
 pub use diagonal::{Diag, Held};
 pub use engine::{Deltas, Engine, EngineTables, PadDelta, ResolvedSlot};

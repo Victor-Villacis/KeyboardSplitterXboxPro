@@ -81,7 +81,8 @@ use ksx_capture::{
     CaptureBackend, CaptureCtl, CaptureHealth, DeviceInfo, EscapeStatus, ExitReason, HealthView,
 };
 use ksx_core::{
-    DeviceId, Engine, EngineTables, InvalidationReason, KeyEvent, PadState, Persona, ResolvedSlot,
+    Blocking, DeviceId, Engine, EngineTables, InvalidationReason, KeyEvent, PadState, Persona,
+    ResolvedSlot,
 };
 use ksx_output::{PadHandle, VirtualPadBackend};
 
@@ -223,7 +224,7 @@ impl SessionHook for NoHook {}
 pub struct SessionShape {
     /// `(slot number, persona, keyboard, mouse)` per slot, in plan order.
     slots: Vec<(u8, Persona, Option<DeviceId>, Option<DeviceId>)>,
-    block_keyboards: bool,
+    block_keyboards: Blocking,
     /// Exactly the `SetCaptured` set.
     captureable: Vec<DeviceId>,
     /// Which boards are WinUSB-claimed — a backend change per device.
@@ -279,7 +280,13 @@ impl SessionShape {
             }
         }
         if self.block_keyboards != next.block_keyboards {
-            return Some("keyboard blocking was turned on or off".to_owned());
+            // Named, both ends: "whole → bound-keys" is a change of which keys
+            // the driver swallows, which is a capture-thread decision and not
+            // something `swap_tables` can reach.
+            return Some(format!(
+                "keyboard blocking changed ({} → {})",
+                self.block_keyboards, next.block_keyboards
+            ));
         }
         if self.captureable != next.captureable {
             return Some("the set of captured keyboards changed".to_owned());
@@ -1112,14 +1119,27 @@ pub fn supervise(
     drop(msg_tx);
 
     // Startup order, step 3: enable blocking, for the bound devices only.
-    let mut blocking = plan.block_keyboards;
-    apply_capture(&ctl_tx, &opts.trace, blocking, &present);
+    let mut blocking = plan.block_keyboards.captures();
+    apply_capture(&ctl_tx, &opts.trace, blocking, &present, plan);
     let _ = if blocking && !present.is_empty() {
-        writeln!(
-            out,
-            "blocking enabled for {} assigned keyboard(s); every other keyboard keeps typing",
-            present.len()
-        )
+        // The two modes promise different things to the person at the keyboard,
+        // so they say different things. Getting "every other keyboard keeps
+        // typing" while your own keyboard still types is not reassuring, it is
+        // confusing.
+        if plan.block_keyboards.is_per_key() {
+            writeln!(
+                out,
+                "blocking enabled for {} assigned keyboard(s), bound keys only; \
+                 every unbound key still types",
+                present.len()
+            )
+        } else {
+            writeln!(
+                out,
+                "blocking enabled for {} assigned keyboard(s); every other keyboard keeps typing",
+                present.len()
+            )
+        }
     } else {
         writeln!(
             out,
@@ -1215,7 +1235,12 @@ pub fn supervise(
             &mut blocking,
             &mut toggles,
             opts.beep,
-            Some((&ctl_tx, &opts.trace, &present)),
+            Some(CaptureMirror {
+                ctl: &ctl_tx,
+                trace: &opts.trace,
+                present: &present,
+                plan,
+            }),
             out,
         );
         // The gesture just handed the keyboard back to Windows. A macro in
@@ -1266,7 +1291,7 @@ pub fn supervise(
                 }
             }
             if changed {
-                apply_capture(&ctl_tx, &opts.trace, blocking, &present);
+                apply_capture(&ctl_tx, &opts.trace, blocking, &present, plan);
                 let _ = out.flush();
             }
         }
@@ -1418,6 +1443,19 @@ fn wait_for_pads(
     }
 }
 
+/// Everything [`apply_capture`] needs, as one argument.
+///
+/// A struct rather than a tuple because it is optional at the call site and the
+/// three references read as noise there — and because `plan` is the one nobody
+/// would guess: the mode it carries decides whether the mirrored state is a
+/// whole-device take or a per-key one.
+struct CaptureMirror<'a> {
+    ctl: &'a Sender<CaptureCtl>,
+    trace: &'a Option<Trace>,
+    present: &'a BTreeSet<DeviceId>,
+    plan: &'a RunPlan,
+}
+
 /// Mirror the capture thread's escape counters into the supervisor's own state:
 /// count the toggles, flip `blocking` to match, print, beep.
 ///
@@ -1431,7 +1469,7 @@ fn mirror_escapes(
     blocking: &mut bool,
     toggles: &mut u32,
     beep_enabled: bool,
-    apply: Option<(&Sender<CaptureCtl>, &Option<Trace>, &BTreeSet<DeviceId>)>,
+    apply: Option<CaptureMirror<'_>>,
     out: &mut dyn Write,
 ) {
     if status.mouse_escapes > seen.mouse_escapes {
@@ -1449,8 +1487,14 @@ fn mirror_escapes(
         seen.toggles += 1;
         *blocking = !*blocking;
         *toggles += 1;
-        if let Some((ctl, trace, present)) = apply {
-            apply_capture(ctl, trace, *blocking, present);
+        if let Some(mirror) = &apply {
+            apply_capture(
+                mirror.ctl,
+                mirror.trace,
+                *blocking,
+                mirror.present,
+                mirror.plan,
+            );
         }
         let state = if *blocking { "ON" } else { "OFF" };
         tracing::warn!(
@@ -1467,14 +1511,33 @@ fn mirror_escapes(
 
 /// The single place capture state is changed. Blocking is only ever enabled for
 /// devices that are BOTH bound to a slot AND currently present.
+///
+/// The plan decides *how much* of each of them is taken. `blocking` is the
+/// runtime latch (an escape gesture toggles it); the mode is fixed for the
+/// session, because changing it bounces the session
+/// ([`SessionShape::bounce_reason`]).
 fn apply_capture(
     ctl: &Sender<CaptureCtl>,
     trace: &Option<Trace>,
     blocking: bool,
     present: &BTreeSet<DeviceId>,
+    plan: &RunPlan,
 ) {
     if blocking && !present.is_empty() {
-        let _ = ctl.send(CaptureCtl::SetCaptured(present.iter().cloned().collect()));
+        if plan.block_keyboards.is_per_key() {
+            // Recomputed per call rather than cached: `present` changes on
+            // hotplug, and a device that just came back must be told about with
+            // the key set its slots bind right now.
+            let takes = present
+                .iter()
+                .map(|id| (id.clone(), plan.take_for(id)))
+                .collect();
+            let _ = ctl.send(CaptureCtl::SetCapturedWith(takes));
+        } else {
+            // The plain spelling for a whole-device take — what a cabinet wants,
+            // and what every backend has always understood.
+            let _ = ctl.send(CaptureCtl::SetCaptured(present.iter().cloned().collect()));
+        }
         record(trace, Step::BlockingEnabled);
     } else {
         let _ = ctl.send(CaptureCtl::SetPassthrough);
@@ -2329,7 +2392,7 @@ mod tests {
             source: super::super::plan::PlanSource::Config,
             config_path: std::path::PathBuf::from("test"),
             slots,
-            block_keyboards: true,
+            block_keyboards: Blocking::Whole,
             block_mice: false,
             captureable,
             winusb: Vec::new(),
@@ -2427,10 +2490,22 @@ mod tests {
             .is_some_and(|r| r.contains("input device")));
 
         let mut passthrough = shape_plan(base.slots.clone());
-        passthrough.block_keyboards = false;
+        passthrough.block_keyboards = Blocking::Off;
         assert!(shape
             .bounce_reason(&SessionShape::of(&passthrough))
             .is_some_and(|r| r.contains("blocking")));
+
+        // ...and so does whole-device → bound-keys. It is the capture thread's
+        // suppression table that changes, which `swap_tables` cannot reach; a
+        // hot swap here would leave the session taking the whole keyboard while
+        // the config says otherwise.
+        let mut partial = shape_plan(base.slots.clone());
+        partial.block_keyboards = Blocking::BoundKeys;
+        let reason = shape
+            .bounce_reason(&SessionShape::of(&partial))
+            .expect("a blocking-mode change must bounce the session");
+        assert!(reason.contains("whole"), "{reason}");
+        assert!(reason.contains("bound-keys"), "{reason}");
 
         let mut winusb = shape_plan(base.slots.clone());
         winusb.winusb = vec![DeviceId::from(BOARD)];
@@ -2488,18 +2563,69 @@ mod tests {
 
     #[test]
     fn apply_capture_never_captures_an_empty_or_absent_set() {
+        let plan = shape_plan(vec![shape_slot(
+            1,
+            BOARD,
+            ksx_core::Preset::builtin_empty(),
+        )]);
         let (tx, rx) = unbounded();
         let present = BTreeSet::new();
-        apply_capture(&tx, &None, true, &present);
+        apply_capture(&tx, &None, true, &present, &plan);
         assert!(matches!(rx.try_recv().unwrap(), CaptureCtl::SetPassthrough));
 
         let present: BTreeSet<DeviceId> = [DeviceId::from("A")].into_iter().collect();
-        apply_capture(&tx, &None, false, &present);
+        apply_capture(&tx, &None, false, &present, &plan);
         assert!(matches!(rx.try_recv().unwrap(), CaptureCtl::SetPassthrough));
-        apply_capture(&tx, &None, true, &present);
+        apply_capture(&tx, &None, true, &present, &plan);
         match rx.try_recv().unwrap() {
             CaptureCtl::SetCaptured(ids) => assert_eq!(ids, vec![DeviceId::from("A")]),
             other => panic!("expected SetCaptured, got {other:?}"),
         }
+    }
+
+    /// **The message that makes the feature exist.** A plan in bound-keys mode
+    /// must reach the capture backend as `SetCapturedWith` carrying that
+    /// device's key set — sending the plain `SetCaptured` would take the whole
+    /// keyboard and the config would be a lie.
+    #[test]
+    fn bound_keys_mode_sends_the_per_key_take_and_whole_mode_does_not() {
+        let mut plan = shape_plan(vec![shape_slot(
+            1,
+            BOARD,
+            ksx_core::Preset::builtin_default(),
+        )]);
+        let present: BTreeSet<DeviceId> = [DeviceId::from(BOARD)].into_iter().collect();
+
+        // Today's default: the plain spelling, unchanged.
+        let (tx, rx) = unbounded();
+        apply_capture(&tx, &None, true, &present, &plan);
+        assert!(
+            matches!(rx.try_recv().unwrap(), CaptureCtl::SetCaptured(ids) if ids == vec![DeviceId::from(BOARD)]),
+            "a whole-device plan must keep sending SetCaptured"
+        );
+
+        plan.block_keyboards = Blocking::BoundKeys;
+        apply_capture(&tx, &None, true, &present, &plan);
+        let CaptureCtl::SetCapturedWith(takes) = rx.try_recv().unwrap() else {
+            panic!("bound-keys mode must send SetCapturedWith");
+        };
+        assert_eq!(takes.len(), 1);
+        assert_eq!(takes[0].0, DeviceId::from(BOARD));
+        let ksx_capture::Take::BoundKeys(keys) = &takes[0].1 else {
+            panic!("expected a per-key take, got {:?}", takes[0].1);
+        };
+        assert!(
+            keys.contains(ksx_core::Key::S),
+            "the default preset binds S to A"
+        );
+        assert!(
+            !keys.contains(ksx_core::Key::F12),
+            "nothing binds F12, so it must still type"
+        );
+
+        // ...and the escape hatch still wins: passthrough is passthrough in
+        // either mode.
+        apply_capture(&tx, &None, false, &present, &plan);
+        assert!(matches!(rx.try_recv().unwrap(), CaptureCtl::SetPassthrough));
     }
 }

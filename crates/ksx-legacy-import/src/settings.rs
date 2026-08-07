@@ -148,7 +148,7 @@ mod tests {
         // default (5).
         assert_eq!(parsed.settings.mouse_move_deadzone, 1);
         assert_eq!(parsed.settings.starting_user_index, 1);
-        assert!(parsed.settings.block_keyboards);
+        assert_eq!(parsed.settings.block_keyboards, ksx_core::Blocking::Whole);
         assert!(!parsed.settings.block_mice);
     }
 

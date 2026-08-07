@@ -1664,7 +1664,7 @@ mod tests {
                 .with_persona(persona),
                 preset,
             }],
-            block_keyboards: true,
+            block_keyboards: ksx_core::Blocking::Whole,
             block_mice: false,
             captureable: vec![ksx_core::DeviceId::from("BOARD")],
             winusb: Vec::new(),

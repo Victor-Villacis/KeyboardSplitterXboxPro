@@ -400,7 +400,7 @@ mod tests {
             arguments: args.into(),
             process_name: process_name.map(str::to_owned),
             launcher_grace_ms: None,
-            block_keyboards: true,
+            block_keyboards: ksx_core::Blocking::Whole,
             block_mice: false,
             slots: Vec::new(),
         }
