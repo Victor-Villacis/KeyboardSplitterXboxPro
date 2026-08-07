@@ -26,16 +26,16 @@ expression: "serde_json::to_string_pretty(&devices_json(&report)).unwrap()"
       "backend": "interception",
       "friendly": "I-PAC Arcade Control Interface",
       "id": "HID\\VID_D209&PID_0430&REV_0056&MI_00",
-      "ipac": true,
-      "slot": 1
+      "slot": 1,
+      "vendor": "Ultimarc I-PAC 4X"
     },
     {
       "alias": null,
       "backend": "interception",
       "friendly": null,
       "id": "HID\\VID_046D&PID_C31C&REV_6402&MI_00",
-      "ipac": false,
-      "slot": 2
+      "slot": 2,
+      "vendor": null
     }
   ],
   "mice_visible": 1,

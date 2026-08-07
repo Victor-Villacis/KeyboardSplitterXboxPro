@@ -3,7 +3,7 @@ source: crates/ksx-app/src/devices.rs
 expression: render_human(&report)
 ---
 keyboards (interception backend):
-  slot 1  HID\VID_D209&PID_0430&REV_0056&MI_00  "I-PAC Arcade Control Interface"  [I-PAC]
+  slot 1  HID\VID_D209&PID_0430&REV_0056&MI_00  "I-PAC Arcade Control Interface"  [Ultimarc I-PAC 4X]
   slot 2  HID\VID_046D&PID_C31C&REV_6402&MI_00  "n/a"
 mice: 1 visible (unused — ksx never sets the mouse filter)
 usb enumeration unavailable

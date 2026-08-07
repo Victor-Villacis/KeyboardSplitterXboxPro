@@ -3,7 +3,7 @@ source: crates/ksx-app/src/monitor.rs
 expression: "String::from_utf8(out).unwrap()"
 ---
 monitoring 2 keyboard(s) — passthrough only, no keys are blocked
-  kb1 = HID\VID_D209&PID_0430&REV_0056&MI_00 "I-PAC Arcade Control Interface"  [I-PAC]
+  kb1 = HID\VID_D209&PID_0430&REV_0056&MI_00 "I-PAC Arcade Control Interface"  [Ultimarc I-PAC 4X]
   kb2 = HID\VID_046D&PID_C31C&REV_6402&MI_00 "n/a"
 kb1 A down
 kb2 Left down

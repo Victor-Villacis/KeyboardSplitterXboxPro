@@ -201,10 +201,32 @@ impl DeviceSelector {
     ///
     /// Order of recognition matters and is not arbitrary: the `usb:` prefix is
     /// checked first because it is the only spelling ksx *writes*, then the two
-    /// legacy path shapes are told apart by their enumerator prefix. Anything
-    /// else is an error rather than a silently-never-matching literal — a
-    /// config that names nothing should say so at load, not at 2 a.m. when the
-    /// panel is dead.
+    /// legacy path shapes are told apart by their enumerator prefix.
+    ///
+    /// # Any other path is an opaque id, not an error
+    ///
+    /// It is tempting to reject an unrecognised prefix — a config that names
+    /// nothing should say so at load, not at 2 a.m. when the panel is dead. But
+    /// `USB\` and `HID\` are not the only enumerators a keyboard can live
+    /// under, and ksx writes the others *itself*: the setup wizard commits
+    /// whatever Raw Input reports, and for a laptop or PS/2 keyboard that is
+    ///
+    /// ```text
+    /// \\.\ACPI#PNP0303#4&1a2b3c4d&0   ->   ACPI\PNP0303\4&1A2B3C4D&0
+    /// ```
+    ///
+    /// So being strict here would refuse to load a config **ksx's own wizard
+    /// wrote**, for an entirely ordinary keyboard, with an error about an
+    /// unrecognised prefix for a value the user never typed.
+    ///
+    /// `ConfigFile::resolve_device` already states the right contract — *a
+    /// literal instance path (contains `\`) passes through unchanged* — and
+    /// this matches it. An unknown prefix with a backslash is an opaque id with
+    /// [`Self::HardwareId`] semantics: byte-exact, case-insensitive, and never
+    /// matching a USB interface, so a half-migrated config stays diagnosable.
+    ///
+    /// Only a spelling with no backslash *and* no known prefix is a parse
+    /// error — that is a typo, not a device.
     pub fn parse(input: &str) -> Result<Self, SelectorParseError> {
         let trimmed = input.trim();
         let bad = |problem: &'static str| SelectorParseError {
@@ -224,7 +246,14 @@ impl DeviceSelector {
         if starts_with_ci(trimmed, "HID\\") {
             return Ok(Self::HardwareId(trimmed.to_uppercase()));
         }
-        Err(bad("it has no recognised prefix"))
+        if trimmed.contains('\\') {
+            // ACPI\…, ROOT\…, BTHENUM\… — an enumerator ksx does not model,
+            // carrying a device it must still be able to name.
+            return Ok(Self::HardwareId(trimmed.to_uppercase()));
+        }
+        Err(bad(
+            "it has no recognised prefix and is not a device path (no `\\`)",
+        ))
     }
 
     fn parse_usb(original: &str, rest: &str) -> Result<Self, SelectorParseError> {
@@ -678,5 +707,40 @@ mod tests {
             assert!(!s.explain().is_empty(), "{text}");
             assert!(!s.rung().is_empty(), "{text}");
         }
+    }
+
+    /// A keyboard that is not on the USB enumerator still has to load.
+    ///
+    /// This is the exact string ksx's own setup wizard commits for a laptop or
+    /// PS/2 keyboard: `ksx_capture::rawinput` normalises the Raw Input device
+    /// name `\\.\ACPI#PNP0303#4&1a2b3c4d&0` to this, and `upsert_device` writes
+    /// it verbatim into `[[device]] id`. Rejecting an unrecognised prefix would
+    /// mean a config ksx itself wrote refuses to load — the user's laptop
+    /// keyboard breaking on upgrade, with an error about a value they never
+    /// typed.
+    #[test]
+    fn an_acpi_keyboard_path_parses_because_ksx_is_what_wrote_it() {
+        let s = sel(r"ACPI\PNP0303\4&1A2B3C4D&0");
+        assert!(
+            matches!(s, DeviceSelector::HardwareId(_)),
+            "an unmodelled enumerator gets opaque, byte-exact semantics: {s:?}"
+        );
+        assert_eq!(
+            s.to_string(),
+            r"ACPI\PNP0303\4&1A2B3C4D&0",
+            "and it must round-trip unchanged, or saving a config rewrites it"
+        );
+    }
+
+    /// Leniency has a floor. A value with no backslash and no known prefix
+    /// cannot name a device on Windows, so it is a typo and saying so at load
+    /// beats a silently-never-matching literal at 2 a.m.
+    #[test]
+    fn a_bare_word_is_still_a_parse_error() {
+        let err = DeviceSelector::parse("my-keyboard").expect_err("not a device");
+        assert!(
+            err.to_string().contains("not a device path"),
+            "the error should point at what is missing: {err}"
+        );
     }
 }

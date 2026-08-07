@@ -101,8 +101,13 @@ pub fn render_status(survey: &Survey) -> String {
         if let Some(kb) = &c.keyboard {
             out.push_str(&format!("    keyboard   : {}\n", kb.instance_id));
         }
-        if c.is_ultimarc() {
-            out.push_str("    note       : Ultimarc (VID D209) — the arcade encoder family\n");
+        // The board's name if ksx knows it, not "the vendor makes encoders".
+        // A SpinTrak is an Ultimarc too, and calling it an arcade encoder is
+        // the same mistake in a different sentence.
+        if let Some((vid, pid)) = c.interface.vid_pid() {
+            if let Some(name) = ksx_core::vendors::name_for(vid, pid) {
+                out.push_str(&format!("    note       : {name}\n"));
+            }
         }
         out.push('\n');
     }
@@ -294,11 +299,21 @@ fn refuse(refusal: &Refusal, json: bool) -> ! {
 
 fn apply_failed(err: &winusb::ApplyError, json: bool) -> ! {
     let hint = err.hint().unwrap_or("");
+    // A driver operation that stops partway leaves the machine in a state the
+    // user did not ask for and cannot see. `recovery()` is the way out, by
+    // hand, with pnputil — printed here because an error the user cannot act
+    // on is the same as no error message at all.
+    let recovery = err.recovery().unwrap_or_default();
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "error": { "code": "pnputil-failed", "message": err.to_string(), "hint": hint }
+                "error": {
+                    "code": "pnputil-failed",
+                    "message": err.to_string(),
+                    "hint": hint,
+                    "recovery": recovery,
+                }
             }))
             .unwrap_or_default()
         );
@@ -306,6 +321,9 @@ fn apply_failed(err: &winusb::ApplyError, json: bool) -> ! {
         eprintln!("FAILED: {err}");
         if !hint.is_empty() {
             eprintln!("\n{hint}");
+        }
+        if !recovery.is_empty() {
+            eprintln!("\n{recovery}");
         }
     }
     std::process::exit(EXIT_APPLY_FAILED);

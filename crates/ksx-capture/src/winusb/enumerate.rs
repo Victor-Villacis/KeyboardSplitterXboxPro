@@ -37,7 +37,13 @@ use crate::hid::INTERFACE_CLASS_HID;
 use crate::regkey::RegKey;
 
 /// Ultimarc's USB vendor id — every I-PAC family board enumerates with it.
-pub const ULTIMARC_VID: u16 = 0xD209;
+///
+/// Re-exported from [`ksx_core::vendors`] rather than spelled again: this
+/// constant used to exist independently in three crates, and each copy grew its
+/// own `is_ultimarc`/`is_ipac` predicate. One of them labelled the SpinTrak
+/// trackball `[I-PAC]`, because a vendor id names a vendor and nothing else.
+/// One table, one place (`docs/DEVICE-IDENTITY.md` §6).
+pub use ksx_core::vendors::ULTIMARC_VID;
 
 /// The service name Microsoft's in-box WinUSB driver registers under.
 pub const WINUSB_SERVICE: &str = "winusb";

@@ -84,7 +84,22 @@ pub const INF_PREFIX: &str = "ksx-winusb-";
 pub const DRIVER_VER: &str = "01/01/2026,1.0.0.0";
 
 /// Ultimarc's USB vendor id — the I-PAC family and the trackball.
-pub const ULTIMARC_VID: u16 = 0xD209;
+///
+/// Re-exported from [`ksx_core::vendors`] rather than spelled again: three
+/// crates each carried their own copy, and each grew its own predicate off it.
+/// See `docs/DEVICE-IDENTITY.md` §6 for why a vendor id may pick a display name
+/// and may not decide anything else.
+pub use ksx_core::vendors::ULTIMARC_VID;
+
+/// The vendor id inside a device instance path, if it carries one.
+///
+/// Used only to decide whether a board-specific *sentence* is worth adding to a
+/// refusal. Nothing branches on the answer.
+fn vendor_of(instance_id: &str) -> Option<u16> {
+    let upper = instance_id.to_ascii_uppercase();
+    let at = upper.find("VID_")? + 4;
+    u16::from_str_radix(&upper[at..].chars().take(4).collect::<String>(), 16).ok()
+}
 
 // ---------------------------------------------------------------------------
 // Device tree
@@ -580,7 +595,7 @@ impl Survey {
                 "claimable": c.state == ClaimState::Claimable,
                 "ksx_device_id": c.ksx_device_id(),
                 "keyboard_instance_id": c.keyboard.as_ref().map(|k| k.instance_id.clone()),
-                "ultimarc": c.is_ultimarc(),
+                "vendor": c.interface.vid_pid().and_then(|(v, p)| ksx_core::vendors::name_for(v, p)),
             })).collect::<Vec<_>>(),
         })
     }
@@ -714,6 +729,29 @@ pub enum Refusal {
          with no way to type"
     )]
     LastKeyboard { instance_id: String },
+    /// The twins case, and the reason it cannot simply be allowed.
+    ///
+    /// A generated INF binds by **hardware id**, and two boards of the same
+    /// model share one (`USB\VID_D209&PID_0430&MI_00` carries no instance or
+    /// port component). So `pnputil /install` would claim every matching
+    /// interface, not the one that was asked for — and the last-keyboard
+    /// refusal, which subtracts a single board, would happily approve it.
+    ///
+    /// Windows offers no INF-level escape: an instance id is not matchable in a
+    /// models section. Binding one twin and not the other needs per-devnode
+    /// installation (SetupAPI `SetupDiSetSelectedDriver` + `DiInstallDevice`),
+    /// which ksx does not do yet. Until it does, this refuses.
+    #[error(
+        "{instance_id} shares the hardware id {hardware_id} with {} other connected \
+         interface(s) — a claim would take all of them",
+        siblings.len()
+    )]
+    SharedHardwareId {
+        instance_id: String,
+        hardware_id: String,
+        /// The other instance ids the same INF would bind.
+        siblings: Vec<String>,
+    },
     #[error("this needs an administrator token; re-run from an elevated prompt")]
     NeedsElevation,
 }
@@ -728,6 +766,7 @@ impl Refusal {
             Refusal::AlreadyClaimed { .. } => "already-claimed",
             Refusal::NotClaimed { .. } => "not-claimed",
             Refusal::LastKeyboard { .. } => "last-keyboard",
+            Refusal::SharedHardwareId { .. } => "shared-hardware-id",
             Refusal::NeedsElevation => "needs-elevation",
         }
     }
@@ -750,11 +789,26 @@ impl Refusal {
                 "be more specific — these all matched:\n  {}",
                 matches.join("\n  ")
             ),
-            Refusal::NotAKeyboard { .. } => {
-                "only the keyboard interface is worth claiming. On an I-PAC that is MI_00; \
-                 MI_01 carries the mouse/system/consumer collections and MI_02 the vendor \
-                 ones, and claiming those would break the trackball for nothing."
-                    .to_owned()
+            // Generic first, board-specific only when we actually recognise the
+            // board. This used to tell every user about I-PAC interface numbers
+            // regardless of what they had plugged in — advice that is wrong for
+            // anyone who does not own the author's encoder, which is everyone
+            // else (`docs/DEVICE-IDENTITY.md` §6).
+            Refusal::NotAKeyboard { instance_id } => {
+                let mut advice = "only the keyboard interface is claimable. A composite board's \
+                                  other interfaces carry its mouse, system/consumer and vendor \
+                                  collections; claiming one of those takes the device off the \
+                                  input stack without giving ksx any keys to read. \
+                                  `ksx winusb status` marks which interface is the keyboard."
+                    .to_owned();
+                if vendor_of(instance_id) == Some(ULTIMARC_VID) {
+                    advice.push_str(
+                        "\n\nOn this board (Ultimarc): the keyboard is MI_00. MI_01 carries the \
+                         mouse/system/consumer collections and MI_02 the vendor ones — claiming \
+                         either would break the trackball for nothing.",
+                    );
+                }
+                advice
             }
             Refusal::AlreadyClaimed { .. } => {
                 "nothing to do. `ksx winusb release <device>` puts it back on the keyboard \
@@ -774,6 +828,19 @@ impl Refusal {
                  cannot do anything at all if ksx is not running. docs/RECOVERY.md §2."
                     .to_owned()
             }
+            Refusal::SharedHardwareId {
+                hardware_id,
+                siblings,
+                ..
+            } => format!(
+                "two boards of the same model are indistinguishable to an INF: the driver \
+                 matches on {hardware_id}, which these also carry, so installing it would \
+                 claim every one of them:\n  {}\n\nUnplug the others and claim this board on \
+                 its own, or keep them on the Interception backend. Telling identical boards \
+                 apart during a claim needs per-device installation, which ksx does not do \
+                 yet — see docs/DEVICE-IDENTITY.md §2.",
+                siblings.join("\n  ")
+            ),
             Refusal::NeedsElevation => {
                 "pnputil changes driver bindings, which needs administrator. ksx never \
                  self-elevates: open an elevated PowerShell and re-run the same command."
@@ -987,6 +1054,35 @@ pub fn plan_claim(survey: &Survey, requested: &str, inf_dir: &Path) -> Result<Cl
             .ok_or_else(|| Refusal::NotAKeyboard {
                 instance_id: candidate.interface.instance_id.clone(),
             })?;
+
+    // An INF binds by hardware id, and a hardware id has no instance or port
+    // component — so `USB\VID_D209&PID_0430&MI_00` names the keyboard interface
+    // of EVERY I-PAC 4X plugged in, not the one that was asked for. Installing
+    // it would claim all of them.
+    //
+    // This has to be checked before the last-keyboard arithmetic below, because
+    // that arithmetic subtracts one board: with two identical boards and no
+    // other keyboard it computes "one left" and approves a claim that takes
+    // both. The refusal that exists to prevent a lockout would authorise one.
+    let siblings: Vec<String> = survey
+        .candidates
+        .iter()
+        .filter(|other| {
+            other.interface.instance_id != candidate.interface.instance_id
+                && other
+                    .interface
+                    .usb_hardware_id()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(&hardware_id))
+        })
+        .map(|other| other.interface.instance_id.clone())
+        .collect();
+    if !siblings.is_empty() {
+        return Err(Refusal::SharedHardwareId {
+            instance_id: candidate.interface.instance_id.clone(),
+            hardware_id,
+            siblings,
+        });
+    }
 
     // What a claim actually costs you is the whole **board**, not the one node
     // hanging off this interface: the other interfaces and collections of the
@@ -1368,6 +1464,20 @@ pub enum ApplyError {
         code: i32,
         output: String,
     },
+    /// Stopped a release BEFORE the rescan, because finishing it would have
+    /// re-claimed the board.
+    ///
+    /// The release order is: remove the devnode, delete the ksx INF from the
+    /// driver store, rescan. That middle step is not optional — the generated
+    /// INF matches on hardware id and outranks the in-box `input.inf`, so a
+    /// rescan performed while it is still in the store binds WinUSB straight
+    /// back on. If ksx cannot confirm the INF is gone, rescanning would undo
+    /// the release and report success for it.
+    #[error(
+        "released the devnode but could not confirm the ksx INF is out of the driver store \
+         ({reason}) — stopping before the rescan, because a rescan now could re-claim the board"
+    )]
+    ReleaseUnconfirmed { reason: String, instance_id: String },
 }
 
 impl ApplyError {
@@ -1388,6 +1498,36 @@ impl ApplyError {
             return Some("run from an elevated prompt: pnputil needs an administrator token.");
         }
         None
+    }
+
+    /// What the machine looks like right now, and how to finish by hand.
+    ///
+    /// A release that stops partway leaves a devnode removed and a board that
+    /// is neither claimed nor a keyboard until something rescans — which is
+    /// exactly the moment a user needs instructions rather than a stack trace.
+    pub fn recovery(&self) -> Option<String> {
+        match self {
+            ApplyError::ReleaseUnconfirmed { instance_id, .. } => Some(format!(
+                concat!(
+                    "The devnode was removed, so the board is currently bound to nothing. ",
+                    "To finish by hand from an elevated prompt:\n",
+                    "\n  pnputil /enum-drivers    # find the ksx oemNN.inf",
+                    "\n  pnputil /delete-driver oemNN.inf /uninstall /force",
+                    "\n  pnputil /scan-devices    # the keyboard driver binds again\n",
+                    "\nIf you rescan WITHOUT deleting the INF, {} goes straight back to ",
+                    "WinUSB. docs/RECOVERY.md §2.",
+                ),
+                instance_id
+            )),
+            ApplyError::Failed { .. } => Some(
+                "A release that failed partway may have removed the devnode already. \
+                 `pnputil /scan-devices` from an elevated prompt re-enumerates; if the board \
+                 comes back on winusb.sys rather than the keyboard driver, the ksx INF is \
+                 still in the store — see docs/RECOVERY.md §2."
+                    .to_owned(),
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -1445,35 +1585,88 @@ pub fn apply_claim(plan: &ClaimPlan) -> Result<Vec<String>, ApplyError> {
     plan.commands.iter().map(run_command).collect()
 }
 
+/// What `/enum-drivers` was able to say about the ksx INF.
+///
+/// The distinction is the whole point. "Not in the store" and "I could not find
+/// out" both used to arrive as `None`, and both then skipped the delete and
+/// rescanned — but only one of them is safe to rescan after.
+enum OemLookup {
+    /// Published as this `oemNN.inf`; delete it.
+    Published(String),
+    /// `/enum-drivers` answered and the ksx INF is not there. Nothing to
+    /// delete, and a rescan will bind the keyboard driver. This is the good
+    /// case, including a second `release` of a board already released.
+    NotInStore,
+    /// `/enum-drivers` could not be run or could not be read. We do not know
+    /// whether the INF is still in the store, so we must not rescan.
+    Unknown(String),
+}
+
 /// Run the release commands, resolving `<oemNN.inf>` from the live driver store
-/// on the way past. Steps whose oem name cannot be resolved are skipped with a
-/// note rather than run with a placeholder.
+/// on the way past.
+///
+/// # Why this refuses to finish rather than pushing on
+///
+/// The sequence is: remove the devnode, delete the ksx INF, rescan. The middle
+/// step is marked REQUIRED in [`release_commands`] for a concrete reason — the
+/// generated INF matches on hardware id and outranks the in-box `input.inf`, so
+/// a rescan while it is still in the driver store binds WinUSB straight back
+/// on.
+///
+/// This function used to swallow a failed `/enum-drivers` with `.ok()?`, treat
+/// it as "no INF found", skip the delete with a log line, run the rescan
+/// anyway, and return `Ok`. The rescan re-claimed the board; ksx reported the
+/// release succeeded. The user is then told their keyboard is back while it is
+/// still off the input stack — the single worst thing this module can say,
+/// because the whole point of `release` is being able to trust it.
 pub fn apply_release(plan: &ReleasePlan) -> Result<Vec<String>, ApplyError> {
     let mut log = Vec::new();
-    let oem = plan.inf_file.as_deref().and_then(|inf| {
-        let listing = run_command(&PlannedCommand::pnputil(&["/enum-drivers"], "")).ok()?;
-        let drivers = parse_enum_drivers(&listing);
-        store_drivers_matching(&drivers, inf)
-            .first()
-            .map(|d| d.published_name.clone())
-    });
+    let oem = match plan.inf_file.as_deref() {
+        None => OemLookup::NotInStore,
+        Some(inf) => match run_command(&PlannedCommand::pnputil(&["/enum-drivers"], "")) {
+            Err(err) => OemLookup::Unknown(format!("pnputil /enum-drivers failed: {err}")),
+            Ok(listing) => {
+                let drivers = parse_enum_drivers(&listing);
+                match store_drivers_matching(&drivers, inf).first() {
+                    Some(found) => OemLookup::Published(found.published_name.clone()),
+                    None if drivers.is_empty() => OemLookup::Unknown(
+                        "pnputil /enum-drivers listed no drivers at all, which is not a state \
+                         Windows reports for a working machine — the output could not be read"
+                            .to_owned(),
+                    ),
+                    None => OemLookup::NotInStore,
+                }
+            }
+        },
+    };
 
     for cmd in &plan.commands {
         if cmd.args.first().map(String::as_str) == Some("/enum-drivers") {
             continue; // already done above
         }
         if cmd.args.iter().any(|a| a == "<oemNN.inf>") {
-            let Some(oem) = &oem else {
-                log.push(
-                    "skipped /delete-driver: no matching ksx INF is in the driver store".to_owned(),
-                );
-                continue;
-            };
-            let resolved = PlannedCommand::pnputil(
-                &["/delete-driver", oem, "/uninstall", "/force"],
-                "remove the ksx INF so a rescan cannot re-bind WinUSB",
-            );
-            log.push(run_command(&resolved)?);
+            match &oem {
+                OemLookup::Published(oem) => {
+                    let resolved = PlannedCommand::pnputil(
+                        &["/delete-driver", oem, "/uninstall", "/force"],
+                        "remove the ksx INF so a rescan cannot re-bind WinUSB",
+                    );
+                    log.push(run_command(&resolved)?);
+                }
+                OemLookup::NotInStore => log.push(
+                    "nothing to delete: the ksx INF is not in the driver store, so a rescan \
+                     binds the keyboard driver"
+                        .to_owned(),
+                ),
+                // Stop here, with the devnode already removed. Continuing would
+                // run the rescan, and a rescan is exactly what re-claims.
+                OemLookup::Unknown(reason) => {
+                    return Err(ApplyError::ReleaseUnconfirmed {
+                        reason: reason.clone(),
+                        instance_id: plan.instance_id.clone(),
+                    })
+                }
+            }
             continue;
         }
         log.push(run_command(cmd)?);
@@ -1933,6 +2126,135 @@ mod tests {
             3,
             "two I-PACs and the spare are three keyboards, not one model"
         );
+    }
+
+    /// The release order is load-bearing, and the plan says so.
+    ///
+    /// `/delete-driver` sits between removing the devnode and rescanning
+    /// because the ksx INF outranks the in-box `input.inf` on the same hardware
+    /// id: rescan with it still in the store and WinUSB binds straight back on.
+    /// This pins the order so a future edit cannot quietly reorder the step
+    /// that makes the release stick.
+    #[test]
+    fn the_ksx_inf_is_deleted_before_the_rescan_not_after() {
+        let commands = release_commands(
+            r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000",
+            Some("ksx-usb-vid_d209-pid_0430-mi_00.inf"),
+        );
+        let verbs: Vec<&str> = commands
+            .iter()
+            .filter_map(|c| c.args.first().map(String::as_str))
+            .collect();
+        assert_eq!(
+            verbs,
+            vec![
+                "/remove-device",
+                "/enum-drivers",
+                "/delete-driver",
+                "/scan-devices"
+            ],
+            "a rescan before the INF is deleted re-claims the board"
+        );
+    }
+
+    /// The recovery text is part of the contract, not decoration: this error
+    /// only happens with the devnode already removed, so the user is holding a
+    /// board bound to nothing and needs the three commands that finish the job.
+    #[test]
+    fn an_unconfirmed_release_says_what_state_the_machine_is_in() {
+        let err = ApplyError::ReleaseUnconfirmed {
+            reason: "pnputil /enum-drivers failed: access denied".to_owned(),
+            instance_id: r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000".to_owned(),
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("stopping before the rescan"),
+            "say that it stopped, and where: {message}"
+        );
+        let recovery = err.recovery().expect("this error must carry a way out");
+        assert!(recovery.contains("/delete-driver"), "{recovery}");
+        assert!(recovery.contains("/scan-devices"), "{recovery}");
+        assert!(
+            recovery.contains("goes straight back to WinUSB"),
+            "the user must be told why the order matters: {recovery}"
+        );
+    }
+
+    /// Add a second I-PAC and a claim must refuse, because the INF it would
+    /// generate cannot tell the two apart.
+    ///
+    /// This is the shape that made the bug invisible: the last-keyboard
+    /// refusal is correct *about boards* — subtract this board and one is
+    /// left — while the artifact it approves is scoped to the hardware id,
+    /// which both boards carry. The safety check and the thing it authorises
+    /// were talking about different objects, so the answer was "you still have
+    /// a keyboard" about a command that would take every keyboard on the
+    /// machine.
+    #[test]
+    fn a_second_identical_board_refuses_the_claim_rather_than_taking_both() {
+        let mut tree = healthy_cabinet_tree();
+        // A second I-PAC 4X, same model, different port.
+        tree.push(live(node(
+            r"USB\VID_D209&PID_0430\9",
+            COMPOSITE_CLASS,
+            "usbccgp",
+            "@usb.inf,%usb\\composite.devicedesc%;USB Composite Device",
+            Some("7&99999999&0"),
+        )));
+        tree.push(live(node(
+            r"USB\VID_D209&PID_0430&MI_00\7&99999999&0&0000",
+            HID_CLASS,
+            "HidUsb",
+            "@input.inf,%hid.devicedesc%;USB Input Device",
+            Some("8&deadbeef&0"),
+        )));
+        tree.push(keyboard_node(
+            r"HID\VID_D209&PID_0430&MI_00\8&deadbeef&0&0000",
+        ));
+
+        let survey = Survey::from_nodes(&tree);
+        let err = plan_claim(
+            &survey,
+            r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000",
+            Path::new(r"C:\tmp"),
+        )
+        .expect_err("a claim that would take both boards must refuse");
+
+        assert_eq!(err.code(), "shared-hardware-id");
+        let Refusal::SharedHardwareId {
+            hardware_id,
+            siblings,
+            ..
+        } = &err
+        else {
+            panic!("expected SharedHardwareId, got {err:?}");
+        };
+        assert_eq!(hardware_id, r"USB\VID_D209&PID_0430&MI_00");
+        assert_eq!(
+            siblings,
+            &[r"USB\VID_D209&PID_0430&MI_00\7&99999999&0&0000".to_owned()],
+            "the refusal must name the board that would also be taken"
+        );
+        assert!(
+            err.advice().contains("claim this board on its own"),
+            "a refusal with no way forward is just an error message: {}",
+            err.advice()
+        );
+    }
+
+    /// The single-board case — the 99% one — must keep working exactly as it
+    /// did. The guard above is about *twins*, and a board's own MI_01/MI_02
+    /// carry different hardware ids, so they must not trip it.
+    #[test]
+    fn one_board_of_its_model_still_claims_cleanly() {
+        let survey = Survey::from_nodes(&healthy_cabinet_tree());
+        let plan = plan_claim(
+            &survey,
+            r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000",
+            Path::new(r"C:\tmp"),
+        )
+        .expect("one I-PAC plus a spare keyboard is a legal claim");
+        assert_eq!(plan.hardware_id, r"USB\VID_D209&PID_0430&MI_00");
     }
 
     /// A keyboard whose interface is **already bound to `winusb.sys`** is not a
@@ -2426,7 +2748,9 @@ Anbietername:           ksx
         assert_eq!(ipac["vid"], "D209");
         assert_eq!(ipac["pid"], "0430");
         assert_eq!(ipac["interface"], 0);
-        assert_eq!(ipac["ultimarc"], true);
+        // Was `"ultimarc": bool` — a yes/no about one vendor. The board's name
+        // says strictly more, and says something different for the SpinTrak.
+        assert_eq!(ipac["vendor"], "Ultimarc I-PAC 4X");
         assert_eq!(
             ipac["ksx_device_id"],
             r"HID\VID_D209&PID_0430&MI_00\8&2a0d0500&0&0000"

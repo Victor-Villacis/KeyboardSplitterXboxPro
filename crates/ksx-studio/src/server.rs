@@ -150,6 +150,15 @@ pub fn serve(
             .route("/favicon.ico", get(favicon_ico))
             .route("/favicon.svg", get(favicon_svg))
             .route("/apple-touch-icon.png", get(apple_touch_icon))
+            // ONE layer over every route, not a check per handler. The routes
+            // above arrived in three separate milestones and the mapper alone
+            // contributed eight form endpoints; a guard you have to remember to
+            // add to each new one is a guard that will be missing from the
+            // ninth. See `crate::guard` for what this refuses and why an
+            // absent `Origin` is deliberately allowed through.
+            .layer(axum::middleware::from_fn(move |req, next| {
+                crate::guard::same_origin(bind, req, next)
+            }))
             .with_state(state);
         tracing::info!(%bind, "ksx Studio listening");
         axum::serve(listener, app).await.map_err(StudioError::Serve)
@@ -234,9 +243,13 @@ async fn status_page(
 
 /// The island poller's endpoint: the SAME [`StatusPayload`] shape the page
 /// embeds as island props (parity unit-tested in render.rs). `flash` is
-/// always null here — a poll is not an action. Loopback bind + no CORS
-/// headers keep it same-origin; the page's `connect-src 'self'` is what
-/// allows the fetch.
+/// always null here — a poll is not an action.
+///
+/// A loopback bind and no CORS headers keep this response body private from a
+/// cross-origin `fetch`, and the page's `connect-src 'self'` is what allows its
+/// own. Note what that does NOT cover: a cross-origin form POST needs no CORS
+/// permission at all, and a rebound DNS name is same-origin by the browser's
+/// reckoning. Both are handled in [`crate::guard`], not here.
 async fn api_status(State(state): State<Arc<AppState>>) -> Response {
     let (snapshot, session) = collect(&state).await;
     (

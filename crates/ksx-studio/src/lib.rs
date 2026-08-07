@@ -84,6 +84,7 @@
 
 mod control;
 mod error;
+mod guard;
 mod render;
 mod render_map;
 mod server;

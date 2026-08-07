@@ -1346,3 +1346,107 @@ fn a_refused_action_comes_back_as_an_error_flash_never_silence() {
         "{page}"
     );
 }
+
+/// The attack this guard exists to stop, executed over a real socket.
+///
+/// A page on another site cannot read ksx's responses — but it never needed to.
+/// A cross-origin `<form method="post">` is a CORS *simple request*: no
+/// preflight, no permission, and the side effect lands before anyone could
+/// object. `/map/preset/clear-all` wipes a preset; `/map/session/stop` ends a
+/// game. The port is 4460 and is not a secret.
+///
+/// So this posts exactly what `evil.example` would post, byte for byte, and
+/// requires that the scripted control never sees it.
+#[test]
+fn a_cross_site_form_post_is_refused_before_it_reaches_the_control() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control.clone());
+
+    for path in [
+        "/map/preset/clear-all",
+        "/map/session/stop",
+        "/session/stop",
+        "/map/clear",
+    ] {
+        let body = "preset=IPAC+P1&slot=1";
+        let response = http(
+            addr,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Origin: https://evil.example\r\nConnection: close\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "{path} must refuse a cross-site write, got: {response}"
+        );
+        assert!(
+            response.contains("refused a request from another site"),
+            "the refusal must say what happened: {response}"
+        );
+    }
+
+    // Not "it returned 403" — that the write never happened. A refusal that
+    // still performed the write would pass a status-code assertion and fail
+    // the user, so assert on what the control surface actually recorded.
+    assert!(
+        control.cleared.lock().unwrap().is_none(),
+        "clear-all must not have run"
+    );
+    assert!(
+        control.bound_with.lock().unwrap().is_none(),
+        "no cross-site request may reach the control surface"
+    );
+}
+
+/// The same routes, from ksx Studio's own page, still work.
+///
+/// A guard that also blocks the real UI is not a fix, and this is the assertion
+/// that would fail if the origin comparison were tightened past correctness.
+#[test]
+fn the_pages_own_origin_still_writes() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control.clone());
+
+    let body = "slot=1&function=A";
+    let response = http(
+        addr,
+        &format!(
+            "POST /map/clear HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+             Origin: http://127.0.0.1:{port}\r\nConnection: close\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {len}\r\n\r\n{body}",
+            port = addr.port(),
+            len = body.len(),
+        ),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 303"),
+        "Studio's own form must still post: {response}"
+    );
+    assert!(
+        control.bound_with.lock().unwrap().is_some(),
+        "the write must actually have reached the control surface"
+    );
+}
+
+/// DNS rebinding: the packet really does arrive on 127.0.0.1, so the bind
+/// cannot tell. Only the name the browser asked for can, and a rebound request
+/// carries the attacker's.
+#[test]
+fn a_rebound_host_cannot_even_read() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+
+    let response = http(
+        addr,
+        "GET /api/map HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 421"),
+        "a rebound read must be refused, got: {response}"
+    );
+}

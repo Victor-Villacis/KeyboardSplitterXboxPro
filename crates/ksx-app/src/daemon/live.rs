@@ -145,7 +145,7 @@ impl SessionRunner for LiveRunner {
         stop: Arc<AtomicBool>,
         out: &mut dyn Write,
     ) -> anyhow::Result<SessionSummary> {
-        use crate::run::supervisor::{self, RunOptions, SessionHook, Wiring};
+        use crate::run::supervisor::{self, SessionHook, Wiring};
         use ksx_output::{RoutedBackend, VigemBackend};
 
         // Same persona → backend routing as `ksx run`, from the same
@@ -177,22 +177,7 @@ impl SessionRunner for LiveRunner {
             )),
             None => Box::new(supervisor::NoHook),
         };
-        let mut options = RunOptions {
-            beep: true,
-            // The daemon's own latch (tray Stop, Quit, Reload) is the only stop
-            // source. `ctrl_c::requested()` deliberately is NOT consulted: it is
-            // a process-lifetime latch ("stays true once tripped" — see
-            // ctrl_c.rs) and a daemon runs many sessions, so honouring it would
-            // make the first Ctrl+C end every future session ~50 ms after start,
-            // forever. `daemon::run` never installs the handler either, so
-            // Ctrl+C takes the default action and ends the process.
-            stop: Box::new(move || stop.load(Ordering::SeqCst)),
-            hook,
-            // The live fan-out. Free while nobody is subscribed, which is
-            // every session on a cabinet with no window open (`crate::feed`).
-            feed: self.feed.clone(),
-            ..RunOptions::default()
-        };
+        let mut options = Self::run_options(&self.swap, &self.feed, stop, hook);
         let outcome = supervisor::supervise(
             &self.plan,
             Wiring {
@@ -220,5 +205,97 @@ impl SessionRunner for LiveRunner {
         _out: &mut dyn Write,
     ) -> anyhow::Result<SessionSummary> {
         anyhow::bail!("`ksx daemon` drives Windows kernel drivers and is Windows-only")
+    }
+}
+
+impl LiveRunner {
+    /// Everything `supervise` needs that is neither the plan nor the wiring.
+    ///
+    /// A free-standing constructor rather than a struct literal inside `run`,
+    /// and `swap` a **required parameter** rather than a field read, because
+    /// that field is what went wrong: `run` built its options with
+    /// `..RunOptions::default()` and never named `hot_swap`, so the default —
+    /// documented as "a slot nobody reads", which is right for `ksx run` and
+    /// wrong for a daemon — quietly won. The session then published its engine
+    /// handle into a slot the control loop was not holding, and every binding
+    /// edit that should have swapped tables under a live engine fell back to
+    /// the three-second stall and full pad bounce instead.
+    ///
+    /// Nothing failed. No test noticed, because the tests hand a slot to the
+    /// supervisor directly and never go through this path. Passing it as an
+    /// argument is what makes forgetting it a compile error next time.
+    #[cfg(windows)]
+    fn run_options(
+        swap: &crate::run::supervisor::HotSwapSlot,
+        feed: &crate::feed::LiveSink,
+        stop: Arc<AtomicBool>,
+        hook: Box<dyn crate::run::supervisor::SessionHook>,
+    ) -> crate::run::supervisor::RunOptions {
+        use crate::run::supervisor::RunOptions;
+        RunOptions {
+            beep: true,
+            // The daemon's own latch (tray Stop, Quit, Reload) is the only stop
+            // source. `ctrl_c::requested()` deliberately is NOT consulted: it is
+            // a process-lifetime latch ("stays true once tripped" — see
+            // ctrl_c.rs) and a daemon runs many sessions, so honouring it would
+            // make the first Ctrl+C end every future session ~50 ms after start,
+            // forever. `daemon::run` never installs the handler either, so
+            // Ctrl+C takes the default action and ends the process.
+            stop: Box::new(move || stop.load(Ordering::SeqCst)),
+            hook,
+            // The live fan-out. Free while nobody is subscribed, which is
+            // every session on a cabinet with no window open (`crate::feed`).
+            feed: feed.clone(),
+            // THE ONE THAT WAS MISSING. `hot_swap_slot()` hands this same slot
+            // to the control loop before the runner moves onto its own thread;
+            // `supervise` publishes the engine's handle into whatever is here.
+            // They have to be the same slot or the handshake has two ends and
+            // no middle.
+            hot_swap: swap.clone(),
+            ..RunOptions::default()
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use crate::run::supervisor::{HotSwapSlot, NoHook};
+
+    /// The handshake has two ends; this asserts they are the same slot.
+    ///
+    /// The bug this pins was invisible to every existing test, because the
+    /// tests hand a `HotSwapSlot` to `supervise` directly and never build a
+    /// daemon session's options. So the assertion has to be about *identity* —
+    /// `Arc::ptr_eq`, not "a slot exists" — since a defaulted slot is a
+    /// perfectly good `HotSwapSlot` that simply nobody is listening to.
+    #[test]
+    fn the_daemons_session_publishes_into_the_slot_the_control_loop_holds() {
+        let swap = HotSwapSlot::default();
+        let options = LiveRunner::run_options(
+            &swap,
+            &crate::feed::LiveSink::default(),
+            Arc::new(AtomicBool::new(false)),
+            Box::new(NoHook),
+        );
+        assert!(
+            options.hot_swap.is_same_slot(&swap),
+            "the session must publish its engine handle into the control loop's own slot; \
+             a fresh one type-checks and silently disables binding hot-swap"
+        );
+    }
+
+    /// Guard the shape, not just this instance: `RunOptions` is built with
+    /// `..RunOptions::default()`, so any field that is both defaultable and
+    /// load-bearing can be dropped by omission and nothing will complain. The
+    /// default slot is deliberately inert, which is correct for `ksx run` and
+    /// exactly what made the daemon's version look fine.
+    #[test]
+    fn a_defaulted_slot_is_not_the_control_loops_slot() {
+        let swap = HotSwapSlot::default();
+        assert!(
+            !HotSwapSlot::default().is_same_slot(&swap),
+            "two default slots must not compare equal, or the test above proves nothing"
+        );
     }
 }
