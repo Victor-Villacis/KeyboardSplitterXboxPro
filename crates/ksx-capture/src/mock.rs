@@ -13,7 +13,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use ksx_core::{DeviceId, KeyEvent};
 
 use crate::backend::{CaptureBackend, CaptureCtl, DeviceInfo, ExitReason};
-use crate::decision::{key_event, should_resend, CaptureSet};
+use crate::decision::{key_event, should_resend, CaptureSet, Take};
 use crate::escape::{EscapeHandle, EscapeWatch};
 use crate::health::HealthHandle;
 use crate::presence::PresenceHandle;
@@ -203,6 +203,13 @@ impl CaptureBackend for MockCaptureBackend {
                             CaptureCtl::SetCaptured(ids) => {
                                 set = CaptureSet::capturing(ids);
                                 watchdog_passthrough = false;
+                                if wd.tripped() {
+                                    wd = Watchdog::default();
+                                }
+                            }
+                            CaptureCtl::SetCapturedWith(takes) => {
+                                set = CaptureSet::capturing_with(takes);
+                                watchdog_passthrough = false;
                                 // Mirror the real backend: re-enabling capture
                                 // re-arms a tripped watchdog so the stall
                                 // protection can fire again (health flag stays
@@ -227,7 +234,18 @@ impl CaptureBackend for MockCaptureBackend {
 
                     let passthrough =
                         set.passthrough || watchdog_passthrough || escapes.passthrough();
-                    if should_resend(passthrough, set.contains(device)) {
+                    // Per-KEY, mirroring the real backend: `contains` answers
+                    // "is this device bound to a slot", which is not the same
+                    // question once a device can be taken by bound keys only.
+                    // `suppresses` reads `set.passthrough` itself, so ask it
+                    // about membership and let `should_resend` fold in the
+                    // watchdog and escape latches the mock adds on top.
+                    let suppressed = set.contains(device)
+                        && match set.take_for(device).cloned().unwrap_or_default() {
+                            Take::Whole => true,
+                            Take::BoundKeys(keys) => keys.contains(event.key),
+                        };
+                    if should_resend(passthrough, suppressed) {
                         resent
                             .lock()
                             .expect("resent log poisoned")
@@ -686,5 +704,102 @@ mod tests {
         let handle = Box::new(backend).run(tx, ctl_rx).unwrap();
         drop(ctl_tx);
         assert_eq!(handle.join().unwrap(), ExitReason::ScriptExhausted);
+    }
+
+    /// The desk-keyboard case, driven through a whole backend loop.
+    ///
+    /// One keyboard, `W` bound and `Enter` not. `W` must reach the engine
+    /// WITHOUT reaching Windows (it drives a pad); `Enter` must reach both
+    /// (it is still a key). Before `Take::BoundKeys` the second half was
+    /// impossible: capturing the device swallowed everything, so splitting a
+    /// desk keyboard into pads cost the user their keyboard.
+    #[test]
+    fn a_partially_taken_keyboard_drives_pads_and_still_types() {
+        const W: u16 = 17;
+        const ENTER: u16 = 28;
+        let script = vec![
+            MockStroke {
+                device: 0,
+                code: W,
+                state: KEY_DOWN,
+            },
+            MockStroke {
+                device: 0,
+                code: ENTER,
+                state: KEY_DOWN,
+            },
+        ];
+        let backend = MockCaptureBackend::new(two_keyboards(), script);
+        let resent = backend.resent_log();
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let (ctl_tx, ctl_rx) = crossbeam_channel::unbounded();
+
+        // Take only what the preset binds.
+        ctl_tx
+            .send(CaptureCtl::SetCapturedWith(vec![(
+                DeviceId::from(IPAC),
+                Take::BoundKeys([Key::W].into_iter().collect()),
+            )]))
+            .unwrap();
+
+        let handle = Box::new(backend).run(tx, ctl_rx).unwrap();
+        let events: Vec<KeyEvent> = rx.iter().take(2).collect();
+        ctl_tx.send(CaptureCtl::Shutdown).unwrap();
+        assert_eq!(handle.join().unwrap(), ExitReason::Shutdown);
+
+        // The engine sees BOTH — it always does; suppression is about Windows.
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].key, Key::W);
+        assert_eq!(events[1].key, Key::Enter);
+
+        // Windows sees only the unbound one.
+        let resent = resent.lock().unwrap();
+        assert_eq!(
+            resent.len(),
+            1,
+            "exactly one stroke should have reached the OS, got {resent:?}"
+        );
+        assert_eq!(
+            resent[0].code, ENTER,
+            "the bound key drives the pad and must not type; the unbound one must"
+        );
+    }
+
+    /// The cabinet, unchanged: a whole take still swallows an unbound key.
+    /// This is the compatibility half — the same script, the same device, the
+    /// other `Take`, and the opposite outcome.
+    #[test]
+    fn a_wholly_taken_keyboard_still_swallows_everything() {
+        let script = vec![
+            MockStroke {
+                device: 0,
+                code: 17,
+                state: KEY_DOWN,
+            },
+            MockStroke {
+                device: 0,
+                code: 28,
+                state: KEY_DOWN,
+            },
+        ];
+        let backend = MockCaptureBackend::new(two_keyboards(), script);
+        let resent = backend.resent_log();
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let (ctl_tx, ctl_rx) = crossbeam_channel::unbounded();
+
+        ctl_tx
+            .send(CaptureCtl::SetCaptured(vec![DeviceId::from(IPAC)]))
+            .unwrap();
+
+        let handle = Box::new(backend).run(tx, ctl_rx).unwrap();
+        let events: Vec<KeyEvent> = rx.iter().take(2).collect();
+        ctl_tx.send(CaptureCtl::Shutdown).unwrap();
+        assert_eq!(handle.join().unwrap(), ExitReason::Shutdown);
+
+        assert_eq!(events.len(), 2, "the engine still sees everything");
+        assert!(
+            resent.lock().unwrap().is_empty(),
+            "an I-PAC is not a typing keyboard: nothing reaches Windows"
+        );
     }
 }

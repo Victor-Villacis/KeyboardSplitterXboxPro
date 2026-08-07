@@ -71,7 +71,10 @@ enum CtlKind {
 impl CtlKind {
     fn of(message: &CaptureCtl) -> Self {
         match message {
-            CaptureCtl::SetCaptured(_) => CtlKind::Captured,
+            // Both spellings are "capture is on"; the teardown-order traces
+            // these tests assert care about WHEN capture starts and stops, not
+            // how much of each device it takes.
+            CaptureCtl::SetCaptured(_) | CaptureCtl::SetCapturedWith(_) => CtlKind::Captured,
             CaptureCtl::SetPassthrough => CtlKind::Passthrough,
             CaptureCtl::Shutdown => CtlKind::Shutdown,
         }

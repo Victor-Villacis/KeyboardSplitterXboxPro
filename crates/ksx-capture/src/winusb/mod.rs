@@ -485,10 +485,12 @@ fn capture_loop(
     loop {
         loop {
             match ctl.try_recv() {
+                // A WinUSB-claimed board is already OFF the input stack, so
+                // there is nothing to suppress and `Take` has no meaning here:
+                // "captured" means "stop typethrough re-injecting its
+                // keystrokes". Both spellings answer the same question —
+                // is this board bound to a slot.
                 Ok(CaptureCtl::SetCaptured(ids)) => {
-                    // "Captured" here means "do NOT inject": the OS already
-                    // cannot see this device, so binding it to a slot simply
-                    // stops us handing its keystrokes on.
                     captured = ids.iter().any(|id| id == &info.id);
                     ctl_passthrough = false;
                     watchdog_passthrough = false;
@@ -499,6 +501,14 @@ fn capture_loop(
                     // rule as the Interception backend: a supervisor mirroring
                     // its own stale state must never re-capture boards a
                     // `LeftCtrl x5` just freed.
+                }
+                Ok(CaptureCtl::SetCapturedWith(takes)) => {
+                    captured = takes.iter().any(|(id, _)| id == &info.id);
+                    ctl_passthrough = false;
+                    watchdog_passthrough = false;
+                    if wd.tripped() {
+                        wd = Watchdog::default();
+                    }
                 }
                 Ok(CaptureCtl::SetPassthrough) => ctl_passthrough = true,
                 Ok(CaptureCtl::Shutdown) => return ExitReason::Shutdown,

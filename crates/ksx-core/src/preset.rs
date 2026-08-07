@@ -316,6 +316,47 @@ impl Preset {
     pub const DEFAULT_NAME: &'static str = "default";
     pub const EMPTY_NAME: &'static str = "empty";
 
+    /// Every key this preset reacts to, in any way.
+    ///
+    /// The set a capture backend suppresses when it is told to take only the
+    /// bound keys of a device (`ksx_capture::Take::BoundKeys`) — so someone
+    /// splitting one desk keyboard into two pads keeps typing with everything
+    /// this does NOT return.
+    ///
+    /// "Reacts to" is deliberately broad, and each inclusion is a key that
+    /// would otherwise leak into the focused window at the exact moment it is
+    /// doing something in a game:
+    ///
+    /// - **entries** — the plain bindings.
+    /// - **chord triggers, `when` AND `unless`** — all three are read while a
+    ///   chord is live. A `when` key is held down for the whole chord; letting
+    ///   it type would spray that character for as long as the player holds it.
+    ///   An `unless` key is stranger but the same: it is *checked*, so pressing
+    ///   it changes what the pad does, and a key that changes game behaviour
+    ///   must not also type.
+    /// - **macro triggers** — a macro key starts a timed sequence.
+    /// - **turbo** is deliberately absent: turbo is keyed by the ENDPOINT it
+    ///   auto-fires, not by a key, so it contributes no key of its own. The
+    ///   key that drives a turbo'd endpoint is already an entry or a chord.
+    ///
+    /// [`Key::None`] is excluded throughout: it is the inert-placeholder
+    /// spelling ("function present, unbound"), not a key anybody can press.
+    /// Including it would suppress nothing but would make an all-placeholder
+    /// preset look like it binds something.
+    pub fn bound_keys(&self) -> impl Iterator<Item = Key> + '_ {
+        let entries = self.entries.iter().map(|(key, _)| *key);
+        let chords = self.chords.iter().flat_map(|chord| {
+            std::iter::once(chord.key)
+                .chain(chord.when.iter().copied())
+                .chain(chord.unless.iter().copied())
+        });
+        let macros = self.macros.triggers.iter().map(|trigger| trigger.key);
+        entries
+            .chain(chords)
+            .chain(macros)
+            .filter(|key| *key != Key::None)
+    }
+
     /// The turbo row for `binding`, if it auto-fires.
     ///
     /// One row per endpoint by construction (the file is keyed by function), so
@@ -614,5 +655,67 @@ mod tests {
         assert_eq!(builtins[0].name, Preset::DEFAULT_NAME);
         assert_eq!(builtins[1].name, Preset::EMPTY_NAME);
         assert!(builtins.iter().all(|p| p.protected));
+    }
+
+    /// `bound_keys` decides which keys a desk keyboard STOPS typing, so every
+    /// key it misses is a key that types into the focused window while it is
+    /// also driving a pad — and every key it adds needlessly is one the user
+    /// loses for no reason.
+    #[test]
+    fn bound_keys_covers_entries_chords_and_macro_triggers() {
+        use crate::macros::MacroTrigger;
+
+        let mut preset = Preset::builtin_empty();
+        preset.entries = vec![
+            (Key::W, Binding::Button(XButton::A)),
+            // The inert-placeholder spelling: a function present but unbound.
+            // Nobody can press it.
+            (Key::None, Binding::Button(XButton::B)),
+        ];
+        preset.chords = vec![Chord {
+            key: Key::K,
+            binding: Binding::Button(XButton::X),
+            when: vec![Key::LeftShift],
+            unless: vec![Key::LeftAlt],
+        }];
+        preset.macros.triggers = vec![MacroTrigger {
+            key: Key::Numpad7,
+            index: 0,
+        }];
+
+        let keys: Vec<Key> = preset.bound_keys().collect();
+
+        assert!(keys.contains(&Key::W), "a plain binding");
+        assert!(keys.contains(&Key::K), "a chord trigger");
+        assert!(
+            keys.contains(&Key::LeftShift),
+            "a `when` key is HELD for the chord's whole life — letting it type \
+             would spray that character the entire time"
+        );
+        assert!(
+            keys.contains(&Key::LeftAlt),
+            "an `unless` key is read, so pressing it changes what the pad does; \
+             a key that changes game behaviour must not also type"
+        );
+        assert!(keys.contains(&Key::Numpad7), "a macro trigger");
+        assert!(
+            !keys.contains(&Key::None),
+            "Key::None is the unbound placeholder, not a key anyone can press"
+        );
+
+        // And the keys a user keeps.
+        for free in [Key::Enter, Key::Escape, Key::Q] {
+            assert!(!keys.contains(&free), "{free:?} must still type");
+        }
+    }
+
+    /// The builtin EMPTY preset is every function present and every key
+    /// `Key::None`. It must bind nothing — so pointing `Take::BoundKeys` at a
+    /// slot nobody has mapped yet cannot silently eat a keyboard.
+    #[test]
+    fn the_empty_preset_binds_no_keys_despite_having_every_row() {
+        let empty = Preset::builtin_empty();
+        assert!(!empty.entries.is_empty(), "it does have rows");
+        assert_eq!(empty.bound_keys().count(), 0, "none of them is a key");
     }
 }

@@ -64,14 +64,14 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use kanata_interception::raw;
-use ksx_core::{DeviceId, KeyEvent};
+use ksx_core::{DeviceId, Key, KeyEvent};
 
 use crate::interception_dll::Api;
 
 use crate::backend::{
     CaptureBackend, CaptureCtl, CaptureError, DeviceInfo, DeviceKind, ExitReason,
 };
-use crate::decision::{key_event, should_resend};
+use crate::decision::{key_event, should_resend, Take};
 use crate::escape::{EscapeHandle, EscapeWatch};
 use crate::exhaustion::{Exhaustion, ExhaustionDetector};
 use crate::friendly;
@@ -187,16 +187,36 @@ type Slots = [Option<SlotEntry>; MAX_DEVICE + 1];
 /// The arc-swap'd snapshot the hot loop decides from. Rebuilt (cold path) on
 /// every ctl message or slot-table change; read (lock-free, alloc-free) per
 /// batch.
+///
+/// `captured` is indexed by the INTERCEPTION DEVICE SLOT (1..=10 keyboards),
+/// not by a ksx slot number — the driver's own numbering, which is why the
+/// array is `MAX_DEVICE + 1` and unaffected by how many pads ksx drives.
+///
+/// `None` means "not captured". `Some(Take)` says how much of that device is
+/// taken, so a desk keyboard can suppress the keys a preset binds and let the
+/// rest type.
 struct SlotDecision {
     passthrough: bool,
-    captured: [bool; MAX_DEVICE + 1],
+    captured: [Option<Take>; MAX_DEVICE + 1],
 }
 
 impl SlotDecision {
     fn passthrough_all() -> Self {
         Self {
             passthrough: true,
-            captured: [false; MAX_DEVICE + 1],
+            captured: [const { None }; MAX_DEVICE + 1],
+        }
+    }
+
+    /// Does this exact stroke get swallowed?
+    ///
+    /// Allocation-free and lock-free, as the hot path requires: an `Option`
+    /// test, then for a partial take one shift and one mask.
+    fn suppresses(&self, slot: usize, key: Key) -> bool {
+        match self.captured.get(slot).and_then(Option::as_ref) {
+            None => false,
+            Some(Take::Whole) => true,
+            Some(Take::BoundKeys(keys)) => keys.contains(key),
         }
     }
 }
@@ -352,7 +372,7 @@ fn capture_loop(
     let mut wd = Watchdog::default();
     let mut exhaustion = ExhaustionDetector::new();
     let mut slots: Slots = std::array::from_fn(|_| None);
-    let mut captured_ids: Vec<DeviceId> = Vec::new();
+    let mut captured_ids: Vec<(DeviceId, Take)> = Vec::new();
     let decision: ArcSwap<SlotDecision> = ArcSwap::from_pointee(SlotDecision::passthrough_all());
     let unknown_device = DeviceId::from("<unknown-interception-device>");
     let mut last_rescan_ms: u64 = 0;
@@ -389,7 +409,7 @@ fn capture_loop(
         loop {
             match ctl.try_recv() {
                 Ok(CaptureCtl::SetCaptured(ids)) => {
-                    captured_ids = ids;
+                    captured_ids = ids.into_iter().map(|id| (id, Take::Whole)).collect();
                     ctl_passthrough = false;
                     watchdog_passthrough = false;
                     // Re-arm a tripped watchdog: the supervisor re-enabling
@@ -404,6 +424,18 @@ fn capture_loop(
                     // supervisor mirroring its own stale state must never be
                     // able to re-capture keyboards a `LeftCtrl ×5` just freed;
                     // only a second gesture does that.
+                    publish(&decision, &slots, &captured_ids, escapes.passthrough());
+                }
+                // Same handling, an explicit `Take` per device. Kept as a
+                // separate arm rather than folded in, so the whole-device
+                // spelling stays the obvious one at every existing call site.
+                Ok(CaptureCtl::SetCapturedWith(takes)) => {
+                    captured_ids = takes;
+                    ctl_passthrough = false;
+                    watchdog_passthrough = false;
+                    if wd.tripped() {
+                        wd = Watchdog::default();
+                    }
                     publish(&decision, &slots, &captured_ids, escapes.passthrough());
                 }
                 Ok(CaptureCtl::SetPassthrough) => {
@@ -501,8 +533,8 @@ fn capture_loop(
 
         let mut snap = decision.load();
         for stroke in &kb_buf[..n as usize] {
-            let (device, is_captured) = match slots[slot].as_ref() {
-                Some(e) => (&e.id, snap.captured[slot]),
+            let (device, attributed) = match slots[slot].as_ref() {
+                Some(e) => (&e.id, true),
                 // No hwid obtainable: treat as unknown device — never suppress
                 // what we cannot attribute.
                 None => (&unknown_device, false),
@@ -533,7 +565,11 @@ fn capture_loop(
                 snap = decision.load();
             }
 
-            if should_resend(snap.passthrough, is_captured) {
+            // The per-KEY question, asked with the `Key` the event above
+            // already decoded — so a partial take costs one array index and
+            // one bitset probe on top of what this loop did anyway.
+            let suppressed = attributed && snap.suppresses(slot, event.key);
+            if should_resend(snap.passthrough, suppressed) {
                 // Re-send FIRST (latency to the OS), byte-for-byte: `stroke`
                 // is untouched since receive — code, state and information all
                 // preserved. A corrupted re-send breaks every keyboard.
@@ -573,13 +609,16 @@ fn capture_loop(
 fn publish(
     decision: &ArcSwap<SlotDecision>,
     slots: &Slots,
-    captured_ids: &[DeviceId],
+    captured_ids: &[(DeviceId, Take)],
     passthrough: bool,
 ) {
-    let mut captured = [false; MAX_DEVICE + 1];
+    let mut captured = [const { None }; MAX_DEVICE + 1];
     for (i, entry) in slots.iter().enumerate() {
         if let Some(e) = entry {
-            captured[i] = captured_ids.iter().any(|c| c == &e.id);
+            captured[i] = captured_ids
+                .iter()
+                .find(|(id, _)| id == &e.id)
+                .map(|(_, take)| take.clone());
         }
     }
     decision.store(Arc::new(SlotDecision {

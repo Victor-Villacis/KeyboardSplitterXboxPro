@@ -65,7 +65,9 @@ pub use backend::{
     CaptureBackend, CaptureCtl, CaptureError, DeviceInfo, DeviceKind, ExitReason, Handles,
 };
 pub use composite::CompositeBackend;
-pub use decision::{key_event, process_keyboard_stroke, should_resend, CaptureSet, StrokeOutcome};
+pub use decision::{
+    key_event, process_keyboard_stroke, should_resend, CaptureSet, KeySet, StrokeOutcome, Take,
+};
 pub use escape::{EscapeAction, EscapeHandle, EscapeStatus, EscapeWatch};
 pub use exhaustion::{Exhaustion, ExhaustionDetector, MAX_KEYBOARD_SLOT};
 pub use health::{CaptureHealth, HealthHandle, HealthView};
