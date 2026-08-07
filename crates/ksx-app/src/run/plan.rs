@@ -193,6 +193,16 @@ pub enum PlanError {
     },
     /// A slot's device reference or preset body could not be resolved.
     Config(ksx_config::ConfigError),
+    /// A `[[device]]` entry names no connected board, names more than one, or
+    /// two entries name the same one ([`crate::run::resolve`]).
+    ///
+    /// Reported HERE, at the top, by name. It used to surface as an empty
+    /// candidate list several layers down, at claim time, as "no connected USB
+    /// interface has the instance path …" — which on a cabinet reads as "ksx
+    /// broke", not as "the encoder moved".
+    Device(crate::run::resolve::ResolveError),
+    /// The USB tree could not be read at all, so no selector can be resolved.
+    Enumeration(std::io::Error),
 }
 
 impl std::fmt::Display for PlanError {
@@ -253,6 +263,12 @@ impl std::fmt::Display for PlanError {
                 }
             }
             PlanError::Config(err) => write!(f, "{err}"),
+            PlanError::Device(err) => write!(f, "{err}"),
+            PlanError::Enumeration(err) => write!(
+                f,
+                "the USB device tree could not be read ({err}), so a [[device]] id that names a \
+                 board rather than a socket cannot be resolved"
+            ),
         }
     }
 }
@@ -394,6 +410,19 @@ pub fn resolve_as(
 
     let mut plan = build_plan(&config.value, &games.value, &presets.value, game)
         .map_err(|err| err.invoked_as(invoked_as))?;
+
+    // THE one resolution pass (`crate::run::resolve`). Here, and only here,
+    // because this is the single call `ksx run`, `ksx daemon`, autostart and
+    // the tray's "Reload config" all funnel through — which is what makes
+    // "what start sees" and "what the hot-swap check compares" the same values.
+    // Resolving downstream of `SessionShape` would bounce a live session on
+    // every preset edit.
+    if crate::run::resolve::needs_enumeration(&plan, &config.value.devices) {
+        let connected = crate::run::resolve::connected().map_err(PlanError::Enumeration)?;
+        crate::run::resolve::apply(&mut plan, &config.value.devices, &connected)
+            .map_err(PlanError::Device)?;
+    }
+
     plan.config_path = root.config_path();
     notes.extend(std::mem::take(&mut plan.notes));
     plan.notes = notes;
@@ -542,13 +571,18 @@ pub fn build_plan(
 
     // Backend selection is a property of the *device*, not of the slot layout,
     // so it comes from `[[device]]` in both the config and the `--game` path.
+    //
+    // Matched on the RAW spelling, because that is still what a slot resolves
+    // to here: turning a selector into a concrete devnode needs a live
+    // enumeration, which is one pass at session start (`crate::run::resolve`)
+    // and rewrites this list along with everything else.
     let winusb: Vec<DeviceId> = captureable
         .iter()
         .filter(|id| {
             config
                 .devices
                 .iter()
-                .any(|d| d.id == id.as_str() && d.backend == ksx_config::Backend::Winusb)
+                .any(|d| d.id.raw() == id.as_str() && d.backend == ksx_config::Backend::Winusb)
         })
         .cloned()
         .collect();
@@ -842,6 +876,36 @@ fn yes_no(b: bool) -> &'static str {
 mod tests {
     use super::*;
     use ksx_core::Key;
+
+    /// **Resolution happens at the seam start and reload SHARE.**
+    ///
+    /// `resolve_as` is the one call `ksx run`, `ksx daemon`, autostart and the
+    /// tray's "Reload config" all go through, and `SessionShape::of` is built
+    /// from whatever it returns. Move the resolution pass downstream of that —
+    /// into `capture::build`, say, where the old byte-comparison lived — and
+    /// two things break at once: hot-swap starts reporting "slot N's input
+    /// device changed" on every preset edit and bouncing a live session
+    /// mid-game, and a missing board goes back to surfacing as an empty
+    /// candidate list at claim time instead of a named refusal at the top.
+    ///
+    /// Asserted over the source because both symptoms need a daemon, a cabinet
+    /// and a person standing at it to notice.
+    #[test]
+    fn the_resolution_pass_runs_inside_the_call_the_daemon_and_ksx_run_share() {
+        let source = include_str!("plan.rs");
+        let body = source
+            .split("pub fn resolve_as")
+            .nth(1)
+            .expect("resolve_as lives here")
+            .split("pub fn build_plan")
+            .next()
+            .expect("build_plan follows it");
+        assert!(
+            body.contains("resolve::apply"),
+            "resolve_as must resolve [[device]] selectors itself; anywhere further down is \
+             downstream of the hot-swap comparison"
+        );
+    }
 
     const IPAC: &str = r"HID\VID_D209&PID_0430&REV_0056&MI_00";
 

@@ -352,6 +352,11 @@ pub fn spawn_in_daemon(
 /// Read HERE, on the window's own thread, because the engine thread that
 /// publishes those hits must not read a config file — the fan-out carries the
 /// instance path and the consumer names it (`crate::feed`).
+///
+/// The id handed over is the **written** spelling, not a resolved one: this
+/// thread has no business enumerating USB, and it does not have to.
+/// `LiveSubscription::alias_for` matches a `usb:` selector against the
+/// concrete id on the wire, which is the whole reason it is selector-aware.
 fn device_aliases(root: &ksx_config::ConfigRoot) -> Vec<(String, String)> {
     ksx_config::Store::new(root.clone())
         .load_config()
@@ -360,7 +365,7 @@ fn device_aliases(root: &ksx_config::ConfigRoot) -> Vec<(String, String)> {
                 .value
                 .devices
                 .iter()
-                .map(|device| (device.id.clone(), device.alias.clone()))
+                .map(|device| (device.id.raw().to_owned(), device.alias.clone()))
                 .collect()
         })
         .unwrap_or_default()

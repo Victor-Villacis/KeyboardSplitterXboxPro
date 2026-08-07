@@ -1,7 +1,7 @@
 //! Main config file schema: `%APPDATA%\ksx\config.toml`
 //! (`docs/research/design-architecture.md` §4.1).
 
-use ksx_core::{Blocking, DeviceId, MacroSwitch, Persona, SlotSpec, Socd};
+use ksx_core::{Blocking, DeviceId, DeviceRef, MacroSwitch, Persona, SlotSpec, Socd};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
@@ -63,8 +63,21 @@ impl Default for Settings {
 /// A known physical device: stable identity learned via the picker wizard.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceEntry {
-    /// Device instance path (see [`ksx_core::DeviceId`] semantics).
-    pub id: String,
+    /// **Which board**, not which socket — a [`ksx_core::DeviceSelector`] plus
+    /// the exact text it was written as (`docs/DEVICE-IDENTITY.md`).
+    ///
+    /// Every spelling that ever worked still does: a full instance path, an
+    /// Interception hardware id, an ACPI path the setup wizard wrote, and now
+    /// `usb:d209:0430:00` — the replug-proof form `ksx device pick` writes.
+    /// What each one *means* is decided once, at session start
+    /// (`ksx-app::run::resolve`), against a fresh enumeration; nothing
+    /// byte-compares this against hardware any more.
+    ///
+    /// The raw string is what goes back to disk — see [`crate::device_serde`]
+    /// for why storing only the parsed value would rewrite every user's file
+    /// just by loading it.
+    #[serde(with = "crate::device_serde")]
+    pub id: DeviceRef,
     pub alias: String,
     #[serde(default)]
     pub backend: Backend,
@@ -123,11 +136,19 @@ pub struct SlotEntry {
 }
 
 impl ConfigFile {
-    /// Alias → instance path. A literal instance path (contains `\`) passes
-    /// through unchanged; anything else must match a `[[device]]` alias.
+    /// Alias → the `[[device]]` entry's id **as written**. A literal instance
+    /// path (contains `\`) passes through unchanged; anything else must match a
+    /// `[[device]]` alias.
+    ///
+    /// Deliberately still the *written* spelling and not a concrete devnode:
+    /// what a selector names is decided once, at session start, against a fresh
+    /// enumeration (`ksx-app::run::resolve`). Resolving here would mean the
+    /// config layer enumerating hardware, and would put resolution downstream
+    /// of the hot-swap comparison that decides whether a config edit has to
+    /// bounce a live session (`docs/DEVICE-IDENTITY.md` §8).
     pub fn resolve_device(&self, alias_or_id: &str) -> Result<DeviceId, ConfigError> {
         if let Some(device) = self.devices.iter().find(|d| d.alias == alias_or_id) {
-            return Ok(DeviceId::new(device.id.clone()));
+            return Ok(device.id.as_device_id());
         }
         if alias_or_id.contains('\\') {
             return Ok(DeviceId::new(alias_or_id));
@@ -201,7 +222,7 @@ impl ConfigFile {
         let display = |id: &DeviceId| {
             self.devices
                 .iter()
-                .find(|d| d.id == id.as_str())
+                .find(|d| d.id.raw() == id.as_str())
                 .map(|d| d.alias.clone())
                 .unwrap_or_else(|| id.as_str().to_owned())
         };
@@ -249,7 +270,7 @@ preset = "street-fighter-p1"
         assert_eq!(cfg.settings, Settings::default());
         assert_eq!(cfg.devices.len(), 1);
         assert_eq!(
-            cfg.devices[0].id,
+            cfg.devices[0].id.raw(),
             r"HID\VID_D209&PID_0430&MI_00\8&2A0D0500&0&0000"
         );
         assert_eq!(cfg.devices[0].alias, "P1 I-PAC");
@@ -352,6 +373,81 @@ preset = "street-fighter-p1"
         let entry: DeviceEntry =
             toml::from_str("id = \"USB\\\\X\"\nalias = \"p\"\nbackend = \"winusb\"\n").unwrap();
         assert_eq!(entry.backend, Backend::Winusb);
+    }
+
+    /// **The cabinet's live `config.toml`, byte for byte.**
+    ///
+    /// This is the file on the machine ksx runs on tonight, and the whole cost
+    /// of `[[device]] id` becoming a selector is paid here: `DeviceSelector::
+    /// parse` uppercases legacy paths, so a config layer that stored the parsed
+    /// value and wrote it back would silently edit this file every time it was
+    /// loaded.
+    ///
+    /// The assertion is on the TEXT, not on the struct. Value equality would
+    /// pass with the id rewritten and prove nothing whatsoever about the bytes
+    /// on disk.
+    #[test]
+    fn the_live_cabinet_config_is_byte_identical_after_a_load_and_save() {
+        const LIVE: &str = "schema_version = 1\n\n\
+             [settings]\n\
+             block_keyboards = true\n\
+             block_mice = false\n\
+             mouse_move_deadzone = 5\n\
+             starting_user_index = 1\n\n\
+             [[device]]\n\
+             id = 'USB\\VID_D209&PID_0430&MI_00\\7&25EEA38C&0&0000'\n\
+             alias = \"ipac\"\n\
+             backend = \"winusb\"\n";
+
+        let cfg: ConfigFile = toml::from_str(LIVE).unwrap();
+        assert_eq!(cfg.devices[0].alias, "ipac");
+        assert_eq!(cfg.devices[0].backend, Backend::Winusb);
+        assert_eq!(
+            toml::to_string(&cfg).unwrap(),
+            LIVE,
+            "a load/save cycle must not move one byte of the user's file"
+        );
+    }
+
+    /// The spelling `ksx device pick` writes. It has to load, keep its exact
+    /// text, and carry a selector that names a model rather than a socket —
+    /// without that, `pick` writes a config that matches no hardware.
+    #[test]
+    fn a_usb_selector_loads_and_keeps_the_text_pick_wrote() {
+        const LINE: &str = "id = \"usb:d209:0430:00\"\nalias = \"ipac\"\nbackend = \"winusb\"\n";
+        let entry: DeviceEntry = toml::from_str(LINE).unwrap();
+        assert_eq!(entry.id.raw(), "usb:d209:0430:00");
+        assert_eq!(entry.id.selector().rung(), "model");
+        assert!(entry.id.selector().survives_replug());
+        assert_eq!(toml::to_string(&entry).unwrap(), LINE);
+    }
+
+    /// A laptop or PS/2 keyboard, whose id ksx's own setup wizard wrote from
+    /// what Raw Input reported. Refusing an enumerator ksx does not model would
+    /// break a config ksx itself produced, on upgrade, for an entirely ordinary
+    /// keyboard.
+    #[test]
+    fn an_acpi_keyboard_entry_still_loads() {
+        let entry: DeviceEntry =
+            toml::from_str("id = 'ACPI\\PNP0303\\4&1A2B3C4D&0'\nalias = \"laptop\"\n").unwrap();
+        assert_eq!(entry.id.raw(), r"ACPI\PNP0303\4&1A2B3C4D&0");
+        assert_eq!(entry.backend, Backend::Interception);
+    }
+
+    /// An alias resolves to the id **as written**, not to a canonicalised or
+    /// hardware-resolved one: resolution is one pass at session start, and the
+    /// hot-swap comparison that decides whether an edit bounces a live session
+    /// has to sit downstream of it, not upstream.
+    #[test]
+    fn resolving_an_alias_yields_the_spelling_the_file_holds() {
+        let cfg: ConfigFile = toml::from_str(
+            "schema_version = 1\n[[device]]\nid = \"usb:D209:0430:00\"\nalias = \"ipac\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_device("ipac").unwrap().as_str(),
+            "usb:D209:0430:00"
+        );
     }
 
     #[test]

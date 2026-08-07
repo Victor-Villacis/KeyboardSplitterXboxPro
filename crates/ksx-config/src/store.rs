@@ -699,7 +699,9 @@ mod tests {
                 starting_user_index: 2,
             },
             devices: vec![DeviceEntry {
-                id: r"HID\VID_D209&PID_0430&MI_00\8&2A0D0500&0&0000".into(),
+                id: r"HID\VID_D209&PID_0430&MI_00\8&2A0D0500&0&0000"
+                    .parse()
+                    .unwrap(),
                 alias: "P1 I-PAC".into(),
                 backend: crate::config::Backend::Interception,
             }],

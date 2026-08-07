@@ -45,6 +45,7 @@
 pub mod game;
 pub mod latency;
 pub mod plan;
+pub mod resolve;
 pub mod supervisor;
 
 /// End-to-end pipeline tests. `ksx-app` is a bin-only crate, so integration

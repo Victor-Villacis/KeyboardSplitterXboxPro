@@ -439,12 +439,14 @@ mod tests {
             },
             devices: vec![
                 DeviceEntry {
-                    id: r"HID\VID_D209&PID_0430&MI_00\8&2A0D0500&0&0000".into(),
+                    id: r"HID\VID_D209&PID_0430&MI_00\8&2A0D0500&0&0000"
+                        .parse()
+                        .unwrap(),
                     alias: "P1 I-PAC".into(),
                     backend: Backend::Interception,
                 },
                 DeviceEntry {
-                    id: r"USB\VID_D209&PID_0430&MI_01\7&1".into(),
+                    id: r"USB\VID_D209&PID_0430&MI_01\7&1".parse().unwrap(),
                     alias: "P2 I-PAC".into(),
                     backend: Backend::Winusb,
                 },

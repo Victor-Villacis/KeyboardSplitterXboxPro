@@ -1,8 +1,10 @@
 # Device identity
 
 > Status: design, partially built. `ksx-core::DeviceSelector` implements the
-> matching rule below and is fully tested. Nothing in a production path calls
-> it yet — see §9.
+> matching rule below and is fully tested. §9 items 1 and 2 are now built —
+> `[[device]] id` is a `DeviceRef` (raw + parsed) and `ksx-app/src/run/
+> resolve.rs` resolves it once per session inside `plan::resolve_as`. Items 3–5
+> (`scan`, `pick`, press-to-identify) are not.
 >
 > Section numbers are load-bearing: `ksx-capture/src/winusb/enumerate.rs` cites
 > §6 and §3 by number. Renumber and those citations start lying.
@@ -229,19 +231,23 @@ unnamed devices. It is display-only, and it must ride the same change-set.
 
 ## §9 What is not built
 
-`DeviceSelector` has one production consumer — `UsbCandidate::facts()` — and
-two round-trip tests. Everywhere else, identity is still a raw `String`
-compared byte-exactly. The gap, smallest-first:
+The gap, smallest-first. Items 1 and 2 are **built**; the rest is not:
 
-1. **Config stores a selector.** `DeviceEntry.id: String` becomes a
-   raw-preserving pair, serialized through a `with`-module in the style of
+1. ~~**Config stores a selector.**~~ Built. `DeviceEntry.id` is a
+   `ksx_core::DeviceRef` — the raw string as written plus the parsed selector —
+   serialized through `ksx_config::device_serde` in the style of
    `persona_serde` / `socd_serde`, so old files round-trip byte-identically.
-2. **One resolution pass.** Between plan-build and every backend consumer,
-   resolve each selector against a fresh enumeration exactly once. `Match::One`
-   proceeds; `Match::None` refuses naming the board; `Match::Ambiguous` refuses
-   listing every hit plus the port-pinned selector that would disambiguate
-   each. Interception hardware-id spellings pass through verbatim — the
-   byte-exact path M3–M5 depend on.
+   A value with no `\` and no known prefix is now a load error rather than a
+   literal that silently matches nothing.
+2. ~~**One resolution pass.**~~ Built, in `ksx-app/src/run/resolve.rs`, called
+   from `plan::resolve_as` — the one call `ksx run`, `ksx daemon`, autostart
+   and the tray's "Reload config" share, which is what keeps it upstream of the
+   hot-swap comparison in §8. `Match::One` proceeds; `Match::None` refuses
+   naming the board; `Match::Ambiguous` refuses listing every hit plus the
+   port-pinned selector that would disambiguate each; two entries landing on
+   one interface is a refusal naming both aliases. Interception hardware-id
+   spellings pass through verbatim — the byte-exact path M3–M5 depend on — and
+   a plan that needs none never enumerates at all.
 3. **`ksx device scan`.** A read-only, daemon-free report in the shape
    `ksx devices` already uses: boards grouped by ContainerId, friendly names,
    which interface is claimable, the selector each would get, ambiguity marked,
