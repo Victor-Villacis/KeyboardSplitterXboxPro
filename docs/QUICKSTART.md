@@ -125,13 +125,14 @@ ksx preset list --templates
 | `arcade-6button` | Two-player, six-button fighting panel on the factory/MAME chart. P1 = arrows + `LeftCtrl` `LeftAlt` `Space` `LeftShift` `Z` `X`, start `1`, coin `5`. P2 = `R` `F` `D` `G` + `A` `S` `Q` `W` `I` `K`, start `2`, coin `6`. Buttons 7–8, if wired, become LB and LT. |
 | `arcade-4way` | Four-player, two-button cabinet on MAME's four-player chart (P1–P4 blocks). |
 | `keyboard-wasd` | One ordinary keyboard: WASD = left stick, arrows = right stick, numpad = D-pad, `Space`=A, `C`=B, `R`=X, `F`=Y. |
+| `keyboard-2p` | Two players on ONE keyboard, no encoder (P1–P2 blocks). P1 = WASD + `Space` `C` `R` `F`, `Q`/`E`, `Z`/`X`, `LeftShift`/`V`, start `1`, back `Tab`. P2 = arrows + the numpad as the pad face (`8`·`4`·`6`·`2` = Y·X·B·A), `Numpad7`/`9` bumpers, `Numpad1`/`3` triggers, `RightShift`/`Numpad5` thumbsticks, `NumpadEnter` start, `Numpad0` back. No right stick on either — half a keyboard has no room. |
 | `default` | The legacy app's layout, for people migrating. |
 | `empty` | Every control listed, nothing bound — a blank worksheet. |
 
-Every arcade template binds each stick direction to **both** the D-pad and the
-left stick, because some games read only one of them. That is ksx fan-out, not
-a duplicate; `ksx map --function dpad.up --clear` removes half of it if you ever
-want only the stick.
+Every arcade template — and `keyboard-2p` — binds each stick direction to
+**both** the D-pad and the left stick, because some games read only one of them.
+That is ksx fan-out, not a duplicate; `ksx map --function dpad.up --clear`
+removes half of it if you ever want only the stick.
 
 Make yourself two presets off one encoder — the primary arcade topology:
 
@@ -143,6 +144,14 @@ ksx preset new "P2" --from-template arcade-6button --player 2
 `--player` picks the key block, not the slot: on an I-PAC, player 2's buttons
 are a *different set of scancodes from the same board*. That is exactly what
 makes one keyboard drive four pads.
+
+The same two commands with `keyboard-2p` are the couch case — a two-player
+Steam game, one desk keyboard, no arcade hardware at all:
+
+```powershell
+ksx preset new "Couch P1" --from-template keyboard-2p --player 1
+ksx preset new "Couch P2" --from-template keyboard-2p --player 2
+```
 
 Add `--dry-run` to see the TOML without writing it. `--force` overwrites an
 existing preset and copies the old one to `<preset>.toml.bak-<timestamp>` first.

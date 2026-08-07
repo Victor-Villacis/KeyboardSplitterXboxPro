@@ -118,8 +118,10 @@ enum Command {
     /// all (docs/MAPPER-UX.md commandment 9): an I-PAC ships MAME-ready, so ksx
     /// ships the same chart. `arcade-6button` is the two-player, six-button
     /// fighting panel; `arcade-4way` is the four-player, two-button cabinet;
-    /// `keyboard-wasd` is one ordinary keyboard; `default` and `empty` are the
-    /// two built-ins, copied under a name of your choosing.
+    /// `keyboard-wasd` is one ordinary keyboard; `keyboard-2p` splits ONE
+    /// keyboard between two players (WASD against the arrows, no encoder);
+    /// `default` and `empty` are the two built-ins, copied under a name of your
+    /// choosing.
     ///
     /// Multi-player templates carry a key block per player — `--player 2`
     /// writes player 2's keys, which on an I-PAC is a different set of
