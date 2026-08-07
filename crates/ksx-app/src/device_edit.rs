@@ -38,7 +38,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use ksx_config::{Backend, ConfigError, ConfigFile, DeviceEntry, GamesFile, Store};
-use ksx_core::{DeviceFacts, DeviceSelector, Match};
+use ksx_core::{DeviceFacts, DeviceRef, DeviceSelector, Match};
 use ksx_platform::winusb::{Candidate, ClaimState, Refusal, Survey};
 
 // ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ pub struct PickPlan {
 impl PickPlan {
     pub fn entry(&self) -> DeviceEntry {
         DeviceEntry {
-            id: self.selector.to_string(),
+            id: DeviceRef::from_selector(self.selector.clone()),
             alias: self.alias.clone(),
             backend: self.backend,
         }
@@ -206,7 +206,7 @@ pub fn resolve<'a>(
         requested: query.to_owned(),
         known: candidate_ids(survey),
     };
-    let selector = DeviceSelector::parse(&entry.id).map_err(|_| unknown())?;
+    let selector = entry.id.selector().clone();
     match selector.match_against(connected) {
         Match::One(facts) => survey.resolve(facts.id.as_str()),
         Match::None => Err(unknown()),
@@ -313,7 +313,7 @@ pub fn plan_pick(
     }) {
         return Err(PickError::AliasTaken {
             alias,
-            id: clash.id.clone(),
+            id: clash.id.raw().to_owned(),
         });
     }
 
@@ -389,10 +389,22 @@ impl PickOutcome {
             // The trade has to be stated at the moment it is made: a user with
             // two identical encoders needs to know WHICH of their boards is now
             // pinned to a socket.
+            //
+            // A `port=` rung means the port is what SEPARATES this board from
+            // its twin — which is why it appears exactly when the serials
+            // collide (measured: two I-PAC 4X boards both answer "4"). So the
+            // cost is twofold, and the second half is easy to miss: a port value
+            // describes THIS machine's USB topology, so the entry does not
+            // travel. That matters the moment configs get shared or a cabinet
+            // gets rebuilt, and `pick` is the only place that knows enough to
+            // say it — by the time `run` sees a missing board it cannot tell a
+            // move from an unplug (see `run::resolve`).
             let _ = writeln!(
                 out,
                 "  [!] PORT-PINNED — nothing weaker than the socket separates this board from \
-                 its twin. Move it to another USB port and this entry stops matching."
+                 its twin. Move it to another USB port and this entry stops matching. It is \
+                 also specific to THIS machine: the port names this PC's USB topology, so do \
+                 not copy this config to another cabinet — run `ksx device pick` there instead."
             );
         }
         if let Some(backup) = &self.backup {
@@ -591,7 +603,7 @@ pub fn plan_remove(
 
     Ok(RemovePlan {
         alias: entry.alias.clone(),
-        id: entry.id.clone(),
+        id: entry.id.raw().to_owned(),
         backend: entry.backend,
         breaks,
         still_claimed: claimed_interface(survey, connected, entry),
@@ -641,7 +653,7 @@ fn claimed_interface(
     connected: &[DeviceFacts],
     entry: &DeviceEntry,
 ) -> Option<String> {
-    let selector = DeviceSelector::parse(&entry.id).ok()?;
+    let selector = entry.id.selector().clone();
     let Match::One(facts) = selector.match_against(connected) else {
         return None;
     };
@@ -774,9 +786,9 @@ fn names_the_same_board(
     facts: &DeviceFacts,
     connected: &[DeviceFacts],
 ) -> bool {
-    let Ok(selector) = DeviceSelector::parse(&entry.id) else {
-        return false;
-    };
+    // Already parsed at load: `DeviceEntry.id` is a `DeviceRef`, so there is
+    // no failure arm left to handle here.
+    let selector = entry.id.selector();
     matches!(selector.match_against(connected), Match::One(hit) if hit.id == facts.id)
 }
 
@@ -974,7 +986,7 @@ mod tests {
 
     fn entry(id: &str, alias: &str, backend: Backend) -> DeviceEntry {
         DeviceEntry {
-            id: id.to_owned(),
+            id: ksx_core::DeviceRef::parse(id).expect("test fixture id must parse"),
             alias: alias.to_owned(),
             backend,
         }
@@ -1040,7 +1052,7 @@ mod tests {
         let outcome = apply_pick(&store, &plan).unwrap();
         let written = store.load_config().unwrap().value;
         assert_eq!(written.devices.len(), 1);
-        assert_eq!(written.devices[0].id, "usb:d209:0430:00");
+        assert_eq!(written.devices[0].id.raw(), "usb:d209:0430:00");
 
         let message = outcome.message();
         assert!(
@@ -1144,6 +1156,11 @@ mod tests {
         .message();
         assert!(message.contains("PORT-PINNED"), "{message}");
         assert!(message.contains("stops matching"), "{message}");
+        // The half that is easy to miss: a `port=` value names THIS PC's USB
+        // topology, so the entry does not survive being copied to another
+        // cabinet. Said at write time because `run` cannot tell a move from
+        // an unplug once the board is gone.
+        assert!(message.contains("another cabinet"), "{message}");
     }
 
     /// The resolver is `ksx winusb claim`'s, so the refusals are its refusals —
@@ -1229,7 +1246,7 @@ mod tests {
         let written = store.load_config().unwrap().value;
         assert_eq!(written.devices.len(), 1, "upgraded, not duplicated");
         assert_eq!(written.devices[0].alias, "P1 panel");
-        assert_eq!(written.devices[0].id, "usb:d209:0430:00");
+        assert_eq!(written.devices[0].id.raw(), "usb:d209:0430:00");
     }
 
     #[test]
@@ -1257,7 +1274,7 @@ mod tests {
                 arguments: String::new(),
                 process_name: None,
                 launcher_grace_ms: None,
-                block_keyboards: true,
+                block_keyboards: ksx_core::Blocking::Whole,
                 block_mice: false,
                 slots,
             }],

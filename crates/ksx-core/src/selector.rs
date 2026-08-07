@@ -204,6 +204,23 @@ impl DeviceRef {
     pub fn as_device_id(&self) -> DeviceId {
         DeviceId::new(self.raw.clone())
     }
+
+    /// Build a ref for an entry ksx is **writing for the first time** — there is
+    /// no user text to preserve, so the canonical spelling becomes the written
+    /// one and it lands in the file exactly as `Display` shows it.
+    ///
+    /// Deliberately not `parse(&selector.to_string())`: that round-trip can only
+    /// fail if `Display` and `parse` disagree, and expressing "cannot fail" as a
+    /// `.expect()` at every call site invites someone to reach for it on a path
+    /// where the input *is* user text. Writers use this; readers use [`parse`].
+    ///
+    /// [`parse`]: Self::parse
+    pub fn from_selector(selector: DeviceSelector) -> Self {
+        Self {
+            raw: selector.to_string(),
+            selector,
+        }
+    }
 }
 
 impl fmt::Display for DeviceRef {
