@@ -10,6 +10,7 @@ mod console;
 #[cfg(windows)]
 mod ctrl_c;
 mod daemon;
+mod device_edit;
 mod device_scan;
 mod devices;
 mod doctor;
@@ -881,6 +882,14 @@ enum Command {
     /// and wrong for choosing: on a cabinet it prints 29 USB interfaces, of
     /// which three are one I-PAC. These verbs group interfaces into the
     /// physical boards they belong to and name each one.
+    ///
+    /// `pick` and `remove` write config and NOTHING else — neither one claims
+    /// or releases a board. A WinUSB claim takes a keyboard off the Windows
+    /// input stack, so it stays a separate, consented act (`ksx winusb claim`).
+    ///
+    /// Exit codes: 0 = done, 1 = error, 2 = refused (unknown or ambiguous
+    /// device, not a keyboard interface, the alias is taken, no id can name the
+    /// board uniquely, or slots still use the device being removed).
     Device {
         #[command(subcommand)]
         command: DeviceCommand,
@@ -1146,6 +1155,50 @@ enum DeviceCommand {
         #[arg(long)]
         all: bool,
         /// The whole DevicesView as JSON — the same shape the UI reads
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a [[device]] entry for one board — this never claims it
+    ///
+    /// The id written is the WEAKEST identity that still names exactly one
+    /// connected interface (docs/DEVICE-IDENTITY.md §2), so moving the board to
+    /// another USB socket does not break the entry. When two identical boards
+    /// leave no weaker choice, the socket is pinned and the output says so; when
+    /// nothing can tell them apart at all, this refuses rather than writing an
+    /// id that would name whichever board enumerated first.
+    ///
+    /// `backend = "winusb"` is written only for an interface that is ALREADY
+    /// bound to winusb.sys. Anything else gets the Interception backend and the
+    /// claim command as an explicit next step — flipping a working keyboard to
+    /// a backend it is not on is a config that refuses to start.
+    Pick {
+        /// An instance path, an existing [[device]] alias, or a unique part of
+        /// one — the same argument `ksx winusb claim` takes
+        query: String,
+        /// The name [[slot]] entries will use; defaults to the board's name
+        #[arg(long)]
+        alias: Option<String>,
+        /// What was written, as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a [[device]] entry
+    ///
+    /// Refuses while any [[slot]] — in config.toml or in a games.toml profile —
+    /// still names the alias, and lists them; `--force` removes it anyway and
+    /// says what it broke.
+    ///
+    /// Removing the entry does NOT release a WinUSB-claimed board: the driver
+    /// binding is a property of the machine, not of the config. A claimed board
+    /// is removed with a warning and the `ksx winusb release` command to undo
+    /// it, because the alternative is a dead panel and no config explaining why.
+    Remove {
+        /// The [[device]] alias to forget
+        alias: String,
+        /// Remove it even though slots still name it
+        #[arg(long)]
+        force: bool,
+        /// What was removed, as JSON
         #[arg(long)]
         json: bool,
     },
@@ -1628,6 +1681,12 @@ fn main() -> anyhow::Result<()> {
         },
         Command::Device { command } => match command {
             DeviceCommand::Scan { all, json } => device_scan::run(all, json),
+            DeviceCommand::Pick { query, alias, json } => {
+                device_edit::pick(device_edit::PickSpec { query, alias }, json)
+            }
+            DeviceCommand::Remove { alias, force, json } => {
+                device_edit::remove(device_edit::RemoveSpec { alias, force }, json)
+            }
         },
         Command::Winusb { command } => match command {
             WinusbCommand::Status { json } => winusb::run(winusb::Options {
@@ -2300,6 +2359,70 @@ mod tests {
             "dry runs by default",
             "2 = refused",
             "3 = pnputil ran and failed",
+        ] {
+            assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // ksx device
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn device_pick_takes_a_query_and_an_optional_alias() {
+        let cli = Cli::try_parse_from(["ksx", "device", "pick", "MI_00", "--alias", "panel"])
+            .expect("a query and a name");
+        match cli.command {
+            Command::Device {
+                command: DeviceCommand::Pick { query, alias, json },
+            } => {
+                assert_eq!(query, "MI_00");
+                assert_eq!(alias.as_deref(), Some("panel"));
+                assert!(!json);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+        // A query is not optional: `ksx device pick` with no target must not be
+        // able to mean "whatever you think is best" — it writes config.
+        assert!(Cli::try_parse_from(["ksx", "device", "pick"]).is_err());
+        assert!(Cli::try_parse_from(["ksx", "device", "remove"]).is_err());
+    }
+
+    #[test]
+    fn device_remove_needs_force_spelled_out() {
+        let cli = Cli::try_parse_from(["ksx", "device", "remove", "panel", "--force"]).unwrap();
+        match cli.command {
+            Command::Device {
+                command: DeviceCommand::Remove { alias, force, .. },
+            } => {
+                assert_eq!(alias, "panel");
+                assert!(force);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+        let plain = Cli::try_parse_from(["ksx", "device", "remove", "panel"]).unwrap();
+        assert!(matches!(
+            plain.command,
+            Command::Device {
+                command: DeviceCommand::Remove { force: false, .. }
+            }
+        ));
+    }
+
+    /// The one thing a user must know before running these: neither verb
+    /// touches a driver binding. If `--help` did not say so, "pick" would read
+    /// as "start using", and on a one-keyboard machine that expectation is a
+    /// lockout waiting to happen.
+    #[test]
+    fn device_help_says_picking_is_not_claiming() {
+        let mut cmd = Cli::command();
+        let device = cmd.find_subcommand_mut("device").unwrap();
+        let help = device.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "neither one claims or releases a board",
+            "separate, consented act",
+            "2 = refused",
         ] {
             assert!(flat.contains(needle), "missing '{needle}' in:\n{help}");
         }
