@@ -10,6 +10,7 @@ mod console;
 #[cfg(windows)]
 mod ctrl_c;
 mod daemon;
+mod device_scan;
 mod devices;
 mod doctor;
 mod feed;
@@ -827,6 +828,16 @@ enum Command {
         #[command(subcommand)]
         command: WinusbCommand,
     },
+    /// Choose which physical device ksx reads — scan for boards, then pick one
+    ///
+    /// `ksx devices` lists devnodes, which is right for diagnosing a backend
+    /// and wrong for choosing: on a cabinet it prints 29 USB interfaces, of
+    /// which three are one I-PAC. These verbs group interfaces into the
+    /// physical boards they belong to and name each one.
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
     /// Serve the ksx Studio page on 127.0.0.1: cabinet status + session control
     ///
     /// One auto-refreshing page. The SESSION panel talks to a running `ksx
@@ -1073,7 +1084,27 @@ impl ConfigPart {
     }
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug, PartialEq)]
+enum DeviceCommand {
+    /// Show the boards ksx can see, grouped as physical devices
+    ///
+    /// Read-only and daemon-free: it enumerates and prints. Opens nothing,
+    /// claims nothing, writes nothing — looking is never a commitment.
+    ///
+    /// Boards with no keyboard interface are hidden by default (they cannot be
+    /// picked) but always COUNTED, so nothing disappears silently; `--all`
+    /// lists them, which is the answer to "ksx cannot see my board".
+    Scan {
+        /// Include boards with no keyboard interface
+        #[arg(long)]
+        all: bool,
+        /// The whole DevicesView as JSON — the same shape the UI reads
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq)]
 enum WinusbCommand {
     /// List USB interfaces, their current driver, and whether ksx could claim them
     ///
@@ -1543,6 +1574,9 @@ fn main() -> anyhow::Result<()> {
                 force,
                 json,
             }),
+        },
+        Command::Device { command } => match command {
+            DeviceCommand::Scan { all, json } => device_scan::run(all, json),
         },
         Command::Winusb { command } => match command {
             WinusbCommand::Status { json } => winusb::run(winusb::Options {

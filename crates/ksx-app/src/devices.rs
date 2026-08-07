@@ -273,7 +273,7 @@ impl DevicesReport {
 /// under the `studio`/`cabinet` features. Gated to the same features as its
 /// only caller: without a UI nothing asks for a `DevicesView`, and an
 /// ungated helper is dead code the default build refuses at `-D warnings`.
-#[cfg(all(windows, feature = "cabinet"))]
+#[cfg(windows)]
 fn stamp_utc() -> String {
     let t = ksx_config::Timestamp::now_utc();
     format!(
@@ -291,7 +291,7 @@ fn stamp_utc() -> String {
 ///
 /// Gated to the UI features because that is who reads it — a default build has
 /// no surface to render a `DevicesView` and would carry this as dead code.
-#[cfg(all(windows, feature = "cabinet"))]
+#[cfg(windows)]
 pub fn to_view(report: &DevicesReport) -> ksx_api::DevicesView {
     use ksx_capture::winusb::Binding;
 
@@ -357,6 +357,13 @@ pub fn to_view(report: &DevicesReport) -> ksx_api::DevicesView {
                 // shares it, which is what lets a picker group three devnodes
                 // into "I-PAC 4X — 3 interfaces".
                 board: Some(c.parent_id.clone()),
+                // HID class 3, subclass 1 (boot), protocol 1 (keyboard). The
+                // one positive signal available without claiming; see the
+                // field's docs for why `claimable` alone is not enough for a
+                // menu.
+                boot_keyboard: c.interface_class == 0x03
+                    && c.interface_subclass == 1
+                    && c.interface_protocol == 1,
             }
         })
         .collect();
@@ -1094,7 +1101,7 @@ mod tests {
     /// vendor fix that stopped calling a SpinTrak an I-PAC lived only in CLI
     /// output where no UI could reach it.
     #[test]
-    #[cfg(all(windows, feature = "cabinet"))]
+    #[cfg(windows)]
     fn the_view_carries_the_vendor_name_and_groups_by_board() {
         let ipac_kb = usb(IPAC_USB, Binding::WinUsb);
         let mut ipac_mouse = usb(
