@@ -1,35 +1,35 @@
 {
   "version": 1,
-  "build_hash": "903ccb7ad7c715470dd7168a11c4eb0cf2349443b9e4403aa2f5f4aeccfc1fa2",
+  "build_hash": "5dc6f5673b949c8050cf0da6ed0ae665cb098fad238fa90e582a9d5a49180d2b",
   "assets": {
     "map.ir": "map.1774b60f.ir",
-    "map.js": "map.22923e04.js",
+    "map.js": "map.0a1fa662.js",
     "status.ir": "status.1bcaac40.ir",
-    "status.js": "status.a0ca6917.js",
+    "status.js": "status.099e2627.js",
     "studio.css": "studio.685204db.css"
   },
   "routes": {
     "/": {
       "js": [
-        "status.a0ca6917.js"
+        "status.099e2627.js"
       ],
       "css": [
         "studio.685204db.css"
       ],
       "fonts": [],
-      "total_size_br": 30178,
+      "total_size_br": 31811,
       "budget_warn_threshold": 200000,
       "ir": "status.1bcaac40.ir"
     },
     "/map": {
       "js": [
-        "map.22923e04.js"
+        "map.0a1fa662.js"
       ],
       "css": [
         "studio.685204db.css"
       ],
       "fonts": [],
-      "total_size_br": 55346,
+      "total_size_br": 56904,
       "budget_warn_threshold": 200000,
       "ir": "map.1774b60f.ir"
     }

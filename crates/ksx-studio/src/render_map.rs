@@ -428,7 +428,7 @@ fn share_title(key: &str, names: &[String]) -> String {
 /// a no-op).
 fn zone_rows(slot: &MapperSlot, live: bool) -> SlotValue {
     let shared = shared_labels(slot);
-    SlotValue::Array(
+    SlotValue::array(
         zones_for(&slot.persona)
             .iter()
             .zip(shared)
@@ -440,7 +440,7 @@ fn zone_rows(slot: &MapperSlot, live: bool) -> SlotValue {
                 let unbound = if key == "—" { " z-unbound" } else { "" };
                 let dead = if live { "" } else { " z-dead" };
                 let shared_cls = if share.is_empty() { "" } else { " z-shared" };
-                SlotValue::Object(vec![
+                SlotValue::object(vec![
                     ("fn".to_owned(), SlotValue::Text(z.fn_name.to_owned())),
                     (
                         "cls".to_owned(),
@@ -509,7 +509,7 @@ fn legend_label(z: &Zone) -> String {
 /// [`writable`], deliberately wider than `live` — see there.
 fn legend_rows(slot: &MapperSlot, live: bool, write: bool) -> SlotValue {
     let shared = shared_labels(slot);
-    SlotValue::Array(
+    SlotValue::array(
         zones_for(&slot.persona)
             .iter()
             .zip(shared)
@@ -636,7 +636,7 @@ fn legend_rows(slot: &MapperSlot, live: bool, write: bool) -> SlotValue {
                     ),
                 ];
                 fields.extend(key_chip_fields(z.fn_name, &keys, live));
-                SlotValue::Object(fields)
+                SlotValue::object(fields)
             })
             .collect(),
     )
@@ -802,14 +802,14 @@ fn key_chip_fields(function: &str, keys: &[String], live: bool) -> Vec<(String, 
 }
 
 fn slot_tabs(payload: &MapPayload, selected: Option<&MapperSlot>) -> SlotValue {
-    SlotValue::Array(
+    SlotValue::array(
         payload
             .mapper
             .slots
             .iter()
             .map(|s| {
                 let active = selected.is_some_and(|sel| sel.number == s.number);
-                SlotValue::Object(vec![
+                SlotValue::object(vec![
                     ("num".to_owned(), SlotValue::Text(s.number.to_string())),
                     (
                         "label".to_owned(),
@@ -1309,7 +1309,7 @@ fn macro_function(name: &str) -> String {
 /// The macro tab strip: one anchor per macro the preset defines, so switching
 /// works with JavaScript off (`/map?slot=N&macro=NAME` is a route).
 fn macro_tabs(payload: &MapPayload, current: Option<&MacroView>) -> SlotValue {
-    SlotValue::Array(
+    SlotValue::array(
         payload
             .macros
             .macros
@@ -1317,7 +1317,7 @@ fn macro_tabs(payload: &MapPayload, current: Option<&MacroView>) -> SlotValue {
             .map(|m| {
                 let active =
                     current.is_some_and(|current| m.name.eq_ignore_ascii_case(&current.name));
-                SlotValue::Object(vec![
+                SlotValue::object(vec![
                     ("name".to_owned(), SlotValue::Text(m.name.clone())),
                     (
                         "label".to_owned(),
@@ -1370,11 +1370,11 @@ fn urlencode_value(text: &str) -> String {
 /// Dustloop or typed digits into `joystick_map`.
 fn macro_cols(slot: Option<&MapperSlot>) -> SlotValue {
     let persona = slot.map_or("xbox360", |s| s.persona.as_str());
-    SlotValue::Array(
+    SlotValue::array(
         macro_columns(persona)
             .into_iter()
             .map(|c| {
-                SlotValue::Object(vec![
+                SlotValue::object(vec![
                     ("fn".to_owned(), SlotValue::Text(c.token)),
                     ("id".to_owned(), SlotValue::Text(c.glyph)),
                     // UNIFORM colour, deliberately: the grid header carries one
@@ -1409,10 +1409,10 @@ fn macro_groups(slot: Option<&MapperSlot>) -> SlotValue {
             _ => runs.push((column.band, 1)),
         }
     }
-    SlotValue::Array(
+    SlotValue::array(
         runs.into_iter()
             .map(|(band, span)| {
-                SlotValue::Object(vec![
+                SlotValue::object(vec![
                     ("label".to_owned(), SlotValue::Text(band.to_owned())),
                     // A CLASS, never an inline `grid-column` — forma's CSP
                     // nonce-locks style-src (ledger #13), and a span of 3/4/8/9
@@ -1565,11 +1565,11 @@ fn macro_rows(
     selected: Option<usize>,
 ) -> SlotValue {
     let Some(mac) = mac else {
-        return SlotValue::Array(Vec::new());
+        return SlotValue::array(Vec::new());
     };
     let last = mac.steps.len().saturating_sub(1);
     let only = mac.steps.len() == 1;
-    SlotValue::Array(
+    SlotValue::array(
         mac.steps
             .iter()
             .enumerate()
@@ -1582,7 +1582,7 @@ fn macro_rows(
                 if selected == Some(i) {
                     cls.push_str(" sel");
                 }
-                SlotValue::Object(vec![
+                SlotValue::object(vec![
                     ("n".to_owned(), SlotValue::Text((i + 1).to_string())),
                     ("cls".to_owned(), SlotValue::Text(cls)),
                     ("dur".to_owned(), SlotValue::Text(duration_text(step))),
@@ -1715,7 +1715,7 @@ fn macro_cells(
     selected: Option<usize>,
 ) -> SlotValue {
     let Some(mac) = mac else {
-        return SlotValue::Array(Vec::new());
+        return SlotValue::array(Vec::new());
     };
     let persona = slot.map_or("xbox360", |s| s.persona.as_str());
     let columns = macro_columns(persona);
@@ -1809,7 +1809,7 @@ fn macro_cells(
                 ),
                 CellState::Off => format!("step {} does not hold {name}", i + 1),
             };
-            cells.push(SlotValue::Object(vec![
+            cells.push(SlotValue::object(vec![
                 ("cls".to_owned(), SlotValue::Text(cls)),
                 (
                     "cell".to_owned(),
@@ -1830,7 +1830,7 @@ fn macro_cells(
             ]));
         }
     }
-    SlotValue::Array(cells)
+    SlotValue::array(cells)
 }
 
 /// Does `function` point the same way as `want`, whatever it is spelled?
@@ -3034,10 +3034,10 @@ fn build_slots(module: &IrModule, payload: &MapPayload, flash: Option<&str>) -> 
     let write = writable(payload) && selected.is_some();
     let zones = selected
         .map(|slot| zone_rows(slot, live))
-        .unwrap_or(SlotValue::Array(Vec::new()));
+        .unwrap_or(SlotValue::array(Vec::new()));
     let legend = selected
         .map(|slot| legend_rows(slot, live, write))
-        .unwrap_or(SlotValue::Array(Vec::new()));
+        .unwrap_or(SlotValue::array(Vec::new()));
     for (name, value) in [
         (LIST_SLOT_TABS, tabs.clone()),
         (LIST_SLOT_ZONES, zones.clone()),
@@ -3045,7 +3045,7 @@ fn build_slots(module: &IrModule, payload: &MapPayload, flash: Option<&str>) -> 
         (LIST_SLOT_LEGEND, legend),
         // Explicitly empty, so the toast stack can never SSR a stale report.
         (LIST_SLOT_TABS_2, tabs),
-        (LIST_SLOT_TOASTS, SlotValue::Array(Vec::new())),
+        (LIST_SLOT_TOASTS, SlotValue::array(Vec::new())),
         // v11's piano roll. `None` for the selected step: an SSR paint has
         // pointed the duration editor at nothing.
         (LIST_SLOT_MACRO_TABS, macro_tabs(payload, mac)),
@@ -3092,6 +3092,12 @@ pub(crate) fn render_map(
         route_pattern: "/map",
         manifest: &page.manifest,
         config_script: None,
+        // The SAFE server-data path (serde_json-escaped, surfaced as
+        // window.__FORMA_CONFIG__), as opposed to config_script, which is a raw
+        // trusted escape hatch. ksx injects its island props through the FMIR
+        // slot table instead, so neither is used — but the distinction matters
+        // the day anything server-derived does need to reach the client.
+        config_json: None,
         body_class: None,
         personality_css: Some(PERSONALITY_CSS),
         body_prefix: Some(&prefix),
@@ -3229,7 +3235,24 @@ mod tests {
             rest = after.split_once("</script>").map_or("", |(_, r)| r);
         }
         cleaned.push_str(rest);
-        cleaned
+        // And the walker's OWN props block. forma-ir 0.2.0 spills props over
+        // `INLINE_PROPS_MAX_BYTES` out of the inline attribute stripped above
+        // and into this shared `<script type="application/json">` — same data,
+        // new location. /map's props are the largest on the site, so they all
+        // moved, and every one of their slot values would otherwise read as
+        // page text: "conflictLine" made `!visible.contains("conflict")` fail,
+        // and an empty title slot made the `title=""` check fail. Neither is
+        // anything a user can see.
+        let mut out = String::with_capacity(cleaned.len());
+        let mut rest = cleaned.as_str();
+        let open = "<script id=\"__forma_islands\" type=\"application/json\">";
+        while let Some(i) = rest.find(open) {
+            out.push_str(&rest[..i]);
+            let after = &rest[i + open.len()..];
+            rest = after.split_once("</script>").map_or("", |(_, r)| r);
+        }
+        out.push_str(rest);
+        out
     }
 
     /// The injected text inside the FIRST element carrying `class="<cls>"`.
@@ -4097,14 +4120,35 @@ mod tests {
         );
         let out = render_map(&page(), &payload, None);
         assert!(out.html.contains(&json), "{}", out.html);
-        assert!(
-            !out.html.contains("__forma_islands"),
-            "the ledger #8 workaround must be gone: {}",
+        // The `__forma_islands` block is UPSTREAM's again, not ours.
+        //
+        // ksx used to hand-emit one, impersonating the islands protocol; that
+        // workaround died when compiler 0.3.1 populated `slot_ids` (ledger
+        // #8), and this asserted the block was gone. At forma-ir 0.2.0 the
+        // walker emits it itself for props over `INLINE_PROPS_MAX_BYTES`
+        // (1 KiB) — upstream acting on ksx's finding #22, that inline props
+        // were a third of this very response and could not be switched off.
+        // /map's props are the largest on the site, so the block is expected
+        // here. What must stay true is that ksx does not write one: exactly
+        // one, emitted by the walker.
+        assert_eq!(
+            out.html.matches(r#"id="__forma_islands""#).count(),
+            1,
+            "the walker emits the shared props block; a second one would be a \
+             duplicate DOM id and would shadow it: {}",
             out.html
         );
         // Native island props (ledger #8 closed): the walker's own emission,
-        // carrying the rendered slot values the client adopts against.
-        assert!(out.html.contains("data-forma-props=\""), "{}", out.html);
+        // carrying the rendered slot values the client adopts against —
+        // delivered through the shared block on this page, since /map's props
+        // are far over the 1 KiB inline ceiling. Pin the VALUES, not the
+        // channel, so a payload that shrinks below the ceiling and goes back
+        // inline is not a test failure.
+        assert!(
+            out.html.contains(r#""actionsCls":"#) || out.html.contains("&quot;actionsCls&quot;:"),
+            "the island must receive its rendered slot values: {}",
+            out.html
+        );
     }
 
     /// Dogfood ledger #20, both halves, pinned server-side.
@@ -4147,9 +4191,29 @@ mod tests {
             "{}",
             out.html
         );
-        // Not one empty title anywhere on the page — the exact shape of the
-        // bug (`title=""`, or the attribute dropped entirely).
-        assert!(!out.html.contains(r#"title="""#), "{}", out.html);
+        // This used to assert `title=""` appeared NOWHERE, as a proxy for "the
+        // concatenated attribute did not come out empty". forma-ir 0.2.0
+        // retired that proxy, and correctly:
+        //
+        //   "DYN_ATTR treats an empty string as a value. value=""/alt="" now
+        //    render as attr="" instead of being dropped, matching what the
+        //    client's setAttribute produces for the same slot."
+        //
+        // ksx has attributes that are DELIBERATELY empty — `chipTitle` returns
+        // "" for an unbound key chip, because there is nothing to say about a
+        // key that is not there — so an unbound chip now ships `title=""`.
+        // That is SSR and hydration agreeing where they used to differ
+        // silently, which is the opposite of a bug.
+        //
+        // So pin the property the ledger actually cares about, on a row whose
+        // title is built by concatenation and is never legitimately empty: the
+        // macro Enable switch above, and a bound key chip here. An empty one
+        // of THESE would be the regression.
+        let visible = visible(&out.html);
+        assert!(
+            !visible.contains(r#"class="lkc lk1" title="""#),
+            "a BOUND key chip's concatenated title must not be empty: {visible}"
+        );
         // (b) The concatenated CHILD renders as one uninterrupted string.
         assert!(
             out.html.contains(

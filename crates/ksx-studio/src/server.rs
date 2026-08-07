@@ -170,30 +170,27 @@ struct PageQuery {
     flash: Option<String>,
 }
 
-/// Dogfood ledger #13: forma-server's CSP nonce-locks `style-src`, and per
-/// the CSP spec a nonce (or hash) in that directive makes browsers drop
-/// `'unsafe-inline'` semantics — every inline `style=""` ATTRIBUTE is then
-/// ignored. But forma's own compiled bindings EMIT style attributes (the
-/// mapper's zone geometry `style:` items, the countdown bar's `width:`),
-/// so under the stock CSP all 25 hit zones collapse into a 2 px pile at the
-/// stage's top-left corner. Until upstream grows an attribute story, rewrite
-/// the directive to `style-src 'self' 'unsafe-inline'`: scripts stay
-/// nonce-locked (the actual XSS boundary); inline style on a localhost-only,
-/// fully-escaped page is the accepted trade-off. The personality `<style>`
-/// keeps working — 'unsafe-inline' covers elements once the nonce is gone.
-fn relax_style_src(csp: &str) -> String {
-    csp.split(';')
-        .map(str::trim)
-        .map(|directive| {
-            if directive.starts_with("style-src") {
-                "style-src 'self' 'unsafe-inline'"
-            } else {
-                directive
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
-}
+// DELETED at forma-server 0.2.0: `relax_style_src`.
+//
+// Dogfood ledger #13 — a nonce in `style-src` makes browsers drop
+// `'unsafe-inline'` semantics per spec, so every inline `style=""` ATTRIBUTE
+// was ignored; forma's own compiled bindings emit those (the mapper's zone
+// geometry, the countdown bar's width), and all 25 hit zones collapsed into a
+// pile at the stage's top-left. The workaround rewrote the directive to
+// `style-src 'self' 'unsafe-inline'`.
+//
+// 0.2.0 fixes it properly: the policy now carries
+// `style-src-attr 'unsafe-inline'` alongside a still-nonce-locked `style-src`,
+// so attribute styles apply while `<style>` blocks and stylesheets keep their
+// nonce. Nothing to work around.
+//
+// Keeping it would have been actively harmful, and invisibly so. It matched
+// `directive.starts_with("style-src")`, which catches `style-src-attr` too —
+// so it would have DESTROYED the new directive and stripped the nonce off the
+// real one, leaving a strictly weaker policy than upstream ships. The page
+// would have rendered perfectly throughout, because the relaxed `style-src` it
+// substituted still permits the inline styles the mapper needs. A workaround
+// that silently outlives its bug is worse than the bug.
 
 /// One fresh (snapshot, session) pair. Collectors hit the registry, the
 /// SCM, schtasks.exe and the daemon pipe — blocking work, kept off the
@@ -231,7 +228,7 @@ async fn status_page(
             ),
             (
                 header::CONTENT_SECURITY_POLICY,
-                HeaderValue::from_str(&relax_style_src(&out.csp))
+                HeaderValue::from_str(&out.csp)
                     .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'")),
             ),
             (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
@@ -332,7 +329,7 @@ async fn map_page(State(state): State<Arc<AppState>>, Query(query): Query<MapQue
             ),
             (
                 header::CONTENT_SECURITY_POLICY,
-                HeaderValue::from_str(&relax_style_src(&out.csp))
+                HeaderValue::from_str(&out.csp)
                     .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'")),
             ),
             (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
@@ -1092,27 +1089,47 @@ fn urlencode(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Ledger #13: the nonce must LEAVE style-src (its presence makes
-    /// browsers ignore 'unsafe-inline', killing every style="" attribute the
-    /// compiled bindings emit), while script-src keeps its nonce untouched.
+    /// Ledger #13, closed upstream: ksx ships forma's CSP verbatim now.
+    ///
+    /// This replaces a test that pinned the OLD workaround. It asserts the
+    /// three properties that made deleting it safe, against the header a real
+    /// request produces — not against a hand-written string, because the point
+    /// is that upstream's policy is what reaches the browser.
     #[test]
-    fn relax_style_src_swaps_the_nonce_for_unsafe_inline_styles_only() {
-        let stock = "default-src 'none'; script-src 'nonce-abc123' 'self'; \
-                     style-src 'nonce-abc123' 'self'; connect-src 'self'";
-        let relaxed = relax_style_src(stock);
+    fn the_served_csp_is_forma_own_and_permits_style_attributes() {
+        let csp = forma_server::build_csp_header(&forma_server::generate_csp_nonce());
+
+        // 1. The reason the workaround existed. `style-src-attr 'unsafe-inline'`
+        //    is what lets the mapper's compiled `style:` bindings apply — the
+        //    25 hit zones' geometry, and the countdown bar's width.
         assert!(
-            relaxed.contains("style-src 'self' 'unsafe-inline'"),
-            "{relaxed}"
+            csp.contains("style-src-attr 'unsafe-inline'"),
+            "without this every inline style=\"\" is dropped and the mapper's zones \
+             collapse into a pile: {csp}"
         );
+
+        // 2. What the workaround cost, and no longer does. A nonce in style-src
+        //    is what makes `<style>` blocks and stylesheets attacker-proof;
+        //    relax_style_src stripped it to buy attribute styles.
         assert!(
-            !relaxed.contains("style-src 'nonce-"),
-            "a style-src nonce would disable 'unsafe-inline': {relaxed}"
+            csp.contains("style-src 'nonce-"),
+            "style-src must stay nonce-locked — attribute styles are permitted by \
+             style-src-attr, not by weakening this: {csp}"
         );
-        assert!(
-            relaxed.contains("script-src 'nonce-abc123' 'self'"),
-            "scripts must stay nonce-locked: {relaxed}"
+
+        // 3. The trap that made keeping the workaround dangerous rather than
+        //    merely redundant. It matched `starts_with("style-src")`, so it
+        //    caught style-src-attr too — destroying the new directive AND
+        //    stripping the nonce, while the page still rendered perfectly.
+        assert_eq!(
+            csp.split(';')
+                .filter(|d| d.trim().starts_with("style-src"))
+                .count(),
+            2,
+            "two directives share the style-src prefix; any prefix-matching \
+             rewrite of this header silently mangles one of them: {csp}"
         );
-        assert!(relaxed.contains("default-src 'none'"), "{relaxed}");
+        assert!(csp.contains("script-src 'nonce-"), "{csp}");
     }
 
     struct NullSource;
