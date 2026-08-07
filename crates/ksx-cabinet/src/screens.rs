@@ -610,8 +610,29 @@ fn status(ui: &mut egui::Ui, app: &mut App, slow: &Slow) {
 // c. Start / stop, pick a game profile, pick a slot's preset
 // ---------------------------------------------------------------------------
 
+/// How many rows the Session screen draws.
+///
+/// Named because two places need to agree on it: [`session`], which draws them
+/// and sets the focus bounds, and [`session_verb`], which says what each one
+/// does. A literal in both is a literal that drifts.
+const SESSION_ROWS: usize = 3;
+
+/// What Ⓐ means on row `row` of the Session screen.
+///
+/// Separated from [`activate`] so it can be tested without an `egui::Ui`: the
+/// mapping from a row the joystick can reach to a verb ksx will run is the part
+/// worth pinning, and it is pure.
+fn session_verb(row: usize, running: bool, profile: Option<String>) -> Ask {
+    match row {
+        0 if running => Ask::Stop,
+        0 => Ask::Start(profile),
+        1 => Ask::Reload,
+        _ => Ask::OpenStudio,
+    }
+}
+
 fn session(ui: &mut egui::Ui, app: &mut App, slow: &Slow) {
-    app.focus.set_rows(2);
+    app.focus.set_rows(SESSION_ROWS);
     let running = slow.session.running;
     let primary = if running {
         "Stop emulation"
@@ -637,6 +658,20 @@ fn session(ui: &mut egui::Ui, app: &mut App, slow: &Slow) {
         ui.add_space(sp::S3);
         ui.label(
             RichText::new("stop, re-read the files, start again")
+                .size(fs::SM)
+                .color(text),
+        );
+    });
+    ui.add_space(sp::S2);
+    // The cabinet reports and operates; Studio is where mapping is authored
+    // (docs/M9-DECISION.md). This row is the bridge between them — and the
+    // address matters as much as the button, because a phone is a far better
+    // client for a mapping surface than a joystick and two buttons.
+    row(ui, app.focus.is_on(2), ctl::ROW, |ui, text| {
+        ui.label(RichText::new("Open ksx Studio").size(fs::LG).color(text));
+        ui.add_space(sp::S3);
+        ui.label(
+            RichText::new("mapping and macros, in a browser — or on your phone")
                 .size(fs::SM)
                 .color(text),
         );
@@ -794,11 +829,11 @@ pub fn activate(app: &mut App, slow: &Slow, row: usize) {
             "This screen only reports. Start / Stop is one screen to the right.",
             Tone::Warn,
         ),
-        Screen::Session => match row {
-            0 if slow.session.running => app.ask(Ask::Stop),
-            0 => app.ask(Ask::Start(slow.session.profile.clone())),
-            _ => app.ask(Ask::Reload),
-        },
+        Screen::Session => app.ask(session_verb(
+            row,
+            slow.session.running,
+            slow.session.profile.clone(),
+        )),
         Screen::Profiles => {
             let Some(profile) = slow.snapshot.profiles.get(row) else {
                 return;
@@ -984,6 +1019,38 @@ fn answer(ui: &mut egui::Ui, text: &str, focused: bool) {
 mod tests {
     use super::*;
     use ksx_api::{MapperSnapshot, SessionView};
+
+    /// `session` declares how many rows it draws and `session_verb` says what
+    /// each one does. They live in different functions, so adding a row is
+    /// exactly the edit that updates one and not the other — leaving a row the
+    /// joystick can reach and Ⓐ cannot act on, or a verb no row can select.
+    ///
+    /// This drives the real mapping function, not a copy of it, and asserts
+    /// every drawn row lands on a DISTINCT verb.
+    #[test]
+    fn every_drawn_row_on_the_session_screen_has_its_own_verb() {
+        let verbs: Vec<Ask> = (0..SESSION_ROWS)
+            .map(|row| session_verb(row, false, None))
+            .collect();
+        for (a, first) in verbs.iter().enumerate() {
+            for second in verbs.iter().skip(a + 1) {
+                assert_ne!(
+                    std::mem::discriminant(first),
+                    std::mem::discriminant(second),
+                    "two of the {SESSION_ROWS} drawn rows fall through to the same verb: {verbs:?}"
+                );
+            }
+        }
+    }
+
+    /// The primary row is the only one whose meaning depends on state, and
+    /// getting it backwards would stop a running session when the operator
+    /// meant to start one.
+    #[test]
+    fn the_primary_row_follows_whether_a_session_is_running() {
+        assert!(matches!(session_verb(0, true, None), Ask::Stop));
+        assert!(matches!(session_verb(0, false, None), Ask::Start(None)));
+    }
 
     fn slow(mapper_profile: Option<&str>, session_profile: Option<&str>) -> Slow {
         Slow {

@@ -104,6 +104,27 @@ pub trait MachineSource: Send + Sync {
             "run `ksx winusb release <ID>` (a dry run) and then `--yes` from an elevated prompt",
         ))
     }
+
+    /// Get ksx Studio on screen — start it if nothing is listening, wait for
+    /// the port to answer, then hand the URL to the shell.
+    ///
+    /// Returns the URL, so a surface that cannot open a browser (a cabinet on a
+    /// 10-foot screen with no pointer, a phone across the room) can still
+    /// *display* it. That is the whole reason this returns a string rather than
+    /// `()`: on a cabinet the useful outcome is often "type this on your
+    /// phone", not "a window appeared".
+    ///
+    /// The implementation must never open a browser before the port answers —
+    /// `docs/M9-DECISION.md` §4: *it must never be possible to reach
+    /// `ERR_CONNECTION_REFUSED` by clicking a ksx shortcut.* A menu item that
+    /// opens a browser at a dead port has not opened Studio; it has produced an
+    /// error page with ksx's name on it.
+    fn open_studio(&self) -> Result<String, Refusal> {
+        Err(Refusal::not_here(
+            "opening ksx Studio",
+            "run `ksx studio` and browse to the address it prints",
+        ))
+    }
 }
 
 /// `ksx devices`, presentation-shaped.

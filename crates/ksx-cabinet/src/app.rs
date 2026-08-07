@@ -86,6 +86,10 @@ pub enum Ask {
         preset: String,
         profile: Option<String>,
     },
+    /// Get Studio on screen — start it if nothing is listening, then open a
+    /// browser. The flash carries the URL either way, because on a cabinet the
+    /// useful answer is often "type this on your phone" rather than a window.
+    OpenStudio,
 }
 
 /// A one-line answer, with a tone.
@@ -163,7 +167,7 @@ fn worker(
                 slow.busy = true;
             }
             repaint();
-            let flash = perform(&control, &ask);
+            let flash = perform(&control, &machine, &ask);
             if let Ok(mut slow) = slow.lock() {
                 slow.busy = false;
                 if let Some(flash) = flash {
@@ -177,7 +181,11 @@ fn worker(
 }
 
 /// One verb. Every arm is one `ksx-api` call and nothing else.
-fn perform(control: &Arc<dyn ControlSource>, ask: &Ask) -> Option<Flash> {
+fn perform(
+    control: &Arc<dyn ControlSource>,
+    machine: &Arc<dyn MachineSource>,
+    ask: &Ask,
+) -> Option<Flash> {
     let now = Instant::now();
     let said = |text: String, tone: Tone, remedy: Option<String>| {
         Some(Flash {
@@ -218,6 +226,15 @@ fn perform(control: &Arc<dyn ControlSource>, ask: &Ask) -> Option<Flash> {
             let remedy = outcome.refusal().and_then(|r| r.remedy);
             said(outcome.headline(), tone, remedy)
         }
+        // The URL is the payload, not a decoration: this screen has no pointer
+        // and the phone in the player's hand is a better Studio client than the
+        // cabinet ever will be. So it is shown whether or not a browser opened,
+        // and it goes in `remedy` — the field the footer renders in monospace
+        // for exactly this "here is the thing to type" case.
+        Ask::OpenStudio => match machine.open_studio() {
+            Ok(url) => said(format!("opening Studio — {url}"), Tone::Ok, Some(url)),
+            Err(refusal) => said(refusal.message, Tone::Bad, refusal.remedy),
+        },
     }
 }
 

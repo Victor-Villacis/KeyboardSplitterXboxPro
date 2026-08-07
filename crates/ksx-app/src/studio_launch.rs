@@ -21,6 +21,16 @@ use std::time::{Duration, Instant};
 
 /// Studio's default port — the one `ksx studio` binds and the one this dials.
 const PORT: u16 = 4460;
+
+/// Where Studio will be, spelled once.
+///
+/// Returned to callers so a surface that cannot open a browser can still show
+/// the address. On a 10-foot cabinet screen with a joystick and two buttons,
+/// "type this on your phone" is frequently the *useful* outcome, and a UI that
+/// only knows how to launch a local browser cannot offer it.
+pub fn url() -> String {
+    format!("http://127.0.0.1:{PORT}/")
+}
 /// How long to wait for a freshly started Studio to answer.
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
 const PROBE_EVERY: Duration = Duration::from_millis(150);
@@ -60,7 +70,7 @@ fn ensure_and_open() -> Result<(), String> {
             std::thread::sleep(PROBE_EVERY);
         }
     }
-    let url = format!("http://127.0.0.1:{PORT}/");
+    let url = url();
     ksx_platform::process::shell_open(&url).map_err(|err| format!("{err} ({url})"))
 }
 

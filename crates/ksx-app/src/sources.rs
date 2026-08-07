@@ -510,6 +510,40 @@ impl ksx_api::MachineSource for LocalMachine {
             templates: Vec::new(),
         })
     }
+
+    /// Reuses the tray's own launcher, deliberately.
+    ///
+    /// `crate::studio_launch::open` already carries the property that makes
+    /// this honest — probe, start if needed, WAIT for the port, only then hand
+    /// the URL to the shell — and a second launch path would be a second place
+    /// for that ordering to be got wrong. It returns immediately and does the
+    /// waiting on its own thread, which is also what the cabinet needs: this is
+    /// called from the worker thread, but eight seconds of port-polling is not
+    /// something to hold even a worker on.
+    #[cfg(feature = "studio")]
+    fn open_studio(&self) -> Result<String, Refusal> {
+        // `open` narrates to a writer for the tray's console. This caller has
+        // no console — the flash carries the same sentence — so the narration
+        // goes nowhere and the URL is the return value.
+        crate::studio_launch::open(&mut std::io::sink());
+        Ok(crate::studio_launch::url())
+    }
+
+    /// A cabinet built without `--features studio` has no Studio to open, and
+    /// `studio_launch` is not even compiled in.
+    ///
+    /// The trait's default refusal says "run `ksx studio`", which is a command
+    /// this binary does not have — advice that sends someone to a dead end is
+    /// worse than the refusal it decorates. So this build says what is actually
+    /// true about itself.
+    #[cfg(not(feature = "studio"))]
+    fn open_studio(&self) -> Result<String, Refusal> {
+        Err(Refusal::with_remedy(
+            ksx_api::codes::REFUSED,
+            "this ksx was built without Studio".to_owned(),
+            "rebuild with `--features studio` (the release build ships it)",
+        ))
+    }
 }
 
 #[cfg(test)]
