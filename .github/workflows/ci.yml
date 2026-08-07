@@ -106,3 +106,33 @@ jobs:
           path: target/release/ksx.exe
           if-no-files-found: error
           retention-days: 30
+      # A bare ksx.exe is not something a person can use. `packaging/ksx.iss`
+      # already describes the whole install — Start-menu entries for the tray
+      # daemon, Studio and the cabinet panel, an optional desktop icon, PATH
+      # integration, the bundled ViGEmBus driver, and an uninstaller — but
+      # nothing ever ran it, so the design existed and the artifact did not.
+      #
+      # Inno Setup ships preinstalled on windows-latest, so this needs no new
+      # dependency. ISCC is not on PATH, hence the explicit path.
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw "Inno Setup not found at $iscc" }
+          & $iscc /Qp 'packaging\ksx.iss'
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+          # OutputDir=out in ksx.iss, and it is relative to the .iss file.
+          $setup = Get-ChildItem packaging\out\*setup.exe | Select-Object -First 1
+          if (-not $setup) { throw 'ISCC reported success but produced no setup.exe' }
+          $h = (Get-FileHash $setup -Algorithm SHA256).Hash
+          $mb = [math]::Round($setup.Length / 1MB, 2)
+          Write-Host "$($setup.Name)  $mb MB"
+          Write-Host "SHA256   $h"
+          "### $($setup.Name)`n`n- size: $mb MB`n- SHA256: ``$h```n" |
+            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ksx-windows-installer
+          path: packaging/out/*setup.exe
+          if-no-files-found: error
+          retention-days: 30

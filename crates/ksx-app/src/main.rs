@@ -1541,6 +1541,20 @@ fn main() -> anyhow::Result<()> {
         Command::Studio { port } => studio::run(port),
         #[cfg(feature = "cabinet")]
         Command::Cabinet { demo } => {
+            // The cabinet is a 10-foot panel UI, and the installer puts it on
+            // the Start menu (`packaging/ksx.iss`) — so for most people this
+            // process starts from a double-click, not a terminal. Without this
+            // a black console window sits behind the panel for the life of the
+            // session, which on a cabinet running attract mode is the whole
+            // screen. Same reasoning and same call as `ksx daemon`
+            // (`daemon/mod.rs`), and the notice names the log file first
+            // because it is the last console output this process can produce.
+            //
+            // `ksx.exe` stays a console subsystem binary deliberately — see
+            // `crate::console` — so `ksx cabinet` run from a terminal still
+            // prints everything up to this point.
+            println!("{}", console::detach_notice(crate::logging::active_path()));
+            console::detach();
             if demo {
                 cabinet::run_demo()
             } else {
