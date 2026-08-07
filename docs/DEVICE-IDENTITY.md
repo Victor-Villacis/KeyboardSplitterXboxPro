@@ -2,11 +2,14 @@
 
 > Status: design, partially built. `ksx-core::DeviceSelector` implements the
 > matching rule below and is fully tested. Nothing in a production path calls
-> it yet — see [What is not built](#what-is-not-built).
+> it yet — see §9.
+>
+> Section numbers are load-bearing: `ksx-capture/src/winusb/enumerate.rs` cites
+> §6 and §3 by number. Renumber and those citations start lying.
 
 `crates/ksx-core/src/selector.rs` references this file. This is that file.
 
-## The defect this exists to remove
+## §1 The defect this exists to remove
 
 A `[[device]]` entry holds a raw Windows device instance path:
 
@@ -35,7 +38,7 @@ wizard's commit step — teaches them to hand-author a value they have no way to
 know. Anyone without that exact board, in that exact socket, has no working
 starting point.
 
-## The rule: weakest identity that is still unique
+## §2 The rule: weakest identity that is still unique
 
 Three rungs. Always prefer the weakest one that uniquely picks out one
 connected interface, and escalate only when it does not.
@@ -65,7 +68,7 @@ stated out loud at the moment it is made: *this board is now pinned to this
 socket and will stop working if you move it.* A user who has two identical
 encoders needs to know which of their boards that applies to.
 
-## Why serials are a hint, not a promise
+## §3 Why serials are a hint, not a promise
 
 Measured on the cabinet, not assumed:
 
@@ -85,7 +88,7 @@ rung is *verified at match time*, never trusted at write time: `match_against`
 compares it against every connected interface, and if two answer, it says so
 rather than picking.
 
-## ContainerId groups interfaces into boards
+## §4 ContainerId groups interfaces into boards
 
 One physical I-PAC exposes three interfaces. They are one device to a human and
 three devnodes to Windows:
@@ -103,7 +106,53 @@ is purely how discovery is *presented*.
 Note: nothing in the repository reads `ContainerId` today. It is the one new
 fact enumeration must learn.
 
-## What a vendor id may and may not decide
+## §5 Legacy spellings keep working — and parsing must be lenient
+
+`DeviceSelector::parse` accepts three forms, so no existing config breaks:
+
+- `usb:…` — the form ksx writes from now on.
+- A raw instance path — matched byte-exactly, case-insensitively. Every config
+  written before this design existed holds one of these.
+- An Interception hardware id (`HID\VID_D209&PID_0430&REV_0056&MI_00`) —
+  never matches a USB interface, which is what makes a half-migrated config
+  *diagnosable* rather than merely broken.
+
+**And it must accept a fourth: anything else containing `\`, as an opaque id.**
+This is not a nicety. `parse` currently recognises only `usb:`, `USB\` and
+`HID\` prefixes — but ksx's own setup wizard writes whatever Raw Input reports,
+and for a laptop or PS/2 keyboard that is an ACPI path:
+
+```
+\\.\ACPI#PNP0303#4&1a2b3c4d&0   ->   ACPI\PNP0303\4&1A2B3C4D&0
+```
+
+`rawinput.rs` pins that normalisation with a test, and `upsert_device` commits
+the result verbatim. So a config the wizard itself wrote, for a perfectly
+ordinary keyboard, holds a spelling `parse` rejects. Wire the selector in
+strictly and **that config stops loading** — a laptop user's setup breaks on
+upgrade, with an error about an unrecognised prefix for an id ksx chose.
+
+The codebase already has the right rule and states it plainly at
+`ConfigFile::resolve_device`: *a literal instance path (contains `\`) passes
+through unchanged*. `parse` must match that contract — unknown prefix plus a
+backslash means an opaque raw id with hardware-id semantics (byte-exact,
+case-insensitive, never matches a USB interface). Only a spelling with no
+backslash and no known prefix is a parse error.
+
+A legacy entry that still resolves is never silently rewritten. Rewriting a
+user's config as a side effect of reading it is how you lose their trust once
+and permanently. `ksx device scan` prints the stronger selector it *would*
+write and leaves the decision with them.
+
+**Round-trip constraint:** `parse` uppercases legacy paths and canonicalises
+`usb:` spellings, so a config layer that stores the parsed value and serialises
+it back would rewrite files on load. The raw string must be preserved verbatim
+alongside the parsed form. ksx-config already pins byte-identical round-trip
+with tests; this must not be the change that breaks it — and the test that
+guards it should assert **text** equality, not value equality, or it proves
+nothing about the bytes on disk.
+
+## §6 What a vendor id may and may not decide
 
 The rule the codebase already documents, restated because it is easy to erode:
 
@@ -122,29 +171,7 @@ every user regardless of hardware.
 The `crate::vendors` module those files cite does not exist either. It should:
 one table, one place, display-only by construction.
 
-## Legacy spellings keep working
-
-`DeviceSelector::parse` accepts all three forms, so no existing config breaks:
-
-- `usb:…` — the form ksx writes from now on.
-- A raw instance path — matched byte-exactly, case-insensitively. Every config
-  written before this design existed holds one of these.
-- An Interception hardware id (`HID\VID_D209&PID_0430&REV_0056&MI_00`) —
-  never matches a USB interface, which is what makes a half-migrated config
-  *diagnosable* rather than merely broken.
-
-A legacy entry that still resolves is never silently rewritten. Rewriting a
-user's config as a side effect of reading it is how you lose their trust once
-and permanently. `ksx device scan` prints the stronger selector it *would*
-write and leaves the decision with them.
-
-**Round-trip constraint:** `parse` uppercases legacy paths and canonicalizes
-`usb:` spellings, so a config layer that stores the parsed value and serializes
-it back would rewrite files on load. The raw string must be preserved verbatim
-alongside the parsed form. ksx-config already pins byte-identical round-trip
-with tests; this must not be the change that breaks it.
-
-## Selection stays opt-in
+## §7 Selection stays opt-in
 
 Making discovery dynamic is not permission to make claiming automatic. A
 WinUSB claim removes a keyboard from the Windows input stack — on a machine
@@ -158,7 +185,49 @@ one:
 - `ksx winusb claim` stays dry-run by default, per-device, requires `--yes`
   and elevation, and keeps the existing last-keyboard refusal.
 
-## What is not built
+One corollary that is easy to get wrong: `pick` may set `backend = winusb` only
+for an interface that is **already** WinUSB-bound. Setting it because the
+interface merely *could* be claimed turns a working Interception keyboard into
+a config that refuses to start, in one command that looked like a menu choice.
+For anything not already bound, `pick` writes the Interception backend and
+prints the claim command as the explicit next step.
+
+## §8 Rules for whoever implements this
+
+Four constraints that are not obvious from the type signatures, each of which
+would otherwise be discovered as a bug on the cabinet.
+
+**Two spellings resolving to one board is a refusal, not a dedupe.** If two
+distinct `[[device]]` entries both resolve `Match::One` to the *same* concrete
+interface, that is one physical board silently driving two slots — the exact
+two-identical-boards case this design exists to protect. It is tempting to
+dedupe the resolved list; don't. Today that situation fails loudly, because the
+second WinUSB claim on one interface errors. Keep it loud: refuse, naming both
+aliases and the board they collided on.
+
+**A writer must verify uniqueness before it writes.** `strongest_for` can emit
+a *port* selector that is still ambiguous: twins that share a devnode rather
+than being composite get the identical instance tail (`MI_00`), so the port
+rung does not always discriminate. Every path that prints or persists a
+selector — `pick`, and `scan`'s upgrade suggestion — must confirm the selector
+it chose matches exactly one connected interface, and say so plainly when no
+rung can separate two boards.
+
+**Resolution happens once, at the seam both start and reload share.** Hot-swap
+eligibility compares `DeviceId`s to decide whether a config edit is a
+structural change that must bounce the session. If resolution runs anywhere
+downstream of that comparison, every preset edit will spuriously report "slot
+N's input device changed" and bounce a live session mid-game. Resolve inside
+the factory both paths go through, so what start sees and what reload compares
+are the same values.
+
+**The cabinet's alias table is a consumer.** The live Button-Check screen keys
+device aliases by the raw config id. Once resolution rewrites ids to concrete
+matched paths, a `usb:` spelling in config will no longer match the id arriving
+on the live feed, and the screen the operator actually stands in front of shows
+unnamed devices. It is display-only, and it must ride the same change-set.
+
+## §9 What is not built
 
 `DeviceSelector` has one production consumer — `UsbCandidate::facts()` — and
 two round-trip tests. Everywhere else, identity is still a raw `String`
@@ -185,7 +254,7 @@ compared byte-exactly. The gap, smallest-first:
    off the input stack — identify *before* claiming, which is the twins
    workflow anyway), and cannot run while a session holds the keyboards.
 
-## "Default device" needs no new concept
+## §10 "Default device" needs no new concept
 
 `[[device]]` plus `[[slot]].keyboard = 'panel'` already *is* the default — the
 alias is the stable name, and the selector is what the alias resolves through.
