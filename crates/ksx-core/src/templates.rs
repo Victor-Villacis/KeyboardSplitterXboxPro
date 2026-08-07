@@ -466,6 +466,134 @@ const KEYBOARD_WASD: &[Row] = &[
     ),
 ];
 
+/// **`keyboard-2p`** — ONE keyboard, TWO players, no encoder.
+///
+/// The couch case `keyboard-wasd` cannot serve: two people, one Steam game, one
+/// keyboard between them. `keyboard-wasd` hands a single player the whole board
+/// — WASD *and* the arrows *and* the numpad — so instantiating it for two slots
+/// would drive both pads off the same keys.
+///
+/// The split is by HAND POSITION, not by taste, because the two players are
+/// sitting elbow to elbow. Player 2's entire block lives past the right edge of
+/// the letters: their left hand on the arrow cluster, their right hand on the
+/// numpad, neither of them over player 1's keys. Player 1 keeps the left hand's
+/// own territory — WASD and the letters that ring it.
+///
+/// Player 1's buttons are `keyboard-wasd`'s, key for key (Space=A, C=B, R=X,
+/// F=Y, Q/E, Z/X, LeftShift, V), so anyone who learned that template keeps
+/// their fingers. Only Start and Back move: `keyboard-wasd` puts them on Enter
+/// and Backspace, which sit inches from player 2's arrow hand.
+///
+/// Player 2's numpad IS a pad face — 8·4·6·2 is the Y·X·B·A diamond in the same
+/// geometry as the buttons on the controller, and the four corners of that 3×3
+/// are the shoulders, bumpers above triggers the way they stack on the pad. The
+/// whole block is one hand span, thumb on Numpad0 and NumpadEnter.
+///
+/// Neither block carries a right stick: half a keyboard has no second four-key
+/// cluster inside one hand's reach. The games two people share a keyboard for —
+/// platformers, fighters, sports, party games — read the left stick and the
+/// hat, and both are bound.
+const KEYBOARD_2P: &[Row] = &[
+    // Movement drives the hat AND the left stick. Unlike `keyboard-wasd` there
+    // is no spare cluster to put the other one on, so a game that reads only
+    // the hat and a game that reads only the stick both have to work off these
+    // four keys.
+    row(
+        dpad(DpadDirection::Up),
+        [Key::W, Key::Up, Key::None, Key::None],
+    ),
+    row(
+        axis(Axis::Y, AXIS_MAX),
+        [Key::W, Key::Up, Key::None, Key::None],
+    ),
+    row(
+        dpad(DpadDirection::Down),
+        [Key::S, Key::Down, Key::None, Key::None],
+    ),
+    row(
+        axis(Axis::Y, AXIS_MIN),
+        [Key::S, Key::Down, Key::None, Key::None],
+    ),
+    row(
+        dpad(DpadDirection::Left),
+        [Key::A, Key::Left, Key::None, Key::None],
+    ),
+    row(
+        axis(Axis::X, AXIS_MIN),
+        [Key::A, Key::Left, Key::None, Key::None],
+    ),
+    row(
+        dpad(DpadDirection::Right),
+        [Key::D, Key::Right, Key::None, Key::None],
+    ),
+    row(
+        axis(Axis::X, AXIS_MAX),
+        [Key::D, Key::Right, Key::None, Key::None],
+    ),
+    // Face buttons: P1 keeps the verbs from `keyboard-wasd`; P2 gets the numpad
+    // diamond, which already has the pad's own A-bottom / Y-top geometry.
+    row(
+        button(XButton::A),
+        [Key::Space, Key::Numpad2, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::B),
+        [Key::C, Key::Numpad6, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::X),
+        [Key::R, Key::Numpad4, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::Y),
+        [Key::F, Key::Numpad8, Key::None, Key::None],
+    ),
+    // Shoulders: the corners of P2's 3×3, bumpers on the top row and triggers
+    // on the bottom, so the hand never leaves the block it holds the face
+    // buttons with.
+    row(
+        button(XButton::LeftBumper),
+        [Key::Q, Key::Numpad7, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::RightBumper),
+        [Key::E, Key::Numpad9, Key::None, Key::None],
+    ),
+    row(
+        trigger(Trigger::Left),
+        [Key::Z, Key::Numpad1, Key::None, Key::None],
+    ),
+    row(
+        trigger(Trigger::Right),
+        [Key::X, Key::Numpad3, Key::None, Key::None],
+    ),
+    // Thumbs: sprint goes on the Shift each player's hand is already resting
+    // against — LeftShift under P1's pinky at WASD, RightShift just above P2's
+    // arrow cluster.
+    row(
+        button(XButton::LeftThumb),
+        [Key::LeftShift, Key::RightShift, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::RightThumb),
+        [Key::V, Key::Numpad5, Key::None, Key::None],
+    ),
+    // Start and Back stay inside each player's own half: pausing must not mean
+    // reaching across the other player's hands, which Enter and Backspace
+    // (`keyboard-wasd`'s pair) would for P1 and Escape would for P2. P1's Tab
+    // is the PC convention for Back and the one key their pinky already rests
+    // beside; the price is that Alt+Tab is consumed while this preset is
+    // loaded, which `ksx map --function back --key G` buys back.
+    row(
+        button(XButton::Start),
+        [Key::One, Key::NumpadEnter, Key::None, Key::None],
+    ),
+    row(
+        button(XButton::Back),
+        [Key::Tab, Key::Numpad0, Key::None, Key::None],
+    ),
+];
+
 /// Every in-box template, in the order `ksx preset list --templates` prints
 /// them: the panels first, the two built-in floors last.
 pub const TEMPLATES: &[Template] = &[
@@ -503,6 +631,21 @@ use this template for all of them — bindings are per-slot, so nothing \
 collides.",
         players: 1,
         body: Body::Rows(KEYBOARD_WASD),
+    },
+    Template {
+        id: "keyboard-2p",
+        summary: "Two players sharing ONE keyboard: WASD vs the arrows",
+        panel: "Two people on one ordinary keyboard, no encoder — the couch \
+co-op case. Player 1 keeps the left hand on WASD (hat AND left stick) with \
+Space=A, C=B, R=X, F=Y, Q/E bumpers, Z/X triggers, LeftShift/V thumbsticks, \
+1=Start, Tab=Back. Player 2 sits to the right of the letters: the arrows are \
+the hat and left stick, the numpad is the pad face (Numpad 8·4·6·2 = Y·X·B·A) \
+with Numpad7/9 bumpers, Numpad1/3 triggers, RightShift/Numpad5 thumbsticks, \
+NumpadEnter=Start, Numpad0=Back. The two blocks share no key, so one press \
+moves one player. Neither has a right stick — there is no room for one on half \
+a keyboard; use keyboard-wasd on a keyboard each when a game needs it.",
+        players: 2,
+        body: Body::Rows(KEYBOARD_2P),
     },
     Template {
         id: "default",
@@ -662,7 +805,7 @@ mod tests {
     /// Every direction of every panel template drives the hat AND the stick.
     #[test]
     fn directions_drive_both_the_hat_and_the_stick() {
-        for id in ["arcade-6button", "arcade-4way"] {
+        for id in ["arcade-6button", "arcade-4way", "keyboard-2p"] {
             let template = find(id).unwrap();
             for player in 1..=template.players {
                 let preset = template.instantiate("Try", player).unwrap();
@@ -749,6 +892,154 @@ mod tests {
             keys_for(&p2, Binding::Button(XButton::Start)),
             vec![Key::Two]
         );
+    }
+
+    /// `keyboard-2p` is the one template where two people press the SAME
+    /// physical keyboard, so a key in both blocks would move both players at
+    /// once. Overlap is checked for every template; what this pins is WHERE the
+    /// keys are — player 2's whole block has to sit past the right edge of the
+    /// letters (arrow cluster, numpad, RightShift) or their hands land on
+    /// player 1's, which no amount of reading the table by eye catches.
+    #[test]
+    fn the_two_player_keyboard_keeps_each_player_out_of_the_others_half() {
+        let template = find("keyboard-2p").unwrap();
+        let p1: BTreeSet<Key> = template.keys_for(1).into_iter().collect();
+        let p2: BTreeSet<Key> = template.keys_for(2).into_iter().collect();
+        let shared: Vec<&Key> = p1.intersection(&p2).collect();
+        assert!(
+            shared.is_empty(),
+            "one press would move both players: {shared:?}"
+        );
+
+        // Player 2's territory, defined by the keyboard and not by the table
+        // above: the clusters right of the letters, plus the right-hand
+        // modifiers that border them. Spelled out in full so that moving a
+        // control onto some *other* numpad or nav key still trips the check.
+        let right_of_the_letters = |key: Key| {
+            matches!(
+                key,
+                Key::Up
+                    | Key::Down
+                    | Key::Left
+                    | Key::Right
+                    | Key::Home
+                    | Key::End
+                    | Key::PageUp
+                    | Key::PageDown
+                    | Key::Insert
+                    | Key::Delete
+                    | Key::NumLock
+                    | Key::NumpadDivide
+                    | Key::NumpadAsterisk
+                    | Key::NumpadMinus
+                    | Key::NumpadPlus
+                    | Key::NumpadEnter
+                    | Key::NumpadDelete
+                    | Key::Numpad0
+                    | Key::Numpad1
+                    | Key::Numpad2
+                    | Key::Numpad3
+                    | Key::Numpad4
+                    | Key::Numpad5
+                    | Key::Numpad6
+                    | Key::Numpad7
+                    | Key::Numpad8
+                    | Key::Numpad9
+                    | Key::RightShift
+                    | Key::RightControl
+                    | Key::RightAlt
+                    | Key::RightWindows
+                    | Key::Menu
+            )
+        };
+        for key in &p2 {
+            assert!(
+                right_of_the_letters(*key),
+                "p2's {} is back in player 1's half",
+                key.name()
+            );
+        }
+        for key in &p1 {
+            assert!(
+                !right_of_the_letters(*key),
+                "p1's {} reaches into player 2's half",
+                key.name()
+            );
+        }
+    }
+
+    /// Player 2 is not the lesser seat: a game that reads LT must work from
+    /// both sides of the keyboard, so both blocks emit the same control set.
+    #[test]
+    fn both_seats_of_the_two_player_keyboard_reach_the_same_controls() {
+        let template = find("keyboard-2p").unwrap();
+        let controls = |player: u8| -> BTreeSet<Binding> {
+            template
+                .instantiate("Try", player)
+                .unwrap()
+                .entries
+                .iter()
+                .map(|(_, binding)| *binding)
+                .collect()
+        };
+        assert_eq!(controls(1), controls(2));
+    }
+
+    #[test]
+    fn the_two_player_keyboards_numpad_is_the_pad_face() {
+        let p2 = instantiate("keyboard-2p", "P2", 2).unwrap();
+        // The diamond in the pad's own geometry: 8 on top, 2 at the bottom.
+        assert_eq!(
+            keys_for(&p2, Binding::Button(XButton::Y)),
+            vec![Key::Numpad8]
+        );
+        assert_eq!(
+            keys_for(&p2, Binding::Button(XButton::A)),
+            vec![Key::Numpad2]
+        );
+        assert_eq!(
+            keys_for(&p2, Binding::Button(XButton::X)),
+            vec![Key::Numpad4]
+        );
+        assert_eq!(
+            keys_for(&p2, Binding::Button(XButton::B)),
+            vec![Key::Numpad6]
+        );
+        assert_eq!(
+            keys_for(
+                &p2,
+                Binding::Axis {
+                    axis: Axis::Y,
+                    value: AXIS_MAX
+                }
+            ),
+            vec![Key::Up]
+        );
+
+        // Player 1's block is `keyboard-wasd`'s buttons, key for key — the
+        // whole reason that claim is in the docs is that a player who learned
+        // the solo template must not have to relearn anything to sit down at
+        // player 1.
+        let p1 = instantiate("keyboard-2p", "P1", 1).unwrap();
+        let solo = instantiate("keyboard-wasd", "Solo", 1).unwrap();
+        for control in [
+            Binding::Button(XButton::A),
+            Binding::Button(XButton::B),
+            Binding::Button(XButton::X),
+            Binding::Button(XButton::Y),
+            Binding::Button(XButton::LeftBumper),
+            Binding::Button(XButton::RightBumper),
+            Binding::Trigger(Trigger::Left),
+            Binding::Trigger(Trigger::Right),
+            Binding::Button(XButton::LeftThumb),
+            Binding::Button(XButton::RightThumb),
+        ] {
+            assert_eq!(
+                keys_for(&p1, control),
+                keys_for(&solo, control),
+                "{control:?}"
+            );
+        }
     }
 
     /// `default` and `empty` are the built-ins, copied — same entries, a new

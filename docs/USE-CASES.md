@@ -73,7 +73,10 @@ has none of that:
   beside the built-ins: `arcade-6button` (I-PAC2/MAME six-button fighting panel,
   P1–P2 key blocks), `arcade-4way` (MAME's four-player chart, P1–P4),
   `keyboard-wasd` (one ordinary keyboard — give each player their own and
-  nothing collides), plus `default`/`empty` as named seeds. `ksx preset list
+  nothing collides), `keyboard-2p` (T1 without an encoder: ONE desk keyboard
+  split into two disjoint key blocks, P1 on WASD and P2 on the arrows plus the
+  numpad, for a two-player Steam game with no arcade hardware in the house),
+  plus `default`/`empty` as named seeds. `ksx preset list
   --templates` / `ksx preset new <NAME> --from-template <ID> [--player N]`.
   Every direction binds the hat AND the left stick, because some games read only
   one; that is fan-out, not duplication.
