@@ -703,10 +703,17 @@ pub fn schtasks_exe() -> PathBuf {
 }
 
 /// Run `schtasks` with `argv`, returning its decoded stdout.
+///
+/// `no_window`, and this is the call that proved why: `ksx autostart --status`
+/// is one of the read-only collectors behind `StatusSource::snapshot`, which
+/// the cabinet window re-runs **every two seconds**. Inside a daemon that has
+/// released its console, each of those spawns opened, drew and destroyed a
+/// console window of its own — the "ghost window that flashes but never fully
+/// loads" over the cabinet UI. Its output is captured and parsed here; nobody
+/// was ever meant to read it on screen.
 #[cfg(windows)]
 fn schtasks(argv: &[String]) -> Result<String, AutostartError> {
-    let out = std::process::Command::new(schtasks_exe())
-        .args(argv)
+    let out = crate::process::no_window(std::process::Command::new(schtasks_exe()).args(argv))
         .output()
         .map_err(|e| AutostartError::SchtasksUnavailable(e.to_string()))?;
     let stdout = decode_console_output(&out.stdout);

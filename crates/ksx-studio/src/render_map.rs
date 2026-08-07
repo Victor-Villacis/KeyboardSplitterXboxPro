@@ -60,7 +60,7 @@ use forma_ir::parser::IrModule;
 use forma_ir::slot::{SlotData, SlotValue};
 use forma_server::{render_page, PageConfig, PageOutput, RenderMode};
 
-use crate::render::{art_for, body_prefix, daemon_command, EmbeddedPage};
+use crate::render::{art_for, body_prefix, daemon_command, with_icon_links, EmbeddedPage};
 use crate::snapshot::{MacroStepView, MacroView, MapPayload, MapperSlot};
 
 /// List slot names (binding-derived, compiler 0.2.0). The zones list appears
@@ -3070,8 +3070,10 @@ fn build_slots(module: &IrModule, payload: &MapPayload, flash: Option<&str>) -> 
 }
 
 /// Same anti-flash CSS as the status page (render.rs PERSONALITY_CSS).
-const PERSONALITY_CSS: &str = "body{background:#0b0e14;color:#dbe2ef;margin:0}\
-@media (prefers-color-scheme:light){body{background:#f2f4f8;color:#1a2130}}";
+/// Kept byte-identical to it; `tests/contrast.rs` pins both against the
+/// `--bg`/`--text` tokens in studio.css so the copies cannot drift apart.
+const PERSONALITY_CSS: &str = "body{background:#120c1c;color:#f0ebe0;margin:0}\
+@media (prefers-color-scheme:light){body{background:#f6f3ee;color:#1c1428}}";
 
 /// Render `/map` for one payload. The `selected` inside the payload drives
 /// the SSR slot pick; the client keeps its own selection after hydration.
@@ -3085,7 +3087,7 @@ pub(crate) fn render_map(
 ) -> PageOutput {
     let slots = build_slots(&page.module, payload, flash);
     let prefix = body_prefix(payload, "/map");
-    render_page(&PageConfig {
+    with_icon_links(render_page(&PageConfig {
         title: "ksx Studio — mapper",
         route_pattern: "/map",
         manifest: &page.manifest,
@@ -3096,7 +3098,7 @@ pub(crate) fn render_map(
         render_mode: RenderMode::Phase2SsrReconcile,
         ir_module: Some(&page.module),
         slots: Some(&slots),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -3425,6 +3427,15 @@ mod tests {
             &MAP_CLIENT_ONLY_SLOTS,
             &MAP_ANONYMOUS_SLOTS,
         );
+    }
+
+    /// The mapper wears the same face as the status page: the icon links go
+    /// through the shared oracle in `render.rs`, so the two pages cannot
+    /// declare different icons.
+    #[test]
+    fn icon_links_are_in_the_mapper_head() {
+        let out = render_map(&page(), &sample(), None);
+        crate::render::assert_icon_links_in_head("/map", &out.html);
     }
 
     /// The big one: real bindings from the payload land as key tags in the

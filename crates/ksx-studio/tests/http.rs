@@ -475,6 +475,90 @@ fn body_of(response: &str) -> &str {
         .unwrap_or("")
 }
 
+/// [`get`], for responses whose body is not UTF-8 — the brand icons.
+/// Returns `(headers, body)` with the body left as bytes.
+fn get_binary(addr: SocketAddr, path: &str) -> (String, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let split = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or_else(|| panic!("{path}: no header/body separator in the response"));
+    let headers = String::from_utf8_lossy(&response[..split]).into_owned();
+    (headers, response[split + 4..].to_vec())
+}
+
+/// The brand icons are served at the ROOT paths their consumers hard-code —
+/// a browser asks for `/favicon.ico` and iOS probes `/apple-touch-icon.png`
+/// with no prompting from the markup — with content types that make them
+/// icons rather than downloads.
+///
+/// Compared BYTE FOR BYTE against the embedded files. A 404 would be found by
+/// anything; the failure worth a test is a 200 carrying a truncated or
+/// re-encoded image, which renders as a perfectly normal page with a blank
+/// tab and no error anywhere.
+#[test]
+fn the_brand_icons_are_served_at_their_root_paths() {
+    let addr = start_server(Arc::new(ScriptedControl::new(true)));
+
+    for (path, mime, expected) in [
+        (
+            "/favicon.ico",
+            "image/x-icon",
+            include_bytes!("../brand/favicon.ico").as_slice(),
+        ),
+        (
+            "/favicon.svg",
+            "image/svg+xml",
+            include_bytes!("../brand/favicon.svg").as_slice(),
+        ),
+        (
+            "/apple-touch-icon.png",
+            "image/png",
+            include_bytes!("../brand/apple-touch-icon.png").as_slice(),
+        ),
+    ] {
+        let (headers, body) = get_binary(addr, path);
+        assert!(headers.starts_with("HTTP/1.1 200"), "{path}: {headers}");
+        assert!(
+            headers.to_ascii_lowercase().contains(mime),
+            "{path}: expected content-type {mime}\n{headers}"
+        );
+        assert_eq!(
+            body.len(),
+            expected.len(),
+            "{path}: served {} bytes, embed has {}",
+            body.len(),
+            expected.len()
+        );
+        assert!(
+            body == expected,
+            "{path}: served bytes differ from the embed"
+        );
+    }
+
+    // And the page points at all three, so the icons are not merely reachable
+    // by luck of the browser's default probing.
+    let page = get(addr, "/");
+    for link in [
+        r#"href="/favicon.svg""#,
+        r#"href="/favicon.ico""#,
+        r#"href="/apple-touch-icon.png""#,
+    ] {
+        assert!(page.contains(link), "status page missing {link}");
+    }
+}
+
 #[test]
 fn the_session_panel_round_trips_start_stop_and_the_flash() {
     let control = Arc::new(ScriptedControl::new(false));

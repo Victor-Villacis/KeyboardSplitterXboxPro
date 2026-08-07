@@ -256,13 +256,23 @@ pub fn spawn_in_daemon(
         let spawned = std::thread::Builder::new()
             .name("ksx-cabinet".into())
             .spawn(move || {
+                tracing::info!("cabinet host: thread up, parked waiting for an open request");
+                let mut opened: u64 = 0;
                 while open_rx.recv().is_ok() {
+                    opened += 1;
                     on_screen.store(true, Ordering::SeqCst);
                     // A FRESH subscription and a fresh alias table per window:
                     // the previous one went away with the previous `App`, and
                     // the config may have been edited in between.
                     let mut subscription = feed.subscribe();
-                    subscription.set_aliases(device_aliases(&root));
+                    let aliases = device_aliases(&root);
+                    tracing::info!(
+                        open = opened,
+                        aliases = aliases.len(),
+                        subscribers = feed.subscriber_count(),
+                        "cabinet host: opening the window"
+                    );
+                    subscription.set_aliases(aliases);
                     let cabinet = ksx_cabinet::Cabinet {
                         status: Arc::new(crate::sources::CollectorSource),
                         control: Arc::new(ksx_api::Client::new(daemon_sink(
@@ -290,7 +300,23 @@ pub fn spawn_in_daemon(
                         tracing::error!(%err, "the cabinet window could not be opened");
                     }
                     on_screen.store(false, Ordering::SeqCst);
+                    // **The line that answers "did closing the window kill the
+                    // daemon".** The host thread is still here, the daemon is
+                    // still here, and the pipeline is back to paying nothing —
+                    // `subscribers` is the proof of the last part. Nothing
+                    // below this loop sends `Quit`, and nothing may ever start
+                    // (`daemon::tests::closing_the_cabinet_window_leaves_the_
+                    // daemon_running`).
+                    tracing::info!(
+                        open = opened,
+                        subscribers = feed.subscriber_count(),
+                        "cabinet host: window closed; the daemon keeps running and the tray \
+                         icon stays — Quit is the tray's alone"
+                    );
                 }
+                // Only reachable if every `Host::open` sender is gone, which
+                // means the daemon itself is being torn down.
+                tracing::info!("cabinet host: thread ending (the daemon is shutting down)");
             });
         if spawned.is_err() {
             // `open_rx` went with the closure, so every later `try_send`
@@ -421,5 +447,82 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The window host cannot end the daemon, and the source says so.**
+    ///
+    /// [`super::spawn_in_daemon`]'s host thread holds a
+    /// `Sender<DaemonCommand>` — it has to, that is how the window drives
+    /// start/stop — so "closing the window does not quit the daemon" is one
+    /// `tx.send(Quit)` away from being false, in a thread nobody watches, on a
+    /// path a unit test cannot enter (it needs a real window).
+    ///
+    /// Asserted over the source for the same reason
+    /// `run::tests::the_session_writer_never_holds_a_std_stream_lock` is: the
+    /// mistake is a one-line edit and the symptom is a cabinet that dies when
+    /// somebody shuts a status panel.
+    #[test]
+    fn the_window_host_never_sends_quit() {
+        let source = include_str!("cabinet.rs");
+        let host = source
+            .split("pub fn spawn_in_daemon")
+            .nth(1)
+            .expect("the host lives here")
+            .split("fn device_aliases")
+            .next()
+            .expect("device_aliases follows it");
+        for forbidden in [
+            "DaemonCommand::Quit",
+            "PostQuitMessage",
+            "process::exit",
+            "std::process::abort",
+        ] {
+            assert!(
+                !host.contains(forbidden),
+                "the cabinet host must not be able to end the daemon, but '{forbidden}' \
+                 appears in spawn_in_daemon"
+            );
+        }
+    }
+
+    /// **Every edge of the window's life is logged.**
+    ///
+    /// A full evening's hardware session produced not one line from the
+    /// cabinet — no window created, no first frame, no exit — which is why a
+    /// ghost window flashing over the panel could not be diagnosed at all. The
+    /// log file is the ONLY surface these threads have: the daemon released its
+    /// console before the window existed.
+    ///
+    /// This holds the edges rather than the wording: each of the two hosting
+    /// layers must still say when a window is asked for, when it comes back,
+    /// and when something fails.
+    #[test]
+    fn the_window_hosts_lifecycle_is_in_the_log() {
+        let host = include_str!("cabinet.rs");
+        for edge in [
+            "cabinet host: thread up",
+            "cabinet host: opening the window",
+            "cabinet host: window closed",
+        ] {
+            assert!(host.contains(edge), "the host must log '{edge}'");
+        }
+        // ...and the window's own half, in the crate that draws it.
+        let window = include_str!("../../ksx-cabinet/src/app.rs");
+        for edge in [
+            "cabinet window: first frame painted",
+            "cabinet window: close requested",
+            "cabinet window: closed",
+            "the viewport count changed",
+        ] {
+            assert!(window.contains(edge), "the window must log '{edge}'");
+        }
+        let launch = include_str!("../../ksx-cabinet/src/lib.rs");
+        for edge in [
+            "cabinet window: entering the event loop",
+            "cabinet window: viewport created",
+            "cabinet window: event loop returned",
+        ] {
+            assert!(launch.contains(edge), "the launcher must log '{edge}'");
+        }
     }
 }

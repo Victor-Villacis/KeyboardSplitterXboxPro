@@ -81,13 +81,21 @@ fn answering() -> bool {
 /// `current_exe`, never a `PATH` lookup: a daemon started from a build tree, a
 /// staging folder or an installer must launch the binary it IS, not whichever
 /// ksx happens to be first on the path.
+/// `no_window`, and this one is the worst of the family: the child is a
+/// **long-lived server**, so the console window it would otherwise be given
+/// does not flash — it sits on the cabinet's game screen for as long as Studio
+/// is up, and closing it kills Studio. The daemon that starts it has already
+/// released its own console, which is exactly the condition under which Windows
+/// hands a console-subsystem child a fresh one.
 fn start_studio() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|err| format!("cannot find my own path: {err}"))?;
-    std::process::Command::new(&exe)
-        .arg("studio")
-        .arg("--port")
-        .arg(PORT.to_string())
-        .spawn()
-        .map(|_| ())
-        .map_err(|err| format!("could not start `{} studio`: {err}", exe.display()))
+    ksx_platform::process::no_window(
+        std::process::Command::new(&exe)
+            .arg("studio")
+            .arg("--port")
+            .arg(PORT.to_string()),
+    )
+    .spawn()
+    .map(|_| ())
+    .map_err(|err| format!("could not start `{} studio`: {err}", exe.display()))
 }

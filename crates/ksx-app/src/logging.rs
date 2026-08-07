@@ -597,19 +597,25 @@ mod tests {
         }
         let tmp = TempDir::new("panic");
         let exe = std::env::current_exe().expect("the test binary");
-        let output = std::process::Command::new(exe)
-            .args([
-                "--exact",
-                "logging::tests::the_child_that_panics",
-                "--ignored",
-                "--nocapture",
-                // One thread, so nothing else in this binary runs alongside a
-                // process that is deliberately dying.
-                "--test-threads=1",
-            ])
-            .env(CHILD_ROOT, tmp.path())
-            .output()
-            .expect("spawning the child test");
+        // `no_window` like every other ksx spawn: the child's output is taken
+        // through `.output()` and asserted on below, so a console of its own
+        // would show nobody anything — and `cargo test` under a GUI runner has
+        // no console to inherit either.
+        let output = ksx_platform::process::no_window(
+            std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "logging::tests::the_child_that_panics",
+                    "--ignored",
+                    "--nocapture",
+                    // One thread, so nothing else in this binary runs alongside
+                    // a process that is deliberately dying.
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ROOT, tmp.path()),
+        )
+        .output()
+        .expect("spawning the child test");
 
         assert!(
             !output.status.success(),

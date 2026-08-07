@@ -150,6 +150,45 @@ impl ConfigFile {
             .map_err(Into::into)
     }
 
+    /// The same resolution for a `[[game.slot]]`.
+    ///
+    /// **A game slot resolves through THIS config's `[[device]]` table**, and
+    /// that is not a convenience — it is the difference between a working
+    /// cabinet and a dead panel. Backend selection (`[[device]] backend =
+    /// "winusb"`) is a property of the *device*, matched by instance path, so a
+    /// game slot that kept `keyboard = "ipac"` as a literal `DeviceId` matched
+    /// no `[[device]]` entry, selected no WinUSB claim, and silently ran the
+    /// session on Interception — which cannot see a claimed board at all. The
+    /// panel is simply dead, with nothing in any log to say why.
+    ///
+    /// Legacy games.toml files persist full instance paths and keep working:
+    /// [`ConfigFile::resolve_device`] passes anything containing a `\` through
+    /// untouched. What changes is that an alias now means the same thing in
+    /// both files, and a reference that means nothing in either is an error
+    /// instead of a literal.
+    pub fn game_slot_spec(
+        &self,
+        slot: &crate::games::GameSlotEntry,
+    ) -> Result<SlotSpec, ConfigError> {
+        let keyboard = slot
+            .keyboard
+            .as_deref()
+            .map(|k| self.resolve_device(k))
+            .transpose()?;
+        let mouse = slot
+            .mouse
+            .as_deref()
+            .map(|m| self.resolve_device(m))
+            .transpose()?;
+        SlotSpec::new(slot.number, keyboard, mouse, slot.preset.clone())
+            .map(|spec| {
+                spec.with_persona(slot.persona)
+                    .with_socd(slot.socd)
+                    .with_macros(slot.macros)
+            })
+            .map_err(Into::into)
+    }
+
     /// Reverse of [`ConfigFile::slot_spec`]: an instance path folds back to
     /// its alias when a `[[device]]` entry matches.
     pub fn slot_entry(&self, spec: &SlotSpec) -> SlotEntry {
@@ -290,6 +329,28 @@ preset = "street-fighter-p1"
         // And back: the id folds to its alias.
         let entry = cfg.slot_entry(&spec);
         assert_eq!(entry, cfg.slots[0]);
+    }
+
+    /// A `[[game.slot]]` and a `[[slot]]` naming the same alias must produce
+    /// the same [`SlotSpec`]. They are two spellings of one sentence, and the
+    /// day they stopped agreeing a claimed panel went dead with no error.
+    #[test]
+    fn a_game_slot_resolves_the_same_alias_the_same_way() {
+        let cfg: ConfigFile = toml::from_str(DOC_EXAMPLE).unwrap();
+        let game: crate::games::GameSlotEntry =
+            toml::from_str("number = 1\nkeyboard = \"P1 I-PAC\"\npreset = \"street-fighter-p1\"\n")
+                .unwrap();
+        assert_eq!(
+            cfg.game_slot_spec(&game).unwrap(),
+            cfg.slot_spec(&cfg.slots[0]).unwrap()
+        );
+        // ...and an alias nothing defines is an error, not a literal id.
+        let ghost: crate::games::GameSlotEntry =
+            toml::from_str("number = 1\nkeyboard = \"ipac\"\npreset = \"p\"\n").unwrap();
+        assert!(matches!(
+            cfg.game_slot_spec(&ghost),
+            Err(ConfigError::UnknownDeviceAlias(_))
+        ));
     }
 
     #[test]

@@ -694,6 +694,20 @@ pub fn control_loop_with(
                 // the typethrough's own Drop is the second line of defence.
                 panel.set_emulating(false);
                 set_run(&state, RunState::Quitting);
+                // **Say WHY, in the log.** A daemon that has released its
+                // console leaves exactly two lines behind on the way out
+                // (`panel::Panel::shutdown` — "released its WinUSB claim,
+                // reason=Shutdown" and "typethrough stopped"), and neither of
+                // them says what asked for the shutdown. Reading that pair
+                // after an evening's session, "did closing the cabinet window
+                // do this?" is unanswerable — which is how the question got
+                // asked in the first place. `Quit` reaches this arm only from
+                // the tray's Quit item, a `quit` on stdin, or a pipe client.
+                tracing::info!(
+                    cause = "quit-command",
+                    "daemon shutting down: a Quit command was received (tray menu, stdin, or \
+                     the control pipe). Closing a cabinet or Studio window never sends one"
+                );
                 let _ = writeln!(out, "bye");
                 let _ = out.flush();
                 return;
@@ -709,6 +723,14 @@ pub fn control_loop_with(
                 }
                 panel.set_emulating(false);
                 set_run(&state, RunState::Quitting);
+                // The other half of the "why did the daemon stop" answer, and
+                // the one that used to be indistinguishable from the first.
+                tracing::warn!(
+                    cause = "command-channel-disconnected",
+                    "daemon shutting down: every command sender is gone (the tray thread died, \
+                     or stdin closed). Nobody could talk to it, so it must not sit on the \
+                     keyboards"
+                );
                 let _ = out.flush();
                 return;
             }
@@ -2470,6 +2492,143 @@ mod tests {
             !text.contains("stopping…"),
             "opening a window must not stop a session: {text}"
         );
+    }
+
+    /// **Closing the cabinet window leaves the daemon running and the tray
+    /// icon on screen.**
+    ///
+    /// The other half of [`opening_a_surface_never_stops_a_session`], and the
+    /// one that was never asserted. A full hardware session ended with a clean
+    /// `reason=Shutdown` in the log and no way to tell whether shutting the
+    /// panel had caused it — because the window emitted nothing, and the two
+    /// shutdown lines the daemon does leave (`panel::Panel::shutdown`) name no
+    /// cause.
+    ///
+    /// Proved here rather than reasoned about: the loop keeps serving commands
+    /// *after* a window has been opened and closed, and the daemon's run state
+    /// is untouched by it. That second assertion is exactly the tray's liveness
+    /// — `tray::wnd_proc`'s timer calls `PostQuitMessage` **iff** the state is
+    /// `RunState::Quitting`, so "not Quitting" is "the icon is still there"
+    /// (see [`the_tray_icon_leaves_only_on_quit_or_a_quitting_state`]).
+    #[test]
+    fn closing_the_cabinet_window_leaves_the_daemon_running_and_the_tray_alive() {
+        /// Models `crate::cabinet::spawn_in_daemon`'s host thread: it holds the
+        /// SAME `Sender<DaemonCommand>` the real host does, runs a window for
+        /// its whole life, and returns when the user closes it. What matters is
+        /// what it does *not* do on the way out.
+        struct ClosingWindow {
+            _tx: Sender<DaemonCommand>,
+            closed: Arc<AtomicBool>,
+        }
+        impl UiHost for ClosingWindow {
+            fn open_cabinet(&self, _out: &mut dyn Write) {
+                // open … draw … close. No verb, no Quit, no channel drop.
+                self.closed.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let (tx, rx) = unbounded();
+        let closed = Arc::new(AtomicBool::new(false));
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        let ran = Arc::new(AtomicBool::new(false));
+        let makes = Arc::new(Mutex::new(0u32));
+
+        let host = ClosingWindow {
+            _tx: tx.clone(),
+            closed: closed.clone(),
+        };
+        let loop_state = state.clone();
+        let loop_ran = ran.clone();
+        let loop_makes = makes.clone();
+        let daemon = std::thread::spawn(move || {
+            let mut factory = FakeFactory {
+                ran: loop_ran,
+                makes: loop_makes,
+                ..FakeFactory::default()
+            };
+            let mut out: Vec<u8> = Vec::new();
+            control_loop_with(rx, loop_state, &mut factory, &mut NoPanel, &host, &mut out);
+            String::from_utf8(out).unwrap()
+        });
+
+        tx.send(DaemonCommand::Start { game: None }).unwrap();
+        tx.send(DaemonCommand::OpenCabinet).unwrap();
+
+        // The window opened and closed…
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !closed.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(closed.load(Ordering::SeqCst), "the window never opened");
+
+        // …and the daemon is still here, still serving, still running the
+        // session. `Status` is answered, which a returned loop could not do.
+        tx.send(DaemonCommand::Status).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if matches!(
+                state.lock().unwrap().run,
+                RunState::Running { .. } | RunState::Starting
+            ) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !daemon.is_finished(),
+            "the control loop returned when a window closed"
+        );
+        let seen = state.lock().unwrap().clone();
+        assert!(
+            !matches!(seen.run, RunState::Quitting),
+            "a closed window put the daemon into Quitting, which is what makes the tray \
+             icon disappear: {:?}",
+            seen.run
+        );
+        assert!(
+            matches!(seen.run, RunState::Running { .. } | RunState::Starting),
+            "the session must survive the window: {:?}",
+            seen.run
+        );
+
+        // Only the tray's own Quit ends it.
+        tx.send(DaemonCommand::Quit).unwrap();
+        let text = daemon.join().expect("the control loop");
+        assert_eq!(*makes.lock().unwrap(), 1, "{text}");
+        assert!(ran.load(Ordering::SeqCst), "{text}");
+        assert!(text.contains("bye"), "{text}");
+    }
+
+    /// The tray icon goes away for exactly two reasons, and a closed window is
+    /// neither.
+    ///
+    /// `tray::pump` returns on `WM_QUIT` and nothing else, and the only
+    /// `PostQuitMessage` a running daemon can reach is the timer's
+    /// `RunState::Quitting` check or the Quit menu item. This is what makes
+    /// "the state is not Quitting" a proof about the icon in the test above,
+    /// and it is asserted over the source because a tray cannot be created in
+    /// a test process.
+    #[test]
+    fn the_tray_icon_leaves_only_on_quit_or_a_quitting_state() {
+        let source = include_str!("tray.rs");
+        assert!(
+            source.contains("RunState::Quitting"),
+            "the tray's state-driven quit must still be RunState::Quitting, or the liveness \
+             assertion in the test above is meaningless"
+        );
+        assert!(
+            source.contains("PostQuitMessage"),
+            "WM_QUIT is the only way out of the pump"
+        );
+        // The tray knows nothing about either window. No import, no handle, no
+        // path from a closed surface to the icon's removal.
+        for foreign in ["cabinet", "eframe", "winit", "run_on_any_thread"] {
+            assert!(
+                !source.contains(foreign),
+                "the tray must not know '{foreign}' exists: a window that can reach the tray \
+                 is a window that can take the icon with it"
+            );
+        }
     }
 
     /// A build with no UI features still answers the menu item — in words,

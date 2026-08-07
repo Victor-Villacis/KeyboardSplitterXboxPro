@@ -15,6 +15,9 @@
 //! - [`key`] — the single key vocabulary (legacy `InterceptionKey`, exact names/values)
 //! - [`pad`] — XInput wire-shape [`PadState`] + legacy `VirtualXbox` ID tables
 //! - [`device`] — [`DeviceId`] (instance-path identity) and [`KeyEvent`]
+//! - [`selector`] — [`DeviceSelector`]: what a `[[device]] id` MEANS, so a
+//!   board keeps working after it is replugged into a different USB socket
+//!   (`docs/DEVICE-IDENTITY.md`)
 //! - [`preset`] — [`Binding`], [`Chord`] (guarded bindings), [`Preset`], and
 //!   the `default`/`empty` built-ins
 //! - [`macros`] — [`Macro`]: timed sequences, the sampling floor, and the
@@ -40,6 +43,7 @@ pub mod macros;
 pub mod pad;
 pub mod persona;
 pub mod preset;
+pub mod selector;
 pub mod slot;
 pub mod socd;
 pub mod templates;
@@ -60,6 +64,7 @@ pub use pad::{
 };
 pub use persona::{PadBackend, Persona, UnknownPersona};
 pub use preset::{Binding, Chord, Macros, Preset, TurboBinding};
+pub use selector::{DeviceFacts, DeviceSelector, Match, Qualifier, SelectorParseError};
 pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS, MAX_XINPUT_SLOTS};
 pub use socd::{DirMechanism, OpposingPair, Pointing, Socd, UnknownSocd};
 pub use templates::{Template, TemplateError, MAX_TEMPLATE_PLAYERS, TEMPLATES};

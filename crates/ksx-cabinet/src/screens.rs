@@ -434,6 +434,19 @@ fn pad_column(ui: &mut egui::Ui, app: &App, numbers: &[u8], now: Instant) {
             role::WARN,
         );
     }
+    // The desk keyboard, said out loud. The feed filters to the devices bound
+    // to a slot in the running session, so a board that is not on this cabinet
+    // lights nothing here — which is the whole point, and would be indis-
+    // tinguishable from a dead panel if the count were not on screen.
+    if app.off_panel > 0 {
+        ui.add_space(sp::S2);
+        fact(
+            ui,
+            "key(s) from a keyboard bound to NO slot (not shown above)",
+            &app.off_panel.to_string(),
+            role::TEXT_3,
+        );
+    }
 }
 
 /// One lit control. Full = happening; fading = just happened.

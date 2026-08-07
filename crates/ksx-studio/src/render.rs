@@ -96,6 +96,91 @@ use crate::snapshot::{StatusPayload, StatusSnapshot};
 #[folder = "assets/"]
 pub(crate) struct Assets;
 
+/// The brand icons: `favicon.ico`, `favicon.svg`, `apple-touch-icon.png`.
+/// Written by `tools/icongen` from the two master SVGs — see
+/// `assets/brand/README.md`.
+///
+/// A SECOND embed, rooted at `brand/` rather than `assets/`, for one concrete
+/// reason: `assets/` is the OUTPUT DIRECTORY of `studio-ui/build.mjs`, and
+/// `@getforma/build` `rmSync`s it at the top of every run. Icons parked there
+/// would survive exactly until the next UI rebuild and then 404, with nothing
+/// in any build log to say why. The icons are not UI build output and they do
+/// not belong in the UI build's scratch space.
+#[derive(Embed)]
+#[folder = "brand/"]
+pub(crate) struct BrandAssets;
+
+/// The `<head>` icon links, identical on both pages.
+///
+/// Three declarations because three consumers choose differently, and each
+/// wants a different file:
+///
+/// - **`favicon.svg`** — the modern path; browsers that support SVG icons
+///   prefer it over the `.ico`. It is the SIMPLIFIED master, not the
+///   detailed one, because what a browser does with it is render it into a
+///   16–32 px tab. Handing it the detailed art would throw away the whole
+///   point of having two drawings.
+/// - **`favicon.ico`** — the fallback, and what Windows itself reads when the
+///   page is pinned or saved as a shortcut. No `sizes` attribute: the file
+///   carries eight size-specific entries and the consumer reads the ICO
+///   directory to choose. A hand-written list here could only ever go stale
+///   against `tools/icongen`'s table.
+/// - **`apple-touch-icon.png`** — 180 px, flattened onto the plate colour, so
+///   iOS's home-screen mask has no transparent corners to composite black.
+///
+/// # Why this is spliced in rather than passed to `render_page`
+///
+/// forma-server 0.1.4's `PageConfig` has no head hook — `title`,
+/// `config_script`, `body_class`, `personality_css`, `body_prefix` is the
+/// whole list, and none of them reaches `<head>`'s link section. One
+/// `</head>` insertion is a smaller and more honest workaround than forking
+/// the template, and the tests below fail the moment upstream grows a real
+/// hook or changes the markup — which is the point at which this should go
+/// away.
+const ICON_LINKS: &str = concat!(
+    r#"<link rel="icon" href="/favicon.svg" type="image/svg+xml">"#,
+    r#"<link rel="icon" href="/favicon.ico" type="image/x-icon">"#,
+    r#"<link rel="apple-touch-icon" href="/apple-touch-icon.png">"#,
+);
+
+/// Splice [`ICON_LINKS`] into a rendered page's `<head>`.
+///
+/// A missing `</head>` costs the page its icons and nothing else, so it is a
+/// warning rather than a panic: a status page that renders without a favicon
+/// still tells the user whether their cabinet is working.
+pub(crate) fn with_icon_links(mut out: PageOutput) -> PageOutput {
+    match out.html.find("</head>") {
+        Some(at) => out.html.insert_str(at, ICON_LINKS),
+        None => tracing::warn!("rendered page has no </head>; ksx icon links not added"),
+    }
+    out
+}
+
+/// The oracle both page modules' tests use: every icon link is present, and
+/// every one of them is INSIDE `<head>`.
+///
+/// The inside-`<head>` half is the half that earns its keep. The links are
+/// spliced in after forma-server has rendered, so an upstream template change
+/// that moved or renamed `</head>` would drop three `<link>` elements into
+/// the body — where they do nothing whatsoever, and where the page looks
+/// completely normal.
+#[cfg(test)]
+pub(crate) fn assert_icon_links_in_head(route: &str, html: &str) {
+    let head_end = html
+        .find("</head>")
+        .unwrap_or_else(|| panic!("{route}: rendered page has no </head>"));
+    for link in [
+        r#"<link rel="icon" href="/favicon.svg" type="image/svg+xml">"#,
+        r#"<link rel="icon" href="/favicon.ico" type="image/x-icon">"#,
+        r#"<link rel="apple-touch-icon" href="/apple-touch-icon.png">"#,
+    ] {
+        let at = html
+            .find(link)
+            .unwrap_or_else(|| panic!("{route}: missing icon link {link}"));
+        assert!(at < head_end, "{route}: {link} landed outside <head>");
+    }
+}
+
 /// List array slot names, BINDING-derived since the v4 lists read from named
 /// signals (`() => padTiles()` → `list:padTiles:array`); a signal source
 /// used by several lists gets `#N` occurrence suffixes in document order
@@ -159,8 +244,15 @@ pub(crate) const REFRESH_SECS: u32 = 5;
 /// template's anti-flash trick): the body starts on the studio ground color
 /// instead of flashing white. Values mirror `--bg`/`--text` in studio.css,
 /// both schemes.
-const PERSONALITY_CSS: &str = "body{background:#0b0e14;color:#dbe2ef;margin:0}\
-@media (prefers-color-scheme:light){body{background:#f2f4f8;color:#1a2130}}";
+///
+/// This is a HAND COPY of two tokens, so it drifts silently — and it had:
+/// before the Street Fighter palette pass these read `#0b0e14`/`#dbe2ef`
+/// while studio.css had moved to `#0a0d13`/`#e3e9f4`, i.e. the first paint
+/// was a *different colour* from the stylesheet that replaced it. Nothing
+/// could catch that, because a wrong anti-flash colour looks like a flash.
+/// `ksx-studio/tests/contrast.rs` now parses studio.css and pins both.
+const PERSONALITY_CSS: &str = "body{background:#120c1c;color:#f0ebe0;margin:0}\
+@media (prefers-color-scheme:light){body{background:#f6f3ee;color:#1c1428}}";
 
 /// The minimum number of pad tiles the signature card shows: live pads
 /// first, then ghost outlines up to this floor (a 4-slot XInput cabinet at
@@ -655,7 +747,7 @@ pub(crate) fn render_status(
         flash: flash.map(str::to_owned),
     };
     let prefix = body_prefix(&payload, "/");
-    render_page(&PageConfig {
+    with_icon_links(render_page(&PageConfig {
         title: "ksx Studio — cabinet status",
         route_pattern: "/",
         manifest: &page.manifest,
@@ -666,7 +758,7 @@ pub(crate) fn render_status(
         render_mode: RenderMode::Phase2SsrReconcile,
         ir_module: Some(&page.module),
         slots: Some(&slots),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -933,7 +1025,7 @@ mod tests {
         );
         assert!(
             out.html.contains(&format!(
-                r#"<style nonce="{nonce}">body{{background:#0b0e14"#
+                r#"<style nonce="{nonce}">body{{background:#120c1c"#
             )),
             "personality css must carry the CSP nonce: {}",
             out.html
@@ -1057,6 +1149,57 @@ mod tests {
         );
         // And the header links into the mapper.
         assert!(out.html.contains(r#"href="/map""#), "{}", out.html);
+    }
+
+    /// The brand embed exists AND is the same bytes `tools/icongen` wrote.
+    ///
+    /// The byte comparison is the part that earns its keep. `favicon.ico` is
+    /// a COPY of `assets/brand/dist/ksx.ico` — the shell, the installer and
+    /// this page each read their own copy — and a copy is exactly the thing
+    /// that goes stale silently. Regenerate the brand, forget to re-run the
+    /// tool, and Studio wears last month's mark forever with no error
+    /// anywhere. Here it is a test failure with the fix in the message.
+    #[test]
+    fn brand_embed_carries_the_trio() {
+        for name in ["favicon.ico", "favicon.svg", "apple-touch-icon.png"] {
+            assert!(
+                BrandAssets::get(name).is_some(),
+                "{name} missing from crates/ksx-studio/brand/ — \
+                 run: cargo run --manifest-path tools/icongen/Cargo.toml --release"
+            );
+        }
+
+        let embedded = BrandAssets::get("favicon.ico").unwrap();
+        let canonical = include_bytes!("../../../assets/brand/dist/ksx.ico");
+        assert_eq!(
+            embedded.data.as_ref(),
+            canonical.as_slice(),
+            "crates/ksx-studio/brand/favicon.ico has drifted from \
+             assets/brand/dist/ksx.ico — re-run tools/icongen"
+        );
+
+        let svg = BrandAssets::get("favicon.svg").unwrap();
+        let master = include_bytes!("../../../assets/brand/ksx-simple.svg");
+        assert_eq!(
+            svg.data.as_ref(),
+            master.as_slice(),
+            "favicon.svg has drifted from the SIMPLIFIED master — re-run \
+             tools/icongen. (It is the simplified art on purpose: a browser \
+             renders an SVG icon into a 16-32 px tab.)"
+        );
+    }
+
+    /// The status page declares all three icons, inside `<head>`. The mapper
+    /// runs the same oracle from its own module.
+    #[test]
+    fn icon_links_are_in_the_status_head() {
+        let out = render_status(
+            &EmbeddedPage::load("/").unwrap(),
+            &sample(),
+            &idle_session(),
+            None,
+        );
+        assert_icon_links_in_head("/", &out.html);
     }
 
     #[test]

@@ -1073,7 +1073,12 @@ pub fn supervise(
     // is pressed" from "nothing is running". Cleared in teardown below, on
     // every path out, so a closed session never leaves a button check claiming
     // a live pipeline.
-    opts.feed.set_running(true);
+    //
+    // `plan.captureable` goes with it: that is exactly "the keyboards bound to
+    // a slot in THIS session", which is what makes the live feed's key column
+    // mean the panel rather than every keyboard on the machine (`crate::feed`,
+    // `LiveSink::key`).
+    opts.feed.session_started(&plan.captureable);
 
     // The engine exists: a binding edit can now reach it in place. Published
     // here rather than at the top of the function because before this line
@@ -1118,7 +1123,7 @@ pub fn supervise(
         let _ = out.flush();
         opts.hook.finished(out);
         opts.hot_swap.clear();
-        opts.feed.set_running(false);
+        opts.feed.session_ended();
         guard.release();
         let _ = ctl_tx.send(CaptureCtl::Shutdown);
         let capture_exit = match capture_handle.join() {
@@ -1309,8 +1314,9 @@ pub fn supervise(
     // ...and no surface may go on claiming a live pipeline once there is not
     // one. Both teardown paths clear it, so a button check that was open when
     // the game exited says "no session is running" rather than "nothing is
-    // pressed".
-    opts.feed.set_running(false);
+    // pressed". The panel set goes with it: between sessions there is no bound
+    // device, so nothing is the panel.
+    opts.feed.session_ended();
 
     // ---- teardown: uncapture, THEN unplug ----------------------------------
     //

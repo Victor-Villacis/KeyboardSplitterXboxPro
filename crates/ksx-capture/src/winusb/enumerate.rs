@@ -111,6 +111,19 @@ pub struct UsbCandidate {
     pub interface_string: Option<String>,
     /// The device's product string (`iProduct`).
     pub product: Option<String>,
+    /// The device's `iSerialNumber` string, read from the descriptor the hub
+    /// driver already cached — **not** parsed out of the instance path.
+    ///
+    /// The distinction matters. Windows only puts a serial in the instance id
+    /// while that serial is unique among connected devices of the same
+    /// VID/PID; the moment two boards claim one serial it stops trusting it and
+    /// falls back to generated port-derived ids for both. Reading the
+    /// descriptor gives the same answer either way, so
+    /// [`ksx_core::DeviceSelector`] can *notice* the collision instead of being
+    /// silently downgraded by it.
+    ///
+    /// `None` when `iSerialNumber` is 0, which is most cheap HID boards.
+    pub serial: Option<String>,
     /// `DeviceDesc` from the Enum tree, minus the INF prefix.
     pub device_desc: Option<String>,
     /// Physical port path (bus id + hub port chain) — why the id is stable.
@@ -132,9 +145,32 @@ impl UsbCandidate {
             && self.interface_protocol == crate::hid::INTERFACE_PROTOCOL_KEYBOARD
     }
 
-    /// An Ultimarc board — the hardware ksx exists for.
+    /// An Ultimarc board.
+    ///
+    /// **Cosmetic only** — this decorates a row with a familiar word and
+    /// nothing else. No capture path, claim path or refusal may branch on it:
+    /// ksx works with any HID keyboard interface, and a program that treated
+    /// one vendor id as special would be exactly the hardcoding
+    /// `docs/DEVICE-IDENTITY.md` §6 forbids. See [`crate::vendors`].
     pub fn is_ultimarc(&self) -> bool {
         self.vendor_id == ULTIMARC_VID
+    }
+
+    /// The vendor-independent facts a [`ksx_core::DeviceSelector`] matches on.
+    ///
+    /// This is the seam between "what Windows says is plugged in" and "which
+    /// board the config means". Everything on the selector side is pure and
+    /// runs in CI; everything on this side is a read-only registry/descriptor
+    /// walk. Neither knows about the other's problems.
+    pub fn facts(&self) -> ksx_core::DeviceFacts {
+        ksx_core::DeviceFacts {
+            id: self.id.clone(),
+            vendor_id: self.vendor_id,
+            product_id: self.product_id,
+            interface_number: self.interface_number,
+            serial: self.serial.clone(),
+            instance: ksx_core::DeviceFacts::instance_of(self.id.as_str()).to_owned(),
+        }
     }
 
     /// Best available human label.
@@ -223,6 +259,7 @@ pub fn candidates() -> std::io::Result<Vec<UsbCandidate>> {
                 interface_protocol: interface.protocol(),
                 interface_string: interface.interface_string().map(str::to_owned),
                 product: device.product_string().map(str::to_owned),
+                serial: device.serial_number().map(str::to_owned),
                 device_desc: node.device_desc,
                 port_chain: device.port_chain().to_vec(),
                 bus_id: device.bus_id().to_owned(),
@@ -385,6 +422,7 @@ mod tests {
             interface_protocol: protocol,
             interface_string: None,
             product: Some("I-PAC Ultimate I/O".into()),
+            serial: Some("4".into()),
             device_desc: Some("HID Keyboard Device".into()),
             port_chain: vec![1, 4],
             bus_id: "1".into(),
@@ -495,5 +533,73 @@ mod tests {
             dupes.is_empty(),
             "two interfaces reported one id: {dupes:?}"
         );
+    }
+
+    /// A candidate's facts must describe the candidate — in particular the
+    /// instance tail has to be the *port-derived* part of the id, because that
+    /// is the only thing the port rung may pin.
+    #[test]
+    fn facts_carry_the_port_tail_and_nothing_else_from_the_path() {
+        let c = candidate(
+            r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000",
+            0x03,
+            1,
+            1,
+            0xD209,
+        );
+        let facts = c.facts();
+        assert_eq!(facts.id, c.id);
+        assert_eq!(facts.vendor_id, 0xD209);
+        assert_eq!(facts.interface_number, 0);
+        assert_eq!(facts.serial.as_deref(), Some("4"));
+        assert_eq!(facts.instance, "7&25EEA38C&0&0000");
+    }
+
+    /// Live, read-only. Every candidate must produce facts a selector can use,
+    /// and the selector ksx would WRITE for it must find it again — on this
+    /// machine's actual USB tree, not a fixture.
+    ///
+    /// This is the test that would have caught the shipped defect: the id in
+    /// the config was a port-specific path, and nothing checked that the
+    /// identity ksx persists is one it can re-resolve.
+    #[test]
+    fn every_real_candidate_round_trips_through_the_selector_ksx_would_write() {
+        use ksx_core::DeviceSelector;
+
+        let found = candidates().expect("nusb enumeration");
+        let facts: Vec<ksx_core::DeviceFacts> = found.iter().map(UsbCandidate::facts).collect();
+        for one in &facts {
+            let selector = DeviceSelector::strongest_for(one, &facts);
+            let text = selector.to_string();
+            let reparsed = DeviceSelector::parse(&text).expect(&text);
+            assert_eq!(reparsed, selector, "selector text must round-trip: {text}");
+            assert_eq!(
+                reparsed.match_against(&facts).id(),
+                Some(&one.id),
+                "the selector ksx would write for {} does not find it again ({text})",
+                one.id
+            );
+        }
+    }
+
+    /// The measured fact this whole design is calibrated against, recorded so a
+    /// future reader does not have to re-derive it: the Ultimarc boards on this
+    /// machine DO report a serial, and it is a one-character constant.
+    ///
+    /// Skips when no Ultimarc board is connected — this is a note about
+    /// hardware, not a requirement on it.
+    #[test]
+    fn ultimarc_serials_are_low_entropy_and_that_is_why_the_port_rung_exists() {
+        let found = candidates().expect("nusb enumeration");
+        for c in found.iter().filter(|c| c.is_ultimarc()) {
+            if let Some(serial) = &c.serial {
+                assert!(
+                    serial.len() <= 4,
+                    "if an Ultimarc board ever ships a REAL per-unit serial ({serial}), \
+                     docs/DEVICE-IDENTITY.md §3 should be revisited — the serial rung \
+                     would then be trustworthy for twins"
+                );
+            }
+        }
     }
 }

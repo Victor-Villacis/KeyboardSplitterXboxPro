@@ -58,6 +58,14 @@ pub struct LiveFrame {
     /// last poll. Reported rather than hidden: a button check that silently
     /// skipped the press you just made is worse than one that says it did.
     pub dropped: u64,
+    /// Keys from a device **bound to no slot** that were left out of
+    /// [`Self::keys`] since the last poll.
+    ///
+    /// Not a fault and not an error — a desk keyboard beside the cabinet is
+    /// allowed to type. It is here so that "the panel is dead" and "you are
+    /// pressing the wrong keyboard" are different sentences on screen instead
+    /// of the same empty column.
+    pub off_panel: u64,
 }
 
 impl LiveFrame {
@@ -115,7 +123,11 @@ impl SlotLive {
 /// "As the engine received it" is the honest scope and worth stating: these are
 /// the keys the capture backend FORWARDED. A key blocked upstream, or one from
 /// a device bound to no slot, is not here — and that absence is itself the
-/// finding when a panel is rewired.
+/// finding when a panel is rewired. (For most of M9 the second half of that
+/// sentence was aspirational: Interception forwards every keyboard it does not
+/// block, so an unbound desk keyboard lit the button check as convincingly as
+/// the panel did. The sink filters to the session's bound devices now, and
+/// counts what it left out into [`LiveFrame::off_panel`].)
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyHit {
     /// The key name a preset would spell it with (`"G"`, `"LeftCtrl"`).
@@ -239,6 +251,7 @@ mod tests {
                 led_number: 1,
             }],
             dropped: 3,
+            off_panel: 7,
         };
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(serde_json::from_str::<LiveFrame>(&json).unwrap(), frame);

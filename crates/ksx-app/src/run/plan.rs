@@ -138,6 +138,21 @@ pub enum PlanError {
     },
     /// A slot names a preset that is neither a file nor a built-in.
     UnknownPreset { slot: u8, preset: String },
+    /// A slot's `keyboard`/`mouse` is neither a `[[device]]` alias nor an
+    /// instance path.
+    ///
+    /// **Never a fallback.** This used to be unreachable from a `--game` slot
+    /// because that path did not consult the device table at all: an alias
+    /// became a literal `DeviceId`, nothing matched it, and the session ran on
+    /// whatever backend was left. A refusal that names the slot, the reference
+    /// and the aliases that DO exist is the whole difference between an
+    /// evening and a line of output.
+    UnknownDevice {
+        slot: u8,
+        reference: String,
+        /// Every `[[device]]` alias in config.toml, so the fix is on screen.
+        known: Vec<String>,
+    },
     /// A slot's device reference or preset body could not be resolved.
     Config(ksx_config::ConfigError),
 }
@@ -174,6 +189,31 @@ impl std::fmt::Display for PlanError {
                 "slot {slot} references preset '{preset}', which is neither a preset file \
                  nor a built-in"
             ),
+            PlanError::UnknownDevice {
+                slot,
+                reference,
+                known,
+            } => {
+                write!(
+                    f,
+                    "slot {slot} names device '{reference}', which is neither a [[device]] alias \
+                     in config.toml nor a device instance path (an instance path contains a '\\')"
+                )?;
+                if known.is_empty() {
+                    write!(
+                        f,
+                        ". config.toml has no [[device]] entries at all — add one, or paste the \
+                         instance path `ksx devices` prints"
+                    )
+                } else {
+                    write!(
+                        f,
+                        ". Known aliases: {}. Add a [[device]] entry with alias = \"{reference}\", \
+                         or paste the instance path `ksx devices` prints",
+                        known.join(", ")
+                    )
+                }
+            }
             PlanError::Config(err) => write!(f, "{err}"),
         }
     }
@@ -348,10 +388,14 @@ pub fn build_plan(
                     .into_iter()
                     .filter(|i| game_title_of(i) == Some(title)),
             );
+            // `config.game_slot_spec`, NOT `entry.slot.to_spec()`: a game slot
+            // resolves through the same `[[device]]` table a config slot does.
+            // See [`PlanError::UnknownDevice`] and `ConfigFile::game_slot_spec`
+            // for what the missing table cost.
             let specs = entry
                 .slots
                 .iter()
-                .map(|s| s.to_spec())
+                .map(|s| named_device_errors(config, s.number, config.game_slot_spec(s)))
                 .collect::<Result<Vec<_>, _>>()?;
             (
                 PlanSource::Game(title.to_owned()),
@@ -364,7 +408,7 @@ pub fn build_plan(
             let specs = config
                 .slots
                 .iter()
-                .map(|s| config.slot_spec(s))
+                .map(|s| named_device_errors(config, s.number, config.slot_spec(s)))
                 .collect::<Result<Vec<_>, _>>()?;
             (
                 PlanSource::Config,
@@ -474,6 +518,28 @@ pub fn build_plan(
         captureable,
         winusb,
         notes,
+    })
+}
+
+/// Turn a bare `UnknownDeviceAlias` into a refusal that names the slot and
+/// lists the aliases that exist.
+///
+/// Applied to **both** slot sources, so a `[[game.slot]]` and a `[[slot]]` that
+/// name the same unresolvable device fail identically. That symmetry is the
+/// point: the two paths having different opinions about the device table is
+/// exactly the bug this replaces.
+fn named_device_errors(
+    config: &ConfigFile,
+    slot: u8,
+    resolved: Result<ksx_core::SlotSpec, ksx_config::ConfigError>,
+) -> Result<ksx_core::SlotSpec, PlanError> {
+    resolved.map_err(|err| match err {
+        ksx_config::ConfigError::UnknownDeviceAlias(reference) => PlanError::UnknownDevice {
+            slot,
+            reference,
+            known: config.devices.iter().map(|d| d.alias.clone()).collect(),
+        },
+        other => PlanError::Config(other),
     })
 }
 
@@ -785,6 +851,171 @@ preset = "IPAC P2"
             "{:?}",
             plan.notes
         );
+    }
+
+    /// **The bug that cost an hour of a hardware session.**
+    ///
+    /// A `[[game.slot]]` naming a `[[device]]` alias must resolve to exactly
+    /// the plan the equivalent `[[slot]]` produces — same instance path, same
+    /// capture set, same backend selection. The `--game` path used to call
+    /// `GameSlotEntry::to_spec()`, which has no access to `config.devices`, so
+    /// `"cab"` became a literal `DeviceId`: it matched no `[[device]]` entry,
+    /// `winusb` came back empty, and the session fell back to Interception —
+    /// which cannot see a WinUSB-claimed board at all. A dead panel, no error
+    /// anywhere.
+    #[test]
+    fn a_game_slot_naming_an_alias_plans_exactly_like_the_config_slot() {
+        let config = config(CAB_CONFIG);
+        let by_config = build_plan(&config, &GamesFile::default(), &presets(), None).unwrap();
+
+        // The same two slots, in a game profile, addressed BY ALIAS.
+        let games = games(
+            r#"
+[[game]]
+title = "Steam"
+path = 'C:\steam.exe'
+
+[[game.slot]]
+number = 1
+keyboard = "cab"
+preset = "IPAC P1"
+
+[[game.slot]]
+number = 2
+keyboard = "cab"
+preset = "IPAC P2"
+"#,
+        );
+        let by_game = build_plan(&config, &games, &presets(), Some("Steam")).unwrap();
+
+        assert_eq!(
+            by_game
+                .slots
+                .iter()
+                .map(|s| s.spec.clone())
+                .collect::<Vec<_>>(),
+            by_config
+                .slots
+                .iter()
+                .map(|s| s.spec.clone())
+                .collect::<Vec<_>>(),
+            "an alias must mean the same device in games.toml as in config.toml"
+        );
+        assert_eq!(by_game.captureable, by_config.captureable);
+        assert_eq!(by_game.captureable, vec![DeviceId::from(IPAC)]);
+        assert_eq!(by_game.winusb, by_config.winusb);
+    }
+
+    /// The same alias, on a device the config puts on WinUSB. This is the half
+    /// that was actually silent: the plan looked fine, `needs_interception()`
+    /// lied, and the run claimed nothing.
+    #[test]
+    fn a_game_slot_alias_selects_the_devices_winusb_backend() {
+        let cfg = config(
+            r#"
+schema_version = 1
+
+[[device]]
+id = 'HID\VID_D209&PID_0430&REV_0056&MI_00'
+alias = "cab"
+backend = "winusb"
+"#,
+        );
+        let games = games(
+            r#"
+[[game]]
+title = "MAME"
+path = 'C:\mame.exe'
+[[game.slot]]
+number = 1
+keyboard = "cab"
+preset = "IPAC P1"
+"#,
+        );
+        let plan = build_plan(&cfg, &games, &presets(), Some("MAME")).unwrap();
+        assert_eq!(
+            plan.winusb,
+            vec![DeviceId::from(IPAC)],
+            "the claimed board must be selected through the [[device]] table"
+        );
+        assert!(
+            !plan.needs_interception(),
+            "a fully claimed cabinet must not load the end-of-life driver"
+        );
+        assert!(render_human(&plan).contains("winusb (1 claimed board(s))"));
+    }
+
+    /// An unresolvable reference is a hard, named refusal — never a literal
+    /// device id nobody will ever match.
+    #[test]
+    fn an_unresolvable_game_slot_device_is_refused_by_name() {
+        let games = games(
+            r#"
+[[game]]
+title = "Steam"
+path = 'C:\steam.exe'
+[[game.slot]]
+number = 3
+keyboard = "ipac"
+preset = "IPAC P1"
+"#,
+        );
+        let err = build_plan(&config(CAB_CONFIG), &games, &presets(), Some("Steam")).unwrap_err();
+        let PlanError::UnknownDevice {
+            slot, reference, ..
+        } = &err
+        else {
+            panic!("expected UnknownDevice, got {err:?}");
+        };
+        assert_eq!(*slot, 3);
+        assert_eq!(reference, "ipac");
+        let text = err.to_string();
+        assert!(text.contains("slot 3"), "{text}");
+        assert!(text.contains("'ipac'"), "{text}");
+        assert!(text.contains("cab"), "the aliases that DO exist: {text}");
+        assert!(text.contains("ksx devices"), "{text}");
+
+        // ...and a config slot with the same typo says the same thing.
+        let cfg = config(
+            r#"
+schema_version = 1
+[[device]]
+id = 'HID\VID_D209&PID_0430&REV_0056&MI_00'
+alias = "cab"
+[[slot]]
+number = 3
+keyboard = "ipac"
+preset = "IPAC P1"
+"#,
+        );
+        let from_config = build_plan(&cfg, &GamesFile::default(), &presets(), None).unwrap_err();
+        assert_eq!(from_config.to_string(), text, "the two paths must agree");
+    }
+
+    /// Legacy games.toml files persist full instance paths, and they must keep
+    /// working untouched — resolution only ADDS aliases, it never requires one.
+    #[test]
+    fn a_game_slot_holding_a_literal_instance_path_still_resolves() {
+        let games = games(
+            r#"
+[[game]]
+title = "Steam"
+path = 'C:\steam.exe'
+[[game.slot]]
+number = 1
+keyboard = 'HID\VID_D209&PID_0430&REV_0056&MI_00'
+preset = "IPAC P1"
+"#,
+        );
+        // ...even with no [[device]] table at all.
+        let plan = build_plan(
+            &config("schema_version = 1\n"),
+            &games,
+            &presets(),
+            Some("Steam"),
+        )
+        .unwrap();
+        assert_eq!(plan.captureable, vec![DeviceId::from(IPAC)]);
     }
 
     #[test]

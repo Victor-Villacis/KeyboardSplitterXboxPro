@@ -138,6 +138,17 @@ struct Inner {
     channels: ArcSwap<Vec<Channel>>,
     /// A session is running right now.
     running: AtomicBool,
+    /// **The panel**: the devices bound to a slot in the running session
+    /// (`RunPlan::captureable`). Empty between sessions.
+    ///
+    /// Published by the supervisor in the same breath as `running`, so the two
+    /// cannot drift, and read on the engine thread through the same
+    /// arc-swapped-snapshot shape as `channels`.
+    panel: ArcSwap<Vec<DeviceId>>,
+    /// Keys dropped by [`LiveSink::key`] because they came from a device bound
+    /// to no slot. Monotonic for the sink's life; each subscription reports its
+    /// own delta, which is what lets one counter serve every consumer.
+    off_panel: AtomicU64,
     next_id: AtomicU64,
 }
 
@@ -174,18 +185,69 @@ impl LiveSink {
         self.inner.subscribers.load(Ordering::Relaxed)
     }
 
-    /// A session started (or ended). Called by the supervisor, off the hot
-    /// path, so a consumer can tell "nothing is pressed" from "nothing is
-    /// running" — which are different sentences and only one of them is a
-    /// fault.
-    pub fn set_running(&self, running: bool) {
-        self.inner.running.store(running, Ordering::Relaxed);
+    /// A session started, driving exactly `panel`. Called by the supervisor,
+    /// off the hot path.
+    ///
+    /// One call rather than two, because the two facts have to move together:
+    /// a consumer can tell "nothing is pressed" from "nothing is running" only
+    /// if `running` is true, and [`Self::key`] can tell the panel from the desk
+    /// only if `panel` is the CURRENT session's bound set. A `set_running(true)`
+    /// that forgot to update the panel would filter this session's keys against
+    /// the previous session's devices, which is a worse bug than the one this
+    /// replaces.
+    pub fn session_started(&self, panel: &[DeviceId]) {
+        self.inner.panel.store(Arc::new(panel.to_vec()));
+        self.inner.running.store(true, Ordering::Relaxed);
+    }
+
+    /// The session ended: nothing is running and nothing is the panel.
+    pub fn session_ended(&self) {
+        self.inner.running.store(false, Ordering::Relaxed);
+        self.inner.panel.store(Arc::new(Vec::new()));
     }
 
     /// What the PANEL sent. Engine thread.
+    ///
+    /// # Why this FILTERS rather than labels
+    ///
+    /// Interception forwards every keystroke it does not block, and the engine
+    /// sees all of them — so before this filter existed, typing on a desk
+    /// keyboard bound to no slot lit the cabinet's button check exactly as
+    /// convincingly as pressing the panel did. A screen whose entire purpose is
+    /// *"what did THE PANEL send"* answered a different question, and answered
+    /// it wrong.
+    ///
+    /// The alternative was to keep every key and label it with its device.
+    /// Rejected, for three reasons:
+    ///
+    /// 1. **The failure mode looked right.** The whole cost of the bug was that
+    ///    a false positive is indistinguishable from a pass. A label makes the
+    ///    truth *available*; filtering makes the wrong answer *unreachable*.
+    ///    Only the second one survives being read at six feet by somebody
+    ///    holding a screwdriver.
+    /// 2. **A label is small text on a 10-foot surface.** The button check's
+    ///    vocabulary is a big key name and a lit control; a device column would
+    ///    be the one thing on the screen nobody standing at the cabinet can
+    ///    read.
+    /// 3. **An unbound board can crowd out the panel.** Delivery is a bounded
+    ///    queue, so somebody typing an email next to the cabinet could push the
+    ///    panel's own keys past [`QUEUE`] and into the dropped counter.
+    ///    Filtering here — before the clone, before the fan-out — means an
+    ///    unbound device cannot consume a subscriber's arrears at all.
+    ///
+    /// Nothing is hidden by it: `KeyHit` still carries `device` and `alias`, so
+    /// two *bound* panels remain two facts, and what was left out is counted
+    /// into [`ksx_api::LiveFrame::off_panel`] and said in words on screen.
     #[inline]
     pub fn key(&self, device: &DeviceId, key: Key, down: bool) {
         if !self.is_live() {
+            return;
+        }
+        if !self.inner.panel.load().iter().any(|bound| bound == device) {
+            // Presses only, so one keystroke is one count rather than two.
+            if down {
+                self.inner.off_panel.fetch_add(1, Ordering::Relaxed);
+            }
             return;
         }
         self.publish(LiveEvent::Key {
@@ -258,6 +320,9 @@ impl LiveSink {
             id,
             rx,
             dropped,
+            // From HERE, not from zero: whatever an unbound keyboard did before
+            // this window opened is not this window's business.
+            off_panel_seen: self.inner.off_panel.load(Ordering::Relaxed),
             aliases: Vec::new(),
         }
     }
@@ -285,6 +350,9 @@ pub struct LiveSubscription {
     id: u64,
     rx: Receiver<LiveEvent>,
     dropped: Arc<AtomicU64>,
+    /// Watermark into [`Inner::off_panel`]. The counter is per-sink and
+    /// monotonic; the delta since the last poll is this consumer's share.
+    off_panel_seen: u64,
     /// Device instance path → friendly name, supplied by the consumer (which
     /// can read the config; the engine thread cannot and must not).
     aliases: Vec<(String, String)>,
@@ -326,6 +394,9 @@ impl LiveFeed for LiveSubscription {
         }
         let mut frame = fold.finish(&self.sink);
         frame.dropped = self.dropped.swap(0, Ordering::Relaxed);
+        let off_panel = self.sink.inner.off_panel.load(Ordering::Relaxed);
+        frame.off_panel = off_panel.saturating_sub(self.off_panel_seen);
+        self.off_panel_seen = off_panel;
         for hit in &mut frame.keys {
             hit.alias = self.alias_for(&hit.device);
         }
@@ -433,6 +504,7 @@ impl Fold {
             keys: self.keys,
             feedback: self.feedback,
             dropped: 0,
+            off_panel: 0,
         }
     }
 }
@@ -568,7 +640,7 @@ mod tests {
         let sink = LiveSink::new();
         let mut feed = sink.subscribe();
         feed.set_aliases(vec![(r"HID\VID_D209".to_owned(), "IPAC P1".to_owned())]);
-        sink.set_running(true);
+        sink.session_started(&[DeviceId::new(r"HID\VID_D209")]);
 
         sink.key(&DeviceId::new(r"HID\VID_D209"), Key::G, true);
         sink.pad(1, pad(XButtons::A | XButtons::DPAD_UP));
@@ -627,6 +699,7 @@ mod tests {
         let sink = LiveSink::new();
         let mut cabinet = sink.subscribe();
         let mut other = sink.subscribe();
+        sink.session_started(&[DeviceId::new("dev")]);
         sink.key(&DeviceId::new("dev"), Key::G, true);
         assert_eq!(cabinet.poll().keys.len(), 1);
         assert_eq!(other.poll().keys.len(), 1);
@@ -656,8 +729,111 @@ mod tests {
         let sink = LiveSink::new();
         let feed = sink.subscribe();
         assert!(feed.unavailable().is_some_and(|why| why.contains("start")));
-        sink.set_running(true);
+        sink.session_started(&[DeviceId::new("dev")]);
         assert!(feed.unavailable().is_none());
+        sink.session_ended();
+        assert!(feed.unavailable().is_some(), "and back again when it ends");
+    }
+
+    /// **The desk keyboard.** A board bound to no slot lights nothing on a
+    /// screen whose whole purpose is "what did THE PANEL send" — and what it
+    /// sent is COUNTED rather than silently discarded, so "the panel is dead"
+    /// and "you are pressing the wrong keyboard" are different sentences.
+    #[test]
+    fn keys_from_a_device_bound_to_no_slot_never_reach_the_button_check() {
+        let panel = DeviceId::new(r"HID\VID_D209&PID_0430&MI_00");
+        let desk = DeviceId::new(r"HID\VID_046D&PID_C52B");
+
+        let sink = LiveSink::new();
+        let mut feed = sink.subscribe();
+        sink.session_started(std::slice::from_ref(&panel));
+
+        sink.key(&desk, Key::E, true);
+        sink.key(&desk, Key::E, false);
+        sink.key(&panel, Key::G, true);
+
+        let frame = feed.poll();
+        assert_eq!(
+            frame.keys.len(),
+            1,
+            "only the panel's key: {:?}",
+            frame.keys
+        );
+        assert_eq!(frame.keys[0].key, "G");
+        assert_eq!(frame.keys[0].device, panel.as_str());
+        assert_eq!(
+            frame.off_panel, 1,
+            "one PRESS from an unbound board, reported not hidden"
+        );
+        // The count is per-frame, like `dropped`.
+        assert_eq!(feed.poll().off_panel, 0);
+    }
+
+    /// ...and the panel set belongs to the SESSION. Between sessions nothing is
+    /// the panel, so a window left open after a game exits cannot go on
+    /// lighting up from the last session's board.
+    #[test]
+    fn the_panel_set_is_cleared_when_the_session_ends() {
+        let panel = DeviceId::new("ipac");
+        let sink = LiveSink::new();
+        let mut feed = sink.subscribe();
+
+        // Before any session: the engine is not running, and nothing is bound.
+        sink.key(&panel, Key::G, true);
+        assert!(feed.poll().keys.is_empty());
+
+        sink.session_started(std::slice::from_ref(&panel));
+        sink.key(&panel, Key::G, true);
+        assert_eq!(feed.poll().keys.len(), 1);
+
+        sink.session_ended();
+        sink.key(&panel, Key::G, true);
+        let frame = feed.poll();
+        assert!(frame.keys.is_empty(), "{:?}", frame.keys);
+        assert!(!frame.running);
+    }
+
+    /// A second session with a different panel filters against ITS OWN bound
+    /// set — the reason `session_started` carries both facts in one call.
+    #[test]
+    fn a_new_session_replaces_the_previous_panel_rather_than_adding_to_it() {
+        let first = DeviceId::new("board-a");
+        let second = DeviceId::new("board-b");
+        let sink = LiveSink::new();
+        let mut feed = sink.subscribe();
+
+        sink.session_started(std::slice::from_ref(&first));
+        sink.session_ended();
+        sink.session_started(std::slice::from_ref(&second));
+
+        sink.key(&first, Key::G, true);
+        sink.key(&second, Key::H, true);
+        let frame = feed.poll();
+        assert_eq!(frame.keys.len(), 1);
+        assert_eq!(frame.keys[0].key, "H");
+    }
+
+    /// An unbound board cannot consume a subscriber's arrears: the filter is in
+    /// front of the queue, not behind it. Somebody typing an email beside the
+    /// cabinet must not push the panel's own keys into the dropped counter.
+    #[test]
+    fn an_unbound_board_cannot_crowd_the_panel_out_of_the_queue() {
+        let panel = DeviceId::new("ipac");
+        let desk = DeviceId::new("desk");
+        let sink = LiveSink::new();
+        let mut feed = sink.subscribe();
+        sink.session_started(std::slice::from_ref(&panel));
+
+        for _ in 0..(QUEUE * 4) {
+            sink.key(&desk, Key::E, true);
+        }
+        sink.key(&panel, Key::G, true);
+
+        let frame = feed.poll();
+        assert_eq!(frame.dropped, 0, "nothing of the panel's was lost");
+        assert_eq!(frame.keys.len(), 1);
+        assert_eq!(frame.keys[0].key, "G");
+        assert_eq!(frame.off_panel, (QUEUE * 4) as u64);
     }
 
     /// Analogue readouts use the preset vocabulary, so a stick reading and a

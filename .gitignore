@@ -4,6 +4,14 @@
 /target
 **/*.rs.bk
 
+# tools/icongen is its own workspace (see its Cargo.toml for why), so it has
+# its own target dir. Its Cargo.lock IS committed — the whole point of the
+# tool is that re-running it reproduces the same bytes.
+/tools/icongen/target
+
+# Inno Setup output (packaging/ksx.iss OutputDir).
+/packaging/out
+
 # =========================
 # Legacy C# tree (kept for reference; rules below are the original VS ignores)
 # =========================

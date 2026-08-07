@@ -34,7 +34,28 @@ import { chromium } from "playwright";
  *  one `macro_fixture.exe`, and Windows will not relink a running binary. See
  *  `--test-concurrency=1` in package.json. */
 const PORT = Number(process.env.KSX_PWTEST_PARITY_PORT ?? 4477);
-const BASE = `http://127.0.0.1:${PORT}`;
+
+/** ONE PORT PER SESSION STATE, and here is why that matters.
+ *
+ *  These suites used to share `PORT`. `after()` calls `server.kill()`, which
+ *  returns as soon as the signal is sent — the listening socket is still
+ *  bound when the next suite's `before()` spawns its fixture a moment later.
+ *  That fixture prints "failed to bind 127.0.0.1:4477" and exits… into
+ *  `stdio: "ignore"`, so nobody ever saw it. The `before()` hook then spun
+ *  for its full 60 s and failed with "fixture never answered", which names
+ *  the symptom and hides the cause.
+ *
+ *  The effect was not flakiness, it was a DETERMINISTIC HOLE: `idle` (first)
+ *  passed, `running` (second) always failed, and `down` (third) passed again
+ *  because 60 s had elapsed by then and the port was free. So the state this
+ *  file's own header calls out — "Only the RUNNING state shows it, which is
+ *  why the fixture learned to be running" — was the one state never actually
+ *  checked, on every run since it was added.
+ *
+ *  A port per state removes the reuse entirely; nothing has to wait on
+ *  Windows releasing a socket. */
+const portFor = (session) => PORT + 1 + SESSIONS.indexOf(session);
+const baseFor = (session) => `http://127.0.0.1:${portFor(session)}`;
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const targetDir = process.env.CARGO_TARGET_DIR
@@ -136,11 +157,21 @@ function firstDifference(a, b) {
 }
 
 before(async () => {
-  const squatter = await fetch(`${BASE}/api/map`).then(
-    () => true,
-    () => false,
-  );
-  assert.equal(squatter, false, `something is already listening on ${BASE} — stop it first`);
+  // Guard every port a suite will actually bind, not the base one that no
+  // suite uses any more — a squatter check that watches the wrong door is
+  // how the bind failure below became invisible in the first place.
+  for (const session of SESSIONS) {
+    const url = baseFor(session);
+    const squatter = await fetch(`${url}/api/map`).then(
+      () => true,
+      () => false,
+    );
+    assert.equal(
+      squatter,
+      false,
+      `something is already listening on ${url} (session "${session}") — stop it first`,
+    );
+  }
   const built = spawnSync(
     "cargo",
     ["build", "--quiet", "-p", "ksx-studio", "--example", "macro_fixture"],
@@ -158,20 +189,39 @@ for (const session of SESSIONS) {
   describe(`SSR and hydration agree — session: ${session}`, () => {
     let server;
 
+    const base = baseFor(session);
+
     before(async () => {
-      server = spawn(exe, [String(PORT)], {
+      // stderr is CAPTURED, not ignored: the one thing this fixture says when
+      // it cannot start is the one thing worth knowing, and swallowing it is
+      // what turned a bind collision into a 60 s mystery.
+      let stderr = "";
+      server = spawn(exe, [String(portFor(session))], {
         cwd: repoRoot,
-        stdio: "ignore",
+        stdio: ["ignore", "ignore", "pipe"],
         env: { ...process.env, KSX_FIXTURE_SESSION: session },
       });
+      server.stderr?.on("data", (b) => (stderr += b.toString()));
+      let exited = null;
+      server.on("exit", (code) => (exited = code));
+
       const until = Date.now() + 60_000;
       for (;;) {
-        const up = await fetch(`${BASE}/api/map`).then(
+        const up = await fetch(`${base}/api/map`).then(
           (r) => r.ok,
           () => false,
         );
         if (up) break;
-        assert.ok(Date.now() < until, `fixture never answered on ${BASE}`);
+        assert.equal(
+          exited,
+          null,
+          `the fixture for session "${session}" exited with code ${exited} instead of ` +
+            `serving ${base}:\n${stderr.trim() || "(it said nothing)"}`,
+        );
+        assert.ok(
+          Date.now() < until,
+          `fixture never answered on ${base}\n${stderr.trim() || "(it said nothing)"}`,
+        );
         await new Promise((r) => setTimeout(r, 200));
       }
     });
@@ -182,7 +232,7 @@ for (const session of SESSIONS) {
 
     for (const route of ROUTES) {
       test(`${route} paints what the client renders`, async () => {
-        const url = BASE + route;
+        const url = base + route;
         const ssr = await ssrDom(url);
         const hydrated = await hydratedDom(url);
         assert.notEqual(ssr, "NO ISLAND ROOT", `${route} rendered no island root`);

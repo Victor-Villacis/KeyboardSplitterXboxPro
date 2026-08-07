@@ -591,6 +591,7 @@ mod tests {
             interface_subclass: 1,
             interface_protocol: 1,
             interface_string: None,
+            serial: None,
             product: Some("I-PAC Ultimate I/O".into()),
             device_desc: Some("HID Keyboard Device".into()),
             port_chain: vec![1, 4],

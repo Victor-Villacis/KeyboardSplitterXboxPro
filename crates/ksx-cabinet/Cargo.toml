@@ -19,6 +19,19 @@ rust-version.workspace = true
 ksx-api.workspace = true
 eframe.workspace = true
 egui.workspace = true
+# The logging FACADE, and nothing more. It widens the dependency list without
+# widening the boundary, which is the property that list is here to protect:
+# `tracing` cannot reach a pipeline thread, a config file or a driver — it emits
+# records to whatever subscriber the HOST installed, which for the in-daemon
+# window is `ksx-app`'s rotating file log.
+#
+# It is here because the alternative was proven worse. A full evening's hardware
+# session produced NOT ONE line from this crate: no window created, no first
+# frame, no exit, no error — so "the cabinet UI flashes a ghost window and never
+# fully loads" was undiagnosable from the log that exists precisely to diagnose
+# a cabinet nobody is sitting at. A UI with no console must be able to say what
+# it did.
+tracing.workspace = true
 
 # XInputGetState, read against OUR OWN virtual pads — the only way a cabinet
 # panel can drive this window while emulation is running, because the panel is

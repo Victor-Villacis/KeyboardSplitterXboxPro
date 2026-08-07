@@ -42,6 +42,42 @@
 use std::path::Path;
 use std::time::Duration;
 
+/// `CREATE_NO_WINDOW` — "this console application is being run without a
+/// console window" (`winbase.h`).
+///
+/// Named here rather than pulled from `windows-sys` so the constant is
+/// available in the one place every spawn already imports, and so the value is
+/// visible beside the reason it exists.
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// **Spawn without conjuring a console window.**
+///
+/// ksx's daemon calls `FreeConsole` the moment its tray icon is up
+/// (`crate::console` in `ksx-app`), so from then on it has *no* console. On
+/// Windows a console-subsystem child started by a parent with no console gets a
+/// **brand new console window of its own** — which is drawn, focused, and torn
+/// down again when the child exits. That is not a theoretical nuisance: the
+/// cabinet window's status refresh runs `schtasks /Query` every two seconds, so
+/// a black window flashed over the 10-foot panel every two seconds for the
+/// whole of an evening's hardware session, with nothing in any log to name it.
+///
+/// So: **every spawn ksx makes for its own plumbing goes through this.** The
+/// two deliberate exceptions are marked `NO_WINDOW_EXEMPT:` at the call site,
+/// with a reason, and [`tests::every_spawn_either_hides_its_console_or_says_why`]
+/// keeps that list honest.
+///
+/// Off Windows this is the identity function: there is no such flag, and there
+/// is no console to conjure.
+pub fn no_window(command: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// One live process, as the OS snapshot reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessEntry {
@@ -159,6 +195,27 @@ pub enum LaunchError {
 /// The existence check up front is not redundant with the spawn error: it lets
 /// the caller distinguish "this profile is misconfigured" (checkable before
 /// anything is plugged, exit 2) from "the OS refused to start it" (exit 3).
+///
+/// # No `CREATE_NO_WINDOW` here, deliberately
+///
+/// Every *other* spawn in ksx goes through [`no_window`], because every other
+/// spawn is ksx's own plumbing whose output ksx captures. This one starts **the
+/// user's program**, and the same policy that says ksx never terminates a game
+/// (the no-kill rule in the module docs) says ksx must not decide that a game's
+/// console is invisible:
+///
+/// - a GUI game is unaffected either way — the flag is ignored for a
+///   non-console subsystem, so setting it would buy nothing;
+/// - a console emulator (MAME's `-verbose`, DOSBox, a ScummVM build) shows its
+///   log in that window on purpose, and a cabinet owner debugging a ROM path
+///   needs to see it;
+/// - a `.bat`/`.cmd` front end — a very common cabinet launcher — runs under
+///   `cmd.exe`, a console app. Hidden, a prompt or an error in it becomes a
+///   game that "does nothing" with no window to read.
+///
+/// The tray-flash argument does not apply: a game is *supposed* to put
+/// something on screen. So the flag is omitted, and the omission is stated
+/// rather than left to be re-derived.
 pub fn launch(
     exe: &Path,
     args: &[String],
@@ -167,6 +224,7 @@ pub fn launch(
     if !exe.is_file() {
         return Err(LaunchError::NotFound(exe.display().to_string()));
     }
+    // NO_WINDOW_EXEMPT: this is the user's game, not ksx's plumbing — see above.
     let mut command = std::process::Command::new(exe);
     command.args(args);
     match working_dir.or_else(|| exe.parent()) {
@@ -518,5 +576,98 @@ mod tests {
                 "ksx never kills the user's game, but '{forbidden}' appears in process.rs"
             );
         }
+    }
+
+    /// **Every spawn in ksx either hides its console or says why it does not.**
+    ///
+    /// ksx is a tray app whose daemon has released its console, so a
+    /// console-subsystem child with no creation flag gets a **new console
+    /// window** — drawn on top of whatever is on the cabinet screen. Six spawn
+    /// sites had no flag at all, and one of them (`schtasks`, behind the status
+    /// snapshot the cabinet window re-runs every two seconds) is what produced
+    /// the "ghost window that flashes but never fully loads" nobody could name.
+    ///
+    /// A review rule would not have caught that and did not. This scans the
+    /// workspace's own sources: each `Command::new` must be within reach of a
+    /// [`no_window`] call, or carry a `NO_WINDOW_EXEMPT:` comment stating why a
+    /// visible console is the point there. The needle is assembled at runtime so
+    /// this test does not match itself.
+    #[test]
+    fn every_spawn_either_hides_its_console_or_says_why() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/")
+            .to_path_buf();
+        // Built, not written: the literal would make this file a finding.
+        let needle = format!("{}::{}::new(", "std::process", "Command");
+        // How far after the spawn the excuse may be. Generous enough for a
+        // multi-line builder chain, tight enough to stay about that one call.
+        const REACH: usize = 600;
+
+        let mut checked = 0usize;
+        let mut findings: Vec<String> = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Only crate sources: tests/, examples/ and benches/ run in
+                    // a console the developer is looking at.
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                // `crates/<name>/src/...` only.
+                if !path.components().any(|c| c.as_os_str() == "src") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let mut from = 0usize;
+                while let Some(at) = text[from..].find(&needle) {
+                    let at = from + at;
+                    from = at + needle.len();
+                    checked += 1;
+                    let window_start = at.saturating_sub(REACH);
+                    let window_end = (at + REACH).min(text.len());
+                    // `char_indices` would be exact; these are ASCII sources
+                    // with occasional UTF-8 in comments, so snap to a boundary.
+                    let (mut lo, mut hi) = (window_start, window_end);
+                    while !text.is_char_boundary(lo) {
+                        lo += 1;
+                    }
+                    while !text.is_char_boundary(hi) {
+                        hi -= 1;
+                    }
+                    let context = &text[lo..hi];
+                    if context.contains("no_window(") || context.contains("NO_WINDOW_EXEMPT:") {
+                        continue;
+                    }
+                    let line = text[..at].matches('\n').count() + 1;
+                    findings.push(format!("{}:{line}", path.display()));
+                }
+            }
+        }
+
+        assert!(
+            checked >= 5,
+            "the scan found only {checked} spawn site(s) — it stopped seeing the sources"
+        );
+        assert!(
+            findings.is_empty(),
+            "these spawns would flash a console window at a tray-app user. Wrap them in \
+             `ksx_platform::process::no_window(..)`, or mark the call site \
+             `NO_WINDOW_EXEMPT: <why>`:\n  {}",
+            findings.join("\n  ")
+        );
     }
 }

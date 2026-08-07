@@ -326,16 +326,39 @@ crates/ksx-games          game launch + exit detection (launcher hand-off)
 crates/ksx-app            the `ksx` binary
 crates/ksx-studio         ksx Studio, the optional localhost UI (feature `studio`)
 crates/vigem-client       vendored CasualX/vigem-client (MIT)
+assets/brand/             the ksx mark: two master SVGs + every generated raster
+tools/icongen/            regenerates them (own cargo workspace — see assets/brand/README.md)
+packaging/                Inno Setup script
 legacy/                   original C# solution (frozen, reference only)
 examples/                 frontend wrapper scripts
 docs/                     architecture, integration, driver story, recovery, migration, research
 ```
+
+### The icon
+
+One mark, two drawings: a detailed one for 48 px and up and a simplified one
+for 32 px and down, because a 2.4-unit outline at 16 px is 0.6 px of grey mud.
+The `.ico` carries both as size-specific entries, so Windows picks art drawn
+*for* the surface it is painting — 16 px in the tray, 256 px in alt-tab.
+
+```
+cargo run --manifest-path tools/icongen/Cargo.toml --release
+```
+
+rebuilds every raster from the masters in one pass: the `ksx.exe` resource
+(via `crates/ksx-app/build.rs`), the tray icon, Studio's favicon trio, the
+egui cabinet window icon and the installer's icon. Full detail in
+[`assets/brand/README.md`](assets/brand/README.md).
 
 ## License
 
 New Rust code: MIT OR Apache-2.0. Third-party driver/binary terms are catalogued in
 [`docs/DRIVERS.md`](docs/DRIVERS.md) — notably Interception is LGPL/**non-commercial**
 and the vendored `vigem-client` is MIT.
+
+Third-party material copied *into* this tree — the Lucide `gamepad-2` path in the
+brand mark (ISC), the vendored controller art (MIT), `vigem-client` (MIT) — is
+recorded in [`NOTICE`](NOTICE).
 
 ## Credits
 
@@ -345,3 +368,5 @@ and the vendored `vigem-client` is MIT.
 - **shauleiz** — vXboxInterface
 - **CasualX** — vigem-client
 - **jtroo** — kanata-interception
+- **Lucide contributors** — the `gamepad-2` silhouette in the ksx mark (ISC)
+- **AL2009man** — Gamepad-Asset-Pack, the controller art in ksx Studio (MIT)

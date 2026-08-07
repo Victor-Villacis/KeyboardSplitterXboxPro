@@ -1038,6 +1038,11 @@ pub fn execute(
         _ => return Err(InstallError::NotVerified),
     }
 
+    // NO_WINDOW_EXEMPT: a driver installer is the one child whose console IS
+    // the point. `ksx install-drivers` is a foreground CLI verb — it is never
+    // reached from the tray — so the parent already has a console the child
+    // inherits, and `.status()` blocks while the user watches. Hiding it would
+    // turn "ViGEmBus setup is asking you something" into a hang with no window.
     std::process::Command::new(sealed.exec_path())
         .args(args)
         .status()

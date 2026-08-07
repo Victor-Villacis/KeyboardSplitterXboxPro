@@ -1392,14 +1392,19 @@ impl ApplyError {
 }
 
 /// Run one planned command, capturing its output.
+///
+/// `no_window`: `pnputil`'s output is captured, decoded and re-printed by ksx
+/// (that is what [`ApplyError::hint`] reads), so a console window of its own
+/// would show the user nothing they are not already being shown — and
+/// `ksx winusb claim` is reachable from a daemon that has no console.
 pub fn run_command(cmd: &PlannedCommand) -> Result<String, ApplyError> {
-    let output = std::process::Command::new(&cmd.program)
-        .args(&cmd.args)
-        .output()
-        .map_err(|source| ApplyError::Spawn {
-            command: cmd.command_line(),
-            source,
-        })?;
+    let output =
+        crate::process::no_window(std::process::Command::new(&cmd.program).args(&cmd.args))
+            .output()
+            .map_err(|source| ApplyError::Spawn {
+                command: cmd.command_line(),
+                source,
+            })?;
     let mut text = crate::autostart::decode_console_output(&output.stdout);
     let err = crate::autostart::decode_console_output(&output.stderr);
     if !err.trim().is_empty() {

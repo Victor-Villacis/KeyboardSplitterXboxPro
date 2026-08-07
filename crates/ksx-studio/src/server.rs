@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{Form, Query, State};
-use axum::http::{header, HeaderValue};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -28,7 +28,7 @@ use serde::Deserialize;
 
 use crate::control::{BindOutcome, BindRequest, ControlSource, SessionView};
 use crate::error::StudioError;
-use crate::render::{render_status, Assets, EmbeddedPage};
+use crate::render::{render_status, Assets, BrandAssets, EmbeddedPage};
 use crate::render_map::render_map;
 use crate::snapshot::{MapPayload, StatusPayload, StatusSnapshot, StatusSource};
 
@@ -141,6 +141,15 @@ pub fn serve(
                 "/_assets/{filename}",
                 get(forma_server::assets::serve_asset::<Assets>),
             )
+            // The brand icons, at the ROOT paths their consumers hard-code.
+            // Not under `/_assets/`: a browser asks for `/favicon.ico` with
+            // no prompting from the markup, and iOS probes
+            // `/apple-touch-icon.png` the same way — a link tag pointing
+            // elsewhere is an optimisation on top of those defaults, never a
+            // replacement for them.
+            .route("/favicon.ico", get(favicon_ico))
+            .route("/favicon.svg", get(favicon_svg))
+            .route("/apple-touch-icon.png", get(apple_touch_icon))
             .with_state(state);
         tracing::info!(%bind, "ksx Studio listening");
         axum::serve(listener, app).await.map_err(StudioError::Serve)
@@ -991,6 +1000,58 @@ where
         Err(error) => format!("error: {error}"),
     };
     Redirect::to(&format!("/?flash={}", urlencode(&flash))).into_response()
+}
+
+/// One embedded brand icon, with a real content type.
+///
+/// `forma_server::assets::serve_asset` is deliberately NOT reused for these.
+/// Two of its behaviours are right for hashed build output and wrong here:
+///
+/// - its `mime_for` knows js/css/woff2/wasm/json/html/svg and answers
+///   `application/octet-stream` for everything else, so the `.ico` and the
+///   `.png` would arrive as downloads rather than as icons;
+/// - it stamps `Cache-Control: public, max-age=31536000, immutable`, which is
+///   correct for `studio.485e0edb.css` and actively harmful for a file called
+///   `favicon.ico` — regenerate the brand and every browser that ever loaded
+///   the page keeps the old mark for a year.
+///
+/// A day is the compromise: browsers cache favicons aggressively anyway, and
+/// a cabinet's Studio page is opened from a bookmark most days.
+fn brand(name: &str, mime: &'static str) -> Response {
+    let Some(file) = BrandAssets::get(name) else {
+        // Only reachable if the crate was compiled without
+        // `crates/ksx-studio/brand/`, which `brand_embed_carries_the_trio`
+        // turns into a test failure rather than a 404 nobody sees.
+        tracing::error!(name, "brand asset missing from the embed");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(mime)),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400"),
+            ),
+            (
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            ),
+        ],
+        file.data.to_vec(),
+    )
+        .into_response()
+}
+
+async fn favicon_ico() -> Response {
+    brand("favicon.ico", "image/x-icon")
+}
+
+async fn favicon_svg() -> Response {
+    brand("favicon.svg", "image/svg+xml")
+}
+
+async fn apple_touch_icon() -> Response {
+    brand("apple-touch-icon.png", "image/png")
 }
 
 /// Query-string percent-encoding (RFC 3986 unreserved set kept literal).

@@ -36,16 +36,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use crossbeam_channel::Sender;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, LoadIconW, PostQuitMessage,
-    RegisterClassW, SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage,
-    IDI_APPLICATION, MFS_DISABLED, MFS_ENABLED, MF_BYPOSITION, MF_STRING, MSG, TPM_BOTTOMALIGN,
+    DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, KillTimer, LoadIconW,
+    LoadImageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, TrackPopupMenu,
+    TranslateMessage, HICON, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MFS_DISABLED,
+    MFS_ENABLED, MF_BYPOSITION, MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN,
     TPM_RIGHTALIGN, WM_APP, WM_COMMAND, WM_DESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
     WS_OVERLAPPED,
 };
@@ -59,6 +61,14 @@ const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 500;
 /// Menu command ids — index into [`DaemonState::menu`] plus this base.
 const MENU_BASE: usize = 0x100;
+
+/// The icon group `build.rs` stamps into `ksx.exe` as `1 ICON …`.
+///
+/// This constant and `ICON_RESOURCE_ID` in `build.rs` are one handshake with
+/// two halves; neither can be changed alone. Explorer also happens to show
+/// the numerically lowest group as the file's face, which is the other reason
+/// it is 1.
+const ICON_RESOURCE_ID: usize = 1;
 
 /// Process-wide, because a `WNDPROC` is a bare `extern "system" fn` with no
 /// user pointer we set up before the first message arrives. There is exactly
@@ -149,9 +159,7 @@ pub fn create(commands: Sender<DaemonCommand>, state: SharedState) -> Option<Tra
     let mut icon = notify_data(hwnd);
     icon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     icon.uCallbackMessage = WM_KSX_TRAY;
-    // SAFETY: IDI_APPLICATION is a system resource id; a null instance is the
-    // documented way to load it.
-    icon.hIcon = unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) };
+    icon.hIcon = load_tray_icon();
     write_tip(&mut icon, &tooltip());
     // SAFETY: `icon` is a fully initialised NOTIFYICONDATAW for `hwnd`.
     if unsafe { Shell_NotifyIconW(NIM_ADD, &icon) } == 0 {
@@ -196,6 +204,68 @@ impl Tray {
             DestroyWindow(hwnd);
         }
     }
+}
+
+/// ksx's own icon, at the size the notification area actually draws.
+///
+/// # Why `LoadImageW` and not `LoadIconW`
+///
+/// This is the entire reason `assets/brand/dist/ksx.ico` carries eight
+/// SIZE-SPECIFIC entries rather than one drawing eight times. Asked for
+/// 16×16, Windows hands back the `.ico`'s 16 px entry — the *simplified*
+/// mark, drawn with no outline and fatter keys precisely so it survives at
+/// that size. `LoadIconW` cannot express that: it always requests
+/// `SM_CXICON` (32 px) and rescales whatever it gets, so the tray would show
+/// a box-filtered 32 px image no matter how good the small art is.
+///
+/// `SM_CXSMICON` rather than a hard 16: on a 150 % desktop the notification
+/// area draws 24 px icons, and the `.ico` has a 24 px entry waiting.
+///
+/// # Lifetime
+///
+/// `LR_SHARED` — so the system owns the handle and there is no `DestroyIcon`
+/// to forget on the teardown path. That flag is only safe for *standard*
+/// sizes, and `SM_CXSMICON`/`SM_CYSMICON` are the definition of one.
+///
+/// # Failure
+///
+/// Falls back to the stock application icon. A tray wearing the wrong face
+/// is a cosmetic bug; a daemon with no tray is unreachable except by
+/// `taskkill`, which is the failure this whole module is arranged to avoid.
+fn load_tray_icon() -> HICON {
+    // SAFETY: `GetModuleHandleW(NULL)` is the documented way to ask for the
+    // running executable's own module handle; it borrows nothing.
+    let module = unsafe { GetModuleHandleW(std::ptr::null()) };
+
+    // SAFETY: an integer resource id is passed in the name pointer, which is
+    // the MAKEINTRESOURCE convention — the value is an ordinal, never
+    // dereferenced. `without_provenance` says exactly that, and keeps the
+    // cast from looking like a pointer that was lost.
+    let name = std::ptr::without_provenance::<u16>(ICON_RESOURCE_ID);
+
+    // SAFETY: `module` is our own image (or null, which LoadImageW rejects
+    // cleanly); `name` is an ordinal; the size arguments are system metrics.
+    let handle: HANDLE = unsafe {
+        LoadImageW(
+            module,
+            name,
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_DEFAULTCOLOR | LR_SHARED,
+        )
+    };
+    if !handle.is_null() {
+        return handle;
+    }
+
+    tracing::warn!(
+        "ksx.exe carries no icon resource (build.rs could not run rc.exe?); \
+         the tray will show the generic application icon"
+    );
+    // SAFETY: IDI_APPLICATION is a system resource id; a null instance is the
+    // documented way to load it.
+    unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) }
 }
 
 fn notify_data(hwnd: HWND) -> NOTIFYICONDATAW {

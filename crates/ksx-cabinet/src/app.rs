@@ -249,12 +249,43 @@ pub struct App {
     /// Total events the sink dropped while this window was open. Reported, not
     /// hidden.
     pub dropped: u64,
+    /// Keys the sink left out because they came from a device bound to no slot
+    /// — a desk keyboard beside the cabinet. Reported for the same reason
+    /// [`Self::dropped`] is: an absence nobody can account for reads as a
+    /// broken panel.
+    pub off_panel: u64,
     /// The slot whose preset is being picked, if any.
     pub picking: Option<u8>,
     /// What a confirmed modal will do.
     pending: Option<Ask>,
     started: Instant,
+    /// Window-lifecycle logging state (`crate::lib`'s logging contract).
+    ///
+    /// Three edges are *transitions*, not states, so each needs its previous
+    /// value: a line per frame would drown the log a cabinet keeps for
+    /// fourteen days, and a line per change is exactly the ghost-hunting
+    /// record that was missing.
+    painted: bool,
+    was_focused: bool,
+    viewports_seen: usize,
+    /// Focus regained, counted over [`FOCUS_WINDOW`]. See
+    /// [`App::log_lifecycle`]: a window that keeps losing and regaining focus
+    /// is being walked over by something, and saying so is the difference
+    /// between "the cabinet UI flickers" and a named cause.
+    focus_regains: u32,
+    focus_since: Instant,
+    focus_warned: bool,
 }
+
+/// How long the focus-theft detector counts over, and how many regains inside
+/// that window are too many.
+///
+/// Six in a minute is far past anything a person does — alt-tabbing to look
+/// something up is one or two — and comfortably under the *twenty-five* the
+/// observed ghost produced (a console window conjured every ~2.35 s, holding
+/// focus for ~200 ms each time).
+const FOCUS_WINDOW: Duration = Duration::from_secs(60);
+const FOCUS_THEFT: u32 = 6;
 
 impl App {
     pub fn new(ctx: &egui::Context, cabinet: Cabinet) -> Self {
@@ -273,13 +304,25 @@ impl App {
             let (status, control, machine) = (status.clone(), control.clone(), machine.clone());
             // A named thread, like every other thread in this project, so a
             // stack trace says which one it was.
-            let _ = std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name("ksx-cabinet-worker".into())
                 .spawn(move || {
                     worker(status, control, machine, slow, rx, move || {
                         ctx.request_repaint();
                     });
                 });
+            // An error path that used to be `let _ =`. Without the worker the
+            // window paints an empty machine for ever and every press is a
+            // no-op — a failure that looks exactly like a daemon that has
+            // stopped answering, and said nothing anywhere.
+            match &spawned {
+                Ok(_) => tracing::debug!("cabinet window: worker thread started"),
+                Err(err) => tracing::error!(
+                    %err,
+                    "cabinet window: the worker thread could not start — this window will \
+                     show an empty machine and perform no verb"
+                ),
+            }
         }
         Self {
             focus: Focus::default(),
@@ -292,9 +335,16 @@ impl App {
             keys: Vec::new(),
             lit: Vec::new(),
             dropped: 0,
+            off_panel: 0,
             picking: None,
             pending: None,
             started: Instant::now(),
+            painted: false,
+            was_focused: false,
+            viewports_seen: 0,
+            focus_regains: 0,
+            focus_since: Instant::now(),
+            focus_warned: false,
         }
     }
 
@@ -358,12 +408,14 @@ impl App {
         self.keys.clear();
         self.lit.clear();
         self.dropped = 0;
+        self.off_panel = 0;
     }
 
     /// Drain the live feed into the window's short memory.
     fn take_frame(&mut self, now: Instant) {
         let frame = self.feed.poll();
         self.dropped += frame.dropped;
+        self.off_panel += frame.off_panel;
         for hit in &frame.keys {
             // Only presses go in the log. A release is the same key a moment
             // later and would halve how much history fits on screen.
@@ -501,9 +553,109 @@ impl App {
     }
 }
 
+impl App {
+    /// The window's lifecycle edges, one line each, at the top of every paint.
+    ///
+    /// # Why the viewport COUNT is in here
+    ///
+    /// "A ghost window that flashes but never fully loads, over and behind the
+    /// cabinet UI" has three plausible explanations from inside this crate and
+    /// they are indistinguishable without evidence: eframe creating and
+    /// destroying a window on the `run_app_on_demand` path, a second egui
+    /// viewport being opened, or something outside egui entirely. Logging the
+    /// viewport map's size on the first frame and on every change separates
+    /// them in one line — if this crate ever owns two viewports, it says so,
+    /// and if it never does the ghost is somebody else's (it was: a console
+    /// window conjured by a `schtasks` spawn — see
+    /// `ksx_platform::process::no_window`).
+    fn log_lifecycle(&mut self, ctx: &egui::Context) {
+        let (focused, viewports, close_requested) = ctx.input(|i| {
+            (
+                i.focused,
+                i.raw.viewports.len(),
+                i.viewport().close_requested(),
+            )
+        });
+
+        if !self.painted {
+            self.painted = true;
+            self.viewports_seen = viewports;
+            tracing::info!(
+                first_paint_ms = self.started.elapsed().as_millis(),
+                viewports,
+                viewport_id = ?ctx.viewport_id(),
+                focused,
+                "cabinet window: first frame painted"
+            );
+        } else if viewports != self.viewports_seen {
+            // This crate opens exactly one viewport. A change here is the
+            // ghost, named.
+            tracing::warn!(
+                was = self.viewports_seen,
+                now = viewports,
+                "cabinet window: the viewport count changed — this surface owns ONE window"
+            );
+            self.viewports_seen = viewports;
+        }
+
+        if focused != self.was_focused {
+            self.was_focused = focused;
+            tracing::debug!(focused, "cabinet window: focus changed");
+            if focused {
+                self.note_focus_regained();
+            }
+        }
+
+        if close_requested {
+            // The single most important line in this file. Inside the daemon
+            // this must be followed by "event loop returned cleanly" and
+            // NOTHING else — no session stop, no claim release, no quit.
+            tracing::info!(
+                open_for_ms = self.started.elapsed().as_millis(),
+                "cabinet window: close requested — the window is going away; \
+                 emulation, the claim and the tray are untouched"
+            );
+        }
+    }
+
+    /// **The focus-theft detector**, and the reason it is `warn!` rather than
+    /// another `debug!` line.
+    ///
+    /// The ghost that cost an evening was a *console window*, conjured every
+    /// two seconds behind the status refresh and destroyed again ~200 ms later
+    /// (`ksx_platform::process::no_window`). From the cabinet's side that is
+    /// invisible except as this: focus lost and regained, over and over, at a
+    /// steady period. Nothing in the window's own state can see the culprit —
+    /// but the *symptom* is unmistakable, and a cabinet's log should describe a
+    /// panel that is being walked over rather than leaving somebody to notice
+    /// the flicker and wonder.
+    ///
+    /// Warned once per [`FOCUS_WINDOW`]: enough to be seen in a day's log, not
+    /// enough to fill one.
+    fn note_focus_regained(&mut self) {
+        if self.focus_since.elapsed() >= FOCUS_WINDOW {
+            self.focus_since = Instant::now();
+            self.focus_regains = 0;
+            self.focus_warned = false;
+        }
+        self.focus_regains += 1;
+        if self.focus_regains >= FOCUS_THEFT && !self.focus_warned {
+            self.focus_warned = true;
+            tracing::warn!(
+                regained = self.focus_regains,
+                within_s = FOCUS_WINDOW.as_secs(),
+                "cabinet window: something keeps taking focus away from this window and giving \
+                 it back. A window flashing over the panel is usually a console conjured for a \
+                 child process by a daemon that has released its own console"
+            );
+        }
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = Instant::now();
+        self.log_lifecycle(ctx);
         self.take_frame(now);
         let slow = self.slow();
         for nav in self.navigation(ctx, now) {
@@ -546,6 +698,29 @@ impl eframe::App for App {
         } else {
             Duration::from_millis(250)
         });
+    }
+
+    /// eframe's last call before the window goes. The counterpart to
+    /// `App::new`'s "viewport created" line, so a log always has both ends.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        tracing::info!(
+            open_for_ms = self.started.elapsed().as_millis(),
+            keys_seen = self.keys.len(),
+            dropped = self.dropped,
+            off_panel = self.off_panel,
+            "cabinet window: closed"
+        );
+    }
+}
+
+/// The subscription and the worker's `Sender` go here, and with them the
+/// pipeline's cost (`ksx-app`'s `crate::feed`). Logged because "did the closed
+/// window actually stop paying" is otherwise only answerable by inspection.
+impl Drop for App {
+    fn drop(&mut self) {
+        tracing::debug!(
+            "cabinet window: app dropped — live subscription released, worker asked to stop"
+        );
     }
 }
 

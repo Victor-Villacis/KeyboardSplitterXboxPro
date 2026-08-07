@@ -11,6 +11,16 @@ rust-version.workspace = true
 name = "ksx"
 path = "src/main.rs"
 
+# The Win32 resource stamp — icon group + VERSIONINFO. See build.rs for what
+# it does and why a failure there is a warning rather than an error.
+[target.'cfg(windows)'.build-dependencies]
+# Named directly rather than through [workspace.dependencies]: it is a
+# BUILD-time dependency of exactly one crate, it never appears in any ksx
+# binary, and hoisting it would put a resource compiler in the same list as
+# the engine's runtime deps. `winresource` is the maintained fork of the
+# unmaintained `winres`.
+winresource = "0.1"
+
 [dependencies]
 ksx-core.workspace = true
 ksx-config.workspace = true
@@ -79,6 +89,16 @@ windows-sys = { workspace = true, features = [
     "Win32_Security",
     "Win32_System_IO",
     "Win32_System_Pipes",
+    # The tray (`daemon/tray.rs`). These three were reaching this crate
+    # TRANSITIVELY — Shell and WindowsAndMessaging from ksx-platform and
+    # ksx-capture, LibraryLoader from ksx-capture — which meant a window
+    # class, a notification icon and a message pump compiled here only for as
+    # long as some other crate happened to want the same modules. windows-sys
+    # features are additive, so declaring what this crate's own `use` lines
+    # name costs nothing and removes the coupling.
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [features]
