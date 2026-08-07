@@ -714,6 +714,29 @@ pub enum Refusal {
          with no way to type"
     )]
     LastKeyboard { instance_id: String },
+    /// The twins case, and the reason it cannot simply be allowed.
+    ///
+    /// A generated INF binds by **hardware id**, and two boards of the same
+    /// model share one (`USB\VID_D209&PID_0430&MI_00` carries no instance or
+    /// port component). So `pnputil /install` would claim every matching
+    /// interface, not the one that was asked for — and the last-keyboard
+    /// refusal, which subtracts a single board, would happily approve it.
+    ///
+    /// Windows offers no INF-level escape: an instance id is not matchable in a
+    /// models section. Binding one twin and not the other needs per-devnode
+    /// installation (SetupAPI `SetupDiSetSelectedDriver` + `DiInstallDevice`),
+    /// which ksx does not do yet. Until it does, this refuses.
+    #[error(
+        "{instance_id} shares the hardware id {hardware_id} with {} other connected \
+         interface(s) — a claim would take all of them",
+        siblings.len()
+    )]
+    SharedHardwareId {
+        instance_id: String,
+        hardware_id: String,
+        /// The other instance ids the same INF would bind.
+        siblings: Vec<String>,
+    },
     #[error("this needs an administrator token; re-run from an elevated prompt")]
     NeedsElevation,
 }
@@ -728,6 +751,7 @@ impl Refusal {
             Refusal::AlreadyClaimed { .. } => "already-claimed",
             Refusal::NotClaimed { .. } => "not-claimed",
             Refusal::LastKeyboard { .. } => "last-keyboard",
+            Refusal::SharedHardwareId { .. } => "shared-hardware-id",
             Refusal::NeedsElevation => "needs-elevation",
         }
     }
@@ -774,6 +798,19 @@ impl Refusal {
                  cannot do anything at all if ksx is not running. docs/RECOVERY.md §2."
                     .to_owned()
             }
+            Refusal::SharedHardwareId {
+                hardware_id,
+                siblings,
+                ..
+            } => format!(
+                "two boards of the same model are indistinguishable to an INF: the driver \
+                 matches on {hardware_id}, which these also carry, so installing it would \
+                 claim every one of them:\n  {}\n\nUnplug the others and claim this board on \
+                 its own, or keep them on the Interception backend. Telling identical boards \
+                 apart during a claim needs per-device installation, which ksx does not do \
+                 yet — see docs/DEVICE-IDENTITY.md §2.",
+                siblings.join("\n  ")
+            ),
             Refusal::NeedsElevation => {
                 "pnputil changes driver bindings, which needs administrator. ksx never \
                  self-elevates: open an elevated PowerShell and re-run the same command."
@@ -987,6 +1024,35 @@ pub fn plan_claim(survey: &Survey, requested: &str, inf_dir: &Path) -> Result<Cl
             .ok_or_else(|| Refusal::NotAKeyboard {
                 instance_id: candidate.interface.instance_id.clone(),
             })?;
+
+    // An INF binds by hardware id, and a hardware id has no instance or port
+    // component — so `USB\VID_D209&PID_0430&MI_00` names the keyboard interface
+    // of EVERY I-PAC 4X plugged in, not the one that was asked for. Installing
+    // it would claim all of them.
+    //
+    // This has to be checked before the last-keyboard arithmetic below, because
+    // that arithmetic subtracts one board: with two identical boards and no
+    // other keyboard it computes "one left" and approves a claim that takes
+    // both. The refusal that exists to prevent a lockout would authorise one.
+    let siblings: Vec<String> = survey
+        .candidates
+        .iter()
+        .filter(|other| {
+            other.interface.instance_id != candidate.interface.instance_id
+                && other
+                    .interface
+                    .usb_hardware_id()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(&hardware_id))
+        })
+        .map(|other| other.interface.instance_id.clone())
+        .collect();
+    if !siblings.is_empty() {
+        return Err(Refusal::SharedHardwareId {
+            instance_id: candidate.interface.instance_id.clone(),
+            hardware_id,
+            siblings,
+        });
+    }
 
     // What a claim actually costs you is the whole **board**, not the one node
     // hanging off this interface: the other interfaces and collections of the
@@ -1933,6 +1999,83 @@ mod tests {
             3,
             "two I-PACs and the spare are three keyboards, not one model"
         );
+    }
+
+    /// Add a second I-PAC and a claim must refuse, because the INF it would
+    /// generate cannot tell the two apart.
+    ///
+    /// This is the shape that made the bug invisible: the last-keyboard
+    /// refusal is correct *about boards* — subtract this board and one is
+    /// left — while the artifact it approves is scoped to the hardware id,
+    /// which both boards carry. The safety check and the thing it authorises
+    /// were talking about different objects, so the answer was "you still have
+    /// a keyboard" about a command that would take every keyboard on the
+    /// machine.
+    #[test]
+    fn a_second_identical_board_refuses_the_claim_rather_than_taking_both() {
+        let mut tree = healthy_cabinet_tree();
+        // A second I-PAC 4X, same model, different port.
+        tree.push(live(node(
+            r"USB\VID_D209&PID_0430\9",
+            COMPOSITE_CLASS,
+            "usbccgp",
+            "@usb.inf,%usb\\composite.devicedesc%;USB Composite Device",
+            Some("7&99999999&0"),
+        )));
+        tree.push(live(node(
+            r"USB\VID_D209&PID_0430&MI_00\7&99999999&0&0000",
+            HID_CLASS,
+            "HidUsb",
+            "@input.inf,%hid.devicedesc%;USB Input Device",
+            Some("8&deadbeef&0"),
+        )));
+        tree.push(keyboard_node(
+            r"HID\VID_D209&PID_0430&MI_00\8&deadbeef&0&0000",
+        ));
+
+        let survey = Survey::from_nodes(&tree);
+        let err = plan_claim(
+            &survey,
+            r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000",
+            Path::new(r"C:\tmp"),
+        )
+        .expect_err("a claim that would take both boards must refuse");
+
+        assert_eq!(err.code(), "shared-hardware-id");
+        let Refusal::SharedHardwareId {
+            hardware_id,
+            siblings,
+            ..
+        } = &err
+        else {
+            panic!("expected SharedHardwareId, got {err:?}");
+        };
+        assert_eq!(hardware_id, r"USB\VID_D209&PID_0430&MI_00");
+        assert_eq!(
+            siblings,
+            &[r"USB\VID_D209&PID_0430&MI_00\7&99999999&0&0000".to_owned()],
+            "the refusal must name the board that would also be taken"
+        );
+        assert!(
+            err.advice().contains("claim this board on its own"),
+            "a refusal with no way forward is just an error message: {}",
+            err.advice()
+        );
+    }
+
+    /// The single-board case — the 99% one — must keep working exactly as it
+    /// did. The guard above is about *twins*, and a board's own MI_01/MI_02
+    /// carry different hardware ids, so they must not trip it.
+    #[test]
+    fn one_board_of_its_model_still_claims_cleanly() {
+        let survey = Survey::from_nodes(&healthy_cabinet_tree());
+        let plan = plan_claim(
+            &survey,
+            r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000",
+            Path::new(r"C:\tmp"),
+        )
+        .expect("one I-PAC plus a spare keyboard is a legal claim");
+        assert_eq!(plan.hardware_id, r"USB\VID_D209&PID_0430&MI_00");
     }
 
     /// A keyboard whose interface is **already bound to `winusb.sys`** is not a
