@@ -63,6 +63,11 @@ export interface BoardRow {
   alias: string | null;
   claim_command: string | null;
   release_command: string | null;
+  /** Decided by DeviceScanView::read — see the DERIVED note below. */
+  pickable: boolean;
+  command_lead: string;
+  command: string;
+  caveat: string;
 }
 
 export interface ConfiguredDevice {
@@ -80,6 +85,12 @@ export interface ConfiguredDevice {
   claim_command: string | null;
   release_command: string | null;
   used_by: string[];
+  /** Decided by DeviceScanView::read — see the DERIVED note below. */
+  health_line: string;
+  /** `ok` | `warn` | `idle` | `none`. */
+  health_level: string;
+  command_lead: string;
+  command: string;
 }
 
 export interface DeviceScanView {
@@ -88,6 +99,29 @@ export interface DeviceScanView {
   boards: BoardRow[];
   configured: ConfiguredDevice[];
   notes: string[];
+  // ── DERIVED: decided once, in Rust (crates/ksx-api/src/machine.rs) ──────
+  //
+  // This island is the SECOND renderer of this payload — `render_devices.rs`
+  // paints the same page server-side — so anything decided here is decided
+  // twice, in two languages, and drifts silently. It did: the partition, the
+  // counts and these three sentences were computed in both files, and only the
+  // Rust copy consulted `usb_available`, so a machine whose USB enumeration
+  // FAILED was told "no keyboard-capable board found".
+  //
+  // Nothing below is recomputed here. `DeviceScanView::read` decides it and
+  // this file renders it. Do not add a derivation to this island; add it there.
+  pickable_boards: number;
+  other_boards: number;
+  configured_summary: string;
+  boards_summary: string;
+  other_summary: string;
+  /** The list is empty AND that emptiness is a real reading of the machine.
+   *  False whenever nothing could be read — "I could not read this" and "there
+   *  is nothing here" are different sentences and the user acts on them
+   *  differently. */
+  no_pickable_board_found: boolean;
+  /** The same, for config.toml. */
+  no_configured_device: boolean;
 }
 
 export interface SessionView {
@@ -112,6 +146,7 @@ interface ConfiguredTile {
   alias: string;
   id: string;
   backend: string;
+  rung: string;
   means: string;
   presence: string;
   presenceCls: string;
@@ -187,129 +222,85 @@ const [boardRows, setBoardRows] = createSignal<BoardTile[]>([]);
 const [otherRows, setOtherRows] = createSignal<OtherTile[]>([]);
 const [noteRows, setNoteRows] = createSignal<NoteTile[]>([]);
 
-// ── Derivations (mirror render_devices.rs; pinned there by unit tests) ─────
+// ── Row shaping (mirrors render_devices.rs; NOT deciding anything) ─────────
+//
+// Everything below turns a value the backend already decided into the class or
+// element id this page draws it with. No sentence is composed here, no count is
+// taken here, and no verdict is reached here — see the DERIVED note on
+// DeviceScanView for what that cost the last time.
 
-/** The elevated half, said the same way in both places. Claiming and
- *  releasing need an admin shell, so what a browser can do with either is show
- *  it — and the sentence has to say WHY, or a copyable command that fails with
- *  "access denied" is the only feedback the user ever gets. */
-const CLAIM_LEAD =
-  "To move it to the WinUSB backend it must be claimed — it then stops typing to Windows, which is a separate, consented step. Run this in an ELEVATED shell:";
-const RELEASE_LEAD =
-  "It is claimed, so Windows sees no keyboard on it. To put it back on the keyboard driver, run this in an ELEVATED shell:";
-
-function configuredSummaryLine(count: number): string {
-  if (count === 0) return "no [[device]] entries in config.toml";
-  if (count === 1) return "1 [[device]] entry in config.toml:";
-  return `${count} [[device]] entries in config.toml:`;
+/** A line that is present on every row and hidden when it has nothing to say:
+ *  `createShow` inside a `createList` is not a shape this compiler emits. */
+function optionalLine(text: string, cls: string): [string, string] {
+  return text === "" ? ["", `${cls} dv-hide`] : [text, cls];
 }
 
-function boardsSummaryLine(count: number, usbAvailable: boolean): string {
-  if (!usbAvailable) {
-    return "USB enumeration failed — this list is empty because nothing could be READ, not because nothing is plugged in";
-  }
-  if (count === 0) return "no keyboard-capable board found";
-  if (count === 1) return "1 keyboard-capable board:";
-  return `${count} keyboard-capable boards:`;
-}
-
-function otherSummaryLine(count: number): string {
-  if (count === 0) return "";
-  if (count === 1) {
-    return "1 board has no keyboard interface — ksx cannot capture it:";
-  }
-  return `${count} boards have no keyboard interface — ksx cannot capture them:`;
+/** `pill pill-<level>` — the level word travels from the backend, so a level it
+ *  adds cannot leave this page rendering the wrong colour. `pill-none` is the
+ *  hidden one (studio.css). */
+function pillOf(level: string): string {
+  return `pill pill-${level}`;
 }
 
 function configuredTile(d: ConfiguredDevice, i: number): ConfiguredTile {
   const present = d.present;
-  const winusbButLoose = present && !d.claimed && d.backend === "winusb";
-  let claimText = "";
-  let claimCls = "pill dv-hide";
-  if (present && d.claimed) {
-    claimText = "claimed — bound to winusb.sys";
-    claimCls = "pill pill-ok";
-  } else if (winusbButLoose) {
-    claimText = "backend is winusb but the board is NOT claimed — ksx run will refuse";
-    claimCls = "pill pill-warn";
-  } else if (present) {
-    claimText = "on the Windows keyboard stack";
-    claimCls = "pill pill-idle";
-  }
-
-  let commandLead = "";
-  let command = "";
-  let commandCls = "dv-cmd dv-hide";
-  if (d.release_command) {
-    commandLead = RELEASE_LEAD;
-    command = d.release_command;
-    commandCls = "dv-cmd";
-  } else if (d.claim_command) {
-    commandLead = CLAIM_LEAD;
-    command = d.claim_command;
-    commandCls = "dv-cmd";
-  }
-
+  const [commandLead, commandCls] = optionalLine(d.command_lead, "dv-cmd");
+  const [portWarn, portWarnCls] = optionalLine(d.port_pinned_warning ?? "", "dv-warn");
+  const used = d.used_by.length > 0;
   return {
     alias: d.alias,
     id: d.id,
     backend: d.backend,
+    rung: d.rung,
     means: d.means,
     presence: present ? "connected" : "not connected right now",
     presenceCls: present ? "pill pill-ok" : "pill pill-warn",
-    claimText,
-    claimCls,
+    claimText: d.health_line,
+    claimCls: pillOf(d.health_level),
     board:
       present && d.instance_id
         ? `${d.board ?? "unknown board"} — ${d.instance_id}`
         : "the id resolves to no connected interface right now — unplugged, moved to another socket, or never here",
     boardCls: present ? "dv-line mono" : "dv-line dv-miss",
     commandLead,
-    command,
+    command: d.command,
     commandCls,
-    portWarn: d.port_pinned_warning ?? "",
-    portWarnCls: d.port_pinned_warning ? "dv-warn" : "dv-warn dv-hide",
-    usedBy:
-      d.used_by.length === 0
-        ? ""
-        : `slots naming it: ${d.used_by.join(", ")} — removing it breaks them, so it needs the box below`,
-    usedByCls: d.used_by.length === 0 ? "dv-used dv-hide" : "dv-used",
+    portWarn,
+    portWarnCls,
+    usedBy: used
+      ? `slots naming it: ${d.used_by.join(", ")} — removing it breaks them, so it needs the box below`
+      : "",
+    usedByCls: used ? "dv-used" : "dv-used dv-hide",
     forceId: `dv-force-${i}`,
-    forceCls: d.used_by.length === 0 ? "dv-force dv-hide" : "dv-force",
+    forceCls: used ? "dv-force" : "dv-force dv-hide",
   };
 }
 
 function boardTile(b: BoardRow, i: number): BoardTile {
   const keyboard = b.keyboard ?? "";
-  let commandLead = "";
-  let command = "";
-  let commandCls = "dv-cmd dv-hide";
-  if (b.release_command) {
-    commandLead = RELEASE_LEAD;
-    command = b.release_command;
-    commandCls = "dv-cmd";
-  } else if (b.claim_command) {
-    commandLead = CLAIM_LEAD;
-    command = b.claim_command;
-    commandCls = "dv-cmd";
-  }
+  const [commandLead, commandCls] = optionalLine(b.command_lead, "dv-cmd");
+  const [caveat, caveatCls] = optionalLine(b.caveat, "dv-warn");
   return {
     name: b.name,
     ifaces: `${b.interfaces.length} interface(s) · keyboard on ${keyboard}`,
     verdict: b.keyboard_verdict,
-    caveat: b.looks_like_a_keyboard
-      ? ""
-      : "NOT declared as a keyboard. This is an HID interface and may be something else entirely — on a real cabinet a mouse, an LED controller and a fan controller all read as claimable.",
-    caveatCls: b.looks_like_a_keyboard ? "dv-warn dv-hide" : "dv-warn",
+    caveat,
+    caveatCls,
     configured: b.alias ? `configured as "${b.alias}"` : "",
     configuredCls: b.alias ? "pill pill-ok" : "pill dv-hide",
     claimText: b.claimed ? "claimed — bound to winusb.sys" : "on the Windows keyboard stack",
     claimCls: b.claimed ? "pill pill-ok" : "pill pill-idle",
     commandLead,
-    command,
+    command: b.command,
     commandCls,
     query: keyboard,
     aliasId: `dv-alias-${i}`,
+    // The box is PRE-FILLED with the name the entry already has, not merely
+    // placeholdered with it. A placeholder reads as "already filled in" and
+    // typing over it renamed the entry, orphaning every [[slot]] that named the
+    // old alias — the same destruction the Remove button below demands a
+    // --force checkbox for. (`plan_pick` now refuses that rename outright; this
+    // is the half that stops it being reached by accident.)
     aliasHint: b.alias ?? b.name,
     pickLabel: b.alias ? "Re-pick — update this entry" : "Use this board",
   };
@@ -333,34 +324,39 @@ export function applyDevices(p: DevicesPayload): void {
   setPillDown(!session.reachable);
   setSessionLive(session.reachable && session.running);
 
-  const configured = scan.configured.map(configuredTile);
-  // Pickable = it has a keyboard interface. A board with none cannot be
-  // picked, so offering it would be an offer that always refuses — it goes in
-  // the quiet list below instead of vanishing, because "ksx cannot see my
-  // board" is a real support question.
-  const pickable = scan.boards.filter((b) => b.keyboard !== null);
-  const other = scan.boards.filter((b) => b.keyboard === null);
-
-  setConfiguredRows(configured);
-  setBoardRows(pickable.map(boardTile));
+  // `b.pickable`, never `b.keyboard !== null`. A board with no keyboard
+  // interface cannot be picked, so offering it would be an offer that always
+  // refuses — it goes in the quiet list below instead of vanishing, because
+  // "ksx cannot see my board" is a real support question. Which side a board
+  // falls on is DeviceScanView::read's decision; this only draws it.
+  setConfiguredRows(scan.configured.map(configuredTile));
+  setBoardRows(scan.boards.filter((b) => b.pickable).map(boardTile));
   setOtherRows(
-    other.map((b) => ({
-      name: b.name,
-      ifaces: `${b.interfaces.length} interface(s) · no keyboard interface`,
-    })),
+    scan.boards
+      .filter((b) => !b.pickable)
+      .map((b) => ({
+        name: b.name,
+        ifaces: `${b.interfaces.length} interface(s) · no keyboard interface`,
+      })),
   );
   setNoteRows(scan.notes.map((note) => ({ note })));
 
-  setConfiguredSummary(configuredSummaryLine(configured.length));
-  setBoardsSummary(boardsSummaryLine(pickable.length, scan.usb_available));
-  setOtherSummary(otherSummaryLine(other.length));
+  setConfiguredSummary(scan.configured_summary);
+  setBoardsSummary(scan.boards_summary);
+  setOtherSummary(scan.other_summary);
 
-  setHasConfigured(configured.length > 0);
-  setNoConfigured(configured.length === 0);
-  setHasBoards(pickable.length > 0);
-  setNoBoards(pickable.length === 0 && unavailable === "");
-  setHasOther(other.length > 0);
+  setHasConfigured(scan.configured.length > 0);
+  setHasBoards(scan.pickable_boards > 0);
+  setHasOther(scan.other_boards > 0);
   setHasNotes(scan.notes.length > 0);
+  // The two empty-state paragraphs are gated on the backend's flags, NOT on
+  // `length === 0`. A refusal or a failed enumeration arrives with empty lists,
+  // and both flags false, so neither paragraph appears and the banner above is
+  // the only thing that speaks. This island previously wrote
+  // `pickable.length === 0 && unavailable === ""`, which forgot `usb_available`
+  // entirely and told a cabinet with four boards plugged in that it had none.
+  setNoConfigured(scan.no_configured_device);
+  setNoBoards(scan.no_pickable_board_found);
 }
 
 /** The studio server itself stopped answering: say so, and leave the last-known
@@ -513,6 +509,20 @@ export function DevicesIsland() {
                       h("span", { class: r.claimCls }, r.claimText),
                     ),
                     h("p", { class: "dv-line mono" }, r.id),
+                    // backend and rung, both RENDERED. The page used to carry
+                    // `backend` in the row object and read it nowhere, so it
+                    // never said whether an entry was winusb or interception —
+                    // the field the pill above is reasoning about — and `rung`
+                    // was not carried at all. Static labels beside dynamic
+                    // values: no concatenation, so no anonymous slot.
+                    h(
+                      "p",
+                      { class: "dv-facts" },
+                      h("span", { class: "dv-lbl" }, "backend"),
+                      h("span", { class: "mono" }, r.backend),
+                      h("span", { class: "dv-lbl" }, "rung"),
+                      h("span", { class: "mono" }, r.rung),
+                    ),
                     h("p", { class: "dv-note" }, r.means),
                     h("p", { class: r.boardCls }, r.board),
                     h("p", { class: r.portWarnCls }, r.portWarn),
@@ -618,6 +628,7 @@ export function DevicesIsland() {
                         type: "text",
                         id: b.aliasId,
                         name: "alias",
+                        value: b.aliasHint,
                         placeholder: b.aliasHint,
                         maxlength: "64",
                         autocomplete: "off",
@@ -638,8 +649,14 @@ export function DevicesIsland() {
             h(
               "p",
               { class: "dv-empty" },
-              "No board here exposes a keyboard interface, so there is nothing ",
-              "ksx could capture. Everything that IS plugged in is listed below.",
+              // Only ever shown when the enumeration ANSWERED — noBoards is
+              // `scan.no_pickable_board_found`, which is false whenever
+              // nothing could be read. The first sentence says so out loud,
+              // because that is the difference between this paragraph and the
+              // banner above it.
+              "The enumeration answered, and no board it found exposes a ",
+              "keyboard interface — so there is nothing here ksx could ",
+              "capture. Anything else that enumerated is listed below.",
             ),
         ),
       ),

@@ -73,83 +73,54 @@ const CLIENT_ONLY_SLOTS: [&str; 0] = [];
 #[cfg(test)]
 const ANONYMOUS_SLOTS: [&str; 0] = [];
 
-/// The elevated half, worded once and shared with the island's twin.
-///
-/// Both commands need an admin shell, so `docs/SURFACES.md` §3 marks them
-/// "never" for the browser and this page shows them instead of running them.
-/// The lead has to say ELEVATED, or the only feedback a user gets is "access
-/// denied" from a command a web page handed them.
-const CLAIM_LEAD: &str = "To move it to the WinUSB backend it must be claimed — it then stops \
-     typing to Windows, which is a separate, consented step. Run this in an ELEVATED shell:";
-const RELEASE_LEAD: &str = "It is claimed, so Windows sees no keyboard on it. To put it back on \
-     the keyboard driver, run this in an ELEVATED shell:";
-
 // ---------------------------------------------------------------------------
 // derivations (mirrored in studio-ui/src/DevicesIsland.ts)
 // ---------------------------------------------------------------------------
+//
+// What is NOT here any more, and must never come back: the pickable/other
+// PARTITION, the board and entry COUNTS, the three summary sentences, the
+// "ksx run will refuse" verdict, the ELEVATED command leads and the HID
+// caveat. Every one of those was computed here AND again in the island's
+// TypeScript, which is `docs/SURFACES.md` §1 broken twice over — and the
+// `usb_available` bug proved the cost, because only one of the two copies had
+// to forget the flag for the page to tell a cabinet with four boards plugged
+// in that it had none.
+//
+// They are `ksx_api::DeviceScanView::read`'s now. What survives below is
+// genuinely this page's: which CSS class a value maps to, and how a row's
+// element ids are spelled.
 
-fn configured_summary(count: usize) -> String {
-    match count {
-        0 => "no [[device]] entries in config.toml".to_owned(),
-        1 => "1 [[device]] entry in config.toml:".to_owned(),
-        n => format!("{n} [[device]] entries in config.toml:"),
-    }
-}
-
-/// The boards line — and the one case where an empty list is NOT the same as
-/// an empty machine.
+/// The pill class for a value `ksx_api` has already judged.
 ///
-/// `usb_available == false` means the enumeration itself failed, so the list is
-/// empty because nothing could be READ. Printing "no keyboard-capable board
-/// found" there would be a confident wrong answer on a cabinet with four boards
-/// plugged in.
-fn boards_summary(count: usize, usb_available: bool) -> String {
-    if !usb_available {
-        return "USB enumeration failed — this list is empty because nothing could be READ, not \
-                because nothing is plugged in"
-            .to_owned();
-    }
-    match count {
-        0 => "no keyboard-capable board found".to_owned(),
-        1 => "1 keyboard-capable board:".to_owned(),
-        n => format!("{n} keyboard-capable boards:"),
-    }
+/// The level word travels; the class is built from it, so adding a level in the
+/// backend cannot leave a surface silently rendering the wrong colour — it
+/// renders `pill pill-<level>`, and an unstyled level is visible rather than
+/// wrong. `pill-none` is the hidden one (studio.css).
+fn pill_of(level: &str) -> String {
+    format!("pill pill-{level}")
 }
 
-fn other_summary(count: usize) -> String {
-    match count {
-        0 => String::new(),
-        1 => "1 board has no keyboard interface — ksx cannot capture it:".to_owned(),
-        n => format!("{n} boards have no keyboard interface — ksx cannot capture them:"),
-    }
-}
-
-/// `(lead, command, class)` for the elevated command a row shows, or the
-/// hidden triple when there is nothing to show.
-fn command_cell(claim: Option<&str>, release: Option<&str>) -> (String, String, &'static str) {
-    match (release, claim) {
-        (Some(cmd), _) => (RELEASE_LEAD.to_owned(), cmd.to_owned(), "dv-cmd"),
-        (None, Some(cmd)) => (CLAIM_LEAD.to_owned(), cmd.to_owned(), "dv-cmd"),
-        (None, None) => (String::new(), String::new(), "dv-cmd dv-hide"),
+/// A `(text, class)` pair for a line that is rendered on every row and hidden
+/// when it has nothing to say — the constraint this page's module docs open
+/// with: a `createShow` inside a `createList` is not a shape this compiler
+/// emits.
+fn optional_line(text: &str, class: &'static str) -> (String, String) {
+    if text.is_empty() {
+        (String::new(), format!("{class} dv-hide"))
+    } else {
+        (text.to_owned(), class.to_owned())
     }
 }
 
 fn scalar_slots(payload: &DevicesPayload, flash: Option<&str>) -> serde_json::Value {
-    let pickable = payload
-        .scan
-        .boards
-        .iter()
-        .filter(|b| b.keyboard.is_some())
-        .count();
-    let other = payload.scan.boards.len() - pickable;
     serde_json::json!({
         "generatedAt": payload.scan.generated_at,
         "sessionLine": payload.session.line,
         "flashLine": flash.unwrap_or(""),
         "unavailableLine": payload.unavailable.trim(),
-        "configuredSummary": configured_summary(payload.scan.configured.len()),
-        "boardsSummary": boards_summary(pickable, payload.scan.usb_available),
-        "otherSummary": other_summary(other),
+        "configuredSummary": payload.scan.configured_summary,
+        "boardsSummary": payload.scan.boards_summary,
+        "otherSummary": payload.scan.other_summary,
     })
 }
 
@@ -160,30 +131,11 @@ fn scalar_slots(payload: &DevicesPayload, flash: Option<&str>) -> serde_json::Va
 /// chose — an alias may contain spaces and quotes, and an `id` attribute built
 /// from one would be a selector nobody can write.
 fn configured_row(device: &ConfiguredDevice, index: usize) -> SlotValue {
-    // The claim state, with the one combination that is actually a fault
-    // called out: `backend = "winusb"` on a board that is NOT bound to
-    // winusb.sys is a config `ksx run` refuses to start on, and it looks
-    // identical to a healthy row unless someone says so.
-    let winusb_but_loose = device.present && !device.claimed && device.backend == "winusb";
-    let (claim_text, claim_cls) = if device.present && device.claimed {
-        ("claimed — bound to winusb.sys".to_owned(), "pill pill-ok")
-    } else if winusb_but_loose {
-        (
-            "backend is winusb but the board is NOT claimed — ksx run will refuse".to_owned(),
-            "pill pill-warn",
-        )
-    } else if device.present {
-        ("on the Windows keyboard stack".to_owned(), "pill pill-idle")
-    } else {
-        // Not present: there is no interface to say anything about, and a
-        // stale claim pill would be a claim about a board that is not here.
-        (String::new(), "pill dv-hide")
-    };
-
-    let (command_lead, command, command_cls) = command_cell(
-        device.claim_command.as_deref(),
-        device.release_command.as_deref(),
-    );
+    // The claim state and the one combination that is actually a fault are
+    // `DeviceScanView::read`'s judgement, not this page's — it is a verdict
+    // about what `ksx run` does, and `run` is not something a render seam can
+    // see. All that happens here is level → class.
+    let (command_lead, command_cls) = optional_line(&device.command_lead, "dv-cmd");
 
     let board = match (device.present, device.instance_id.as_deref()) {
         (true, Some(instance)) => format!(
@@ -207,6 +159,12 @@ fn configured_row(device: &ConfiguredDevice, index: usize) -> SlotValue {
     SlotValue::object(vec![
         ("alias".to_owned(), SlotValue::Text(device.alias.clone())),
         ("id".to_owned(), SlotValue::Text(device.id.clone())),
+        ("rung".to_owned(), SlotValue::Text(device.rung.clone())),
+        // Both RENDERED, on their own line beside the id. `backend` used to be
+        // computed into this object and read by nothing, which meant the page
+        // never said whether an entry was `winusb` or `interception` — the one
+        // field the health verdict above it is reasoning about — and `rung`
+        // was not carried at all.
         (
             "backend".to_owned(),
             SlotValue::Text(device.backend.clone()),
@@ -231,8 +189,14 @@ fn configured_row(device: &ConfiguredDevice, index: usize) -> SlotValue {
                 .to_owned(),
             ),
         ),
-        ("claimText".to_owned(), SlotValue::Text(claim_text)),
-        ("claimCls".to_owned(), SlotValue::Text(claim_cls.to_owned())),
+        (
+            "claimText".to_owned(),
+            SlotValue::Text(device.health_line.clone()),
+        ),
+        (
+            "claimCls".to_owned(),
+            SlotValue::Text(pill_of(&device.health_level)),
+        ),
         ("board".to_owned(), SlotValue::Text(board)),
         (
             "boardCls".to_owned(),
@@ -246,11 +210,11 @@ fn configured_row(device: &ConfiguredDevice, index: usize) -> SlotValue {
             ),
         ),
         ("commandLead".to_owned(), SlotValue::Text(command_lead)),
-        ("command".to_owned(), SlotValue::Text(command)),
         (
-            "commandCls".to_owned(),
-            SlotValue::Text(command_cls.to_owned()),
+            "command".to_owned(),
+            SlotValue::Text(device.command.clone()),
         ),
+        ("commandCls".to_owned(), SlotValue::Text(command_cls)),
         // The whole paragraph, straight from the writer that decided it —
         // including the half people miss, that a `port=` value names THIS PC's
         // USB topology and must not be copied to another cabinet.
@@ -304,10 +268,8 @@ fn configured_row(device: &ConfiguredDevice, index: usize) -> SlotValue {
 /// a board ksx cannot capture is an offer that always refuses.
 fn board_row(board: &BoardRow, index: usize) -> SlotValue {
     let keyboard = board.keyboard.clone().unwrap_or_default();
-    let (command_lead, command, command_cls) = command_cell(
-        board.claim_command.as_deref(),
-        board.release_command.as_deref(),
-    );
+    let (command_lead, command_cls) = optional_line(&board.command_lead, "dv-cmd");
+    let (caveat, caveat_cls) = optional_line(&board.caveat, "dv-warn");
     SlotValue::object(vec![
         ("name".to_owned(), SlotValue::Text(board.name.clone())),
         (
@@ -321,31 +283,12 @@ fn board_row(board: &BoardRow, index: usize) -> SlotValue {
             "verdict".to_owned(),
             SlotValue::Text(board.keyboard_verdict.clone()),
         ),
-        // The honest caveat. Without it "ksx could claim it" reads as a
-        // recommendation, and on a real cabinet a mouse, an LED controller and
-        // a fan controller all satisfy "it is HID".
-        (
-            "caveat".to_owned(),
-            SlotValue::Text(if board.looks_like_a_keyboard {
-                String::new()
-            } else {
-                "NOT declared as a keyboard. This is an HID interface and may be something else \
-                 entirely — on a real cabinet a mouse, an LED controller and a fan controller all \
-                 read as claimable."
-                    .to_owned()
-            }),
-        ),
-        (
-            "caveatCls".to_owned(),
-            SlotValue::Text(
-                if board.looks_like_a_keyboard {
-                    "dv-warn dv-hide"
-                } else {
-                    "dv-warn"
-                }
-                .to_owned(),
-            ),
-        ),
+        // The honest caveat, worded by `ksx_api` (`CAVEAT_NOT_A_KEYBOARD`).
+        // Without it "ksx could claim it" reads as a recommendation, and on a
+        // real cabinet a mouse, an LED controller and a fan controller all
+        // satisfy "it is HID".
+        ("caveat".to_owned(), SlotValue::Text(caveat)),
+        ("caveatCls".to_owned(), SlotValue::Text(caveat_cls)),
         (
             "configured".to_owned(),
             SlotValue::Text(match &board.alias {
@@ -387,11 +330,8 @@ fn board_row(board: &BoardRow, index: usize) -> SlotValue {
             ),
         ),
         ("commandLead".to_owned(), SlotValue::Text(command_lead)),
-        ("command".to_owned(), SlotValue::Text(command)),
-        (
-            "commandCls".to_owned(),
-            SlotValue::Text(command_cls.to_owned()),
-        ),
+        ("command".to_owned(), SlotValue::Text(board.command.clone())),
+        ("commandCls".to_owned(), SlotValue::Text(command_cls)),
         // What the form posts: the KEYBOARD interface's instance path, not the
         // board's parent. `plan_pick` resolves it through the same resolver
         // `ksx winusb claim` uses, so the page never has to know which of an
@@ -443,12 +383,16 @@ fn list_values(payload: &DevicesPayload) -> [(&'static str, SlotValue); 4] {
             .map(|(i, d)| configured_row(d, i))
             .collect(),
     );
+    // `b.pickable`, never `b.keyboard.is_some()`: the partition is
+    // `DeviceScanView::read`'s single decision, and re-deriving it here is how
+    // the seam and the island came to disagree about the count in the sentence
+    // above the list.
     let boards = SlotValue::array(
         payload
             .scan
             .boards
             .iter()
-            .filter(|b| b.keyboard.is_some())
+            .filter(|b| b.pickable)
             .enumerate()
             .map(|(i, b)| board_row(b, i))
             .collect(),
@@ -458,7 +402,7 @@ fn list_values(payload: &DevicesPayload) -> [(&'static str, SlotValue); 4] {
             .scan
             .boards
             .iter()
-            .filter(|b| b.keyboard.is_none())
+            .filter(|b| !b.pickable)
             .map(other_row)
             .collect(),
     );
@@ -484,13 +428,7 @@ fn show_values(
 ) -> [(&'static str, bool); SHOW_COUNT] {
     let flash_err = flash.is_some_and(|f| f.starts_with("error"));
     let unavailable = !payload.unavailable.trim().is_empty();
-    let pickable = payload
-        .scan
-        .boards
-        .iter()
-        .filter(|b| b.keyboard.is_some())
-        .count();
-    let other = payload.scan.boards.len() - pickable;
+    let scan = &payload.scan;
     let session = &payload.session;
     [
         ("show:pillRunning", session.reachable && session.running),
@@ -503,16 +441,20 @@ fn show_values(
         // config.toml, and the session already running keeps the devices it
         // opened until it is restarted.
         ("show:sessionLive", session.reachable && session.running),
-        ("show:hasConfigured", !payload.scan.configured.is_empty()),
-        ("show:noConfigured", payload.scan.configured.is_empty()),
-        ("show:hasBoards", pickable > 0),
-        // Deliberately NOT the complement: when the scan itself refused, the
-        // empty list is not a reading of this machine, and saying "no
-        // keyboard-capable board found" under the refusal banner would answer
-        // a question nothing asked.
-        ("show:noBoards", pickable == 0 && !unavailable),
-        ("show:hasOther", other > 0),
-        ("show:hasNotes", !payload.scan.notes.is_empty()),
+        ("show:hasConfigured", !scan.configured.is_empty()),
+        // Deliberately NOT the complement of `hasConfigured`, and deliberately
+        // not `configured.is_empty()` either. `no_configured_device` and
+        // `no_pickable_board_found` are the two flags that license this page to
+        // say "there is nothing here", and `DeviceScanView` only ever sets them
+        // when the list is empty AND something was actually read. A refusal
+        // arrives as `DeviceScanView::default()`, where both are false, so the
+        // empty-state paragraphs stay off the screen and the refusal banner is
+        // the only thing that speaks.
+        ("show:noConfigured", scan.no_configured_device),
+        ("show:hasBoards", scan.pickable_boards > 0),
+        ("show:noBoards", scan.no_pickable_board_found),
+        ("show:hasOther", scan.other_boards > 0),
+        ("show:hasNotes", !scan.notes.is_empty()),
     ]
 }
 
@@ -598,64 +540,83 @@ mod tests {
     /// The reference cabinet, in the shape the api serves: one claimed I-PAC
     /// wearing two devnodes, one fan controller with no keyboard interface,
     /// and one configured entry whose id is PORT-PINNED.
-    fn cabinet() -> DevicesPayload {
-        DevicesPayload {
-            scan: DeviceScanView {
-                generated_at: "2026-08-07 12:00:00 UTC".into(),
-                usb_available: true,
-                boards: vec![
-                    ksx_api::BoardRow {
-                        name: "Ultimarc I-PAC 4X".into(),
-                        interfaces: vec![iface(PANEL, "claimed"), iface(AUX, "not-a-keyboard")],
-                        keyboard: Some(PANEL.to_owned()),
-                        keyboard_verdict: "bound to winusb.sys — ksx can capture this".into(),
-                        looks_like_a_keyboard: true,
-                        claimed: true,
-                        alias: Some("panel".into()),
-                        claim_command: None,
-                        release_command: Some(format!("ksx winusb release {PANEL} --yes")),
-                    },
-                    ksx_api::BoardRow {
-                        name: "NZXT fan controller".into(),
-                        interfaces: vec![UsbRow {
-                            boot_keyboard: false,
-                            ..iface(FAN, "not-a-keyboard")
-                        }],
-                        keyboard: None,
-                        keyboard_verdict: "no keyboard interface — ksx cannot capture this board"
-                            .into(),
-                        looks_like_a_keyboard: false,
-                        claimed: false,
-                        alias: None,
-                        claim_command: None,
-                        release_command: None,
-                    },
-                ],
-                configured: vec![ksx_api::ConfiguredDevice {
-                    alias: "panel".into(),
-                    id: "port=7&25EEA38C&0&0000".into(),
-                    backend: "winusb".into(),
-                    rung: "port".into(),
-                    survives_replug: false,
-                    means: "this exact USB socket".into(),
-                    port_pinned_warning: Some(
-                        "PORT-PINNED — nothing weaker than the socket separates this board from \
-                         its twin. Move it to another USB port and this entry stops matching. It \
-                         is also specific to THIS machine: the port names this PC's USB topology, \
-                         so do not copy this config to another cabinet — run `ksx device pick` \
-                         there instead."
-                            .into(),
-                    ),
-                    present: true,
-                    board: Some("Ultimarc I-PAC 4X".into()),
-                    instance_id: Some(PANEL.to_owned()),
+    ///
+    /// Built through `DeviceScanView::read`, deliberately — a fixture that
+    /// wrote the summary lines, the counts, the health verdict and the elevated
+    /// leads as literals would be a fixture that already contains the answers
+    /// these tests are asking about, and it could not disagree with the page
+    /// even when the page was wrong.
+    fn cabinet_scan() -> DeviceScanView {
+        DeviceScanView::read(
+            "2026-08-07 12:00:00 UTC".into(),
+            true,
+            vec![
+                ksx_api::BoardRow {
+                    name: "Ultimarc I-PAC 4X".into(),
+                    interfaces: vec![iface(PANEL, "claimed"), iface(AUX, "not-a-keyboard")],
+                    keyboard: Some(PANEL.to_owned()),
+                    keyboard_verdict: "bound to winusb.sys — ksx can capture this".into(),
+                    looks_like_a_keyboard: true,
                     claimed: true,
+                    alias: Some("panel".into()),
                     claim_command: None,
                     release_command: Some(format!("ksx winusb release {PANEL} --yes")),
-                    used_by: vec!["slot 1 (keyboard)".into()],
-                }],
-                notes: vec!["Interception is installed but ksx is not using it".into()],
-            },
+                    ..ksx_api::BoardRow::default()
+                },
+                ksx_api::BoardRow {
+                    name: "NZXT fan controller".into(),
+                    interfaces: vec![UsbRow {
+                        boot_keyboard: false,
+                        ..iface(FAN, "not-a-keyboard")
+                    }],
+                    keyboard: None,
+                    keyboard_verdict: "no keyboard interface — ksx cannot capture this board"
+                        .into(),
+                    looks_like_a_keyboard: false,
+                    claimed: false,
+                    alias: None,
+                    claim_command: None,
+                    release_command: None,
+                    ..ksx_api::BoardRow::default()
+                },
+            ],
+            vec![ksx_api::ConfiguredDevice {
+                alias: "panel".into(),
+                id: "port=7&25EEA38C&0&0000".into(),
+                backend: "winusb".into(),
+                rung: "port".into(),
+                survives_replug: false,
+                means: "this exact USB socket".into(),
+                port_pinned_warning: Some(ksx_app_port_pinned_warning_stand_in().to_owned()),
+                present: true,
+                board: Some("Ultimarc I-PAC 4X".into()),
+                instance_id: Some(PANEL.to_owned()),
+                claimed: true,
+                claim_command: None,
+                release_command: Some(format!("ksx winusb release {PANEL} --yes")),
+                used_by: vec!["slot 1 (keyboard)".into()],
+                ..ksx_api::ConfiguredDevice::default()
+            }],
+            vec!["Interception is installed but ksx is not using it".into()],
+        )
+    }
+
+    /// ksx-studio does not depend on ksx-app, so the paragraph cannot be
+    /// imported. It is reproduced with the two halves the tests assert on and
+    /// nothing else, and `ksx-app`'s own
+    /// `the_port_pinned_warning_says_both_halves` pins the real constant — so
+    /// the two cannot silently diverge on the parts that matter.
+    fn ksx_app_port_pinned_warning_stand_in() -> &'static str {
+        "PORT-PINNED — nothing weaker than the Windows instance path separates this board from \
+         its twin, so this entry matches only while Windows keeps reporting that exact path. \
+         Moving the board to another USB socket is the usual way that changes, and the entry then \
+         stops matching. It is also specific to THIS machine, so do not copy this config to \
+         another cabinet — run `ksx device pick` there instead."
+    }
+
+    fn cabinet() -> DevicesPayload {
+        DevicesPayload {
+            scan: cabinet_scan(),
             session: SessionView {
                 reachable: true,
                 running: false,
@@ -810,10 +771,190 @@ mod tests {
         assert_icon_links_in_head("/devices", &out.html);
     }
 
+    /// **Every list ITEM field the seam fills is bound, and every one the
+    /// island binds is filled — both ways.**
+    ///
+    /// `assert_island_slot_contract` cannot state this: it checks scalars,
+    /// `list:*:array` names and `show:*` names, and stops. So a row field could
+    /// be computed on both sides and read by neither (`backend` was, for the
+    /// whole life of this page) or bound by the island and never filled by the
+    /// seam (which renders the authored default forever, server-side).
+    ///
+    /// The compiler names an item binding `list:<signal>:<field>`, so the IR
+    /// answers this exactly. FAILS against the shipped page on `backend`.
+    #[test]
+    fn every_row_field_is_bound_and_every_bound_row_field_is_filled() {
+        let page = EmbeddedPage::load("/devices").unwrap();
+        let module = &page.module;
+        let ir_names: std::collections::BTreeSet<&str> = module
+            .slots
+            .entries()
+            .iter()
+            .filter_map(|e| module.strings.get(e.name_str_idx).ok())
+            .collect();
+
+        let payload = cabinet();
+        for (list_slot, value) in list_values(&payload) {
+            // "list:configuredRows:array" → "configuredRows"
+            let signal = list_slot
+                .strip_prefix("list:")
+                .and_then(|s| s.strip_suffix(":array"))
+                .expect("list slot names are list:<signal>:array");
+
+            let SlotValue::Array(rows) = &value else {
+                panic!("{list_slot} is not an array");
+            };
+            let first = rows.first().unwrap_or_else(|| {
+                panic!("the cabinet fixture must populate {signal}, or this proves nothing")
+            });
+            let SlotValue::Object(fields) = first else {
+                panic!("{signal} rows are not objects");
+            };
+
+            let filled: std::collections::BTreeSet<String> =
+                fields.iter().map(|(k, _)| k.clone()).collect();
+            // `array` is the list itself and `item` is the compiler's own
+            // per-iteration handle; neither is a field the seam fills.
+            let bound: std::collections::BTreeSet<String> = ir_names
+                .iter()
+                .filter_map(|n| n.strip_prefix(&format!("list:{signal}:")))
+                .filter(|f| *f != "array" && *f != "item")
+                .map(str::to_owned)
+                .collect();
+
+            let unread: Vec<&String> = filled.difference(&bound).collect();
+            assert!(
+                unread.is_empty(),
+                "{signal} rows carry field(s) the island never reads, so the page is silent \
+                 about them: {unread:?}"
+            );
+            let unfilled: Vec<&String> = bound.difference(&filled).collect();
+            assert!(
+                unfilled.is_empty(),
+                "the island binds {signal} field(s) the seam never fills, so the SSR paint \
+                 renders their authored defaults: {unfilled:?}"
+            );
+        }
+    }
+
+    /// **Every field the row object carries is RENDERED.**
+    ///
+    /// FAILS against the shipped page for two of them. `backend` was computed
+    /// into the row object and into `ConfiguredTile`, and the h() tree read it
+    /// nowhere — so the page never said whether an entry was `winusb` or
+    /// `interception`, which is the exact field the health pill above it is
+    /// reasoning about. `rung` was not carried at all, though the commit
+    /// summary listed it. `assert_island_slot_contract` cannot catch either:
+    /// it checks scalars, `list:*:array` names and `show:*` names, never list
+    /// ITEM fields.
+    ///
+    /// Asserted on the rendered HTML, because "the row object has the key" is
+    /// precisely what was true while the page stayed silent.
+    #[test]
+    fn every_configured_row_field_reaches_the_html() {
+        let page = EmbeddedPage::load("/devices").unwrap();
+        let out = render_devices(&page, &cabinet(), None);
+        let scan = cabinet_scan();
+        let device = &scan.configured[0];
+
+        // A value that appears in the html only as part of a LONGER string
+        // would pass a naive `contains`, so each is checked in the labelled
+        // position the tree puts it in.
+        for (label, value) in [
+            ("backend", device.backend.as_str()),
+            ("rung", device.rung.as_str()),
+        ] {
+            let marker = format!(">{label}</span>");
+            let at = out
+                .html
+                .find(&marker)
+                .unwrap_or_else(|| panic!("the '{label}' label is not on the page: {}", out.html));
+            let after = &out.html[at + marker.len()..];
+            assert!(
+                after
+                    .split("</span>")
+                    .next()
+                    .is_some_and(|cell| cell.contains(value)),
+                "'{label}' is labelled on the page but its value ({value:?}) does not follow \
+                 it: {}",
+                &after[..after.len().min(200)]
+            );
+        }
+
+        // The rest of the row, in the same spirit: present in the output, not
+        // merely present in the object.
+        assert!(out.html.contains(&device.alias), "{}", out.html);
+        assert!(out.html.contains(&device.means), "{}", out.html);
+        assert!(out.html.contains("slots naming it"), "{}", out.html);
+    }
+
+    /// The health verdict is `ksx_api`'s, and the page renders BOTH halves of
+    /// it — the sentence and the severity the sentence is worth.
+    ///
+    /// FAILS against the shipped page, which minted its own verdict from
+    /// `present && !claimed && backend == "winusb"` and told an entry no slot
+    /// names that "ksx run will refuse", which it does not.
+    #[test]
+    fn the_health_verdict_and_its_severity_come_from_the_backend() {
+        let page = EmbeddedPage::load("/devices").unwrap();
+
+        let loose = |used_by: Vec<String>| {
+            let scan = DeviceScanView::read(
+                "t".into(),
+                true,
+                Vec::new(),
+                vec![ksx_api::ConfiguredDevice {
+                    alias: "panel".into(),
+                    id: "usb:d209:0430:00".into(),
+                    backend: "winusb".into(),
+                    present: true,
+                    claimed: false,
+                    used_by,
+                    ..ksx_api::ConfiguredDevice::default()
+                }],
+                Vec::new(),
+            );
+            let expected = scan.configured[0].clone();
+            let out = render_devices(
+                &page,
+                &DevicesPayload {
+                    scan,
+                    ..DevicesPayload::default()
+                },
+                None,
+            );
+            (out.html, expected)
+        };
+
+        let (named, expected) = loose(vec!["slot 1 (keyboard)".into()]);
+        assert!(named.contains("refuses to start"), "{named}");
+        assert!(
+            named.contains(&format!("pill pill-{}", expected.health_level)),
+            "the severity the backend judged ({}) is not the class the page drew: {named}",
+            expected.health_level
+        );
+        assert!(named.contains("pill pill-warn"), "{named}");
+
+        let (orphan, _) = loose(Vec::new());
+        assert!(
+            !orphan.contains("refuses to start"),
+            "no slot names this alias, so nothing refuses — the page must not send the user to \
+             debug a session that works: {orphan}"
+        );
+        assert!(orphan.contains("NOT claimed"), "{orphan}");
+        assert!(!orphan.contains("pill pill-warn"), "{orphan}");
+    }
+
     /// The PORT-PINNED paragraph must survive to the page IN FULL — both
     /// halves. The second one is the half people miss, and it is the reason the
     /// warning lives on the ENTRY rather than in `pick`'s console output: a
     /// config that gets copied to a second cabinet silently stops matching.
+    ///
+    /// A transport check, not a wording check: the fixture supplies the
+    /// paragraph and this proves the seam carries it whole, so a `portWarn`
+    /// that got dropped or truncated fails here. `ksx-app`'s
+    /// `the_port_pinned_warning_says_both_halves_and_promises_neither_too_hard`
+    /// is what pins the WORDS.
     #[test]
     fn the_port_pinned_warning_reaches_the_page_including_the_machine_specific_half() {
         let page = EmbeddedPage::load("/devices").unwrap();
@@ -878,58 +1019,142 @@ mod tests {
         assert!(out.html.contains("Remove entry"), "{}", out.html);
     }
 
-    /// A refused scan must never render as an empty machine. On a cabinet with
-    /// four boards plugged in, "no keyboard-capable board found" is the worst
-    /// answer this page could give.
+    /// **The three empty states, and the assertion each one is allowed to
+    /// make.**
+    ///
+    /// There are three, not two, and the page must tell them apart: the scan
+    /// REFUSED, the scan RAN and found nothing, and the ENUMERATION ITSELF
+    /// FAILED. Only the middle one licenses "there is nothing here". The other
+    /// two are "I could not read this", and a user acts on those differently —
+    /// this project's signature bug is a session reporting success while the
+    /// arcade panel was dead.
+    ///
+    /// FAILS against the shipped page. Its failed-enumeration block asserted
+    /// only that "nothing could be READ" appeared and checked no absence at
+    /// all, so the contradicting sentence — "No board here exposes a keyboard
+    /// interface" printed directly beneath the banner saying nothing could be
+    /// read — sailed through. Every block below now asserts BOTH what the state
+    /// says and what it must not say.
     #[test]
-    fn a_refused_scan_says_so_instead_of_drawing_an_empty_machine() {
+    fn the_three_empty_states_are_three_different_pages() {
         let page = EmbeddedPage::load("/devices").unwrap();
-        let payload = DevicesPayload {
-            unavailable: "listing devices is not available on this surface — run `ksx devices`"
-                .to_owned(),
-            ..DevicesPayload::default()
-        };
-        let out = render_devices(&page, &payload, None);
-        assert!(out.html.contains("could not be read"), "{}", out.html);
-        assert!(out.html.contains("run `ksx devices`"), "{}", out.html);
-        assert!(
-            !out.html.contains("no keyboard-capable board found"),
-            "the empty-machine sentence must not appear under a refusal: {}",
-            out.html
-        );
 
-        // …and the ordinary empty machine still says its own sentence. Note
-        // `usb_available: true` — three states, not two, and the page must
-        // tell them apart: the scan refused, the scan ran and found nothing,
-        // and the enumeration itself failed. `DeviceScanView::default()` is
-        // the THIRD (nothing has been read), which is why it cannot stand in
-        // for the second.
-        let empty = render_devices(
+        // The sentences only ONE of the three states may print. Named through
+        // ksx_api so a reworded page cannot quietly stop being checked.
+        let absence_claims = [
+            ksx_api::NO_BOARDS_LINE,
+            "no board it found exposes a",
+            "No board is configured yet",
+            "no [[device]] entries in config.toml",
+        ];
+        let unreadable_claims = ["nothing could be READ"];
+
+        // (1) THE SCAN REFUSED. `unavailable` is set and the scan degrades to
+        // `DeviceScanView::default()`, exactly as server.rs's error arms build
+        // it.
+        let refused = render_devices(
             &page,
             &DevicesPayload {
-                scan: DeviceScanView {
-                    usb_available: true,
-                    ..DeviceScanView::default()
-                },
+                unavailable: "listing devices is not available on this surface — run `ksx devices`"
+                    .to_owned(),
                 ..DevicesPayload::default()
             },
             None,
         );
         assert!(
-            empty.html.contains("no keyboard-capable board found"),
+            refused.html.contains("could not be read"),
+            "{}",
+            refused.html
+        );
+        assert!(
+            refused.html.contains("run `ksx devices`"),
+            "{}",
+            refused.html
+        );
+        for claim in absence_claims {
+            assert!(
+                !refused.html.contains(claim),
+                "a refused read printed an assertion of absence ({claim:?}): {}",
+                refused.html
+            );
+        }
+
+        // (2) THE ENUMERATION FAILED. No refusal banner — the surface answered
+        // — but `usb_available` is false, so the list is empty because nothing
+        // could be READ. This is the block that used to be one-sided.
+        let blind = render_devices(
+            &page,
+            &DevicesPayload {
+                scan: DeviceScanView::read(
+                    "2026-08-07 12:00:00 UTC".into(),
+                    false,
+                    Vec::new(),
+                    Vec::new(),
+                    vec!["the USB enumeration returned no interfaces".into()],
+                ),
+                ..DevicesPayload::default()
+            },
+            None,
+        );
+        for claim in unreadable_claims {
+            assert!(blind.html.contains(claim), "{}", blind.html);
+        }
+        for claim in [ksx_api::NO_BOARDS_LINE, "no board it found exposes a"] {
+            assert!(
+                !blind.html.contains(claim),
+                "a failed enumeration printed the empty-machine sentence ({claim:?}) — on a \
+                 cabinet with four boards plugged in this is the worst answer the page can \
+                 give: {}",
+                blind.html
+            );
+        }
+
+        // (3) THE MACHINE REALLY IS EMPTY. The enumeration answered and found
+        // nothing, so the page says so — and must NOT hedge with "could not be
+        // read", or the fix above would just be silence everywhere.
+        let empty = render_devices(
+            &page,
+            &DevicesPayload {
+                scan: DeviceScanView::read(
+                    "2026-08-07 12:00:00 UTC".into(),
+                    true,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                ..DevicesPayload::default()
+            },
+            None,
+        );
+        assert!(
+            empty.html.contains(ksx_api::NO_BOARDS_LINE),
             "{}",
             empty.html
         );
-
-        // And the enumeration failing is its own sentence again: an empty list
-        // on a cabinet with four boards plugged in must never read as an empty
-        // cabinet.
-        let blind = render_devices(&page, &DevicesPayload::default(), None);
         assert!(
-            blind.html.contains("nothing could be READ"),
+            empty.html.contains("no board it found exposes a"),
             "{}",
-            blind.html
+            empty.html
         );
+        assert!(
+            empty.html.contains("No board is configured yet"),
+            "{}",
+            empty.html
+        );
+        for claim in unreadable_claims {
+            assert!(
+                !claim.is_empty() && !empty.html.contains(claim),
+                "a machine that WAS read must not claim it could not be: {}",
+                empty.html
+            );
+        }
+
+        // …and the three pages are three different pages, not three spellings
+        // of one. If any two ever render identically the distinction has been
+        // lost regardless of which sentences are present.
+        assert_ne!(refused.html, blind.html);
+        assert_ne!(blind.html, empty.html);
+        assert_ne!(refused.html, empty.html);
     }
 
     /// A hostile flash is a query-string value and is attacker-writable. It

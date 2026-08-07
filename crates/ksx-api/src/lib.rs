@@ -69,6 +69,8 @@ pub use machine::{
     AdviceRow, AutostartView, BoardRow, ConfiguredDevice, DevicePickSpec, DevicePickView,
     DeviceRemoveSpec, DeviceRemoveView, DeviceScanView, DevicesView, DoctorRow, DoctorView,
     KeyboardRow, MachineSource, PresetRow, PresetsView, TemplateRow, UsbRow, WinusbView,
+    CAVEAT_NOT_A_KEYBOARD, CLAIM_LEAD, NO_BOARDS_LINE, RELEASE_LEAD, UNREAD_BOARDS_LINE,
+    UNREAD_CONFIGURED_LINE,
 };
 pub use pipe::{PipeTransport, TransportError, NO_CHANNEL};
 pub use refusal::{codes, Refusal, Refused};

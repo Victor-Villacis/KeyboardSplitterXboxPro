@@ -530,6 +530,9 @@ impl ksx_api::MachineSource for LocalMachine {
         let connected = crate::device_edit::connected_facts();
         let store = crate::device_edit::store().map_err(config_refusal)?;
         let config = store.load_config().map_err(config_refusal)?.value;
+        // For the rename check only: re-picking under a new name orphans every
+        // slot that named the old one, in config.toml AND in every profile.
+        let games = store.load_games().map_err(config_refusal)?.value;
 
         let wanted = crate::device_edit::PickSpec {
             query: spec.query.trim().to_owned(),
@@ -543,7 +546,7 @@ impl ksx_api::MachineSource for LocalMachine {
                 .filter(|alias| !alias.is_empty())
                 .map(str::to_owned),
         };
-        let plan = crate::device_edit::plan_pick(&survey, &connected, &config, &wanted)
+        let plan = crate::device_edit::plan_pick(&survey, &connected, &config, &games, &wanted)
             .map_err(pick_refusal)?;
         let outcome = crate::device_edit::apply_pick(&store, &plan).map_err(pick_refusal)?;
         Ok(pick_view(&outcome))

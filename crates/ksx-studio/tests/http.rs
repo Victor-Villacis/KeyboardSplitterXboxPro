@@ -383,6 +383,11 @@ struct ScriptedMachine {
     removed: Mutex<Vec<(String, bool)>>,
     /// Refuse the read — the "this surface cannot enumerate devices" path.
     refuse: bool,
+    /// The scan ANSWERS but the USB enumeration inside it failed: empty lists
+    /// that are not a reading of the machine. A third state, distinct from
+    /// `refuse` and from an actually-empty cabinet, and the one the page
+    /// shipped without a single test reaching it.
+    blind: bool,
 }
 
 const IPAC_KB: &str = r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000";
@@ -393,6 +398,14 @@ impl ScriptedMachine {
     fn refusing() -> Self {
         Self {
             refuse: true,
+            ..Self::default()
+        }
+    }
+
+    /// The scan answers, and answers "I could not read the USB bus".
+    fn blind() -> Self {
+        Self {
+            blind: true,
             ..Self::default()
         }
     }
@@ -418,10 +431,26 @@ impl ksx_api::MachineSource for ScriptedMachine {
         if self.refuse {
             return Err(Refusal::not_here("listing devices", "run `ksx devices`"));
         }
-        Ok(ksx_api::DeviceScanView {
-            generated_at: "test".to_owned(),
-            usb_available: true,
-            boards: vec![
+        if self.blind {
+            // Empty lists with `usb_available: false` — nothing could be read.
+            // Built through `read` like every other path, so the summary lines
+            // and the `no_*` flags are the ones the real backend would send.
+            return Ok(ksx_api::DeviceScanView::read(
+                "test".to_owned(),
+                false,
+                Vec::new(),
+                Vec::new(),
+                vec!["the USB enumeration returned no interfaces".to_owned()],
+            ));
+        }
+        // Through `DeviceScanView::read`, never a struct literal. A fixture
+        // that wrote the summary lines, the counts and the health verdict as
+        // literals would already contain the answers these tests ask about,
+        // and could not disagree with the page even when the page was wrong.
+        Ok(ksx_api::DeviceScanView::read(
+            "test".to_owned(),
+            true,
+            vec![
                 ksx_api::BoardRow {
                     name: "Ultimarc I-PAC 4X".to_owned(),
                     interfaces: vec![
@@ -435,6 +464,7 @@ impl ksx_api::MachineSource for ScriptedMachine {
                     alias: Some("panel".to_owned()),
                     claim_command: None,
                     release_command: Some(format!("ksx winusb release {IPAC_KB} --yes")),
+                    ..ksx_api::BoardRow::default()
                 },
                 ksx_api::BoardRow {
                     name: "NZXT fan controller".to_owned(),
@@ -447,9 +477,10 @@ impl ksx_api::MachineSource for ScriptedMachine {
                     alias: None,
                     claim_command: None,
                     release_command: None,
+                    ..ksx_api::BoardRow::default()
                 },
             ],
-            configured: vec![ksx_api::ConfiguredDevice {
+            vec![ksx_api::ConfiguredDevice {
                 alias: "panel".to_owned(),
                 id: "port=7&25EEA38C&0&0000".to_owned(),
                 backend: "winusb".to_owned(),
@@ -457,10 +488,12 @@ impl ksx_api::MachineSource for ScriptedMachine {
                 survives_replug: false,
                 means: "this exact USB socket".to_owned(),
                 port_pinned_warning: Some(
-                    "PORT-PINNED — nothing weaker than the socket separates this board from its \
-                     twin. Move it to another USB port and this entry stops matching. It is also \
-                     specific to THIS machine: the port names this PC's USB topology, so do not \
-                     copy this config to another cabinet — run `ksx device pick` there instead."
+                    "PORT-PINNED — nothing weaker than the Windows instance path separates this \
+                     board from its twin, so this entry matches only while Windows keeps \
+                     reporting that exact path. Moving the board to another USB socket is the \
+                     usual way that changes, and the entry then stops matching. It is also \
+                     specific to THIS machine, so do not copy this config to another cabinet — \
+                     run `ksx device pick` there instead."
                         .to_owned(),
                 ),
                 present: true,
@@ -470,9 +503,10 @@ impl ksx_api::MachineSource for ScriptedMachine {
                 claim_command: None,
                 release_command: Some(format!("ksx winusb release {IPAC_KB} --yes")),
                 used_by: vec!["slot 1 (keyboard)".to_owned()],
+                ..ksx_api::ConfiguredDevice::default()
             }],
-            notes: Vec::new(),
-        })
+            Vec::new(),
+        ))
     }
 
     fn device_pick(
@@ -1676,6 +1710,14 @@ fn the_devices_page_lists_boards_not_devnodes_and_keeps_the_port_pinned_warning(
         body.contains("do not copy this config to another cabinet"),
         "the machine-specific half of the warning must reach the page: {body}"
     );
+    // The two words that decide whether the entry can capture anything. The
+    // page carried `backend` in its row object and rendered it nowhere, so it
+    // never said `winusb` or `interception` — the field the health pill above
+    // is reasoning about — and `rung` was not carried at all.
+    assert!(body.contains(">backend</span>"), "{body}");
+    assert!(body.contains(">rung</span>"), "{body}");
+    assert!(body.contains(">winusb<"), "{body}");
+    assert!(body.contains(">port<"), "{body}");
     // Claiming needs elevation, so the command is TEXT and there is no form.
     assert!(body.contains("ksx winusb release"), "{body}");
     assert!(body.contains("ELEVATED shell"), "{body}");
@@ -1698,10 +1740,104 @@ fn a_refused_scan_renders_the_refusal_rather_than_an_empty_list() {
     let body = body_of(&page);
     assert!(body.contains("could not be read"), "{body}");
     assert!(body.contains("run `ksx devices`"), "{body}");
-    assert!(
-        !body.contains("no keyboard-capable board found"),
-        "the empty-machine sentence must not appear under a refusal: {body}"
+    for claim in [
+        ksx_api::NO_BOARDS_LINE,
+        "no board it found exposes a",
+        "No board is configured yet",
+        "no [[device]] entries in config.toml",
+    ] {
+        assert!(
+            !body.contains(claim),
+            "a refused read printed an assertion of absence ({claim:?}): {body}"
+        );
+    }
+}
+
+/// **A scan that ANSWERS "I could not read the USB bus" is not an empty
+/// cabinet either** — and this is the state nothing tested.
+///
+/// FAILS against the shipped page. `ScriptedMachine` only ever returned
+/// `usb_available: true`, so no HTTP test could reach the path where the
+/// enumeration itself failed; the page printed the banner "nothing could be
+/// READ" and, directly beneath it, "No board here exposes a keyboard
+/// interface". This is the shape of the failure that started the whole
+/// project: a session reporting success while the arcade panel was dead
+/// because a WinUSB board had fallen back to Interception. "I could not read
+/// this" and "there is nothing here" are different sentences, and the user
+/// acts on them differently.
+#[test]
+fn a_failed_enumeration_never_renders_as_an_empty_cabinet() {
+    let addr = start_server_with_machine(
+        Arc::new(ScriptedControl::new(true)),
+        Arc::new(ScriptedMachine::blind()),
     );
+    let body = body_of(&get(addr, "/devices")).to_owned();
+
+    assert!(
+        body.contains("nothing could be READ"),
+        "the page must say the list is empty because nothing was read: {body}"
+    );
+    for claim in [ksx_api::NO_BOARDS_LINE, "no board it found exposes a"] {
+        assert!(
+            !body.contains(claim),
+            "a failed enumeration printed the empty-machine sentence ({claim:?}): {body}"
+        );
+    }
+
+    // The poller gets the same answer, in the field the island actually reads.
+    // A page that got this right while `/api/devices` sent
+    // `no_pickable_board_found: true` would go wrong two seconds later.
+    let json: serde_json::Value =
+        serde_json::from_str(body_of(&get(addr, "/api/devices"))).unwrap();
+    assert_eq!(
+        json.pointer("/scan/no_pickable_board_found"),
+        Some(&serde_json::json!(false)),
+        "the poll licensed the island to draw an empty machine: {json}"
+    );
+    assert_eq!(
+        json.pointer("/scan/usb_available"),
+        Some(&serde_json::json!(false))
+    );
+
+    // And the ordinary cabinet is unaffected — it still has boards and says so.
+    let ok = start_server(Arc::new(ScriptedControl::new(true)));
+    assert!(body_of(&get(ok, "/devices")).contains("1 keyboard-capable board"));
+}
+
+/// A refusal degrades to `DeviceScanView::default()`, and that default must
+/// license nothing. This is the invariant the `show:` flags depend on: they
+/// read `no_pickable_board_found` / `no_configured_device` alone, with no
+/// `&& unavailable.is_empty()` in either language, which is only sound while
+/// every refusing path in `collect_devices` hands over a defaulted scan.
+#[test]
+fn a_refusal_serves_a_scan_that_asserts_nothing() {
+    let addr = start_server_with_machine(
+        Arc::new(ScriptedControl::new(true)),
+        Arc::new(ScriptedMachine::refusing()),
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(body_of(&get(addr, "/api/devices"))).unwrap();
+
+    assert_ne!(
+        json.pointer("/unavailable"),
+        Some(&serde_json::json!("")),
+        "the refusal itself must be on the wire: {json}"
+    );
+    assert_eq!(
+        json.pointer("/scan/no_pickable_board_found"),
+        Some(&serde_json::json!(false))
+    );
+    assert_eq!(
+        json.pointer("/scan/no_configured_device"),
+        Some(&serde_json::json!(false))
+    );
+    for line in ["/scan/boards_summary", "/scan/configured_summary"] {
+        let value = json.pointer(line).and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            value.contains("nothing could be READ"),
+            "{line} must say why it is empty, got {value:?}"
+        );
+    }
 }
 
 /// The page and the poller serve one shape.

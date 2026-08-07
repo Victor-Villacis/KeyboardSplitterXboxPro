@@ -266,13 +266,17 @@ pub fn view(
         .map(|entry| configured_row(entry, devices, connected, config, games, &found))
         .collect();
 
-    ksx_api::DeviceScanView {
-        generated_at: devices.generated_at.clone(),
-        usb_available: devices.usb_available,
-        boards: rows,
+    // Through `read`, never a struct literal: the partition, the counts, the
+    // summary lines and the per-entry health verdicts are that constructor's
+    // to decide, so no caller — this one, a test fixture, or a second surface
+    // — can hand a page a summary that disagrees with the list beneath it.
+    ksx_api::DeviceScanView::read(
+        devices.generated_at.clone(),
+        devices.usb_available,
+        rows,
         configured,
-        notes: devices.notes.clone(),
-    }
+        devices.notes.clone(),
+    )
 }
 
 fn board_row(board: &Board<'_>) -> ksx_api::BoardRow {
@@ -294,6 +298,14 @@ fn board_row(board: &Board<'_>) -> ksx_api::BoardRow {
         release_command: keyboard
             .filter(|r| r.state == "claimed")
             .map(|r| release_command(&r.instance_id)),
+        // Derived by `DeviceScanView::read` from the fields above — the
+        // partition, the elevated lead that must accompany the command, and
+        // the HID caveat. Setting any of them here would be the same decision
+        // taken twice.
+        pickable: false,
+        command_lead: String::new(),
+        command: String::new(),
+        caveat: String::new(),
     }
 }
 
@@ -373,6 +385,13 @@ fn configured_row(
             .iter()
             .map(ToString::to_string)
             .collect(),
+        // Filled by `DeviceScanView::read` from the fields above — it is a
+        // verdict about what `ksx run` does with this entry, and it reads
+        // `used_by`, which is only complete once this row is built.
+        health_line: String::new(),
+        health_level: String::new(),
+        command_lead: String::new(),
+        command: String::new(),
     }
 }
 
@@ -389,20 +408,42 @@ fn board_named(found: &[Board<'_>], instance_id: &str) -> Option<String> {
         .map(|board| board.name.clone())
 }
 
+/// # `--json` changed shape, and gained a failure the plain report does not have
+///
+/// **Shape.** `--json` used to print [`ksx_api::DevicesView`] — the raw
+/// interface list — from enumeration alone. It now prints
+/// [`ksx_api::DeviceScanView`], the grouped shape. `--json` on a verb whose
+/// entire point is the grouping used to hand back `ksx devices`' 29 rows, which
+/// meant a script had to re-implement `boards()` to use it: one capability, two
+/// shapes, exactly what `docs/SURFACES.md` §1 forbids. Any consumer reading
+/// `.usb[]` must move to `.boards[].interfaces[]`.
+///
+/// **Failure mode.** The grouped view includes the `[[device]]` entries
+/// resolved against the live enumeration, so `--json` now READS `config.toml`
+/// and `games.toml` where the plain report does not. A missing config is fine
+/// (the store returns a default), but an unparseable one is a hard error — so
+/// on a machine with a corrupt `config.toml`, plain `ksx device scan` still
+/// prints the hardware and `--json` exits non-zero.
+///
+/// That asymmetry is deliberate rather than an oversight. The alternative is
+/// printing `configured: []` beside `no_configured_device: true`, which is the
+/// failure this whole page was rebuilt to remove: a read that did not happen
+/// must never be served as an assertion that there is nothing there. The
+/// context below says which file and which flag, so the exit is
+/// self-explaining.
 #[cfg(windows)]
 pub fn run(all: bool, json: bool) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let report = crate::devices::collect();
     let devices = crate::devices::to_view(&report);
     if json {
-        // The GROUPED shape, not the raw interface list. `--json` on a verb
-        // whose entire point is the grouping used to print `ksx devices`'
-        // 29 rows back, which meant a script had to re-implement `boards()`
-        // to use it — one capability, two shapes, exactly what
-        // `docs/SURFACES.md` §1 forbids. This is the same view every non-
-        // terminal surface reads.
         let store = crate::device_edit::store()?;
-        let config = store.load_config()?.value;
-        let games = store.load_games()?.value;
+        let context = "`ksx device scan --json` reports the [[device]] entries alongside the \
+                       hardware, so it must parse the config; plain `ksx device scan` does not \
+                       read it at all";
+        let config = store.load_config().context(context)?.value;
+        let games = store.load_games().context(context)?.value;
         let connected = crate::device_edit::connected_facts();
         println!(
             "{}",

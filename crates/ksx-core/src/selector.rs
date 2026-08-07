@@ -87,9 +87,15 @@ pub struct DeviceFacts {
     /// index is 0 (most cheap HID boards) — which is the common case, and the
     /// reason the model rung exists.
     pub serial: Option<String>,
-    /// The instance tail: everything after the last `\` of [`Self::id`]. This
-    /// is the port-derived part, kept separate so a port-pinned selector never
-    /// has to re-parse a path.
+    /// The instance tail: everything after the last `\` of [`Self::id`], kept
+    /// separate so a port-pinned selector never has to re-parse a path.
+    ///
+    /// Windows derives this tail from the SOCKET only for devices with no
+    /// usable serial; where the descriptor carries one it is serial-anchored
+    /// instead, and the tail then survives a move to another port. Measured on
+    /// this cabinet 2026-08-07: an I-PAC 4X's tail was unchanged across a port
+    /// move. Nothing in the tail says which kind a board is, so no message
+    /// built from it may promise that moving the board breaks the match.
     pub instance: String,
 }
 
@@ -567,15 +573,26 @@ impl DeviceSelector {
                 Qualifier::Serial(sn) => format!(
                     "the board whose serial is \"{sn}\" — survives being moved to another USB port"
                 ),
+                // Not "moving it breaks this entry": the tail is port-derived
+                // only where the board has no usable serial (see
+                // `DeviceFacts::instance`), and an I-PAC 4X measured here kept
+                // its tail across a port move. State what is certain — the
+                // match is tied to the path — and call the port move the usual
+                // cause rather than the guaranteed one.
                 Qualifier::Port(port) => format!(
-                    "the board in one specific USB socket ({port}) — MOVING IT TO ANOTHER PORT \
-                     BREAKS THIS ENTRY, which is the price of telling two identical boards apart"
+                    "the board at one specific Windows instance path ({port}) — it matches only \
+                     while Windows reports that path for it, which moving the board to another USB \
+                     socket usually (not always) changes; that is the price of telling two \
+                     identical boards apart"
                 ),
             },
-            Self::InstancePath(_) => "one specific USB socket (a legacy full instance path) — \
-                 MOVING THE BOARD TO ANOTHER PORT BREAKS THIS ENTRY; `ksx device scan` prints the \
+            Self::InstancePath(_) => {
+                "one specific Windows instance path (a legacy full path) — it \
+                 matches only while Windows reports that path, which moving the board to another \
+                 USB socket usually (not always) changes; `ksx device scan` prints the \
                  replug-proof replacement"
-                .to_owned(),
+                    .to_owned()
+            }
             Self::HardwareId(_) => {
                 "an Interception hardware id — it names a model, not a board, so \
                  two identical boards are indistinguishable, and it never matches a WinUSB-claimed \
@@ -786,7 +803,17 @@ mod tests {
             "usb:d209:0430:00:port=7&25EEA38C&0&0000"
         );
         assert!(!pinned.survives_replug());
-        assert!(pinned.explain().contains("BREAKS THIS ENTRY"));
+        // It announces the cost — and states it as a tie to the instance path
+        // rather than as a promise about what a port move does. The tail is
+        // port-derived only for boards with no usable serial, and an I-PAC 4X
+        // measured here kept its tail across a move, so "moving it breaks this"
+        // is a claim ksx cannot make. See `DeviceFacts::instance`.
+        let explained = pinned.explain();
+        assert!(
+            explained.contains("matches only while Windows"),
+            "{explained}"
+        );
+        assert!(explained.contains("not always"), "{explained}");
         assert!(pinned.match_against(&[a, b]).is_one());
     }
 

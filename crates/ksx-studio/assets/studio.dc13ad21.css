@@ -962,6 +962,15 @@ input[type="checkbox"] {
   color: var(--text-secondary);
 }
 
+/* A pill whose backend judged there is nothing to say — `health_level: "none"`
+   on a configured device whose board is not connected. The level word comes
+   from the wire and the class is built from it (`pill pill-<level>`), so a
+   level ksx-api adds later renders unstyled-but-visible instead of silently
+   wrong; this is the one level that is deliberately invisible. */
+.pill-none {
+  display: none;
+}
+
 /* ── 4.6 Tabs / segmented nav ───────────────────────────────────────────
    Reads as NAVIGATION: a rail with a track, the active item lifted onto a
    filled plate. Used by the slot switcher and the macro switcher. */
@@ -4077,6 +4086,24 @@ a.strow:hover {
   letter-spacing: var(--track-eyebrow);
 }
 
+/* `backend  winusb   rung  port` — the two words that decide whether this
+   entry can capture anything, on one line beside the id. Label/value pairs
+   rather than a composed sentence, because the island may not concatenate
+   inside its h() tree. */
+.dv-facts {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-2);
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+}
+
+.dv-facts .dv-lbl + .mono {
+  margin-right: var(--sp-3);
+}
+
 .dv-alias {
   flex: 1 1 12rem;
   min-width: 0;
@@ -4097,6 +4124,36 @@ a.strow:hover {
   gap: var(--sp-2);
   font-size: var(--fs-sm);
   color: var(--warn);
+}
+
+/* TOUCH TARGETS: this page's two buttons are not row accelerators.
+   `.btn-row` is the dense size the mapper uses for per-row shortcuts, and the
+   coarse-pointer block above caps it at 2.25rem for that reason. Here "Use
+   this board" and "Remove entry" are the primary and the destructive action of
+   the whole card — the only two things on the page that write anything — so
+   they take the full 2.5rem target the design system's own comment claims for
+   "the WHOLE control vocabulary". The --force checkbox goes with them: it is
+   the consent gate on the destructive one, and a 17 px box is not a thing you
+   tick on a cabinet screen. */
+@media (pointer: coarse) {
+  .dv-form .btn-row {
+    min-height: 2.5rem;
+    --btn-h: 2.5rem;
+    padding-inline: var(--sp-4);
+  }
+
+  .dv-force input[type="checkbox"] {
+    width: 1.5rem;
+    height: 1.5rem;
+  }
+
+  /* The label is half the target: on a checkbox this consequential, missing
+     the box and hitting nothing reads as "the button is broken". */
+  .dv-force label {
+    min-height: 2.5rem;
+    display: flex;
+    align-items: center;
+  }
 }
 
 .dv-empty {
