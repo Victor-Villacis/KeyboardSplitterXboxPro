@@ -1623,9 +1623,12 @@ preset = "default"
         let msg = issues[0].to_string();
         assert!(msg.contains("playstation"), "{msg}");
 
-        // The supported 8-player shape: 4 Xbox + 4 PlayStation. No issues.
+        // The supported full-house shape: 4 Xbox and the rest PlayStation, all
+        // the way to the ceiling. Written as `1..=MAX_SLOTS` so the raise from
+        // 8 to 16 actually widened what is under test instead of leaving this
+        // exercising the first half of the range.
         let cfg = ConfigFile {
-            slots: (1..=8)
+            slots: (1..=MAX_SLOTS)
                 .map(|n| {
                     slot(
                         n,

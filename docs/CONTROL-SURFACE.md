@@ -373,9 +373,10 @@ whose `reload` is a BOUNCE (honest gaps 1 and 5, above).
 | `backup` | the timestamped copy of the whole file, taken before the write, exactly like every whole-preset write |
 
 Refusal codes: `unknown-preset` (lists the ones on disk), `unknown-profile`
-(lists the titles), `bad-slot` (outside 1..=8), `config-error`. Every one of
-them refuses **before** anything is copied or written, so a refusal never
-leaves a stray backup behind.
+(lists the titles), `bad-slot` (outside 1..=`ksx_core::MAX_SLOTS`, 16 today —
+the refusal text is formatted from the constant, so it always names the real
+bound), `config-error`. Every one of them refuses **before** anything is copied
+or written, so a refusal never leaves a stray backup behind.
 
 `map-restore` (writer: `mapping.rs::restore`; CLI face: `ksx map --preset …
 --restore defaults|session-backup|latest-backup`) has **three destinations**,

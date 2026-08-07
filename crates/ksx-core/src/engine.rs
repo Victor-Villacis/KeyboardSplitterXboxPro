@@ -16,7 +16,7 @@ use crate::key::Key;
 use crate::macros::{Interrupt, OnRelease, Repeat, Retrigger};
 use crate::pad::{Axis, PadState, Trigger, AXIS_CENTER};
 use crate::preset::{Binding, Chord, Preset};
-use crate::slot::SlotSpec;
+use crate::slot::{SlotSpec, MAX_SLOTS};
 
 /// A slot with its preset already resolved by the config layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,15 +26,22 @@ pub struct ResolvedSlot {
 }
 
 /// A genuine pad-state transition for one slot. `slot` is the slot *number*
-/// (1..=4), never an XInput user index.
+/// (1..=[`MAX_SLOTS`]), never an XInput user index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PadDelta {
     pub slot: u8,
     pub state: PadState,
 }
 
-/// Delta batch: at most one entry per slot, so 4 inline slots never allocate.
-pub type Deltas = SmallVec<[PadDelta; 4]>;
+/// Delta batch: at most one entry per slot, so sizing it off [`MAX_SLOTS`]
+/// makes the no-allocation-per-event guarantee ([`Engine::new`]) hold for any
+/// configuration rather than only for panels of four. Held at 4, this
+/// allocated on EVERY event the moment five slots shared one key — which is
+/// what a coin or start button on a big panel is.
+///
+/// Costs nothing but stack: the batch is returned by value into the caller's
+/// own slot, so only the entries actually produced are ever written.
+pub type Deltas = SmallVec<[PadDelta; MAX_SLOTS as usize]>;
 
 /// One precompiled dispatch target: an entry of `slots[slot]`'s preset.
 #[derive(Clone, Copy)]
@@ -42,6 +49,23 @@ struct Target {
     slot: u8,
     binding: Binding,
 }
+
+/// Every slot one key dispatches to, precompiled. Fan-out is one entry per
+/// binding per slot, so [`MAX_SLOTS`] inline holds the whole list for the key
+/// every player shares — a coin or a start button — inside the table's own
+/// allocation, instead of behind a pointer [`Engine::handle`] has to chase to
+/// reach the very targets the event exists to drive.
+///
+/// Paid for in memory, flatly: 208 bytes per DISTINCT key whatever its real
+/// fan-out, against 64 when this held 4. A few hundred keys is tens of
+/// kilobytes, which is worth it here and would not be at 255 slots.
+type KeyTargets = SmallVec<[Target; MAX_SLOTS as usize]>;
+
+/// The stateful slots one key makes resync — one entry per slot, deduped at
+/// build time, so [`MAX_SLOTS`] is the exact bound rather than a guess. Nearly
+/// free at that width: these are `u8`s, 32 bytes per key against 24 for the 2
+/// it held before.
+type SyncSlots = SmallVec<[u8; MAX_SLOTS as usize]>;
 
 /// One precompiled chord in a slot (docs/INPUT-TRANSFORMS.md §1b).
 ///
@@ -968,7 +992,7 @@ pub struct EngineTables {
     slots: Vec<SlotRuntime>,
     devices: Vec<DeviceId>,
     index: HashMap<Key, u32>,
-    targets: Vec<SmallVec<[Target; 4]>>,
+    targets: Vec<KeyTargets>,
     down: Vec<u64>,
     words: usize,
     /// A permanently-empty key bitset, for a slot with no input device at all:
@@ -976,7 +1000,7 @@ pub struct EngineTables {
     zeros: Vec<u64>,
     /// Dense key -> the stateful slots that must resync when it moves. Empty
     /// (and never consulted) when no preset in the build has a chord or macro.
-    sync_slots: Vec<SmallVec<[u8; 2]>>,
+    sync_slots: Vec<SyncSlots>,
     /// `false` ⇒ the engine takes the pre-chord path end to end.
     has_state: bool,
     /// `false` ⇒ the engine never looks at the clock or the timer list, and
@@ -994,7 +1018,7 @@ impl EngineTables {
     /// Precompile the dispatch tables for `slots`.
     ///
     /// Preconditions (validated upstream by `SlotSpec`/config): slot numbers
-    /// are unique and in 1..=8.
+    /// are unique and in 1..=[`MAX_SLOTS`].
     pub fn build(slots: Vec<ResolvedSlot>) -> Self {
         debug_assert!(
             {
@@ -1017,7 +1041,7 @@ impl EngineTables {
 
         fn intern_key(
             index: &mut HashMap<Key, u32>,
-            targets: &mut Vec<SmallVec<[Target; 4]>>,
+            targets: &mut Vec<KeyTargets>,
             key: Key,
         ) -> u32 {
             *index.entry(key).or_insert_with(|| {
@@ -1028,7 +1052,7 @@ impl EngineTables {
 
         let mut devices: Vec<DeviceId> = Vec::new();
         let mut index: HashMap<Key, u32> = HashMap::new();
-        let mut targets: Vec<SmallVec<[Target; 4]>> = Vec::new();
+        let mut targets: Vec<KeyTargets> = Vec::new();
         let mut runtimes = Vec::with_capacity(slots.len());
 
         for (si, rs) in slots.iter().enumerate() {
@@ -1192,7 +1216,7 @@ impl EngineTables {
         // Second pass: everything that needs the FINAL dense-key count. Only
         // chorded slots allocate any of it, so a chord-free build is byte-for
         // byte the pre-chord table set.
-        let mut sync_slots: Vec<SmallVec<[u8; 2]>> = Vec::new();
+        let mut sync_slots: Vec<SyncSlots> = Vec::new();
         if has_state {
             let chord_base = targets.len() as u32;
             sync_slots = vec![SmallVec::new(); targets.len()];
@@ -1451,7 +1475,7 @@ pub struct Engine {
     /// Key -> dense id. Built once; `handle` never scans presets.
     index: HashMap<Key, u32>,
     /// Dense id -> dispatch targets across all slots (fan-out preserved).
-    targets: Vec<SmallVec<[Target; 4]>>,
+    targets: Vec<KeyTargets>,
     /// Per-device key bitsets, `words` u64s per device: a key held on device A
     /// is distinct from the same key held on device B.
     down: Vec<u64>,
@@ -1459,7 +1483,7 @@ pub struct Engine {
     /// Stand-in key bitset for a slot with no device (see [`EngineTables`]).
     zeros: Vec<u64>,
     /// Dense key -> stateful slots to resync (see [`EngineTables`]).
-    sync_slots: Vec<SmallVec<[u8; 2]>>,
+    sync_slots: Vec<SyncSlots>,
     /// The one branch chords and macros cost a configuration with neither.
     has_state: bool,
     has_macros: bool,
@@ -1477,7 +1501,7 @@ impl Engine {
     /// Build the engine over resolved slots.
     ///
     /// Preconditions (validated upstream by `SlotSpec`/config): slot numbers
-    /// are unique and in 1..=8. All lookups are precompiled in
+    /// are unique and in 1..=[`MAX_SLOTS`]. All lookups are precompiled in
     /// [`EngineTables::build`] so [`Engine::handle`] performs no per-event
     /// preset iteration and no heap allocation.
     pub fn new(slots: Vec<ResolvedSlot>) -> Self {
@@ -1537,7 +1561,9 @@ impl Engine {
     /// Slot state is matched by slot NUMBER, not by position, so a swap that
     /// keeps the same slots in a different build order still reports honestly.
     pub fn swap_tables(&mut self, tables: EngineTables) -> Deltas {
-        let previous: SmallVec<[(u8, PadState); 8]> = self
+        // One entry per configured slot, so [`MAX_SLOTS`] is the bound rather
+        // than a guess about how many players a cabinet has.
+        let previous: SmallVec<[(u8, PadState); MAX_SLOTS as usize]> = self
             .slots
             .iter()
             .map(|s| (s.number, s.last_emitted))

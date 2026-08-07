@@ -123,10 +123,20 @@ HID stack starts polling, 1–3 ms after `WAIT_DEVICE_READY`; `wait_ready` now
 primes through it and `update` retries transients (fix in the vendored client,
 worth offering upstream). The persona plumbing is live end to end: `Persona` in
 ksx-core (`persona = "playstation"` in TOML, `ds4`/`ps4` accepted as aliases),
-`MAX_SLOTS` raised to 8 with a validation rule that refuses a fifth `xbox360`
+`MAX_SLOTS` raised past 4 with a validation rule that refuses a fifth `xbox360`
 slot by name, the `PadState`→DS4 mapper with a documented D-pad SOCD collapse,
 and `ksx pads --persona playstation` verified on the cabinet: six pads plugged,
 driven, and unplugged with zero XInput slots consumed.
+
+**Raised again to 16 (2026-08-07).** The 8 was a guess about panel sizes, not a
+measurement, and it was the only thing standing in the way: nothing slot-keyed
+truncates above it, and the one hard limit is the `u8` the engine indexes slots
+with (255). Four I-PAC4 boards is a 16-player cabinet. The work was not the
+constant — it was the three clap `1..=8` ranges and the two `ksx-api` refusal
+strings that did **not** track it, so `ksx setup --slot 9` failed at the parser
+before reading a file. All five now format from `MAX_SLOTS`, with tests that
+compare against the constant rather than a literal. `MAX_XINPUT_SLOTS` is
+untouched at 4 — that one is Windows.
 
 ## E5 — AI-drivable CLI (accepted into CURRENT scope, not deferred)
 

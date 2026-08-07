@@ -477,15 +477,19 @@ impl SlotAssignRequest {
     /// lives in the crate both sides link, so a client hears the identical
     /// words with no round trip.
     pub fn from_json(request: &serde_json::Value) -> Result<Self, Refusal> {
+        // The bound is formatted from ksx-core's constant, never spelled out:
+        // these sentences are what a client SEES, so a stale literal here is a
+        // daemon telling a 16-player cabinet that slot 9 does not exist.
+        let max = ksx_core::MAX_SLOTS;
         let Some(slot) = request.get("slot").and_then(serde_json::Value::as_u64) else {
-            return Err(bad_request(
-                r#"slot-assign needs a "slot" (the slot NUMBER, 1..=8)"#,
-            ));
+            return Err(bad_request(format!(
+                r#"slot-assign needs a "slot" (the slot NUMBER, 1..={max})"#
+            )));
         };
         let Ok(slot) = u8::try_from(slot) else {
             return Err(Refusal::new(
                 codes::BAD_SLOT,
-                format!("slot {slot} is not a slot number (1..=8)"),
+                format!("slot {slot} is not a slot number (1..={max})"),
             ));
         };
         let Some(preset) = field(request, "preset") else {
@@ -1276,5 +1280,35 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 3, allow_sh
         let fine: ActionResponse =
             serde_json::from_value(serde_json::json!({"ok": true, "message": "stopped"})).unwrap();
         assert!(fine.refusal().is_none());
+    }
+
+    /// `slot-assign`'s two slot refusals quote the LIVE bound.
+    ///
+    /// These sentences are the only thing a client sees, and this crate links
+    /// ksx-core, so there is no excuse for a literal: one hardcoded `1..=8`
+    /// here is a daemon telling a 16-player cabinet that slot 9 is not a slot
+    /// number. Asserted against the constant so a raise cannot go stale.
+    #[test]
+    fn the_slot_assign_refusals_quote_max_slots_not_a_literal() {
+        let bound = format!("1..={}", ksx_core::MAX_SLOTS);
+
+        let missing = SlotAssignRequest::from_json(&serde_json::json!({"preset": "P"}))
+            .expect_err("no slot is a refusal");
+        assert_eq!(missing.code, codes::BAD_REQUEST);
+        assert!(missing.message.contains(&bound), "{}", missing.message);
+
+        // Past `u8` entirely — the only slot value this reader itself rejects;
+        // 1..=MAX_SLOTS proper is checked where the config is (ksx-app).
+        let huge = SlotAssignRequest::from_json(&serde_json::json!({"slot": 999, "preset": "P"}))
+            .expect_err("999 is not a slot");
+        assert_eq!(huge.code, codes::BAD_SLOT);
+        assert!(huge.message.contains(&bound), "{}", huge.message);
+
+        // A slot past the old eight-player ceiling is an ordinary request to
+        // this reader, whose only slot rule is "fits in u8" — pinned so nobody
+        // adds a second, literal ceiling on the wire beside ksx-app's.
+        let ninth = SlotAssignRequest::from_json(&serde_json::json!({"slot": 9, "preset": "P"}))
+            .expect("slot 9 is a slot");
+        assert_eq!(ninth.slot, 9);
     }
 }
