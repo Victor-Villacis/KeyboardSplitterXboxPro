@@ -563,7 +563,11 @@ mod tests {
     /// nothing in this module may terminate a process the user is playing.
     #[test]
     fn no_kill_primitive_exists() {
-        let source = include_str!("process.rs");
+        // include_str! sees this file as checked out on disk: with git's
+        // core.autocrlf on (every fresh Windows clone, GitHub CI) that is
+        // CRLF, and the `\n` inside the section marker below never matches.
+        // Normalize first so the invariant holds on any checkout.
+        let source = include_str!("process.rs").replace("\r\n", "\n");
         // Skip the doc comment and this test, which necessarily name the APIs.
         let body = source
             .split("// ---------------------------------------------------------------------------\n// Launching, with a handle")
