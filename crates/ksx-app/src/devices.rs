@@ -267,7 +267,148 @@ impl DevicesReport {
     }
 }
 
-/// The single `--json` success object.
+/// `YYYY-MM-DD HH:MM:SS UTC`, the stamp every ksx view carries.
+///
+/// Spelled here rather than borrowed from `crate::sources`, which only exists
+/// under the `studio`/`cabinet` features. Gated to the same features as its
+/// only caller: without a UI nothing asks for a `DevicesView`, and an
+/// ungated helper is dead code the default build refuses at `-D warnings`.
+#[cfg(all(windows, feature = "cabinet"))]
+fn stamp_utc() -> String {
+    let t = ksx_config::Timestamp::now_utc();
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    )
+}
+
+/// The report as the typed surface every front end reads
+/// ([`ksx_api::MachineSource::devices`]).
+///
+/// A translation, not a second collector: same pass, same facts, shaped for a
+/// screen instead of a terminal. The cabinet and Studio therefore cannot
+/// disagree with `ksx devices` about what is plugged in.
+///
+/// Gated to the UI features because that is who reads it — a default build has
+/// no surface to render a `DevicesView` and would carry this as dead code.
+#[cfg(all(windows, feature = "cabinet"))]
+pub fn to_view(report: &DevicesReport) -> ksx_api::DevicesView {
+    use ksx_capture::winusb::Binding;
+
+    let keyboards = report
+        .keyboards
+        .iter()
+        .map(|d| ksx_api::KeyboardRow {
+            slot: u16::from(d.interception_slot.unwrap_or(0)),
+            hardware_id: d.id.as_str().to_owned(),
+            alias: report.configured.alias_for(&d.id).map(str::to_owned),
+            backend: backend_name(report.configured.backend_for(&d.id)).to_owned(),
+            detail: match (d.friendly.as_deref(), vendor_tag(d.id.as_str())) {
+                (Some(f), Some(v)) => format!("{f} ({v})"),
+                (Some(f), None) => f.to_owned(),
+                (None, Some(v)) => v.to_owned(),
+                (None, None) => String::new(),
+            },
+        })
+        .collect();
+
+    let usb = report
+        .usb
+        .iter()
+        .map(|row| {
+            let c = &row.candidate;
+            // The vocabulary the CLI already prints, so a screen and a terminal
+            // describe the same interface with the same words.
+            let (state, verdict) = if !c.is_keyboard_candidate() {
+                (
+                    "not-a-keyboard",
+                    "not a keyboard interface; ksx leaves it alone".to_owned(),
+                )
+            } else {
+                match &c.binding {
+                    Binding::WinUsb => (
+                        "claimed",
+                        "bound to winusb.sys — ksx can capture this".to_owned(),
+                    ),
+                    Binding::HidUsb => (
+                        "claimable",
+                        "on the keyboard stack; ksx could claim it".to_owned(),
+                    ),
+                    Binding::Other(service) => (
+                        "foreign-driver",
+                        format!("{service} owns this interface; ksx will not touch it"),
+                    ),
+                    Binding::None => (
+                        "foreign-driver",
+                        "nothing is driving this devnode (mid-rescan?)".to_owned(),
+                    ),
+                }
+            };
+            ksx_api::UsbRow {
+                instance_id: c.id.as_str().to_owned(),
+                description: c.friendly().unwrap_or_default().to_owned(),
+                state: state.to_owned(),
+                verdict,
+                alias: row.alias.clone(),
+                selected: row.selected,
+                ready: row.ready(),
+                vendor: ksx_core::vendors::name_for(c.vendor_id, c.product_id).map(str::to_owned),
+                // The composite parent: every interface of one physical board
+                // shares it, which is what lets a picker group three devnodes
+                // into "I-PAC 4X — 3 interfaces".
+                board: Some(c.parent_id.clone()),
+            }
+        })
+        .collect();
+
+    // Notes are the things a LIST cannot say, and every one of them is a
+    // condition a user would otherwise diagnose by reading rows carefully.
+    let mut notes = Vec::new();
+    if !report.interception_available && !report.usb_available {
+        notes.push(
+            "neither the Interception driver nor USB enumeration is available — \
+             run `ksx doctor`"
+                .to_owned(),
+        );
+    } else if !report.interception_available {
+        notes.push(
+            "the Interception driver is not installed. After M6 that is the expected \
+             state, not a fault."
+                .to_owned(),
+        );
+    }
+    for id in report.duplicates() {
+        notes.push(format!(
+            "two keyboards report the hardware id {id} — Interception cannot tell them \
+             apart, so capturing one captures both"
+        ));
+    }
+    for row in report.pending_rebinds() {
+        notes.push(format!(
+            "{} is configured for winusb but is still on the keyboard stack; \
+             `ksx run` will refuse until it is claimed",
+            row.candidate.id.as_str()
+        ));
+    }
+    for id in report.unmatched_winusb_config() {
+        notes.push(format!(
+            "config names {id} for winusb, but no such interface is present"
+        ));
+    }
+    if report.reboot_required() {
+        notes.push("a rebind is pending a reboot before it takes effect".to_owned());
+    }
+
+    ksx_api::DevicesView {
+        generated_at: stamp_utc(),
+        keyboards,
+        interception_available: report.interception_available,
+        usb,
+        usb_available: report.usb_available,
+        notes,
+    }
+}
+
 pub fn devices_json(report: &DevicesReport) -> serde_json::Value {
     let keyboards: Vec<serde_json::Value> = report
         .keyboards
@@ -486,8 +627,19 @@ pub fn render_human(report: &DevicesReport) -> String {
     out
 }
 
+/// One enumeration pass, shared by `ksx devices` and by
+/// [`ksx_api::MachineSource::devices`].
+///
+/// Extracted so the cabinet cannot grow a second collector. The whole point of
+/// the M9 typed surface is that a screen and a CLI verb answer from the same
+/// facts; two collectors would be two answers to "what is plugged in", and the
+/// one on screen would be the one nobody tested.
+///
+/// Read-only on both halves — see the module docs. Never exits: a machine with
+/// neither backend is a *report*, and the caller decides what that means (the
+/// CLI exits 2; a UI renders the note).
 #[cfg(windows)]
-pub fn run(json: bool) -> anyhow::Result<()> {
+pub fn collect() -> DevicesReport {
     use ksx_capture::{CaptureBackend as _, InterceptionBackend};
 
     // Config is advisory here: a machine with no config still lists hardware.
@@ -523,6 +675,21 @@ pub fn run(json: bool) -> anyhow::Result<()> {
         }
     };
 
+    DevicesReport::build(
+        keyboards,
+        interception_available,
+        usb,
+        usb_available,
+        configured,
+    )
+}
+
+#[cfg(windows)]
+pub fn run(json: bool) -> anyhow::Result<()> {
+    let report = collect();
+    let interception_available = report.interception_available;
+    let usb_available = report.usb_available;
+
     if !interception_available && !usb_available {
         let message = "neither the Interception driver nor USB enumeration is available; \
                        run `ksx doctor` for driver diagnostics"
@@ -538,13 +705,6 @@ pub fn run(json: bool) -> anyhow::Result<()> {
         std::process::exit(EXIT_DRIVER_MISSING);
     }
 
-    let report = DevicesReport::build(
-        keyboards,
-        interception_available,
-        usb,
-        usb_available,
-        configured,
-    );
     if json {
         println!("{}", serde_json::to_string_pretty(&devices_json(&report))?);
     } else {
@@ -925,5 +1085,86 @@ mod tests {
         assert!(text.contains("no keyboards"), "{text}");
         assert!(!report.reboot_required());
         assert_eq!(report.highest_slot(), None);
+    }
+
+    /// The typed surface a screen reads must carry what the terminal prints.
+    ///
+    /// Until this existed, `MachineSource::devices()` fell through to the
+    /// trait's REFUSAL, so the cabinet could not list devices at all — and the
+    /// vendor fix that stopped calling a SpinTrak an I-PAC lived only in CLI
+    /// output where no UI could reach it.
+    #[test]
+    #[cfg(all(windows, feature = "cabinet"))]
+    fn the_view_carries_the_vendor_name_and_groups_by_board() {
+        let ipac_kb = usb(IPAC_USB, Binding::WinUsb);
+        let mut ipac_mouse = usb(
+            r"USB\VID_D209&PID_0430&MI_01\7&25EEA38C&0&0001",
+            Binding::HidUsb,
+        );
+        ipac_mouse.interface_number = 1;
+        // Vendor-specific class, not HID. `is_keyboard_candidate` is
+        // deliberately just `is_hid()` — a rebound interface stops describing
+        // itself as a keyboard, and NKRO firmware often reports protocol 0, so
+        // guessing harder there would only produce confident wrong answers.
+        // The real proof is the report descriptor at claim time.
+        ipac_mouse.interface_class = 0xFF;
+        ipac_mouse.interface_protocol = 0;
+        let mut spintrak = usb(r"USB\VID_D209&PID_15A2\6", Binding::HidUsb);
+        spintrak.product_id = 0x15A2;
+        spintrak.parent_id = r"USB\VID_D209&PID_15A2\6".into();
+        spintrak.product = Some("SpinTrak".into());
+
+        let report = DevicesReport::build(
+            Vec::new(),
+            false,
+            vec![
+                UsbRow {
+                    candidate: ipac_kb,
+                    alias: None,
+                    selected: true,
+                },
+                UsbRow {
+                    candidate: ipac_mouse,
+                    alias: None,
+                    selected: false,
+                },
+                UsbRow {
+                    candidate: spintrak,
+                    alias: None,
+                    selected: false,
+                },
+            ],
+            true,
+            ConfiguredDevices::default(),
+        );
+        let view = to_view(&report);
+
+        assert_eq!(view.usb.len(), 3);
+        // The regression the vendors table fixed, now reaching a screen.
+        assert_eq!(view.usb[0].vendor.as_deref(), Some("Ultimarc I-PAC 4X"));
+        assert_eq!(view.usb[2].vendor.as_deref(), Some("Ultimarc SpinTrak"));
+        assert_ne!(
+            view.usb[2].vendor, view.usb[0].vendor,
+            "a trackball must not be labelled as the keyboard encoder"
+        );
+
+        // Grouping: the I-PAC's two interfaces are ONE board; the SpinTrak is
+        // another. This is what lets a picker offer boards, not devnodes.
+        assert_eq!(view.usb[0].board, view.usb[1].board);
+        assert_ne!(view.usb[0].board, view.usb[2].board);
+
+        // The verdict vocabulary a screen renders is the CLI's own.
+        assert_eq!(view.usb[0].state, "claimed");
+        assert_eq!(view.usb[1].state, "not-a-keyboard");
+        assert_eq!(view.usb[2].state, "claimable");
+        assert!(view.usb.iter().all(|r| !r.verdict.is_empty()));
+
+        // A missing Interception driver is a NOTE, not an empty list with no
+        // explanation — it is the expected end state after M6.
+        assert!(
+            view.notes.iter().any(|n| n.contains("expected state")),
+            "{:?}",
+            view.notes
+        );
     }
 }

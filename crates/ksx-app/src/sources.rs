@@ -465,6 +465,24 @@ fn load_profiles() -> (Vec<ProfileRow>, String) {
 pub struct LocalMachine;
 
 impl ksx_api::MachineSource for LocalMachine {
+    /// The one thing the cabinet could not previously ask for.
+    ///
+    /// Until now this fell through to the trait's default, which REFUSES with
+    /// "not here, run `ksx devices`" — so a screen that wanted to list devices
+    /// got a refusal, and the device picker had nothing to render. It is
+    /// read-only and safe mid-session on both halves (see `crate::devices`),
+    /// which is why it needs none of the consent ceremony `pads` and
+    /// `winusb_claim` keep.
+    /// Gated to `cabinet` because that is the only surface that constructs a
+    /// `LocalMachine` today. Studio reads the machine through its own
+    /// providers, so building this there would carry `to_view` as dead code —
+    /// which `--features studio` refuses at `-D warnings`, and which the CI
+    /// matrix caught the moment this was written.
+    #[cfg(all(windows, feature = "cabinet"))]
+    fn devices(&self) -> Result<ksx_api::DevicesView, Refusal> {
+        Ok(crate::devices::to_view(&crate::devices::collect()))
+    }
+
     fn presets(&self) -> Result<PresetsView, Refusal> {
         let root = ksx_config::ConfigRoot::discover().map_err(|err| {
             Refusal::with_remedy(

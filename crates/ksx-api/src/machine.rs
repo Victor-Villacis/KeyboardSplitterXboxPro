@@ -177,6 +177,23 @@ pub struct UsbRow {
     pub selected: bool,
     /// Selected AND rebound — `ksx run` will capture it.
     pub ready: bool,
+    /// The board's name, when ksx recognises the VID/PID
+    /// (`ksx_core::vendors`). `None` is the normal answer and not a failure —
+    /// most devices are not in the table, and [`Self::description`] carries
+    /// what the device says about itself.
+    ///
+    /// Display only, always: `docs/DEVICE-IDENTITY.md` §6 is explicit that no
+    /// capture, claim or refusal path may branch on a vendor id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    /// The physical board this interface belongs to.
+    ///
+    /// One I-PAC exposes three interfaces (`MI_00`/`01`/`02`); they are one
+    /// device to a human and three devnodes to Windows. Grouping by this is
+    /// what lets a picker say "I-PAC 4X — 3 interfaces, keyboard on MI_00"
+    /// instead of listing three cryptic paths and asking the user to guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<String>,
 }
 
 /// `ksx winusb status`, presentation-shaped.
