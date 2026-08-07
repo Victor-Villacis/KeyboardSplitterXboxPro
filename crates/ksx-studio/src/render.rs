@@ -1191,8 +1191,11 @@ mod tests {
             "{}",
             out.html
         );
-        // And the header links into the mapper.
+        // And the header links into every sibling screen. The nav is STATIC
+        // MARKUP duplicated per island, so a new page is invisible until this
+        // one links to it — which is exactly the regression this asserts.
         assert!(out.html.contains(r#"href="/map""#), "{}", out.html);
+        assert!(out.html.contains(r#"href="/setup""#), "{}", out.html);
     }
 
     /// The brand embed exists AND is the same bytes `tools/icongen` wrote.

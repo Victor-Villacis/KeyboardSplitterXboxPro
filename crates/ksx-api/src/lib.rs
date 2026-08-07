@@ -77,11 +77,13 @@ pub use control::{
 };
 pub use live::{KeyHit, LiveFeed, LiveFrame, NoFeed, PadFeedback, SlotLive};
 pub use machine::{
-    AdviceRow, AutostartView, BoardRow, ConfiguredDevice, DevicePickSpec, DevicePickView,
-    DeviceRemoveSpec, DeviceRemoveView, DeviceScanView, DevicesView, DoctorRow, DoctorView,
+    setup_states, setup_steps, AdviceRow, AutostartView, BoardRow, ConfigExport, ConfiguredDevice,
+    DevicePickSpec, DevicePickView, DeviceRemoveSpec, DeviceRemoveView, DeviceScanView,
+    DevicesView, DoctorRow, DoctorView, ExportRequest, ImportReport, ImportRequest, ImportWrite,
     KeyboardRow, MachineSource, NewPreset, NewProfile, PresetRow, PresetsView, ProfileDetail,
-    ProfilesView, TemplateRow, UsbRow, WinusbView, CAVEAT_NOT_A_KEYBOARD, CLAIM_LEAD,
-    NO_BOARDS_LINE, RELEASE_LEAD, UNREAD_BOARDS_LINE, UNREAD_CONFIGURED_LINE,
+    ProfilesView, SetupDeviceRow, SetupSlotRow, SetupStep, SetupView, TemplateRow, UsbRow,
+    WinusbView, CAVEAT_NOT_A_KEYBOARD, CLAIM_LEAD, NO_BOARDS_LINE, RELEASE_LEAD,
+    UNREAD_BOARDS_LINE, UNREAD_CONFIGURED_LINE,
 };
 pub use pipe::{PipeTransport, TransportError, NO_CHANNEL};
 pub use refusal::{codes, Refusal, Refused};

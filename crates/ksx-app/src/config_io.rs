@@ -88,19 +88,68 @@ pub struct ImportOptions {
 }
 
 // ---------------------------------------------------------------------------
-// export
+// The reusable halves
+//
+// Everything below this banner and above `export` is the part of these two
+// verbs that has NO console in it: read a root into a bundle, read a document
+// into a bundle, work out what writing it would do, do it. The CLI entry
+// points are thin wrappers that add printing and exit codes.
+//
+// Split out because there is a second front door now — Studio's `/setup` page
+// reaches the identical machinery through
+// `ksx_api::MachineSource::{config_export, config_import}` — and the CLI's own
+// answer shape cannot be reused from a request handler: `refuse` below is
+// `-> !` and calls `std::process::exit`, which inside axum would take the whole
+// server down instead of returning a 303. One reader, one writer, two front
+// doors (docs/SURFACES.md §1).
 // ---------------------------------------------------------------------------
 
-pub fn export(options: ExportOptions) -> anyhow::Result<()> {
-    let store = Store::new(ConfigRoot::discover()?);
-    let want = resolve_parts(&options.what, options.preset.is_some());
-    if options.preset.is_some() && !want.contains(&Part::Presets) {
-        refuse(
-            options.json,
+/// A refusal that has not yet been acted on: the stable `--json` code and the
+/// sentence. The CLI hands one to [`refuse`]; a library caller turns it into a
+/// `ksx_api::Refusal`.
+pub(crate) enum Fault {
+    Refused { code: &'static str, message: String },
+    Error(anyhow::Error),
+}
+
+impl Fault {
+    pub(crate) fn refused(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Refused {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<ConfigError> for Fault {
+    fn from(err: ConfigError) -> Self {
+        Self::Error(err.into())
+    }
+}
+
+impl From<anyhow::Error> for Fault {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Error(err)
+    }
+}
+
+/// A config root read into one bundle.
+pub(crate) struct Gathered {
+    pub(crate) bundle: Bundle,
+    pub(crate) warnings: Vec<Warning>,
+}
+
+/// The bundle an export of `want` (optionally one named preset) would produce.
+pub(crate) fn gather(
+    store: &Store,
+    want: &[Part],
+    preset: Option<&str>,
+) -> Result<Gathered, Fault> {
+    if preset.is_some() && !want.contains(&Part::Presets) {
+        return Err(Fault::refused(
             "bad-selection",
             "--preset selects one preset, so --what must include presets",
-            &[],
-        );
+        ));
     }
 
     let mut bundle = Bundle::default();
@@ -120,23 +169,154 @@ pub fn export(options: ExportOptions) -> anyhow::Result<()> {
         let loaded = store.load_presets()?;
         warnings.extend(loaded.warnings);
         let mut presets = loaded.value;
-        if let Some(name) = &options.preset {
+        if let Some(name) = preset {
             presets.retain(|preset| preset.name.eq_ignore_ascii_case(name));
             if presets.is_empty() {
-                refuse(
-                    options.json,
+                return Err(Fault::refused(
                     "unknown-preset",
-                    &format!(
+                    format!(
                         "no preset named \"{name}\" in {} — `ksx config export --what presets` \
                          lists what is there",
                         store.root().presets_dir().display()
                     ),
-                    &[],
-                );
+                ));
             }
         }
         bundle.presets = Some(presets);
     }
+    Ok(Gathered { bundle, warnings })
+}
+
+/// A document read into one bundle, narrowed to `what`.
+pub(crate) struct Incoming {
+    pub(crate) bundle: Bundle,
+    pub(crate) warnings: Vec<Warning>,
+}
+
+/// Parse an interop document and narrow it — the "what IS this file" half of
+/// [`import`], with the same refusal to guess.
+pub(crate) fn read_bundle(label: &Path, text: &str, what: &[Part]) -> Result<Incoming, Fault> {
+    // A BARE document (no `ksx_interop`) needs to be told what it is, and only
+    // an unambiguous --what can tell it. Anything else is refused rather than
+    // guessed — importing the wrong file over the wrong file is the failure
+    // this whole verb exists to avoid.
+    let bare = match what {
+        [only] => Some(*only),
+        _ => None,
+    };
+    let loaded = interop::parse_document(label, text, bare)
+        .map_err(|err| Fault::refused(parse_error_code(&err), err.to_string()))?;
+    let mut bundle = loaded.value;
+    if !what.is_empty() {
+        bundle.narrow(what);
+    }
+    if bundle.is_empty() {
+        let asked: Vec<&str> = what.iter().map(|p| p.as_str()).collect();
+        return Err(Fault::refused(
+            "empty-selection",
+            format!(
+                "{} carries nothing to import{}",
+                label.display(),
+                if asked.is_empty() {
+                    String::new()
+                } else {
+                    format!(" for --what {}", asked.join(","))
+                }
+            ),
+        ));
+    }
+    Ok(Incoming {
+        bundle,
+        warnings: loaded.warnings,
+    })
+}
+
+/// What would be WRONG with the state an import produces. Reads only — nothing
+/// here writes, and nothing here plans a write either: the fault check has to
+/// come first, so that a document which cannot pass validation is refused with
+/// "nothing was written" rather than with whatever the planner tripped over.
+pub(crate) struct Examination {
+    pub(crate) issues: Vec<Issue>,
+    pub(crate) warnings: Vec<Warning>,
+}
+
+impl Examination {
+    /// Validation faults — the ones that refuse the write without `--force`.
+    pub(crate) fn faults(&self) -> Vec<&Issue> {
+        self.issues.iter().filter(|i| !i.is_advisory()).collect()
+    }
+}
+
+/// Validate the state the import WOULD PRODUCE, not the document in isolation:
+/// a preset bundle is only sound against the config that will reference it, and
+/// a config is only sound against the presets that will be on disk when it is
+/// read.
+pub(crate) fn examine(store: &Store, bundle: &Bundle) -> Result<Examination, ConfigError> {
+    let disk_config = store.load_config()?;
+    let disk_games = store.load_games()?;
+    let disk_presets = store.load_presets()?;
+    let mut warnings = Vec::new();
+    warnings.extend(disk_config.warnings);
+    warnings.extend(disk_games.warnings);
+    warnings.extend(disk_presets.warnings);
+
+    let config_after = bundle.config.clone().unwrap_or(disk_config.value);
+    let games_after = bundle.games.clone().unwrap_or(disk_games.value);
+    let presets_after = merged_presets(disk_presets.value, bundle.presets.as_deref());
+
+    let mut issues = ksx_config::validate(&config_after, &presets_after);
+    issues.extend(ksx_config::validate_games(&games_after, &presets_after));
+
+    Ok(Examination { issues, warnings })
+}
+
+/// What an applied import really did.
+pub(crate) struct Applied {
+    pub(crate) written: Vec<PathBuf>,
+    pub(crate) backups: Vec<PathBuf>,
+    /// The write that stopped it. The paths above ARE on disk either way.
+    pub(crate) failure: Option<ConfigError>,
+}
+
+/// Write a plan. Every overwrite is backed up FIRST, and the loop stops at the
+/// first failure with both halves named — a half-applied import that lies
+/// about it is worse than one that says where it stopped.
+pub(crate) fn apply_writes(store: &Store, bundle: &Bundle, plan: &[PlannedWrite]) -> Applied {
+    let mut applied = Applied {
+        written: Vec::new(),
+        backups: Vec::new(),
+        failure: None,
+    };
+    for step in plan {
+        let outcome = store
+            .backup(&step.path)
+            .and_then(|backup| {
+                if let Some(backup) = backup {
+                    applied.backups.push(backup);
+                }
+                write_part(store, bundle, step)
+            })
+            .map(|path| applied.written.push(path));
+        if let Err(err) = outcome {
+            applied.failure = Some(err);
+            break;
+        }
+    }
+    applied
+}
+
+// ---------------------------------------------------------------------------
+// export
+// ---------------------------------------------------------------------------
+
+pub fn export(options: ExportOptions) -> anyhow::Result<()> {
+    let store = Store::new(ConfigRoot::discover()?);
+    let want = resolve_parts(&options.what, options.preset.is_some());
+    let Gathered { bundle, warnings } = match gather(&store, &want, options.preset.as_deref()) {
+        Ok(gathered) => gathered,
+        Err(Fault::Refused { code, message }) => refuse(options.json, code, &message, &[]),
+        Err(Fault::Error(err)) => return Err(err),
+    };
 
     let mut text = bundle.to_json(options.style)?;
     text.push('\n');
@@ -192,16 +372,16 @@ pub fn export(options: ExportOptions) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// One file the import would touch.
-struct PlannedWrite {
-    part: Part,
-    path: PathBuf,
-    format: Format,
+pub(crate) struct PlannedWrite {
+    pub(crate) part: Part,
+    pub(crate) path: PathBuf,
+    pub(crate) format: Format,
     /// A file is already there: it gets a timestamped backup before the write.
-    overwrite: bool,
+    pub(crate) overwrite: bool,
 }
 
 impl PlannedWrite {
-    fn action(&self) -> &'static str {
+    pub(crate) fn action(&self) -> &'static str {
         if self.overwrite {
             "overwrite"
         } else {
@@ -214,69 +394,28 @@ pub fn import(options: ImportOptions) -> anyhow::Result<()> {
     let store = Store::new(ConfigRoot::discover()?);
     let (label, text) = read_source(&options.source)?;
 
-    // A BARE document (no `ksx_interop`) needs to be told what it is, and only
-    // an unambiguous --what can tell it. Anything else is refused rather than
-    // guessed — importing the wrong file over the wrong file is the failure
-    // this whole verb exists to avoid.
-    let bare = match options.what.as_slice() {
-        [only] => Some(*only),
-        _ => None,
+    let Incoming {
+        bundle,
+        mut warnings,
+    } = match read_bundle(&label, &text, &options.what) {
+        Ok(incoming) => incoming,
+        Err(Fault::Refused { code, message }) => refuse(options.json, code, &message, &[]),
+        Err(Fault::Error(err)) => return Err(err),
     };
-    let loaded = match interop::parse_document(&label, &text, bare) {
-        Ok(loaded) => loaded,
-        Err(err) => refuse(options.json, parse_error_code(&err), &err.to_string(), &[]),
-    };
-    let mut bundle = loaded.value;
-    let mut warnings = loaded.warnings;
-    if !options.what.is_empty() {
-        bundle.narrow(&options.what);
-    }
-    if bundle.is_empty() {
-        let asked: Vec<&str> = options.what.iter().map(|p| p.as_str()).collect();
-        refuse(
-            options.json,
-            "empty-selection",
-            &format!(
-                "{} carries nothing to import{}",
-                label.display(),
-                if asked.is_empty() {
-                    String::new()
-                } else {
-                    format!(" for --what {}", asked.join(","))
-                }
-            ),
-            &[],
-        );
-    }
 
-    // Validate the state the import WOULD PRODUCE, not the document in
-    // isolation: a preset bundle is only sound against the config that will
-    // reference it, and a config is only sound against the presets that will
-    // be on disk when it is read.
-    let disk_config = store.load_config()?;
-    let disk_games = store.load_games()?;
-    let disk_presets = store.load_presets()?;
-    warnings.extend(disk_config.warnings);
-    warnings.extend(disk_games.warnings);
-    warnings.extend(disk_presets.warnings);
+    let examined = examine(&store, &bundle)?;
+    let faults = examined.faults().len();
+    warnings.extend(examined.warnings);
+    let issues = examined.issues;
 
-    let config_after = bundle.config.clone().unwrap_or(disk_config.value);
-    let games_after = bundle.games.clone().unwrap_or(disk_games.value);
-    let presets_after = merged_presets(disk_presets.value, bundle.presets.as_deref());
-
-    let mut issues = ksx_config::validate(&config_after, &presets_after);
-    issues.extend(ksx_config::validate_games(&games_after, &presets_after));
-    let faults: Vec<&Issue> = issues.iter().filter(|i| !i.is_advisory()).collect();
-
-    if !faults.is_empty() && !options.force {
+    if faults > 0 && !options.force {
         refuse(
             options.json,
             "validation-failed",
             &format!(
-                "refusing to import {}: {} validation fault(s) in the configuration it would \
-                 produce — nothing was written (--force writes anyway)",
+                "refusing to import {}: {faults} validation fault(s) in the configuration it \
+                 would produce — nothing was written (--force writes anyway)",
                 label.display(),
-                faults.len()
             ),
             &issues,
         );
@@ -289,32 +428,18 @@ pub fn import(options: ImportOptions) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Write. Every overwrite is backed up FIRST, and the loop stops at the
-    // first failure with both halves named — a half-applied import that lies
-    // about it is worse than one that says where it stopped.
-    let mut written: Vec<PathBuf> = Vec::new();
-    let mut backups: Vec<PathBuf> = Vec::new();
-    let mut failure: Option<ConfigError> = None;
-    for step in &plan {
-        let outcome = store
-            .backup(&step.path)
-            .and_then(|backup| {
-                if let Some(backup) = backup {
-                    backups.push(backup);
-                }
-                write_part(&store, &bundle, step)
-            })
-            .map(|path| written.push(path));
-        if let Err(err) = outcome {
-            failure = Some(err);
-            break;
-        }
-    }
-
+    let applied = apply_writes(&store, &bundle, &plan);
     report_applied(
-        &options, &label, &bundle, &written, &backups, &issues, &warnings, &failure,
+        &options,
+        &label,
+        &bundle,
+        &applied.written,
+        &applied.backups,
+        &issues,
+        &warnings,
+        &applied.failure,
     );
-    if failure.is_some() {
+    if applied.failure.is_some() {
         std::process::exit(EXIT_PARTIAL_WRITE);
     }
     Ok(())
@@ -339,7 +464,12 @@ fn merged_presets(mut disk: Vec<PresetFile>, imported: Option<&[PresetFile]>) ->
     disk
 }
 
-fn plan_writes(store: &Store, bundle: &Bundle) -> Result<Vec<PlannedWrite>, ConfigError> {
+/// Which files an import touches, and how. Called AFTER [`examine`]'s fault
+/// check, never before it — see that type's docs.
+pub(crate) fn plan_writes(
+    store: &Store,
+    bundle: &Bundle,
+) -> Result<Vec<PlannedWrite>, ConfigError> {
     let mut plan = Vec::new();
     let mut push = |part: Part, source: ksx_config::Source| {
         plan.push(PlannedWrite {
@@ -523,7 +653,7 @@ fn plan_json(step: &PlannedWrite) -> serde_json::Value {
 // plumbing
 // ---------------------------------------------------------------------------
 
-fn resolve_parts(what: &[Part], preset_named: bool) -> Vec<Part> {
+pub(crate) fn resolve_parts(what: &[Part], preset_named: bool) -> Vec<Part> {
     if !what.is_empty() {
         return what.to_vec();
     }

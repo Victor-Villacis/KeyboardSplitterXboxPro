@@ -673,6 +673,34 @@ impl ksx_api::MachineSource for LocalMachine {
         Ok(remove_view(&outcome))
     }
 
+    /// The first run, and the two verbs a person actually performs on a
+    /// configuration.
+    ///
+    /// All three land in [`crate::onboard`], which is where the CLI's own
+    /// `config export|import` machinery is reached from — there is no second
+    /// reader, no second writer and no second validator. What differs is only
+    /// the answer's shape: a value, rather than a console and an exit code.
+    /// Ungated (unlike [`Self::devices`]) because none of it touches hardware:
+    /// it is the config store and nothing else, on every platform.
+    fn setup_state(&self) -> Result<ksx_api::SetupView, Refusal> {
+        crate::onboard::state()
+    }
+
+    fn config_export(
+        &self,
+        request: &ksx_api::ExportRequest,
+    ) -> Result<ksx_api::ConfigExport, Refusal> {
+        crate::onboard::export(request)
+    }
+
+    /// **Dry run unless `request.apply`** — the CLI's consent shape, unchanged.
+    fn config_import(
+        &self,
+        request: &ksx_api::ImportRequest,
+    ) -> Result<ksx_api::ImportReport, Refusal> {
+        crate::onboard::import(request)
+    }
+
     fn presets(&self) -> Result<PresetsView, Refusal> {
         let root = ksx_config::ConfigRoot::discover().map_err(|err| {
             Refusal::with_remedy(

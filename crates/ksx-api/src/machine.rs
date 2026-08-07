@@ -196,6 +196,54 @@ pub trait MachineSource: Send + Sync {
         ))
     }
 
+    /// The first-run state: what the config root already holds, and which of
+    /// the onboarding steps is next.
+    ///
+    /// The STEPS are part of the answer on purpose. "Which step comes next" is
+    /// a decision about configuration, and docs/SURFACES.md §1 puts decisions
+    /// in the backend — a surface that worked it out from the rows would be a
+    /// second, silently diverging copy of the rule the moment a fifth step
+    /// exists.
+    fn setup_state(&self) -> Result<SetupView, Refusal> {
+        Err(Refusal::not_here(
+            "reading the first-run state",
+            "run `ksx setup`",
+        ))
+    }
+
+    /// `ksx config export` — the config root as ONE interop JSON document,
+    /// **in memory**.
+    ///
+    /// Deliberately not a path. The CLI's export writes to stdout or to a file
+    /// because that is what a shell can consume; a surface that offers the user
+    /// a DOWNLOAD needs the bytes, and giving it a path instead would put the
+    /// filesystem back in front of a person who asked for a file (which is the
+    /// whole reason `/setup` exists). Same `ksx_config::interop` machinery
+    /// underneath either way — there is no second serializer.
+    fn config_export(&self, _request: &ExportRequest) -> Result<ConfigExport, Refusal> {
+        Err(Refusal::not_here(
+            "exporting the configuration",
+            "run `ksx config export`",
+        ))
+    }
+
+    /// `ksx config import` — a document in, **dry run unless
+    /// [`ImportRequest::apply`]**.
+    ///
+    /// The consent shape is load-bearing and is the CLI's, unchanged
+    /// (`ksx-app/src/config_io.rs`): a first call reports exactly which files
+    /// it would create and which it would overwrite, every overwrite leaves a
+    /// timestamped `.bak`, and validation faults refuse the write unless
+    /// [`ImportRequest::force`] says otherwise. A surface may not skip the dry
+    /// run — replacing a cabinet's whole configuration is not a thing to do on
+    /// one click.
+    fn config_import(&self, _request: &ImportRequest) -> Result<ImportReport, Refusal> {
+        Err(Refusal::not_here(
+            "importing a configuration",
+            "run `ksx config import`",
+        ))
+    }
+
     /// Get ksx Studio on screen — start it if nothing is listening, wait for
     /// the port to answer, then hand the URL to the shell.
     ///
@@ -966,6 +1014,188 @@ pub struct AdviceRow {
     pub remedy: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// First run, and the config in/out that has no path in it
+// ---------------------------------------------------------------------------
+
+/// Stable [`SetupStep::id`] values, in the order a first run performs them.
+///
+/// Named constants because a surface routes on them (the board step is a link
+/// to the devices screen, the prove step is a button that starts the learner),
+/// and a typo in a match arm would silently render a step nobody can act on.
+pub mod setup_steps {
+    /// Find the board and give it a name — one `[[device]]` entry.
+    pub const BOARD: &str = "board";
+    /// Point a slot at a preset — one `[[slot]]`, or one `[[game.slot]]`.
+    pub const SLOT: &str = "slot";
+    /// Press a button and watch ksx name it.
+    pub const PROVE: &str = "prove";
+}
+
+/// Stable [`SetupStep::state`] values.
+pub mod setup_states {
+    /// Already true of this machine — nothing to do.
+    pub const DONE: &str = "done";
+    /// The next thing to do.
+    pub const NOW: &str = "now";
+    /// Real, but an earlier step has to happen first.
+    pub const LATER: &str = "later";
+}
+
+/// The first run, as a surface reads it: what is already configured, and what
+/// the next step is.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupView {
+    pub generated_at: String,
+    /// **Support detail, never an interface.** A person setting a cabinet up
+    /// does not operate on a directory — they import, export, and follow the
+    /// steps. This is here so a bug report can quote it, and it belongs in
+    /// small print.
+    pub config_root: String,
+    /// A `config.toml` (or `config.json`) is really on disk. `false` is the
+    /// first-run state, and it is not an error.
+    pub config_exists: bool,
+    /// `[[device]]` entries — the boards this cabinet has been told about.
+    pub devices: Vec<SetupDeviceRow>,
+    /// Every wired slot, from `config.toml` and from every games.toml profile.
+    pub slots: Vec<SetupSlotRow>,
+    /// Preset names on disk.
+    pub presets: Vec<String>,
+    /// games.toml profile titles.
+    pub profiles: Vec<String>,
+    /// The onboarding checklist, ordered, with exactly one step in
+    /// [`setup_states::NOW`] while anything is left to do.
+    pub steps: Vec<SetupStep>,
+    /// Anything the read has to say out loud (a games.toml that would not
+    /// parse) — rendered, never swallowed.
+    pub notes: Vec<String>,
+}
+
+/// One `[[device]]` entry, as the setup page shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupDeviceRow {
+    /// The name the user gave it — what slots refer to.
+    pub alias: String,
+    /// The selector it resolves through. Long and machine-shaped: small print.
+    pub id: String,
+    /// `interception` | `winusb`.
+    pub backend: String,
+}
+
+/// One wired slot.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupSlotRow {
+    pub number: u8,
+    /// The `[[device]]` alias (or the raw selector, in a games.toml profile),
+    /// or `(any)` when the slot takes whatever is plugged in.
+    pub device: String,
+    pub preset: String,
+    pub persona: String,
+    /// `config.toml`, or the games.toml profile title this slot lives in.
+    pub source: String,
+}
+
+/// One step of the first run.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupStep {
+    /// One of [`setup_steps`] — what a surface routes on.
+    pub id: String,
+    pub title: String,
+    /// What is true about this step RIGHT NOW, in one sentence.
+    pub detail: String,
+    /// One of [`setup_states`].
+    pub state: String,
+}
+
+/// What to export. Empty `what` is the whole root.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportRequest {
+    /// `config` | `games` | `presets`; empty = all three.
+    #[serde(default)]
+    pub what: Vec<String>,
+}
+
+/// One exported document, held in memory rather than written anywhere.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigExport {
+    /// A suggested name for whatever the surface does with the bytes.
+    pub filename: String,
+    /// The document — interop JSON (TOML stays canonical on disk).
+    pub document: String,
+    pub bytes: usize,
+    /// Which parts it carries: `config`, `games`, `presets`.
+    pub parts: Vec<String>,
+    /// How many presets travelled with it.
+    pub presets: usize,
+    /// Anything the read had to say (unknown keys in a file, a shadowed
+    /// `.json`) — said out loud, never swallowed.
+    pub warnings: Vec<String>,
+}
+
+/// One import attempt. `apply` false — the default — is a DRY RUN.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportRequest {
+    /// The document itself. A bare (un-enveloped) document needs `what` to
+    /// name what it is, exactly as the CLI does — importing the wrong file
+    /// over the wrong file is the failure this verb exists to prevent.
+    pub document: String,
+    #[serde(default)]
+    pub what: Vec<String>,
+    /// **Write.** Absent or false reports what would happen and changes
+    /// nothing.
+    #[serde(default)]
+    pub apply: bool,
+    /// Write even though validation found faults (advisories never block).
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// What an import did, or would do.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportReport {
+    /// The verb ended the way it was asked to. A DRY RUN with a clean plan is
+    /// `true`; a write refused by validation faults and a write that stopped
+    /// half way are both `false`.
+    ///
+    /// A separate field from [`applied`](Self::applied) so no surface has to
+    /// re-derive "did this go wrong" from two other booleans and get it
+    /// subtly different from the next surface.
+    pub ok: bool,
+    /// Files were really written. `false` is a dry-run report — or a refusal.
+    pub applied: bool,
+    /// ONE sentence, short enough to survive a redirect's `?flash=` — the
+    /// no-JavaScript path has nowhere else to put it.
+    pub summary: String,
+    /// The write that stopped a half-finished import. The paths in
+    /// [`written`](Self::written) ARE on disk; the rest are not.
+    pub error: Option<String>,
+    pub parts: Vec<String>,
+    /// Every file the import touches, whether or not it was applied.
+    pub writes: Vec<ImportWrite>,
+    /// Validation faults in the configuration this import would produce.
+    /// Non-empty and `force` unset means nothing was written.
+    pub faults: Vec<String>,
+    /// Validation advisories — never blocking, always shown.
+    pub advisories: Vec<String>,
+    pub warnings: Vec<String>,
+    /// Paths really written (empty on a dry run).
+    pub written: Vec<String>,
+    /// The `.bak-YYYYMMDD-HHMMSS` copies taken first — the road home.
+    pub backups: Vec<String>,
+}
+
+/// One file an import touches.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportWrite {
+    /// `config` | `games` | `presets`.
+    pub part: String,
+    pub path: String,
+    /// `create` | `overwrite`.
+    pub action: String,
+    /// `toml` | `json` — the format the file KEEPS, not the document's.
+    pub format: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,6 +1241,19 @@ mod tests {
             (
                 "ksx winusb release",
                 Nothing.winusb_release("ID").unwrap_err(),
+            ),
+            ("ksx setup", Nothing.setup_state().unwrap_err()),
+            (
+                "ksx config export",
+                Nothing
+                    .config_export(&ExportRequest::default())
+                    .unwrap_err(),
+            ),
+            (
+                "ksx config import",
+                Nothing
+                    .config_import(&ImportRequest::default())
+                    .unwrap_err(),
             ),
         ];
         for (command, refusal) in checks {
@@ -1266,5 +1509,53 @@ mod tests {
         let view = scan(true, vec![lying]);
         assert!(!view.boards[0].pickable);
         assert_eq!(view.pickable_boards, 0);
+    }
+
+    /// The import consent shape, as a TYPE rather than as a review note: an
+    /// [`ImportRequest`] a surface builds — or deserializes from a form that
+    /// simply omitted the box — writes nothing at all. `apply` has to be said.
+    #[test]
+    fn an_import_request_is_a_dry_run_until_someone_says_so() {
+        assert!(!ImportRequest::default().apply);
+        assert!(!ImportRequest::default().force);
+        let off_the_wire: ImportRequest =
+            serde_json::from_str(r#"{"document":"{}"}"#).expect("minimal request");
+        assert!(
+            !off_the_wire.apply && !off_the_wire.force,
+            "a document with no consent fields must not write: {off_the_wire:?}"
+        );
+    }
+
+    /// One step is the NEXT one. The rule lives with the type it describes, so
+    /// every implementation of [`MachineSource::setup_state`] is held to it.
+    #[test]
+    fn a_setup_checklist_has_at_most_one_next_step() {
+        let view = SetupView {
+            steps: vec![
+                SetupStep {
+                    id: setup_steps::BOARD.to_owned(),
+                    state: setup_states::DONE.to_owned(),
+                    ..SetupStep::default()
+                },
+                SetupStep {
+                    id: setup_steps::SLOT.to_owned(),
+                    state: setup_states::NOW.to_owned(),
+                    ..SetupStep::default()
+                },
+                SetupStep {
+                    id: setup_steps::PROVE.to_owned(),
+                    state: setup_states::LATER.to_owned(),
+                    ..SetupStep::default()
+                },
+            ],
+            ..SetupView::default()
+        };
+        assert_eq!(
+            view.steps
+                .iter()
+                .filter(|s| s.state == setup_states::NOW)
+                .count(),
+            1
+        );
     }
 }

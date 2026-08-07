@@ -19,6 +19,19 @@
 //! (`connect-src 'self'` covers the poller, `form-action 'self'` the
 //! forms).
 //!
+//! `/setup` (M10) is the third screen and the config's own: what this machine
+//! holds, and the two verbs a person performs on a configuration — **Export**
+//! (`GET /setup/export.json`, the whole root as one JSON document) and
+//! **Import** (`POST /setup/import`, dry run unless the write box is ticked).
+//! Neither takes a filesystem path: `ksx_api::MachineSource::{config_export,
+//! config_import}` work in memory, so no screen has to put a directory in front
+//! of someone who asked for their configuration. Under them is the first run —
+//! a checklist the BACKEND decides (`ksx-app::onboard::plan_steps`) with one
+//! backend verb per step: the board step links to the devices screen, `POST
+//! /setup/slot` is one [`ControlSource::assign_slot`], and `POST /setup/prove`
+//! is the daemon's own learner, read back per render so it works with scripting
+//! switched off.
+//!
 //! Session state and the three POST routes go through [`ControlSource`] —
 //! ksx-app implements it over the daemon's `\\.\pipe\ksx-daemon` control
 //! channel, so every button maps to the same `DaemonCommand` the tray
@@ -89,6 +102,7 @@ mod render;
 mod render_devices;
 mod render_map;
 mod render_profiles;
+mod render_setup;
 mod server;
 mod snapshot;
 
@@ -100,5 +114,6 @@ pub use error::StudioError;
 pub use server::serve;
 pub use snapshot::{
     DevicesPayload, MacroSnapshot, MacroStepView, MacroView, MapPayload, MapperSlot,
-    MapperSnapshot, PadRow, ProfileRow, ProfilesPayload, StatusSnapshot, StatusSource,
+    MapperSnapshot, PadRow, ProfileRow, ProfilesPayload, SetupPayload, SetupSnapshot,
+    StatusSnapshot, StatusSource,
 };

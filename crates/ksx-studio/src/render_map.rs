@@ -4234,6 +4234,11 @@ mod tests {
             "{}",
             out.html
         );
+        // The nav is STATIC MARKUP duplicated per island, so a new screen is
+        // invisible until every existing one links to it. Asserted here, on
+        // this page, because a dropped link is otherwise a silent regression.
+        assert!(out.html.contains(r#"href="/""#), "{}", out.html);
+        assert!(out.html.contains(r#"href="/setup""#), "{}", out.html);
     }
 
     /// v9, the headline: with JavaScript switched off the page is still a

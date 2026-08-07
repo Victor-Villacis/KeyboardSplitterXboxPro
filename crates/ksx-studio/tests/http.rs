@@ -161,6 +161,36 @@ impl ScriptedControl {
 const NO_CHANNEL: &str = "no daemon control channel — start the daemon (tray, or `ksx daemon`)";
 
 impl ControlSource for ScriptedControl {
+    /// The verb `/setup`'s step 2 performs. `restarted` is TRUE, because the
+    /// real one bounces the pads — the flash has to say so, and a fake that
+    /// quietly said otherwise would let that regression ship.
+    fn assign_slot(&self, request: &ksx_api::SlotAssignRequest) -> ksx_api::SlotOutcome {
+        if self.no_daemon {
+            return ksx_api::SlotOutcome::failed(NO_CHANNEL, "ksx daemon");
+        }
+        if request.preset != "IPAC P1" {
+            return ksx_api::SlotOutcome {
+                ok: false,
+                error: Some(format!("no preset named \"{}\" on disk", request.preset)),
+                code: Some(ksx_api::codes::UNKNOWN_PRESET.into()),
+                ..ksx_api::SlotOutcome::default()
+            };
+        }
+        ksx_api::SlotOutcome {
+            ok: true,
+            message: Some(format!(
+                "slot {} now uses \"{}\".",
+                request.slot, request.preset
+            )),
+            slot: Some(request.slot),
+            preset: Some(request.preset.clone()),
+            profile: request.profile.clone(),
+            restarted: request.reload,
+            reloaded: request.reload,
+            ..ksx_api::SlotOutcome::default()
+        }
+    }
+
     fn session(&self) -> SessionView {
         if self.no_daemon {
             // The profile still comes from the config, so the banner can print
@@ -686,6 +716,95 @@ impl ksx_api::MachineSource for ScriptedMachine {
             spec.name, spec.template, spec.player
         ))
     }
+
+    // ── The M10 verbs behind /setup: the config in and out, and the first-run
+    //    state. Synthetic, and deliberately just enough to prove the ROUTES —
+    //    what the real provider does to a config root is `ksx-app`'s to test
+    //    (`onboard.rs` + `config_io.rs`), and testing it twice would only pin
+    //    the fake.
+
+    fn setup_state(&self) -> Result<ksx_api::SetupView, Refusal> {
+        Ok(ksx_api::SetupView {
+            generated_at: "test".into(),
+            config_root: "C:\\cfg".into(),
+            config_exists: true,
+            devices: vec![ksx_api::SetupDeviceRow {
+                alias: "P1 board".into(),
+                id: "usb:d209:0430:00".into(),
+                backend: "interception".into(),
+            }],
+            slots: vec![ksx_api::SetupSlotRow {
+                number: 1,
+                device: "P1 board".into(),
+                preset: "IPAC P1".into(),
+                persona: "Xbox 360 pad".into(),
+                source: "config.toml".into(),
+            }],
+            presets: vec!["IPAC P1".into()],
+            profiles: vec!["Street Fighter".into()],
+            steps: vec![
+                ksx_api::SetupStep {
+                    id: ksx_api::setup_steps::BOARD.into(),
+                    title: "Find your board and name it".into(),
+                    detail: "One board is named.".into(),
+                    state: ksx_api::setup_states::DONE.into(),
+                },
+                ksx_api::SetupStep {
+                    id: ksx_api::setup_steps::SLOT.into(),
+                    title: "Wire a slot".into(),
+                    detail: "One slot is wired.".into(),
+                    state: ksx_api::setup_states::DONE.into(),
+                },
+                ksx_api::SetupStep {
+                    id: ksx_api::setup_steps::PROVE.into(),
+                    title: "Press a button and watch it land".into(),
+                    detail: "Start the listener and press a button.".into(),
+                    state: ksx_api::setup_states::NOW.into(),
+                },
+            ],
+            notes: Vec::new(),
+        })
+    }
+
+    fn config_export(
+        &self,
+        _request: &ksx_api::ExportRequest,
+    ) -> Result<ksx_api::ConfigExport, Refusal> {
+        let document = "{\n  \"ksx_interop\": 1,\n  \"schema_version\": 1\n}\n".to_owned();
+        Ok(ksx_api::ConfigExport {
+            filename: "ksx-config-20260807-120000.json".into(),
+            bytes: document.len(),
+            parts: vec!["config".into(), "games".into(), "presets".into()],
+            presets: 1,
+            warnings: Vec::new(),
+            document,
+        })
+    }
+
+    /// The consent shape, faithfully: no `apply`, no write.
+    fn config_import(
+        &self,
+        request: &ksx_api::ImportRequest,
+    ) -> Result<ksx_api::ImportReport, Refusal> {
+        if !request.document.contains("ksx_interop") {
+            return Err(Refusal::new(
+                ksx_api::codes::BAD_REQUEST,
+                "the pasted document does not say what it is",
+            ));
+        }
+        Ok(ksx_api::ImportReport {
+            ok: true,
+            applied: request.apply,
+            summary: if request.apply {
+                "imported config, games — 2 file(s) written, 2 backed up first".to_owned()
+            } else {
+                "nothing written yet — this would replace your settings. Tick \"write it\" \
+                 and import again to apply."
+                    .to_owned()
+            },
+            ..ksx_api::ImportReport::default()
+        })
+    }
 }
 
 /// Bind port 0 to learn a free port, release it, and serve there. The tiny
@@ -736,6 +855,9 @@ fn start_server_with_machine(
         fn save_macro(&self, request: &MacroWrite) -> MacroOutcome {
             self.0.save_macro(request)
         }
+        fn assign_slot(&self, request: &ksx_api::SlotAssignRequest) -> ksx_api::SlotOutcome {
+            self.0.assign_slot(request)
+        }
     }
     struct SharedMachine(Arc<ScriptedMachine>);
     impl ksx_api::MachineSource for SharedMachine {
@@ -765,6 +887,21 @@ fn start_server_with_machine(
         }
         fn preset_new(&self, spec: &ksx_api::NewPreset) -> Result<String, Refusal> {
             self.0.preset_new(spec)
+        }
+        fn setup_state(&self) -> Result<ksx_api::SetupView, Refusal> {
+            self.0.setup_state()
+        }
+        fn config_export(
+            &self,
+            request: &ksx_api::ExportRequest,
+        ) -> Result<ksx_api::ConfigExport, Refusal> {
+            self.0.config_export(request)
+        }
+        fn config_import(
+            &self,
+            request: &ksx_api::ImportRequest,
+        ) -> Result<ksx_api::ImportReport, Refusal> {
+            self.0.config_import(request)
         }
     }
     std::thread::spawn(move || {
@@ -2507,7 +2644,7 @@ fn a_rebound_host_cannot_read_the_profiles() {
 fn every_page_links_to_every_other_page() {
     let control = Arc::new(ScriptedControl::new(true));
     let addr = start_server(control);
-    for route in ["/", "/map", "/devices", "/profiles"] {
+    for route in ["/", "/map", "/devices", "/profiles", "/setup"] {
         let response = get(addr, route);
         let body = body_of(&response);
         for link in [
@@ -2515,11 +2652,248 @@ fn every_page_links_to_every_other_page() {
             r#"href="/map""#,
             r#"href="/devices""#,
             r#"href="/profiles""#,
+            r#"href="/setup""#,
         ] {
             assert!(
                 body.contains(link),
                 "{route} does not link to {link} — the page is unreachable from it"
             );
         }
+    }
+}
+
+// ── /setup: the config first, and the first run ────────────────────────────
+
+/// The page a first run lands on, over real HTTP: the configuration is the
+/// first card, the two verbs are on it, and the checklist is what the backend
+/// decided rather than anything this page worked out.
+#[test]
+fn the_setup_page_leads_with_the_config_and_its_two_verbs() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control);
+    let response = get(addr, "/setup");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        response.contains("cache-control: no-store"),
+        "a config read is point-in-time: {response}"
+    );
+    let body = body_of(&response);
+
+    // The two verbs, both reachable with no JavaScript at all.
+    assert!(body.contains(r#"href="/setup/export.json""#), "{body}");
+    assert!(body.contains(r#"action="/setup/import""#), "{body}");
+    // The checklist, straight off the provider.
+    assert!(body.contains("Press a button and watch it land"), "{body}");
+    assert!(body.contains(r#"class="step now""#), "{body}");
+    // Onward, rather than duplicated: the board step belongs to /devices.
+    assert!(body.contains(r#"href="/devices""#), "{body}");
+    // The path is present exactly once, in the support line — never as a
+    // control. This is the owner's brief, checked over the wire.
+    let at = body.find("C:\\cfg").expect("the config root, for support");
+    let smallprint = body.find(r#"class="smallprint""#).expect("support line");
+    assert!(
+        smallprint < at,
+        "the config root must be inside the small print"
+    );
+    assert!(!body.contains(r#"href="C:\cfg"#), "{body}");
+}
+
+/// The page and the poller serve one shape (the parity render_setup.rs pins
+/// server-side, observed here end to end).
+#[test]
+fn the_setup_api_serves_the_payload_the_page_embeds() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control);
+    let payload: serde_json::Value =
+        serde_json::from_str(body_of(&get(addr, "/api/setup"))).expect("json");
+    assert_eq!(payload["setup"]["available"], serde_json::json!(true));
+    assert_eq!(
+        payload["setup"]["view"]["config_exists"],
+        serde_json::json!(true)
+    );
+    assert_eq!(payload["setup"]["view"]["steps"][2]["state"], "now");
+    assert_eq!(payload["learn"]["state"], "idle");
+    // A poll is not an action.
+    assert_eq!(payload["flash"], serde_json::json!(null));
+}
+
+/// EXPORT is a download, not a path. The bytes come back with a file name
+/// attached, so a plain `<a download>` finishes the job.
+#[test]
+fn export_hands_back_the_document_itself() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control);
+    let response = get(addr, "/setup/export.json");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        response.contains("content-disposition: attachment; filename=\"ksx-config-"),
+        "{response}"
+    );
+    assert!(
+        response.contains("content-type: application/json"),
+        "{response}"
+    );
+    assert!(body_of(&response).contains("ksx_interop"), "{response}");
+}
+
+/// The consent shape, over HTTP: no "write it" box, no write — and the answer
+/// says so in a sentence short enough to have survived the redirect.
+#[test]
+fn import_is_a_dry_run_until_the_box_is_ticked() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control);
+
+    let document = "%7B%22ksx_interop%22%3A1%7D";
+    let dry = post_form(addr, "/setup/import", &format!("document={document}"));
+    assert!(dry.starts_with("HTTP/1.1 303"), "{dry}");
+    assert!(dry.contains("nothing%20written%20yet"), "{dry}");
+    assert!(
+        !dry.contains("flash=error"),
+        "a clean dry run is not an error: {dry}"
+    );
+
+    let applied = post_form(
+        addr,
+        "/setup/import",
+        &format!("document={document}&apply=yes"),
+    );
+    assert!(applied.starts_with("HTTP/1.1 303"), "{applied}");
+    assert!(applied.contains("imported%20config"), "{applied}");
+
+    // A document that does not say what it is comes back as an ERROR flash —
+    // never silence, and never a claim that something was written.
+    let junk = post_form(addr, "/setup/import", "document=%7B%7D");
+    assert!(junk.contains("flash=error"), "{junk}");
+    // …and an empty box is refused before the provider is even asked.
+    let empty = post_form(addr, "/setup/import", "document=");
+    assert!(empty.contains("flash=error"), "{empty}");
+    assert!(empty.contains("paste%20a%20configuration"), "{empty}");
+}
+
+/// Step 2 is ONE backend verb — `ControlSource::assign_slot`, the same pipe
+/// verb `ksx slot assign` performs — and the flash says the pads replugged,
+/// because that is the surprising half of the outcome.
+#[test]
+fn wiring_a_slot_goes_through_assign_slot_and_names_the_pad_bounce() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control);
+
+    let ok = post_form(addr, "/setup/slot", "slot=2&preset=IPAC+P1&profile=");
+    assert!(ok.starts_with("HTTP/1.1 303"), "{ok}");
+    assert!(ok.contains("slot%202%20now%20uses"), "{ok}");
+    assert!(ok.contains("pads%20replugged"), "{ok}");
+
+    // A preset that is not there is a refusal, flashed as one.
+    let bad = post_form(addr, "/setup/slot", "slot=2&preset=Nope");
+    assert!(bad.contains("flash=error"), "{bad}");
+    // …and so is submitting the form with nothing chosen.
+    let empty = post_form(addr, "/setup/slot", "slot=2&preset=");
+    assert!(empty.contains("flash=error"), "{empty}");
+}
+
+/// Step 3 is the daemon's own learner, and it is operable with scripting off:
+/// POST, 303, and the next render shows the state the poll would have.
+#[test]
+fn proving_a_button_uses_the_daemon_learner_with_no_javascript() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control);
+
+    let started = post_form(addr, "/setup/prove", "");
+    assert!(started.starts_with("HTTP/1.1 303"), "{started}");
+    assert!(started.contains("Listening"), "{started}");
+
+    // The page itself now says the learner is listening — no client code
+    // involved, which is what makes the <noscript> refresh enough.
+    let page = body_of(&get(addr, "/setup")).to_owned();
+    assert!(page.contains("press any button on the panel"), "{page}");
+    assert!(page.contains(r#"action="/setup/prove/cancel""#), "{page}");
+
+    let stopped = post_form(addr, "/setup/prove/cancel", "");
+    assert!(stopped.starts_with("HTTP/1.1 303"), "{stopped}");
+}
+
+/// Every mutating /setup route is inside the guarded router, and the reads are
+/// covered by the Host check like every other read. Written as a loop over the
+/// routes rather than as one case, because the failure this catches is a route
+/// added later and attached in the wrong place.
+#[test]
+fn the_setup_routes_are_guarded_like_every_other_one() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control);
+
+    for path in [
+        "/setup/import",
+        "/setup/slot",
+        "/setup/prove",
+        "/setup/prove/cancel",
+    ] {
+        let body = "document=%7B%7D&slot=1&preset=IPAC+P1";
+        let response = http(
+            addr,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Origin: https://evil.example\r\nConnection: close\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "{path} must refuse a cross-site write, got: {response}"
+        );
+    }
+
+    // Reads too: a rebound name never reaches a handler, on any route.
+    for path in ["/setup", "/api/setup", "/setup/export.json"] {
+        let response = http(
+            addr,
+            &format!("GET {path} HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n"),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 421"),
+            "{path} must refuse a rebound read, got: {response}"
+        );
+    }
+}
+
+/// With no daemon, the config half of the page keeps working and the two verbs
+/// stay live — Import and Export are the config store, not the pipe. The steps
+/// that DO need a daemon say so instead of offering a dead button.
+#[test]
+fn the_config_verbs_survive_a_dead_daemon() {
+    let control = Arc::new(ScriptedControl::dead());
+    let addr = start_server(control);
+    let body = body_of(&get(addr, "/setup")).to_owned();
+
+    assert!(body.contains(r#"href="/setup/export.json""#), "{body}");
+    assert!(body.contains(r#"action="/setup/import""#), "{body}");
+    assert!(
+        body.contains("Import and Export below still work"),
+        "{body}"
+    );
+    // …and no live control that would silently do nothing.
+    assert!(!body.contains(r#"action="/setup/slot""#), "{body}");
+    assert!(!body.contains(r#"action="/setup/prove""#), "{body}");
+    assert!(body.contains("the listener lives in the daemon"), "{body}");
+
+    // An export still produces a document.
+    assert!(
+        get(addr, "/setup/export.json").starts_with("HTTP/1.1 200"),
+        "the config store needs no daemon"
+    );
+}
+
+/// A new page is invisible until the pages that already exist link to it.
+#[test]
+fn the_existing_pages_link_to_setup() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control);
+    for path in ["/", "/map"] {
+        let body = body_of(&get(addr, path)).to_owned();
+        assert!(
+            body.contains(r#"href="/setup""#),
+            "{path} must reach /setup from its nav: {body}"
+        );
     }
 }

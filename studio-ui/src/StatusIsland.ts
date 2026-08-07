@@ -284,6 +284,7 @@ export function StatusIsland() {
         h("a", { class: "navlink", href: "/map" }, "Mapper"),
         h("a", { class: "navlink", href: "/devices" }, "Devices"),
         h("a", { class: "navlink", href: "/profiles" }, "Profiles"),
+        h("a", { class: "navlink", href: "/setup" }, "Setup"),
       ),
       createShow(
         () => pillRunning(),

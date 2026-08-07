@@ -6,8 +6,15 @@
 // spawned via execFileSync without shell:true, ENOENT — was fixed in 0.1.9,
 // so a `tailwind: true` cssEntry would now work if ever wanted.)
 //
-// v5: TWO routes — "/" (status) and "/map" (the mapper) — plus the vendored
-// controller art copied (cleaned) from art/ into the embed.
+// THREE routes — "/" (status), "/map" (the mapper) and "/setup" (the
+// configuration: import, export, first run) — plus the vendored controller art
+// copied (cleaned) from art/ into the embed.
+//
+// Adding a route is FOUR edits in this file and none of them is optional:
+// `entryPoints`, `routes`, `ssrEntryPoints`, and the FMIR version guard's list
+// at the bottom. Miss the last one and the route ships unverified; miss any of
+// the first three and `EmbeddedPage::load` fails at startup, so Studio does not
+// bind at all.
 //
 // 2026-08-06: @getforma/compiler 0.3.1 + @getforma/build 0.2.0 are consumed
 // from disk (`file:` deps in package.json — npm publishing was down; the note
@@ -62,6 +69,7 @@ await build({
     { entry: "src/map.ts", outfile: "map.js" },
     { entry: "src/devices.ts", outfile: "devices.js" },
     { entry: "src/profiles.ts", outfile: "profiles.js" },
+    { entry: "src/setup.ts", outfile: "setup.js" },
   ],
   cssEntries: [{ input: "src/studio.css", outfile: "studio.css" }],
   routes: {
@@ -69,6 +77,7 @@ await build({
     "/map": { js: ["map"], css: ["studio"] },
     "/devices": { js: ["devices"], css: ["studio"] },
     "/profiles": { js: ["profiles"], css: ["studio"] },
+    "/setup": { js: ["setup"], css: ["studio"] },
   },
   outputDir,
   ssr: true,
@@ -77,6 +86,7 @@ await build({
     map: "src/map.ts",
     devices: "src/devices.ts",
     profiles: "src/profiles.ts",
+    setup: "src/setup.ts",
   },
 });
 

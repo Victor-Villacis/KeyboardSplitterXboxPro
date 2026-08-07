@@ -22,6 +22,12 @@ mod macro_trace;
 mod map;
 mod mapping;
 mod monitor;
+// The first-run state and the path-free config in/out, for the surfaces that
+// have a screen. Gated with `sources` for the same reason: the CLI reaches this
+// machinery through `config_io` directly, so a default build would carry it as
+// dead code — which `-D warnings` refuses.
+#[cfg(any(feature = "studio", feature = "cabinet"))]
+mod onboard;
 mod pads;
 mod preset_cli;
 mod preset_edit;

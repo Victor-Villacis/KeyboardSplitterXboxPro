@@ -3783,6 +3783,254 @@ a.strow:hover {
   padding-inline: var(--sp-2);
 }
 
+/* ═══ §6b SCREEN — SETUP ══════════════════════════════════════════════════
+   Layout only; every widget here is a §4 component. Two tiers, and the order
+   is the argument:
+     FIRST     the configuration itself — what you have, and the two verbs
+               (Export, Import) that are the only things you do to it
+     THEN      the first run, as a checklist the backend decides
+     LAST      the inventory, quiet, with the config root in small print
+
+   A path is never a control on this screen. `.smallprint` is the one place one
+   appears, at the bottom, sized and coloured so it reads as a support detail
+   rather than as somewhere to go. */
+
+.setupcard .state {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-2xl);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--track-title);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+  text-wrap: balance;
+}
+
+.setupcard .controls,
+.setupsteps .controls,
+.importcard .controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+
+.setupcard .controls label,
+.setupsteps .controls label {
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+/* The two verbs, side by side and equally reachable — Export is primary
+   because it is the one that can never do harm. */
+.setupverbs {
+  margin-bottom: var(--sp-4);
+}
+
+/* ── The checklist ─────────────────────────────────────────────────────── */
+
+.steplist {
+  list-style: none;
+  margin: 0 0 var(--sp-5);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.steplist .step {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid var(--border-subtle);
+  border-left-width: 3px;
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+.stepbadge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--border-default);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--text-secondary);
+}
+
+.stepbody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.steptitle {
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.stepdetail {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-snug);
+  color: var(--text-secondary);
+  max-width: 82ch;
+}
+
+/* State by COLOUR ROLE, not by decoration: ok = already true, accent = the one
+   thing to do next, neutral = real but not yet. Exactly one row is ever
+   `now` (ksx-app `onboard::plan_steps` guarantees it). */
+.steplist .step.done {
+  border-left-color: var(--ok-line);
+}
+
+.steplist .step.done .stepbadge {
+  border-color: var(--ok-line);
+  background: var(--ok-dim);
+  color: var(--ok);
+}
+
+.steplist .step.now {
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+}
+
+.steplist .step.now .stepbadge {
+  border-color: var(--accent-line);
+  background: var(--accent-dim-2);
+  color: var(--accent);
+}
+
+.steplist .step.later {
+  opacity: 0.72;
+}
+
+/* ── One step's action ─────────────────────────────────────────────────── */
+
+.stepact {
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.stepact + .stepact {
+  margin-top: var(--sp-4);
+}
+
+.stepact h3 {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.stepact .warn {
+  margin-top: var(--sp-3);
+}
+
+/* The learned key, big enough to read from behind the cabinet with the phone
+   in your hand (docs/SURFACES.md §8). */
+.provekey {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-2xl);
+  font-weight: var(--fw-bold);
+  letter-spacing: var(--track-mono);
+  color: var(--accent);
+  overflow-wrap: anywhere;
+}
+
+/* ── Import ────────────────────────────────────────────────────────────── */
+
+.importform {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+.importlabel {
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.importbox {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: var(--sp-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+  color: var(--text-primary);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+}
+
+/* Consent reads as text, not as chrome: the box and its sentence are one
+   target, and the sentence is the part you read. */
+.importopt {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-regular);
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+/* ── The inventory, and the one path on the page ───────────────────────── */
+
+.notelist li {
+  border-left: 3px solid var(--warn-line);
+}
+
+.smallprint {
+  margin: var(--sp-5) 0 0;
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border-subtle);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  color: var(--text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 40rem) {
+  .setupcard .state {
+    font-size: var(--fs-xl);
+  }
+
+  /* A phone gets one verb per row rather than two half-legible ones. */
+  .setupverbs .btn,
+  .setupsteps .controls .btn,
+  .setupsteps .controls select,
+  .importcard .controls .btn {
+    width: 100%;
+  }
+
+  .setupsteps .controls,
+  .importcard .controls {
+    align-items: stretch;
+  }
+}
+
 /* ═══ §7 RESPONSIVE ═══════════════════════════════════════════════════════ */
 
 @media (max-width: 60rem) {

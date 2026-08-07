@@ -343,6 +343,7 @@ export function ProfilesIsland() {
           { class: "navlink on", href: "/profiles", "aria-current": "page" },
           "Profiles",
         ),
+        h("a", { class: "navlink", href: "/setup" }, "Setup"),
       ),
       createShow(
         () => pillRunning(),

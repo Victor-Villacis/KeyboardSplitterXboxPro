@@ -403,6 +403,43 @@ impl ProfilesDerived {
     }
 }
 
+/// The setup page's read: `ksx_api::MachineSource::setup_state`, plus the one
+/// fact a bare `Result` cannot carry into a template — WHY there is nothing.
+///
+/// The same shape, and the same reason, as [`MapperSnapshot::unavailable`]: a
+/// provider that refuses must produce a page that SAYS so, not an empty
+/// checklist that looks like a machine with nothing configured. Those two
+/// states are opposite advice ("import a config" vs "this build has no machine
+/// provider") and a blank page gives the wrong one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupSnapshot {
+    /// The machine provider answered.
+    pub available: bool,
+    /// Where the facts came from, or — with `available` false — why there are
+    /// none. Rendered either way.
+    pub source: String,
+    pub view: ksx_api::SetupView,
+}
+
+impl SetupSnapshot {
+    pub fn ready(view: ksx_api::SetupView) -> Self {
+        Self {
+            available: true,
+            source: "read from this machine's config root".to_owned(),
+            view,
+        }
+    }
+
+    /// No setup facts; `reason` renders where the checklist would be.
+    pub fn unavailable(reason: &str) -> Self {
+        Self {
+            available: false,
+            source: reason.to_owned(),
+            view: ksx_api::SetupView::default(),
+        }
+    }
+}
+
 /// The line above the profile list.
 ///
 /// The `failed` arm is the point of this function. "no profiles in games.toml"
@@ -529,6 +566,22 @@ fn player_range(players: &[u8]) -> String {
     }
 }
 
+/// What `GET /api/setup` serves AND what the setup island's props carry — the
+/// same one-struct-one-serializer rule as [`StatusPayload`], parity pinned in
+/// `render_setup.rs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupPayload {
+    pub setup: SetupSnapshot,
+    pub session: crate::control::SessionView,
+    /// Where the daemon's learner stands. This is step 3 — "press a button and
+    /// watch it land" — and it is read on every page render, so the no-JS
+    /// `<noscript>` refresh shows the press without any client code at all.
+    pub learn: crate::control::LearnView,
+    /// One-shot action feedback (the `?flash=` query). Always `None` from
+    /// `/api/setup` — a poll is not an action.
+    pub flash: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +657,62 @@ mod tests {
         // `flash` is always present (null when absent) — the client types it
         // `string | null`, not optional.
         assert_eq!(v.pointer("/flash"), Some(&serde_json::json!(null)));
+    }
+
+    /// The same rule for the setup envelope: `SetupIsland.ts` reads these
+    /// names, and the poller overwrites the signals the SSR paint seeded, so a
+    /// rename on either side has to be a test failure rather than a page that
+    /// flickers back to its defaults every two seconds.
+    #[test]
+    fn the_setup_payload_envelope_names_are_stable() {
+        let payload = SetupPayload {
+            setup: SetupSnapshot::ready(ksx_api::SetupView {
+                config_root: "C:\\cfg\\ksx".into(),
+                config_exists: true,
+                ..ksx_api::SetupView::default()
+            }),
+            session: crate::control::SessionView::default(),
+            learn: crate::control::LearnView::unavailable("no daemon"),
+            flash: None,
+        };
+        let v = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            v.pointer("/setup/available"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            v.pointer("/setup/view/config_root"),
+            Some(&serde_json::json!("C:\\cfg\\ksx"))
+        );
+        assert_eq!(
+            v.pointer("/setup/view/config_exists"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            v.pointer("/setup/view/steps"),
+            Some(&serde_json::json!([])),
+            "steps must always be an array — the page renders a list, not a maybe"
+        );
+        assert_eq!(
+            v.pointer("/learn/state"),
+            Some(&serde_json::json!("unavailable"))
+        );
+        assert_eq!(v.pointer("/flash"), Some(&serde_json::json!(null)));
+
+        // A refused provider still produces the whole envelope, with the reason
+        // in it: the page must be able to SAY why it has nothing.
+        let down = SetupPayload {
+            setup: SetupSnapshot::unavailable("no machine provider on this surface"),
+            ..SetupPayload::default()
+        };
+        let v = serde_json::to_value(&down).unwrap();
+        assert_eq!(
+            v.pointer("/setup/available"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            v.pointer("/setup/source"),
+            Some(&serde_json::json!("no machine provider on this surface"))
+        );
     }
 }
