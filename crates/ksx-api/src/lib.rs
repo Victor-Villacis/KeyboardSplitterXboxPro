@@ -59,6 +59,17 @@ pub mod refusal;
 pub mod status;
 pub mod wire;
 
+/// **How many slots exist**, re-exported so a surface can size a list against
+/// it without naming `ksx-core`.
+///
+/// This is part of the wire contract already — [`wire`] validates
+/// `1..=MAX_SLOTS` on the way in, and three of this crate's doc comments point
+/// at it — but every front end had to reach past `ksx-api` to read the number,
+/// so none of them did. That is how the cabinet's slot list came to be sized
+/// for four after the ceiling moved to sixteen: nothing in the surface's own
+/// dependency list could tell it how many rows there might be.
+pub use ksx_core::MAX_SLOTS;
+
 pub use client::{Client, VerbSink};
 pub use control::{
     map_request, multi_key_refusal, with_key, without_key, BindConflict, BindOutcome, BindRequest,
