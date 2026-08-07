@@ -68,8 +68,8 @@ windows-sys = "0.60"
 # `studio` feature; the default build must link none of these (provable with
 # `cargo tree -p ksx-app`).
 axum = "0.8"
-forma-ir = "0.1.4"
-forma-server = "0.1.4"
+forma-ir = "0.2.0"
+forma-server = "0.2.0"
 rust-embed = "8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
 # cabinet (the 10-foot OPERATE surface) — reaches ksx-app ONLY through the

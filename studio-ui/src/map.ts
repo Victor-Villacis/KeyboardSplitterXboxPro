@@ -1,14 +1,17 @@
-import { activateIslands, createUnownedRoot, untrack } from "@getforma/core";
+import { activateIslands } from "@getforma/core";
 import { fetchJSON } from "@getforma/core/http";
 
-// Dogfood ledger #13 (docs/FORMA-DOGFOOD.md): the adoption-path show effect
-// materializes re-toggled branches INSIDE its own reactive run, so every
-// binding created there is disposed when the effect re-runs — stale modal
-// prompts, empty flash boxes, dead conflict dialogs. build.mjs patches the
-// compiled setupShowEffect to route branch creation through this unowned
-// root; installed at module top so it exists before any island activates.
-(globalThis as unknown as Record<string, unknown>).__ksxShowBranch = (make: () => unknown) =>
-  createUnownedRoot(() => untrack(make));
+// Dogfood ledger #13(b) CLOSED at @getforma/core 2.0.0 — the `__ksxShowBranch`
+// install that stood here is gone, along with the build.mjs bundle patch that
+// rewrote setupShowEffect to call it.
+//
+// The bug: the adoption-path show effect materialized a re-toggled branch
+// inside its own reactive run, so every binding created there was owned by
+// that run and disposed on the next one — stale modal prompts, empty flash
+// boxes, conflict dialogs that never rendered. 2.0.0's setupShowEffect now
+// wraps each branch in `createRoot(...)` + `untrack(...)`, which is exactly
+// what the workaround supplied.
+//
 // Compile-time anchor: the imported *Page component NOT in the
 // activateIslands registry is this entry's SSR root (see status.ts).
 import { MapPage } from "./MapPage";

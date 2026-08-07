@@ -617,10 +617,23 @@ fn the_mapper_page_learn_flow_and_bind_round_trip() {
     );
     // Ledger #13(a): the CSP header must allow inline STYLE attributes (the
     // zone geometry rides them) while scripts stay nonce-locked.
+    //
+    // It used to assert `style-src 'self' 'unsafe-inline'` — the policy ksx's
+    // own `relax_style_src` produced. forma-server 0.2.0 fixed the underlying
+    // problem, that workaround is deleted, and the header now carries
+    // upstream's answer: a separate `style-src-attr` permits the attributes,
+    // so `style-src` keeps its nonce for `<style>` blocks and stylesheets.
+    // Asserting the old string here would have quietly demanded a weaker
+    // policy than the server ships.
     let headers = page.split("\r\n\r\n").next().unwrap_or("");
     assert!(
-        headers.contains("style-src 'self' 'unsafe-inline'"),
-        "{headers}"
+        headers.contains("style-src-attr 'unsafe-inline'"),
+        "the mapper's zone geometry rides inline style attributes: {headers}"
+    );
+    assert!(
+        headers.contains("style-src 'nonce-"),
+        "style-src must stay nonce-locked now that attributes have their own \
+         directive: {headers}"
     );
     assert!(headers.contains("script-src 'nonce-"), "{headers}");
 

@@ -286,8 +286,17 @@ impl EmbeddedPage {
 
         let module = IrModule::parse(&ir_bytes.data)
             .map_err(|e| StudioError::Ir(format!("{ir_name}: {e}")))?;
-        forma_server::check_ir_compatibility(&module)
-            .map_err(|e| StudioError::Ir(format!("{ir_name}: {e}")))?;
+        // There used to be a `forma_server::check_ir_compatibility(&module)`
+        // call here. 0.2.0 removed the function, and re-implementing it would
+        // have been re-implementing dead code: `IrModule::parse` above starts
+        // with `IrHeader::parse`, which rejects a version mismatch outright
+        // (`IrError::UnsupportedVersion`, forma-ir format.rs). Any module that
+        // reached the old call had ALREADY passed the identical comparison, so
+        // it could only ever return `Ok`.
+        //
+        // That was true in 0.1.4 as well — the guard is in both releases — so
+        // nothing is lost here, and a mismatched IR still fails, one line
+        // earlier, through `StudioError::Ir`.
 
         Ok(Self { manifest, module })
     }
@@ -391,20 +400,20 @@ fn profiles_summary(snap: &StatusSnapshot) -> String {
 /// number ("P1"…), and the ghost list pads the grid out to
 /// [`PAD_TILE_FLOOR`].
 fn list_values(snap: &StatusSnapshot) -> [(&'static str, SlotValue); 5] {
-    let options = SlotValue::Array(
+    let options = SlotValue::array(
         snap.profiles
             .iter()
             .map(|g| {
-                SlotValue::Object(vec![("title".to_owned(), SlotValue::Text(g.title.clone()))])
+                SlotValue::object(vec![("title".to_owned(), SlotValue::Text(g.title.clone()))])
             })
             .collect(),
     );
-    let pads = SlotValue::Array(
+    let pads = SlotValue::array(
         snap.pads
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                SlotValue::Object(vec![
+                SlotValue::object(vec![
                     ("player".to_owned(), SlotValue::Text(format!("P{}", i + 1))),
                     ("persona".to_owned(), SlotValue::Text(p.persona.clone())),
                     ("instance".to_owned(), SlotValue::Text(p.instance.clone())),
@@ -422,21 +431,21 @@ fn list_values(snap: &StatusSnapshot) -> [(&'static str, SlotValue); 5] {
             })
             .collect(),
     );
-    let ghosts = SlotValue::Array(
+    let ghosts = SlotValue::array(
         (snap.pads.len()..PAD_TILE_FLOOR)
             .map(|i| {
-                SlotValue::Object(vec![(
+                SlotValue::object(vec![(
                     "slot".to_owned(),
                     SlotValue::Text(format!("P{}", i + 1)),
                 )])
             })
             .collect(),
     );
-    let profiles = SlotValue::Array(
+    let profiles = SlotValue::array(
         snap.profiles
             .iter()
             .map(|g| {
-                SlotValue::Object(vec![
+                SlotValue::object(vec![
                     ("title".to_owned(), SlotValue::Text(g.title.clone())),
                     ("detail".to_owned(), SlotValue::Text(g.detail.clone())),
                 ])
@@ -752,6 +761,12 @@ pub(crate) fn render_status(
         route_pattern: "/",
         manifest: &page.manifest,
         config_script: None,
+        // The SAFE server-data path (serde_json-escaped, surfaced as
+        // window.__FORMA_CONFIG__), as opposed to config_script, which is a raw
+        // trusted escape hatch. ksx injects its island props through the FMIR
+        // slot table instead, so neither is used — but the distinction matters
+        // the day anything server-derived does need to reach the client.
+        config_json: None,
         body_class: None,
         personality_css: Some(PERSONALITY_CSS),
         body_prefix: Some(&prefix),
@@ -975,30 +990,43 @@ mod tests {
         );
         assert!(out.html.contains(r#"data-forma-hydrate="load""#));
         // Native island props, carrying the SSR slot values themselves — the
-        // whole point of ledger #8 being closed. `loadIslandProps` prefers
-        // this attribute over any script block, so it IS what the hydrate fn
-        // receives.
+        // whole point of ledger #8 being closed.
+        //
+        // WHICH CHANNEL they arrive in is forma's choice, not ours, and it
+        // changed at forma-ir 0.2.0: props whose JSON exceeds
+        // `INLINE_PROPS_MAX_BYTES` (1 KiB) spill from the inline
+        // `data-forma-props` attribute into the shared `__forma_islands`
+        // block. That is upstream acting on ksx's own finding #22 — inline
+        // props were 32.5% of the /map response and could not be switched off.
+        // This page's props are far over the ceiling, so it uses the block.
+        //
+        // So the assertion is on the CONTRACT rather than the mechanism:
+        // exactly one channel, carrying the values. `loadIslandProps` reads
+        // the attribute first and falls back to the block, and the walker
+        // emits only one, so precedence never has two answers.
+        let inline = out.html.contains("data-forma-props=\"");
+        let shared = out.html.contains(r#"<script id="__forma_islands""#);
         assert!(
-            out.html.contains("data-forma-props=\""),
-            "compiler 0.3.1 populates slot_ids, so the walker must emit \
-             native props: {}",
+            inline ^ shared,
+            "props must travel in EXACTLY one channel (inline={inline}, \
+             shared={shared}): {}",
+            out.html
+        );
+        // Values, in whichever channel — attribute-escaped inline, plain JSON
+        // in the block.
+        assert!(
+            out.html
+                .contains(r#""vigemLine":"installed — service running"#)
+                || out
+                    .html
+                    .contains("&quot;vigemLine&quot;:&quot;installed — service running"),
+            "props must carry the injected slot VALUES: {}",
             out.html
         );
         assert!(
-            out.html
-                .contains("&quot;vigemLine&quot;:&quot;installed — service running"),
-            "native props must carry the injected slot VALUES: {}",
-            out.html
-        );
-        assert!(
-            out.html.contains("&quot;show:pillIdle&quot;:true"),
-            "native props must carry the named show booleans: {}",
-            out.html
-        );
-        // We no longer hand-emit the islands protocol's shared-props path.
-        assert!(
-            !out.html.contains("__forma_islands"),
-            "the ledger #8 workaround must be gone: {}",
+            out.html.contains(r#""show:pillIdle":true"#)
+                || out.html.contains("&quot;show:pillIdle&quot;:true"),
+            "props must carry the named show booleans: {}",
             out.html
         );
         // The ksx payload data block (non-executing, CSP-exempt) — the SOURCE
@@ -1076,8 +1104,13 @@ mod tests {
             serde_json::json!("</script><script>alert(1)</script>"),
             "escaping must be lossless"
         );
-        // The NATIVE props path escapes into an ATTRIBUTE, which is forma-ir's
-        // job — pin that a hostile line cannot break out of it either.
+        // The NATIVE props path escapes too, which is forma-ir's job — pin
+        // that a hostile line cannot break out of whichever channel carries
+        // it. This page's props exceed INLINE_PROPS_MAX_BYTES so they land in
+        // the shared block, where the hazard is `</script` rather than a
+        // stray quote; forma-ir 0.2.0's changelog calls that escaping "now
+        // total". Both channels are checked so a payload that shrinks below
+        // the ceiling does not quietly skip the assertion.
         let page = EmbeddedPage::load("/").unwrap();
         let out = render_status(&page, &payload.snapshot, &payload.session, None);
         let props = out
@@ -1085,10 +1118,16 @@ mod tests {
             .split("data-forma-props=\"")
             .nth(1)
             .and_then(|s| s.split('"').next())
-            .expect("native props attribute");
+            .or_else(|| {
+                out.html
+                    .split(r#"<script id="__forma_islands" type="application/json">"#)
+                    .nth(1)
+                    .and_then(|s| s.split("</script>").next())
+            })
+            .expect("island props in one channel or the other");
         assert!(
-            !props.contains("<script"),
-            "native props must be attribute-escaped: {props}"
+            !props.contains("<script") && !props.contains("</script"),
+            "island props must be escaped for their channel: {props}"
         );
     }
 

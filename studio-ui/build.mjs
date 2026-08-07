@@ -101,73 +101,17 @@ for (const logical of Object.keys(manifest.assets)) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Dogfood ledger #13, part 2: patch the ADOPTION-path show effect
-// (`setupShowEffect` in @getforma/core's hydrate.ts, bundled into each entry).
-// Upstream materializes a re-toggled show branch INSIDE its own
-// internalEffect run, so every binding created there (reactive text, nested
-// shows, lists) is owned by that run and disposed when the effect re-runs —
-// in practice: the modal's prompt goes stale after the first close, a
-// reopened flash renders an empty box, and a conflict dialog that first
-// appears on a reopened modal never renders at all. The runtime-path
-// createShow does it right (createRoot + untrack per branch); this rewrite
-// gives the adoption path the same semantics via the `__ksxShowBranch`
-// helper the entries install (map.ts / status.ts). Anchored replacements
-// that MUST match exactly once — an upstream change fails the build loudly
-// instead of silently reintroducing the bug.
+// Dogfood ledger #13(b) CLOSED at @getforma/core 2.0.0: the bundle patch that
+// rewrote setupShowEffect to route branch creation through __ksxShowBranch is
+// gone, and so is the helper the entries installed for it.
 //
-// STILL REQUIRED as of 2026-08-06. The 0.3.1 wave fixed @getforma/compiler
-// and @getforma/build; @getforma/core is untouched at 1.5.0, and its
-// `setupShowEffect` still reads
-// `branch = next ? thenFragment ?? desc.whenTrue() : …` inside the
-// internalEffect with no createRoot/untrack — verified by reading
-// node_modules/@getforma/core/dist/chunk-3U2IQIKB.js, and by both anchors
-// below still matching exactly once. Ledger #13(b)/#16 stay OURS-TO-SEND.
-// ---------------------------------------------------------------------------
-function patchAdoptionShowSeam(file) {
-  let src = readFileSync(file, "utf8");
-  const patches = [
-    {
-      name: "branch creation (whenTrue/whenFalse)",
-      pattern:
-        /=(\w+)\?(\w+)\?\?(\w+)\.whenTrue\(\):\3\.whenFalse\?(\w+)\?\?\3\.whenFalse\(\):null/g,
-      replace:
-        "=$1?$2??globalThis.__ksxShowBranch(()=>$3.whenTrue())" +
-        ":$3.whenFalse?$4??globalThis.__ksxShowBranch(()=>$3.whenFalse()):null",
-    },
-    {
-      name: "branch ensureNode (descriptor → DOM)",
-      pattern: /(\w+)!=null&&!\(\1 instanceof Node\)&&\(\1=(\w+)\(\1\)\)/g,
-      replace: "$1!=null&&!($1 instanceof Node)&&($1=globalThis.__ksxShowBranch(()=>$2($1)))",
-    },
-  ];
-  for (const { name, pattern, replace } of patches) {
-    const hits = [...src.matchAll(pattern)];
-    if (hits.length !== 1) {
-      throw new Error(
-        `ledger #13 patch anchor '${name}' matched ${hits.length}× in ${file} ` +
-          "(expected exactly 1) — upstream changed; re-derive the patch",
-      );
-    }
-    src = src.replace(pattern, replace);
-  }
-  writeFileSync(file, src);
-  // The build precompressed the unpatched bundle; regenerate both variants.
-  writeFileSync(
-    `${file}.br`,
-    brotliCompressSync(src, {
-      params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 11 },
-    }),
-  );
-  writeFileSync(`${file}.gz`, gzipSync(src, { level: 9 }));
-  console.log(`OK: ledger #13 show-seam patch applied to ${file}`);
-}
-for (const logical of ["map.js", "status.js"]) {
-  const hashed = manifest.assets[logical];
-  if (!hashed) throw new Error(`manifest lost its '${logical}' asset`);
-  patchAdoptionShowSeam(join(outputDir, hashed));
-}
-
+// Upstream now wraps each show branch in createRoot(...) + untrack(...) — the
+// exact semantics the patch supplied — so re-toggled branches own their own
+// bindings and survive the effect re-running. The anchored-replacement guard
+// did its job on the way out: the first build against 2.0.0 failed with
+// "matched 0x (expected exactly 1) — upstream changed", which is how a
+// workaround is supposed to announce that its bug is fixed rather than
+// silently reapplying itself to code that no longer needs it.
 // ---------------------------------------------------------------------------
 // Vendored controller art (Gamepad-Asset-Pack, MIT, by AL2009man — see
 // art/README.md): the committed sources are print-style assets — a hidden
