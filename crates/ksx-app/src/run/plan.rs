@@ -565,6 +565,11 @@ fn game_title_of(issue: &Issue) -> Option<&str> {
         Issue::GameSlotNumberOutOfRange { game, .. }
         | Issue::GameDuplicateSlotNumber { game, .. }
         | Issue::GameUnknownPresetRef { game, .. }
+        // Both persona rules were missing from this list, and an unattributed
+        // game issue is silently dropped by the caller's title filter — so
+        // `ksx run --game X` would build a plan for slots that cannot plug.
+        | Issue::GameTooManyXinputSlots { game, .. }
+        | Issue::GamePersonaNotImplemented { game, .. }
         | Issue::GameUserIndexOutOfRange { game, .. } => Some(game),
         _ => None,
     }
@@ -1047,6 +1052,37 @@ preset = "nope"
             .iter()
             .any(|i| matches!(i, Issue::UnknownPresetRef { .. })));
         assert!(err.to_string().contains("refusing to start"), "{err}");
+    }
+
+    /// A slot that can never plug is caught by `--dry-run`, not by the plug.
+    ///
+    /// Without this the plan builds, the session starts, and the run dies
+    /// mid-teardown with an error naming a driver the user does not need. The
+    /// file is still *accepted* — it parses, `dualsense` is a real persona —
+    /// and it is refused with the reason and the fix in the same sentence.
+    #[test]
+    fn a_slot_whose_persona_cannot_plug_refuses_the_run_and_names_the_fix() {
+        let cfg = config(
+            r#"
+schema_version = 1
+[[slot]]
+number = 1
+keyboard = 'HID\X\1'
+preset = "default"
+persona = "dualsense"
+"#,
+        );
+        let err = build_plan(&cfg, &GamesFile::default(), &presets(), None).unwrap_err();
+        let PlanError::Issues(issues) = &err else {
+            panic!("expected Issues, got {err:?}");
+        };
+        assert!(issues
+            .iter()
+            .any(|i| matches!(i, Issue::PersonaNotImplemented { slot: 1, .. })));
+        let text = err.to_string();
+        assert!(text.contains("dualsense"), "{text}");
+        assert!(text.contains("playstation"), "{text}");
+        assert!(text.contains("refusing to start"), "{text}");
     }
 
     /// A chord layered over already-bound keys is a legitimate choice with a

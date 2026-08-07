@@ -34,6 +34,28 @@ pub enum OutputError {
     #[error("this backend cannot emulate a '{0}' controller")]
     PersonaUnsupported(ksx_core::Persona),
 
+    /// The persona is valid and its backend is wired up — and **no build of
+    /// ksx can create it yet**.
+    ///
+    /// The third and last member of a family that must never merge:
+    /// [`OutputError::PersonaUnsupported`] means "wrong backend, try the other
+    /// one", [`OutputError::HidMaestroMissing`] means "install the driver", and
+    /// this one means "there is nothing you can do on this machine". Only the
+    /// first two describe something the user can act on, so folding this into
+    /// either sends them on an errand that ends where it started.
+    ///
+    /// Raised by [`RoutedBackend`](crate::RoutedBackend) *before* any backend
+    /// is constructed, so the machine is never even probed: a probe is exactly
+    /// the wrong evidence here.
+    #[error(
+        "persona '{persona}' cannot be plugged by this build of ksx: {gap}. \
+         Use persona '{instead}'",
+        persona = .0,
+        gap = .0.backend().gap().unwrap_or("no reason recorded"),
+        instead = .0.nearest_pluggable()
+    )]
+    PersonaNotImplemented(ksx_core::Persona),
+
     /// No backend is configured that could materialize this persona.
     ///
     /// Distinct from [`OutputError::PersonaUnsupported`]: that one means "this
@@ -59,7 +81,12 @@ pub enum OutputError {
     HidMaestroMissing { probe: String },
 
     /// Any other HIDMaestro client failure.
-    #[error("HIDMaestro operation failed")]
+    ///
+    /// The source is inlined into the message, not left to `{:#}`: the most
+    /// common occupant is [`ksx_hidmaestro::HmError::NotImplemented`], whose
+    /// whole value is the sentence it carries, and a caller that prints only
+    /// the top-level error would show "operation failed" and nothing else.
+    #[error("HIDMaestro operation failed: {0}")]
     HidMaestro(#[source] ksx_hidmaestro::HmError),
 
     /// The underlying driver client reported an error.
@@ -85,6 +112,20 @@ impl OutputError {
         match self {
             OutputError::HidMaestroMissing { .. } => true,
             OutputError::HidMaestro(err) => err.is_not_installed(),
+            _ => false,
+        }
+    }
+
+    /// True when the root cause is "this build of ksx cannot do that".
+    ///
+    /// The flag a CLI checks to print a refusal instead of an install hint.
+    /// Never overlaps [`OutputError::is_hidmaestro_missing`] — the overlap is
+    /// the bug: a "not implemented" reported as "not installed" is an
+    /// instruction to go and install a driver that will not help.
+    pub fn is_not_implemented(&self) -> bool {
+        match self {
+            OutputError::PersonaNotImplemented(_) => true,
+            OutputError::HidMaestro(err) => err.is_not_implemented(),
             _ => false,
         }
     }
@@ -140,6 +181,50 @@ mod tests {
         assert!(err.to_string().contains("hidmaestro"), "{err}");
         assert!(!err.is_bus_missing());
         assert!(!err.is_hidmaestro_missing());
+    }
+
+    #[test]
+    fn a_persona_this_build_cannot_make_is_refused_with_a_way_out() {
+        let err = OutputError::PersonaNotImplemented(ksx_core::Persona::DualSense);
+        let msg = err.to_string();
+        assert!(msg.contains("dualsense"), "{msg}");
+        // It must not read as an install problem...
+        assert!(!err.is_hidmaestro_missing(), "{msg}");
+        assert!(err.is_not_implemented());
+        assert!(
+            msg.contains("installing HIDMaestro does not change it"),
+            "{msg} must close off the wrong fix"
+        );
+        // ...and it must end in something the user can actually type.
+        assert!(msg.contains("playstation"), "{msg}");
+    }
+
+    #[test]
+    fn the_three_refusals_are_never_confused_for_one_another() {
+        // Wrong backend / driver absent / build cannot do it. Each has a
+        // different fix, and only two of them have one at all.
+        let unsupported = OutputError::PersonaUnsupported(ksx_core::Persona::DualSense);
+        let missing = OutputError::HidMaestroMissing {
+            probe: "looked for a and found none".into(),
+        };
+        let unimplemented = OutputError::PersonaNotImplemented(ksx_core::Persona::SwitchPro);
+
+        assert!(!unsupported.is_not_implemented() && !unsupported.is_hidmaestro_missing());
+        assert!(missing.is_hidmaestro_missing() && !missing.is_not_implemented());
+        assert!(unimplemented.is_not_implemented() && !unimplemented.is_hidmaestro_missing());
+    }
+
+    #[test]
+    fn a_wrapped_driver_error_carries_its_own_sentence_to_the_surface() {
+        // `HidMaestro(_)` used to print "HIDMaestro operation failed" and put
+        // the only informative text in a source nothing was obliged to render.
+        let err = OutputError::HidMaestro(ksx_hidmaestro::HmError::NotImplemented {
+            detail: "no section mapper",
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("no section mapper"), "{msg}");
+        assert!(err.is_not_implemented());
+        assert!(!err.is_hidmaestro_missing(), "{msg}");
     }
 
     #[test]

@@ -19,6 +19,23 @@ pub enum HmError {
     )]
     NotInstalled { probe: ProbeSummary },
 
+    /// ksx itself cannot create a HIDMaestro device — on any machine.
+    ///
+    /// The variant that exists so [`HmError::NotInstalled`] stops being said
+    /// when it is not the reason. Everything above HIDMaestro's shared section
+    /// is written and tested (seqlock, lifecycle order, axis routing,
+    /// keepalive, decode table); the section's own byte layout has never been
+    /// transcribed from HIDMaestro's sources, so [`crate::HmDriverApi`] has no
+    /// production implementation that can create anything. Reporting that as
+    /// "not installed" costs the user a driver install and leaves them exactly
+    /// where they started.
+    #[error(
+        "creating a HIDMaestro device is not implemented in this build of ksx: {detail}. \
+         The DualSense / Switch Pro / Xbox Series personas cannot plug on any machine, \
+         installed or not. Xbox 360 and PlayStation are unaffected: they run on ViGEmBus."
+    )]
+    NotImplemented { detail: &'static str },
+
     /// The driver is installed but `InstallDriver` needs elevation we do not
     /// have. PadForge sidesteps this by running elevated always; ksx does not,
     /// so the error has to be nameable.
@@ -61,6 +78,15 @@ impl HmError {
     /// [`ksx_output`-style](https://docs.rs) `is_bus_missing` does for ViGEmBus.
     pub fn is_not_installed(&self) -> bool {
         matches!(self, HmError::NotInstalled { .. })
+    }
+
+    /// True when the root cause is "ksx cannot do this yet".
+    ///
+    /// Kept apart from [`HmError::is_not_installed`] because the two lead to
+    /// opposite advice: one is an action the user can take, the other is one
+    /// they must not be sent on.
+    pub fn is_not_implemented(&self) -> bool {
+        matches!(self, HmError::NotImplemented { .. })
     }
 }
 
@@ -138,5 +164,32 @@ mod tests {
         assert!(!HmError::ElevationRequired.is_not_installed());
         assert!(!HmError::DeadSlot(3).is_not_installed());
         assert!(!HmError::LatchTorn { retries: 64 }.is_not_installed());
+    }
+
+    #[test]
+    fn not_implemented_is_never_reported_as_not_installed() {
+        // The confusion this variant exists to end. Folding the two together
+        // is what sends a user off to install a driver that cannot help.
+        let err = HmError::NotImplemented {
+            detail: "no section mapper",
+        };
+        assert!(err.is_not_implemented());
+        assert!(!err.is_not_installed());
+        assert!(!HmError::NotInstalled { probe: summary() }.is_not_implemented());
+    }
+
+    #[test]
+    fn not_implemented_says_installing_will_not_help() {
+        let msg = HmError::NotImplemented {
+            detail: "no section mapper",
+        }
+        .to_string();
+        assert!(msg.contains("not implemented in this build"), "{msg}");
+        assert!(msg.contains("no section mapper"), "{msg}");
+        // The load-bearing clause: without it the message still reads as an
+        // install problem, which is the whole failure mode.
+        assert!(msg.contains("on any machine, installed or not"), "{msg}");
+        // ...and it must still say what keeps working, so nobody panics.
+        assert!(msg.contains("ViGEmBus"), "{msg}");
     }
 }

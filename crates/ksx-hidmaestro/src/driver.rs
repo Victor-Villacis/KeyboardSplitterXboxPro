@@ -1,19 +1,25 @@
-//! Availability probe, and the driver implementation for a machine that does
-//! not have HIDMaestro.
+//! Availability probe, and the only [`crate::HmDriverApi`] this build ships:
+//! one that cannot create a device.
 //!
-//! **Status on Victor's cabinet as of 2026-08-06: NOT INSTALLED.** Probed live:
-//! no `HIDMaestro` service, no driver package in `pnputil /enum-drivers`, no
-//! `ROOT\HIDMAESTRO` device node, nothing under `Program Files`. The only
-//! artifact anywhere on the machine is a bundled managed assembly inside an
-//! unrelated clone (`HIDMaestro.Core.dll` 1.3.22, in `controller-project`),
-//! which is a .NET library, not an installed driver.
+//! **The refusal is about ksx, not about the machine.** ksx has never had code
+//! that maps HIDMaestro's shared section, so [`UnavailableDriver`] refuses on
+//! every machine — including one where HIDMaestro is installed and every probe
+//! below says so. That is why the refusal is [`HmError::NotImplemented`] and
+//! not [`HmError::NotInstalled`]: the second reads as an instruction to install
+//! a driver, and following it changes nothing.
 //!
-//! So this module contains no fake. [`UnavailableDriver`] answers the sweep
-//! honestly (nothing to sweep, because nothing can exist) and refuses at
-//! `install_driver` with the probe evidence attached. Everything upstream of it
-//! — the seqlock, the lifecycle order, the axis routing, the keepalive, the
-//! decode table — is real code that will run unchanged the day a real driver
-//! implementation is dropped in behind the same trait.
+//! (For the record, the probe's own answer on Victor's cabinet as of
+//! 2026-08-06 is NOT INSTALLED: no `HIDMaestro` service, no driver package in
+//! `pnputil /enum-drivers`, no `ROOT\HIDMAESTRO` device node, nothing under
+//! `Program Files`. The only artifact anywhere is a bundled managed assembly
+//! inside an unrelated clone — a .NET library, not an installed driver. It is
+//! reported by `ksx doctor` because it is worth knowing, and it gates nothing.)
+//!
+//! So this module contains no fake. It answers the sweep honestly (nothing to
+//! sweep, because ksx created nothing) and refuses everything else. Everything
+//! upstream of it — the seqlock, the lifecycle order, the axis routing, the
+//! keepalive, the decode table — is real code that will run unchanged the day a
+//! real driver implementation is dropped in behind the same trait.
 //!
 //! ## What a real implementation still needs
 //!
@@ -120,15 +126,23 @@ pub fn probe() -> Availability {
     evaluate(&[false, false, false])
 }
 
-/// The [`crate::context::HmDriverApi`] implementation for a machine without
-/// HIDMaestro.
+/// The [`crate::context::HmDriverApi`] this build ships — the one that cannot
+/// create a device.
 ///
 /// Deliberately **not** a mock or a stub: it does not pretend to create
 /// devices, and it does not silently succeed. It refuses at the first step that
-/// would require the driver to exist, with the probe evidence attached.
+/// would need a device to exist, and it refuses for the true reason (nothing
+/// here can build one) rather than the plausible one (the driver is absent).
 pub struct UnavailableDriver {
     availability: Availability,
 }
+
+/// What is specifically missing, carried by every refusal below.
+///
+/// Short and concrete on purpose: [`HmError::NotImplemented`]'s own message
+/// already supplies the consequences, so this only has to name the hole.
+const GAP: &str = "HIDMaestro's shared-section byte layout has never been transcribed from its \
+                   sources, so no HmDriverApi implementation here can create a controller";
 
 impl UnavailableDriver {
     pub fn new() -> Self {
@@ -137,6 +151,11 @@ impl UnavailableDriver {
         }
     }
 
+    /// What the probe found. **Diagnostic only** — nothing in this file branches
+    /// on it any more. It used to, and that was the bug: `require()` was called
+    /// and its success thrown away one line later, so "installed" and "not
+    /// installed" produced the same `NotInstalled` error and the install a user
+    /// performed had no observable effect anywhere.
     pub fn availability(&self) -> &Availability {
         &self.availability
     }
@@ -155,25 +174,19 @@ impl crate::context::HmDriverApi for UnavailableDriver {
     type Storage = crate::seqlock::HeapStorage;
 
     fn remove_all_virtual_controllers(&mut self) -> Result<usize, HmError> {
-        // Truthful: with no driver installed, no virtual controllers can exist,
-        // so a sweep really did remove zero. This is the one step that is
-        // meaningfully answerable without the driver, and answering it keeps
-        // the lifecycle order under test in production too.
+        // Truthful whatever the machine has: ksx cannot create a HIDMaestro
+        // controller, so ksx has none to sweep. This is the one step that is
+        // meaningfully answerable without a driver, and answering it keeps the
+        // lifecycle order under test in production too.
         Ok(0)
     }
 
     fn load_default_profiles(&mut self) -> Result<usize, HmError> {
-        self.availability.require()?;
-        Err(HmError::NotInstalled {
-            probe: self.availability.probe.clone(),
-        })
+        Err(HmError::NotImplemented { detail: GAP })
     }
 
     fn install_driver(&mut self) -> Result<(), HmError> {
-        self.availability.require()?;
-        Err(HmError::NotInstalled {
-            probe: self.availability.probe.clone(),
-        })
+        Err(HmError::NotImplemented { detail: GAP })
     }
 
     fn publish_pid_pool(
@@ -181,9 +194,7 @@ impl crate::context::HmDriverApi for UnavailableDriver {
         _slot: crate::context::SlotId,
         _profile: &crate::profile::HmProfile,
     ) -> Result<(), HmError> {
-        Err(HmError::NotInstalled {
-            probe: self.availability.probe.clone(),
-        })
+        Err(HmError::NotImplemented { detail: GAP })
     }
 
     fn create_controller(
@@ -191,9 +202,7 @@ impl crate::context::HmDriverApi for UnavailableDriver {
         _slot: crate::context::SlotId,
         _profile: &crate::profile::HmProfile,
     ) -> Result<crate::seqlock::Latch<Self::Storage>, HmError> {
-        Err(HmError::NotInstalled {
-            probe: self.availability.probe.clone(),
-        })
+        Err(HmError::NotImplemented { detail: GAP })
     }
 
     fn park_feedback_index(
@@ -246,26 +255,64 @@ mod tests {
         }
     }
 
-    /// The honesty contract: on a machine without HIDMaestro, nothing pretends.
+    /// The honesty contract: nothing pretends, and nothing blames the machine.
     #[test]
     fn the_unavailable_driver_refuses_instead_of_faking_a_device() {
         let mut driver = UnavailableDriver::new();
-        if driver.availability().installed {
-            // Someone installed it — this test has nothing to say.
-            return;
-        }
         // The sweep is answerable and answered.
         assert_eq!(driver.remove_all_virtual_controllers().unwrap(), 0);
-        // Everything that would need a driver refuses, and says so.
+        // Everything that would need a device refuses, and says so.
         let err = driver.install_driver().unwrap_err();
-        assert!(err.is_not_installed(), "{err}");
+        assert!(err.is_not_implemented(), "{err}");
         assert!(driver.load_default_profiles().is_err());
 
         // ...and through the context, `start` fails with the same error rather
         // than leaving a half-started session.
         let mut ctx = HmContext::new(UnavailableDriver::new());
         let err = ctx.start().unwrap_err();
-        assert!(err.is_not_installed(), "{err}");
+        assert!(err.is_not_implemented(), "{err}");
         assert!(ctx.live_slots().is_empty());
+    }
+
+    /// The bug this file was carrying, stated as a test.
+    ///
+    /// `install_driver` and `load_default_profiles` used to call
+    /// `availability.require()?` and then return `NotInstalled` on the very
+    /// next line — so a machine WITH HIDMaestro got the identical "not
+    /// installed" error, and installing the driver was unobservable. Nothing
+    /// here may depend on the probe again: a probe-shaped answer to a
+    /// build-shaped question is the whole failure.
+    #[test]
+    fn refusal_never_depends_on_whether_hidmaestro_is_installed() {
+        let installed = probe().installed;
+        let mut driver = UnavailableDriver::new();
+        for err in [
+            driver.install_driver().unwrap_err(),
+            driver.load_default_profiles().unwrap_err(),
+        ] {
+            assert!(
+                err.is_not_implemented(),
+                "probe said installed={installed}; refusal must not blame the install: {err}"
+            );
+            assert!(!err.is_not_installed(), "{err}");
+            let msg = err.to_string();
+            assert!(msg.contains("on any machine, installed or not"), "{msg}");
+        }
+    }
+
+    /// The step that actually plugs a pad, checked on its own: it is what the
+    /// picker's promise cashes out to, and it never even reached `require()`.
+    #[test]
+    fn create_controller_refuses_as_unimplemented_not_as_uninstalled() {
+        let profile = crate::profile::expected_profile(ksx_core::Persona::DualSense)
+            .expect("dualsense has a profile — the persona is known, just not buildable");
+        let mut driver = UnavailableDriver::new();
+        let err = driver.create_controller(0, &profile).unwrap_err();
+        assert!(err.is_not_implemented(), "{err}");
+        assert!(!err.is_not_installed(), "{err}");
+        assert!(driver
+            .publish_pid_pool(0, &profile)
+            .unwrap_err()
+            .is_not_implemented());
     }
 }

@@ -36,32 +36,51 @@ pub fn summarize(report: &DriverReport) -> Vec<Advice> {
     out
 }
 
-/// HIDMaestro's absence is **Info, never Warning**.
+/// The personas ksx cannot build, and — separately — whether HIDMaestro is
+/// installed.
 ///
-/// A cabinet running Xbox 360 and PlayStation slots — every configuration ksx
-/// ships today — works perfectly with no HIDMaestro installed. Raising a
-/// warning for it would train users to ignore the warning column, and would
-/// nudge people into installing a second driver they do not need. It is
-/// reported so the three gated personas have an explanation, and for no other
-/// reason.
+/// **Two facts, deliberately not one.** The old version reported only the
+/// second and let it stand for the first: it said "HIDMaestro is not installed,
+/// so the dualsense/switchpro/xboxseries personas are unavailable", and it went
+/// completely silent once the driver appeared. Both halves were wrong. ksx has
+/// no code that can create a HIDMaestro pad on any machine, so the install was
+/// never the reason and its arrival never a fix — a user who followed that
+/// advice installed a second driver and got exactly nothing.
+///
+/// Everything here stays **Info, never Warning** (except a half-finished
+/// install, which is a real defect on the machine): a cabinet running Xbox 360
+/// and PlayStation slots — every configuration ksx ships today — is unaffected,
+/// and warning about it would train users to ignore the warning column.
 fn summarize_hidmaestro(report: &DriverReport, out: &mut Vec<Advice>) {
     let hm = &report.hidmaestro;
+    let gated = crate::report::HidMaestroReport::gated_personas();
+    if !gated.is_empty() {
+        out.push(Advice {
+            severity: Severity::Info,
+            code: "personas-not-implemented",
+            message: format!(
+                "The {} personas cannot be plugged by this build of ksx: it has no code \
+                 that creates a device over HIDMaestro's shared section, only the protocol \
+                 layers above it. Installing HIDMaestro does not enable them. Use \
+                 playstation (HID/DirectInput — ✕○△□ prompts, read by MAME/RetroArch/Steam \
+                 Input) or xbox360 instead.",
+                gated.join("/"),
+            ),
+        });
+    }
     if hm.installed {
         return;
     }
     if hm.service_key {
-        // A service key with no driver binary IS worth a warning: an install
-        // half-happened, and a plug will fail with a driver error rather than a
-        // clean "not installed".
+        // A half-install is a real defect on the machine and worth a warning on
+        // its own terms — even though no persona depends on fixing it today.
         out.push(Advice {
             severity: Severity::Warning,
             code: "hidmaestro-partial",
             message: format!(
                 "HIDMaestro's service key exists but its UMDF driver is missing \
-                 (checked {}): a broken or half-removed install. Reinstall or remove \
-                 it; the {} personas will not plug until then.",
+                 (checked {}): a broken or half-removed install. Reinstall or remove it.",
                 hm.looked_for.join(", "),
-                crate::report::HidMaestroReport::GATED_PERSONAS.join("/"),
             ),
         });
         return;
@@ -69,12 +88,9 @@ fn summarize_hidmaestro(report: &DriverReport, out: &mut Vec<Advice>) {
     out.push(Advice {
         severity: Severity::Info,
         code: "hidmaestro-missing",
-        message: format!(
-            "HIDMaestro is not installed, so the {} personas are unavailable. This \
-             costs nothing else: xbox360 and playstation slots run on ViGEmBus and \
-             are unaffected.",
-            crate::report::HidMaestroReport::GATED_PERSONAS.join("/"),
-        ),
+        message: "HIDMaestro is not installed. Nothing depends on it today — ksx cannot \
+                  drive it either way — and xbox360/playstation slots run on ViGEmBus."
+            .into(),
     });
 }
 
@@ -544,13 +560,56 @@ mod tests {
             hidmaestro: crate::report::HidMaestroReport::absent(vec!["<probe>".into()]),
         };
         let advice = summarize(&r);
-        // Sorted most-severe-first, so the Info-level HIDMaestro note lands
-        // last — behind anything that is actually broken.
+        // Sorted most-severe-first, so the two Info-level notes land last —
+        // behind anything that is actually broken.
         assert_eq!(
             codes(&advice),
-            vec!["interception-missing", "hidmaestro-missing"]
+            vec![
+                "interception-missing",
+                "personas-not-implemented",
+                "hidmaestro-missing"
+            ]
         );
         assert_eq!(advice[0].severity, Severity::Warning);
+    }
+
+    /// The advice that used to be a wrong-turn sign.
+    ///
+    /// "HIDMaestro is not installed, so those personas are unavailable" reads
+    /// as an instruction, and following it costs a driver install and buys
+    /// nothing. The two facts are now separate, and the one that gates the
+    /// personas must not mention the install as its cause — nor go quiet when
+    /// the driver turns up.
+    #[test]
+    fn installing_hidmaestro_does_not_change_which_personas_are_offered() {
+        let mut absent = cabinet_report();
+        absent.hidmaestro = crate::report::HidMaestroReport::absent(vec!["<probe>".into()]);
+        let mut present = absent.clone();
+        present.hidmaestro.installed = true;
+        present.hidmaestro.service_key = true;
+
+        for (label, report) in [("absent", &absent), ("installed", &present)] {
+            let advice = summarize(report);
+            let gate = advice
+                .iter()
+                .find(|a| a.code == "personas-not-implemented")
+                .unwrap_or_else(|| {
+                    panic!("{label}: the gate note must survive: {:?}", codes(&advice))
+                });
+            for persona in crate::report::HidMaestroReport::gated_personas() {
+                assert!(gate.message.contains(persona), "{label}: {}", gate.message);
+            }
+            assert!(
+                gate.message
+                    .contains("Installing HIDMaestro does not enable them"),
+                "{label}: {}",
+                gate.message
+            );
+            assert_eq!(gate.severity, Severity::Info, "{label}");
+        }
+        // ...and the install note itself only appears when it is true.
+        assert!(codes(&summarize(&absent)).contains(&"hidmaestro-missing"));
+        assert!(!codes(&summarize(&present)).contains(&"hidmaestro-missing"));
     }
 
     #[test]

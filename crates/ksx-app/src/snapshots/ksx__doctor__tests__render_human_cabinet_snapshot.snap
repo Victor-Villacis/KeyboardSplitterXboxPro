@@ -23,8 +23,10 @@ Interception (keyboard/mouse class filters — M3 capture backend)
   [OK]   C:\Windows\System32\drivers\test.sys — 1.21.442.0
   [WARN] signature valid via timestamp — Francisco Lopes da Silva; signing cert expired 2012-10-21T15:38:52Z
 
-HIDMaestro (M8 backend — DualSense / Switch Pro / Xbox Series personas)
-  [INFO] not installed — dualsense/switchpro/xboxseries personas unavailable (xbox360/playstation are unaffected: they use ViGEmBus)
+HIDMaestro (M8 backend — not implemented in this build; see below)
+  [INFO] dualsense/switchpro/xboxseries cannot be plugged by this build of ksx — no HIDMaestro transport is implemented, so installing the driver does not enable them
+  [INFO]   use persona 'playstation' or 'xbox360' instead
+  [INFO] not installed (nothing depends on it today)
   [INFO]   looked for HKLM\SYSTEM\CurrentControlSet\Services\HIDMaestro
   [INFO]   looked for C:\Windows\System32\drivers\UMDF\HIDMaestro.dll
 
@@ -36,4 +38,5 @@ Code integrity (2026 cross-signed-trust removal)
 Advice
   [WARN] interception-borrowed-time: Interception is on borrowed time: its driver is cross-signed with a certificate that expired 2012-10-21, and the 'Microsoft Windows Cross Certificates for Code Integrity Exceptions Audit Policy' CI policy ({784C4414-79F4-4C32-A6A5-F0FB42A51D0D}, id 10.29611.0.0) is active on this machine in Audit mode. When Windows flips it to enforcement the driver is blocked from loading. Do NOT take Windows feature updates on the cabinet; the M6 WinUSB backend removes this dependency.
   [INFO] scpvbus-present: Legacy ScpVBus (1.21.442.0) is still installed. Harmless alongside ViGEmBus (the legacy KeyboardSplitter keeps working); uninstall only after full migration to ksx.
-  [INFO] hidmaestro-missing: HIDMaestro is not installed, so the dualsense/switchpro/xboxseries personas are unavailable. This costs nothing else: xbox360 and playstation slots run on ViGEmBus and are unaffected.
+  [INFO] personas-not-implemented: The dualsense/switchpro/xboxseries personas cannot be plugged by this build of ksx: it has no code that creates a device over HIDMaestro's shared section, only the protocol layers above it. Installing HIDMaestro does not enable them. Use playstation (HID/DirectInput — ✕○△□ prompts, read by MAME/RetroArch/Steam Input) or xbox360 instead.
+  [INFO] hidmaestro-missing: HIDMaestro is not installed. Nothing depends on it today — ksx cannot drive it either way — and xbox360/playstation slots run on ViGEmBus.
