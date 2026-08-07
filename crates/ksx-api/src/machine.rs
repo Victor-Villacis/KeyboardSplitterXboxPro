@@ -177,6 +177,39 @@ pub struct UsbRow {
     pub selected: bool,
     /// Selected AND rebound — `ksx run` will capture it.
     pub ready: bool,
+    /// The board's name, when ksx recognises the VID/PID
+    /// (`ksx_core::vendors`). `None` is the normal answer and not a failure —
+    /// most devices are not in the table, and [`Self::description`] carries
+    /// what the device says about itself.
+    ///
+    /// Display only, always: `docs/DEVICE-IDENTITY.md` §6 is explicit that no
+    /// capture, claim or refusal path may branch on a vendor id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    /// The physical board this interface belongs to.
+    ///
+    /// One I-PAC exposes three interfaces (`MI_00`/`01`/`02`); they are one
+    /// device to a human and three devnodes to Windows. Grouping by this is
+    /// what lets a picker say "I-PAC 4X — 3 interfaces, keyboard on MI_00"
+    /// instead of listing three cryptic paths and asking the user to guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<String>,
+    /// Does this interface declare the HID **boot keyboard** protocol?
+    ///
+    /// The difference between "ksx could claim this" and "this is a keyboard",
+    /// and a picker needs both. `state == "claimable"` is deliberately
+    /// generous — it means "it is HID", because a rebound interface stops
+    /// describing itself as a keyboard and plenty of NKRO firmware reports
+    /// protocol 0, so guessing harder there would produce confident wrong
+    /// answers. The real proof is the report descriptor at claim time.
+    ///
+    /// The cost of that generosity shows up the moment you render a MENU: on
+    /// the reference cabinet a mouse, an LED controller, a fan controller and
+    /// a USB audio device all have HID interfaces and all read as claimable.
+    /// This flag is the honest positive signal — set, it is very probably a
+    /// keyboard; unset, it might still be one, and only claiming proves it.
+    #[serde(default)]
+    pub boot_keyboard: bool,
 }
 
 /// `ksx winusb status`, presentation-shaped.
