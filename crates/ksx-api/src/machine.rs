@@ -1044,7 +1044,15 @@ pub mod setup_states {
 
 /// The first run, as a surface reads it: what is already configured, and what
 /// the next step is.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The `now` step is the backend's decision and every implementation owes the
+/// same invariant — exactly one step is next, always. It is held where a real
+/// implementation can be driven against it: `ksx-app`'s
+/// `onboard::exactly_one_step_is_next_for_every_state_of_the_machine`, which
+/// runs `plan_steps` over every combination of the three counts. A hand-built
+/// `SetupView` asserted against here would only test the `vec!` literal beside
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetupView {
     pub generated_at: String,
     /// **Support detail, never an interface.** A person setting a cabinet up
@@ -1069,6 +1077,43 @@ pub struct SetupView {
     /// Anything the read has to say out loud (a games.toml that would not
     /// parse) — rendered, never swallowed.
     pub notes: Vec<String>,
+    /// **The highest slot number this build accepts** — `ksx_core::MAX_SLOTS`,
+    /// carried so a surface can offer the slots the daemon would actually take.
+    ///
+    /// Here rather than in the view code for the reason docs/SURFACES.md §1
+    /// gives: "which slots exist" is a decision about configuration, and a
+    /// surface that answers it from a constant of its own is a second copy of
+    /// the rule. Task #17 lifted this number from an arbitrary 8 and had to
+    /// chase three frozen `1..=8` literals to do it; a menu built from this
+    /// field cannot become the fourth.
+    #[serde(default = "default_max_slots")]
+    pub max_slots: u8,
+}
+
+/// The ceiling a document that predates the field gets — the real one, never
+/// zero. A missing field means "an older ksx wrote this", not "no slots".
+fn default_max_slots() -> u8 {
+    ksx_core::MAX_SLOTS
+}
+
+impl Default for SetupView {
+    /// Hand-written for one field: `max_slots` defaults to the ceiling this
+    /// build really has. A derived `Default` would hand every caller a zero,
+    /// and a zero renders as a slot menu with nothing in it.
+    fn default() -> Self {
+        Self {
+            generated_at: String::new(),
+            config_root: String::new(),
+            config_exists: false,
+            devices: Vec::new(),
+            slots: Vec::new(),
+            presets: Vec::new(),
+            profiles: Vec::new(),
+            steps: Vec::new(),
+            notes: Vec::new(),
+            max_slots: default_max_slots(),
+        }
+    }
 }
 
 /// One `[[device]]` entry, as the setup page shows it.
@@ -1526,36 +1571,39 @@ mod tests {
         );
     }
 
-    /// One step is the NEXT one. The rule lives with the type it describes, so
-    /// every implementation of [`MachineSource::setup_state`] is held to it.
+    /// The slot ceiling a surface renders is THIS build's, never zero and never
+    /// a number the view code picked.
+    ///
+    /// Two ways it can go wrong and both are covered: a derived `Default`
+    /// (`max_slots: 0`, a slot menu with nothing in it) and a plain
+    /// `#[serde(default)]` on the field, which turns a document written by an
+    /// older ksx into the same zero. Either regression fails here; both were
+    /// live in the version that hardcoded the menu at eight.
+    ///
+    /// (The old test in this slot built a `SetupView` with one `now` step and
+    /// then asserted it had one `now` step — it tested the `vec!` literal three
+    /// lines above it. The invariant it claimed to hold is really held in
+    /// ksx-app, against `plan_steps`; see [`SetupView`].)
     #[test]
-    fn a_setup_checklist_has_at_most_one_next_step() {
-        let view = SetupView {
-            steps: vec![
-                SetupStep {
-                    id: setup_steps::BOARD.to_owned(),
-                    state: setup_states::DONE.to_owned(),
-                    ..SetupStep::default()
-                },
-                SetupStep {
-                    id: setup_steps::SLOT.to_owned(),
-                    state: setup_states::NOW.to_owned(),
-                    ..SetupStep::default()
-                },
-                SetupStep {
-                    id: setup_steps::PROVE.to_owned(),
-                    state: setup_states::LATER.to_owned(),
-                    ..SetupStep::default()
-                },
-            ],
-            ..SetupView::default()
-        };
+    fn the_slot_ceiling_a_surface_renders_is_this_builds_max_slots() {
+        assert_eq!(SetupView::default().max_slots, ksx_core::MAX_SLOTS);
+        assert!(ksx_core::MAX_SLOTS > 0);
+
+        // A document from a ksx that predates the field.
+        let older: SetupView = serde_json::from_str(
+            r#"{"generated_at":"","config_root":"","config_exists":false,
+                 "devices":[],"slots":[],"presets":[],"profiles":[],"steps":[],"notes":[]}"#,
+        )
+        .expect("an older document must still deserialize");
         assert_eq!(
-            view.steps
-                .iter()
-                .filter(|s| s.state == setup_states::NOW)
-                .count(),
-            1
+            older.max_slots,
+            ksx_core::MAX_SLOTS,
+            "a missing ceiling means 'an older ksx wrote this', not 'no slots'"
         );
+
+        // …and it survives the round trip a surface actually makes.
+        let wire = serde_json::to_string(&SetupView::default()).unwrap();
+        let back: SetupView = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.max_slots, ksx_core::MAX_SLOTS);
     }
 }

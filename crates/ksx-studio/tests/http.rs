@@ -176,17 +176,31 @@ impl ControlSource for ScriptedControl {
                 ..ksx_api::SlotOutcome::default()
             };
         }
+        // Faithful to `bounce_after_slot_write` (ksx-app/src/daemon/pipe.rs):
+        // the pads replug only when a session was RUNNING, and the daemon's own
+        // sentence says which of the two happened. A fake that reported
+        // `restarted` off the request rather than off the session is exactly
+        // what let "The pads replugged." ship as an unconditional suffix.
+        let running = self.running.load(Ordering::SeqCst);
+        let mut message = format!("slot {} now uses \"{}\"", request.slot, request.preset);
+        let (restarted, reloaded) = if !running {
+            message.push_str(" — nothing is running, so the next start reads it");
+            (false, true)
+        } else if request.reload {
+            message.push_str(" — the session restarted and the pads replugged");
+            (true, true)
+        } else {
+            message.push_str(" — a session is running on the old wiring; `reload` to restart it");
+            (false, false)
+        };
         ksx_api::SlotOutcome {
             ok: true,
-            message: Some(format!(
-                "slot {} now uses \"{}\".",
-                request.slot, request.preset
-            )),
+            message: Some(message),
             slot: Some(request.slot),
             preset: Some(request.preset.clone()),
             profile: request.profile.clone(),
-            restarted: request.reload,
-            reloaded: request.reload,
+            restarted,
+            reloaded,
             ..ksx_api::SlotOutcome::default()
         }
     }
@@ -763,6 +777,9 @@ impl ksx_api::MachineSource for ScriptedMachine {
                 },
             ],
             notes: Vec::new(),
+            // The ceiling comes from the BACKEND (`ksx_core::MAX_SLOTS`); the
+            // default carries it, which is the behaviour a real provider has.
+            ..ksx_api::SetupView::default()
         })
     }
 
@@ -782,15 +799,41 @@ impl ksx_api::MachineSource for ScriptedMachine {
     }
 
     /// The consent shape, faithfully: no `apply`, no write.
+    ///
+    /// The summaries mirror `ksx-app::onboard`'s after the review: the backend
+    /// states the FACT and names no control, because the same sentence is read
+    /// by the cabinet egui, which has no checkbox called "write it". Naming
+    /// this page's box is `server.rs::import_flash`'s job and is asserted as
+    /// such below.
     fn config_import(
         &self,
         request: &ksx_api::ImportRequest,
     ) -> Result<ksx_api::ImportReport, Refusal> {
-        if !request.document.contains("ksx_interop") {
+        // A bare document with `what` supplied is the assistant-written case
+        // the import card invites: the form's `what` select is how a person
+        // says what it is when the document does not say for itself.
+        if !request.document.contains("ksx_interop") && request.what.is_empty() {
             return Err(Refusal::new(
                 ksx_api::codes::BAD_REQUEST,
                 "the pasted document does not say what it is",
             ));
+        }
+        // A document that would not validate: the faults are STRUCTURED, and
+        // the page is holding them.
+        if request.document.contains("\"faulty\"") {
+            return Ok(ksx_api::ImportReport {
+                ok: false,
+                applied: false,
+                summary: "refused: importing this would leave 3 validation fault(s) in your \
+                          configuration — nothing was written."
+                    .to_owned(),
+                faults: vec![
+                    "slot 2 points at preset \"Nope\", which is not in this document".to_owned(),
+                    "device \"P2 board\" has no id".to_owned(),
+                    "game \"Steam\" names slot 9".to_owned(),
+                ],
+                ..ksx_api::ImportReport::default()
+            });
         }
         Ok(ksx_api::ImportReport {
             ok: true,
@@ -798,8 +841,7 @@ impl ksx_api::MachineSource for ScriptedMachine {
             summary: if request.apply {
                 "imported config, games — 2 file(s) written, 2 backed up first".to_owned()
             } else {
-                "nothing written yet — this would replace your settings. Tick \"write it\" \
-                 and import again to apply."
+                "nothing written yet — this would replace your settings. Nothing was written."
                     .to_owned()
             },
             ..ksx_api::ImportReport::default()
@@ -813,9 +855,12 @@ fn start_server(control: Arc<ScriptedControl>) -> SocketAddr {
     start_server_with_machine(control, Arc::new(ScriptedMachine::default()))
 }
 
+/// …with a MACHINE provider of the caller's choosing — the seam a refused
+/// read (a device scan, a profiles read, or the first-run state) arrives
+/// through.
 fn start_server_with_machine(
     control: Arc<ScriptedControl>,
-    machine: Arc<ScriptedMachine>,
+    machine: Arc<dyn ksx_api::MachineSource>,
 ) -> SocketAddr {
     let probe = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = probe.local_addr().unwrap();
@@ -859,7 +904,7 @@ fn start_server_with_machine(
             self.0.assign_slot(request)
         }
     }
-    struct SharedMachine(Arc<ScriptedMachine>);
+    struct SharedMachine(Arc<dyn ksx_api::MachineSource>);
     impl ksx_api::MachineSource for SharedMachine {
         fn device_scan(&self) -> Result<ksx_api::DeviceScanView, Refusal> {
             self.0.device_scan()
@@ -2760,6 +2805,17 @@ fn import_is_a_dry_run_until_the_box_is_ticked() {
     assert!(applied.starts_with("HTTP/1.1 303"), "{applied}");
     assert!(applied.contains("imported%20config"), "{applied}");
 
+    // The CONSENT CONTROL is named by this page, not by the backend: the
+    // report's own sentence says what would happen and that nothing was
+    // written, and the flash adds the label on the box that makes it write.
+    // (The backend used to bake `Tick "write it"` in, where the cabinet egui —
+    // which has no such box — reads the same string.)
+    assert!(dry.contains("Tick%20%22write%20it%22"), "{dry}");
+    assert!(
+        !applied.contains("Tick%20%22write%20it%22"),
+        "a write that happened must not ask for consent again: {applied}"
+    );
+
     // A document that does not say what it is comes back as an ERROR flash —
     // never silence, and never a claim that something was written.
     let junk = post_form(addr, "/setup/import", "document=%7B%7D");
@@ -2770,18 +2826,131 @@ fn import_is_a_dry_run_until_the_box_is_ticked() {
     assert!(empty.contains("paste%20a%20configuration"), "{empty}");
 }
 
-/// Step 2 is ONE backend verb — `ControlSource::assign_slot`, the same pipe
-/// verb `ksx slot assign` performs — and the flash says the pads replugged,
-/// because that is the surprising half of the outcome.
+/// The commonest way an import fails is a document that will not validate —
+/// and the page that OWNS config editing (docs/SURFACES.md §3) must be able to
+/// say what is wrong with it.
+///
+/// Fails against the version that shipped: it flashed `report.summary` alone
+/// and threw the populated `faults` list away, ending on "`ksx config import
+/// --dry-run` lists them" — a page handing the user to a shell to read a list
+/// it was already holding.
 #[test]
-fn wiring_a_slot_goes_through_assign_slot_and_names_the_pad_bounce() {
+fn a_refused_import_says_what_is_wrong_with_the_document() {
     let control = Arc::new(ScriptedControl::new(false));
     let addr = start_server(control);
 
-    let ok = post_form(addr, "/setup/slot", "slot=2&preset=IPAC+P1&profile=");
-    assert!(ok.starts_with("HTTP/1.1 303"), "{ok}");
-    assert!(ok.contains("slot%202%20now%20uses"), "{ok}");
-    assert!(ok.contains("pads%20replugged"), "{ok}");
+    let document = "%7B%22ksx_interop%22%3A1%2C%22faulty%22%3Atrue%7D";
+    let refused = post_form(addr, "/setup/import", &format!("document={document}"));
+    assert!(refused.contains("flash=error"), "{refused}");
+    // The count, from the backend…
+    assert!(refused.contains("3%20validation%20fault"), "{refused}");
+    // …and the first fault itself, plus how many more there are, from here.
+    assert!(refused.contains("First%3A"), "{refused}");
+    assert!(refused.contains("Nope"), "{refused}");
+    assert!(refused.contains("%2B2%20more"), "{refused}");
+    // Never the CLI dead end.
+    assert!(!refused.contains("dry-run%60%20lists"), "{refused}");
+}
+
+/// A bare document — the one "an assistant wrote you", which the import card
+/// invites — needs a way to say what it is, and the form has one.
+#[test]
+fn the_import_form_can_say_what_a_bare_document_is() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control);
+
+    // The invitation is on the page, and so is the control that makes it true.
+    let body = body_of(&get(addr, "/setup")).to_owned();
+    assert!(body.contains("an assistant that wrote you one"), "{body}");
+    assert!(body.contains(r#"name="what""#), "{body}");
+
+    // Bare + unsaid: refused, as it must be — importing the wrong file over
+    // the wrong file is what that refusal exists to prevent.
+    let unsaid = post_form(addr, "/setup/import", "document=%7B%22slots%22%3A%5B%5D%7D");
+    assert!(unsaid.contains("flash=error"), "{unsaid}");
+    assert!(
+        unsaid.contains("does%20not%20say%20what%20it%20is"),
+        "{unsaid}"
+    );
+
+    // Bare + said: the same document goes through.
+    let said = post_form(
+        addr,
+        "/setup/import",
+        "document=%7B%22slots%22%3A%5B%5D%7D&what=config",
+    );
+    assert!(said.starts_with("HTTP/1.1 303"), "{said}");
+    assert!(!said.contains("flash=error"), "{said}");
+}
+
+/// Every refusal on this route is a flashed sentence — including the ones axum
+/// would otherwise answer itself.
+///
+/// The page's whole feedback channel with scripting off is the flash (see
+/// `ImportForm`'s doc comment), so a body this route cannot read has to arrive
+/// as one too. It used to fall through to axum's bare 4xx with no way back.
+#[test]
+fn an_unreadable_import_body_is_a_flashed_sentence_not_a_bare_4xx() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control);
+
+    // Wrong content type: the same rejection arm an over-large paste takes.
+    let body = "{\"ksx_interop\":1}";
+    let response = http(
+        addr,
+        &format!(
+            "POST /setup/import HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+             Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 303"),
+        "a body this route cannot read must come back as a flash: {response}"
+    );
+    assert!(response.contains("flash=error"), "{response}");
+    assert!(response.contains("ksx%20config%20import"), "{response}");
+}
+
+/// Step 2 is ONE backend verb — `ControlSource::assign_slot`, the same pipe
+/// verb `ksx slot assign` performs — and the flash is
+/// `SlotOutcome::headline()`, the canonical renderer the cabinet and the daemon
+/// already print.
+///
+/// **The idle half is the regression test.** The version that shipped rebuilt
+/// the sentence from flags and appended " The pads replugged." whenever
+/// `restarted` was set — and this page offers the wire form whenever the daemon
+/// is REACHABLE, not running. So an idle cabinet was told its four controllers
+/// had just vanished and come back by a write that replugged nothing. The
+/// ledger test `control.rs::a_slot_outcome_prints_what_the_daemon_said_rather
+/// _than_re_deriving_it` forbids that re-derivation by name.
+#[test]
+fn wiring_a_slot_goes_through_assign_slot_and_prints_the_daemons_own_sentence() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control);
+
+    // Nothing running: the daemon says so, and the page does not invent a
+    // bounce on top of it.
+    let idle = post_form(addr, "/setup/slot", "slot=2&preset=IPAC+P1&profile=");
+    assert!(idle.starts_with("HTTP/1.1 303"), "{idle}");
+    assert!(idle.contains("slot%202%20now%20uses"), "{idle}");
+    assert!(idle.contains("nothing%20is%20running"), "{idle}");
+    assert!(
+        !idle.contains("replugged"),
+        "the flash claimed a pad bounce against an idle daemon: {idle}"
+    );
+
+    // A running session: the bounce is named once, by the daemon, and not
+    // again by this page.
+    let started = post_form(addr, "/session/start", "profile=");
+    assert!(started.starts_with("HTTP/1.1 303"), "{started}");
+    let running = post_form(addr, "/setup/slot", "slot=2&preset=IPAC+P1&profile=");
+    assert!(running.contains("pads%20replugged"), "{running}");
+    assert_eq!(
+        running.matches("replugged").count(),
+        1,
+        "the bounce was named twice — once by the daemon and once by the page: {running}"
+    );
 
     // A preset that is not there is a refusal, flashed as one.
     let bad = post_form(addr, "/setup/slot", "slot=2&preset=Nope");
@@ -2789,6 +2958,84 @@ fn wiring_a_slot_goes_through_assign_slot_and_names_the_pad_bounce() {
     // …and so is submitting the form with nothing chosen.
     let empty = post_form(addr, "/setup/slot", "slot=2&preset=");
     assert!(empty.contains("flash=error"), "{empty}");
+}
+
+/// The slot menu offers what the DAEMON accepts, over the wire.
+///
+/// `ksx-core` is a test-only dependency of this crate for exactly this kind of
+/// assertion (see Cargo.toml): the page knows no vocabulary at runtime, the
+/// test reads the one true constant. Fails against the shipped version, which
+/// held `SLOT_CHOICES = 8` in two languages while `MAX_SLOTS` was 16.
+#[test]
+fn the_setup_slot_menu_offers_every_slot_the_daemon_accepts() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control);
+    let body = body_of(&get(addr, "/setup")).to_owned();
+    for n in 1..=ksx_core::MAX_SLOTS {
+        assert!(
+            body.contains(&format!(">Slot {n}<")),
+            "the menu skips slot {n}, which `slot assign` takes: {body}"
+        );
+    }
+    let past = u16::from(ksx_core::MAX_SLOTS) + 1;
+    assert!(!body.contains(&format!(">Slot {past}<")), "{body}");
+}
+
+/// A machine provider that REFUSED produces a page that says so — and says
+/// nothing else about the machine.
+///
+/// The signature bug of this project is a surface reporting success over a
+/// read that failed. Here it would be a first-run page telling a cabinet with a
+/// full configuration that it has no boards, no slots and no presets, because
+/// the provider that could not answer was rendered as an empty one. Fails
+/// against the shipped version six sentences over.
+#[test]
+fn a_refused_machine_provider_never_claims_the_machine_is_empty() {
+    struct NoMachine;
+    // Every method defaulted: `setup_state` refuses with the CONTROL-SURFACE
+    // sentence, which is exactly the state this test is about.
+    impl ksx_api::MachineSource for NoMachine {}
+
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server_with_machine(control, Arc::new(NoMachine));
+    let body = body_of(&get(addr, "/setup")).to_owned();
+
+    assert!(
+        body.contains("The configuration could not be read"),
+        "{body}"
+    );
+    assert!(body.contains("cannot say which step is next"), "{body}");
+    for claim in [
+        "There is no configuration on this machine yet.",
+        "no boards named yet",
+        "No board has a name yet",
+        "no slots wired yet",
+        "No slot is wired yet",
+        "0 preset(s) and 0 game profile(s) on disk.",
+        "Three steps, in order.",
+    ] {
+        assert!(
+            !body.contains(claim),
+            "a refused read claimed {claim:?} over the wire: {body}"
+        );
+    }
+    // …and no live control that would write against a config nobody read.
+    assert!(!body.contains(r#"action="/setup/slot""#), "{body}");
+    assert!(
+        body.contains("could not be read, so ksx cannot offer"),
+        "{body}"
+    );
+
+    // The poller sees the same refusal, in the same words.
+    let payload: serde_json::Value =
+        serde_json::from_str(body_of(&get(addr, "/api/setup"))).expect("json");
+    assert_eq!(payload["setup"]["available"], serde_json::json!(false));
+    assert_eq!(
+        payload["lines"]["config"],
+        serde_json::json!("The configuration could not be read.")
+    );
+    assert_eq!(payload["flags"]["no_boards"], serde_json::json!(false));
+    assert_eq!(payload["flags"]["setup_known"], serde_json::json!(false));
 }
 
 /// Step 3 is the daemon's own learner, and it is operable with scripting off:

@@ -114,6 +114,6 @@ pub use error::StudioError;
 pub use server::serve;
 pub use snapshot::{
     DevicesPayload, MacroSnapshot, MacroStepView, MacroView, MapPayload, MapperSlot,
-    MapperSnapshot, PadRow, ProfileRow, ProfilesPayload, SetupPayload, SetupSnapshot,
-    StatusSnapshot, StatusSource,
+    MapperSnapshot, PadRow, ProfileRow, ProfilesPayload, SetupFlags, SetupLines, SetupPayload,
+    SetupSnapshot, StatusSnapshot, StatusSource,
 };

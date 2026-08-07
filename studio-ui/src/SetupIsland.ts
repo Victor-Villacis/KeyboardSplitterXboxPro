@@ -71,6 +71,52 @@ export interface SetupView {
   profiles: string[];
   steps: SetupStep[];
   notes: string[];
+  /** The highest slot number this build accepts (`ksx_core::MAX_SLOTS`). The
+   *  slot menu is built from it — this page does not get to pick a ceiling. */
+  max_slots: number;
+}
+
+/** Every sentence the page states, composed in `crates/ksx-studio/src/
+ *  snapshot.rs`. Rendered here, never derived here: two implementations of one
+ *  sentence in two languages drift silently, and a test in one of them cannot
+ *  see the other. */
+export interface SetupLines {
+  config: string;
+  boards: string;
+  slots: string;
+  library: string;
+  export: string;
+  prove: string;
+  /** Why the wire control is disabled — empty when it is not. */
+  wire_blocked: string;
+  /** Why the learner control is disabled — empty when it is not. */
+  prove_blocked: string;
+  /** What wiring a slot does to the pads of the session there actually is. */
+  wire_warning: string;
+}
+
+/** Every `createShow` boolean on the page, decided in the same place and for
+ *  the same reason. Assigned straight into the signals below. */
+export interface SetupFlags {
+  pill_running: boolean;
+  pill_idle: boolean;
+  pill_down: boolean;
+  no_daemon: boolean;
+  setup_down: boolean;
+  setup_known: boolean;
+  first_run: boolean;
+  configured: boolean;
+  can_wire: boolean;
+  cannot_wire: boolean;
+  prove_down: boolean;
+  prove_listening: boolean;
+  prove_hit: boolean;
+  prove_idle: boolean;
+  has_boards: boolean;
+  no_boards: boolean;
+  has_slots: boolean;
+  no_slots: boolean;
+  has_notes: boolean;
 }
 
 export interface SetupSnapshot {
@@ -103,6 +149,10 @@ export interface SetupPayload {
   session: SessionView;
   learn: LearnView;
   flash: string | null;
+  /** Derived, server-side. See [[SetupLines]]. */
+  lines: SetupLines;
+  /** Derived, server-side. See [[SetupFlags]]. */
+  flags: SetupFlags;
 }
 
 interface StepRow {
@@ -142,6 +192,9 @@ const [exportLine, setExportLine] = createSignal("not collected");
 const [proveLine, setProveLine] = createSignal("not collected");
 const [proveKey, setProveKey] = createSignal("");
 const [setupSource, setSetupSource] = createSignal("not collected");
+const [wireBlocked, setWireBlocked] = createSignal("not collected");
+const [proveBlocked, setProveBlocked] = createSignal("not collected");
+const [wireWarning, setWireWarning] = createSignal("not collected");
 
 const [pillRunning, setPillRunning] = createSignal(false);
 const [pillIdle, setPillIdle] = createSignal(false);
@@ -150,6 +203,12 @@ const [noDaemon, setNoDaemon] = createSignal(false);
 const [flashOk, setFlashOk] = createSignal(false);
 const [flashError, setFlashError] = createSignal(false);
 const [setupDown, setSetupDown] = createSignal(false);
+// The checklist's own gate. Two names for one fact, because a signal used in
+// two places on a page compiles to two slots with one name and the seam can
+// only fill the first — the second would render its compile-time default for
+// ever. One `createShow`, one signal, always.
+const [stepsKnown, setStepsKnown] = createSignal(false);
+const [stepsUnknown, setStepsUnknown] = createSignal(false);
 const [firstRun, setFirstRun] = createSignal(false);
 const [configured, setConfigured] = createSignal(false);
 const [canWire, setCanWire] = createSignal(false);
@@ -172,112 +231,60 @@ const [presetOptions, setPresetOptions] = createSignal<TextRow[]>([]);
 const [profileOptions, setProfileOptions] = createSignal<TextRow[]>([]);
 const [noteRows, setNoteRows] = createSignal<TextRow[]>([]);
 
-// ── Derivations (mirror render_setup.rs; pinned there by unit tests) ───────
-
-/** How many slot numbers the wire form offers. Mirrors render_setup.rs
- *  `SLOT_CHOICES`: enough for the eight-player cabinet ksx already drives,
- *  and not `MAX_SLOTS` — a dropdown of sixteen is a worse answer than a
- *  config file for the cabinet that needs sixteen. */
-const SLOT_CHOICES = 8;
-
-export function configSummary(snap: SetupSnapshot): string {
-  // A provider that refused knows nothing about this machine, so it must not
-  // claim there is no configuration — that sentence is advice, and it would be
-  // the wrong advice. Mirrors render_setup.rs `config_summary`.
-  if (!snap.available) return "The configuration could not be read.";
-  const view = snap.view;
-  if (!view.config_exists) {
-    return "There is no configuration on this machine yet.";
-  }
-  return `Configured — ${view.devices.length} board(s), ${view.slots.length} slot(s), ${view.presets.length} preset(s).`;
-}
-
-export function boardsLine(count: number): string {
-  if (count === 0) return "no boards named yet";
-  if (count === 1) return "1 board named:";
-  return `${count} boards named:`;
-}
-
-export function slotsLine(count: number): string {
-  if (count === 0) return "no slots wired yet";
-  if (count === 1) return "1 slot wired:";
-  return `${count} slots wired:`;
-}
-
-export function libraryLineOf(view: SetupView): string {
-  return `${view.presets.length} preset(s) and ${view.profiles.length} game profile(s) on disk.`;
-}
-
-export function exportLineOf(view: SetupView): string {
-  return `One JSON file: settings, boards, slots, ${view.profiles.length} game profile(s) and ${view.presets.length} preset(s).`;
-}
-
-export function learnLine(learn: LearnView): string {
-  if (learn.state === "listening") {
-    return "Listening — press any button on the panel now.";
-  }
-  if (learn.state === "hit") {
-    return learn.device
-      ? `Seen, on ${learn.device}.`
-      : "Seen.";
-  }
-  if (learn.state === "unavailable" || !learn.ok) {
-    return learn.error ?? "the daemon's listener is not available";
-  }
-  return "Nothing is listening. Start the listener, then press a button on the panel.";
-}
+// ── Applying the payload. THERE ARE NO DERIVATIONS HERE ────────────────────
+//
+// Six display strings and the whole show-flag algebra used to be written twice
+// — once in render_setup.rs for the SSR paint and again here for the poll —
+// and the test that claimed to pin the two sides together only ever read the
+// Rust one. So every sentence and every boolean below arrives on the payload,
+// composed by `crates/ksx-studio/src/snapshot.rs`, and this function assigns
+// them. docs/SURFACES.md §1: the decision lives in the backend; the view
+// renders it.
 
 /** Write one /api/setup payload into every signal (flash excluded — flash is
  *  one-shot action feedback, owned by `applyFlash`). */
 export function applySetup(p: SetupPayload): void {
-  const snap = p.setup;
-  const view = snap.view;
-  const session = p.session;
-  const learn = p.learn;
+  const view = p.setup.view;
+  const lines = p.lines;
+  const f = p.flags;
 
   setGeneratedAt(view.generated_at === "" ? "(no snapshot)" : view.generated_at);
-  setSessionLine(session.line);
-  setDaemonCmd(session.profile ? `ksx daemon --game "${session.profile}"` : "ksx daemon");
-  setConfigLine(configSummary(snap));
+  setSessionLine(p.session.line);
+  setDaemonCmd(p.session.profile ? `ksx daemon --game "${p.session.profile}"` : "ksx daemon");
   setConfigRoot(view.config_root === "" ? "(unknown)" : view.config_root);
-  setBoardsSummary(boardsLine(view.devices.length));
-  setSlotsSummary(slotsLine(view.slots.length));
-  setLibraryLine(libraryLineOf(view));
-  setExportLine(exportLineOf(view));
-  setSetupSource(snap.source);
+  setSetupSource(p.setup.source);
+  setProveKey(p.learn.key ?? "");
 
-  setProveLine(learnLine(learn));
-  setProveKey(learn.key ?? "");
+  setConfigLine(lines.config);
+  setBoardsSummary(lines.boards);
+  setSlotsSummary(lines.slots);
+  setLibraryLine(lines.library);
+  setExportLine(lines.export);
+  setProveLine(lines.prove);
+  setWireBlocked(lines.wire_blocked);
+  setProveBlocked(lines.prove_blocked);
+  setWireWarning(lines.wire_warning);
 
-  const startable = session.reachable && !session.running;
-  setPillRunning(session.reachable && session.running);
-  setPillIdle(startable);
-  setPillDown(!session.reachable);
-  setNoDaemon(!session.reachable);
-
-  setSetupDown(!snap.available);
-  setFirstRun(snap.available && !view.config_exists);
-  setConfigured(snap.available && view.config_exists);
-
-  const wireable = session.reachable && view.presets.length > 0;
-  setCanWire(wireable);
-  setCannotWire(!wireable);
-
-  setProveDown(!session.reachable || learn.state === "unavailable");
-  setProveListening(session.reachable && learn.state === "listening");
-  setProveHit(session.reachable && learn.state === "hit");
-  setProveIdle(
-    session.reachable &&
-      learn.state !== "unavailable" &&
-      learn.state !== "listening" &&
-      learn.state !== "hit",
-  );
-
-  setHasBoards(view.devices.length > 0);
-  setNoBoards(view.devices.length === 0);
-  setHasSlots(view.slots.length > 0);
-  setNoSlots(view.slots.length === 0);
-  setHasNotes(view.notes.length > 0);
+  setPillRunning(f.pill_running);
+  setPillIdle(f.pill_idle);
+  setPillDown(f.pill_down);
+  setNoDaemon(f.no_daemon);
+  setSetupDown(f.setup_down);
+  setStepsKnown(f.setup_known);
+  setStepsUnknown(f.setup_down);
+  setFirstRun(f.first_run);
+  setConfigured(f.configured);
+  setCanWire(f.can_wire);
+  setCannotWire(f.cannot_wire);
+  setProveDown(f.prove_down);
+  setProveListening(f.prove_listening);
+  setProveHit(f.prove_hit);
+  setProveIdle(f.prove_idle);
+  setHasBoards(f.has_boards);
+  setNoBoards(f.no_boards);
+  setHasSlots(f.has_slots);
+  setNoSlots(f.no_slots);
+  setHasNotes(f.has_notes);
 
   setStepRows(
     view.steps.map((step, i) => ({
@@ -299,8 +306,11 @@ export function applySetup(p: SetupPayload): void {
       detail: `${slot.device} · ${slot.persona} · ${slot.source}`,
     })),
   );
+  // 1..=the ceiling the BACKEND serves. This used to be a `SLOT_CHOICES = 8`
+  // const here and another one in render_setup.rs, which hid slots 9-16 that
+  // `ksx slot assign` accepts and that the inventory above would list.
   const choices: OptionRow[] = [];
-  for (let n = 1; n <= SLOT_CHOICES; n++) {
+  for (let n = 1; n <= view.max_slots; n++) {
     choices.push({ value: String(n), label: `Slot ${n}` });
   }
   setSlotOptions(choices);
@@ -309,7 +319,13 @@ export function applySetup(p: SetupPayload): void {
   setNoteRows(view.notes.map((text) => ({ text })));
 }
 
-/** The studio server itself stopped answering /api/setup. */
+/** The studio server itself stopped answering /api/setup.
+ *
+ *  The only state whose words are authored here rather than composed in Rust,
+ *  and necessarily so: the process that composes them is the one that stopped
+ *  answering. It takes the CONTROLS dead and says why; it deliberately leaves
+ *  the inventory and the checklist showing the last read, because those were
+ *  read successfully and a dropped poll is not evidence that they changed. */
 export function applyUnreachable(): void {
   setSessionLine("ksx-studio not responding — retrying every 2 s");
   setPillRunning(false);
@@ -318,10 +334,17 @@ export function applyUnreachable(): void {
   setNoDaemon(true);
   setCanWire(false);
   setCannotWire(true);
+  setWireBlocked(
+    "disabled — ksx Studio itself stopped answering, so nothing can be written from " +
+      "this page. It retries every 2 s.",
+  );
   setProveIdle(false);
   setProveListening(false);
   setProveHit(false);
   setProveDown(true);
+  setProveBlocked(
+    "disabled — ksx Studio itself stopped answering. It retries every 2 s.",
+  );
 }
 
 /** One-shot action feedback (POST outcome or the seed's ?flash= value). */
@@ -490,31 +513,55 @@ export function SetupIsland() {
         "section",
         { class: "card wide setupsteps" },
         h("h2", null, "Set this cabinet up"),
-        h(
-          "p",
-          { class: "cardline" },
-          "Three steps, in order. ksx works out which one is next by reading ",
-          "your configuration — there is nothing to tick off by hand.",
-        ),
-        h(
-          "ol",
-          { class: "steplist" },
-          createList(
-            () => stepRows(),
-            (s) => s.badge + "|" + s.cls + "|" + s.title,
-            (s) =>
+        // THE CHECKLIST IS A CLAIM ABOUT THIS MACHINE, so it is gated on the
+        // read having worked. A refused provider used to render this heading,
+        // the sentence below it and zero rows — which reads as "you have
+        // nothing set up" when the truth is "I could not look".
+        createShow(
+          () => stepsKnown(),
+          () =>
+            h(
+              "div",
+              { class: "stepchecklist" },
               h(
-                "li",
-                { class: s.cls },
-                h("span", { class: "stepbadge" }, s.badge),
-                h(
-                  "div",
-                  { class: "stepbody" },
-                  h("span", { class: "steptitle" }, s.title),
-                  h("span", { class: "stepdetail" }, s.detail),
+                "p",
+                { class: "cardline" },
+                "Three steps, in order. ksx works out which one is next by reading ",
+                "your configuration — there is nothing to tick off by hand.",
+              ),
+              h(
+                "ol",
+                { class: "steplist" },
+                createList(
+                  () => stepRows(),
+                  (s) => s.badge + "|" + s.cls + "|" + s.title,
+                  (s) =>
+                    h(
+                      "li",
+                      { class: s.cls },
+                      h("span", { class: "stepbadge" }, s.badge),
+                      h(
+                        "div",
+                        { class: "stepbody" },
+                        h("span", { class: "steptitle" }, s.title),
+                        h("span", { class: "stepdetail" }, s.detail),
+                      ),
+                    ),
                 ),
               ),
-          ),
+            ),
+        ),
+        createShow(
+          () => stepsUnknown(),
+          () =>
+            h(
+              "p",
+              { class: "warn" },
+              "ksx could not read this machine's configuration, so it cannot say ",
+              "which step is next. That is not the same as nothing being set up ",
+              "here — the card above says what could not be read. The three ",
+              "actions below still work on their own.",
+            ),
         ),
         // ── Step 1: the board. One place, and it is not this one. ───────
         h(
@@ -528,6 +575,17 @@ export function SetupIsland() {
             "the same thing everywhere ksx uses it.",
           ),
           h("a", { class: "btn", href: "/devices" }, "Go to Devices"),
+          // The devices screen is task #22 and ships in the same merge as this
+          // page (render_setup.rs "MERGE DEPENDENCY"). Naming the shell verb
+          // beside the link is the same shape step 3 uses for a missing
+          // listener: a step that cannot be taken here is never a dead end.
+          h(
+            "p",
+            { class: "smallprint" },
+            "No Devices screen in this build? ",
+            h("code", { class: "mono copyable" }, "ksx device pick"),
+            " does the same job in a shell.",
+          ),
         ),
         // ── Step 2: wire a slot. One backend verb: slot-assign. ─────────
         h(
@@ -587,22 +645,18 @@ export function SetupIsland() {
                 "div",
                 { class: "controls off" },
                 h("button", { class: "btn", disabled: "" }, "Wire it"),
-                h(
-                  "p",
-                  { class: "warn" },
-                  "disabled — wiring a slot is a daemon write, and it needs a ",
-                  "preset to point at. Start the daemon, and import or create a ",
-                  "preset first.",
-                ),
+                // ONE reason, and it is the one that fired. `can_wire` is
+                // three facts ANDed, and the single sentence that used to sit
+                // here covered all of them at once — so it told a user with a
+                // running daemon to start the daemon, and a user with presets
+                // on disk to go and make a preset.
+                h("p", { class: "warn" }, () => wireBlocked()),
               ),
           ),
-          h(
-            "p",
-            { class: "warn" },
-            "Wiring a slot REPLUGS the pads: every controller vanishes and comes ",
-            "back, and anything mid-game sees it. Bindings do not — those swap in ",
-            "place.",
-          ),
+          // What the write does to the session there IS. The unconditional
+          // "REPLUGS the pads" was false against an idle daemon, which this
+          // form is offered on.
+          h("p", { class: "warn" }, () => wireWarning()),
         ),
         // ── Step 3: prove it. learn-start / learn-poll, the daemon's own. ─
         h(
@@ -639,12 +693,9 @@ export function SetupIsland() {
                 "div",
                 { class: "controls off" },
                 h("button", { class: "btn", disabled: "" }, "Listen for a press"),
-                h(
-                  "p",
-                  { class: "warn" },
-                  "disabled — the listener lives in the daemon. Without one, ",
-                  "`ksx monitor` does the same job in a shell.",
-                ),
+                // Same rule: "no daemon" and "a daemon whose listener is not
+                // available" are different states, and the page knows which.
+                h("p", { class: "warn" }, () => proveBlocked()),
               ),
           ),
         ),
@@ -677,6 +728,24 @@ export function SetupIsland() {
             spellcheck: "false",
             placeholder: '{ "ksx_interop": 1, ... }',
           }),
+          // A document ksx exported says what it is (`"ksx_interop": 1`), and
+          // then this stays on "(the document says)". A BARE document — the
+          // one an assistant writes you, which this card invites — carries no
+          // envelope, and `read_bundle` refuses it in those words. This is how
+          // the page says it, instead of refusing an invitation it made.
+          h(
+            "label",
+            { class: "importlabel", for: "setup-what" },
+            "if it is not a ksx export, what is it?",
+          ),
+          h(
+            "select",
+            { id: "setup-what", name: "what" },
+            h("option", { value: "" }, "(the document says)"),
+            h("option", { value: "config" }, "settings, boards and slots"),
+            h("option", { value: "games" }, "game profiles"),
+            h("option", { value: "presets" }, "presets"),
+          ),
           h(
             "div",
             { class: "controls" },
@@ -701,6 +770,20 @@ export function SetupIsland() {
           "Every file it replaces is copied first, so there is always a way back. ",
           "Comments in a replaced file do not survive the rewrite — that is the ",
           "price of an atomic, validated write, and it is why the copy is taken.",
+        ),
+        // Said here rather than only in a source comment: with scripting off
+        // the form really posts and the page really reloads, so the box is
+        // empty again. Every other control on this page is fully operable
+        // without JavaScript; this one costs a second paste, and a person
+        // about to lose a long document should hear it before they do.
+        h(
+          "p",
+          { class: "smallprint" },
+          "With JavaScript switched off this form still works, but the page ",
+          "reloads to show the answer — so a dry run and then a write means ",
+          "pasting the document twice. ",
+          h("code", { class: "mono copyable" }, "ksx config import <file>"),
+          " does it in one step from a shell.",
         ),
       ),
       // ── WHAT IS CONFIGURED: the inventory, quiet, last ────────────────

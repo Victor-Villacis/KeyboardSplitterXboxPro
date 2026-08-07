@@ -28,6 +28,40 @@
 //! file does with the steps is pick a CSS class and a number, which is
 //! presentation and nothing else.
 //!
+//! # …and so is every sentence, and every show flag
+//!
+//! Same rule, applied to the rest of the page after a review found six display
+//! strings and the whole show-flag algebra hand-mirrored between this file and
+//! `SetupIsland.ts`. They are composed ONCE now, in `snapshot.rs`
+//! ([`crate::snapshot::SetupLines`] and [`crate::snapshot::SetupFlags`]),
+//! travel in the payload, and both the SSR paint and the client's two-second
+//! poll read the same fields. Two implementations of one sentence in two
+//! languages drift silently; there is now one.
+//!
+//! The slot MENU obeys the same rule and is the sharpest case:
+//! `SetupView::max_slots` carries `ksx_core::MAX_SLOTS`, so the form offers the
+//! slots the daemon accepts rather than a number this file picked.
+//!
+//! # A refused read is not an empty machine
+//!
+//! `SetupSnapshot::available` gates the entire inventory and the entire
+//! checklist, not just the headline. A provider that refused knows nothing
+//! about this machine: "I could not read this" and "there is nothing here" are
+//! different sentences, and the user acts on them differently — the second one
+//! is advice ("import a config", "go and name your board") and it would be the
+//! wrong advice. `show:stepsKnown` is the checklist's gate, every `has*`/`no*`
+//! inventory flag folds the same fact in, and `show:setupDown` /
+//! `show:stepsUnknown` render the refusal where the claims would have been.
+//!
+//! # MERGE DEPENDENCY: step 1 links to `/devices`, which this branch does not serve
+//!
+//! Stated here rather than left implicit. The board step is a link to the
+//! devices screen (task #22, `wt/ui-devices`) because a board is picked and
+//! named in ONE place; this branch adds no such route, so on its own the link
+//! is a 404. It must land in the same merge as the devices page. Until it does,
+//! the step-1 card names `ksx device pick` beside the button — the same shape
+//! step 3 uses for a missing listener — so the step is never a dead end.
+//!
 //! # Three steps, three backend verbs
 //!
 //! | step | verb | route |
@@ -61,7 +95,7 @@ const LIST_SLOT_NOTES: &str = "list:noteRows:array";
 
 /// How many `createShow` pairs this page has; pinned by the layout test
 /// alongside every name.
-const SETUP_SHOW_COUNT: usize = 20;
+const SETUP_SHOW_COUNT: usize = 22;
 
 #[cfg(test)]
 const ISLAND_COMPONENT: &str = "SetupIsland";
@@ -80,112 +114,35 @@ const SETUP_CLIENT_ONLY_SLOTS: [&str; 0] = [];
 #[cfg(test)]
 const SETUP_ANONYMOUS_SLOTS: [&str; 0] = [];
 
-/// How many slot numbers the "wire a slot" form offers.
-///
-/// Eight, not `ksx_core::MAX_SLOTS`: eight is the player count this project has
-/// actually driven (four XInput + four DS4), and a dropdown of sixteen is a
-/// worse answer than a config file for the cabinet that needs sixteen. A test
-/// below pins it at or below `MAX_SLOTS`, so the menu can never offer a slot
-/// the daemon would refuse.
-const SLOT_CHOICES: u8 = 8;
-
-/// The configuration in one line — the loudest thing on the page, and the
-/// first. Mirrored by `SetupIsland.ts` `configSummary`.
-fn config_summary(payload: &SetupPayload) -> String {
-    let view = &payload.setup.view;
-    // A provider that refused knows nothing about this machine, so it must not
-    // claim there is no configuration — that sentence is advice ("import one"),
-    // and it would be the wrong advice.
-    if !payload.setup.available {
-        return "The configuration could not be read.".to_owned();
-    }
-    if !view.config_exists {
-        return "There is no configuration on this machine yet.".to_owned();
-    }
-    format!(
-        "Configured — {} board(s), {} slot(s), {} preset(s).",
-        view.devices.len(),
-        view.slots.len(),
-        view.presets.len()
-    )
-}
-
-fn boards_line(count: usize) -> String {
-    match count {
-        0 => "no boards named yet".to_owned(),
-        1 => "1 board named:".to_owned(),
-        n => format!("{n} boards named:"),
-    }
-}
-
-fn slots_line(count: usize) -> String {
-    match count {
-        0 => "no slots wired yet".to_owned(),
-        1 => "1 slot wired:".to_owned(),
-        n => format!("{n} slots wired:"),
-    }
-}
-
-fn library_line(payload: &SetupPayload) -> String {
-    let view = &payload.setup.view;
-    format!(
-        "{} preset(s) and {} game profile(s) on disk.",
-        view.presets.len(),
-        view.profiles.len()
-    )
-}
-
-fn export_line(payload: &SetupPayload) -> String {
-    let view = &payload.setup.view;
-    format!(
-        "One JSON file: settings, boards, slots, {} game profile(s) and {} preset(s).",
-        view.profiles.len(),
-        view.presets.len()
-    )
-}
-
-/// The learner, as the sentence step 3 reads. Mirrored by `SetupIsland.ts`
-/// `learnLine`.
-fn learn_line(learn: &crate::control::LearnView) -> String {
-    match learn.state.as_str() {
-        "listening" => "Listening — press any button on the panel now.".to_owned(),
-        "hit" => match learn.device.as_deref() {
-            Some(device) => format!("Seen, on {device}."),
-            None => "Seen.".to_owned(),
-        },
-        "unavailable" => learn
-            .error
-            .clone()
-            .unwrap_or_else(|| "the daemon's listener is not available".to_owned()),
-        _ if !learn.ok => learn
-            .error
-            .clone()
-            .unwrap_or_else(|| "the daemon's listener is not available".to_owned()),
-        _ => {
-            "Nothing is listening. Start the listener, then press a button on the panel.".to_owned()
-        }
-    }
-}
-
 /// Scalar slot values, keyed by the signal names in `SetupIsland.ts`.
+///
+/// Every SENTENCE here comes off [`SetupPayload::lines`], which
+/// `snapshot.rs` composed — this seam picks a slot name and a CSS class and
+/// derives nothing. `SetupIsland.ts` reads the identical fields off the same
+/// payload, so the SSR paint and the two-second poll cannot disagree: there is
+/// one implementation of the wording, not two.
 fn scalar_slots(payload: &SetupPayload, flash: Option<&str>) -> serde_json::Value {
     let view = &payload.setup.view;
+    let lines = &payload.lines;
     serde_json::json!({
         "generatedAt": if view.generated_at.is_empty() { "(no snapshot)" } else { &view.generated_at },
         "sessionLine": payload.session.line,
         "flashLine": flash.unwrap_or(""),
         "daemonCmd": daemon_command(&payload.session),
-        "configLine": config_summary(payload),
+        "configLine": lines.config,
         // SUPPORT DETAIL, and the page renders it as such. It is here because a
         // bug report needs it, not because anyone is meant to go there.
         "configRoot": if view.config_root.is_empty() { "(unknown)" } else { &view.config_root },
-        "boardsSummary": boards_line(view.devices.len()),
-        "slotsSummary": slots_line(view.slots.len()),
-        "libraryLine": library_line(payload),
-        "exportLine": export_line(payload),
-        "proveLine": learn_line(&payload.learn),
+        "boardsSummary": lines.boards,
+        "slotsSummary": lines.slots,
+        "libraryLine": lines.library,
+        "exportLine": lines.export,
+        "proveLine": lines.prove,
         "proveKey": payload.learn.key.clone().unwrap_or_default(),
         "setupSource": payload.setup.source,
+        "wireBlocked": lines.wire_blocked,
+        "proveBlocked": lines.prove_blocked,
+        "wireWarning": lines.wire_warning,
     })
 }
 
@@ -213,8 +170,12 @@ fn list_values(payload: &SetupPayload) -> [(&'static str, SlotValue); 7] {
             .collect(),
     );
 
+    // 1..=the ceiling THE BACKEND serves (`ksx_core::MAX_SLOTS`, carried on
+    // `SetupView::max_slots`). This page used to hold its own `SLOT_CHOICES =
+    // 8` — in Rust and again in TypeScript — which silently hid slots 9-16
+    // that `ksx slot assign` accepts and that this page's own inventory lists.
     let slot_options = SlotValue::array(
-        (1..=SLOT_CHOICES)
+        (1..=view.max_slots)
             .map(|n| {
                 SlotValue::object(vec![
                     ("value".to_owned(), SlotValue::Text(n.to_string())),
@@ -294,52 +255,51 @@ fn list_values(payload: &SetupPayload) -> [(&'static str, SlotValue); 7] {
     ]
 }
 
-/// Every show slot on this page, BY NAME, with the boolean the server wants.
+/// Every show slot on this page, BY NAME, mapped to the boolean
+/// [`crate::snapshot::SetupFlags`] already decided.
 ///
-/// The learner's four states are a partition: exactly one of `proveDown`,
-/// `proveListening`, `proveHit`, `proveIdle` is true, so the panel always
-/// offers precisely one control and never a dead button as live.
+/// The mapping is the only thing here: slot name → field. Nothing on this line
+/// is a decision, which is the point — `SetupIsland.ts` assigns the SAME
+/// fields into its signals, so the learner partition and the "is this readable"
+/// gate cannot be true on one side of the seam and false on the other.
+///
+/// The two flash booleans are the exception and are computed here, because a
+/// flash is not a fact about the machine: it arrives on the query string, shows
+/// once, and the client clears it on a timer.
 fn show_values(
     payload: &SetupPayload,
     flash: Option<&str>,
 ) -> [(&'static str, bool); SETUP_SHOW_COUNT] {
-    let view = &payload.setup.view;
-    let session = &payload.session;
-    let learn = &payload.learn;
     let flash_err = flash.is_some_and(|f| f.starts_with("error"));
-    let available = payload.setup.available;
-
-    // "Can this page write a slot?" is two facts, and both have to be true: a
-    // daemon to take the write, and a preset for the slot to point AT. A menu
-    // with no options and a live button is the shape that makes a user think
-    // they did something.
-    let wireable = session.reachable && !view.presets.is_empty();
-
-    let listener_down = !session.reachable || learn.state == "unavailable";
-    let listening = !listener_down && learn.state == "listening";
-    let hit = !listener_down && learn.state == "hit";
+    let f = &payload.flags;
 
     [
-        ("show:pillRunning", session.reachable && session.running),
-        ("show:pillIdle", session.reachable && !session.running),
-        ("show:pillDown", !session.reachable),
-        ("show:noDaemon", !session.reachable),
+        ("show:pillRunning", f.pill_running),
+        ("show:pillIdle", f.pill_idle),
+        ("show:pillDown", f.pill_down),
+        ("show:noDaemon", f.no_daemon),
         ("show:flashOk", flash.is_some() && !flash_err),
         ("show:flashError", flash_err),
-        ("show:setupDown", !available),
-        ("show:firstRun", available && !view.config_exists),
-        ("show:configured", available && view.config_exists),
-        ("show:canWire", wireable),
-        ("show:cannotWire", !wireable),
-        ("show:proveDown", listener_down),
-        ("show:proveListening", listening),
-        ("show:proveHit", hit),
-        ("show:proveIdle", !listener_down && !listening && !hit),
-        ("show:hasBoards", !view.devices.is_empty()),
-        ("show:noBoards", view.devices.is_empty()),
-        ("show:hasSlots", !view.slots.is_empty()),
-        ("show:noSlots", view.slots.is_empty()),
-        ("show:hasNotes", !view.notes.is_empty()),
+        ("show:setupDown", f.setup_down),
+        // Two slot names, one fact. A signal used in two places on a page
+        // compiles to two slots with the SAME name, and this seam can only
+        // fill the first — so the checklist's gate gets its own signal in the
+        // island rather than reusing the card's.
+        ("show:stepsKnown", f.setup_known),
+        ("show:stepsUnknown", f.setup_down),
+        ("show:firstRun", f.first_run),
+        ("show:configured", f.configured),
+        ("show:canWire", f.can_wire),
+        ("show:cannotWire", f.cannot_wire),
+        ("show:proveDown", f.prove_down),
+        ("show:proveListening", f.prove_listening),
+        ("show:proveHit", f.prove_hit),
+        ("show:proveIdle", f.prove_idle),
+        ("show:hasBoards", f.has_boards),
+        ("show:noBoards", f.no_boards),
+        ("show:hasSlots", f.has_slots),
+        ("show:noSlots", f.no_slots),
+        ("show:hasNotes", f.has_notes),
     ]
 }
 
@@ -384,6 +344,11 @@ pub(crate) fn render_setup(
     payload: &SetupPayload,
     flash: Option<&str>,
 ) -> PageOutput {
+    // Re-derive the sentences and the show booleans from the facts in hand.
+    // Both halves are derived data (snapshot.rs), and doing it HERE is what
+    // makes it impossible to render a payload whose wording was composed
+    // against different facts — including one a test mutated field by field.
+    let payload = &payload.clone().composed();
     let slots = build_slots(&page.module, payload, flash);
     let prefix = body_prefix(payload, "/setup");
     with_icon_links(render_page(&PageConfig {
@@ -453,6 +418,7 @@ mod tests {
             profiles: vec!["Street Fighter".into()],
             steps: steps(),
             notes: Vec::new(),
+            ..SetupView::default()
         }
     }
 
@@ -476,13 +442,26 @@ mod tests {
         }
     }
 
+    /// A daemon with a session up — the state the pad-bounce warning is true
+    /// of.
+    fn running_session() -> SessionView {
+        SessionView {
+            reachable: true,
+            running: true,
+            line: "running — 4 pad(s)".into(),
+            profile: Some("Street Fighter".into()),
+        }
+    }
+
     fn configured() -> SetupPayload {
         SetupPayload {
             setup: SetupSnapshot::ready(configured_view()),
             session: idle_session(),
             learn: idle_learn(),
             flash: None,
+            ..SetupPayload::default()
         }
+        .composed()
     }
 
     fn fresh() -> SetupPayload {
@@ -502,7 +481,24 @@ mod tests {
             session: idle_session(),
             learn: idle_learn(),
             flash: None,
+            ..SetupPayload::default()
         }
+        .composed()
+    }
+
+    /// The state this whole page's honesty rule is about: the machine provider
+    /// REFUSED. Nothing was read, so nothing may be claimed.
+    fn refused() -> SetupPayload {
+        SetupPayload {
+            setup: SetupSnapshot::unavailable(
+                "reading the first-run state is not available on this surface",
+            ),
+            session: idle_session(),
+            learn: idle_learn(),
+            flash: None,
+            ..SetupPayload::default()
+        }
+        .composed()
     }
 
     #[test]
@@ -731,19 +727,25 @@ mod tests {
         );
     }
 
-    /// Wiring a slot is one backend verb and it BOUNCES the pads. The warning
-    /// is on the page before the click, not in the flash after it.
+    /// Wiring a slot is one backend verb, and against a RUNNING session it
+    /// bounces the pads. The warning is on the page before the click, not in
+    /// the flash after it — and it is about the session there actually is.
+    ///
+    /// The second half fails against the version that shipped: the warning was
+    /// unconditional markup, and the form is offered whenever the daemon is
+    /// REACHABLE (not running), so an idle cabinet was told its four
+    /// controllers were about to vanish by a write that replugs nothing.
     #[test]
     fn the_slot_form_warns_that_the_pads_replug_before_the_click() {
         let page = EmbeddedPage::load("/setup").unwrap();
-        let out = render_setup(&page, &configured(), None);
+        let mut running = configured();
+        running.session = running_session();
+        let out = render_setup(&page, &running, None);
         assert!(out.html.contains(r#"action="/setup/slot""#), "{}", out.html);
         assert!(out.html.contains("REPLUGS the pads"), "{}", out.html);
-        // The preset menu offers what is on disk, and the slot menu never
-        // offers a slot the daemon would refuse.
+        // The preset menu offers what is on disk.
         assert!(out.html.contains("IPAC P1"), "{}", out.html);
         assert!(out.html.contains("Slot 1"), "{}", out.html);
-        assert!(!out.html.contains("Slot 9"), "{}", out.html);
         // Where it lands is a choice, and config.toml is the default.
         assert!(
             out.html.contains("(this cabinet&#x27;s config)")
@@ -752,24 +754,130 @@ mod tests {
             out.html
         );
         assert!(out.html.contains("Street Fighter"), "{}", out.html);
+
+        // Reachable but idle: the form is still offered, and the sentence
+        // above it must not claim a bounce that will not happen.
+        let out = render_setup(&page, &configured(), None);
+        assert!(out.html.contains(r#"action="/setup/slot""#), "{}", out.html);
+        assert!(
+            !out.html.contains("REPLUGS the pads"),
+            "an idle daemon was warned its pads would replug: {}",
+            out.html
+        );
+        assert!(out.html.contains("Nothing is running"), "{}", out.html);
     }
 
-    /// No preset on disk means nothing to point a slot at: the control renders
-    /// disabled with the reason, never live with an empty menu.
+    /// The slot menu offers every slot the BACKEND accepts — the ceiling it
+    /// serves on `SetupView::max_slots`, which is `ksx_core::MAX_SLOTS`.
+    ///
+    /// This is the test that fails against the shipped version. That one held
+    /// `const SLOT_CHOICES: u8 = 8` here and again in `SetupIsland.ts`, and
+    /// guarded it with `assert!(SLOT_CHOICES <= MAX_SLOTS)` — an assertion that
+    /// can only ever catch an OVER-offer, so it stayed green forever while the
+    /// page hid slots 9-16 that `ksx slot assign` accepts and that this page's
+    /// own inventory would list.
+    ///
+    /// `ksx-core` is a dev-dependency here on purpose (see Cargo.toml): the
+    /// page knows no vocabulary at runtime, and the test reads the one true
+    /// constant.
     #[test]
-    fn a_machine_with_no_presets_cannot_wire_a_slot_and_says_why() {
+    fn the_slot_menu_offers_every_slot_the_backend_accepts() {
         let page = EmbeddedPage::load("/setup").unwrap();
+        let mut payload = configured();
+        payload.session = running_session();
+        let out = render_setup(&page, &payload, None);
+
+        for n in 1..=ksx_core::MAX_SLOTS {
+            assert!(
+                out.html.contains(&format!(">Slot {n}<")),
+                "the menu skips slot {n}, which the daemon accepts: {}",
+                out.html
+            );
+        }
+        // …and not one past it.
+        let past = u16::from(ksx_core::MAX_SLOTS) + 1;
+        assert!(
+            !out.html.contains(&format!(">Slot {past}<")),
+            "the menu offers slot {past}, which `slot-assign` refuses: {}",
+            out.html
+        );
+
+        // The number is the BACKEND's, not this file's: serve a smaller
+        // ceiling and the menu shrinks with it, with nothing recompiled.
+        payload.setup.view.max_slots = 3;
+        let out = render_setup(&page, &payload, None);
+        assert!(out.html.contains(">Slot 3<"), "{}", out.html);
+        assert!(
+            !out.html.contains(">Slot 4<"),
+            "the menu ignored the ceiling the backend served: {}",
+            out.html
+        );
+    }
+
+    /// A disabled control renders the reason that is TRUE — not a sentence
+    /// covering every reason it could have been.
+    ///
+    /// The version that shipped had one static paragraph ("wiring a slot is a
+    /// daemon write, and it needs a preset to point at. Start the daemon, and
+    /// import or create a preset first") for a condition that is two facts
+    /// ANDed. It fired for both single-cause states, so half the time it told
+    /// the user to fix something that was not broken. This test renders each
+    /// cause on its own and would fail against that version at the first
+    /// `assert_ne!` — the two sentences were identical.
+    #[test]
+    fn a_disabled_wire_control_names_the_cause_that_actually_fired() {
+        let page = EmbeddedPage::load("/setup").unwrap();
+
+        // Daemon UP, no preset on disk.
         let out = render_setup(&page, &fresh(), None);
+        assert!(
+            !out.html.contains(r#"action="/setup/slot""#),
+            "no live control with nothing to point it at: {}",
+            out.html
+        );
+        assert!(
+            out.html.contains("a slot points at a preset"),
+            "{}",
+            out.html
+        );
+        assert!(
+            !out.html.to_lowercase().contains("start the daemon"),
+            "told a user whose daemon is running to start it: {}",
+            out.html
+        );
+
+        // Daemon DOWN, presets on disk.
+        let mut dead = configured();
+        dead.session = SessionView::unreachable("no daemon control channel");
+        let out = render_setup(&page, &dead, None);
         assert!(
             !out.html.contains(r#"action="/setup/slot""#),
             "{}",
             out.html
         );
+        assert!(out.html.contains("no daemon is running"), "{}", out.html);
         assert!(
-            out.html.contains("it needs a preset to point at"),
-            "{}",
+            !out.html.contains("preset new"),
+            "told a user with \"IPAC P1\" on disk to go and create a preset: {}",
             out.html
         );
+
+        // The two are different sentences, which is the whole finding.
+        let a = disabled_reason(&render_setup(&page, &fresh(), None).html);
+        let b = disabled_reason(&render_setup(&page, &dead, None).html);
+        assert_ne!(a, b, "one sentence covered both causes");
+    }
+
+    /// The rendered text of the disabled-wire paragraph, for comparing two
+    /// renders. `class="controls off"` is the wrapper the island gives it.
+    fn disabled_reason(html: &str) -> String {
+        let at = html
+            .find(r#"class="controls off""#)
+            .expect("a disabled control renders its reason");
+        let tail = &html[at..];
+        let warn = tail.find(r#"class="warn""#).expect("the reason paragraph");
+        let rest = &tail[warn..];
+        rest[..rest.find("</p>").expect("closed paragraph")].to_owned()
     }
 
     /// Step 3 works with JavaScript off: the learner's state is SSR'd, so the
@@ -838,6 +946,7 @@ mod tests {
             let mut payload = configured();
             payload.learn.state = state.into();
             payload.session.reachable = reachable;
+            let payload = payload.composed();
             let shows = show_values(&payload, None);
             let live = shows
                 .iter()
@@ -855,21 +964,24 @@ mod tests {
         }
     }
 
-    /// A provider that refuses says so, in words, instead of rendering an empty
-    /// checklist that reads as "this machine has nothing configured" — the two
-    /// states want opposite advice.
+    /// **A refused read must not render as an assertion of absence.**
+    ///
+    /// The page a provider-refusal produces says it could not read this
+    /// machine, and says nothing else about it. Not "no boards named yet", not
+    /// "No slot is wired yet — step 2 above is how one gets wired", not "0
+    /// preset(s) and 0 game profile(s) on disk", and above all not a promise
+    /// about the contents of a download whose source it just failed to read.
+    ///
+    /// Every string below rendered on the version that shipped, where only the
+    /// headline carried the `available` guard — so this test fails against it
+    /// six times over. It also rendered the checklist card, heading and all,
+    /// with zero step rows.
     #[test]
     fn a_refused_machine_provider_is_rendered_as_a_refusal() {
         let page = EmbeddedPage::load("/setup").unwrap();
-        let payload = SetupPayload {
-            setup: SetupSnapshot::unavailable(
-                "reading the first-run state is not available on this surface",
-            ),
-            session: idle_session(),
-            learn: idle_learn(),
-            flash: None,
-        };
-        let out = render_setup(&page, &payload, None);
+        let out = render_setup(&page, &refused(), None);
+
+        // It SAYS so, and it says why.
         assert!(
             out.html.contains("The configuration could not be read"),
             "{}",
@@ -880,22 +992,71 @@ mod tests {
             "{}",
             out.html
         );
-        // Neither of the two config states may claim anything.
+
+        // …and it asserts nothing about a machine nothing was read from.
+        for claim in [
+            "There is no configuration on this machine yet.",
+            "no boards named yet",
+            "No board has a name yet",
+            "no slots wired yet",
+            "No slot is wired yet",
+            "0 preset(s) and 0 game profile(s) on disk.",
+            "One JSON file: settings, boards, slots, 0 game profile(s) and 0 preset(s).",
+            "Three steps, in order.",
+        ] {
+            assert!(
+                !out.html.contains(claim),
+                "a refused read still claimed {claim:?}: {}",
+                out.html
+            );
+        }
+
+        // The two states are visibly different pages, which is the point: an
+        // empty machine that WAS read says all of the above, loudly.
+        let empty_but_read = SetupPayload {
+            setup: SetupSnapshot::ready(SetupView::default()),
+            session: idle_session(),
+            learn: idle_learn(),
+            flash: None,
+            ..SetupPayload::default()
+        };
+        let read = render_setup(&page, &empty_but_read, None);
+        assert!(read.html.contains("no boards named yet"), "{}", read.html);
+        assert!(read.html.contains("No slot is wired yet"), "{}", read.html);
         assert!(
-            !out.html
-                .contains("There is no configuration on this machine yet."),
+            !read.html.contains("The configuration could not be read"),
+            "a successful read of an empty machine is not a failure: {}",
+            read.html
+        );
+
+        // And the checklist card is not rendered empty — the failure state has
+        // its own words where the steps would be.
+        assert!(
+            out.html.contains("cannot say which step is next"),
             "{}",
+            out.html
+        );
+        assert!(
+            !out.html.contains(r#"class="step now""#),
+            "a refused read rendered a checklist row: {}",
             out.html
         );
     }
 
     /// Every page links onward. The board step goes to `/devices` rather than
     /// duplicating it, and the nav reaches the other two screens.
+    ///
+    /// `/devices` is task #22 and is NOT served by this crate yet (see the
+    /// module's MERGE DEPENDENCY note), so the step also names the shell verb
+    /// that does the same job — the same shape step 3 uses for a missing
+    /// listener. Without it, the first thing a fresh cabinet clicks is a bare
+    /// 404 with no way back.
     #[test]
     fn the_page_links_onward_instead_of_duplicating() {
         let page = EmbeddedPage::load("/setup").unwrap();
         let out = render_setup(&page, &configured(), None);
         assert!(out.html.contains(r#"href="/devices""#), "{}", out.html);
+        assert!(out.html.contains("ksx device pick"), "{}", out.html);
         assert!(out.html.contains(r#"href="/""#), "{}", out.html);
         assert!(out.html.contains(r#"href="/map""#), "{}", out.html);
         assert!(
@@ -957,55 +1118,82 @@ mod tests {
         assert_icon_links_in_head("/setup", &out.html);
     }
 
+    /// `SetupPayload::default()` is the DEFAULTED payload, which is a refused
+    /// read (`available: false`) — so the page it renders is the refusal, not
+    /// an empty cabinet. That distinction is the finding this page exists
+    /// under; the default must not be the one payload that quietly breaks it.
     #[test]
     fn render_survives_an_empty_payload() {
         let page = EmbeddedPage::load("/setup").unwrap();
         let out = render_setup(&page, &SetupPayload::default(), None);
         assert!(out.html.contains("data-forma-ssr"), "{}", out.html);
-        assert!(out.html.contains("no boards named yet"), "{}", out.html);
-        assert!(out.html.contains("no slots wired yet"), "{}", out.html);
+        assert!(
+            out.html.contains("The configuration could not be read"),
+            "{}",
+            out.html
+        );
+        assert!(!out.html.contains("no boards named yet"), "{}", out.html);
+        assert!(!out.html.contains("no slots wired yet"), "{}", out.html);
     }
 
-    /// The slot menu can never offer a slot number the daemon would refuse.
+    /// **Every sentence on this page comes from the payload, so there is only
+    /// one implementation of it.**
     ///
-    /// `ksx-core` is a dev-dependency here on purpose (see Cargo.toml): the
-    /// page knows no vocabulary at runtime, and the test reads the one true
-    /// constant. A `const` block rather than a runtime assertion, so lowering
-    /// `MAX_SLOTS` fails the BUILD of this test rather than one run of it.
+    /// This replaces a test whose docstring claimed to pin the Rust and the
+    /// TypeScript together and whose body called six Rust functions — change
+    /// any string in `SetupIsland.ts` and the whole workspace stayed green
+    /// while the page flipped wording on the first two-second poll. There is
+    /// nothing to pin now: `snapshot.rs` composes the lines, this seam injects
+    /// them, and the island reads the SAME fields off the SAME payload.
+    ///
+    /// So what is checked here is the property that makes that true — the
+    /// rendered HTML contains the payload's own lines, verbatim. A seam that
+    /// went back to deriving one of them fails here.
     #[test]
-    fn the_slot_menu_never_exceeds_what_the_backend_accepts() {
-        const {
+    fn every_sentence_on_the_page_is_the_payload_s_own() {
+        let page = EmbeddedPage::load("/setup").unwrap();
+        let mut payload = configured();
+        payload.session = running_session();
+        let payload = payload.composed();
+        let out = render_setup(&page, &payload, None);
+
+        let lines = &payload.lines;
+        for (field, line) in [
+            ("config", &lines.config),
+            ("boards", &lines.boards),
+            ("slots", &lines.slots),
+            ("library", &lines.library),
+            ("export", &lines.export),
+            ("prove", &lines.prove),
+            ("wire_warning", &lines.wire_warning),
+        ] {
             assert!(
-                SLOT_CHOICES <= ksx_core::MAX_SLOTS,
-                "the wire-a-slot menu offers a slot number `slot-assign` refuses: \
-                 lower SLOT_CHOICES to at most ksx_core::MAX_SLOTS"
+                !line.is_empty(),
+                "{field} is empty for a configured machine"
+            );
+            assert!(
+                out.html.contains(escape_text(line).as_str()),
+                "the page did not render the payload's {field} line ({line:?}): {}",
+                out.html
             );
         }
+        // A wirable machine has no blocked reason to render, and says so by
+        // saying nothing.
+        assert_eq!(lines.wire_blocked, "");
+        assert_eq!(lines.prove_blocked, "");
+
+        // The payload the CLIENT reads carries them too — same struct, same
+        // serializer, so the poll cannot repaint different words.
+        let json = payload_json(&payload);
+        assert!(json.contains(r#""config":"#), "{json}");
+        assert!(out.html.contains(&json), "{}", out.html);
     }
 
-    /// The two summary lines the client re-derives per poll are the ones this
-    /// seam renders for the first paint. `SetupIsland.ts` mirrors these; the
-    /// wording is pinned here so a change on one side is a test failure rather
-    /// than a page that flickers between two sentences every two seconds.
-    #[test]
-    fn the_summary_lines_are_the_ones_the_client_mirrors() {
-        assert_eq!(boards_line(0), "no boards named yet");
-        assert_eq!(boards_line(1), "1 board named:");
-        assert_eq!(boards_line(3), "3 boards named:");
-        assert_eq!(slots_line(0), "no slots wired yet");
-        assert_eq!(slots_line(1), "1 slot wired:");
-        assert_eq!(slots_line(4), "4 slots wired:");
-        assert_eq!(
-            config_summary(&fresh()),
-            "There is no configuration on this machine yet."
-        );
-        assert_eq!(
-            config_summary(&configured()),
-            "Configured — 1 board(s), 1 slot(s), 2 preset(s)."
-        );
-        assert_eq!(
-            learn_line(&idle_learn()),
-            "Nothing is listening. Start the listener, then press a button on the panel."
-        );
+    /// HTML-escape the few characters forma's text nodes escape, so a rendered
+    /// sentence can be compared against its source.
+    fn escape_text(text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     }
 }

@@ -249,6 +249,9 @@ pub fn state() -> Result<SetupView, Refusal> {
         profiles: games.games.iter().map(|g| g.title.clone()).collect(),
         steps: plan_steps(progress),
         notes,
+        // The one place this number may live is `ksx_core` (task #17). A
+        // surface renders the menu; it does not get to decide how long it is.
+        max_slots: ksx_core::MAX_SLOTS,
     })
 }
 
@@ -338,11 +341,15 @@ pub fn import(request: &ImportRequest) -> Result<ImportReport, Refusal> {
     // statement about a decision rather than about how far it got.
     if !report.faults.is_empty() && !request.force {
         let faults = report.faults.len();
+        // The COUNT is the fact; the faults themselves ride in
+        // `report.faults`, which every surface already receives. This sentence
+        // used to end "`ksx config import --dry-run` lists them", which handed
+        // a web page's user to a shell to read a list the page was holding.
         return Ok(ImportReport {
             ok: false,
             summary: format!(
                 "refused: importing this would leave {faults} validation fault(s) in your \
-                 configuration — nothing was written. `ksx config import --dry-run` lists them."
+                 configuration — nothing was written."
             ),
             ..report
         });
@@ -421,6 +428,12 @@ pub fn import(request: &ImportRequest) -> Result<ImportReport, Refusal> {
 /// is the same fact in the vocabulary they are actually working in. The count
 /// of REPLACED files rides along, because "replace" is the word that needs a
 /// number beside it.
+///
+/// **And it names no control.** This sentence used to end `Tick "write it" and
+/// import again to apply.` — the label on ONE checkbox on ONE web page, baked
+/// into the shared backend every `MachineSource` consumer reads, cabinet egui
+/// included. The backend states the fact (`applied: false`, and a plan in
+/// `writes`); each surface names its own consent control on top of it.
 fn dry_run_summary(report: &ImportReport) -> String {
     let overwrites = report
         .writes
@@ -442,7 +455,7 @@ fn dry_run_summary(report: &ImportReport) -> String {
             report.advisories.len()
         ));
     }
-    line.push_str(". Tick \"write it\" and import again to apply.");
+    line.push_str(". Nothing was written.");
     line
 }
 
@@ -691,10 +704,16 @@ mod tests {
         assert!(summary.contains("replacing 2 file(s)"), "{summary}");
         assert!(summary.contains("copied first"), "{summary}");
         assert!(summary.contains("1 advisory note(s)"), "{summary}");
-        assert!(
-            summary.contains("Tick \"write it\""),
-            "the sentence must name the way to make it write: {summary}"
-        );
+        assert!(summary.contains("Nothing was written."), "{summary}");
+        // …and it names no CONTROL. A checkbox label ("write it") belongs to
+        // one web form; this sentence is read by the cabinet egui and by any
+        // other MachineSource consumer, none of which has that box.
+        for surface_only in ["Tick", "tick", "box", "checkbox", "click", "button"] {
+            assert!(
+                !summary.contains(surface_only),
+                "the shared backend named a surface's own control ({surface_only:?}): {summary}"
+            );
+        }
         assert!(
             summary.chars().count() <= 300,
             "{} chars, and the flash truncates at 300: {summary}",

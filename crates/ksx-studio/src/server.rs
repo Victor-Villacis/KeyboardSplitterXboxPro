@@ -200,7 +200,18 @@ pub fn serve(
             // DRY RUN unless the form's "write it" box is ticked
             // (`ksx_api::ImportRequest::apply`), which is the CLI's consent
             // shape and not a web-only ceremony.
-            .route("/setup/import", post(setup_form_import))
+            //
+            // The one route with its own body limit. axum's default is 2 MB,
+            // and a whole cabinet — config, every games.toml profile and every
+            // preset in one interop document — can exceed it; the cost of the
+            // default was a bare 413 with no way back to the page. 8 MB is
+            // roomy for a configuration and still a bound, and the handler
+            // turns the rejection into a flashed sentence either way.
+            .route(
+                "/setup/import",
+                post(setup_form_import)
+                    .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+            )
             // Step 2: one `ControlSource::assign_slot` — the same pipe verb
             // `ksx slot assign` performs. It BOUNCES the pads, which the page
             // says before the click, not after it.
@@ -1120,14 +1131,24 @@ async fn collect_setup(state: &Arc<AppState>) -> SetupPayload {
             // scripting off — the <noscript> refresh repaints the key.
             learn: setup_state.control.learn_poll(),
             flash: None,
+            ..SetupPayload::default()
         }
+        // The page's sentences and its show booleans, composed from the three
+        // reads above (snapshot.rs). Composed HERE means the poller's JSON and
+        // the server paint carry the identical words — the client derives
+        // none of them.
+        .composed()
     })
     .await
-    .unwrap_or_else(|_| SetupPayload {
-        setup: SetupSnapshot::unavailable("the setup collection panicked"),
-        session: SessionView::unreachable("the setup collection panicked"),
-        learn: crate::control::LearnView::unavailable("the setup collection panicked"),
-        flash: None,
+    .unwrap_or_else(|_| {
+        SetupPayload {
+            setup: SetupSnapshot::unavailable("the setup collection panicked"),
+            session: SessionView::unreachable("the setup collection panicked"),
+            learn: crate::control::LearnView::unavailable("the setup collection panicked"),
+            flash: None,
+            ..SetupPayload::default()
+        }
+        .composed()
     })
 }
 
@@ -1398,14 +1419,28 @@ struct ImportForm {
 
 /// POST /setup/import — one `MachineSource::config_import`.
 ///
-/// The report is structured; the flash is one line. That split is deliberate
-/// (`urlencode` caps at 300 characters): the verb composes ONE sentence that
-/// says what it did or would do, and the fault list stays in the CLI, which is
-/// where a fifty-line validation report belongs.
+/// The report is structured; the flash is one line (`urlencode` caps at 300
+/// characters). What the line carries is chosen rather than truncated: a
+/// refusal names the FIRST fault and how many more there are, because the
+/// commonest way an import fails is a document that will not validate, and
+/// telling the owner of this page to go and run a CLI to read a list the page
+/// is already holding is the dead end this screen exists to remove.
+///
+/// The extractor is a `Result` on purpose. Every refusal on this route is a
+/// flashed sentence — that is the whole feedback channel with scripting off —
+/// so an over-large paste or a wrong content type has to arrive as one too,
+/// rather than as axum's bare 413/415 with no way back to the page.
 async fn setup_form_import(
     State(state): State<Arc<AppState>>,
-    Form(form): Form<ImportForm>,
+    form: Result<Form<ImportForm>, axum::extract::rejection::FormRejection>,
 ) -> Response {
+    let Ok(Form(form)) = form else {
+        return setup_redirect(Err(
+            "that document could not be read — it may be larger than this page accepts \
+             (8 MB). Import it with `ksx config import <file>` instead"
+                .to_owned(),
+        ));
+    };
     let request = ksx_api::ImportRequest {
         document: form.document.unwrap_or_default(),
         what: what_words(form.what.as_deref()),
@@ -1426,10 +1461,32 @@ async fn setup_form_import(
             ))
         });
     setup_redirect(match outcome {
-        Ok(report) if report.ok => Ok(report.summary),
-        Ok(report) => Err(report.summary),
+        Ok(report) if report.ok => Ok(import_flash(&report)),
+        Ok(report) => Err(import_flash(&report)),
         Err(refusal) => Err(refusal.message),
     })
+}
+
+/// One [`ksx_api::ImportReport`] as the sentence this page flashes.
+///
+/// The backend composes the fact and names no control (`onboard::import`); each
+/// surface adds its own. Here that is two things the report cannot know: the
+/// label on THIS page's consent box, and the first of the faults it is holding.
+fn import_flash(report: &ksx_api::ImportReport) -> String {
+    let mut line = report.summary.clone();
+    if let Some(first) = report.faults.first() {
+        line.push_str(&format!(" First: {first}"));
+        let rest = report.faults.len() - 1;
+        if rest > 0 {
+            line.push_str(&format!(" (+{rest} more)"));
+        }
+    } else if report.ok && !report.applied {
+        // A clean dry run. The backend said what it WOULD do and that nothing
+        // was written; "write it" is the name of the box on this page and
+        // nowhere else.
+        line.push_str(" Tick \"write it\" and import again to apply.");
+    }
+    line
 }
 
 #[derive(Deserialize)]
@@ -1491,22 +1548,26 @@ async fn setup_form_slot(
 
 /// One [`crate::control::SlotOutcome`] as the sentence this page flashes.
 ///
-/// The pad bounce is named in the SUCCESS line as well as in the warning above
-/// the button: "it worked" and "your controllers just went away and came back"
-/// are two facts, and the second one is the surprising one.
+/// **The canonical formatters, not a second reconstruction.**
+/// [`ksx_api::SlotOutcome::headline`] is the designated one-line renderer and
+/// is what the cabinet (`ksx-cabinet/src/app.rs`) and the daemon
+/// (`ksx-app/src/daemon/pipe.rs`) print; `refusal()` is the matching one for
+/// the error arm, and it carries the CODE and the remedy that a hand-built
+/// `unwrap_or` throws away.
+///
+/// This used to rebuild the sentence from flags — `message` then `if restarted
+/// { push(" The pads replugged.") }` — which is the exact re-derivation
+/// `control.rs::a_slot_outcome_prints_what_the_daemon_said_rather_than_re_deriving_it`
+/// forbids by name. It went wrong three ways: it double-named the bounce when
+/// the daemon's own sentence already named it, it lost slot/preset/`unchanged`
+/// when there was no sentence, and it had no way to say "nothing was running,
+/// so nothing had to restart" — which is the state this page's own wire form is
+/// offered in, because it turns on `reachable`, not `running`.
 fn slot_flash(outcome: crate::control::SlotOutcome) -> Result<String, String> {
-    if !outcome.ok {
-        return Err(outcome
-            .error
-            .unwrap_or_else(|| "the slot was not changed".to_owned()));
+    match outcome.refusal() {
+        Some(refusal) => Err(refusal.message),
+        None => Ok(outcome.headline()),
     }
-    let mut line = outcome
-        .message
-        .unwrap_or_else(|| "the slot was updated".to_owned());
-    if outcome.restarted {
-        line.push_str(" The pads replugged.");
-    }
-    Ok(line)
 }
 
 /// POST /setup/prove — step 3, `ControlSource::learn_start` (pipe `learn-key`).
