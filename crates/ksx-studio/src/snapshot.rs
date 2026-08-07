@@ -95,6 +95,25 @@ pub struct ProfilesPayload {
     pub profiles: ksx_api::ProfilesView,
     pub presets: ksx_api::PresetsView,
     pub session: crate::control::SessionView,
+    /// The refusal that stopped the games.toml read, if it stopped.
+    ///
+    /// This field is the difference between two sentences that a count cannot
+    /// tell apart: **"you have no profiles"** and **"I could not read your
+    /// profiles."** Before it existed the handler substituted a
+    /// `ProfilesView::default()` on `Err`, so an unreadable games.toml printed
+    /// "no profiles in games.toml" at the top of the page with the real reason
+    /// four cards further down. That is this project's signature failure —
+    /// a surface reporting success over a read that did not happen — and it is
+    /// the exact thing the rest of this page was written to stop.
+    ///
+    /// `Some` means the list below is empty BECAUSE THE READ FAILED, and every
+    /// derived line ([`ProfilesDerived`]) says so instead of counting.
+    #[serde(default)]
+    pub profiles_error: Option<String>,
+    /// The same, for the presets folder. Kept separate because the two reads
+    /// fail independently and the page has to be able to say which.
+    #[serde(default)]
+    pub presets_error: Option<String>,
     /// Anything either read had to say out loud, including a whole read that
     /// refused. Rendered; never swallowed.
     #[serde(default)]
@@ -102,6 +121,378 @@ pub struct ProfilesPayload {
     /// One-shot action feedback (the `?flash=` query). Always `None` from
     /// `/api/profiles` — a poll is not an action.
     pub flash: Option<String>,
+    /// Every displayed string and every branch this page needs, computed ONCE
+    /// — see [`ProfilesDerived`]. Recomputed from the fields above by
+    /// [`Self::derived`]; never assembled by hand.
+    #[serde(default)]
+    pub view: ProfilesDerived,
+}
+
+impl ProfilesPayload {
+    /// Fill [`Self::view`] from the raw provider data.
+    ///
+    /// Every producer of a payload calls this — the page render and
+    /// `GET /api/profiles` — so the server paint and the 2 s poll are the same
+    /// bytes by construction rather than by two implementations agreeing.
+    #[must_use]
+    pub fn derived(mut self) -> Self {
+        self.view = ProfilesDerived::of(&self);
+        self
+    }
+}
+
+/// Everything the Profiles page DISPLAYS that is not verbatim provider data:
+/// the summary lines, the row lines, the pill classes, the option lists, the
+/// slot ceiling, and every `show:` branch.
+///
+/// # Why it is a serialized struct and not two functions
+///
+/// It was two functions, and that was the review finding. Every line below
+/// existed twice — once in `render_profiles.rs` for the server paint, once in
+/// `ProfilesIsland.ts` for the 2 s poll — which docs/SURFACES.md §1 forbids
+/// for exactly the reason it went wrong here: the TypeScript half carried a
+/// hardcoded `"16"` slot ceiling that no poll could correct, so the first
+/// `ksx_core::MAX_SLOTS` raise would have had the server render `max="32"` and
+/// hydration write `16` straight back over it. Two copies of a SENTENCE drift
+/// silently; two copies of a NUMBER drift silently and then refuse a legal
+/// input. `main.rs`'s `slot_arg` module exists to commemorate the same bug.
+///
+/// So the derivation happens here, once, in the backend, and both the SSR slot
+/// injection and the browser read the result. The island computes nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfilesDerived {
+    /// The line above the profile list. Says "could not be read" — NOT
+    /// "no profiles" — when [`ProfilesPayload::profiles_error`] is set.
+    pub profiles_summary: String,
+    pub broken_summary: String,
+    pub presets_summary: String,
+    pub templates_summary: String,
+    /// The exact `ksx daemon …` line for this cabinet.
+    pub daemon_cmd: String,
+    /// `ksx_core::MAX_SLOTS`, as the slot-count input's `max`. The ONE place
+    /// this number may come from; a client-side literal was the finding.
+    pub max_slots: u8,
+    /// The widest player block any offered template carries — the preset
+    /// form's `max`, which used to be the literal `"4"` whether or not the
+    /// selected template had four blocks.
+    pub max_player: u8,
+    pub profile_rows: Vec<ProfileRowView>,
+    pub broken_rows: Vec<BrokenRowView>,
+    pub preset_rows: Vec<PresetRowView>,
+    /// The in-box templates as a LIST, carrying `detail` — the panel note
+    /// ksx-api documents as the thing that makes a template identifiable.
+    /// Served since the beginning and rendered nowhere until now.
+    pub template_rows: Vec<TemplateRowView>,
+    pub preset_options: Vec<OptionView>,
+    pub template_options: Vec<OptionView>,
+    pub note_rows: Vec<NoteView>,
+
+    // ── The `show:` branches. Booleans, because a page that decides in two
+    //    languages decides differently in one of them.
+    pub pill_running: bool,
+    pub pill_idle: bool,
+    pub pill_down: bool,
+    pub no_daemon: bool,
+    pub any_broken: bool,
+    /// Offer the Switch button (a start could actually be accepted).
+    pub rows_live: bool,
+    pub rows_plain: bool,
+    /// The games.toml read REFUSED. Distinct from "no profiles" on purpose.
+    pub profiles_unreadable: bool,
+    /// The create-profile form is usable: presets were read, and there is one.
+    pub can_make_profile: bool,
+    /// Presets were read and there are none — a real, fixable empty state
+    /// whose copy points at the template form below, which will work.
+    pub no_presets_yet: bool,
+    /// The presets read REFUSED. NOT [`Self::no_presets_yet`]: that sentence
+    /// sends the user to a template form whose `<select>` is also empty, so
+    /// the only path it offers cannot succeed — a closed loop with a wrong
+    /// sentence on it.
+    pub presets_unreadable: bool,
+    /// The template form is usable at all (the presets read, which carries the
+    /// template list, succeeded).
+    pub can_make_preset: bool,
+    pub any_notes: bool,
+}
+
+/// One `[[game]]` profile as a row.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileRowView {
+    pub title: String,
+    pub path: String,
+    pub detail: String,
+    pub verdict: String,
+    /// The pill class. Derived from `ProfileDetail::state` HERE so the pill a
+    /// poll paints is the pill the server painted.
+    pub statecls: String,
+    pub statelabel: String,
+}
+
+/// One broken profile in the alarm card.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokenRowView {
+    pub title: String,
+    /// The path that does not resolve — the whole reason the card exists.
+    pub path: String,
+    pub verdict: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresetRowView {
+    pub name: String,
+    pub detail: String,
+    pub statecls: String,
+    pub statelabel: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateRowView {
+    pub id: String,
+    pub label: String,
+    /// The panel note that travels with the template.
+    pub detail: String,
+    /// "player 1" / "players 1–2" — the block range this template can
+    /// instantiate, so the number the form asks for is visible next to it.
+    pub players: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptionView {
+    pub value: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteView {
+    pub line: String,
+}
+
+impl ProfilesDerived {
+    /// Derive the whole display layer from one payload.
+    fn of(p: &ProfilesPayload) -> Self {
+        let profiles_failed = p.profiles_error.is_some();
+        let presets_failed = p.presets_error.is_some();
+        let has_presets = !p.presets.presets.is_empty();
+        let can_start = p.session.reachable && !p.session.running;
+
+        // The provider's word, never a re-derivation: deciding what counts as
+        // broken outside the provider is what docs/SURFACES.md §1 forbids.
+        let broken: Vec<&ksx_api::ProfileDetail> = p
+            .profiles
+            .profiles
+            .iter()
+            .filter(|g| g.state == "broken")
+            .collect();
+
+        Self {
+            profiles_summary: profiles_summary(p.profiles.profiles.len(), profiles_failed),
+            broken_summary: broken_summary(broken.len()),
+            presets_summary: presets_summary(p.presets.presets.len(), presets_failed),
+            templates_summary: templates_summary(p.presets.templates.len(), presets_failed),
+            daemon_cmd: crate::render::daemon_command(&p.session),
+            max_slots: ksx_api::MAX_SLOTS,
+            max_player: p
+                .presets
+                .templates
+                .iter()
+                .filter_map(|t| t.players.iter().copied().max())
+                .max()
+                .unwrap_or(1),
+            profile_rows: p
+                .profiles
+                .profiles
+                .iter()
+                .map(|g| ProfileRowView {
+                    title: g.title.clone(),
+                    path: g.path.clone(),
+                    detail: profile_detail_line(g),
+                    verdict: g.verdict.clone(),
+                    statecls: state_class(&g.state).to_owned(),
+                    statelabel: g.state.clone(),
+                })
+                .collect(),
+            broken_rows: broken
+                .iter()
+                .map(|g| BrokenRowView {
+                    title: g.title.clone(),
+                    // `broken_path` is the provider's answer to "which string
+                    // is wrong"; falling back to `path` keeps the row honest
+                    // for the empty-path case, where there IS no bad path.
+                    path: g.broken_path.clone().unwrap_or_else(|| g.path.clone()),
+                    verdict: g.verdict.clone(),
+                })
+                .collect(),
+            preset_rows: p
+                .presets
+                .presets
+                .iter()
+                .map(|r| PresetRowView {
+                    name: r.name.clone(),
+                    detail: preset_detail_line(r),
+                    statecls: if r.protected {
+                        "pill pill-idle".to_owned()
+                    } else {
+                        "pill pill-ok".to_owned()
+                    },
+                    statelabel: if r.protected {
+                        "built-in".to_owned()
+                    } else {
+                        "yours".to_owned()
+                    },
+                })
+                .collect(),
+            template_rows: p
+                .presets
+                .templates
+                .iter()
+                .map(|t| TemplateRowView {
+                    id: t.id.clone(),
+                    label: t.label.clone(),
+                    detail: t.detail.clone(),
+                    players: player_range(&t.players),
+                })
+                .collect(),
+            preset_options: p
+                .presets
+                .presets
+                .iter()
+                .map(|r| OptionView {
+                    value: r.name.clone(),
+                    label: r.name.clone(),
+                })
+                .collect(),
+            template_options: p
+                .presets
+                .templates
+                .iter()
+                .map(|t| OptionView {
+                    value: t.id.clone(),
+                    // The player range is IN the option, because the form's
+                    // player field is one ceiling for every template and the
+                    // user is the only one who can see which they picked.
+                    label: format!("{} — {} ({})", t.id, t.label, player_range(&t.players)),
+                })
+                .collect(),
+            note_rows: p
+                .notes
+                .iter()
+                .map(|line| NoteView { line: line.clone() })
+                .collect(),
+
+            pill_running: p.session.reachable && p.session.running,
+            pill_idle: can_start,
+            pill_down: !p.session.reachable,
+            no_daemon: !p.session.reachable,
+            any_broken: !broken.is_empty(),
+            rows_live: can_start,
+            rows_plain: !can_start,
+            profiles_unreadable: profiles_failed,
+            can_make_profile: has_presets && !presets_failed,
+            no_presets_yet: !has_presets && !presets_failed,
+            presets_unreadable: presets_failed,
+            can_make_preset: !presets_failed,
+            any_notes: !p.notes.is_empty(),
+        }
+    }
+}
+
+/// The line above the profile list.
+///
+/// The `failed` arm is the point of this function. "no profiles in games.toml"
+/// is a statement about the file's CONTENTS; when the read refused, nothing is
+/// known about the contents, and printing the count sentence asserts an
+/// absence nobody checked.
+fn profiles_summary(count: usize, failed: bool) -> String {
+    if failed {
+        return "games.toml could NOT be read — this is not an empty list, it is a failed \
+                read, and the reason is below"
+            .to_owned();
+    }
+    match count {
+        0 => "no profiles in games.toml".to_owned(),
+        1 => "1 profile in games.toml:".to_owned(),
+        n => format!("{n} profiles in games.toml:"),
+    }
+}
+
+fn broken_summary(count: usize) -> String {
+    match count {
+        1 => "1 profile points at a program that is not there:".to_owned(),
+        n => format!("{n} profiles point at a program that is not there:"),
+    }
+}
+
+fn presets_summary(count: usize, failed: bool) -> String {
+    if failed {
+        return "the presets could NOT be read — this is not an empty folder, it is a failed \
+                read, and the reason is below"
+            .to_owned();
+    }
+    match count {
+        0 => "no presets on disk".to_owned(),
+        1 => "1 preset on disk:".to_owned(),
+        n => format!("{n} presets on disk:"),
+    }
+}
+
+/// The templates ship inside the binary, so an empty list here means the read
+/// that carries them refused — never "this build has no templates".
+fn templates_summary(count: usize, failed: bool) -> String {
+    if failed {
+        return "the in-box templates could not be listed — the presets read refused".to_owned();
+    }
+    match count {
+        0 => "no in-box templates".to_owned(),
+        1 => "1 in-box template:".to_owned(),
+        n => format!("{n} in-box templates:"),
+    }
+}
+
+/// A profile's state as the pill class that carries it.
+///
+/// `launcher` gets the NEUTRAL pill, not the OK one, and that is not a style
+/// choice: `ksx_games::preflight` cannot resolve a `steam://` URL — only the
+/// shell knows whether `rungameid/9999` names a real game — so a green badge
+/// would be ksx claiming a check it did not make.
+fn state_class(state: &str) -> &'static str {
+    match state {
+        "broken" => "pill pill-warn",
+        "launcher" => "pill pill-idle",
+        _ => "pill pill-ok",
+    }
+}
+
+fn profile_detail_line(p: &ksx_api::ProfileDetail) -> String {
+    let slots = match p.slots {
+        1 => "1 slot".to_owned(),
+        n => format!("{n} slots"),
+    };
+    if p.presets.is_empty() {
+        format!("{slots} — no preset named")
+    } else {
+        format!("{slots} on {}", p.presets.join(", "))
+    }
+}
+
+fn preset_detail_line(p: &ksx_api::PresetRow) -> String {
+    let controls = match p.bound {
+        1 => "1 control".to_owned(),
+        n => format!("{n} controls"),
+    };
+    let macros = match p.macros {
+        0 => String::new(),
+        n => format!(", {n} macro(s)"),
+    };
+    format!("{controls}{macros} — {}", p.source)
+}
+
+/// "player 1" / "players 1–3" — the blocks a template can instantiate.
+fn player_range(players: &[u8]) -> String {
+    match (players.iter().min(), players.iter().max()) {
+        (Some(lo), Some(hi)) if lo == hi => format!("player {lo}"),
+        (Some(lo), Some(hi)) => format!("players {lo}–{hi}"),
+        _ => "no player blocks".to_owned(),
+    }
 }
 
 #[cfg(test)]

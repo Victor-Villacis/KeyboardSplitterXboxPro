@@ -392,6 +392,12 @@ struct ScriptedMachine {
     /// prove the FORM's values reached the verb rather than a default.
     created_profile: Mutex<Option<ksx_api::NewProfile>>,
     created_preset: Mutex<Option<ksx_api::NewPreset>>,
+    /// Both machine READS behind /profiles refuse — the state a machine with
+    /// a syntax error in games.toml and a permission problem on the presets
+    /// folder is in. Distinct from "the machine is empty", which is what the
+    /// page used to render for it — and distinct from [`Self::refuse`], which
+    /// is the DEVICE scan refusing.
+    reads_refuse: bool,
 }
 
 const IPAC_KB: &str = r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000";
@@ -410,6 +416,14 @@ impl ScriptedMachine {
     fn blind() -> Self {
         Self {
             blind: true,
+            ..Self::default()
+        }
+    }
+
+    /// Both /profiles reads refuse (games.toml AND the presets folder).
+    fn reads_refusing() -> Self {
+        Self {
+            reads_refuse: true,
             ..Self::default()
         }
     }
@@ -575,6 +589,13 @@ impl ksx_api::MachineSource for ScriptedMachine {
     /// path, exactly as `LocalMachine::profiles` composes it from
     /// `ksx_games::preflight`.
     fn profiles(&self) -> Result<ksx_api::ProfilesView, Refusal> {
+        if self.reads_refuse {
+            return Err(Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                "games.toml could not be read: expected `=` at line 4",
+                "run `ksx config export --what games`",
+            ));
+        }
         Ok(ksx_api::ProfilesView {
             generated_at: "test".into(),
             config_root: "C:\\cfg".into(),
@@ -608,6 +629,13 @@ impl ksx_api::MachineSource for ScriptedMachine {
     }
 
     fn presets(&self) -> Result<ksx_api::PresetsView, Refusal> {
+        if self.reads_refuse {
+            return Err(Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                "the presets folder could not be read: access is denied",
+                "run `ksx doctor`",
+            ));
+        }
         Ok(ksx_api::PresetsView {
             config_root: "C:\\cfg\\presets".into(),
             presets: vec![ksx_api::PresetRow {
@@ -642,6 +670,17 @@ impl ksx_api::MachineSource for ScriptedMachine {
 
     fn preset_new(&self, spec: &ksx_api::NewPreset) -> Result<String, Refusal> {
         *self.created_preset.lock().unwrap() = Some(spec.clone());
+        // The refusal `LocalMachine` composes from
+        // `preset_edit::PresetError::Exists` + its `advice()`, verbatim in
+        // shape: a message that names the file it protected, and a remedy that
+        // is the ONLY way forward. "Arcade" is the preset `presets()` lists.
+        if spec.name == "Arcade" && !spec.force {
+            return Err(Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                "a preset called \"Arcade\" already exists (C:\\cfg\\presets\\Arcade.toml)",
+                "--force overwrites it (a timestamped backup is taken first).",
+            ));
+        }
         Ok(format!(
             "created preset \"{}\" — 30 controls from \"{}\" (player {})",
             spec.name, spec.template, spec.player
@@ -2192,29 +2231,164 @@ fn a_refused_profile_create_flashes_the_reason() {
     assert!(response.contains("flash=error%3A"), "{response}");
 }
 
-/// A post missing a field entirely still comes back as a 303 with a worded
-/// flash, NOT a 422.
+/// A post with a field missing OR EMPTY still comes back as a 303 with a
+/// worded flash, NOT a 422.
 ///
 /// The distinction is not pedantry. The island fetch-submits and reads its
 /// outcome out of the redirect's `?flash=` — a 422 carries no `Location`, so
 /// the page would show nothing whatsoever and the user would be left pressing
 /// a button that appears to do nothing. That is the failure mode this whole
 /// screen replaced; it must not come back through the extractor.
+///
+/// The EMPTY cases are the ones that matter, and the earlier version of this
+/// test did not have them: it covered only the absent key, which
+/// `#[serde(default)]` already handled, so it passed against the broken build.
+/// A browser sends `slots=` — present, empty — the instant a user clears a
+/// non-`required` `<input type="number">`, and serde_urlencoded answers
+/// "cannot parse integer from empty string" for an `Option<u8>`. The rows
+/// below fail against the `Option<u8>` version with a 422 and no `Location`;
+/// the `garbage` rows fail against any version that lets the extractor do the
+/// parsing at all.
 #[test]
-fn a_post_missing_fields_still_flashes_instead_of_422() {
+fn a_post_with_a_missing_or_empty_number_still_flashes_instead_of_422() {
     let control = Arc::new(ScriptedControl::new(true));
     let addr = start_server(control);
-    for (path, body) in [
-        ("/profiles/new", "path=C%3A%5Cx.exe"),
-        ("/profiles/preset/new", "name=Couch"),
+    for (path, body, why) in [
+        ("/profiles/new", "path=C%3A%5Cx.exe", "the key is absent"),
+        (
+            "/profiles/new",
+            "title=T&path=C%3A%5Cx.exe&slots=&preset=Arcade",
+            "the user cleared the slots box",
+        ),
+        (
+            "/profiles/new",
+            "title=T&path=C%3A%5Cx.exe&slots=lots&preset=Arcade",
+            "the slots box holds something that is not a number",
+        ),
+        ("/profiles/preset/new", "name=Couch", "the key is absent"),
+        (
+            "/profiles/preset/new",
+            "name=Couch&template=keyboard-2p&player=",
+            "the user cleared the player box",
+        ),
+        (
+            "/profiles/preset/new",
+            "name=Couch&template=keyboard-2p&player=two",
+            "the player box holds something that is not a number",
+        ),
     ] {
         let response = post_form(addr, path, body);
         assert!(
             response.starts_with("HTTP/1.1 303"),
-            "{path} must redirect with a flash, not reject the body: {response}"
+            "{path} must redirect with a flash when {why}, not reject the \
+             body — a 422 carries no Location and the island renders it as \
+             nothing at all: {response}"
         );
-        assert!(response.contains("flash="), "{path}: {response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("location: /profiles"),
+            "{path} ({why}) must carry a Location the island can read a flash \
+             out of: {response}"
+        );
+        assert!(response.contains("flash="), "{path} ({why}): {response}");
     }
+}
+
+/// A refusal arrives with its REMEDY, not just its message.
+///
+/// `flash_of` used to return `refusal.message` and drop `refusal.remedy`,
+/// justified by "the page has a place for the remedy already: the no-daemon
+/// banner". True of the control verbs it was written for; false of every
+/// machine verb this page added. `preset-exists` is the case that proves it —
+/// the message names the file it protected and the remedy names `--force`,
+/// which is the only path forward that exists anywhere on this screen, and the
+/// page has nowhere else that carries one.
+///
+/// Fails against the shipped version: the flash there stops at the filename.
+#[test]
+fn a_refusal_flashes_the_way_out_and_not_only_the_reason() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    let response = post_form(
+        addr,
+        "/profiles/preset/new",
+        "name=Arcade&template=keyboard-2p&player=1",
+    );
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(
+        response.contains("already%20exists"),
+        "the refusal must name what it protected: {response}"
+    );
+    assert!(
+        response.contains("--force"),
+        "…and the flag that means yes, which is the only way forward on this \
+         page: {response}"
+    );
+}
+
+/// A REFUSED read must not render as an assertion of absence.
+///
+/// This is the page's own stated purpose turned on itself, and it is this
+/// project's signature bug: a surface answering for a read it never completed
+/// (the session that reported success while the arcade panel was dead because
+/// a WinUSB board had silently fallen back to Interception).
+///
+/// Fails against the shipped version on the first two assertions: there,
+/// `collect_profiles` substituted `ProfilesView::default()` / `PresetsView::
+/// default()` on `Err`, so the page printed "no profiles in games.toml" and
+/// "No presets on disk … Make a preset from an in-box template below first" —
+/// the second of which points at a form whose `<select>` is empty for exactly
+/// the same reason, so the only route it offers cannot succeed.
+#[test]
+fn a_refused_read_is_not_rendered_as_an_empty_machine() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server_with_machine(control, Arc::new(ScriptedMachine::reads_refusing()));
+    let response = get(addr, "/profiles");
+    let body = body_of(&response);
+
+    assert!(
+        !body.contains("no profiles in games.toml"),
+        "a failed read must not be reported as an empty games.toml: {body}"
+    );
+    assert!(
+        !body.contains("Make a preset from an in-box template below"),
+        "a failed presets read must not send the user to a form fed by the \
+         same read: {body}"
+    );
+    assert!(
+        !body.contains(r#"action="/profiles/preset/new""#),
+        "…and that form must not be on the page at all: {body}"
+    );
+    // What it says instead: the failure, and both reasons, in words.
+    assert!(body.contains("could NOT be read"), "{body}");
+    assert!(body.contains("expected `=` at line 4"), "{body}");
+    assert!(body.contains("access is denied"), "{body}");
+    // Each read's remedy travels with it — this string replaces the list the
+    // user came for, so it is the one place that cannot be a dead end.
+    assert!(body.contains("ksx config export --what games"), "{body}");
+    assert!(body.contains("ksx doctor"), "{body}");
+
+    // The JSON twin says it in a machine-readable field, not by omission.
+    let value: serde_json::Value =
+        serde_json::from_str(body_of(&get(addr, "/api/profiles"))).expect("json");
+    assert_eq!(
+        value.pointer("/view/profiles_unreadable"),
+        Some(&serde_json::json!(true)),
+        "a poller must be able to tell a refused read from an empty one: \
+         {value}"
+    );
+    assert_eq!(
+        value.pointer("/view/presets_unreadable"),
+        Some(&serde_json::json!(true)),
+        "{value}"
+    );
+    assert_eq!(
+        value.pointer("/view/no_presets_yet"),
+        Some(&serde_json::json!(false)),
+        "'no presets yet' is a claim about the FOLDER; nothing was read: \
+         {value}"
+    );
 }
 
 /// Creating a preset from a template, through the same `preset_new` verb

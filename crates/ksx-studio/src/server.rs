@@ -1225,15 +1225,27 @@ async fn config_reload(State(state): State<Arc<AppState>>) -> Response {
 /// One fresh profiles payload. Both machine reads hit the config store, which
 /// blocks; kept off the async workers like [`collect`] and [`collect_map`].
 ///
-/// A read that REFUSES becomes a note, not an exception: "no profiles" and
-/// "games.toml is unreadable" are not the same sentence, and a page that
-/// renders the first when the second is true is the failure this whole page
-/// exists to stop repeating.
+/// A read that REFUSES is recorded as a REFUSAL, not as an empty view.
+///
+/// This was the review finding, and it is this project's signature bug: on
+/// `Err` the handler substituted `ProfilesView::default()`, so the page said
+/// "no profiles in games.toml" at the top and buried "games.toml could not be
+/// read: …" in the last card. The presets side was worse — a `PresetsView`
+/// default made `noPresetsYet` true, whose copy sends the user to a template
+/// form whose `<select>` is ALSO empty, so the one route offered could not
+/// succeed. "I could not read this" and "there is nothing here" are different
+/// sentences, and a user acts on them differently.
+///
+/// So the refusal lands in a typed field ([`ProfilesPayload::profiles_error`])
+/// that every derived line branches on, AND in the notes, which is where a
+/// warning from a read that SUCCEEDED goes.
 async fn collect_profiles(state: &Arc<AppState>) -> ProfilesPayload {
     let read_state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
         let session = read_state.control.session();
         let mut notes = Vec::new();
+        let mut profiles_error = None;
+        let mut presets_error = None;
         let profiles = match read_state.machine.profiles() {
             Ok(view) => {
                 notes.extend(view.notes.iter().cloned());
@@ -1244,6 +1256,10 @@ async fn collect_profiles(state: &Arc<AppState>) -> ProfilesPayload {
                 if let Some(remedy) = &refusal.remedy {
                     notes.push(remedy.clone());
                 }
+                // The same message+remedy join a refused ACTION flashes: this
+                // string replaces the list the user came for, so dropping the
+                // way out would leave the one card with nowhere to send them.
+                profiles_error = Some(flash_of(refusal));
                 ksx_api::ProfilesView::default()
             }
         };
@@ -1251,6 +1267,10 @@ async fn collect_profiles(state: &Arc<AppState>) -> ProfilesPayload {
             Ok(view) => view,
             Err(refusal) => {
                 notes.push(refusal.message.clone());
+                if let Some(remedy) = &refusal.remedy {
+                    notes.push(remedy.clone());
+                }
+                presets_error = Some(flash_of(refusal));
                 ksx_api::PresetsView::default()
             }
         };
@@ -1267,15 +1287,26 @@ async fn collect_profiles(state: &Arc<AppState>) -> ProfilesPayload {
             profiles,
             presets,
             session,
+            profiles_error,
+            presets_error,
             notes,
             flash: None,
+            view: Default::default(),
         }
+        .derived()
     })
     .await
-    .unwrap_or_else(|_| ProfilesPayload {
-        session: SessionView::unreachable("profile collection panicked"),
-        notes: vec!["profile collection panicked".to_owned()],
-        ..ProfilesPayload::default()
+    .unwrap_or_else(|_| {
+        // A panicked read is a FAILED read, not an empty machine — the same
+        // distinction, arriving by a different door.
+        ProfilesPayload {
+            session: SessionView::unreachable("profile collection panicked"),
+            profiles_error: Some("profile collection panicked".to_owned()),
+            presets_error: Some("profile collection panicked".to_owned()),
+            notes: vec!["profile collection panicked".to_owned()],
+            ..ProfilesPayload::default()
+        }
+        .derived()
     })
 }
 
@@ -1337,7 +1368,8 @@ where
     profiles_redirect(outcome)
 }
 
-/// Every field defaults, deliberately — including the two that are required.
+/// Every field defaults, deliberately — including the two that are required —
+/// and every field is a `String`, which is the same decision twice.
 ///
 /// Not laxity: an extraction FAILURE is a 422 with no `Location`, and the
 /// island's fetch-submit reads its outcome out of the redirect's `?flash=`
@@ -1345,6 +1377,15 @@ where
 /// renders as nothing at all — the exact silent failure every route here is
 /// written to avoid. Defaulting hands an empty spec to the planner instead,
 /// which refuses in words and 303s like everything else.
+///
+/// The number fields were `Option<u8>` and that was HALF the fix, which is
+/// worse than none because it looks finished. `#[serde(default)]` covers an
+/// ABSENT key; a browser sends `slots=` — present, empty — the moment a user
+/// clears a non-`required` `<input type="number">`, and serde_urlencoded
+/// answers "cannot parse integer from empty string". Straight back to the 422
+/// with no `Location`, and a button that does nothing at all. So the wire type
+/// is a string all the way in and [`number_field`] does the parsing, where a
+/// bad value is a worded refusal on a 303 like every other refusal here.
 #[derive(Deserialize)]
 struct NewProfileForm {
     #[serde(default)]
@@ -1353,13 +1394,28 @@ struct NewProfileForm {
     path: String,
     #[serde(default)]
     arguments: String,
-    /// The form's `<input type="number">`. Absent falls through to the
+    /// The form's `<input type="number">`, as text. Empty falls through to the
     /// planner's own refusal rather than a silent default: "how many players"
     /// is not a question this layer may answer on the user's behalf.
     #[serde(default)]
-    slots: Option<u8>,
+    slots: String,
     #[serde(default)]
     preset: String,
+}
+
+/// One numeric form field, parsed HERE instead of by the extractor.
+///
+/// `Ok(None)` means "the user left it blank" — the caller decides whether that
+/// is a default or a refusal. `Err` is the sentence to flash: a 303 with words
+/// on it, never a 422 the page cannot read.
+fn number_field(raw: &str, field: &str) -> Result<Option<u8>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse::<u8>().map(Some).map_err(|_| {
+        format!("\"{raw}\" is not a number this form can use for {field} — type a whole number")
+    })
 }
 
 /// POST /profiles/new — the verb that did not exist.
@@ -1373,13 +1429,19 @@ async fn profiles_form_new(
     State(state): State<Arc<AppState>>,
     Form(form): Form<NewProfileForm>,
 ) -> Response {
+    // Blank stays 0, which the planner refuses by name ("a profile hands out
+    // 1..=MAX_SLOTS slots") — this layer does not pick a player count.
+    let slots = match number_field(&form.slots, "slots") {
+        Ok(value) => value.unwrap_or(0),
+        Err(message) => return profiles_redirect(Err(message)),
+    };
     machine_act(state, move |machine| {
         machine
             .profile_new(&ksx_api::NewProfile {
                 title: form.title,
                 path: form.path,
                 arguments: form.arguments,
-                slots: form.slots.unwrap_or(0),
+                slots,
                 preset: form.preset,
             })
             .map_err(flash_of)
@@ -1387,7 +1449,7 @@ async fn profiles_form_new(
     .await
 }
 
-/// Defaulted for the same reason as [`NewProfileForm`].
+/// Defaulted, and string-typed, for the same reasons as [`NewProfileForm`].
 #[derive(Deserialize)]
 struct NewPresetForm {
     #[serde(default)]
@@ -1395,25 +1457,34 @@ struct NewPresetForm {
     #[serde(default)]
     template: String,
     #[serde(default)]
-    player: Option<u8>,
+    player: String,
 }
 
 /// POST /profiles/preset/new — `ksx preset new`, through the same writer.
 ///
 /// No `force` field, deliberately: overwriting a preset is destructive and the
 /// consent shape for it is the CLI's `--force`. A web form that could clobber
-/// a 25-binding mapping because a name collided is not a form this page wants;
-/// the refusal names the preset it protected and the flag that means yes.
+/// a 25-binding mapping because a name collided is not a form this page wants.
+/// That makes the refusal load-bearing — it is the ONLY thing standing between
+/// "that name is taken" and a user with nowhere to go — which is why
+/// [`flash_of`] carries `Refusal::remedy`, and why the Presets card no longer
+/// claims that only the built-ins are protected.
 async fn profiles_form_preset_new(
     State(state): State<Arc<AppState>>,
     Form(form): Form<NewPresetForm>,
 ) -> Response {
+    // Blank means player 1 — every template has a first block, and the field
+    // is labelled as the multi-player exception rather than a required answer.
+    let player = match number_field(&form.player, "the player block") {
+        Ok(value) => value.unwrap_or(1),
+        Err(message) => return profiles_redirect(Err(message)),
+    };
     machine_act(state, move |machine| {
         machine
             .preset_new(&ksx_api::NewPreset {
                 name: form.name,
                 template: form.template,
-                player: form.player.unwrap_or(1),
+                player,
                 force: false,
             })
             .map_err(flash_of)
@@ -1445,14 +1516,27 @@ async fn profiles_form_switch(
     profiles_redirect(outcome)
 }
 
-/// One [`ksx_api::Refusal`] as the sentence this page flashes.
+/// One [`ksx_api::Refusal`] as the sentence a page flashes — message AND
+/// remedy.
 ///
-/// The flash is one line, so it carries the MESSAGE and nothing else — the
-/// refusal's `remedy` is a second line, and the page already has a place for
-/// it that a query string does not: the no-daemon banner, which prints the
-/// exact `ksx daemon` command for this cabinet above every disabled control.
+/// It used to drop the remedy, justified by "the page already has a place for
+/// it: the no-daemon banner, which prints the exact `ksx daemon` command".
+/// That is true of the CONTROL refusals this function was written for, and
+/// false of every machine verb the Profiles page added, which is where review
+/// caught it. `preset-exists` is the sharpest case: the message names the
+/// preset it protected, and the remedy — "--force overwrites it (a timestamped
+/// backup is taken first)" — is the only path forward that exists anywhere on
+/// that page. Same for `unknown-template` ("`ksx preset list --templates`
+/// names the ones that ship") and `NoSuchPreset` ("`ksx preset new …` makes
+/// one"). A refusal with its way out deleted is just an error message.
+///
+/// One line still, joined with an em dash: `urlencode` caps the flash at 300
+/// characters and the page renders it in a wrapping `<p>`.
 fn flash_of(refusal: ksx_api::Refusal) -> String {
-    refusal.message
+    match refusal.remedy {
+        Some(remedy) => format!("{} — {remedy}", refusal.message),
+        None => refusal.message,
+    }
 }
 
 /// Run one control verb off the async workers (the pipe client blocks), then

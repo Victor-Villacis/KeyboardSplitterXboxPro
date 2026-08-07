@@ -75,17 +75,17 @@ export interface SessionView {
   profile: string | null;
 }
 
-/** What GET /api/profiles serves and what the island props carry — one shape
- *  (`ProfilesPayload` in snapshot.rs; the parity is unit-tested there). */
-export interface ProfilesPayload {
-  profiles: ProfilesView;
-  presets: PresetsView;
-  session: SessionView;
-  notes: string[];
-  flash: string | null;
-}
-
-// ── Row view models (server derives the same fields; render_profiles.rs) ────
+// ── Row view models — DERIVED BY THE SERVER (snapshot.rs ProfilesDerived) ──
+//
+// These used to be built here, from functions that were a second copy of
+// render_profiles.rs's. That is what docs/SURFACES.md §1 forbids, and the
+// second copy went stale in exactly the way the rule predicts: the slot
+// ceiling below was the literal string "16", `setMaxSlots` was never called,
+// and no payload field could correct it — so the first `ksx_core::MAX_SLOTS`
+// raise would have had the server render max="32" and hydration write 16 back
+// over it (adoption effects write signal state into the DOM immediately; see
+// the ledger-#5 note in profiles.ts). Now the island composes nothing: every
+// string and every branch below arrives in `payload.view`.
 
 interface ProfileRowView {
   title: string;
@@ -111,6 +111,15 @@ interface PresetRowView {
   statelabel: string;
 }
 
+interface TemplateRowView {
+  id: string;
+  label: string;
+  /** The panel note that travels with the template — served since the
+   *  beginning, rendered nowhere until the review asked why. */
+  detail: string;
+  players: string;
+}
+
 interface OptionView {
   value: string;
   label: string;
@@ -118,6 +127,57 @@ interface OptionView {
 
 interface NoteView {
   line: string;
+}
+
+/** Everything this page displays that is not verbatim provider data, computed
+ *  once in Rust (`ProfilesDerived`). Field names are the serde names. */
+export interface ProfilesDerived {
+  profiles_summary: string;
+  broken_summary: string;
+  presets_summary: string;
+  templates_summary: string;
+  daemon_cmd: string;
+  /** `ksx_core::MAX_SLOTS`. The ONE place this number comes from. */
+  max_slots: number;
+  max_player: number;
+  profile_rows: ProfileRowView[];
+  broken_rows: BrokenRowView[];
+  preset_rows: PresetRowView[];
+  template_rows: TemplateRowView[];
+  preset_options: OptionView[];
+  template_options: OptionView[];
+  note_rows: NoteView[];
+  pill_running: boolean;
+  pill_idle: boolean;
+  pill_down: boolean;
+  no_daemon: boolean;
+  any_broken: boolean;
+  rows_live: boolean;
+  rows_plain: boolean;
+  /** The games.toml read REFUSED — not "there are no profiles". */
+  profiles_unreadable: boolean;
+  can_make_profile: boolean;
+  no_presets_yet: boolean;
+  /** The presets read REFUSED — not "there are no presets". */
+  presets_unreadable: boolean;
+  can_make_preset: boolean;
+  any_notes: boolean;
+}
+
+/** What GET /api/profiles serves and what the island props carry — one shape
+ *  (`ProfilesPayload` in snapshot.rs; the parity is unit-tested there). */
+export interface ProfilesPayload {
+  profiles: ProfilesView;
+  presets: PresetsView;
+  session: SessionView;
+  /** The refusal that stopped the games.toml read, if it stopped. `null` and
+   *  `"…could not be read"` are different sentences and the user acts on them
+   *  differently — which is why this is a field and not an empty list. */
+  profiles_error: string | null;
+  presets_error: string | null;
+  notes: string[];
+  flash: string | null;
+  view: ProfilesDerived;
 }
 
 // ── The live state store (module-level: one island, page lifetime) ─────────
@@ -132,7 +192,16 @@ const [profilesSummary, setProfilesSummary] = createSignal("not collected");
 const [brokenSummary, setBrokenSummary] = createSignal("");
 const [presetsSummary, setPresetsSummary] = createSignal("not collected");
 const [templatesSummary, setTemplatesSummary] = createSignal("not collected");
-const [maxSlots, setMaxSlots] = createSignal("16");
+const [profilesError, setProfilesError] = createSignal("");
+const [presetsError, setPresetsError] = createSignal("");
+// NO compile-time ceiling. These were `createSignal("16")` and `max: "4"`,
+// and `setMaxSlots` was never called — a number that only LOOKED live. The
+// server sends `ksx_core::MAX_SLOTS` and the widest template's player count in
+// every payload; until one arrives, an empty `max` means "no client-side
+// ceiling", and the backend refuses an out-of-range value in words. A wrong
+// ceiling silently rejects a legal input; no ceiling does not.
+const [maxSlots, setMaxSlots] = createSignal("");
+const [maxPlayer, setMaxPlayer] = createSignal("");
 
 const [pillRunning, setPillRunning] = createSignal(false);
 const [pillIdle, setPillIdle] = createSignal(false);
@@ -144,132 +213,66 @@ const [anyBroken, setAnyBroken] = createSignal(false);
 const [anyNotes, setAnyNotes] = createSignal(false);
 const [rowsLive, setRowsLive] = createSignal(false);
 const [rowsPlain, setRowsPlain] = createSignal(false);
+const [profilesUnreadable, setProfilesUnreadable] = createSignal(false);
 const [canMakeProfile, setCanMakeProfile] = createSignal(false);
 const [noPresetsYet, setNoPresetsYet] = createSignal(false);
+const [presetsUnreadable, setPresetsUnreadable] = createSignal(false);
+const [canMakePreset, setCanMakePreset] = createSignal(false);
 
 const [profileRows, setProfileRows] = createSignal<ProfileRowView[]>([]);
 const [brokenRows, setBrokenRows] = createSignal<BrokenRowView[]>([]);
 const [presetRows, setPresetRows] = createSignal<PresetRowView[]>([]);
+const [templateRows, setTemplateRows] = createSignal<TemplateRowView[]>([]);
 const [presetOptions, setPresetOptions] = createSignal<OptionView[]>([]);
 const [templateOptions, setTemplateOptions] = createSignal<OptionView[]>([]);
 const [noteRows, setNoteRows] = createSignal<NoteView[]>([]);
 
-// ── Derivations (mirror render_profiles.rs; pinned there by unit tests) ────
-
-function profilesSummaryLine(count: number): string {
-  if (count === 0) return "no profiles in games.toml";
-  if (count === 1) return "1 profile in games.toml:";
-  return `${count} profiles in games.toml:`;
-}
-
-function brokenSummaryLine(count: number): string {
-  if (count === 1) return "1 profile points at a program that is not there:";
-  return `${count} profiles point at a program that is not there:`;
-}
-
-function presetsSummaryLine(count: number): string {
-  if (count === 0) return "no presets on disk";
-  if (count === 1) return "1 preset on disk:";
-  return `${count} presets on disk:`;
-}
-
-function templatesSummaryLine(count: number): string {
-  if (count === 1) return "1 in-box template:";
-  return `${count} in-box templates:`;
-}
-
-/** A profile's state as the pill that carries it. `launcher` is deliberately
- *  the neutral pill, not the OK one: preflight cannot check a `steam://` URL,
- *  and a green badge would claim a check ksx did not make. */
-function stateClass(state: string): string {
-  if (state === "broken") return "pill pill-warn";
-  if (state === "launcher") return "pill pill-idle";
-  return "pill pill-ok";
-}
-
-function profileDetailLine(p: ProfileDetail): string {
-  const slots = p.slots === 1 ? "1 slot" : `${p.slots} slots`;
-  if (p.presets.length === 0) return `${slots} — no preset named`;
-  return `${slots} on ${p.presets.join(", ")}`;
-}
-
-function presetDetailLine(p: PresetRow): string {
-  const controls = p.bound === 1 ? "1 control" : `${p.bound} controls`;
-  const macros = p.macros === 0 ? "" : `, ${p.macros} macro(s)`;
-  return `${controls}${macros} — ${p.source}`;
-}
-
 /** Write one /api/profiles payload into every signal (flash excluded — flash
- *  is one-shot action feedback, owned by `applyFlash`). */
+ *  is one-shot action feedback, owned by `applyFlash`).
+ *
+ *  Copy, and nothing else. Every sentence, every pill class, every count and
+ *  both numeric ceilings arrive in `p.view`, composed once by `snapshot.rs`.
+ *  This function deriving ANY of them again would be the drift docs/SURFACES.md
+ *  §1 bans — and the last time it did, the drift was a hardcoded slot ceiling
+ *  the server could not reach. */
 export function applyProfiles(p: ProfilesPayload): void {
-  const view = p.profiles;
-  const presets = p.presets;
-  const session = p.session;
+  const d = p.view;
 
-  setGeneratedAt(view.generated_at);
-  setSessionLine(session.line);
-  setDaemonCmd(
-    session.profile ? `ksx daemon --game "${session.profile}"` : "ksx daemon",
-  );
-  setGamesPath(view.games_path);
-  setPresetRoot(presets.config_root);
-  setProfilesSummary(profilesSummaryLine(view.profiles.length));
-  setPresetsSummary(presetsSummaryLine(presets.presets.length));
-  setTemplatesSummary(templatesSummaryLine(presets.templates.length));
+  setGeneratedAt(p.profiles.generated_at);
+  setSessionLine(p.session.line);
+  setDaemonCmd(d.daemon_cmd);
+  setGamesPath(p.profiles.games_path);
+  setPresetRoot(p.presets.config_root);
+  setProfilesSummary(d.profiles_summary);
+  setBrokenSummary(d.broken_summary);
+  setPresetsSummary(d.presets_summary);
+  setTemplatesSummary(d.templates_summary);
+  setProfilesError(p.profiles_error ?? "");
+  setPresetsError(p.presets_error ?? "");
+  setMaxSlots(String(d.max_slots));
+  setMaxPlayer(String(d.max_player));
 
-  const startable = session.reachable && !session.running;
-  setPillRunning(session.reachable && session.running);
-  setPillIdle(startable);
-  setPillDown(!session.reachable);
-  setNoDaemon(!session.reachable);
-  setRowsLive(startable);
-  setRowsPlain(!startable);
-  setCanMakeProfile(presets.presets.length > 0);
-  setNoPresetsYet(presets.presets.length === 0);
+  setPillRunning(d.pill_running);
+  setPillIdle(d.pill_idle);
+  setPillDown(d.pill_down);
+  setNoDaemon(d.no_daemon);
+  setRowsLive(d.rows_live);
+  setRowsPlain(d.rows_plain);
+  setAnyBroken(d.any_broken);
+  setProfilesUnreadable(d.profiles_unreadable);
+  setCanMakeProfile(d.can_make_profile);
+  setNoPresetsYet(d.no_presets_yet);
+  setPresetsUnreadable(d.presets_unreadable);
+  setCanMakePreset(d.can_make_preset);
+  setAnyNotes(d.any_notes);
 
-  const broken = view.profiles.filter((g) => g.state === "broken");
-  setAnyBroken(broken.length > 0);
-  setBrokenSummary(brokenSummaryLine(broken.length));
-  setBrokenRows(
-    broken.map((g) => ({
-      title: g.title,
-      path: g.broken_path ?? g.path,
-      verdict: g.verdict,
-    })),
-  );
-
-  setProfileRows(
-    view.profiles.map((g) => ({
-      title: g.title,
-      path: g.path,
-      detail: profileDetailLine(g),
-      verdict: g.verdict,
-      statecls: stateClass(g.state),
-      statelabel: g.state,
-    })),
-  );
-
-  setPresetRows(
-    presets.presets.map((r) => ({
-      name: r.name,
-      detail: presetDetailLine(r),
-      statecls: r.protected ? "pill pill-idle" : "pill pill-ok",
-      statelabel: r.protected ? "built-in" : "yours",
-    })),
-  );
-  setPresetOptions(
-    presets.presets.map((r) => ({ value: r.name, label: r.name })),
-  );
-  setTemplateOptions(
-    presets.templates.map((t) => ({
-      value: t.id,
-      label: `${t.id} — ${t.label}`,
-    })),
-  );
-
-  const notes = p.notes ?? [];
-  setAnyNotes(notes.length > 0);
-  setNoteRows(notes.map((line) => ({ line })));
+  setBrokenRows(d.broken_rows);
+  setProfileRows(d.profile_rows);
+  setPresetRows(d.preset_rows);
+  setTemplateRows(d.template_rows);
+  setPresetOptions(d.preset_options);
+  setTemplateOptions(d.template_options);
+  setNoteRows(d.note_rows);
 }
 
 /** The studio server itself stopped answering: say so and stop offering the
@@ -453,6 +456,28 @@ export function ProfilesIsland() {
           "the same verb the tray and `ksx daemon --game` use.",
         ),
         h("p", { class: "cardline mono" }, () => profilesSummary()),
+        // A REFUSED read is not an empty list. Before this box existed, an
+        // unreadable games.toml printed "no profiles in games.toml" here and
+        // put the reason in the last card on the page — a page telling you
+        // your cabinet is empty when what actually happened is that it could
+        // not look. The summary line above says so too; this says why.
+        createShow(
+          () => profilesUnreadable(),
+          () =>
+            h(
+              "div",
+              { class: "warnbox" },
+              h("p", { class: "warn" }, () => profilesError()),
+              h(
+                "p",
+                { class: "cardline" },
+                "Nothing below this line is a statement about your profiles. ",
+                "The file ksx tried to read is ",
+                h("span", { class: "mono" }, () => gamesPath()),
+                ".",
+              ),
+            ),
+        ),
         // Two lists, one signal, one show pair — the status page's shape.
         // A Switch button is only offered when a start could actually be
         // accepted; a dead button rendered as live is the one thing this
@@ -590,6 +615,7 @@ export function ProfilesIsland() {
                   type: "number",
                   name: "slots",
                   min: "1",
+                  // ksx_core::MAX_SLOTS, injected. Never a literal.
                   max: () => maxSlots(),
                   value: "2",
                 }),
@@ -630,6 +656,29 @@ export function ProfilesIsland() {
               ),
             ),
         ),
+        // The THIRD state, and the reason it is not the one above: "make a
+        // preset below first" points at a form whose template <select> is fed
+        // by the same read that just failed. Offering it would be a closed
+        // loop — the only route out of the empty state cannot succeed — with
+        // a sentence on it that claims to know the folder is empty.
+        createShow(
+          () => presetsUnreadable(),
+          () =>
+            h(
+              "div",
+              { class: "warnbox" },
+              h("p", { class: "warn" }, () => presetsError()),
+              h(
+                "p",
+                { class: "cardline" },
+                "This is not an empty presets folder — it is a read that ",
+                "refused, so ksx does not know what is in it. Both forms on ",
+                "this page are withheld until it can be read: creating a ",
+                "profile needs a preset that exists, and creating a preset ",
+                "needs to know the name is free.",
+              ),
+            ),
+        ),
       ),
       // ── PRESETS ───────────────────────────────────────────────────────
       h(
@@ -640,8 +689,12 @@ export function ProfilesIsland() {
           "p",
           { class: "cardline" },
           "A preset is one pad's key map. Slots point at them by name; the ",
-          "mapper edits them. `default` and `empty` are built in and are ",
-          "never overwritten.",
+          "mapper edits them. `default` and `empty` are built in — the ",
+          "\"built-in\" pill marks them — but the pill is not what protects a ",
+          "file: creating from this page never overwrites ANYTHING, yours ",
+          "included. A name that is already taken is refused, and the refusal ",
+          "names `--force`, which is the CLI's consent step for replacing a ",
+          "preset (it takes a timestamped backup first).",
         ),
         h("p", { class: "cardline mono" }, () => presetsSummary()),
         h(
@@ -679,53 +732,90 @@ export function ProfilesIsland() {
           "editable preset file; from then on it is yours.",
         ),
         h("p", { class: "cardline mono" }, () => templatesSummary()),
+        // The summary above ends in a colon and used to be followed by a
+        // FORM. `TemplateRow.detail` — the panel note ksx-api describes as
+        // the thing without which "a template nobody can identify from a list
+        // is a template nobody uses" — was transmitted on every request and
+        // rendered nowhere. Here is the list the colon promised.
         h(
-          "form",
-          { class: "grid", method: "post", action: "/profiles/preset/new" },
-          h(
-            "label",
-            { class: "bindlabel", for: "npr-name" },
-            "name for the new preset",
-            h("input", {
-              id: "npr-name",
-              type: "text",
-              name: "name",
-              required: "",
-              placeholder: "P1 panel",
-            }),
+          "ul",
+          { class: "plist" },
+          createList(
+            () => templateRows(),
+            (t) => t.id,
+            (t) =>
+              h(
+                "li",
+                null,
+                h(
+                  "div",
+                  { class: "pmeta" },
+                  h("span", { class: "ptitle" }, t.id),
+                  h("span", { class: "pdetail" }, t.label),
+                  h("span", { class: "pdetail" }, t.detail),
+                ),
+                h("span", { class: "pill pill-idle" }, t.players),
+              ),
           ),
-          h(
-            "label",
-            { class: "bindlabel", for: "npr-template" },
-            "template",
+        ),
+        createShow(
+          () => canMakePreset(),
+          () =>
             h(
-              "select",
-              { id: "npr-template", name: "template" },
-              createList(
-                () => templateOptions(),
-                (o) => o.value,
-                (o) => h("option", { value: o.value }, o.label),
+              "form",
+              { class: "grid", method: "post", action: "/profiles/preset/new" },
+              h(
+                "label",
+                { class: "bindlabel", for: "npr-name" },
+                "name for the new preset",
+                h("input", {
+                  id: "npr-name",
+                  type: "text",
+                  name: "name",
+                  required: "",
+                  placeholder: "P1 panel",
+                }),
+              ),
+              h(
+                "label",
+                { class: "bindlabel", for: "npr-template" },
+                "template",
+                h(
+                  "select",
+                  { id: "npr-template", name: "template" },
+                  createList(
+                    () => templateOptions(),
+                    (o) => o.value,
+                    (o) => h("option", { value: o.value }, o.label),
+                  ),
+                ),
+              ),
+              h(
+                "label",
+                { class: "bindlabel", for: "npr-player" },
+                "player block — each option above names the range it has",
+                h("input", {
+                  id: "npr-player",
+                  type: "number",
+                  name: "player",
+                  min: "1",
+                  // The widest block any offered template carries, injected.
+                  // It was the literal "4", which matched whichever template
+                  // happened to be widest rather than the one selected — so
+                  // `keyboard-2p` + player 3 was offerable and refused
+                  // server-side. One ceiling cannot express four templates;
+                  // the per-template range is in the option label instead,
+                  // and the backend still refuses what it must.
+                  max: () => maxPlayer(),
+                  value: "1",
+                }),
+              ),
+              h(
+                "button",
+                { class: "btn btn-primary", type: "submit" },
+                "Create preset",
               ),
             ),
-          ),
-          h(
-            "label",
-            { class: "bindlabel", for: "npr-player" },
-            "player block (multi-player templates only)",
-            h("input", {
-              id: "npr-player",
-              type: "number",
-              name: "player",
-              min: "1",
-              max: "4",
-              value: "1",
-            }),
-          ),
-          h(
-            "button",
-            { class: "btn btn-primary", type: "submit" },
-            "Create preset",
-          ),
         ),
         h(
           "p",

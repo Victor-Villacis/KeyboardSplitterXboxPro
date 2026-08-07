@@ -54,7 +54,23 @@ async function submitForm(form: HTMLFormElement): Promise<void> {
       body,
       redirect: "follow", // 303 → GET /profiles?flash=…; the outcome rides res.url
     });
-    applyFlash(new URL(res.url).searchParams.get("flash"));
+    // The outcome rides the REDIRECT. Every route on this page answers a POST
+    // with a 303 carrying `?flash=`, so anything else — a 422 the extractor
+    // produced, a 403 from the same-origin guard, a 500 — has no flash to
+    // read, and `searchParams.get("flash")` would return null, which
+    // `applyFlash` renders as nothing at all. A button that silently does
+    // nothing is the failure this whole page was written to close; it must
+    // not be reachable by any status code, including ones added later.
+    const flash = res.redirected
+      ? new URL(res.url).searchParams.get("flash")
+      : null;
+    if (flash !== null) {
+      applyFlash(flash);
+    } else {
+      applyFlash(
+        `error: ksx studio answered ${res.status} without a result — the form was not accepted, and nothing was written`,
+      );
+    }
   } catch {
     applyFlash("error: request failed — is ksx studio still running?");
   }
