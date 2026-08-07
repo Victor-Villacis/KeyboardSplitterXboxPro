@@ -294,11 +294,21 @@ fn refuse(refusal: &Refusal, json: bool) -> ! {
 
 fn apply_failed(err: &winusb::ApplyError, json: bool) -> ! {
     let hint = err.hint().unwrap_or("");
+    // A driver operation that stops partway leaves the machine in a state the
+    // user did not ask for and cannot see. `recovery()` is the way out, by
+    // hand, with pnputil — printed here because an error the user cannot act
+    // on is the same as no error message at all.
+    let recovery = err.recovery().unwrap_or_default();
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "error": { "code": "pnputil-failed", "message": err.to_string(), "hint": hint }
+                "error": {
+                    "code": "pnputil-failed",
+                    "message": err.to_string(),
+                    "hint": hint,
+                    "recovery": recovery,
+                }
             }))
             .unwrap_or_default()
         );
@@ -306,6 +316,9 @@ fn apply_failed(err: &winusb::ApplyError, json: bool) -> ! {
         eprintln!("FAILED: {err}");
         if !hint.is_empty() {
             eprintln!("\n{hint}");
+        }
+        if !recovery.is_empty() {
+            eprintln!("\n{recovery}");
         }
     }
     std::process::exit(EXIT_APPLY_FAILED);

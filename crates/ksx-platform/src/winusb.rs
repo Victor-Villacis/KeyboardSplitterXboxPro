@@ -1434,6 +1434,20 @@ pub enum ApplyError {
         code: i32,
         output: String,
     },
+    /// Stopped a release BEFORE the rescan, because finishing it would have
+    /// re-claimed the board.
+    ///
+    /// The release order is: remove the devnode, delete the ksx INF from the
+    /// driver store, rescan. That middle step is not optional — the generated
+    /// INF matches on hardware id and outranks the in-box `input.inf`, so a
+    /// rescan performed while it is still in the store binds WinUSB straight
+    /// back on. If ksx cannot confirm the INF is gone, rescanning would undo
+    /// the release and report success for it.
+    #[error(
+        "released the devnode but could not confirm the ksx INF is out of the driver store \
+         ({reason}) — stopping before the rescan, because a rescan now could re-claim the board"
+    )]
+    ReleaseUnconfirmed { reason: String, instance_id: String },
 }
 
 impl ApplyError {
@@ -1454,6 +1468,36 @@ impl ApplyError {
             return Some("run from an elevated prompt: pnputil needs an administrator token.");
         }
         None
+    }
+
+    /// What the machine looks like right now, and how to finish by hand.
+    ///
+    /// A release that stops partway leaves a devnode removed and a board that
+    /// is neither claimed nor a keyboard until something rescans — which is
+    /// exactly the moment a user needs instructions rather than a stack trace.
+    pub fn recovery(&self) -> Option<String> {
+        match self {
+            ApplyError::ReleaseUnconfirmed { instance_id, .. } => Some(format!(
+                concat!(
+                    "The devnode was removed, so the board is currently bound to nothing. ",
+                    "To finish by hand from an elevated prompt:\n",
+                    "\n  pnputil /enum-drivers    # find the ksx oemNN.inf",
+                    "\n  pnputil /delete-driver oemNN.inf /uninstall /force",
+                    "\n  pnputil /scan-devices    # the keyboard driver binds again\n",
+                    "\nIf you rescan WITHOUT deleting the INF, {} goes straight back to ",
+                    "WinUSB. docs/RECOVERY.md §2.",
+                ),
+                instance_id
+            )),
+            ApplyError::Failed { .. } => Some(
+                "A release that failed partway may have removed the devnode already. \
+                 `pnputil /scan-devices` from an elevated prompt re-enumerates; if the board \
+                 comes back on winusb.sys rather than the keyboard driver, the ksx INF is \
+                 still in the store — see docs/RECOVERY.md §2."
+                    .to_owned(),
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -1511,35 +1555,88 @@ pub fn apply_claim(plan: &ClaimPlan) -> Result<Vec<String>, ApplyError> {
     plan.commands.iter().map(run_command).collect()
 }
 
+/// What `/enum-drivers` was able to say about the ksx INF.
+///
+/// The distinction is the whole point. "Not in the store" and "I could not find
+/// out" both used to arrive as `None`, and both then skipped the delete and
+/// rescanned — but only one of them is safe to rescan after.
+enum OemLookup {
+    /// Published as this `oemNN.inf`; delete it.
+    Published(String),
+    /// `/enum-drivers` answered and the ksx INF is not there. Nothing to
+    /// delete, and a rescan will bind the keyboard driver. This is the good
+    /// case, including a second `release` of a board already released.
+    NotInStore,
+    /// `/enum-drivers` could not be run or could not be read. We do not know
+    /// whether the INF is still in the store, so we must not rescan.
+    Unknown(String),
+}
+
 /// Run the release commands, resolving `<oemNN.inf>` from the live driver store
-/// on the way past. Steps whose oem name cannot be resolved are skipped with a
-/// note rather than run with a placeholder.
+/// on the way past.
+///
+/// # Why this refuses to finish rather than pushing on
+///
+/// The sequence is: remove the devnode, delete the ksx INF, rescan. The middle
+/// step is marked REQUIRED in [`release_commands`] for a concrete reason — the
+/// generated INF matches on hardware id and outranks the in-box `input.inf`, so
+/// a rescan while it is still in the driver store binds WinUSB straight back
+/// on.
+///
+/// This function used to swallow a failed `/enum-drivers` with `.ok()?`, treat
+/// it as "no INF found", skip the delete with a log line, run the rescan
+/// anyway, and return `Ok`. The rescan re-claimed the board; ksx reported the
+/// release succeeded. The user is then told their keyboard is back while it is
+/// still off the input stack — the single worst thing this module can say,
+/// because the whole point of `release` is being able to trust it.
 pub fn apply_release(plan: &ReleasePlan) -> Result<Vec<String>, ApplyError> {
     let mut log = Vec::new();
-    let oem = plan.inf_file.as_deref().and_then(|inf| {
-        let listing = run_command(&PlannedCommand::pnputil(&["/enum-drivers"], "")).ok()?;
-        let drivers = parse_enum_drivers(&listing);
-        store_drivers_matching(&drivers, inf)
-            .first()
-            .map(|d| d.published_name.clone())
-    });
+    let oem = match plan.inf_file.as_deref() {
+        None => OemLookup::NotInStore,
+        Some(inf) => match run_command(&PlannedCommand::pnputil(&["/enum-drivers"], "")) {
+            Err(err) => OemLookup::Unknown(format!("pnputil /enum-drivers failed: {err}")),
+            Ok(listing) => {
+                let drivers = parse_enum_drivers(&listing);
+                match store_drivers_matching(&drivers, inf).first() {
+                    Some(found) => OemLookup::Published(found.published_name.clone()),
+                    None if drivers.is_empty() => OemLookup::Unknown(
+                        "pnputil /enum-drivers listed no drivers at all, which is not a state \
+                         Windows reports for a working machine — the output could not be read"
+                            .to_owned(),
+                    ),
+                    None => OemLookup::NotInStore,
+                }
+            }
+        },
+    };
 
     for cmd in &plan.commands {
         if cmd.args.first().map(String::as_str) == Some("/enum-drivers") {
             continue; // already done above
         }
         if cmd.args.iter().any(|a| a == "<oemNN.inf>") {
-            let Some(oem) = &oem else {
-                log.push(
-                    "skipped /delete-driver: no matching ksx INF is in the driver store".to_owned(),
-                );
-                continue;
-            };
-            let resolved = PlannedCommand::pnputil(
-                &["/delete-driver", oem, "/uninstall", "/force"],
-                "remove the ksx INF so a rescan cannot re-bind WinUSB",
-            );
-            log.push(run_command(&resolved)?);
+            match &oem {
+                OemLookup::Published(oem) => {
+                    let resolved = PlannedCommand::pnputil(
+                        &["/delete-driver", oem, "/uninstall", "/force"],
+                        "remove the ksx INF so a rescan cannot re-bind WinUSB",
+                    );
+                    log.push(run_command(&resolved)?);
+                }
+                OemLookup::NotInStore => log.push(
+                    "nothing to delete: the ksx INF is not in the driver store, so a rescan \
+                     binds the keyboard driver"
+                        .to_owned(),
+                ),
+                // Stop here, with the devnode already removed. Continuing would
+                // run the rescan, and a rescan is exactly what re-claims.
+                OemLookup::Unknown(reason) => {
+                    return Err(ApplyError::ReleaseUnconfirmed {
+                        reason: reason.clone(),
+                        instance_id: plan.instance_id.clone(),
+                    })
+                }
+            }
             continue;
         }
         log.push(run_command(cmd)?);
@@ -1998,6 +2095,58 @@ mod tests {
             survey.keyboard_count(),
             3,
             "two I-PACs and the spare are three keyboards, not one model"
+        );
+    }
+
+    /// The release order is load-bearing, and the plan says so.
+    ///
+    /// `/delete-driver` sits between removing the devnode and rescanning
+    /// because the ksx INF outranks the in-box `input.inf` on the same hardware
+    /// id: rescan with it still in the store and WinUSB binds straight back on.
+    /// This pins the order so a future edit cannot quietly reorder the step
+    /// that makes the release stick.
+    #[test]
+    fn the_ksx_inf_is_deleted_before_the_rescan_not_after() {
+        let commands = release_commands(
+            r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000",
+            Some("ksx-usb-vid_d209-pid_0430-mi_00.inf"),
+        );
+        let verbs: Vec<&str> = commands
+            .iter()
+            .filter_map(|c| c.args.first().map(String::as_str))
+            .collect();
+        assert_eq!(
+            verbs,
+            vec![
+                "/remove-device",
+                "/enum-drivers",
+                "/delete-driver",
+                "/scan-devices"
+            ],
+            "a rescan before the INF is deleted re-claims the board"
+        );
+    }
+
+    /// The recovery text is part of the contract, not decoration: this error
+    /// only happens with the devnode already removed, so the user is holding a
+    /// board bound to nothing and needs the three commands that finish the job.
+    #[test]
+    fn an_unconfirmed_release_says_what_state_the_machine_is_in() {
+        let err = ApplyError::ReleaseUnconfirmed {
+            reason: "pnputil /enum-drivers failed: access denied".to_owned(),
+            instance_id: r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000".to_owned(),
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("stopping before the rescan"),
+            "say that it stopped, and where: {message}"
+        );
+        let recovery = err.recovery().expect("this error must carry a way out");
+        assert!(recovery.contains("/delete-driver"), "{recovery}");
+        assert!(recovery.contains("/scan-devices"), "{recovery}");
+        assert!(
+            recovery.contains("goes straight back to WinUSB"),
+            "the user must be told why the order matters: {recovery}"
         );
     }
 
