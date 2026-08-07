@@ -524,6 +524,623 @@ pub fn prune(_yes: bool, _json: bool) -> anyhow::Result<()> {
     anyhow::bail!("`ksx pads --prune` restarts a Windows bus device and is Windows-only")
 }
 
+// ---------------------------------------------------------------------------
+// The same two verbs, called by a SURFACE instead of a console
+// ---------------------------------------------------------------------------
+
+/// `ksx pads` and `ksx pads --prune` for a caller that has no stdout, no exit
+/// code and no Ctrl+C.
+///
+/// Everything here is the DECISION half — pure, total, and tested in CI with
+/// no ViGEmBus anywhere near it, exactly like [`plan_prune`] above. The only
+/// Windows-only thing in the module is [`plug_and_hold`], which is the driver
+/// plumbing the decision authorises.
+///
+/// Two properties the console versions got for free and a surface does not:
+///
+/// - **An end.** `ksx pads` holds the pattern until `--hold-secs` expires or
+///   the user presses Ctrl+C. A web page has neither, so the hold is part of
+///   the spec and every plug schedules its own unplug.
+/// - **A judgement about the session.** The CLI trusts whoever typed the
+///   command to know emulation is stopped. Nothing on a page carries that
+///   knowledge, so [`plan_spawn`] refuses while a session is live — the same
+///   refusal, and for the same reason, [`plan_prune`] already makes.
+///
+/// What it deliberately does NOT do is refuse a count above the XInput
+/// ceiling. `ksx pads --count 8 --persona xbox360` plugs eight pads today and
+/// four of them are invisible to every game (open task #16); changing that is
+/// that task's job. What this adds is the sentence saying so, attached to the
+/// option that would cause it, so a surface can warn BEFORE the click without
+/// knowing why four is the number.
+#[cfg_attr(not(any(feature = "studio", feature = "cabinet")), allow(dead_code))]
+pub mod surface {
+    use ksx_core::{Persona, MAX_SLOTS, MAX_XINPUT_SLOTS};
+
+    use super::{PruneMode, PrunePlan};
+
+    /// The longest hold a surface may ask for. Two minutes is long enough to
+    /// walk to joy.cpl and back and short enough that a forgotten tab does not
+    /// leave pads on the bus all afternoon.
+    pub const MAX_HOLD_SECS: u64 = 120;
+
+    /// The holds offered, in seconds, shortest first — so the default a
+    /// `<select>` picks on its own is the CLI's own `--hold-secs 10`. One
+    /// default for both surfaces beats a defensible reason for two.
+    const HOLD_CHOICES: [u64; 4] = [10, 30, 60, 120];
+
+    /// What a spawn would do, decided before ViGEmBus is opened.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum SpawnPlan {
+        /// Emulation is live. Those four XInput slots are the ones a player is
+        /// using, and a test pad would take one out of their hands.
+        SessionRunning,
+        /// This build cannot create that persona at all
+        /// ([`Persona::can_plug`]) — a driver install does not change it.
+        PersonaNotImplemented { persona: Persona },
+        /// Outside `1..=MAX_SLOTS`.
+        BadCount { given: u8 },
+        /// Outside `1..=MAX_HOLD_SECS`.
+        BadHold { given: u64 },
+        /// Plug them, hold the pattern, unplug.
+        Plug {
+            count: u8,
+            persona: Persona,
+            hold_secs: u64,
+            /// How many of the requested pads no game will be able to read,
+            /// because the XInput slots ran out. Zero for HID personas, and
+            /// zero is the normal answer.
+            unreadable: u8,
+        },
+    }
+
+    /// Decide, given what the caller asked for and what the machine is doing.
+    ///
+    /// `xinput_in_use` is the count of pads ALREADY on the bus that hold an
+    /// XInput slot — the input a page cannot compute for itself, and the one
+    /// that makes "4 pads" a different promise on a busy cabinet than on an
+    /// idle one.
+    pub fn plan_spawn(
+        count: u8,
+        persona: Persona,
+        hold_secs: u64,
+        session_running: bool,
+        xinput_in_use: u8,
+    ) -> SpawnPlan {
+        if session_running {
+            return SpawnPlan::SessionRunning;
+        }
+        if count == 0 || count > MAX_SLOTS {
+            return SpawnPlan::BadCount { given: count };
+        }
+        if hold_secs == 0 || hold_secs > MAX_HOLD_SECS {
+            return SpawnPlan::BadHold { given: hold_secs };
+        }
+        if !persona.can_plug() {
+            return SpawnPlan::PersonaNotImplemented { persona };
+        }
+        SpawnPlan::Plug {
+            count,
+            persona,
+            hold_secs,
+            unreadable: unreadable_count(count, persona, xinput_in_use),
+        }
+    }
+
+    /// XInput slots still free for a NEW pad.
+    pub fn xinput_free(xinput_in_use: u8) -> u8 {
+        MAX_XINPUT_SLOTS.saturating_sub(xinput_in_use)
+    }
+
+    /// How many of `count` pads of this persona no game could read.
+    fn unreadable_count(count: u8, persona: Persona, xinput_in_use: u8) -> u8 {
+        if persona.is_xinput() {
+            count.saturating_sub(xinput_free(xinput_in_use))
+        } else {
+            0
+        }
+    }
+
+    impl SpawnPlan {
+        /// The stable code a refusal carries; `None` when nothing is refused.
+        pub fn code(&self) -> Option<&'static str> {
+            match self {
+                SpawnPlan::SessionRunning => Some("session-running"),
+                SpawnPlan::PersonaNotImplemented { .. } => Some("persona-not-implemented"),
+                SpawnPlan::BadCount { .. } => Some("bad-count"),
+                SpawnPlan::BadHold { .. } => Some("bad-hold"),
+                SpawnPlan::Plug { .. } => None,
+            }
+        }
+
+        /// ONE SENTENCE. Studio caps a flash at 300 characters and truncates
+        /// the rest silently, so nothing here is allowed to be a paragraph —
+        /// the page renders the long form from [`spawn_offer`] instead.
+        pub fn message(&self) -> String {
+            match self {
+                SpawnPlan::SessionRunning => "a session is running, and those pads are the ones \
+                     it is driving — stop emulation first"
+                    .to_owned(),
+                SpawnPlan::PersonaNotImplemented { persona } => {
+                    format!("this build of ksx cannot create a {} pad", persona.label())
+                }
+                SpawnPlan::BadCount { given } => {
+                    format!("pad count must be 1..={MAX_SLOTS}, got {given}")
+                }
+                SpawnPlan::BadHold { given } => {
+                    format!("hold must be 1..={MAX_HOLD_SECS} seconds, got {given}")
+                }
+                SpawnPlan::Plug {
+                    count,
+                    persona,
+                    hold_secs,
+                    unreadable,
+                } => {
+                    let head = format!(
+                        "{count} {} pad(s) plugged — they unplug themselves in {hold_secs}s",
+                        persona.as_str()
+                    );
+                    match unreadable {
+                        0 => format!("{head}."),
+                        n => format!(
+                            "{head}. {n} of them are past Windows' {MAX_XINPUT_SLOTS} XInput \
+                             slots and no game can read those."
+                        ),
+                    }
+                }
+            }
+        }
+
+        /// The command that carries this out where it is not refused, so a
+        /// refusal is never a dead end.
+        pub fn remedy(&self) -> Option<String> {
+            match self {
+                SpawnPlan::SessionRunning => Some("run `ksx session stop`".to_owned()),
+                SpawnPlan::PersonaNotImplemented { .. } => None,
+                SpawnPlan::BadCount { .. } | SpawnPlan::BadHold { .. } => {
+                    Some("pick a value from the list".to_owned())
+                }
+                SpawnPlan::Plug { .. } => None,
+            }
+        }
+    }
+
+    /// The XInput ceiling, stated for THIS machine right now — the sentence
+    /// task #16 exists because nothing said.
+    ///
+    /// `unknown` is how many pads the bus reports that ksx could not classify.
+    /// They are not counted as XInput (guessing would be worse), but a free
+    /// count computed without them is optimistic and the sentence says so
+    /// rather than quietly being wrong.
+    pub fn xinput_line(xinput_in_use: u8, unknown: usize) -> String {
+        let free = xinput_free(xinput_in_use);
+        let mut line = format!(
+            "Windows exposes exactly {MAX_XINPUT_SLOTS} XInput slots and no virtual bus can \
+             create a fifth. {xinput_in_use} of them {} held by pads already on the bus, so {} \
+             more xbox360 pad(s) will be readable. PlayStation pads are plain HID and use none \
+             of the four.",
+            if xinput_in_use == 1 { "is" } else { "are" },
+            free
+        );
+        if free == 0 {
+            line.push_str(" Anything asked for now still plugs — and no game will see it.");
+        }
+        if unknown > 0 {
+            line.push_str(&format!(
+                " {unknown} pad(s) on the bus could not be classified; if any of them are XInput \
+                 the free count above is optimistic."
+            ));
+        }
+        line
+    }
+
+    /// One `<option>` label for a pad count, with its consequence attached.
+    ///
+    /// This is the whole point of the offer being backend-owned: the label for
+    /// "8" is different on a machine with two XInput pads already plugged, and
+    /// no surface should have to know that.
+    pub fn count_label(count: u8, free: u8) -> String {
+        let noun = if count == 1 { "pad" } else { "pads" };
+        if count <= free {
+            return format!("{count} {noun}");
+        }
+        match free {
+            0 => format!("{count} {noun} — none readable (XInput slots are full)"),
+            n => format!(
+                "{count} {noun} — only {n} readable, {} invisible to games (XInput)",
+                count - n
+            ),
+        }
+    }
+
+    /// One `<option>` label for a persona.
+    pub fn persona_label(persona: Persona) -> String {
+        if persona.is_xinput() {
+            format!(
+                "{} — takes one of the {MAX_XINPUT_SLOTS} XInput slots",
+                persona.as_str()
+            )
+        } else {
+            format!("{} — plain HID, takes no XInput slot", persona.as_str())
+        }
+    }
+
+    /// One `<option>` label for a hold.
+    pub fn hold_label(secs: u64) -> String {
+        format!("{secs} seconds")
+    }
+
+    /// One line: how many pads the bus is carrying.
+    pub fn summary_line(count: usize) -> String {
+        match count {
+            0 => "no virtual pads on the ViGEm bus".to_owned(),
+            1 => "1 virtual pad on the ViGEm bus:".to_owned(),
+            n => format!("{n} virtual pads on the ViGEm bus:"),
+        }
+    }
+
+    /// The whole spawn offer, every option already labelled.
+    pub fn spawn_offer(session_running: bool, xinput_in_use: u8) -> ksx_api::SpawnOffer {
+        let free = xinput_free(xinput_in_use);
+        ksx_api::SpawnOffer {
+            counts: (1..=MAX_SLOTS)
+                .map(|n| ksx_api::SpawnOption {
+                    value: n.to_string(),
+                    label: count_label(n, free),
+                })
+                .collect(),
+            personas: Persona::ALL
+                .iter()
+                .copied()
+                .filter(|p| p.can_plug())
+                .map(|p| ksx_api::SpawnOption {
+                    value: p.as_str().to_owned(),
+                    label: persona_label(p),
+                })
+                .collect(),
+            holds: HOLD_CHOICES
+                .iter()
+                .map(|s| ksx_api::SpawnOption {
+                    value: s.to_string(),
+                    label: hold_label(*s),
+                })
+                .collect(),
+            note: format!(
+                "A spawn is a TEST: the pads plug, run the A/B/X/Y + stick pattern so you can \
+                 see them move in joy.cpl, then unplug themselves when the hold expires. \
+                 Nothing is written to config, and the longest hold is {MAX_HOLD_SECS}s."
+            ),
+            refused: session_running.then(|| SpawnPlan::SessionRunning.message()),
+        }
+    }
+
+    /// [`PrunePlan`] on the wire, so no surface re-decides whether a bus
+    /// restart is allowed.
+    pub fn prune_plan_view(plan: &PrunePlan) -> ksx_api::PrunePlanView {
+        let (kind, count) = match plan {
+            PrunePlan::Nothing => ("nothing", 0),
+            PrunePlan::NoBus => ("no-bus", 0),
+            PrunePlan::SessionRunning { count } => ("session-running", *count),
+            PrunePlan::Restart { count, .. } => ("restart", *count),
+        };
+        ksx_api::PrunePlanView {
+            kind: kind.to_owned(),
+            count,
+            command: plan.command(),
+            detail: plan.render(PruneMode::DryRun),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The refusal that matters, and the one the CLI never had to make:
+        /// whoever typed `ksx pads` knew emulation was stopped. A page click
+        /// carries no such knowledge, so the plan makes the judgement.
+        #[test]
+        fn a_running_session_refuses_a_spawn_before_the_bus_is_opened() {
+            let plan = plan_spawn(4, Persona::Xbox360, 30, true, 0);
+            assert_eq!(plan, SpawnPlan::SessionRunning);
+            assert_eq!(plan.code(), Some("session-running"));
+            assert!(
+                plan.remedy()
+                    .is_some_and(|r| r.contains("ksx session stop")),
+                "a refusal with no way forward is just an error message"
+            );
+        }
+
+        /// Task #16, as the page sees it: over the ceiling is a WARNING, not a
+        /// refusal. Changing that is #16's job; saying it is this module's.
+        #[test]
+        fn eight_xbox_pads_are_allowed_and_four_of_them_are_named_unreadable() {
+            let plan = plan_spawn(8, Persona::Xbox360, 30, false, 0);
+            assert_eq!(
+                plan,
+                SpawnPlan::Plug {
+                    count: 8,
+                    persona: Persona::Xbox360,
+                    hold_secs: 30,
+                    unreadable: 4,
+                }
+            );
+            assert_eq!(plan.code(), None, "over the ceiling is not a refusal");
+            let message = plan.message();
+            assert!(message.contains('4'), "{message}");
+            assert!(message.contains("no game can read"), "{message}");
+        }
+
+        /// Pads already on the bus eat the same four slots.
+        #[test]
+        fn pads_already_on_the_bus_reduce_what_a_new_spawn_can_be_read_as() {
+            let plan = plan_spawn(4, Persona::Xbox360, 30, false, 2);
+            let SpawnPlan::Plug { unreadable, .. } = plan else {
+                panic!("expected a plug: {plan:?}");
+            };
+            assert_eq!(unreadable, 2);
+            assert_eq!(xinput_free(2), 2);
+            assert_eq!(xinput_free(9), 0, "saturating, never wrapping");
+        }
+
+        /// PlayStation pads are plain HID: eight of them is eight readable
+        /// pads, which is the whole reason MAX_SLOTS and MAX_XINPUT_SLOTS are
+        /// different numbers.
+        #[test]
+        fn playstation_pads_never_count_against_the_xinput_ceiling() {
+            let plan = plan_spawn(8, Persona::PlayStation, 30, false, 4);
+            let SpawnPlan::Plug { unreadable, .. } = plan else {
+                panic!("expected a plug: {plan:?}");
+            };
+            assert_eq!(unreadable, 0);
+        }
+
+        /// A persona this build cannot create is refused before ViGEmBus is
+        /// opened — a build limitation must never arrive shaped like a driver
+        /// problem (the same ordering `run` keeps).
+        #[test]
+        fn an_unimplementable_persona_is_refused_and_not_offered() {
+            let plan = plan_spawn(1, Persona::DualSense, 30, false, 0);
+            assert_eq!(plan.code(), Some("persona-not-implemented"));
+            let offered: Vec<String> = spawn_offer(false, 0)
+                .personas
+                .into_iter()
+                .map(|o| o.value)
+                .collect();
+            assert!(
+                !offered.iter().any(|v| v == "dualsense"),
+                "a menu must not offer what the plan refuses: {offered:?}"
+            );
+            assert!(offered.iter().any(|v| v == "xbox360"), "{offered:?}");
+        }
+
+        #[test]
+        fn counts_and_holds_are_bounded() {
+            assert_eq!(
+                plan_spawn(0, Persona::Xbox360, 30, false, 0).code(),
+                Some("bad-count")
+            );
+            assert_eq!(
+                plan_spawn(MAX_SLOTS + 1, Persona::Xbox360, 30, false, 0).code(),
+                Some("bad-count")
+            );
+            assert_eq!(
+                plan_spawn(4, Persona::Xbox360, 0, false, 0).code(),
+                Some("bad-hold")
+            );
+            assert_eq!(
+                plan_spawn(4, Persona::Xbox360, MAX_HOLD_SECS + 1, false, 0).code(),
+                Some("bad-hold")
+            );
+        }
+
+        /// The warning has to reach the user BEFORE the click, and a dropdown
+        /// entry reading "8" says nothing. Every offered count above the free
+        /// slots carries its own consequence.
+        #[test]
+        fn every_over_ceiling_count_option_says_so_in_its_own_label() {
+            let offer = spawn_offer(false, 0);
+            assert_eq!(offer.counts.len(), usize::from(MAX_SLOTS));
+            for option in &offer.counts {
+                let count: u8 = option.value.parse().unwrap();
+                if count > MAX_XINPUT_SLOTS {
+                    assert!(
+                        option.label.contains("invisible to games"),
+                        "count {count} must warn in its own label: {}",
+                        option.label
+                    );
+                } else {
+                    assert!(
+                        !option.label.contains("invisible"),
+                        "count {count} is readable and must not cry wolf: {}",
+                        option.label
+                    );
+                }
+            }
+        }
+
+        /// A full bus makes EVERY count unreadable, and the label says "none"
+        /// rather than "0 readable".
+        #[test]
+        fn a_full_bus_labels_every_count_as_unreadable() {
+            let offer = spawn_offer(false, MAX_XINPUT_SLOTS);
+            for option in &offer.counts {
+                assert!(option.label.contains("none readable"), "{}", option.label);
+            }
+        }
+
+        /// A live session must disable the whole panel, not just fail on
+        /// submit — the offer says so itself.
+        #[test]
+        fn a_running_session_refuses_the_offer_not_just_the_submit() {
+            assert!(spawn_offer(true, 0).refused.is_some());
+            assert!(spawn_offer(false, 0).refused.is_none());
+        }
+
+        /// The ceiling sentence must name the number, the pads holding it and
+        /// what is left — and must not silently ignore pads it cannot classify.
+        #[test]
+        fn the_ceiling_sentence_states_the_numbers_and_owns_its_uncertainty() {
+            let clean = xinput_line(2, 0);
+            assert!(clean.contains('4'), "{clean}");
+            assert!(clean.contains("2 of them are held"), "{clean}");
+            assert!(!clean.contains("optimistic"), "{clean}");
+
+            let murky = xinput_line(2, 3);
+            assert!(murky.contains("optimistic"), "{murky}");
+
+            let full = xinput_line(4, 0);
+            assert!(full.contains("no game will see it"), "{full}");
+        }
+
+        /// Every plan's message is one line and fits a Studio flash (300
+        /// chars, truncated silently past that).
+        #[test]
+        fn every_spawn_message_survives_a_flash() {
+            for plan in [
+                plan_spawn(4, Persona::Xbox360, 30, true, 0),
+                plan_spawn(0, Persona::Xbox360, 30, false, 0),
+                plan_spawn(4, Persona::Xbox360, 0, false, 0),
+                plan_spawn(1, Persona::DualSense, 30, false, 0),
+                plan_spawn(16, Persona::Xbox360, 120, false, 0),
+            ] {
+                let message = plan.message();
+                assert!(message.chars().count() <= 300, "{message}");
+                assert!(!message.contains('\n'), "{message}");
+            }
+        }
+
+        /// The prune decision crosses to the wire unchanged, kind included —
+        /// a surface keys its panels off `kind`, never off the prose.
+        #[test]
+        fn the_prune_plan_reaches_the_wire_with_its_kind_and_its_command() {
+            let bus = r"ROOT\SYSTEM\0002";
+            let view = prune_plan_view(&super::super::plan_prune(Some(bus), 15, false));
+            assert_eq!(view.kind, "restart");
+            assert_eq!(view.count, 15);
+            assert!(view.command.is_some_and(|c| c.contains("pnputil")));
+            assert!(view.detail.contains("15"), "{}", view.detail);
+
+            let busy = prune_plan_view(&super::super::plan_prune(Some(bus), 4, true));
+            assert_eq!(busy.kind, "session-running");
+            assert_eq!(
+                busy.command, None,
+                "a refusal must not hand over the command that does it anyway"
+            );
+
+            assert_eq!(
+                prune_plan_view(&super::super::plan_prune(Some(bus), 0, false)).kind,
+                "nothing"
+            );
+            assert_eq!(
+                prune_plan_view(&super::super::plan_prune(None, 3, false)).kind,
+                "no-bus"
+            );
+        }
+
+        #[test]
+        fn summary_line_counts_in_words() {
+            assert_eq!(summary_line(0), "no virtual pads on the ViGEm bus");
+            assert!(summary_line(1).starts_with("1 virtual pad on"));
+            assert!(summary_line(7).starts_with("7 virtual pads on"));
+        }
+    }
+
+    /// Plug `count` pads, run the visible pattern for `hold_secs`, unplug —
+    /// with no printing, no exit code and no Ctrl+C latch.
+    ///
+    /// [`super::run`] is the console command and cannot be reused: it prints
+    /// its rows, it `std::process::exit`s on a missing driver, and its pattern
+    /// loop polls a `SetConsoleCtrlHandler` latch that a long-lived GUI
+    /// process must not have installed. This is the same three steps for a
+    /// caller that lives inside another process.
+    ///
+    /// **The plug is synchronous and the hold is not.** A surface that
+    /// returned "4 pads plugged" and then discovered ViGEmBus was missing on a
+    /// background thread would have lied to the user; a surface that blocked
+    /// for the whole hold would be unusable. So the driver is opened and every
+    /// pad is plugged before this returns, and only the pattern + unplug run
+    /// on the thread — which also means the handles outlive this call, because
+    /// a pad exists exactly as long as the handle that made it.
+    #[cfg(windows)]
+    pub fn plug_and_hold(count: u8, persona: Persona, hold_secs: u64) -> Result<(), PlugError> {
+        use std::time::{Duration, Instant};
+
+        use ksx_core::PadState;
+        use ksx_output::{OutputError, RoutedBackend, VigemBackend, VirtualPadBackend as _};
+
+        // Refused before ViGEmBus is opened, exactly as `run` does it: a build
+        // limitation must not arrive after a driver handshake wearing a driver
+        // problem's clothes.
+        if !persona.can_plug() {
+            return Err(OutputError::PersonaNotImplemented(persona).into());
+        }
+        let vigem = VigemBackend::connect()?;
+        let mut backend = RoutedBackend::standard(Box::new(vigem));
+        let mut handles = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            match backend.plug_persona(persona) {
+                Ok(handle) => handles.push(handle),
+                Err(err) => {
+                    // Half a spawn is worse than none: it leaves pads nobody
+                    // asked for on the bus AND reports a failure. Undo, then
+                    // fail.
+                    for handle in handles {
+                        let _ = backend.unplug(handle);
+                    }
+                    return Err(err.into());
+                }
+            }
+        }
+
+        std::thread::Builder::new()
+            .name("ksx-pad-test".to_owned())
+            .spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(hold_secs);
+                let mut tick: u64 = 0;
+                while Instant::now() < deadline {
+                    let state = super::pattern_state(tick);
+                    for &handle in &handles {
+                        if let Err(err) = backend.update(handle, &state) {
+                            tracing::warn!(%err, ?handle, "pad-test pattern update failed");
+                        }
+                    }
+                    tick += 1;
+                    std::thread::sleep(super::TICK);
+                }
+                for handle in handles {
+                    // Released before the unplug so nothing is left "pressed",
+                    // and unplugged even if the release failed — a pad left on
+                    // the bus is precisely the ghost `--prune` exists to clear.
+                    let _ = backend.update(handle, &PadState::default());
+                    if let Err(err) = backend.unplug(handle) {
+                        tracing::warn!(%err, ?handle, "pad-test unplug failed");
+                    }
+                }
+            })
+            // A spawn that cannot get a thread has already plugged the pads,
+            // and nothing would ever unplug them. Say so, do not leave ghosts.
+            .map_err(PlugError::HoldThread)?;
+        Ok(())
+    }
+
+    /// Why [`plug_and_hold`] did not leave pads running.
+    ///
+    /// Two members and they are not the same news. Everything the driver
+    /// refuses left the bus exactly as it found it; [`PlugError::HoldThread`]
+    /// means the pads ARE on the bus with nothing scheduled to remove them,
+    /// which is the one outcome that needs the prune command in its message.
+    #[cfg(windows)]
+    #[derive(Debug, thiserror::Error)]
+    pub enum PlugError {
+        #[error(transparent)]
+        Output(#[from] ksx_output::OutputError),
+        #[error(
+            "the pads are plugged but the hold thread could not start ({0}) — run \
+             `ksx pads --prune` to clear them"
+        )]
+        HoldThread(std::io::Error),
+    }
+}
+
 #[cfg(test)]
 mod prune_tests {
     use super::*;

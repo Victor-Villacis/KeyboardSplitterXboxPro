@@ -4241,6 +4241,25 @@ mod tests {
         assert!(out.html.contains(r#"href="/setup""#), "{}", out.html);
     }
 
+    /// The nav rail reaches every screen from here.
+    ///
+    /// It is STATIC MARKUP inside this page's own island — there is no shared
+    /// nav component and nothing server-injected — so a new page is invisible
+    /// from the mapper until `MapIsland.ts` is edited, with nothing anywhere to
+    /// report the omission. This test is that report.
+    #[test]
+    fn the_nav_reaches_every_screen() {
+        let out = render_map(&page(), &sample(), None);
+        for href in [r#"href="/""#, r#"href="/pads""#] {
+            assert!(out.html.contains(href), "missing {href}: {}", out.html);
+        }
+        assert!(
+            out.html.contains(r#"aria-current="page""#),
+            "the current screen must be marked: {}",
+            out.html
+        );
+    }
+
     /// v9, the headline: with JavaScript switched off the page is still a
     /// working mapper. Every control owns a real `<form method="post">` — a
     /// key picker, a Bind submit and a Clear submit — and every other action

@@ -101,6 +101,7 @@ mod guard;
 mod render;
 mod render_devices;
 mod render_map;
+mod render_pads;
 mod render_profiles;
 mod render_setup;
 mod server;
@@ -114,6 +115,6 @@ pub use error::StudioError;
 pub use server::serve;
 pub use snapshot::{
     DevicesPayload, MacroSnapshot, MacroStepView, MacroView, MapPayload, MapperSlot,
-    MapperSnapshot, PadRow, ProfileRow, ProfilesPayload, SetupFlags, SetupLines, SetupPayload,
-    SetupRows, SetupSnapshot, StatusSnapshot, StatusSource,
+    MapperSnapshot, PadRow, PadsPayload, ProfileRow, ProfilesPayload, SetupFlags, SetupLines,
+    SetupPayload, SetupRows, SetupSnapshot, StatusSnapshot, StatusSource,
 };

@@ -43,12 +43,15 @@ pub fn run(port: u16) -> anyhow::Result<()> {
         bind,
         Box::new(CollectorSource),
         Box::new(control_source()),
-        // The third provider: the MACHINE verbs — `/devices` and `/profiles`,
-        // plus the config in and out and the first-run state `/setup` reads.
-        // Daemon-free by construction — it walks the USB tree and the config
-        // store directly, never the pipe — which is why none of it is on
-        // `ControlSource`: every one of these pages keeps working behind the
-        // "No daemon" banner that disables the session controls.
+        // The third provider: the MACHINE verbs — `/devices`, `/profiles` and
+        // `/pads`, plus the config in and out and the first-run state `/setup`
+        // reads. Daemon-free by construction — it walks the USB tree, the
+        // config store and the ViGEm bus directly — which is why none of it is
+        // on `ControlSource`: every one of these pages keeps working behind the
+        // "No daemon" banner that disables the session controls. (The two pad
+        // WRITES do ask the pipe whether a session is live before acting, but
+        // an unreachable daemon answers "no session" there, so /pads never
+        // goes dark with the pipe dead.)
         Box::new(LocalMachine),
     )?;
     Ok(())

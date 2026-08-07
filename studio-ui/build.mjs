@@ -67,6 +67,7 @@ await build({
   entryPoints: [
     { entry: "src/status.ts", outfile: "status.js" },
     { entry: "src/map.ts", outfile: "map.js" },
+    { entry: "src/pads.ts", outfile: "pads.js" },
     { entry: "src/devices.ts", outfile: "devices.js" },
     { entry: "src/profiles.ts", outfile: "profiles.js" },
     { entry: "src/setup.ts", outfile: "setup.js" },
@@ -75,6 +76,7 @@ await build({
   routes: {
     "/": { js: ["status"], css: ["studio"] },
     "/map": { js: ["map"], css: ["studio"] },
+    "/pads": { js: ["pads"], css: ["studio"] },
     "/devices": { js: ["devices"], css: ["studio"] },
     "/profiles": { js: ["profiles"], css: ["studio"] },
     "/setup": { js: ["setup"], css: ["studio"] },
@@ -84,6 +86,7 @@ await build({
   ssrEntryPoints: {
     status: "src/status.ts",
     map: "src/map.ts",
+    pads: "src/pads.ts",
     devices: "src/devices.ts",
     profiles: "src/profiles.ts",
     setup: "src/setup.ts",

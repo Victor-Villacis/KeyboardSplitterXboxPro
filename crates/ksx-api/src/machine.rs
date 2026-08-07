@@ -163,15 +163,52 @@ pub trait MachineSource: Send + Sync {
         ))
     }
 
+    /// `ksx pads` / `ksx pads --prune`, as a page can read them: what is on
+    /// the bus, what would be removed, and what a spawn may legally offer.
+    ///
+    /// Read-only. Everything a surface needs to decide *before* a click —
+    /// including the XInput ceiling stated in words — arrives here, so no
+    /// surface has to know that four is the number (docs/SURFACES.md §1).
+    fn pads_view(&self) -> Result<PadsView, Refusal> {
+        Err(Refusal::not_here(
+            "the virtual-pad report",
+            "run `ksx pads --prune` (a dry run) or `ksx doctor`",
+        ))
+    }
+
     /// `ksx pads` — plug N test pads, run the pattern, unplug.
     ///
-    /// Defaulted-refused deliberately: test pads COMPETE for the four XInput
-    /// slots, so this is only ever legal while emulation is stopped, and the
-    /// CLI is where that judgement (and the Ctrl+C that ends it) lives today.
-    fn pads(&self, _count: u8, _persona: &str) -> Result<String, Refusal> {
+    /// Defaulted-refused, and the default is still the honest answer for any
+    /// surface that has not thought about the two things the CLI carried
+    /// implicitly: test pads COMPETE for the four XInput slots, so this is
+    /// only ever legal while emulation is stopped, and the Ctrl+C that ends a
+    /// console run does not exist on a web page. An implementation owes both —
+    /// a refusal while a session is live, and a bounded hold that unplugs
+    /// itself — which is why the spec carries [`PadsSpawnSpec::hold_secs`]
+    /// rather than leaving "how does this end" to the caller.
+    fn pads(&self, _spec: &PadsSpawnSpec) -> Result<String, Refusal> {
         Err(Refusal::not_here(
             "the pad test",
             "run `ksx pads --count 4` with emulation stopped",
+        ))
+    }
+
+    /// `ksx pads --prune` — clear pads that outlived whatever made them.
+    ///
+    /// `confirm` is the CLI's `--yes`, and it means the same thing: without it
+    /// this is a DRY RUN that only says what it would do. The dry-run-first
+    /// consent shape is not the surface's to choose — a verb that restarts a
+    /// bus device and drops every pad on it keeps it wherever it is called
+    /// from.
+    ///
+    /// Restarting a bus devnode needs an administrator token and ksx never
+    /// self-elevates, so an implementation running unelevated must REFUSE in
+    /// words with the command to run instead — never silently do nothing.
+    /// [`PadsView::elevated`] is how a page says that before the click.
+    fn pads_prune(&self, _confirm: bool) -> Result<String, Refusal> {
+        Err(Refusal::not_here(
+            "clearing the bus",
+            "run `ksx pads --prune` (a dry run) and then `--yes` from an elevated prompt",
         ))
     }
 
@@ -971,6 +1008,130 @@ pub struct TemplateRow {
     pub players: Vec<u8>,
 }
 
+/// `ksx pads`, presentation-shaped: the bus, its children, and both verbs'
+/// preconditions in one read.
+///
+/// Composed sentences on purpose, like [`DevicesView`]'s `detail` and
+/// [`StatusSnapshot`](crate::StatusSnapshot)'s driver lines: the wording of
+/// "four XInput slots, two already taken" is a fact about ksx's own limits,
+/// and a surface that re-derives it is a surface that will disagree with the
+/// CLI about it (docs/SURFACES.md §1).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadsView {
+    pub generated_at: String,
+    /// One line: how many pads the bus is carrying.
+    pub summary: String,
+    /// The ViGEmBus devnode the children hang off — also the argument to the
+    /// prune command. `None` when the bus has no present devnode.
+    pub bus_instance_id: Option<String>,
+    pub pads: Vec<VirtualPadRow>,
+    /// Known splitter processes alive right now, as `name (pid N)` lines.
+    /// Heuristic by nature — a third-party ViGEm feeder is invisible to it.
+    pub owners: Vec<String>,
+    /// Is emulation live? Both verbs refuse while it is: a spawn would fight
+    /// the pads a player is holding, and a prune would yank them.
+    pub session_running: bool,
+    /// How many XInput slots Windows has (`ksx_core::MAX_XINPUT_SLOTS`).
+    pub xinput_ceiling: u8,
+    /// How many of them the pads already on the bus are holding.
+    pub xinput_in_use: u8,
+    /// **The ceiling, said out loud for this machine right now.** The reason
+    /// this is a backend string and not a page's `if`: `ksx pads --count 8
+    /// --persona xbox360` plugs eight pads and four of them are invisible to
+    /// every game (open task #16), and a surface must be able to say that
+    /// BEFORE the button is pressed without knowing why four is the number.
+    pub xinput_line: String,
+    /// Does THIS process hold an administrator token? `None` = unanswerable.
+    /// A prune restarts a bus device, which needs one; a page shows this
+    /// before the click rather than after the refusal.
+    pub elevated: Option<bool>,
+    pub prune: PrunePlanView,
+    pub spawn: SpawnOffer,
+}
+
+/// One pad hanging off the bus.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualPadRow {
+    /// Full device instance id — what a prune removes, named exactly.
+    pub instance_id: String,
+    /// The id the persona guess was made from, so an `unknown pad` row is
+    /// still actionable.
+    pub hardware_id: String,
+    /// What the bus says it is: `Xbox 360 pad`, `PlayStation (DS4) pad`, or
+    /// `unknown pad`.
+    pub persona: String,
+    /// Does this pad hold one of the four XInput slots?
+    pub xinput: bool,
+}
+
+/// What `ksx pads --prune` would do, as a page renders it.
+///
+/// The decision itself is the CLI's pure `plan_prune`; this is that plan on
+/// the wire, so no surface re-decides "is a bus restart allowed right now".
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrunePlanView {
+    /// `nothing` | `no-bus` | `session-running` | `restart`. Stable strings —
+    /// a surface keys its panels off these, not off the prose.
+    #[serde(default)]
+    pub kind: String,
+    /// How many pads it would remove.
+    pub count: usize,
+    /// The command a user could run by hand instead, when one exists. A
+    /// driver operation nobody can reproduce without ksx is one nobody can
+    /// undo without ksx either.
+    pub command: Option<String>,
+    /// The paragraph the CLI prints. Too long for a flash (Studio caps those
+    /// at 300 chars), which is exactly why it is a field and not a message.
+    pub detail: String,
+}
+
+/// What a spawn may offer right now, every option already labelled with what
+/// it will actually do.
+///
+/// The labels are the load-bearing part. "8" in a dropdown is a lie on a
+/// machine with four XInput slots; "8 pads — only 4 readable, 4 invisible to
+/// games" is the same click with the consequence attached, and putting that
+/// sentence here rather than in a page is what stops the second surface from
+/// disagreeing with the first.
+///
+/// **The first option in each list is the default**, because that is what a
+/// `<select>` does with no further help — so the ordering here IS the default,
+/// and there is no second field to keep in step with it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnOffer {
+    pub counts: Vec<SpawnOption>,
+    pub personas: Vec<SpawnOption>,
+    pub holds: Vec<SpawnOption>,
+    /// One sentence saying what a spawn will do, in advance — including the
+    /// fact that it unplugs itself when the hold expires.
+    pub note: String,
+    /// Why a spawn must not be offered at all right now (`None` = offer it).
+    pub refused: Option<String>,
+}
+
+/// One `<option>`: the value that goes on the wire, and what it means.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnOption {
+    pub value: String,
+    pub label: String,
+}
+
+/// `ksx pads --count N --persona P` as a typed spec.
+///
+/// `hold_secs` is not optional and not a detail: a console run ends at Ctrl+C
+/// and a web click has no Ctrl+C, so every caller states when the pads go
+/// away. See [`MachineSource::pads`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadsSpawnSpec {
+    pub count: u8,
+    /// A [`ksx_core::Persona`] name — `xbox360`, `playstation`, … Parsed by
+    /// the implementation with the same lenient parser the CLI uses, so a
+    /// surface never has to carry the alias table.
+    pub persona: String,
+    /// Seconds to hold the pads up before they unplug themselves.
+    pub hold_secs: u64,
+}
+
 /// `ksx autostart --status`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutostartView {
@@ -1281,7 +1442,18 @@ mod tests {
             ("ksx autostart", Nothing.autostart().unwrap_err()),
             ("ksx doctor", Nothing.doctor().unwrap_err()),
             ("ksx winusb status", Nothing.winusb().unwrap_err()),
-            ("ksx pads", Nothing.pads(4, "xbox360").unwrap_err()),
+            (
+                "ksx pads",
+                Nothing
+                    .pads(&PadsSpawnSpec {
+                        count: 4,
+                        persona: "xbox360".into(),
+                        hold_secs: 10,
+                    })
+                    .unwrap_err(),
+            ),
+            ("ksx pads --prune", Nothing.pads_view().unwrap_err()),
+            ("ksx pads --prune", Nothing.pads_prune(false).unwrap_err()),
             ("ksx winusb claim", Nothing.winusb_claim("ID").unwrap_err()),
             (
                 "ksx winusb release",

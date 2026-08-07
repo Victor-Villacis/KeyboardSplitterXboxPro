@@ -847,6 +847,119 @@ impl ksx_api::MachineSource for ScriptedMachine {
             ..ksx_api::ImportReport::default()
         })
     }
+
+    // ── The /pads verbs, delegated to `FixedMachine` below ─────────────────
+    //
+    // The /pads tests run through the default `start_server`, which serves
+    // THIS machine; the pad answers are the fixed fixture's, so every pads
+    // assertion reads one fixture regardless of which harness built the
+    // server.
+    fn pads_view(&self) -> Result<ksx_api::PadsView, Refusal> {
+        FixedMachine.pads_view()
+    }
+
+    fn pads(&self, spec: &ksx_api::PadsSpawnSpec) -> Result<String, Refusal> {
+        FixedMachine.pads(spec)
+    }
+
+    fn pads_prune(&self, confirm: bool) -> Result<String, Refusal> {
+        FixedMachine.pads_prune(confirm)
+    }
+}
+
+/// The machine, scripted: a restartable bus carrying two pads, and two verbs
+/// that ECHO what they were asked for.
+///
+/// Echoing rather than recording is deliberate. Every /pads assertion below
+/// reads the 303's `?flash=`, so a passing test proves the form values reached
+/// the verb — `confirm=yes` in particular — with no shared mutable state
+/// between a test and the server thread it started.
+struct FixedMachine;
+
+/// One count option over the ceiling, so the page's warning has something real
+/// to render. The label is the PROVIDER's — the whole point of task #16's
+/// warning is that the backend writes that sentence, not the page.
+const OVER_CEILING_LABEL: &str = "8 pads — only 3 readable, 5 invisible to games (XInput)";
+
+impl ksx_api::MachineSource for FixedMachine {
+    fn pads_view(&self) -> Result<ksx_api::PadsView, Refusal> {
+        Ok(ksx_api::PadsView {
+            generated_at: "test".into(),
+            summary: "2 virtual pads on the ViGEm bus:".into(),
+            bus_instance_id: Some("ROOT\\SYSTEM\\0002".into()),
+            pads: vec![
+                ksx_api::VirtualPadRow {
+                    instance_id: "USB\\TEST\\PAD1".into(),
+                    hardware_id: "USB\\TEST".into(),
+                    persona: "Xbox 360 pad".into(),
+                    xinput: true,
+                },
+                ksx_api::VirtualPadRow {
+                    instance_id: "USB\\TEST\\PAD2".into(),
+                    hardware_id: "USB\\TEST".into(),
+                    persona: "PlayStation (DS4) pad".into(),
+                    xinput: false,
+                },
+            ],
+            owners: vec!["ksx.exe (pid 1)".into()],
+            session_running: false,
+            xinput_ceiling: 4,
+            xinput_in_use: 1,
+            xinput_line: "Windows exposes exactly 4 XInput slots and no virtual bus can create \
+                          a fifth."
+                .into(),
+            elevated: Some(false),
+            prune: ksx_api::PrunePlanView {
+                kind: "restart".into(),
+                count: 2,
+                command: Some("pnputil /restart-device \"ROOT\\SYSTEM\\0002\"".into()),
+                detail: "DRY RUN — would clear 2 virtual pad(s)".into(),
+            },
+            spawn: ksx_api::SpawnOffer {
+                counts: vec![
+                    ksx_api::SpawnOption {
+                        value: "1".into(),
+                        label: "1 pad".into(),
+                    },
+                    ksx_api::SpawnOption {
+                        value: "8".into(),
+                        label: OVER_CEILING_LABEL.into(),
+                    },
+                ],
+                personas: vec![ksx_api::SpawnOption {
+                    value: "xbox360".into(),
+                    label: "xbox360 — takes one of the 4 XInput slots".into(),
+                }],
+                holds: vec![ksx_api::SpawnOption {
+                    value: "10".into(),
+                    label: "10 seconds".into(),
+                }],
+                note: "A spawn is a TEST".into(),
+                refused: None,
+            },
+        })
+    }
+
+    fn pads(&self, spec: &ksx_api::PadsSpawnSpec) -> Result<String, Refusal> {
+        if spec.count == 0 {
+            return Err(Refusal::new(
+                ksx_api::codes::REFUSED,
+                "pad count must be 1..=16, got 0",
+            ));
+        }
+        Ok(format!(
+            "spawned {} {} pad(s) for {}s",
+            spec.count, spec.persona, spec.hold_secs
+        ))
+    }
+
+    fn pads_prune(&self, confirm: bool) -> Result<String, Refusal> {
+        if confirm {
+            Ok("cleared 2 virtual pad(s) — the bus was restarted.".to_owned())
+        } else {
+            Ok("dry run — 2 virtual pad(s) would be cleared. Nothing was changed.".to_owned())
+        }
+    }
 }
 
 /// Bind port 0 to learn a free port, release it, and serve there. The tiny
@@ -3143,4 +3256,185 @@ fn the_existing_pages_link_to_setup() {
             "{path} must reach /setup from its nav: {body}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// /pads — the ViGEm bus, a bounded pad test, and the prune (v15)
+// ---------------------------------------------------------------------------
+
+/// The page renders from ONE `MachineSource::pads_view` call, with no
+/// JavaScript involved: the pads, the bus devnode, the ceiling sentence and
+/// the spawn form are all in the first paint.
+#[test]
+fn the_pads_page_renders_the_bus_server_side() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    let response = get(addr, "/pads");
+    let body = body_of(&response);
+
+    assert!(body.contains("2 virtual pads on the ViGEm bus"), "{body}");
+    assert!(body.contains(r"USB\TEST\PAD1"), "{body}");
+    assert!(body.contains(r"USB\TEST\PAD2"), "{body}");
+    assert!(body.contains(r"ROOT\SYSTEM\0002"), "{body}");
+    assert!(body.contains("ksx.exe (pid 1)"), "{body}");
+    // The no-JS baseline: real forms, not fetch handlers.
+    assert!(body.contains(r#"action="/pads/spawn""#), "{body}");
+}
+
+/// **Task #16 reaches the user before the click, not after it.**
+///
+/// Two independent channels, both server-rendered so a browser with scripting
+/// switched off gets them: the standing ceiling paragraph, and the label on
+/// the `<option>` that would cause it. Both strings are the PROVIDER's — this
+/// asserts they survive the route and the render, which is the only part
+/// Studio owns.
+#[test]
+fn the_pads_page_warns_about_the_xinput_ceiling_before_the_button_is_pressed() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    let response = get(addr, "/pads");
+    let body = body_of(&response);
+
+    assert!(
+        body.contains("Windows exposes exactly 4 XInput slots"),
+        "the ceiling paragraph must render: {body}"
+    );
+    assert!(
+        body.contains(OVER_CEILING_LABEL),
+        "the over-ceiling count must warn in its own option label: {body}"
+    );
+}
+
+/// The spawn form's values reach the verb intact — the echo proves all three.
+#[test]
+fn spawning_pads_passes_the_whole_spec_through_and_303s_back() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+
+    let response = post_form(addr, "/pads/spawn", "count=8&persona=xbox360&hold_secs=30");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(
+        response.contains("/pads?flash=spawned%208%20xbox360%20pad%28s%29%20for%2030s"),
+        "the spec must arrive whole: {response}"
+    );
+}
+
+/// A refusal flashes too, prefixed `error:` so the page colours it — never a
+/// silent failure and never an error page dead-ending the no-JS loop.
+#[test]
+fn a_refused_spawn_flashes_the_refusal() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+
+    let response = post_form(addr, "/pads/spawn", "count=0&persona=xbox360&hold_secs=10");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(
+        response.contains("flash=error%3A%20pad%20count%20must%20be"),
+        "{response}"
+    );
+}
+
+/// **The consent shape, end to end.** Unarmed, the document carries no submit
+/// that could restart the bus — not hidden, not disabled, ABSENT — because the
+/// SSR paint is what a no-JS browser gets and a `display:none` button is one
+/// CSS failure away from being pressable. Arming is a GET, and only the armed
+/// page names every pad that goes.
+#[test]
+fn prune_is_absent_until_armed_and_then_names_every_pad() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+
+    let unarmed_response = get(addr, "/pads");
+    let unarmed = body_of(&unarmed_response);
+    assert!(
+        !unarmed.contains(r#"name="confirm" value="yes""#),
+        "an unarmed page must not carry the confirmed submit: {unarmed}"
+    );
+    assert!(unarmed.contains(r#"href="/pads?confirm=1""#), "{unarmed}");
+
+    let armed_response = get(addr, "/pads?confirm=1");
+    let armed = body_of(&armed_response);
+    assert!(armed.contains(r#"action="/pads/prune""#), "{armed}");
+    assert!(armed.contains(r#"name="confirm" value="yes""#), "{armed}");
+    assert!(armed.contains("This removes 2 pad(s)"), "{armed}");
+    assert!(armed.contains(r"USB\TEST\PAD1"), "{armed}");
+    assert!(armed.contains(r"USB\TEST\PAD2"), "{armed}");
+    // Elevation is stated before the click, not discovered after the refusal.
+    assert!(armed.contains("NOT running elevated"), "{armed}");
+}
+
+/// `confirm` is what turns a dry run into a bus restart, and a POST that did
+/// not come from the confirm screen gets the dry run. Not an error — the CLI
+/// answers the same way without `--yes`, and answering "what would happen" is
+/// strictly better than answering "no".
+#[test]
+fn a_prune_without_the_confirm_field_is_a_dry_run() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+
+    let dry = post_form(addr, "/pads/prune", "");
+    assert!(dry.starts_with("HTTP/1.1 303"), "{dry}");
+    assert!(dry.contains("flash=dry%20run"), "{dry}");
+
+    let confirmed = post_form(addr, "/pads/prune", "confirm=yes");
+    assert!(confirmed.starts_with("HTTP/1.1 303"), "{confirmed}");
+    assert!(
+        confirmed.contains("flash=cleared%202%20virtual%20pad"),
+        "{confirmed}"
+    );
+}
+
+/// Both mutating routes are inside the guarded router. A cross-origin POST is
+/// refused by `Origin`, and any request at all is refused by `Host` — the
+/// property that has to hold for EVERY new route, and the one a route declared
+/// outside the `Router::new()` chain would silently lose.
+#[test]
+fn the_pads_routes_are_behind_the_guard() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+
+    for path in ["/pads/spawn", "/pads/prune"] {
+        let body = "confirm=yes";
+        let response = http(
+            addr,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+                 Origin: https://evil.example\r\nConnection: close\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {len}\r\n\r\n{body}",
+                port = addr.port(),
+                len = body.len(),
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "{path} must refuse a foreign origin: {response}"
+        );
+    }
+    // …and the rebinding defence covers the read as well.
+    let rebound = http(
+        addr,
+        "GET /pads HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(rebound.starts_with("HTTP/1.1 421"), "{rebound}");
+}
+
+/// The poller's endpoint serves the same struct the page embeds — and never
+/// an armed one. A 2 s poll is not a user saying yes, and a poll that could
+/// re-arm the prune would make the confirm panel reappear after someone had
+/// deliberately navigated away from it.
+#[test]
+fn the_pads_api_serves_the_payload_and_never_arms_it() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+
+    let response = get(addr, "/api/pads?confirm=1");
+    // A pad list that is quietly ten minutes old is worse than one that took
+    // 40 ms to fetch (sources.rs's rule); nothing on this page may be cached.
+    assert!(response.contains("cache-control: no-store"), "{response}");
+    let value: serde_json::Value = serde_json::from_str(body_of(&response)).expect("json");
+    assert_eq!(value["confirm"], serde_json::json!(false));
+    assert_eq!(value["flash"], serde_json::json!(null));
+    assert_eq!(value["pads"]["prune"]["kind"], serde_json::json!("restart"));
+    assert_eq!(value["pads"]["pads"].as_array().unwrap().len(), 2);
 }

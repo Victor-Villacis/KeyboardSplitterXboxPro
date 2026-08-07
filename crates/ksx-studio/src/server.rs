@@ -9,6 +9,14 @@
 //! client optionally upgrades to fetch-submits that read the redirect's
 //! flash without a reload.
 //!
+//! v15 adds `/pads`, and it takes its facts from a THIRD provider:
+//! [`ksx_api::MachineSource`], beside the existing status and control ones.
+//! Neither of those could answer it — `StatusSource` reads the config store
+//! and `ControlSource` the daemon pipe, and a ViGEm bus is neither. Its two
+//! verbs keep the CLI's consent shape rather than inventing one: a spawn is
+//! bounded (it unplugs itself, because a page has no Ctrl+C) and a prune is a
+//! DRY RUN unless the form carries `confirm=yes`.
+//!
 //! v9 gives the MAPPER the same baseline: `/map/*` are form-encoded twins of
 //! the `/api/*` mapper verbs (bind, clear, restore, clear-all, pause), each
 //! calling the identical [`ControlSource`] method and 303-ing back to
@@ -33,13 +41,14 @@ use crate::render_devices::render_devices;
 use crate::render_map::render_map;
 use crate::render_setup::render_setup;
 use crate::snapshot::{
-    DevicesPayload, MapPayload, ProfilesPayload, SetupPayload, SetupSnapshot, StatusPayload,
-    StatusSnapshot, StatusSource,
+    DevicesPayload, MapPayload, PadsPayload, ProfilesPayload, SetupPayload, SetupSnapshot,
+    StatusPayload, StatusSnapshot, StatusSource,
 };
 
 struct AppState {
     page: EmbeddedPage,
     map_page: EmbeddedPage,
+    pads_page: EmbeddedPage,
     devices_page: EmbeddedPage,
     profiles_page: EmbeddedPage,
     setup_page: EmbeddedPage,
@@ -47,14 +56,15 @@ struct AppState {
     control: Box<dyn ControlSource>,
     /// The MACHINE reads and writes that are not a `DaemonCommand`: the
     /// device enumeration and the two `[[device]]` writes behind `/devices`,
-    /// the preflighted profile list, the preset list with its templates, the
+    /// the ViGEm bus report and the two pad verbs behind `/pads`, the
+    /// preflighted profile list, the preset list with its templates, the
     /// two creates behind `/profiles`, and the config in and out plus the
     /// first-run state behind `/setup`. A THIRD provider rather than more
     /// methods on the other two, because that is the split `ksx-api` already
     /// draws — status is what the box looks like, control is what the daemon
-    /// can be told, and this is what is on the machine itself (the USB tree
-    /// and the config store), readable while the pipe is dead, exactly as the
-    /// read-only mapper is.
+    /// can be told, and this is what is on the machine itself (the USB tree,
+    /// the config store, the bus device), readable while the pipe is dead,
+    /// exactly as the read-only mapper is.
     machine: Box<dyn ksx_api::MachineSource>,
 }
 
@@ -78,12 +88,14 @@ pub fn serve(
     }
     let page = EmbeddedPage::load("/")?;
     let mapper = EmbeddedPage::load("/map")?;
+    let pads = EmbeddedPage::load("/pads")?;
     let devices = EmbeddedPage::load("/devices")?;
     let profiles = EmbeddedPage::load("/profiles")?;
     let setup = EmbeddedPage::load("/setup")?;
     let state = Arc::new(AppState {
         page,
         map_page: mapper,
+        pads_page: pads,
         devices_page: devices,
         profiles_page: profiles,
         setup_page: setup,
@@ -161,6 +173,15 @@ pub fn serve(
             .route("/map/preset/restore", post(map_form_restore))
             .route("/map/preset/clear-all", post(map_form_clear_all))
             .route("/map/session/stop", post(map_form_session_stop))
+            // v15 — the PADS page: what is on the ViGEm bus, a bounded pad
+            // test, and the prune that clears ghosts. Three routes, one
+            // `MachineSource` verb each, and the arming step is a GET
+            // (`/pads?confirm=1`) because showing someone what a destructive
+            // button will remove must not itself be a POST.
+            .route("/pads", get(pads_page))
+            .route("/api/pads", get(api_pads))
+            .route("/pads/spawn", post(pads_form_spawn))
+            .route("/pads/prune", post(pads_form_prune))
             // v17: the DEVICE PICKER — `ksx device scan` as a page, plus the
             // two writes it exists for. Read is `MachineSource::device_scan`
             // (boards, not devnodes); the writes are `device_pick` and
@@ -1597,6 +1618,181 @@ fn learn_flash(view: crate::control::LearnView, done: &str) -> Result<String, St
         Some(refusal) => Err(refusal.message),
         None => Ok(done.to_owned()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// /pads — the ViGEm bus, a bounded pad test, and the prune (v15)
+// ---------------------------------------------------------------------------
+//
+// Every fact and every refusal on this page arrives from ONE
+// `ksx_api::MachineSource` call. Nothing here counts pads, decides whether a
+// bus restart is allowed, or works out how many of eight Xbox pads a game
+// could actually read — those are backend decisions with backend tests, and a
+// second copy of any of them living in a web page is the failure
+// docs/SURFACES.md §1 names by example.
+
+#[derive(Deserialize)]
+struct PadsQuery {
+    /// `1` ARMS the prune: the page re-reads the plan and renders every pad it
+    /// would remove, beside a real submit. Deliberately a GET — showing
+    /// someone what a destructive button will destroy must not itself change
+    /// anything, so a reload, a bookmark or a back button are all harmless.
+    confirm: Option<String>,
+    flash: Option<String>,
+}
+
+/// One fresh pads payload. `MachineSource::pads_view` enumerates devnodes and
+/// dials the daemon pipe — blocking work, kept off the async workers like
+/// [`collect`] and [`collect_map`].
+async fn collect_pads(state: &Arc<AppState>, confirm: bool) -> PadsPayload {
+    let pads_state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let session = pads_state.control.session();
+        match pads_state.machine.pads_view() {
+            Ok(pads) => PadsPayload {
+                pads,
+                session,
+                confirm,
+                unavailable: None,
+                flash: None,
+            },
+            // A provider that cannot answer renders a banner, never a 500 and
+            // never an empty pad list that reads as "your bus is clean".
+            Err(refusal) => PadsPayload {
+                pads: ksx_api::PadsView::default(),
+                session,
+                confirm,
+                unavailable: Some(match refusal.remedy.as_deref() {
+                    Some(remedy) => format!("{} — {remedy}", refusal.message),
+                    None => refusal.message,
+                }),
+                flash: None,
+            },
+        }
+    })
+    .await
+    .unwrap_or_else(|_| PadsPayload {
+        pads: ksx_api::PadsView::default(),
+        session: SessionView::unreachable("pad collection panicked"),
+        confirm,
+        unavailable: Some("the pad collection panicked".to_owned()),
+        flash: None,
+    })
+}
+
+async fn pads_page(State(state): State<Arc<AppState>>, Query(query): Query<PadsQuery>) -> Response {
+    let mut payload = collect_pads(&state, query.confirm.as_deref() == Some("1")).await;
+    let flash = query.flash.as_deref().filter(|f| !f.trim().is_empty());
+    payload.flash = flash.map(str::to_owned);
+    let out = crate::render_pads::render_pads(&state.pads_page, &payload);
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_str(&out.csp)
+                    .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'")),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        out.html,
+    )
+        .into_response()
+}
+
+/// The pads poller's endpoint — the same [`PadsPayload`] the page embeds.
+///
+/// `confirm` is false here whatever the page is showing: a 2 s poll is not a
+/// user arming a destructive action, and letting a poll re-arm it would mean
+/// the confirm panel could reappear after the user had walked away from it.
+async fn api_pads(State(state): State<Arc<AppState>>) -> Response {
+    let payload = collect_pads(&state, false).await;
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        axum::Json(payload),
+    )
+        .into_response()
+}
+
+/// 303 back to /pads, carrying the outcome as the flash. Errors flash exactly
+/// like successes — a page with no JavaScript must never fail silently.
+fn pads_redirect(outcome: Result<String, String>) -> Response {
+    let flash = match outcome {
+        Ok(message) => message,
+        Err(error) => format!("error: {error}"),
+    };
+    Redirect::to(&format!("/pads?flash={}", urlencode(&flash))).into_response()
+}
+
+/// Run one machine verb off the async workers, then 303 back to /pads.
+async fn pads_act<F>(state: Arc<AppState>, verb: F) -> Response
+where
+    F: FnOnce(&dyn ksx_api::MachineSource) -> Result<String, String> + Send + 'static,
+{
+    let outcome = tokio::task::spawn_blocking(move || verb(state.machine.as_ref()))
+        .await
+        .unwrap_or_else(|_| Err("the machine call panicked".to_owned()));
+    pads_redirect(outcome)
+}
+
+#[derive(Deserialize)]
+struct SpawnForm {
+    #[serde(default)]
+    count: u8,
+    #[serde(default)]
+    persona: String,
+    #[serde(default)]
+    hold_secs: u64,
+}
+
+/// POST /pads/spawn — `ksx pads --count N --persona P`, bounded.
+///
+/// No validation here, on purpose: an absent field arrives as 0/"" and the
+/// backend plan refuses it in words ("pad count must be 1..=16, got 0"). A
+/// second copy of the bounds in this handler is a second thing to keep in step
+/// with `ksx_core::MAX_SLOTS`.
+async fn pads_form_spawn(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<SpawnForm>,
+) -> Response {
+    pads_act(state, move |machine| {
+        machine
+            .pads(&ksx_api::PadsSpawnSpec {
+                count: form.count,
+                persona: form.persona,
+                hold_secs: form.hold_secs,
+            })
+            .map_err(flash_of)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct PruneForm {
+    /// The armed panel's hidden field, and the only thing that turns this from
+    /// a dry run into a bus restart.
+    ///
+    /// Its absence is not an error: `pads_prune(false)` is the CLI's own dry
+    /// run, so a POST that did not come from the confirm screen answers with
+    /// what WOULD happen instead of doing it. The guard stops another site;
+    /// this is what stops a stray submit from this one.
+    #[serde(default)]
+    confirm: Option<String>,
+}
+
+/// POST /pads/prune — `ksx pads --prune`, with `--yes` spelled `confirm=yes`.
+async fn pads_form_prune(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<PruneForm>,
+) -> Response {
+    let confirm = form.confirm.as_deref() == Some("yes");
+    pads_act(state, move |machine| {
+        machine.pads_prune(confirm).map_err(flash_of)
+    })
+    .await
 }
 
 #[derive(Deserialize)]

@@ -1196,6 +1196,15 @@ mod tests {
         // one links to it — which is exactly the regression this asserts.
         assert!(out.html.contains(r#"href="/map""#), "{}", out.html);
         assert!(out.html.contains(r#"href="/setup""#), "{}", out.html);
+        // …and into /pads, twice: the nav rail, and the deep link on the
+        // Virtual pads card — a page reachable only from the top nav is a
+        // page nobody finds.
+        assert_eq!(
+            out.html.matches(r#"href="/pads""#).count(),
+            2,
+            "the /pads nav link AND the pad-card deep link must both be here: {}",
+            out.html
+        );
     }
 
     /// The brand embed exists AND is the same bytes `tools/icongen` wrote.

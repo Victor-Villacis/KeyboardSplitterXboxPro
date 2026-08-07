@@ -151,6 +151,7 @@ surface does a human perform this task on*, and that is answered by the matrix.
 | WinUSB claim / release | owns | planned | never (needs elevation) |
 | "Press a button, see it light" | input only (`ksx monitor`) | **primary** | planned (§8) |
 | Is it working: pads, drivers | owns | **primary** | view |
+| Spawn test pads / prune the bus | owns | — | **primary** (§3a) |
 | Start / stop / switch profile | owns | **primary** | convenience |
 
 "owns" = the verb lives here. "primary" = where a human does it. "view" =
@@ -189,6 +190,33 @@ Four cells were corrected, each against the code:
   frame type, nothing — and the cross-reference pointed at the wrong section
   (mobile is §8; §6 is launching).
 
+### §3a Why the pad verbs get a Studio face and WinUSB claim does not
+
+Both are driver operations and only one of them is dangerous, so "it touches a
+driver" is not the line. The two that matter are:
+
+- **Can it lock the user out of the machine?** A WinUSB claim takes a keyboard
+  out of the keyboard stack, and the worst case is a panel that no longer types
+  and a user who cannot type the command to undo it. A test pad plugs and
+  unplugs; the worst case is four pads a game cannot see, which the page says
+  out loud before the click.
+- **Can the surface state the consequence in advance?** `ksx pads --count 8
+  --persona xbox360` plugs eight pads and Windows hands four of them to nobody
+  (open task #16). That is the exact failure a web page is *better* at than a
+  console: the option can carry its own label. The backend composes it
+  (`MachineSource::pads_view`); the page renders it.
+
+Elevation does not change the answer either — it changes the wording. A prune
+restarts a bus devnode, which needs an administrator token, and ksx never
+self-elevates. So Studio SAYS so before the click (`PadsView::elevated`) and
+the backend refuses with the elevated command attached. That is a better
+outcome than the surface pretending the verb does not exist.
+
+What is unchanged: the dry-run-first consent shape is the backend's, not the
+surface's. `pads_prune(confirm)` is `--yes`, spelled the same way and refusing
+the same things, and a POST that did not come from the confirm screen gets the
+dry run.
+
 ## §4 The egui is an appliance panel, not a worse browser
 
 The egui's five screens (`ksx-cabinet/src/nav.rs`) are ButtonCheck, Status,
@@ -208,10 +236,11 @@ profile. Anything requiring text entry belongs elsewhere.
 
 Studio binds `127.0.0.1` and refuses anything else — `ksx-studio/src/error.rs`
 returns `NonLoopbackBind` rather than serving a LAN address. Its **pages** are
-`/` (status), `/map` (the mapper), `/devices` (the picker), `/profiles`
-(profiles & presets) and `/setup` (the configuration).
+`/` (status), `/map` (the mapper), `/pads` (the ViGEm bus and its two verbs),
+`/devices` (the picker), `/profiles` (profiles & presets) and `/setup` (the
+configuration).
 
-Five pages, dozens of routes: the rest are the `/api/*` reads, the mutating
+Six pages, dozens of routes: the rest are the `/api/*` reads, the mutating
 form endpoints, the service worker, the asset handler and three icons. The
 distinction is not pedantry — it is the whole reason the CSRF guard is one
 layer over the router rather than a check per handler, because "the mapper
