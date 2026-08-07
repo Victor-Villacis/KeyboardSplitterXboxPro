@@ -66,7 +66,10 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use ksx_api::{KeyHit, LiveFeed, LiveFrame, PadFeedback, SlotLive};
-use ksx_core::{Axis, Binding, DeviceId, DpadDirection, Key, PadState, Trigger, XButton, XButtons};
+use ksx_core::{
+    Axis, Binding, DeviceId, DeviceSelector, DpadDirection, Key, PadState, Trigger, XButton,
+    XButtons,
+};
 
 /// How many events one subscriber may fall behind by before it starts losing
 /// them.
@@ -353,9 +356,12 @@ pub struct LiveSubscription {
     /// Watermark into [`Inner::off_panel`]. The counter is per-sink and
     /// monotonic; the delta since the last poll is this consumer's share.
     off_panel_seen: u64,
-    /// Device instance path → friendly name, supplied by the consumer (which
-    /// can read the config; the engine thread cannot and must not).
-    aliases: Vec<(String, String)>,
+    /// `[[device]] id` → friendly name, supplied by the consumer (which can
+    /// read the config; the engine thread cannot and must not).
+    ///
+    /// Parsed once here rather than per key hit: [`Self::alias_for`] runs for
+    /// every key in every frame.
+    aliases: Vec<(String, Option<DeviceSelector>, String)>,
 }
 
 impl LiveSubscription {
@@ -363,14 +369,38 @@ impl LiveSubscription {
     /// "IPAC P1" rather than a 60-character instance path. Re-settable: a
     /// surface refreshes it whenever it re-reads the config.
     pub fn set_aliases(&mut self, aliases: Vec<(String, String)>) {
-        self.aliases = aliases;
+        self.aliases = aliases
+            .into_iter()
+            .map(|(id, alias)| (id.clone(), DeviceSelector::parse(&id).ok(), alias))
+            .collect();
     }
 
+    /// The name to print for the device an event arrived from.
+    ///
+    /// **Two comparisons, because config and the live feed no longer speak the
+    /// same spelling.** A `[[device]] id` is a selector now, resolved once at
+    /// session start; what arrives here is the concrete interface it resolved
+    /// to. So `id = 'usb:d209:0430:00'` never equals the id on the wire, and
+    /// without the second comparison the Button-Check screen the operator is
+    /// standing in front of shows unnamed devices — the whole screen's job,
+    /// undone by a config edit that was supposed to be an improvement.
+    ///
+    /// The selector match is display-grade on purpose: it is fed
+    /// [`DeviceFacts::from_instance_path`], which cannot know a serial, so a
+    /// `sn=` selector falls through to no name rather than risking one twin's
+    /// label on the other twin's keystrokes.
     fn alias_for(&self, device: &str) -> String {
+        if let Some((_, _, alias)) = self.aliases.iter().find(|(id, _, _)| id == device) {
+            return alias.clone();
+        }
+        let facts = ksx_core::DeviceFacts::from_instance_path(device);
         self.aliases
             .iter()
-            .find(|(id, _)| id == device)
-            .map(|(_, alias)| alias.clone())
+            .find(|(_, selector, _)| match (selector, &facts) {
+                (Some(selector), Some(facts)) => selector.matches(facts),
+                _ => false,
+            })
+            .map(|(_, _, alias)| alias.clone())
             .unwrap_or_default()
     }
 }
@@ -656,6 +686,49 @@ mod tests {
         assert!(slot.is_down("A"), "{:?}", slot.down);
         assert!(slot.is_down("dpad.up"), "{:?}", slot.down);
         assert!(!slot.is_down("B"));
+    }
+
+    /// **The screen the operator is standing in front of.**
+    ///
+    /// Once `[[device]] id` became a selector, the id in config and the id on
+    /// the live feed stopped being the same string: config says
+    /// `usb:d209:0430:00`, the wire carries the concrete interface that
+    /// resolved to. Match only on equality and Button-Check shows unnamed
+    /// devices — the one job that screen has, undone by a config edit that was
+    /// supposed to be an improvement.
+    #[test]
+    fn a_usb_selector_in_config_still_names_the_device_on_the_wire() {
+        const LIVE: &str = r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000";
+        const OTHER: &str = r"USB\VID_046D&PID_C077&MI_00\7&AAAA&0&0000";
+        let sink = LiveSink::new();
+        let mut feed = sink.subscribe();
+        feed.set_aliases(vec![("usb:d209:0430:00".to_owned(), "IPAC P1".to_owned())]);
+        // The bound set the supervisor publishes is the RESOLVED one — which is
+        // exactly why the alias table has to reach across the two spellings.
+        sink.session_started(&[DeviceId::new(LIVE), DeviceId::new(OTHER)]);
+
+        sink.key(&DeviceId::new(LIVE), Key::G, true);
+        let frame = feed.poll();
+        assert_eq!(frame.keys[0].alias, "IPAC P1");
+
+        // A different board is still nameless rather than mislabelled.
+        sink.key(&DeviceId::new(OTHER), Key::H, true);
+        assert_eq!(feed.poll().keys[0].alias, "");
+    }
+
+    /// A serial cannot be read off a path, so a `sn=` entry falls through to no
+    /// name. That is the right answer, not a gap: a `sn=` selector is only
+    /// written when twins are connected, and matching it on VID/PID/MI alone
+    /// would put one board's label on the other board's keystrokes.
+    #[test]
+    fn a_serial_rung_alias_declines_to_guess_which_twin_is_typing() {
+        let sink = LiveSink::new();
+        let mut feed = sink.subscribe();
+        const LIVE: &str = r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000";
+        feed.set_aliases(vec![("usb:d209:0430:00:sn=4".to_owned(), "P1".to_owned())]);
+        sink.session_started(&[DeviceId::new(LIVE)]);
+        sink.key(&DeviceId::new(LIVE), Key::G, true);
+        assert_eq!(feed.poll().keys[0].alias, "");
     }
 
     /// A press and release inside ONE display frame: invisible in `down`,

@@ -57,6 +57,13 @@
 //! [`DeviceSelector::HardwareId`]). Every config that works today keeps
 //! working; what changes is that a *newly written* entry uses the strongest
 //! surviving rung, and that `ksx device scan` prints the upgrade.
+//!
+//! # What a config stores, and what resolves it
+//!
+//! [`DeviceRef`] is the pair a `[[device]] id` holds: the selector, and the
+//! text it was written as. Both, because `parse` canonicalises — see that
+//! type's docs. `ksx-app::run::resolve` turns each one into a concrete devnode
+//! exactly once, at session start.
 
 use core::fmt;
 
@@ -94,6 +101,124 @@ impl DeviceFacts {
             Some(i) => &id[i + 1..],
             None => id,
         }
+    }
+
+    /// The facts that can be read out of an instance path alone, with **no
+    /// enumeration** — `USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000`.
+    ///
+    /// # Why this exists, and where it must not be used
+    ///
+    /// Display surfaces are handed a live device id and a config's `[[device]]`
+    /// table, and nothing else: the cabinet's Button-Check screen names devices
+    /// on the window thread, which has no business enumerating USB. Without
+    /// this, a config holding a `usb:` spelling stops matching the concrete id
+    /// arriving on the live feed and the screen the operator is standing in
+    /// front of shows unnamed devices.
+    ///
+    /// [`Self::serial`] is `None` because a serial lives in the device
+    /// descriptor, not in the path. That is deliberate rather than
+    /// unfortunate: a `sn=` selector therefore never matches through this
+    /// constructor, which is the honest answer — a `sn=` selector is only ever
+    /// written when twins are connected, and matching it on VID/PID/MI alone
+    /// would put one board's name on the other's keystrokes.
+    ///
+    /// So: fine for naming a row, never for deciding what to capture or claim.
+    /// Capture resolves against [`DeviceFacts`] built by the enumerator, which
+    /// reads the descriptor.
+    ///
+    /// `None` unless the path is a USB interface devnode carrying the full
+    /// `VID_`/`PID_`/`MI_` triple — anything else is a devnode no
+    /// [`DeviceSelector::Usb`] could ever name.
+    ///
+    /// The `USB\` enumerator check is part of that and is not redundant: an
+    /// Interception-era instance path (`HID\VID_D209&PID_0430&MI_00\8&…`)
+    /// carries the same triple, and letting a `usb:` selector match one would
+    /// put a claimed board's name on a row from the keyboard stack — the two
+    /// backends telling one story about two different things.
+    pub fn from_instance_path(id: &str) -> Option<Self> {
+        let upper = id.to_ascii_uppercase();
+        if !upper.starts_with("USB\\") {
+            return None;
+        }
+        let head = &upper[..upper.rfind('\\')?];
+        Some(Self {
+            id: DeviceId::new(id),
+            vendor_id: hex_field(head, "VID_", 4)? as u16,
+            product_id: hex_field(head, "PID_", 4)? as u16,
+            interface_number: hex_field(head, "MI_", 2)? as u8,
+            serial: None,
+            instance: Self::instance_of(&upper).to_owned(),
+        })
+    }
+}
+
+/// `VID_D209` -> `0xD209`. `width` digits, exactly, or nothing.
+fn hex_field(upper: &str, key: &str, width: usize) -> Option<u32> {
+    let at = upper.find(key)? + key.len();
+    let digits = upper.get(at..at + width)?;
+    u32::from_str_radix(digits, 16).ok()
+}
+
+/// A `[[device]] id` as the user wrote it, **and** what it means.
+///
+/// # Why both halves are kept
+///
+/// [`DeviceSelector::parse`] uppercases legacy paths and canonicalises `usb:`
+/// spellings. A config layer that stored only the parsed value and serialised
+/// it back would therefore rewrite every user's file as a side effect of
+/// *reading* it — the cabinet's live config holds
+/// `id = 'USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000'`, and a load/save
+/// cycle that returned different bytes is how you lose someone's trust once and
+/// permanently (`docs/DEVICE-IDENTITY.md` §5).
+///
+/// So the raw string is what goes back to disk, always, and the selector is
+/// what resolution matches with. Neither is derived from the other at write
+/// time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceRef {
+    raw: String,
+    selector: DeviceSelector,
+}
+
+impl DeviceRef {
+    /// Parse a written `id`, keeping the text exactly as it was written.
+    pub fn parse(raw: &str) -> Result<Self, SelectorParseError> {
+        Ok(Self {
+            raw: raw.to_owned(),
+            selector: DeviceSelector::parse(raw)?,
+        })
+    }
+
+    /// The text as it appears in the file. **This is what gets serialized** —
+    /// see the type docs.
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    pub fn selector(&self) -> &DeviceSelector {
+        &self.selector
+    }
+
+    /// The unresolved id: the written spelling, as the rest of the pipeline
+    /// still carries it until one resolution pass rewrites it.
+    pub fn as_device_id(&self) -> DeviceId {
+        DeviceId::new(self.raw.clone())
+    }
+}
+
+impl fmt::Display for DeviceRef {
+    /// The written spelling, never the canonical one — a message that quotes an
+    /// `id` must quote what is in the file, or the user cannot find it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.raw)
+    }
+}
+
+impl std::str::FromStr for DeviceRef {
+    type Err = SelectorParseError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::parse(raw)
     }
 }
 
@@ -729,6 +854,75 @@ mod tests {
             s.to_string(),
             r"ACPI\PNP0303\4&1A2B3C4D&0",
             "and it must round-trip unchanged, or saving a config rewrites it"
+        );
+    }
+
+    /// **The round-trip constraint, as a test.** A `DeviceRef` hands back the
+    /// bytes it was given, whatever the selector canonicalised them to.
+    #[test]
+    fn a_device_ref_keeps_the_spelling_the_user_wrote() {
+        for text in [
+            // The cabinet's live config, verbatim.
+            r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000",
+            // Lower case, which `parse` would have uppercased.
+            r"usb\vid_d209&pid_0430&mi_00\7&25eea38c&0&0000",
+            // Upper case `usb:`, which `parse` would have folded down.
+            "USB:D209:0430:00",
+            r"ACPI\PNP0303\4&1a2b3c4d&0",
+        ] {
+            let d = DeviceRef::parse(text).expect(text);
+            assert_eq!(d.raw(), text, "the file's bytes must survive");
+            assert_eq!(d.to_string(), text);
+        }
+        // ...and the selector inside is still the canonical, matchable one.
+        let d = DeviceRef::parse("USB:D209:0430:00").unwrap();
+        assert_eq!(d.selector().to_string(), "usb:d209:0430:00");
+    }
+
+    /// The display-only constructor: everything a selector matches on except
+    /// the serial, read straight off the path with nothing enumerated.
+    #[test]
+    fn facts_can_be_read_off_an_instance_path_for_naming_a_row() {
+        let facts =
+            DeviceFacts::from_instance_path(r"usb\vid_d209&pid_0430&mi_00\7&25eea38c&0&0000")
+                .expect("a USB interface path");
+        assert_eq!(facts.vendor_id, 0xD209);
+        assert_eq!(facts.product_id, 0x0430);
+        assert_eq!(facts.interface_number, 0);
+        assert_eq!(facts.instance, "7&25EEA38C&0&0000");
+        assert!(sel("usb:d209:0430:00").matches(&facts));
+        assert!(sel(r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000").matches(&facts));
+        // The id is preserved as given: it is what the live feed said, and a
+        // surface has to be able to compare it back.
+        assert_eq!(
+            facts.id.as_str(),
+            r"usb\vid_d209&pid_0430&mi_00\7&25eea38c&0&0000"
+        );
+
+        // A serial cannot be read off a path, so a `sn=` selector does NOT
+        // match here — matching it on VID/PID/MI alone would put one twin's
+        // name on the other twin's keystrokes, which is the exact confusion a
+        // serial rung is written to prevent.
+        assert!(!sel("usb:d209:0430:00:sn=4").matches(&facts));
+
+        // Not a USB interface devnode: no VID/PID/MI, so no Usb selector could
+        // ever name it and there is nothing to build.
+        assert_eq!(
+            DeviceFacts::from_instance_path(r"ACPI\PNP0303\4&1A2B3C4D&0"),
+            None
+        );
+        assert_eq!(DeviceFacts::from_instance_path("no-backslash"), None);
+        // The composite parent has VID/PID but no interface number.
+        assert_eq!(
+            DeviceFacts::from_instance_path(r"USB\VID_D209&PID_0430\4"),
+            None
+        );
+        // An Interception-era instance path carries the same VID/PID/MI triple
+        // and is NOT a USB interface. Matching it would let a `usb:` selector
+        // name a row that belongs to the keyboard stack.
+        assert_eq!(
+            DeviceFacts::from_instance_path(r"HID\VID_D209&PID_0430&MI_00\8&2A0D0500&0&0000"),
+            None
         );
     }
 

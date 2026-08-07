@@ -26,7 +26,7 @@
 
 use ksx_capture::{DeviceInfo, DeviceKind, MAX_KEYBOARD_SLOT};
 use ksx_config::Backend;
-use ksx_core::DeviceId;
+use ksx_core::{DeviceFacts, DeviceId};
 
 /// Exit code when no enumeration path worked at all (documented in `--help`).
 /// Same value as `ksx pads`' missing-ViGEmBus code: 2 always means "a required
@@ -90,8 +90,8 @@ pub fn duplicate_hardware_ids(devices: &[DeviceInfo]) -> Vec<DeviceId> {
 /// What `config.toml` says about one device, if anything.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConfiguredDevices {
-    /// `(id, alias, backend)` from every `[[device]]` entry.
-    pub entries: Vec<(DeviceId, String, Backend)>,
+    /// `(id, alias, backend)` from every `[[device]]` entry, the id as written.
+    pub entries: Vec<(ksx_core::DeviceRef, String, Backend)>,
 }
 
 impl ConfiguredDevices {
@@ -100,27 +100,74 @@ impl ConfiguredDevices {
             entries: config
                 .devices
                 .iter()
-                .map(|d| (DeviceId::new(d.id.clone()), d.alias.clone(), d.backend))
+                .map(|d| (d.id.clone(), d.alias.clone(), d.backend))
                 .collect(),
         }
     }
 
-    fn find(&self, id: &DeviceId) -> Option<&(DeviceId, String, Backend)> {
-        self.entries.iter().find(|(entry, _, _)| entry == id)
+    /// The `[[device]]` entry that names this connected interface.
+    ///
+    /// Byte-exact first — an Interception hardware id and a legacy full
+    /// instance path both land there — then the selector, so a config holding
+    /// `usb:d209:0430:00` still shows its alias and its backend against the
+    /// board it names. Without that second step, switching a config to the
+    /// replug-proof spelling would blank the alias and backend columns of
+    /// `ksx devices` and turn the "configured for WinUSB but not rebound"
+    /// warning off, which is the single most useful line the command prints.
+    ///
+    /// A model-rung entry with twins connected matches BOTH rows. That is the
+    /// honest report — the entry really does name both, and `ksx run` refuses
+    /// with the pair listed rather than picking one.
+    fn find(&self, id: &DeviceId, facts: Option<&DeviceFacts>) -> Option<&Entry> {
+        if let Some(hit) = self
+            .entries
+            .iter()
+            .find(|(entry, _, _)| entry.raw() == id.as_str())
+        {
+            return Some(hit);
+        }
+        // Enumerated facts when the caller has them, because those carry the
+        // descriptor's serial and a path does not — a `sn=` selector can only
+        // be honoured against the real thing.
+        let derived;
+        let facts = match facts {
+            Some(facts) => facts,
+            None => {
+                derived = DeviceFacts::from_instance_path(id.as_str())?;
+                &derived
+            }
+        };
+        self.entries
+            .iter()
+            .find(|(entry, _, _)| entry.selector().matches(facts))
     }
 
     /// Which backend would drive this device: what config says, or the default
     /// for an unconfigured one.
     pub fn backend_for(&self, id: &DeviceId) -> Backend {
-        self.find(id).map(|(_, _, b)| *b).unwrap_or_default()
+        self.find(id, None).map(|(_, _, b)| *b).unwrap_or_default()
     }
 
     pub fn alias_for(&self, id: &DeviceId) -> Option<&str> {
-        self.find(id).map(|(_, alias, _)| alias.as_str())
+        self.find(id, None).map(|(_, alias, _)| alias.as_str())
     }
 
-    /// Entries that ask for the WinUSB backend.
-    pub fn winusb_ids(&self) -> Vec<&DeviceId> {
+    /// [`Self::backend_for`] for a row that was enumerated, so a `sn=` selector
+    /// is answered against the serial the descriptor actually reports.
+    pub fn backend_for_facts(&self, facts: &DeviceFacts) -> Backend {
+        self.find(&facts.id, Some(facts))
+            .map(|(_, _, b)| *b)
+            .unwrap_or_default()
+    }
+
+    /// [`Self::alias_for`], likewise.
+    pub fn alias_for_facts(&self, facts: &DeviceFacts) -> Option<&str> {
+        self.find(&facts.id, Some(facts))
+            .map(|(_, alias, _)| alias.as_str())
+    }
+
+    /// Entries that ask for the WinUSB backend, as written.
+    pub fn winusb_ids(&self) -> Vec<&ksx_core::DeviceRef> {
         self.entries
             .iter()
             .filter(|(_, _, b)| *b == Backend::Winusb)
@@ -128,6 +175,10 @@ impl ConfiguredDevices {
             .collect()
     }
 }
+
+/// One `[[device]]` row: what it names, what the user calls it, how it is
+/// captured.
+type Entry = (ksx_core::DeviceRef, String, Backend);
 
 /// One WinUSB-side row: a USB interface plus what config wants from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,11 +309,16 @@ impl DevicesReport {
     /// likely, and the reason this exists) a config still holding an
     /// **Interception hardware id** after being switched to `winusb`.
     /// See `docs/MIGRATION-WINUSB.md`.
-    pub fn unmatched_winusb_config(&self) -> Vec<&DeviceId> {
+    pub fn unmatched_winusb_config(&self) -> Vec<&ksx_core::DeviceRef> {
         self.configured
             .winusb_ids()
             .into_iter()
-            .filter(|id| !self.usb.iter().any(|r| &r.candidate.id == *id))
+            .filter(|entry| {
+                !self.usb.iter().any(|r| {
+                    r.candidate.id.as_str() == entry.raw()
+                        || entry.selector().matches(&r.candidate.facts())
+                })
+            })
             .collect()
     }
 }
@@ -488,7 +544,7 @@ pub fn devices_json(report: &DevicesReport) -> serde_json::Value {
             "unmatched_winusb_config": report
                 .unmatched_winusb_config()
                 .iter()
-                .map(|id| id.as_str())
+                .map(|entry| entry.raw())
                 .collect::<Vec<_>>(),
         },
     })
@@ -668,10 +724,17 @@ pub fn collect() -> DevicesReport {
         Ok(found) => {
             let rows = found
                 .into_iter()
-                .map(|candidate| UsbRow {
-                    alias: configured.alias_for(&candidate.id).map(str::to_owned),
-                    selected: configured.backend_for(&candidate.id) == Backend::Winusb,
-                    candidate,
+                .map(|candidate| {
+                    // The enumerated facts, not the id: a `sn=` selector can
+                    // only be answered against the serial the descriptor
+                    // reports, and `selected` is what turns on the "configured
+                    // for WinUSB but still on the keyboard stack" warning.
+                    let facts = candidate.facts();
+                    UsbRow {
+                        alias: configured.alias_for_facts(&facts).map(str::to_owned),
+                        selected: configured.backend_for_facts(&facts) == Backend::Winusb,
+                        candidate,
+                    }
                 })
                 .collect();
             (rows, true)
@@ -786,7 +849,7 @@ mod tests {
         ConfiguredDevices {
             entries: entries
                 .iter()
-                .map(|(id, alias, b)| (DeviceId::from(*id), (*alias).to_owned(), *b))
+                .map(|(id, alias, b)| (id.parse().expect(id), (*alias).to_owned(), *b))
                 .collect(),
         }
     }
@@ -976,8 +1039,12 @@ mod tests {
             cfg,
         );
         assert_eq!(
-            report.unmatched_winusb_config(),
-            vec![&DeviceId::from(IPAC)]
+            report
+                .unmatched_winusb_config()
+                .iter()
+                .map(|entry| entry.raw())
+                .collect::<Vec<_>>(),
+            vec![IPAC]
         );
         let text = render_human(&report);
         assert!(
@@ -1048,7 +1115,45 @@ mod tests {
         );
         assert_eq!(cfg.alias_for(&DeviceId::from(IPAC_USB)), Some("P1 I-PAC"));
         assert_eq!(cfg.alias_for(&DeviceId::from("USB\\NOPE")), None);
-        assert_eq!(cfg.winusb_ids(), vec![&DeviceId::from(IPAC_USB)]);
+        assert_eq!(
+            cfg.winusb_ids()
+                .iter()
+                .map(|entry| entry.raw())
+                .collect::<Vec<_>>(),
+            vec![IPAC_USB]
+        );
+    }
+
+    /// **The spelling `ksx device pick` writes has to light up the same
+    /// columns.** A config that names a board rather than a socket must still
+    /// show its alias and its backend against that board — and must still turn
+    /// on the "configured for WinUSB but still on the keyboard stack" line,
+    /// which is the single most useful thing this command prints.
+    #[test]
+    fn a_usb_selector_still_names_the_board_it_matches() {
+        let cfg = config(&[("usb:d209:0430:00", "P1 I-PAC", Backend::Winusb)]);
+        let candidate = usb(IPAC_USB, Binding::HidUsb);
+        let facts = candidate.facts();
+
+        assert_eq!(cfg.alias_for_facts(&facts), Some("P1 I-PAC"));
+        assert_eq!(cfg.backend_for_facts(&facts), Backend::Winusb);
+
+        let report = DevicesReport::build(
+            Vec::new(),
+            false,
+            vec![UsbRow {
+                alias: cfg.alias_for_facts(&facts).map(str::to_owned),
+                selected: cfg.backend_for_facts(&facts) == Backend::Winusb,
+                candidate,
+            }],
+            true,
+            cfg,
+        );
+        assert_eq!(report.pending_rebinds().len(), 1, "the rebind is still due");
+        assert!(
+            report.unmatched_winusb_config().is_empty(),
+            "the entry DOES match a connected interface — through its selector"
+        );
     }
 
     #[test]

@@ -792,7 +792,7 @@ pub fn commit(store: &Store, plan: &Plan) -> anyhow::Result<Written> {
         Wiring::None => {}
         Wiring::Config => {
             let mut config = store.load_config()?.value;
-            let alias = upsert_device(&mut config.devices, &plan.device_id, &plan.device_alias);
+            let alias = upsert_device(&mut config.devices, &plan.device_id, &plan.device_alias)?;
             upsert_slot(&mut config.slots, plan, &alias);
             written.config = Some(store.save_config(&config)?);
         }
@@ -818,9 +818,19 @@ pub fn commit(store: &Store, plan: &Plan) -> anyhow::Result<Written> {
 /// An id that is already known keeps ITS alias — renaming a device the user
 /// named would break every slot that refers to it by name — and a fresh id
 /// whose preferred alias is taken gets a numbered one rather than stealing it.
-fn upsert_device(devices: &mut Vec<DeviceEntry>, id: &str, preferred: &str) -> String {
-    if let Some(known) = devices.iter().find(|d| d.id == id) {
-        return known.alias.clone();
+///
+/// Fallible now that `[[device]] id` is a selector: this refuses rather than
+/// committing an id that would make the file itself unloadable next time. The
+/// value comes from Raw Input, which is always a device path, so in practice
+/// the wizard never meets this — but writing a config ksx cannot read back is
+/// the one failure a setup command must not have.
+fn upsert_device(
+    devices: &mut Vec<DeviceEntry>,
+    id: &str,
+    preferred: &str,
+) -> anyhow::Result<String> {
+    if let Some(known) = devices.iter().find(|d| d.id.raw() == id) {
+        return Ok(known.alias.clone());
     }
     let mut alias = preferred.to_owned();
     let mut n = 2;
@@ -829,11 +839,11 @@ fn upsert_device(devices: &mut Vec<DeviceEntry>, id: &str, preferred: &str) -> S
         n += 1;
     }
     devices.push(DeviceEntry {
-        id: id.to_owned(),
+        id: id.parse()?,
         alias: alias.clone(),
         backend: Default::default(),
     });
-    alias
+    Ok(alias)
 }
 
 fn upsert_slot(slots: &mut Vec<SlotEntry>, plan: &Plan, alias: &str) {
@@ -1747,11 +1757,11 @@ mod tests {
         let plan = plan_for(&wizard, Wiring::Config);
         let mut devices = Vec::new();
         let mut slots = Vec::new();
-        let alias = upsert_device(&mut devices, &plan.device_id, &plan.device_alias);
+        let alias = upsert_device(&mut devices, &plan.device_id, &plan.device_alias).unwrap();
         upsert_slot(&mut slots, &plan, &alias);
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].alias, "P1 panel");
-        assert_eq!(devices[0].id, PANEL);
+        assert_eq!(devices[0].id.raw(), PANEL);
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].number, 1);
         assert_eq!(slots[0].keyboard.as_deref(), Some("P1 panel"));
@@ -1761,7 +1771,7 @@ mod tests {
         // not rename the one the user may have edited, and the slot follows
         // the name that is actually in the file.
         devices[0].alias = "Cabinet P1".to_owned();
-        let alias = upsert_device(&mut devices, &plan.device_id, &plan.device_alias);
+        let alias = upsert_device(&mut devices, &plan.device_id, &plan.device_alias).unwrap();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].alias, "Cabinet P1");
         assert_eq!(alias, "Cabinet P1");
@@ -1775,13 +1785,27 @@ mod tests {
     #[test]
     fn a_second_panel_never_steals_the_first_ones_alias() {
         let mut devices = Vec::new();
-        assert_eq!(upsert_device(&mut devices, PANEL, "P1 panel"), "P1 panel");
         assert_eq!(
-            upsert_device(&mut devices, DESK, "P1 panel"),
+            upsert_device(&mut devices, PANEL, "P1 panel").unwrap(),
+            "P1 panel"
+        );
+        assert_eq!(
+            upsert_device(&mut devices, DESK, "P1 panel").unwrap(),
             "P1 panel (2)"
         );
         assert_eq!(devices.len(), 2);
         assert_ne!(devices[0].alias, devices[1].alias);
+    }
+
+    /// The wizard commits what Raw Input reported, and a value that cannot name
+    /// a device on Windows is refused HERE rather than written into a file that
+    /// then refuses to load — which would leave the machine worse off than
+    /// before the wizard ran.
+    #[test]
+    fn an_id_that_could_never_name_a_device_is_refused_rather_than_committed() {
+        let mut devices = Vec::new();
+        assert!(upsert_device(&mut devices, "not-a-device", "P1 panel").is_err());
+        assert!(devices.is_empty());
     }
 
     #[test]

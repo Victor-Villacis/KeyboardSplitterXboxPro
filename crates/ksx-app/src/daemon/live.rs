@@ -84,6 +84,13 @@ impl SessionFactory for LiveFactory {
     /// is the path a tray "Reload config" takes, so a "nothing to run" refusal
     /// must suggest `ksx daemon --game "…"`. Suggesting `ksx run` from inside a
     /// running daemon hands the user a foreground session.
+    ///
+    /// **This is also where `[[device]]` selectors become concrete devnodes**
+    /// — inside `resolve_as`, so start and reload get the same values. Hot-swap
+    /// eligibility (`SessionShape::bounce_reason`) compares the `DeviceId`s in
+    /// the plans these two calls return; resolve anywhere downstream of that
+    /// comparison and every preset edit reports "slot N's input device changed"
+    /// and bounces a live session mid-game (`docs/DEVICE-IDENTITY.md` §8).
     fn resolve_plan(&self) -> anyhow::Result<crate::run::plan::RunPlan> {
         crate::run::plan::resolve_as(&self.root, self.game.as_deref(), "ksx daemon")
             .map_err(|err| anyhow::anyhow!("{err}"))

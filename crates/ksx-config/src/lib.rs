@@ -31,6 +31,7 @@
 
 pub mod blocking_serde;
 pub mod config;
+pub mod device_serde;
 pub mod error;
 pub mod function;
 pub mod games;

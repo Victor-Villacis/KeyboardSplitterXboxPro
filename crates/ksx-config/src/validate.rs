@@ -1790,7 +1790,7 @@ preset = "default"
     #[test]
     fn duplicate_device_aliases_are_reported_once() {
         let device = |alias: &str| DeviceEntry {
-            id: r"HID\X".into(),
+            id: r"HID\X".parse().unwrap(),
             alias: alias.into(),
             backend: crate::config::Backend::Interception,
         };

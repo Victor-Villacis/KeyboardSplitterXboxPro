@@ -69,7 +69,7 @@ pub use pad::{
 };
 pub use persona::{PadBackend, Persona, UnknownPersona};
 pub use preset::{Binding, Chord, Macros, Preset, TurboBinding};
-pub use selector::{DeviceFacts, DeviceSelector, Match, Qualifier, SelectorParseError};
+pub use selector::{DeviceFacts, DeviceRef, DeviceSelector, Match, Qualifier, SelectorParseError};
 pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS, MAX_XINPUT_SLOTS};
 pub use socd::{DirMechanism, OpposingPair, Pointing, Socd, UnknownSocd};
 pub use templates::{Template, TemplateError, MAX_TEMPLATE_PLAYERS, TEMPLATES};
