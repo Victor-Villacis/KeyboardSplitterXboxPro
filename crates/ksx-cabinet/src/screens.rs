@@ -111,7 +111,7 @@ fn tabs(ui: &mut egui::Ui, current: Screen) {
                 ui.painter().rect_stroke(
                     rect,
                     crate::theme::plate(radius::ROW),
-                    Stroke::new(2.0, role::BORDER_STRONG),
+                    Stroke::new(2.0_f32, role::BORDER_STRONG),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -925,7 +925,7 @@ pub fn modal(ctx: &egui::Context, confirm: &Confirm) {
             ui.painter().rect_stroke(
                 card,
                 crate::theme::plate(radius::CARD),
-                Stroke::new(2.0, role::BORDER_STRONG),
+                Stroke::new(2.0_f32, role::BORDER_STRONG),
                 egui::StrokeKind::Inside,
             );
 

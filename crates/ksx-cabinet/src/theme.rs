@@ -223,12 +223,12 @@ pub fn install(ctx: &egui::Context) {
     visuals.extreme_bg_color = role::SURFACE;
     visuals.override_text_color = Some(role::TEXT);
     visuals.widgets.noninteractive.bg_fill = role::RAISED;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, role::BORDER);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, role::BORDER);
     visuals.widgets.inactive.bg_fill = role::INSET;
     visuals.widgets.hovered.bg_fill = role::INSET;
     visuals.widgets.active.bg_fill = role::INSET;
     visuals.selection.bg_fill = role::ACCENT;
-    visuals.selection.stroke = Stroke::new(1.0, role::ACCENT_ON);
+    visuals.selection.stroke = Stroke::new(1.0_f32, role::ACCENT_ON);
     // egui's own focus ring is off: this surface draws its own, and two rings
     // disagreeing about where the cursor is would be worse than either.
     visuals.widgets.hovered.expansion = 0.0;
