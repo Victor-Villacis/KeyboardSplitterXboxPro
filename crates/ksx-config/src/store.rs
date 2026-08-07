@@ -693,7 +693,7 @@ mod tests {
         ConfigFile {
             schema_version: SCHEMA_VERSION,
             settings: Settings {
-                block_keyboards: true,
+                block_keyboards: ksx_core::Blocking::Whole,
                 block_mice: true,
                 mouse_move_deadzone: 7,
                 starting_user_index: 2,
@@ -754,7 +754,7 @@ mod tests {
                 arguments: "-silent".into(),
                 process_name: Some("portal2.exe".into()),
                 launcher_grace_ms: None,
-                block_keyboards: true,
+                block_keyboards: ksx_core::Blocking::Whole,
                 block_mice: false,
                 slots: vec![GameSlotEntry {
                     number: 1,
@@ -818,7 +818,10 @@ extra = true
         )
         .unwrap();
         let loaded = store.load_config().unwrap();
-        assert!(!loaded.value.settings.block_keyboards);
+        assert_eq!(
+            loaded.value.settings.block_keyboards,
+            ksx_core::Blocking::Off
+        );
         assert_eq!(loaded.value.devices.len(), 1);
         let paths: Vec<&str> = loaded
             .warnings
@@ -893,7 +896,10 @@ extra = true
         std::fs::write(store.root().config_path(), original).unwrap();
 
         let loaded = store.load_config().unwrap();
-        assert!(!loaded.value.settings.block_keyboards);
+        assert_eq!(
+            loaded.value.settings.block_keyboards,
+            ksx_core::Blocking::Off
+        );
         assert_eq!(loaded.value.schema_version, SCHEMA_VERSION);
 
         let backup = dir.path().join("config.toml.bak-20260803-123456");

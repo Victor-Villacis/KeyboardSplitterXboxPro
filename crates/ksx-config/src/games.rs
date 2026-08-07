@@ -2,7 +2,7 @@
 //! `splitter_games.xml` (title, path, args, block flags, per-slot
 //! device-by-id + preset-by-name).
 
-use ksx_core::{DeviceId, MacroSwitch, Persona, SlotSpec, Socd};
+use ksx_core::{Blocking, DeviceId, MacroSwitch, Persona, SlotSpec, Socd};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
@@ -51,18 +51,20 @@ pub struct GameEntry {
     /// a live session — which is why the default errs high.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launcher_grace_ms: Option<u64>,
-    /// Legacy `BlockKeyboards` (default true).
-    #[serde(default = "default_true")]
-    pub block_keyboards: bool,
+    /// See [`crate::config::Settings::block_keyboards`]. Per-game, because the
+    /// right answer is a property of the TITLE: a fighting game on the cabinet
+    /// takes the panel whole, and a game with a chat box played on a desk
+    /// keyboard cannot afford to.
+    ///
+    /// The default is [`Blocking::Whole`] (`true`), which is what legacy
+    /// `BlockKeyboards` meant and what every imported profile says.
+    #[serde(default, with = "crate::blocking_serde")]
+    pub block_keyboards: Blocking,
     /// Legacy `BlockMice` (default false).
     #[serde(default)]
     pub block_mice: bool,
     #[serde(default, rename = "slot", skip_serializing_if = "Vec::is_empty")]
     pub slots: Vec<GameSlotEntry>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,7 +176,7 @@ preset = "IPAC P2"
         assert_eq!(game.title, "Steam");
         assert_eq!(game.path, r"C:\Program Files (x86)\Steam\steam.exe");
         assert_eq!(game.arguments, "");
-        assert!(game.block_keyboards);
+        assert_eq!(game.block_keyboards, Blocking::Whole);
         assert!(!game.block_mice);
         assert_eq!(game.slots.len(), 2);
         assert_eq!(game.slots[1].number, 2);
@@ -185,13 +187,33 @@ preset = "IPAC P2"
     #[test]
     fn defaults_match_legacy() {
         let game: GameEntry = toml::from_str("title = \"t\"\npath = \"C:\\\\g.exe\"\n").unwrap();
-        assert!(game.block_keyboards);
+        assert_eq!(game.block_keyboards, Blocking::Whole);
         assert!(!game.block_mice);
         assert!(game.slots.is_empty());
         assert_eq!(game.notes, "");
         assert_eq!(game.arguments, "");
         assert_eq!(game.process_name, None);
         assert_eq!(game.launcher_grace_ms, None);
+    }
+
+    /// A profile can now ask for the desk-keyboard mode — and the two states it
+    /// could already express keep the exact bytes every imported legacy profile
+    /// was written with.
+    #[test]
+    fn a_profile_can_take_bound_keys_only_without_disturbing_the_bool_spellings() {
+        let games: GamesFile = toml::from_str(EXAMPLE).unwrap();
+        assert!(toml::to_string(&games)
+            .unwrap()
+            .contains("block_keyboards = true"));
+
+        let partial: GameEntry = toml::from_str(
+            "title = \"t\"\npath = \"C:\\\\g.exe\"\nblock_keyboards = \"bound-keys\"\n",
+        )
+        .unwrap();
+        assert_eq!(partial.block_keyboards, Blocking::BoundKeys);
+        let text = toml::to_string(&partial).unwrap();
+        assert!(text.contains("block_keyboards = \"bound-keys\""), "{text}");
+        assert_eq!(toml::from_str::<GameEntry>(&text).unwrap(), partial);
     }
 
     /// The per-profile launcher grace: optional, absent from every imported

@@ -415,7 +415,9 @@ mod tests {
     use crate::config::{Backend, DeviceEntry, Settings, SlotEntry};
     use crate::games::{GameEntry, GameSlotEntry};
     use crate::preset::{BindingEntry, GuardedEntry, MacroFile, MacroStepFile};
-    use ksx_core::{Axis, Binding, Chord, DpadDirection, Key, Persona, Preset, Socd, AXIS_MIN};
+    use ksx_core::{
+        Axis, Binding, Blocking, Chord, DpadDirection, Key, Persona, Preset, Socd, AXIS_MIN,
+    };
     use std::path::PathBuf;
 
     fn p() -> PathBuf {
@@ -430,7 +432,7 @@ mod tests {
         ConfigFile {
             schema_version: SCHEMA_VERSION,
             settings: Settings {
-                block_keyboards: false,
+                block_keyboards: Blocking::Off,
                 block_mice: true,
                 mouse_move_deadzone: 11,
                 starting_user_index: 3,
@@ -480,7 +482,9 @@ mod tests {
                     arguments: "-silent".into(),
                     process_name: Some("portal2.exe".into()),
                     launcher_grace_ms: Some(20_000),
-                    block_keyboards: true,
+                    // The third state, in the fixture that exists to make every
+                    // shape cross JSON: a bool cannot carry it.
+                    block_keyboards: Blocking::BoundKeys,
                     block_mice: false,
                     slots: vec![GameSlotEntry {
                         number: 1,
@@ -501,7 +505,7 @@ mod tests {
                     arguments: String::new(),
                     process_name: None,
                     launcher_grace_ms: None,
-                    block_keyboards: false,
+                    block_keyboards: Blocking::Off,
                     block_mice: true,
                     slots: Vec::new(),
                 },

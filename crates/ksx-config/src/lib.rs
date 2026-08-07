@@ -29,6 +29,7 @@
 //! - [`validate`] — structured cross-file [`Issue`]s
 //! - [`error`] — [`ConfigError`]
 
+pub mod blocking_serde;
 pub mod config;
 pub mod error;
 pub mod function;

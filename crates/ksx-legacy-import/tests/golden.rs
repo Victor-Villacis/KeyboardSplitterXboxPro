@@ -41,7 +41,7 @@ fn primary_corpus_imports_with_zero_warnings() {
     let settings = import.settings.as_ref().expect("settings imported");
     assert_eq!(settings.mouse_move_deadzone, 1);
     assert_eq!(settings.starting_user_index, 1);
-    assert!(settings.block_keyboards);
+    assert_eq!(settings.block_keyboards, ksx_core::Blocking::Whole);
     assert!(!settings.block_mice);
 
     // HWIDs land verbatim; the empty legacy Mouse attribute becomes absent.
@@ -289,7 +289,7 @@ preset = "IPAC P1"
         toml::from_str(&std::fs::read_to_string(root.join("config.toml")).unwrap()).unwrap();
     // Settings replaced by the import...
     assert_eq!(merged.settings.mouse_move_deadzone, 1);
-    assert!(merged.settings.block_keyboards);
+    assert_eq!(merged.settings.block_keyboards, ksx_core::Blocking::Whole);
     // ...devices/slots preserved.
     assert_eq!(merged.devices.len(), 1);
     assert_eq!(merged.devices[0].alias, "P1 I-PAC");
