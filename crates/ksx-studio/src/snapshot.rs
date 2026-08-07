@@ -54,6 +54,32 @@ pub struct MapPayload {
     pub macro_selected: String,
 }
 
+/// What `GET /api/devices` serves AND what the `/devices` island's props
+/// carry — the same one-struct-one-serializer rule as [`StatusPayload`],
+/// parity pinned in `render_devices.rs`.
+///
+/// The scan and the reason it is missing are SEPARATE fields on purpose. An
+/// empty `DeviceScanView` is a real answer on a machine with nothing plugged
+/// in; it is also what a refusal would degrade to if the two were collapsed,
+/// and "no boards found" on a machine with four boards is the worst possible
+/// lie for this page to tell. [`Self::unavailable`] non-empty means the view
+/// below is not a reading of anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevicesPayload {
+    pub scan: ksx_api::DeviceScanView,
+    /// Session state, for the header pill and for the one caution this page
+    /// owes a running cabinet: a `[[device]]` edit lands in `config.toml`, and
+    /// the session already running keeps the devices it opened until it is
+    /// restarted.
+    pub session: crate::control::SessionView,
+    /// Empty when the scan answered. Otherwise the refusal, verbatim.
+    #[serde(default)]
+    pub unavailable: String,
+    /// One-shot action feedback (the `?flash=` query). Always `None` from
+    /// `/api/devices` — a poll is not an action.
+    pub flash: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

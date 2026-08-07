@@ -25,13 +25,22 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use crate::sources::{configured_profile, CollectorSource};
+use crate::sources::{configured_profile, CollectorSource, LocalMachine};
 
 pub fn run(port: u16) -> anyhow::Result<()> {
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     println!("ksx Studio: http://{bind}/  (localhost only; Ctrl+C or close the window to stop)");
     println!("Session controls talk to a running `ksx daemon` over its control pipe.");
-    ksx_studio::serve(bind, Box::new(CollectorSource), Box::new(control_source()))?;
+    ksx_studio::serve(
+        bind,
+        Box::new(CollectorSource),
+        Box::new(control_source()),
+        // The third provider (v17): the MACHINE verbs the `/devices` picker
+        // needs. Daemon-free by construction — it walks the USB tree and the
+        // config store directly — which is why the picker keeps working behind
+        // the "No daemon" banner that disables every session control.
+        Box::new(LocalMachine),
+    )?;
     Ok(())
 }
 

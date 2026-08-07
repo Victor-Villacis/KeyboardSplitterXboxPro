@@ -45,6 +45,43 @@ use ksx_platform::winusb::{Candidate, ClaimState, Refusal, Survey};
 // pick
 // ---------------------------------------------------------------------------
 
+/// The cost of a `port=` rung, in one paragraph, said once.
+///
+/// It lives here rather than inline in [`PickOutcome::message`] because it is
+/// not a property of the MOMENT the entry was written — it is a property of the
+/// entry. `ksx device pick` prints it at write time; a surface listing
+/// configured devices has to keep printing it, or the entry looks like every
+/// other one right up until the board moves socket.
+///
+/// The second half is the half people miss. A `port=` value names THIS PC's USB
+/// topology, so the entry does not travel — which matters the moment configs
+/// get shared or a cabinet gets rebuilt, and `pick` is the only place that
+/// knows enough to say it (by the time `run` sees a missing board it cannot
+/// tell a move from an unplug).
+///
+/// # Why it does not simply say "move it and it breaks"
+///
+/// It used to, and that was a stronger claim than ksx can make. The `port=`
+/// value is [`DeviceFacts::instance_of`] — the tail of the Windows instance
+/// path — and Windows derives that tail from the SOCKET only for devices with
+/// no usable serial. Measured on this cabinet on 2026-08-07: an I-PAC 4X's
+/// instance path is serial-anchored and survived a move to another USB port
+/// completely unchanged. Nothing in the path itself says which kind a given
+/// board is.
+///
+/// So the paragraph states what is true of every port-rung entry — it matches
+/// only while Windows keeps reporting that exact path — and names the port move
+/// as the usual, not the certain, way that changes. Same rule as the `resolve`
+/// refusal: never assert a port move ksx cannot know happened.
+pub const PORT_PINNED_WARNING: &str =
+    "PORT-PINNED — nothing weaker than the Windows instance path separates this board from its \
+     twin, so this entry matches only while Windows keeps reporting that exact path for it. \
+     Moving the board to another USB socket is the usual way that changes, and the entry then \
+     stops matching — though not reliably: on some boards the path is anchored to the serial and \
+     survives a move (measured here on an I-PAC 4X), and ksx cannot tell the two kinds apart from \
+     the path alone. It is also specific to THIS machine: the path names this PC's USB topology, \
+     so do not copy this config to another cabinet — run `ksx device pick` there instead.";
+
 /// One `ksx device pick`, as any surface spells it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PickSpec {
@@ -96,6 +133,22 @@ pub enum PickError {
     Device(#[from] Refusal),
     #[error("the alias \"{alias}\" already names {id}")]
     AliasTaken { alias: String, id: String },
+    /// Re-picking a configured board under a DIFFERENT name is a rename, and a
+    /// rename orphans every `[[slot]]` that referred to the old one.
+    ///
+    /// `remove` has refused this since it existed; `pick` did not, so the same
+    /// destruction was reachable by typing a new name into the box beside the
+    /// board — one field and one click, on the very row whose Remove button
+    /// demands a `--force` checkbox for exactly this consequence.
+    #[error(
+        "renaming \"{from}\" to \"{to}\" would orphan {}",
+        breaks.iter().map(SlotRef::to_string).collect::<Vec<_>>().join(", ")
+    )]
+    RenameOrphansSlots {
+        from: String,
+        to: String,
+        breaks: Vec<SlotRef>,
+    },
     #[error("\"{alias}\" cannot be an alias: {problem}")]
     BadAlias {
         alias: String,
@@ -123,6 +176,7 @@ impl PickError {
         match self {
             Self::Device(refusal) => refusal.code(),
             Self::AliasTaken { .. } => "alias-taken",
+            Self::RenameOrphansSlots { .. } => "rename-orphans-slots",
             Self::BadAlias { .. } => "bad-alias",
             Self::NotEnumerable { .. } => "not-enumerable",
             Self::NotUnique { .. } => "ambiguous-selector",
@@ -146,6 +200,19 @@ impl PickError {
                  config, so it can never resolve back to this entry."
                     .to_owned()
             }
+            Self::RenameOrphansSlots { from, to, breaks } => format!(
+                "these slots name \"{from}\" and nothing would repoint them at \"{to}\", so they \
+                 would resolve to nothing and `ksx run` would refuse to start on them — the panel \
+                 dead at the next boot, long after whoever renamed it walked away:\n  {}\n\nLeave \
+                 the name box empty to re-pick this board WITHOUT renaming it (that is what \
+                 re-picking is for: it upgrades the id and keeps the name). To rename it \
+                 deliberately, repoint those slots first.",
+                breaks
+                    .iter()
+                    .map(SlotRef::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
+            ),
             Self::NotEnumerable { .. } => {
                 "run `ksx devices`. The USB enumeration ksx builds selectors from did not return \
                  this interface, so there is nothing to write an id from — writing the raw \
@@ -222,10 +289,17 @@ pub fn resolve<'a>(
 /// Every check that can refuse runs **before** the caller is allowed anywhere
 /// near the store, so a refusal never leaves a stray backup behind — the same
 /// ordering [`crate::slots::assign`] uses.
+///
+/// `games` is here for one check: re-picking a configured board under a new
+/// name is a RENAME, and a rename orphans every slot that named the old alias.
+/// `remove` has always refused that; `pick` used to do it silently, which meant
+/// the destruction `remove` gates behind `--force` was reachable by typing a
+/// different name into `--alias`.
 pub fn plan_pick(
     survey: &Survey,
     connected: &[DeviceFacts],
     config: &ConfigFile,
+    games: &GamesFile,
     spec: &PickSpec,
 ) -> Result<PickPlan, PickError> {
     let candidate = resolve(survey, connected, config, &spec.query)?;
@@ -317,6 +391,22 @@ pub fn plan_pick(
         });
     }
 
+    // `apply_pick` overwrites the replaced entry wholesale, so a different
+    // alias here is a rename — and a rename leaves every `[[slot]]` that named
+    // the old one pointing at nothing. `plan_remove` refuses that without
+    // `--force`; refusing it here is the same rule reaching the same
+    // destruction by its other door.
+    if let Some(previous) = replaces.as_deref().filter(|old| *old != alias) {
+        let breaks = references_to(config, games, previous);
+        if !breaks.is_empty() {
+            return Err(PickError::RenameOrphansSlots {
+                from: previous.to_owned(),
+                to: alias,
+                breaks,
+            });
+        }
+    }
+
     Ok(PickPlan {
         instance_id,
         name,
@@ -388,24 +478,12 @@ impl PickOutcome {
         if !plan.selector.survives_replug() {
             // The trade has to be stated at the moment it is made: a user with
             // two identical encoders needs to know WHICH of their boards is now
-            // pinned to a socket.
-            //
-            // A `port=` rung means the port is what SEPARATES this board from
-            // its twin — which is why it appears exactly when the serials
-            // collide (measured: two I-PAC 4X boards both answer "4"). So the
-            // cost is twofold, and the second half is easy to miss: a port value
-            // describes THIS machine's USB topology, so the entry does not
-            // travel. That matters the moment configs get shared or a cabinet
-            // gets rebuilt, and `pick` is the only place that knows enough to
-            // say it — by the time `run` sees a missing board it cannot tell a
-            // move from an unplug (see `run::resolve`).
-            let _ = writeln!(
-                out,
-                "  [!] PORT-PINNED — nothing weaker than the socket separates this board from \
-                 its twin. Move it to another USB port and this entry stops matching. It is \
-                 also specific to THIS machine: the port names this PC's USB topology, so do \
-                 not copy this config to another cabinet — run `ksx device pick` there instead."
-            );
+            // pinned to a socket. A `port=` rung means the port is what
+            // SEPARATES this board from its twin — which is why it appears
+            // exactly when the serials collide (measured: two I-PAC 4X boards
+            // both answer "4"). The wording is [`PORT_PINNED_WARNING`], shared
+            // with every surface that lists a configured device.
+            let _ = writeln!(out, "  [!] {PORT_PINNED_WARNING}");
         }
         if let Some(backup) = &self.backup {
             let _ = writeln!(out, "  backup  : {}", backup.display());
@@ -622,7 +700,13 @@ pub fn plan_remove(
 /// Matching is byte-exact, like `ConfigFile::resolve_device`: a slot that says
 /// `"Panel"` when the entry says `"panel"` is already an unresolved reference
 /// and deleting this entry is not what broke it.
-fn references_to(config: &ConfigFile, games: &GamesFile, alias: &str) -> Vec<SlotRef> {
+///
+/// Public because it is the ONE answer to "what breaks if this goes away", and
+/// a surface that offers a Remove button has to show it BEFORE the click —
+/// `plan_remove` refuses on this list, and a page that re-derived its own
+/// version would be a second implementation of the refusal
+/// (`docs/SURFACES.md` §1). [`crate::device_scan::view`] renders it per entry.
+pub fn references_to(config: &ConfigFile, games: &GamesFile, alias: &str) -> Vec<SlotRef> {
     let mut out = Vec::new();
     let mut push =
         |slot: u8, profile: Option<&str>, field: &'static str, value: &Option<String>| {
@@ -809,7 +893,7 @@ fn board_name(candidate: &Candidate, facts: &DeviceFacts) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
-fn connected_facts() -> Vec<DeviceFacts> {
+pub(crate) fn connected_facts() -> Vec<DeviceFacts> {
     match ksx_capture::usb_candidates() {
         Ok(found) => found.iter().map(ksx_capture::UsbCandidate::facts).collect(),
         Err(err) => {
@@ -820,7 +904,7 @@ fn connected_facts() -> Vec<DeviceFacts> {
 }
 
 #[cfg(windows)]
-fn store() -> Result<Store, ConfigError> {
+pub(crate) fn store() -> Result<Store, ConfigError> {
     Ok(Store::new(ksx_config::ConfigRoot::discover()?))
 }
 
@@ -830,8 +914,9 @@ pub fn pick(spec: PickSpec, json: bool) -> anyhow::Result<()> {
     let connected = connected_facts();
     let store = store()?;
     let config = store.load_config()?.value;
+    let games = store.load_games()?.value;
 
-    let plan = match plan_pick(&survey, &connected, &config, &spec) {
+    let plan = match plan_pick(&survey, &connected, &config, &games, &spec) {
         Ok(plan) => plan,
         Err(err) => refuse(&err.to_string(), &err.advice(), &err.to_json(), json),
     };
@@ -1043,8 +1128,14 @@ mod tests {
         let config = ConfigFile::default();
         let store = root.store(&config);
 
-        let plan = plan_pick(&cabinet(), &one_ipac(), &config, &spec("MI_00\\7&25EEA38C"))
-            .expect("one I-PAC, on the keyboard stack");
+        let plan = plan_pick(
+            &cabinet(),
+            &one_ipac(),
+            &config,
+            &GamesFile::default(),
+            &spec("MI_00\\7&25EEA38C"),
+        )
+        .expect("one I-PAC, on the keyboard stack");
         assert_eq!(plan.selector.to_string(), "usb:d209:0430:00");
         assert!(plan.selector.survives_replug());
         assert_eq!(plan.alias, "Ultimarc I-PAC 4X");
@@ -1074,8 +1165,14 @@ mod tests {
     fn only_an_already_bound_interface_gets_backend_winusb() {
         let config = ConfigFile::default();
 
-        let claimable = plan_pick(&cabinet(), &one_ipac(), &config, &spec("MI_00\\7&25EEA38C"))
-            .expect("the I-PAC is claimable");
+        let claimable = plan_pick(
+            &cabinet(),
+            &one_ipac(),
+            &config,
+            &GamesFile::default(),
+            &spec("MI_00\\7&25EEA38C"),
+        )
+        .expect("the I-PAC is claimable");
         assert_eq!(claimable.backend, Backend::Interception);
         assert!(!claimable.claimed);
 
@@ -1090,6 +1187,7 @@ mod tests {
             &Survey::from_nodes(&nodes),
             &one_ipac(),
             &config,
+            &GamesFile::default(),
             &spec("MI_00\\7&25EEA38C"),
         )
         .expect("a claimed board is still pickable");
@@ -1121,8 +1219,14 @@ mod tests {
         twin_b.instance = twin_a.instance.clone();
         let connected = vec![twin_a, twin_b];
 
-        let err = plan_pick(&cabinet(), &connected, &ConfigFile::default(), &spec(PANEL))
-            .expect_err("no rung separates them");
+        let err = plan_pick(
+            &cabinet(),
+            &connected,
+            &ConfigFile::default(),
+            &GamesFile::default(),
+            &spec(PANEL),
+        )
+        .expect_err("no rung separates them");
         assert_eq!(err.code(), "ambiguous-selector");
         let advice = err.advice();
         assert!(
@@ -1143,8 +1247,14 @@ mod tests {
         // Measured on this hardware: both I-PAC 4X boards answer "4", so the
         // serial rung is no help and the port rung is the honest fallback.
         let connected = vec![facts(PANEL, 0, Some("4")), facts(PANEL_B, 0, Some("4"))];
-        let plan = plan_pick(&cabinet(), &connected, &ConfigFile::default(), &spec(PANEL))
-            .expect("the port separates them");
+        let plan = plan_pick(
+            &cabinet(),
+            &connected,
+            &ConfigFile::default(),
+            &GamesFile::default(),
+            &spec(PANEL),
+        )
+        .expect("the port separates them");
         assert_eq!(plan.selector.rung(), "port");
         assert!(!plan.selector.survives_replug());
 
@@ -1168,14 +1278,26 @@ mod tests {
     #[test]
     fn an_unknown_or_ambiguous_query_is_refused_with_the_candidates_listed() {
         let config = ConfigFile::default();
-        let unknown = plan_pick(&cabinet(), &one_ipac(), &config, &spec("nothing-like-this"))
-            .expect_err("no such interface");
+        let unknown = plan_pick(
+            &cabinet(),
+            &one_ipac(),
+            &config,
+            &GamesFile::default(),
+            &spec("nothing-like-this"),
+        )
+        .expect_err("no such interface");
         assert_eq!(unknown.code(), "unknown-device");
         assert!(unknown.advice().contains(PANEL), "{}", unknown.advice());
 
         // `MI_00` alone matches the I-PAC and the desk keyboard.
-        let ambiguous =
-            plan_pick(&cabinet(), &one_ipac(), &config, &spec("MI_00")).expect_err("two boards");
+        let ambiguous = plan_pick(
+            &cabinet(),
+            &one_ipac(),
+            &config,
+            &GamesFile::default(),
+            &spec("MI_00"),
+        )
+        .expect_err("two boards");
         assert_eq!(ambiguous.code(), "ambiguous-device");
     }
 
@@ -1188,6 +1310,7 @@ mod tests {
             &cabinet(),
             &one_ipac(),
             &ConfigFile::default(),
+            &GamesFile::default(),
             &spec("MI_01"),
         )
         .expect_err("MI_01 carries no keys");
@@ -1209,6 +1332,7 @@ mod tests {
             &cabinet(),
             &one_ipac(),
             &config,
+            &GamesFile::default(),
             &PickSpec {
                 query: PANEL.to_owned(),
                 alias: Some("panel".to_owned()),
@@ -1236,8 +1360,14 @@ mod tests {
         let config = config_with(vec![entry(PANEL, "P1 panel", Backend::Interception)]);
         let store = root.store(&config);
 
-        let plan = plan_pick(&cabinet(), &one_ipac(), &config, &spec("P1 panel"))
-            .expect("the alias resolves to the board it names");
+        let plan = plan_pick(
+            &cabinet(),
+            &one_ipac(),
+            &config,
+            &GamesFile::default(),
+            &spec("P1 panel"),
+        )
+        .expect("the alias resolves to the board it names");
         assert_eq!(plan.replaces.as_deref(), Some("P1 panel"));
         assert_eq!(plan.alias, "P1 panel");
         assert_eq!(plan.selector.to_string(), "usb:d209:0430:00");
@@ -1249,12 +1379,123 @@ mod tests {
         assert_eq!(written.devices[0].id.raw(), "usb:d209:0430:00");
     }
 
+    /// Both halves of the paragraph, pinned on the CONSTANT rather than on a
+    /// rendering of it — every surface that lists a configured device shows
+    /// this, and `ksx-studio` cannot import it (no dependency edge), so its
+    /// fixture reproduces these two halves and this is what keeps them true.
+    ///
+    /// The second half is the one people miss: a config that travels to a
+    /// second cabinet silently stops matching. The first must NOT promise that
+    /// a port move breaks the entry — see the constant's own docs and the
+    /// 2026-08-07 I-PAC measurement.
+    #[test]
+    fn the_port_pinned_warning_says_both_halves_and_promises_neither_too_hard() {
+        assert!(PORT_PINNED_WARNING.contains("stops matching"));
+        assert!(PORT_PINNED_WARNING.contains("do not copy this config to another cabinet"));
+        assert!(
+            !PORT_PINNED_WARNING.contains("Move it to another USB port and this entry stops"),
+            "that sentence promises a consequence of a port move that an I-PAC 4X measurably \
+             does not have: {PORT_PINNED_WARNING}"
+        );
+        assert!(
+            PORT_PINNED_WARNING.contains("not reliably"),
+            "the uncertainty has to be stated, or the warning is just wrong more politely: \
+             {PORT_PINNED_WARNING}"
+        );
+    }
+
+    /// **A rename by another door is still a rename.**
+    ///
+    /// FAILS against the shipped writer, where `plan_pick` took the typed alias
+    /// unconditionally, `apply_pick` overwrote the replaced entry wholesale,
+    /// and every `[[slot]]` naming the old alias was left pointing at nothing —
+    /// `plan_pick` never called `references_to` at all. Studio's `/devices`
+    /// page put that one keystroke away, in the name box directly ABOVE a
+    /// Remove button that demands a `--force` checkbox for the identical
+    /// consequence.
+    ///
+    /// Asserted on the SLOTS, not just the code: the point is the config that
+    /// would have been written, and a status word alone would not prove the
+    /// entry survived.
+    #[test]
+    fn re_picking_under_a_new_name_is_refused_while_slots_name_the_old_one() {
+        let config = ConfigFile {
+            devices: vec![entry(PANEL, "P1 panel", Backend::Interception)],
+            slots: vec![slot(1, Some("P1 panel"))],
+            ..ConfigFile::default()
+        };
+        let renamed = PickSpec {
+            query: "P1 panel".to_owned(),
+            alias: Some("panel".to_owned()),
+        };
+        let err = plan_pick(
+            &cabinet(),
+            &one_ipac(),
+            &config,
+            &GamesFile::default(),
+            &renamed,
+        )
+        .expect_err("slot 1 names the old alias");
+        assert_eq!(err.code(), "rename-orphans-slots");
+        assert!(err.to_string().contains("slot 1 (keyboard)"), "{err}");
+        assert!(
+            err.advice().contains("Leave the name box empty"),
+            "the refusal must name the way through: {}",
+            err.advice()
+        );
+
+        // A slot in a games.toml profile counts too — `ksx run --game` is a
+        // session like any other, and the panel is just as dead in it.
+        let profile = games_with("Street Fighter", vec![game_slot(1, "P1 panel")]);
+        let err = plan_pick(
+            &cabinet(),
+            &one_ipac(),
+            &config_with(vec![entry(PANEL, "P1 panel", Backend::Interception)]),
+            &profile,
+            &renamed,
+        )
+        .expect_err("a profile slot names the old alias");
+        assert_eq!(err.code(), "rename-orphans-slots");
+
+        // …and the two things that must STILL work, or this is just a block on
+        // re-picking: re-picking with no name given (the upgrade path), and
+        // renaming an entry nothing refers to.
+        let kept = plan_pick(
+            &cabinet(),
+            &one_ipac(),
+            &config,
+            &GamesFile::default(),
+            &spec("P1 panel"),
+        )
+        .expect("re-picking without a name keeps the name");
+        assert_eq!(kept.alias, "P1 panel");
+
+        let unreferenced = config_with(vec![entry(PANEL, "P1 panel", Backend::Interception)]);
+        let free = plan_pick(
+            &cabinet(),
+            &one_ipac(),
+            &unreferenced,
+            &GamesFile::default(),
+            &renamed,
+        )
+        .expect("no slot names it, so the rename breaks nothing");
+        assert_eq!(free.alias, "panel");
+        assert_eq!(free.replaces.as_deref(), Some("P1 panel"));
+    }
+
     #[test]
     fn the_write_takes_a_timestamped_backup_of_the_file_it_replaces() {
         let root = TempRoot::new("backup");
         let config = ConfigFile::default();
         let store = root.store(&config);
-        let plan = plan_pick(&cabinet(), &one_ipac(), &config, &spec(PANEL)).unwrap();
+        let plan = plan_pick(
+            &cabinet(),
+            &one_ipac(),
+            &config,
+            &GamesFile::default(),
+            &spec(PANEL),
+        )
+        .unwrap();
         let outcome = apply_pick(&store, &plan).unwrap();
         let backup = outcome
             .backup

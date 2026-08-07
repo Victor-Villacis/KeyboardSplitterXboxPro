@@ -96,9 +96,15 @@ pub struct DeviceFacts {
     /// index is 0 (most cheap HID boards) — which is the common case, and the
     /// reason the model rung exists.
     pub serial: Option<String>,
-    /// The instance tail: everything after the last `\` of [`Self::id`]. This
-    /// is the port-derived part, kept separate so a port-pinned selector never
-    /// has to re-parse a path.
+    /// The instance tail: everything after the last `\` of [`Self::id`], kept
+    /// separate so a port-pinned selector never has to re-parse a path.
+    ///
+    /// Windows derives this tail from the SOCKET only for devices with no
+    /// usable serial; where the descriptor carries one it is serial-anchored
+    /// instead, and the tail then survives a move to another port. Measured on
+    /// this cabinet 2026-08-07: an I-PAC 4X's tail was unchanged across a port
+    /// move. Nothing in the tail says which kind a board is, so no message
+    /// built from it may promise that moving the board breaks the match.
     pub instance: String,
 }
 
@@ -581,23 +587,33 @@ impl DeviceSelector {
                 Qualifier::Serial(sn) => format!(
                     "the board whose serial is \"{sn}\" — survives being moved to another USB port"
                 ),
-                // Worded as an instruction, not a prediction. §3 measured a
-                // board whose instance id did NOT change across a port move —
-                // Windows keys a devnode off the serial when the device reports
-                // one — so "moving it breaks this entry" is a claim ksx cannot
-                // make. What it can say is that this entry offers no protection
-                // if it does, and that is the whole content of the warning.
+                // Two branches corrected this same falsehood independently and
+                // reached different halves of the right answer, so it keeps
+                // both. §3 measured a board whose instance id did NOT change
+                // across a port move — Windows keys a devnode off the serial
+                // when the board reports one — so "moving it breaks this entry"
+                // is a claim ksx cannot make. What is CERTAIN is that the match
+                // is tied to the path. What is PRUDENT is to treat that as
+                // socket-specific anyway: the user cannot tell which kind of
+                // board they own, ksx cannot tell them once it is unplugged,
+                // and the failure mode is a dead arcade panel. State the
+                // certainty, then give the instruction — a bare "usually (not
+                // always)" reads as "probably fine" to someone about to move a
+                // board.
                 Qualifier::Port(port) => format!(
-                    "the board at one exact devnode ({port}) — the price of telling two identical \
-                     boards apart. TREAT IT AS SOCKET-SPECIFIC: an instance id follows the USB \
-                     socket unless the board reports a serial, and this rung is only ever written \
-                     when no weaker one could separate your boards"
+                    "the board at one specific Windows instance path ({port}) — it matches only \
+                     while Windows reports that path for it. An instance id follows the USB \
+                     socket unless the board reports a serial, so moving the board usually (not \
+                     always) changes it. TREAT IT AS SOCKET-SPECIFIC: that is the price of \
+                     telling two identical boards apart"
                 ),
             },
-            Self::InstancePath(_) => "one exact devnode (a legacy full instance path) — TREAT IT \
-                 AS SOCKET-SPECIFIC: an instance id follows the USB socket unless the board \
-                 reports a serial, and ksx cannot tell which yours is while it is unplugged. \
-                 `ksx device scan` prints the replug-proof replacement"
+            Self::InstancePath(_) => "one specific Windows instance path (a legacy full path) — \
+                 it matches only while Windows reports that path. An instance id follows the USB \
+                 socket unless the board reports a serial, so moving the board usually (not \
+                 always) changes it. TREAT IT AS SOCKET-SPECIFIC: ksx cannot tell which kind \
+                 yours is while it is unplugged. `ksx device scan` prints the replug-proof \
+                 replacement"
                 .to_owned(),
             Self::HardwareId(_) => {
                 "an Interception hardware id — it names a model, not a board, so \
@@ -809,7 +825,25 @@ mod tests {
             "usb:d209:0430:00:port=7&25EEA38C&0&0000"
         );
         assert!(!pinned.survives_replug());
-        assert!(pinned.explain().contains("TREAT IT AS SOCKET-SPECIFIC"));
+        // It announces the cost, and BOTH halves are load-bearing. The tail is
+        // port-derived only for boards with no usable serial, and an I-PAC 4X
+        // measured here kept its tail across a move, so "moving it breaks this"
+        // is a claim ksx cannot make — hence the hedge. But the hedge alone
+        // reads as "probably fine" to someone about to move a board, so the
+        // instruction has to survive too. See `DeviceFacts::instance`.
+        let explained = pinned.explain();
+        assert!(
+            explained.contains("matches only while Windows"),
+            "state the certainty: {explained}"
+        );
+        assert!(
+            explained.contains("not always"),
+            "keep the hedge: {explained}"
+        );
+        assert!(
+            explained.contains("TREAT IT AS SOCKET-SPECIFIC"),
+            "keep the instruction: {explained}"
+        );
         assert!(pinned.match_against(&[a, b]).is_one());
     }
 

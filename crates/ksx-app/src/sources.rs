@@ -483,6 +483,104 @@ impl ksx_api::MachineSource for LocalMachine {
         Ok(crate::devices::to_view(&crate::devices::collect()))
     }
 
+    /// The picker read: boards, not devnodes.
+    ///
+    /// Not feature-gated the way [`Self::devices`] is, because both UI
+    /// surfaces want it — Studio's `/devices` page and the cabinet's device
+    /// screen render the identical [`ksx_api::DeviceScanView`] — and because
+    /// `crate::device_scan::view` is what keeps `crate::devices::to_view` from
+    /// being dead code in a `--features studio` build.
+    ///
+    /// Read-only end to end: it enumerates, it resolves the configured ids
+    /// against that enumeration, and it composes commands as STRINGS. Nothing
+    /// is opened, claimed or written, so it is safe mid-session.
+    #[cfg(windows)]
+    fn device_scan(&self) -> Result<ksx_api::DeviceScanView, Refusal> {
+        let devices = crate::devices::to_view(&crate::devices::collect());
+        let store = crate::device_edit::store().map_err(config_refusal)?;
+        let config = store.load_config().map_err(config_refusal)?.value;
+        let games = store.load_games().map_err(config_refusal)?.value;
+        Ok(crate::device_scan::view(
+            &devices,
+            &crate::device_edit::connected_facts(),
+            &config,
+            &games,
+        ))
+    }
+
+    /// Write one `[[device]]` entry — the plan/apply pair, never the CLI verb.
+    ///
+    /// `crate::device_edit::pick` looks like the obvious call and would kill
+    /// this process: its refusal path is `refuse()`, which is `-> !` and ends
+    /// in `std::process::exit`. A daemon-free config write inside a web server
+    /// must be able to say no and keep serving, so this drives the same
+    /// `plan_pick` + `apply_pick` the CLI does and turns the error into a
+    /// [`Refusal`] the surface renders.
+    ///
+    /// Picking is NOT claiming, and the view says so ([`DevicePickView::
+    /// claimed`], [`DevicePickView::next_step`]). Nothing here rebinds a
+    /// driver — that needs elevation and stays in the CLI (`docs/SURFACES.md`
+    /// §3).
+    #[cfg(windows)]
+    fn device_pick(
+        &self,
+        spec: &ksx_api::DevicePickSpec,
+    ) -> Result<ksx_api::DevicePickView, Refusal> {
+        let survey = ksx_platform::winusb::survey();
+        let connected = crate::device_edit::connected_facts();
+        let store = crate::device_edit::store().map_err(config_refusal)?;
+        let config = store.load_config().map_err(config_refusal)?.value;
+        // For the rename check only: re-picking under a new name orphans every
+        // slot that named the old one, in config.toml AND in every profile.
+        let games = store.load_games().map_err(config_refusal)?.value;
+
+        let wanted = crate::device_edit::PickSpec {
+            query: spec.query.trim().to_owned(),
+            // A blank box means "derive one", exactly like the absent `--alias`
+            // flag — the web form always submits the field, so "" must not
+            // become an empty alias the writer then refuses.
+            alias: spec
+                .alias
+                .as_deref()
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+                .map(str::to_owned),
+        };
+        let plan = crate::device_edit::plan_pick(&survey, &connected, &config, &games, &wanted)
+            .map_err(pick_refusal)?;
+        let outcome = crate::device_edit::apply_pick(&store, &plan).map_err(pick_refusal)?;
+        Ok(pick_view(&outcome))
+    }
+
+    /// Delete one `[[device]]` entry — and say what that did NOT do.
+    ///
+    /// Three removals exist in ksx and they are not interchangeable:
+    /// `ksx pads --prune` drops stale virtual pads off the ViGEm bus,
+    /// `ksx winusb release` puts a claimed board back on the keyboard stack,
+    /// and this forgets a config entry. Deleting the entry releases nothing,
+    /// which is why [`ksx_api::DeviceRemoveView::still_claimed`] is filled and
+    /// carries the release command with it.
+    #[cfg(windows)]
+    fn device_remove(
+        &self,
+        spec: &ksx_api::DeviceRemoveSpec,
+    ) -> Result<ksx_api::DeviceRemoveView, Refusal> {
+        let survey = ksx_platform::winusb::survey();
+        let connected = crate::device_edit::connected_facts();
+        let store = crate::device_edit::store().map_err(config_refusal)?;
+        let config = store.load_config().map_err(config_refusal)?.value;
+        let games = store.load_games().map_err(config_refusal)?.value;
+
+        let wanted = crate::device_edit::RemoveSpec {
+            alias: spec.alias.trim().to_owned(),
+            force: spec.force,
+        };
+        let plan = crate::device_edit::plan_remove(&survey, &connected, &config, &games, &wanted)
+            .map_err(remove_refusal)?;
+        let outcome = crate::device_edit::apply_remove(&store, &plan).map_err(remove_refusal)?;
+        Ok(remove_view(&outcome))
+    }
+
     fn presets(&self) -> Result<PresetsView, Refusal> {
         let root = ksx_config::ConfigRoot::discover().map_err(|err| {
             Refusal::with_remedy(
@@ -561,6 +659,117 @@ impl ksx_api::MachineSource for LocalMachine {
             "this ksx was built without Studio".to_owned(),
             "rebuild with `--features studio` (the release build ships it)",
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// device pick / remove: outcomes and refusals, as the api spells them
+// ---------------------------------------------------------------------------
+//
+// Field copying and nothing else, deliberately. Every decision above these
+// lines — which interface is the keyboard, which rung is unique, whether an
+// alias is taken, which slots break — was taken by `crate::device_edit`'s pure
+// planners. `docs/SURFACES.md` §1: a surface calls a plan and renders the
+// result; if one of these functions ever grew an `if` about hardware, the plan
+// is the thing that is missing a field.
+
+/// A config-store failure, worded for a surface.
+///
+/// The remedy is `ksx doctor` rather than the failing verb: a store that will
+/// not open is not a device problem, and sending someone back to press the same
+/// button is how a refusal becomes a loop.
+#[cfg(windows)]
+fn config_refusal(err: ksx_config::ConfigError) -> Refusal {
+    Refusal::with_remedy(
+        ksx_api::codes::REFUSED,
+        format!("the config could not be read: {err}"),
+        "run `ksx doctor`",
+    )
+}
+
+/// `PickError` → `Refusal`, keeping the CLI's own refusal CODE.
+///
+/// One vocabulary across surfaces: `alias-taken` is `alias-taken` whether it
+/// came back from a terminal or from a form post, and the advice — which names
+/// the way forward — rides along as the remedy instead of being re-invented per
+/// page. The message is one line by construction, which is what the flash needs
+/// (`server.rs` caps it at 300 characters).
+#[cfg(windows)]
+fn pick_refusal(err: crate::device_edit::PickError) -> Refusal {
+    let advice = err.advice();
+    let refusal = Refusal::new(err.code(), err.to_string());
+    if advice.is_empty() {
+        refusal
+    } else {
+        refusal.remedy(advice)
+    }
+}
+
+#[cfg(windows)]
+fn remove_refusal(err: crate::device_edit::RemoveError) -> Refusal {
+    let advice = err.advice();
+    let refusal = Refusal::new(err.code(), err.to_string());
+    if advice.is_empty() {
+        refusal
+    } else {
+        refusal.remedy(advice)
+    }
+}
+
+#[cfg(windows)]
+fn pick_view(outcome: &crate::device_edit::PickOutcome) -> ksx_api::DevicePickView {
+    let plan = &outcome.plan;
+    let verb = match plan.replaces {
+        Some(_) => "updated",
+        None => "wrote",
+    };
+    ksx_api::DevicePickView {
+        alias: plan.alias.clone(),
+        id: plan.selector.to_string(),
+        backend: match plan.backend {
+            ksx_config::Backend::Winusb => "winusb".to_owned(),
+            ksx_config::Backend::Interception => "interception".to_owned(),
+        },
+        board: plan.name.clone(),
+        instance_id: plan.instance_id.clone(),
+        replaced: plan.replaces.clone(),
+        claimed: plan.claimed,
+        port_pinned: !plan.selector.survives_replug(),
+        // Printed, never run. Claiming needs elevation, so the only honest
+        // thing a browser can do with it is show it (`docs/SURFACES.md` §3).
+        next_step: (!plan.claimed).then(|| format!("ksx winusb claim {}", plan.instance_id)),
+        backup: outcome.backup.as_ref().map(|p| p.display().to_string()),
+        // ONE sentence: `PickOutcome::message` is a whole report and would be
+        // truncated to nothing useful by the flash's 300-character cap. The
+        // report's facts are on the page, in the row this just wrote.
+        summary: format!(
+            "{verb} [[device]] \"{}\" — id = {} — nothing was claimed",
+            plan.alias, plan.selector
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn remove_view(outcome: &crate::device_edit::RemoveOutcome) -> ksx_api::DeviceRemoveView {
+    let plan = &outcome.plan;
+    let mut summary = format!("removed [[device]] \"{}\" (id = {})", plan.alias, plan.id);
+    if plan.still_claimed.is_some() {
+        // The one thing a person must not miss on their way back to the list:
+        // the board is still off the Windows keyboard stack and there is no
+        // longer an entry anywhere explaining why the panel does not type.
+        summary.push_str(" — the board is STILL CLAIMED; releasing it is a separate step");
+    }
+    ksx_api::DeviceRemoveView {
+        alias: plan.alias.clone(),
+        id: plan.id.clone(),
+        still_claimed: plan.still_claimed.clone(),
+        release_command: plan
+            .still_claimed
+            .as_ref()
+            .map(|id| format!("ksx winusb release {id} --yes")),
+        breaks: plan.breaks.iter().map(ToString::to_string).collect(),
+        backup: outcome.backup.as_ref().map(|p| p.display().to_string()),
+        summary,
     }
 }
 

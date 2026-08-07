@@ -60,15 +60,21 @@ await build({
   entryPoints: [
     { entry: "src/status.ts", outfile: "status.js" },
     { entry: "src/map.ts", outfile: "map.js" },
+    { entry: "src/devices.ts", outfile: "devices.js" },
   ],
   cssEntries: [{ input: "src/studio.css", outfile: "studio.css" }],
   routes: {
     "/": { js: ["status"], css: ["studio"] },
     "/map": { js: ["map"], css: ["studio"] },
+    "/devices": { js: ["devices"], css: ["studio"] },
   },
   outputDir,
   ssr: true,
-  ssrEntryPoints: { status: "src/status.ts", map: "src/map.ts" },
+  ssrEntryPoints: {
+    status: "src/status.ts",
+    map: "src/map.ts",
+    devices: "src/devices.ts",
+  },
 });
 
 console.warn = realWarn;
@@ -232,7 +238,10 @@ for (const [source, out, extra] of ART) {
 // insurance"): forma-server 0.1.4 renders FMIR v2 only. Refuse to emit
 // anything a compiler bump silently made incompatible — for EVERY route.
 // ---------------------------------------------------------------------------
-for (const route of ["/", "/map"]) {
+// EVERY route, not a hand-kept subset: a page whose IR is unverified is a page
+// that fails at `EmbeddedPage::load` and takes the WHOLE server down with it
+// (serve() loads all routes eagerly, so one bad .ir means Studio never binds).
+for (const route of ["/", "/map", "/devices"]) {
   const irName = manifest.routes[route].ir;
   if (!irName) throw new Error(`manifest route '${route}' lost its .ir entry`);
   const ir = readFileSync(join(outputDir, irName));

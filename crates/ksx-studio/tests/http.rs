@@ -5,7 +5,7 @@
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Refusals are typed now (docs/M9-DECISION.md §6): a fake daemon refuses with
@@ -365,9 +365,216 @@ impl ControlSource for ScriptedControl {
     }
 }
 
+/// The MACHINE provider, scripted: one reference cabinet, and the two writes
+/// RECORDED rather than performed.
+///
+/// Recorded rather than performed for the reason the cross-site test below
+/// spells out — the assertion that matters about a refused write is not the
+/// status code, it is that the writer never saw it. A fake that wrote to a real
+/// config store could not tell those two apart.
+///
+/// The tree is the reference cabinet as `device_scan` shapes it: one I-PAC
+/// wearing two devnodes with the keyboard on `MI_00`, one fan controller with
+/// no keyboard interface at all, and one configured entry whose id is
+/// PORT-PINNED.
+#[derive(Default)]
+struct ScriptedMachine {
+    picked: Mutex<Vec<(String, Option<String>)>>,
+    removed: Mutex<Vec<(String, bool)>>,
+    /// Refuse the read — the "this surface cannot enumerate devices" path.
+    refuse: bool,
+    /// The scan ANSWERS but the USB enumeration inside it failed: empty lists
+    /// that are not a reading of the machine. A third state, distinct from
+    /// `refuse` and from an actually-empty cabinet, and the one the page
+    /// shipped without a single test reaching it.
+    blind: bool,
+}
+
+const IPAC_KB: &str = r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000";
+const IPAC_AUX: &str = r"USB\VID_D209&PID_0430&MI_01\7&25EEA38C&0&0001";
+const FAN_HID: &str = r"USB\VID_1E71&PID_300E&MI_01\7&8FBF878&0&0001";
+
+impl ScriptedMachine {
+    fn refusing() -> Self {
+        Self {
+            refuse: true,
+            ..Self::default()
+        }
+    }
+
+    /// The scan answers, and answers "I could not read the USB bus".
+    fn blind() -> Self {
+        Self {
+            blind: true,
+            ..Self::default()
+        }
+    }
+
+    fn iface(id: &str, state: &str, boot: bool) -> ksx_api::UsbRow {
+        ksx_api::UsbRow {
+            instance_id: id.to_owned(),
+            description: "USB Input Device".to_owned(),
+            state: state.to_owned(),
+            verdict: "bound to winusb.sys — ksx can capture this".to_owned(),
+            alias: None,
+            selected: false,
+            ready: false,
+            vendor: Some("Ultimarc I-PAC 4X".to_owned()),
+            board: Some(r"USB\VID_D209&PID_0430\4".to_owned()),
+            boot_keyboard: boot,
+            // The selector `scan` would write. A constant, not derived from `id`:
+            // UsbRow::selector exists so no surface re-derives what the writer
+            // decided (docs/SURFACES.md section 1), and a fixture that computed it
+            // would be re-deriving it in a third place to test the other two.
+            selector: Some("usb:d209:0430:00".to_owned()),
+        }
+    }
+}
+
+impl ksx_api::MachineSource for ScriptedMachine {
+    fn device_scan(&self) -> Result<ksx_api::DeviceScanView, Refusal> {
+        if self.refuse {
+            return Err(Refusal::not_here("listing devices", "run `ksx devices`"));
+        }
+        if self.blind {
+            // Empty lists with `usb_available: false` — nothing could be read.
+            // Built through `read` like every other path, so the summary lines
+            // and the `no_*` flags are the ones the real backend would send.
+            return Ok(ksx_api::DeviceScanView::read(
+                "test".to_owned(),
+                false,
+                Vec::new(),
+                Vec::new(),
+                vec!["the USB enumeration returned no interfaces".to_owned()],
+            ));
+        }
+        // Through `DeviceScanView::read`, never a struct literal. A fixture
+        // that wrote the summary lines, the counts and the health verdict as
+        // literals would already contain the answers these tests ask about,
+        // and could not disagree with the page even when the page was wrong.
+        Ok(ksx_api::DeviceScanView::read(
+            "test".to_owned(),
+            true,
+            vec![
+                ksx_api::BoardRow {
+                    name: "Ultimarc I-PAC 4X".to_owned(),
+                    interfaces: vec![
+                        Self::iface(IPAC_KB, "claimed", true),
+                        Self::iface(IPAC_AUX, "not-a-keyboard", false),
+                    ],
+                    keyboard: Some(IPAC_KB.to_owned()),
+                    keyboard_verdict: "bound to winusb.sys — ksx can capture this".to_owned(),
+                    looks_like_a_keyboard: true,
+                    claimed: true,
+                    alias: Some("panel".to_owned()),
+                    claim_command: None,
+                    release_command: Some(format!("ksx winusb release {IPAC_KB} --yes")),
+                    ..ksx_api::BoardRow::default()
+                },
+                ksx_api::BoardRow {
+                    name: "NZXT fan controller".to_owned(),
+                    interfaces: vec![Self::iface(FAN_HID, "not-a-keyboard", false)],
+                    keyboard: None,
+                    keyboard_verdict: "no keyboard interface — ksx cannot capture this board"
+                        .to_owned(),
+                    looks_like_a_keyboard: false,
+                    claimed: false,
+                    alias: None,
+                    claim_command: None,
+                    release_command: None,
+                    ..ksx_api::BoardRow::default()
+                },
+            ],
+            vec![ksx_api::ConfiguredDevice {
+                alias: "panel".to_owned(),
+                id: "port=7&25EEA38C&0&0000".to_owned(),
+                backend: "winusb".to_owned(),
+                rung: "port".to_owned(),
+                survives_replug: false,
+                means: "this exact USB socket".to_owned(),
+                port_pinned_warning: Some(
+                    "PORT-PINNED — nothing weaker than the Windows instance path separates this \
+                     board from its twin, so this entry matches only while Windows keeps \
+                     reporting that exact path. Moving the board to another USB socket is the \
+                     usual way that changes, and the entry then stops matching. It is also \
+                     specific to THIS machine, so do not copy this config to another cabinet — \
+                     run `ksx device pick` there instead."
+                        .to_owned(),
+                ),
+                present: true,
+                board: Some("Ultimarc I-PAC 4X".to_owned()),
+                instance_id: Some(IPAC_KB.to_owned()),
+                claimed: true,
+                claim_command: None,
+                release_command: Some(format!("ksx winusb release {IPAC_KB} --yes")),
+                used_by: vec!["slot 1 (keyboard)".to_owned()],
+                ..ksx_api::ConfiguredDevice::default()
+            }],
+            Vec::new(),
+        ))
+    }
+
+    fn device_pick(
+        &self,
+        spec: &ksx_api::DevicePickSpec,
+    ) -> Result<ksx_api::DevicePickView, Refusal> {
+        self.picked
+            .lock()
+            .unwrap()
+            .push((spec.query.clone(), spec.alias.clone()));
+        let alias = spec
+            .alias
+            .clone()
+            .unwrap_or_else(|| "Ultimarc I-PAC 4X".to_owned());
+        Ok(ksx_api::DevicePickView {
+            alias: alias.clone(),
+            id: "model=d209:0430".to_owned(),
+            backend: "winusb".to_owned(),
+            board: "Ultimarc I-PAC 4X".to_owned(),
+            instance_id: IPAC_KB.to_owned(),
+            replaced: None,
+            claimed: true,
+            port_pinned: false,
+            next_step: None,
+            backup: None,
+            summary: format!("wrote [[device]] \"{alias}\" — nothing was claimed"),
+        })
+    }
+
+    fn device_remove(
+        &self,
+        spec: &ksx_api::DeviceRemoveSpec,
+    ) -> Result<ksx_api::DeviceRemoveView, Refusal> {
+        self.removed
+            .lock()
+            .unwrap()
+            .push((spec.alias.clone(), spec.force));
+        Ok(ksx_api::DeviceRemoveView {
+            alias: spec.alias.clone(),
+            id: "port=7&25EEA38C&0&0000".to_owned(),
+            still_claimed: Some(IPAC_KB.to_owned()),
+            release_command: Some(format!("ksx winusb release {IPAC_KB} --yes")),
+            breaks: Vec::new(),
+            backup: None,
+            summary: format!(
+                "removed [[device]] \"{}\" — the board is STILL CLAIMED; releasing it is a \
+                 separate step",
+                spec.alias
+            ),
+        })
+    }
+}
+
 /// Bind port 0 to learn a free port, release it, and serve there. The tiny
 /// race is acceptable in a local test.
 fn start_server(control: Arc<ScriptedControl>) -> SocketAddr {
+    start_server_with_machine(control, Arc::new(ScriptedMachine::default()))
+}
+
+fn start_server_with_machine(
+    control: Arc<ScriptedControl>,
+    machine: Arc<ScriptedMachine>,
+) -> SocketAddr {
     let probe = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = probe.local_addr().unwrap();
     drop(probe);
@@ -407,11 +614,30 @@ fn start_server(control: Arc<ScriptedControl>) -> SocketAddr {
             self.0.save_macro(request)
         }
     }
+    struct SharedMachine(Arc<ScriptedMachine>);
+    impl ksx_api::MachineSource for SharedMachine {
+        fn device_scan(&self) -> Result<ksx_api::DeviceScanView, Refusal> {
+            self.0.device_scan()
+        }
+        fn device_pick(
+            &self,
+            spec: &ksx_api::DevicePickSpec,
+        ) -> Result<ksx_api::DevicePickView, Refusal> {
+            self.0.device_pick(spec)
+        }
+        fn device_remove(
+            &self,
+            spec: &ksx_api::DeviceRemoveSpec,
+        ) -> Result<ksx_api::DeviceRemoveView, Refusal> {
+            self.0.device_remove(spec)
+        }
+    }
     std::thread::spawn(move || {
         let _ = ksx_studio::serve(
             addr,
             Box::new(FixedStatus),
             Box::new(SharedControl(control)),
+            Box::new(SharedMachine(machine)),
         );
     });
     // Wait until it accepts.
@@ -1462,4 +1688,312 @@ fn a_rebound_host_cannot_even_read() {
         response.starts_with("HTTP/1.1 421"),
         "a rebound read must be refused, got: {response}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// /devices — the picker, end to end
+// ---------------------------------------------------------------------------
+
+/// The read. One PHYSICAL board per row (an I-PAC is one device to a human and
+/// two devnodes here), the configured entry beside it, and the PORT-PINNED
+/// paragraph in full — including the machine-specific half, which is the half
+/// people miss and the reason a shared config silently stops matching.
+#[test]
+fn the_devices_page_lists_boards_not_devnodes_and_keeps_the_port_pinned_warning() {
+    let addr = start_server(Arc::new(ScriptedControl::new(true)));
+    let page = get(addr, "/devices");
+    let body = body_of(&page);
+
+    assert!(body.contains("Ultimarc I-PAC 4X"), "{body}");
+    assert!(body.contains("1 keyboard-capable board"), "{body}");
+    assert!(body.contains("1 [[device]] entry in config.toml"), "{body}");
+    // The board with no keyboard interface is LISTED, not hidden: "ksx cannot
+    // see my board" is a real support question.
+    assert!(body.contains("NZXT fan controller"), "{body}");
+    assert!(body.contains("PORT-PINNED"), "{body}");
+    assert!(
+        body.contains("do not copy this config to another cabinet"),
+        "the machine-specific half of the warning must reach the page: {body}"
+    );
+    // The two words that decide whether the entry can capture anything. The
+    // page carried `backend` in its row object and rendered it nowhere, so it
+    // never said `winusb` or `interception` — the field the health pill above
+    // is reasoning about — and `rung` was not carried at all.
+    assert!(body.contains(">backend</span>"), "{body}");
+    assert!(body.contains(">rung</span>"), "{body}");
+    assert!(body.contains(">winusb<"), "{body}");
+    assert!(body.contains(">port<"), "{body}");
+    // Claiming needs elevation, so the command is TEXT and there is no form.
+    assert!(body.contains("ksx winusb release"), "{body}");
+    assert!(body.contains("ELEVATED shell"), "{body}");
+    assert!(
+        !body.contains(r#"action="/devices/claim""#),
+        "a claim form on a surface that cannot elevate: {body}"
+    );
+}
+
+/// A refused scan renders as a refusal, never as an empty machine. The two are
+/// indistinguishable in the data and completely different to a person standing
+/// at a cabinet with four boards plugged in.
+#[test]
+fn a_refused_scan_renders_the_refusal_rather_than_an_empty_list() {
+    let addr = start_server_with_machine(
+        Arc::new(ScriptedControl::new(true)),
+        Arc::new(ScriptedMachine::refusing()),
+    );
+    let page = get(addr, "/devices");
+    let body = body_of(&page);
+    assert!(body.contains("could not be read"), "{body}");
+    assert!(body.contains("run `ksx devices`"), "{body}");
+    for claim in [
+        ksx_api::NO_BOARDS_LINE,
+        "no board it found exposes a",
+        "No board is configured yet",
+        "no [[device]] entries in config.toml",
+    ] {
+        assert!(
+            !body.contains(claim),
+            "a refused read printed an assertion of absence ({claim:?}): {body}"
+        );
+    }
+}
+
+/// **A scan that ANSWERS "I could not read the USB bus" is not an empty
+/// cabinet either** — and this is the state nothing tested.
+///
+/// FAILS against the shipped page. `ScriptedMachine` only ever returned
+/// `usb_available: true`, so no HTTP test could reach the path where the
+/// enumeration itself failed; the page printed the banner "nothing could be
+/// READ" and, directly beneath it, "No board here exposes a keyboard
+/// interface". This is the shape of the failure that started the whole
+/// project: a session reporting success while the arcade panel was dead
+/// because a WinUSB board had fallen back to Interception. "I could not read
+/// this" and "there is nothing here" are different sentences, and the user
+/// acts on them differently.
+#[test]
+fn a_failed_enumeration_never_renders_as_an_empty_cabinet() {
+    let addr = start_server_with_machine(
+        Arc::new(ScriptedControl::new(true)),
+        Arc::new(ScriptedMachine::blind()),
+    );
+    let body = body_of(&get(addr, "/devices")).to_owned();
+
+    assert!(
+        body.contains("nothing could be READ"),
+        "the page must say the list is empty because nothing was read: {body}"
+    );
+    for claim in [ksx_api::NO_BOARDS_LINE, "no board it found exposes a"] {
+        assert!(
+            !body.contains(claim),
+            "a failed enumeration printed the empty-machine sentence ({claim:?}): {body}"
+        );
+    }
+
+    // The poller gets the same answer, in the field the island actually reads.
+    // A page that got this right while `/api/devices` sent
+    // `no_pickable_board_found: true` would go wrong two seconds later.
+    let json: serde_json::Value =
+        serde_json::from_str(body_of(&get(addr, "/api/devices"))).unwrap();
+    assert_eq!(
+        json.pointer("/scan/no_pickable_board_found"),
+        Some(&serde_json::json!(false)),
+        "the poll licensed the island to draw an empty machine: {json}"
+    );
+    assert_eq!(
+        json.pointer("/scan/usb_available"),
+        Some(&serde_json::json!(false))
+    );
+
+    // And the ordinary cabinet is unaffected — it still has boards and says so.
+    let ok = start_server(Arc::new(ScriptedControl::new(true)));
+    assert!(body_of(&get(ok, "/devices")).contains("1 keyboard-capable board"));
+}
+
+/// A refusal degrades to `DeviceScanView::default()`, and that default must
+/// license nothing. This is the invariant the `show:` flags depend on: they
+/// read `no_pickable_board_found` / `no_configured_device` alone, with no
+/// `&& unavailable.is_empty()` in either language, which is only sound while
+/// every refusing path in `collect_devices` hands over a defaulted scan.
+#[test]
+fn a_refusal_serves_a_scan_that_asserts_nothing() {
+    let addr = start_server_with_machine(
+        Arc::new(ScriptedControl::new(true)),
+        Arc::new(ScriptedMachine::refusing()),
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(body_of(&get(addr, "/api/devices"))).unwrap();
+
+    assert_ne!(
+        json.pointer("/unavailable"),
+        Some(&serde_json::json!("")),
+        "the refusal itself must be on the wire: {json}"
+    );
+    assert_eq!(
+        json.pointer("/scan/no_pickable_board_found"),
+        Some(&serde_json::json!(false))
+    );
+    assert_eq!(
+        json.pointer("/scan/no_configured_device"),
+        Some(&serde_json::json!(false))
+    );
+    for line in ["/scan/boards_summary", "/scan/configured_summary"] {
+        let value = json.pointer(line).and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            value.contains("nothing could be READ"),
+            "{line} must say why it is empty, got {value:?}"
+        );
+    }
+}
+
+/// The page and the poller serve one shape.
+#[test]
+fn api_devices_serves_the_same_payload_the_page_embeds() {
+    let addr = start_server(Arc::new(ScriptedControl::new(true)));
+    let json: serde_json::Value =
+        serde_json::from_str(body_of(&get(addr, "/api/devices"))).unwrap();
+    assert_eq!(
+        json.pointer("/scan/boards/0/name"),
+        Some(&serde_json::json!("Ultimarc I-PAC 4X"))
+    );
+    assert_eq!(
+        json.pointer("/scan/configured/0/alias"),
+        Some(&serde_json::json!("panel"))
+    );
+    // A poll is not an action.
+    assert_eq!(json.pointer("/flash"), Some(&serde_json::json!(null)));
+}
+
+/// The pick write: 303 back to the page with the outcome as the flash, and the
+/// spec that reached the backend is the KEYBOARD interface — not the board's
+/// composite parent, which no resolver would accept.
+#[test]
+fn picking_a_board_calls_the_backend_and_redirects_with_the_outcome() {
+    let machine = Arc::new(ScriptedMachine::default());
+    let addr = start_server_with_machine(Arc::new(ScriptedControl::new(true)), machine.clone());
+
+    let response = post_form(
+        addr,
+        "/devices/pick",
+        "query=USB%5CVID_D209%26PID_0430%26MI_00%5C7%2625EEA38C%260%260000&alias=panel",
+    );
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(response.contains("/devices?flash="), "{response}");
+
+    let picked = machine.picked.lock().unwrap();
+    assert_eq!(picked.len(), 1, "exactly one pick reached the backend");
+    assert_eq!(picked[0].0, IPAC_KB);
+    assert_eq!(picked[0].1.as_deref(), Some("panel"));
+}
+
+/// A blank name box is "derive one from the board", exactly like the absent
+/// `--alias` flag. The form always submits the field, so the emptiness has to
+/// survive the wire; `LocalMachine::device_pick` is what turns it back into
+/// `None` before the writer sees it.
+#[test]
+fn a_blank_alias_still_posts_and_is_accepted() {
+    let machine = Arc::new(ScriptedMachine::default());
+    let addr = start_server_with_machine(Arc::new(ScriptedControl::new(true)), machine.clone());
+
+    let response = post_form(addr, "/devices/pick", "query=MI_00&alias=");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    let picked = machine.picked.lock().unwrap();
+    assert_eq!(picked[0].1.as_deref(), Some(""), "the form sends it empty");
+}
+
+/// The remove write, and the fact that surprises people: deleting the entry did
+/// not release the board. It has to be in the flash, because the flash is all
+/// the user sees on the way back.
+#[test]
+fn removing_an_entry_says_the_board_is_still_claimed() {
+    let machine = Arc::new(ScriptedMachine::default());
+    let addr = start_server_with_machine(Arc::new(ScriptedControl::new(true)), machine.clone());
+
+    let response = post_form(addr, "/devices/remove", "alias=panel");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(
+        response.contains("STILL%20CLAIMED"),
+        "the flash must carry the claim warning: {response}"
+    );
+
+    let removed = machine.removed.lock().unwrap();
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].0, "panel");
+    assert!(
+        !removed[0].1,
+        "an unticked checkbox is not sent at all, so no --force"
+    );
+}
+
+/// The checkbox is the consent, and HTML omits an unchecked box entirely — so
+/// `force` is "present at all", never a parsed boolean.
+#[test]
+fn a_ticked_force_box_reaches_the_backend_as_force() {
+    let machine = Arc::new(ScriptedMachine::default());
+    let addr = start_server_with_machine(Arc::new(ScriptedControl::new(true)), machine.clone());
+
+    post_form(addr, "/devices/remove", "alias=panel&force=yes");
+    assert!(machine.removed.lock().unwrap()[0].1, "--force must carry");
+}
+
+/// Both writes are POST and both sit inside the guarded router. The assertion
+/// that matters is not the status code — it is that the WRITER never saw the
+/// request.
+#[test]
+fn a_cross_site_post_never_reaches_the_device_writer() {
+    let machine = Arc::new(ScriptedMachine::default());
+    let addr = start_server_with_machine(Arc::new(ScriptedControl::new(true)), machine.clone());
+
+    for (path, body) in [
+        ("/devices/pick", "query=MI_00&alias=stolen"),
+        ("/devices/remove", "alias=panel&force=yes"),
+    ] {
+        let response = http(
+            addr,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Origin: https://evil.example\r\nConnection: close\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "{path} must refuse a cross-site write, got: {response}"
+        );
+    }
+    assert!(
+        machine.picked.lock().unwrap().is_empty(),
+        "no cross-site request may reach the device writer"
+    );
+    assert!(machine.removed.lock().unwrap().is_empty());
+}
+
+/// DNS rebinding: the read is guarded too, on every request, by NAME.
+#[test]
+fn a_rebound_host_cannot_read_the_device_list() {
+    let addr = start_server(Arc::new(ScriptedControl::new(true)));
+    let response = http(
+        addr,
+        "GET /api/devices HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 421"),
+        "a rebound read must be refused, got: {response}"
+    );
+}
+
+/// The nav is static markup duplicated per island, so a page nobody links to is
+/// a page nobody finds. Both existing screens must carry the link.
+#[test]
+fn every_page_links_to_the_device_picker() {
+    let addr = start_server(Arc::new(ScriptedControl::new(true)));
+    for route in ["/", "/map", "/devices"] {
+        let page = get(addr, route);
+        let body = body_of(&page);
+        assert!(
+            body.contains(r#"href="/devices""#),
+            "{route} has no link to the device picker: {body}"
+        );
+    }
 }
