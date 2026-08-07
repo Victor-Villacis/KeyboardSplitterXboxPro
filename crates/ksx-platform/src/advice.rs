@@ -123,15 +123,27 @@ fn summarize_virtual_pads(report: &DriverReport, out: &mut Vec<Advice>) {
         return;
     }
     if let Some(owner) = pads.owners.first() {
-        // Not a fault: a running splitter's pads are the product working. Info
-        // keeps the count visible for scripts without flagging anything.
+        // Info, not a fault — but NOT the reassurance this used to print.
+        //
+        // The owner check matches on process NAME, and the tray daemon is
+        // `ksx.exe` whether or not it has a session. On a cabinet the daemon
+        // runs all day, so there is always an "owner", so `is_ghost_suspect`
+        // essentially never fires on the one machine it exists to protect.
+        // This said "Expected while it runs" about pads no live handle owned,
+        // and 15 of them accumulated on the reference cabinet unremarked.
+        //
+        // So it now states what is actually known, and names the check that
+        // settles it.
         out.push(Advice {
             severity: Severity::Info,
             code: "virtual-pads-in-use",
             message: format!(
                 "{} virtual pad(s) are on the bus and a splitter process is running \
-                 ({} pid {}). Expected while it runs; the pads unplug when it exits.",
-                pads.count, owner.name, owner.pid
+                 ({} pid {}). That process is ASSUMED to own them — this matches on \
+                 process name, and the tray daemon is `{}` whether or not it is running a \
+                 session. If `ksx session status` says stopped, these pads outlived \
+                 whatever made them and can be cleared with `ksx pads --prune`.",
+                pads.count, owner.name, owner.pid, owner.name
             ),
         });
         return;
@@ -151,8 +163,9 @@ fn summarize_virtual_pads(report: &DriverReport, out: &mut Vec<Advice>) {
              running. Unless another ViGEm client (DS4Windows and similar feeders \
              use the same bus) created them, these are ghosts left by a killed or \
              wedged session: they sit in joy.cpl, can hold XInput slots and confuse \
-             games. Close whatever created them if it is still alive; otherwise \
-             restart the bus device from an elevated prompt: \
+             games. Close whatever created them if it is still alive; otherwise run \
+             `ksx pads --prune` (a dry run; add --yes from an elevated prompt), which \
+             restarts the bus device — the same thing as \
              pnputil /restart-device \"{bus}\" — or reboot.",
             pads.count,
             crate::virtual_pads::SPLITTER_PROCESS_NAMES.join(", "),
