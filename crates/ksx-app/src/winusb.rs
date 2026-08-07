@@ -101,8 +101,13 @@ pub fn render_status(survey: &Survey) -> String {
         if let Some(kb) = &c.keyboard {
             out.push_str(&format!("    keyboard   : {}\n", kb.instance_id));
         }
-        if c.is_ultimarc() {
-            out.push_str("    note       : Ultimarc (VID D209) — the arcade encoder family\n");
+        // The board's name if ksx knows it, not "the vendor makes encoders".
+        // A SpinTrak is an Ultimarc too, and calling it an arcade encoder is
+        // the same mistake in a different sentence.
+        if let Some((vid, pid)) = c.interface.vid_pid() {
+            if let Some(name) = ksx_core::vendors::name_for(vid, pid) {
+                out.push_str(&format!("    note       : {name}\n"));
+            }
         }
         out.push('\n');
     }

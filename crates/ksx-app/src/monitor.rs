@@ -57,7 +57,7 @@ use crossbeam_channel::RecvTimeoutError;
 use ksx_capture::{CaptureBackend, CaptureCtl, DeviceInfo, DeviceKind, ExitReason};
 use ksx_core::KeyEvent;
 
-use crate::devices::is_ipac;
+use crate::devices::vendor_tag;
 
 /// How often the loop wakes to check Ctrl+C / the deadline even when no keys
 /// arrive. Also bounds shutdown latency.
@@ -257,11 +257,7 @@ pub(crate) fn run_loop(
                 .map(String::as_str)
                 .unwrap_or("kb?");
             let friendly = d.friendly.as_deref().unwrap_or("n/a");
-            let tag = if is_ipac(d.id.as_str()) {
-                "  [I-PAC]"
-            } else {
-                ""
-            };
+            let tag = vendor_tag(d.id.as_str()).map_or_else(String::new, |n| format!("  [{n}]"));
             writeln!(out, "  {alias} = {} \"{friendly}\"{tag}", d.id.as_str())?;
         }
     }

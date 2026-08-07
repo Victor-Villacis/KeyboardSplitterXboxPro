@@ -33,14 +33,30 @@ use ksx_core::DeviceId;
 /// driver is not there".
 pub const EXIT_DRIVER_MISSING: i32 = 2;
 
-/// Ultimarc's USB vendor id — every I-PAC board enumerates with it. The exact
-/// known cabinet encoder is `HID\VID_D209&PID_0430&REV_0056&MI_00`.
-const IPAC_VID_TAG: &str = "VID_D209";
+/// The vendor/board name to tag a hardware id with, if ksx knows one.
+///
+/// Replaces an `is_ipac()` that matched on `VID_D209` alone and therefore
+/// labelled **every** Ultimarc product `[I-PAC]` — including the SpinTrak
+/// trackball on the reference cabinet, which is not an I-PAC and said so in its
+/// own product string. A vendor id is enough to name a *vendor*; naming a
+/// *board* needs the product id too, which is why this reads both.
+///
+/// Returns a name, never a bool: a bool is the shape that invites a branch, and
+/// `docs/DEVICE-IDENTITY.md` §6 is explicit that no capture, claim or refusal
+/// path may branch on a vendor id.
+pub fn vendor_tag(hwid: &str) -> Option<&'static str> {
+    let upper = hwid.to_ascii_uppercase();
+    let vid = hex_field(&upper, "VID_")?;
+    // A hardware id without a PID still identifies a vendor.
+    let pid = hex_field(&upper, "PID_").unwrap_or_default();
+    ksx_core::vendors::name_for(vid, pid)
+}
 
-/// Is this hardware id an Ultimarc I-PAC family board — the device this whole
-/// program exists for?
-pub fn is_ipac(hwid: &str) -> bool {
-    hwid.to_ascii_uppercase().contains(IPAC_VID_TAG)
+/// Read `<key>XXXX` as hex out of a device id, e.g. `VID_D209` -> `0xD209`.
+fn hex_field(upper: &str, key: &str) -> Option<u16> {
+    let at = upper.find(key)? + key.len();
+    let digits: String = upper[at..].chars().take(4).collect();
+    u16::from_str_radix(&digits, 16).ok()
 }
 
 /// Hardware ids reported by more than one connected **keyboard**, sorted and
@@ -261,7 +277,9 @@ pub fn devices_json(report: &DevicesReport) -> serde_json::Value {
                 "id": d.id.as_str(),
                 "slot": d.interception_slot,
                 "friendly": d.friendly,
-                "ipac": is_ipac(d.id.as_str()),
+                // Was `"ipac": bool` — one vendor's product name as the shape
+                // of the schema, and wrong for every other Ultimarc board.
+                "vendor": vendor_tag(d.id.as_str()),
                 "alias": report.configured.alias_for(&d.id),
                 "backend": backend_name(report.configured.backend_for(&d.id)),
             })
@@ -288,7 +306,7 @@ pub fn devices_json(report: &DevicesReport) -> serde_json::Value {
                 "interface": c.interface_number,
                 "boot_keyboard": c.is_boot_keyboard(),
                 "friendly": c.friendly(),
-                "ipac": c.is_ultimarc(),
+                "vendor": ksx_core::vendors::name_for(c.vendor_id, c.product_id),
                 "bound_to": c.binding.label(),
                 "winusb_rebind_present": c.binding.is_winusb(),
                 "alias": row.alias,
@@ -357,11 +375,7 @@ pub fn render_human(report: &DevicesReport) -> String {
                 .interception_slot
                 .map_or_else(|| "?".to_string(), |s| s.to_string());
             let friendly = d.friendly.as_deref().unwrap_or("n/a");
-            let tag = if is_ipac(d.id.as_str()) {
-                "  [I-PAC]"
-            } else {
-                ""
-            };
+            let tag = vendor_tag(d.id.as_str()).map_or_else(String::new, |n| format!("  [{n}]"));
             // A device configured for winusb still shows up here until the
             // rebind happens — saying so is the whole point of the column.
             let note = match report.configured.backend_for(&d.id) {
@@ -395,7 +409,8 @@ pub fn render_human(report: &DevicesReport) -> String {
             for row in rows {
                 let c = &row.candidate;
                 let friendly = c.friendly().unwrap_or("n/a");
-                let tag = if c.is_ultimarc() { "  [I-PAC]" } else { "" };
+                let tag = ksx_core::vendors::name_for(c.vendor_id, c.product_id)
+                    .map_or_else(String::new, |n| format!("  [{n}]"));
                 let state = if row.ready() {
                     "  [READY]"
                 } else if row.needs_rebind() {
@@ -619,11 +634,33 @@ mod tests {
     }
 
     #[test]
-    fn ipac_tag_matches_vid_d209_case_insensitively() {
-        assert!(is_ipac(IPAC));
-        assert!(is_ipac(&IPAC.to_ascii_lowercase()));
-        assert!(!is_ipac(LOGI));
-        assert!(!is_ipac(""));
+    fn the_vendor_tag_reads_the_product_id_not_just_the_vendor() {
+        assert_eq!(vendor_tag(IPAC), Some("Ultimarc I-PAC 4X"));
+        assert_eq!(
+            vendor_tag(&IPAC.to_ascii_lowercase()),
+            Some("Ultimarc I-PAC 4X")
+        );
+        assert_eq!(vendor_tag(LOGI), None);
+        assert_eq!(vendor_tag(""), None);
+    }
+
+    /// The bug this replaced, as seen on the reference cabinet:
+    ///
+    /// ```text
+    ///   USB\VID_D209&PID_15A2\6  "SpinTrak"  [I-PAC]
+    /// ```
+    ///
+    /// A SpinTrak is a trackball. `is_ipac` matched Ultimarc's vendor id alone,
+    /// so every product that vendor makes claimed to be the one board the
+    /// author owned — while the device's own product string said otherwise.
+    #[test]
+    fn a_spintrak_is_never_tagged_as_an_ipac() {
+        let tag = vendor_tag(r"USB\VID_D209&PID_15A2\6").expect("Ultimarc is a known vendor");
+        assert_eq!(tag, "Ultimarc SpinTrak");
+        assert!(
+            !tag.contains("I-PAC"),
+            "a trackball must not be labelled as the keyboard encoder: {tag}"
+        );
     }
 
     #[test]

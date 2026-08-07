@@ -84,7 +84,22 @@ pub const INF_PREFIX: &str = "ksx-winusb-";
 pub const DRIVER_VER: &str = "01/01/2026,1.0.0.0";
 
 /// Ultimarc's USB vendor id — the I-PAC family and the trackball.
-pub const ULTIMARC_VID: u16 = 0xD209;
+///
+/// Re-exported from [`ksx_core::vendors`] rather than spelled again: three
+/// crates each carried their own copy, and each grew its own predicate off it.
+/// See `docs/DEVICE-IDENTITY.md` §6 for why a vendor id may pick a display name
+/// and may not decide anything else.
+pub use ksx_core::vendors::ULTIMARC_VID;
+
+/// The vendor id inside a device instance path, if it carries one.
+///
+/// Used only to decide whether a board-specific *sentence* is worth adding to a
+/// refusal. Nothing branches on the answer.
+fn vendor_of(instance_id: &str) -> Option<u16> {
+    let upper = instance_id.to_ascii_uppercase();
+    let at = upper.find("VID_")? + 4;
+    u16::from_str_radix(&upper[at..].chars().take(4).collect::<String>(), 16).ok()
+}
 
 // ---------------------------------------------------------------------------
 // Device tree
@@ -580,7 +595,7 @@ impl Survey {
                 "claimable": c.state == ClaimState::Claimable,
                 "ksx_device_id": c.ksx_device_id(),
                 "keyboard_instance_id": c.keyboard.as_ref().map(|k| k.instance_id.clone()),
-                "ultimarc": c.is_ultimarc(),
+                "vendor": c.interface.vid_pid().and_then(|(v, p)| ksx_core::vendors::name_for(v, p)),
             })).collect::<Vec<_>>(),
         })
     }
@@ -774,11 +789,26 @@ impl Refusal {
                 "be more specific — these all matched:\n  {}",
                 matches.join("\n  ")
             ),
-            Refusal::NotAKeyboard { .. } => {
-                "only the keyboard interface is worth claiming. On an I-PAC that is MI_00; \
-                 MI_01 carries the mouse/system/consumer collections and MI_02 the vendor \
-                 ones, and claiming those would break the trackball for nothing."
-                    .to_owned()
+            // Generic first, board-specific only when we actually recognise the
+            // board. This used to tell every user about I-PAC interface numbers
+            // regardless of what they had plugged in — advice that is wrong for
+            // anyone who does not own the author's encoder, which is everyone
+            // else (`docs/DEVICE-IDENTITY.md` §6).
+            Refusal::NotAKeyboard { instance_id } => {
+                let mut advice = "only the keyboard interface is claimable. A composite board's \
+                                  other interfaces carry its mouse, system/consumer and vendor \
+                                  collections; claiming one of those takes the device off the \
+                                  input stack without giving ksx any keys to read. \
+                                  `ksx winusb status` marks which interface is the keyboard."
+                    .to_owned();
+                if vendor_of(instance_id) == Some(ULTIMARC_VID) {
+                    advice.push_str(
+                        "\n\nOn this board (Ultimarc): the keyboard is MI_00. MI_01 carries the \
+                         mouse/system/consumer collections and MI_02 the vendor ones — claiming \
+                         either would break the trackball for nothing.",
+                    );
+                }
+                advice
             }
             Refusal::AlreadyClaimed { .. } => {
                 "nothing to do. `ksx winusb release <device>` puts it back on the keyboard \
@@ -2718,7 +2748,9 @@ Anbietername:           ksx
         assert_eq!(ipac["vid"], "D209");
         assert_eq!(ipac["pid"], "0430");
         assert_eq!(ipac["interface"], 0);
-        assert_eq!(ipac["ultimarc"], true);
+        // Was `"ultimarc": bool` — a yes/no about one vendor. The board's name
+        // says strictly more, and says something different for the SpinTrak.
+        assert_eq!(ipac["vendor"], "Ultimarc I-PAC 4X");
         assert_eq!(
             ipac["ksx_device_id"],
             r"HID\VID_D209&PID_0430&MI_00\8&2a0d0500&0&0000"

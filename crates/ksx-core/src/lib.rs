@@ -47,6 +47,7 @@ pub mod selector;
 pub mod slot;
 pub mod socd;
 pub mod templates;
+pub mod vendors;
 
 pub use device::{DeviceId, KeyEvent};
 pub use diagonal::{Diag, Held};

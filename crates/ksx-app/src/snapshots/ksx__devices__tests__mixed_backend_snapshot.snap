@@ -5,9 +5,9 @@ expression: render_human(&report)
 keyboards (interception backend):
   slot 1  HID\VID_046D&PID_C31C&REV_6402&MI_00  "Logitech Keyboard"
 usb interfaces (winusb backend candidates):
-  USB\VID_D209&PID_0430&MI_00\7&1A2B3C4D&0&0000  "I-PAC Ultimate I/O"  [I-PAC]
+  USB\VID_D209&PID_0430&MI_00\7&1A2B3C4D&0&0000  "I-PAC Ultimate I/O"  [Ultimarc I-PAC 4X]
       bound to winusb.sys | interface MI_00 | backend winusb  [READY]
-  USB\VID_D209&PID_0430&MI_00\7&5E6F7A8B&0&0000  "I-PAC Ultimate I/O"  [I-PAC]
+  USB\VID_D209&PID_0430&MI_00\7&5E6F7A8B&0&0000  "I-PAC Ultimate I/O"  [Ultimarc I-PAC 4X]
       bound to hidusb.sys (keyboard stack) | interface MI_00 | backend winusb  [NEEDS REBIND]
 [WARN] USB\VID_D209&PID_0430&MI_00\7&5E6F7A8B&0&0000 is configured for the winusb backend but is bound to hidusb.sys (keyboard stack). ksx never rebinds a device itself — perform the supervised rebind (docs/MIGRATION-WINUSB.md) with a spare keyboard plugged in, or set backend = "interception" for now.
 health: [OK]   1/10 keyboard slots in use (highest slot 1); no exhaustion detected
