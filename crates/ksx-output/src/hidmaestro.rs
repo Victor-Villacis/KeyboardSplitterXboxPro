@@ -15,12 +15,24 @@
 //! [`ksx_core::Persona::backend`], which is where the rule is stated once and
 //! enforced by [`crate::router`].
 //!
-//! # Availability
+//! # Nothing here can plug a pad yet, on any machine
 //!
-//! HIDMaestro is **not installed on this cabinet** (probed 2026-08-06). This
-//! type therefore fails at [`HidMaestroBackend::connect`] with
-//! [`OutputError::HidMaestroMissing`], carrying the probe evidence. It does not
-//! stub a pad.
+//! Everything below is the adapter, and the adapter is finished: persona
+//! refusal, axis routing, submit cadence, feedback preservation, teardown
+//! order. What is missing is one level down — ksx has no code that maps
+//! HIDMaestro's shared section, so the only [`HmDriverApi`] that ships
+//! ([`UnavailableDriver`]) cannot create a controller.
+//!
+//! [`HidMaestroBackend::connect`] therefore fails **everywhere**, including on
+//! a machine with HIDMaestro installed, and it fails as "not implemented in
+//! this build" rather than "not installed". The distinction is the difference
+//! between a true statement and an errand: nothing a user installs makes the
+//! DualSense, Switch Pro or Xbox Series persona plug today. Users are kept away
+//! from this path entirely by [`ksx_core::Persona::can_plug`], enforced in
+//! [`crate::RoutedBackend`] before any backend is built.
+//!
+//! (`ksx doctor` still reports whether HIDMaestro is present, because it is
+//! worth knowing. It gates nothing.)
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -69,9 +81,9 @@ pub struct HidMaestroBackend<D: HmDriverApi = UnavailableDriver> {
 impl HidMaestroBackend<UnavailableDriver> {
     /// Starts a HIDMaestro session on this machine.
     ///
-    /// Returns [`OutputError::HidMaestroMissing`] when the driver is absent —
-    /// the analogue of [`OutputError::BusNotFound`] for ViGEmBus, and the only
-    /// outcome available on a machine without HIDMaestro.
+    /// Always fails today, with [`ksx_hidmaestro::HmError::NotImplemented`]
+    /// wrapped in [`OutputError::HidMaestro`] — see the module docs for why
+    /// that is not [`OutputError::HidMaestroMissing`].
     pub fn connect() -> Result<Self, OutputError> {
         Self::with_driver(UnavailableDriver::new())
     }
@@ -419,18 +431,24 @@ mod tests {
         assert_eq!(b.user_index(h), None);
     }
 
-    /// On this machine, `connect()` must fail — and say why.
+    /// `connect()` must fail on **every** machine, and blame the right thing.
+    ///
+    /// It used to be written as "unless someone installs HIDMaestro, in which
+    /// case this test has nothing to say" — and that escape hatch is exactly
+    /// the hole: with the driver installed the old code still refused, with the
+    /// still-wrong reason, and no test noticed.
     #[test]
-    fn connect_on_a_machine_without_hidmaestro_refuses_with_evidence() {
-        match HidMaestroBackend::connect() {
-            Err(OutputError::HidMaestroMissing { probe }) => {
-                assert!(probe.contains("looked for"), "{probe}");
-            }
-            Err(other) => panic!("expected HidMaestroMissing, got {other}"),
-            Ok(_) => {
-                // Someone installed HIDMaestro. Then `connect` is allowed to
-                // succeed, and this test has nothing to assert.
-            }
-        }
+    fn connect_refuses_on_every_machine_and_blames_the_build_not_the_driver() {
+        let err = HidMaestroBackend::connect()
+            .err()
+            .expect("no build of ksx can start a HIDMaestro session");
+        assert!(err.is_not_implemented(), "{err}");
+        assert!(
+            !err.is_hidmaestro_missing(),
+            "{err} would send the user to install a driver that cannot help"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("not implemented in this build"), "{msg}");
+        assert!(msg.contains("on any machine, installed or not"), "{msg}");
     }
 }

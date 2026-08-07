@@ -43,6 +43,37 @@ pub enum Issue {
     /// game, which is a failure that looks like success — so it is reported
     /// here, where the fix (a HID persona) can be named.
     TooManyXinputSlots { count: usize },
+    /// A `[[slot]]` names a persona this BUILD of ksx cannot create.
+    ///
+    /// Not a typo and not an unknown name — the persona is real, it parses, and
+    /// there is simply no code behind it yet ([`ksx_core::Persona::can_plug`]).
+    /// Reported here for the same reason [`Issue::TooManyXinputSlots`] is: the
+    /// alternative is a session that starts, plugs three pads, and dies on the
+    /// fourth with a driver-flavoured error naming a driver that would not have
+    /// helped.
+    ///
+    /// Deliberately **not** derived from a driver probe. A probe flips to
+    /// "installed" the moment a user installs HIDMaestro, and this would then
+    /// go quiet while the plug still failed.
+    PersonaNotImplemented {
+        slot: u8,
+        /// Canonical name, as written in the file.
+        persona: String,
+        /// What is missing, verbatim from [`ksx_core::PadBackend::gap`] —
+        /// carried rather than re-derived so `--json` consumers read the same
+        /// sentence the text output prints.
+        reason: String,
+        /// The nearest persona that does work, so the fix is in the message.
+        instead: String,
+    },
+    /// See [`Issue::PersonaNotImplemented`], for one game's slot list.
+    GamePersonaNotImplemented {
+        game: String,
+        slot: u8,
+        persona: String,
+        reason: String,
+        instead: String,
+    },
     /// Slot references a preset that is neither a preset file nor a built-in.
     UnknownPresetRef { slot: u8, preset: String },
     /// Slot keyboard/mouse is neither a `[[device]]` alias nor an instance
@@ -356,6 +387,28 @@ impl fmt::Display for Issue {
                     Persona::PlayStation
                 )
             }
+            Issue::PersonaNotImplemented {
+                slot,
+                persona,
+                reason,
+                instead,
+            } => write!(
+                f,
+                "slot {slot}: persona '{persona}' cannot be plugged by this build of ksx — \
+                 {reason}. The name is valid and the file is fine; there is just nothing \
+                 behind it yet. Use persona '{instead}' on that [[slot]]"
+            ),
+            Issue::GamePersonaNotImplemented {
+                game,
+                slot,
+                persona,
+                reason,
+                instead,
+            } => write!(
+                f,
+                "game '{game}': slot {slot} persona '{persona}' cannot be plugged by this \
+                 build of ksx — {reason}. Use persona '{instead}' on that slot"
+            ),
             Issue::UnknownPresetRef { slot, preset } => {
                 write!(f, "slot {slot} references preset '{preset}', which is neither a preset file nor a built-in")
             }
@@ -726,6 +779,14 @@ pub fn validate(config: &ConfigFile, presets: &[PresetFile]) -> Vec<Issue> {
                 preset: slot.preset.clone(),
             });
         }
+        if let Some((reason, instead)) = persona_gap(slot.persona) {
+            issues.push(Issue::PersonaNotImplemented {
+                slot: slot.number,
+                persona: slot.persona.to_string(),
+                reason,
+                instead,
+            });
+        }
         for reference in [&slot.keyboard, &slot.mouse].into_iter().flatten() {
             let is_path = reference.contains('\\');
             let is_alias = alias_counts.contains_key(reference.as_str());
@@ -793,6 +854,15 @@ pub fn validate_games(games: &GamesFile, presets: &[PresetFile]) -> Vec<Issue> {
                     preset: slot.preset.clone(),
                 });
             }
+            if let Some((reason, instead)) = persona_gap(slot.persona) {
+                issues.push(Issue::GamePersonaNotImplemented {
+                    game: game.title.clone(),
+                    slot: slot.number,
+                    persona: slot.persona.to_string(),
+                    reason,
+                    instead,
+                });
+            }
             socd_issues(&cores, slot.number, &slot.preset, slot.socd, &mut issues);
             macros_off_issue(&cores, slot.number, &slot.preset, slot.macros, &mut issues);
             if let Some(value) = slot.user_index {
@@ -814,6 +884,27 @@ pub fn validate_games(games: &GamesFile, presets: &[PresetFile]) -> Vec<Issue> {
         }
     }
     issues
+}
+
+/// The gap between a persona a file may name and one ksx can build, or `None`
+/// when there is none. Returns `(what is missing, what to write instead)`.
+///
+/// Reads [`Persona::can_plug`] and nothing else — never a driver probe. A probe
+/// answers "is HIDMaestro on this machine", which is a different question with
+/// a different answer: install it and the probe says yes while the plug still
+/// fails, so a probe-based check would go quiet exactly when it was needed.
+fn persona_gap(persona: Persona) -> Option<(String, String)> {
+    if persona.can_plug() {
+        return None;
+    }
+    Some((
+        persona
+            .backend()
+            .gap()
+            .unwrap_or("no reason recorded")
+            .to_owned(),
+        persona.nearest_pluggable().to_string(),
+    ))
 }
 
 /// Every preset that can be resolved to the core model, by name — the
@@ -1576,6 +1667,121 @@ preset = "default"
                 count: 6
             }]
         );
+    }
+
+    /// A slot naming a persona nothing can build must be caught by `ksx check`
+    /// and `ksx run --dry-run`, not by a plug three steps later.
+    #[test]
+    fn a_persona_this_build_cannot_plug_is_refused_at_validate_time() {
+        let slot = |number: u8, persona: Persona| SlotEntry {
+            number,
+            keyboard: None,
+            mouse: None,
+            preset: "default".into(),
+            persona,
+            socd: Socd::default(),
+            macros: Default::default(),
+        };
+        for persona in [Persona::DualSense, Persona::SwitchPro, Persona::XboxSeries] {
+            let cfg = ConfigFile {
+                slots: vec![slot(1, persona)],
+                ..ConfigFile::default()
+            };
+            let issues = validate(&cfg, &[]);
+            let found = issues
+                .iter()
+                .find(|i| matches!(i, Issue::PersonaNotImplemented { .. }))
+                .unwrap_or_else(|| panic!("{persona} produced no issue: {issues:?}"));
+            let msg = found.to_string();
+            assert!(msg.contains(persona.as_str()), "{msg}");
+            // A refusal that stops at "no" makes the user guess. It has to name
+            // what is missing AND what to write instead.
+            assert!(msg.contains("cannot be plugged by this build"), "{msg}");
+            assert!(
+                msg.contains(persona.nearest_pluggable().as_str()),
+                "{msg} must name the persona to use instead"
+            );
+            // It is a fault, not advice: the slot does not work as written.
+            assert!(!found.is_advisory(), "{msg}");
+        }
+    }
+
+    #[test]
+    fn the_personas_that_do_work_produce_no_persona_issue() {
+        // The other half of the gate: a cabinet on xbox360/playstation must
+        // stay silent, or the warning becomes noise nobody reads.
+        let slot = |number: u8, persona: Persona| SlotEntry {
+            number,
+            keyboard: None,
+            mouse: None,
+            preset: "default".into(),
+            persona,
+            socd: Socd::default(),
+            macros: Default::default(),
+        };
+        let cfg = ConfigFile {
+            slots: vec![
+                slot(1, Persona::Xbox360),
+                slot(2, Persona::PlayStation),
+                slot(3, Persona::Xbox360),
+            ],
+            ..ConfigFile::default()
+        };
+        assert_eq!(validate(&cfg, &[]), vec![]);
+    }
+
+    #[test]
+    fn a_games_unbuildable_persona_is_reported_per_game() {
+        use crate::games::GameSlotEntry;
+        let mut games: GamesFile =
+            toml::from_str("[[game]]\ntitle = \"Bloodborne\"\npath = \"C:\\\\ps.exe\"\n").unwrap();
+        games.games[0].slots = vec![GameSlotEntry {
+            number: 1,
+            user_index: None,
+            keyboard: None,
+            mouse: None,
+            preset: "default".into(),
+            persona: Persona::DualSense,
+            socd: Socd::default(),
+            macros: Default::default(),
+        }];
+        let issues = validate_games(&games, &[]);
+        assert_eq!(
+            issues,
+            vec![Issue::GamePersonaNotImplemented {
+                game: "Bloodborne".into(),
+                slot: 1,
+                persona: "dualsense".into(),
+                reason: ksx_core::PadBackend::HidMaestro.gap().unwrap().to_owned(),
+                instead: "playstation".into(),
+            }]
+        );
+        let msg = issues[0].to_string();
+        assert!(msg.contains("Bloodborne"), "{msg}");
+        assert!(msg.contains("playstation"), "{msg}");
+    }
+
+    /// The trap, stated as a test: this check may never consult the machine.
+    ///
+    /// A driver probe flips to "installed" the moment someone installs
+    /// HIDMaestro — at which point a probe-based check would go quiet while the
+    /// plug still failed, and the user would have installed a driver for
+    /// nothing. So the reason printed here is the BUILD's, verbatim, and it
+    /// says the install does not help.
+    #[test]
+    fn the_persona_gap_is_a_build_fact_and_says_installing_will_not_help() {
+        let (reason, instead) =
+            persona_gap(Persona::SwitchPro).expect("switchpro cannot be plugged by this build");
+        assert_eq!(
+            reason,
+            ksx_core::PadBackend::HidMaestro.gap().unwrap(),
+            "the sentence must come from the capability, not a second copy"
+        );
+        assert!(reason.contains("installing HIDMaestro does not change it"));
+        assert_eq!(instead, "xbox360");
+        // And no gap at all for what the cabinet actually runs.
+        assert_eq!(persona_gap(Persona::Xbox360), None);
+        assert_eq!(persona_gap(Persona::PlayStation), None);
     }
 
     #[test]

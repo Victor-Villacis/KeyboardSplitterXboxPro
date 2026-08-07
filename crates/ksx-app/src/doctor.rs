@@ -158,7 +158,7 @@ pub fn render_human(report: &DriverReport, advice: &[Advice]) -> String {
     render_interception(&mut doc, report);
     doc.blank();
 
-    doc.line("HIDMaestro (M8 backend — DualSense / Switch Pro / Xbox Series personas)");
+    doc.line("HIDMaestro (M8 backend — not implemented in this build; see below)");
     render_hidmaestro(&mut doc, &report.hidmaestro);
     doc.blank();
 
@@ -292,32 +292,47 @@ fn render_interception(doc: &mut Doc, report: &DriverReport) {
     render_filter(doc, "mouse", &interception.mouse);
 }
 
-/// HIDMaestro's row.
+/// HIDMaestro's row — and, printed first, the row that actually decides
+/// anything.
 ///
-/// Marked `[INFO]` when absent, never `[FAIL]`: unlike ViGEmBus, nothing on the
-/// cabinet stops working without it — it gates exactly three personas. The row
-/// prints what was looked for so "not installed" is checkable rather than
-/// assertive.
+/// The install state used to *be* the verdict: absent read "those personas are
+/// unavailable", present read "[OK] installed — personas available". The second
+/// was a promise ksx could not keep, and it appeared the instant a user acted
+/// on the first. Which personas ksx can build is a fact about this binary
+/// ([`ksx_core::Persona::can_plug`]), so that is what the gate line reports,
+/// and it says the same thing whatever the probe found.
+///
+/// The install state is still printed, with what was looked for, because a
+/// half-finished install is worth knowing about. It is `[INFO]`, never `[FAIL]`:
+/// nothing on the cabinet stops working without HIDMaestro.
 fn render_hidmaestro(doc: &mut Doc, hm: &ksx_platform::HidMaestroReport) {
-    let gated = ksx_platform::HidMaestroReport::GATED_PERSONAS.join("/");
+    let gated = ksx_platform::HidMaestroReport::gated_personas();
+    if !gated.is_empty() {
+        doc.line(format!(
+            "  [INFO] {} cannot be plugged by this build of ksx — no HIDMaestro \
+             transport is implemented, so installing the driver does not enable them",
+            gated.join("/")
+        ));
+        doc.line(format!(
+            "  [INFO]   use persona '{}' or '{}' instead",
+            ksx_core::Persona::PlayStation,
+            ksx_core::Persona::Xbox360
+        ));
+    }
     if !hm.installed {
         if hm.service_key {
-            doc.line(format!(
-                "  [WARN] service key present but the UMDF driver is missing — \
-                 broken install; {gated} personas will not plug"
-            ));
+            doc.line(
+                "  [WARN] service key present but the UMDF driver is missing — broken install",
+            );
         } else {
-            doc.line(format!(
-                "  [INFO] not installed — {gated} personas unavailable \
-                 (xbox360/playstation are unaffected: they use ViGEmBus)"
-            ));
+            doc.line("  [INFO] not installed (nothing depends on it today)");
         }
         for target in &hm.looked_for {
             doc.line(format!("  [INFO]   looked for {target}"));
         }
         return;
     }
-    doc.line(format!("  [OK]   installed — {gated} personas available"));
+    doc.line("  [INFO] installed");
     match &hm.driver_file {
         Some(file) => render_driver_file(doc, file),
         None => doc.line("  [WARN] driver file present but unreadable"),
@@ -528,6 +543,36 @@ mod tests {
         let report = cabinet_report();
         let advice = summarize(&report);
         insta::assert_snapshot!(render_human(&report, &advice));
+    }
+
+    /// The row that used to become a promise the moment a driver appeared.
+    ///
+    /// With HIDMaestro installed the old render printed
+    /// "[OK] installed — dualsense/switchpro/xboxseries personas available",
+    /// which was false on every build ksx has ever shipped, and false in the
+    /// one state where a user would act on it.
+    #[test]
+    fn installing_hidmaestro_never_makes_doctor_offer_a_persona() {
+        let mut report = cabinet_report();
+        report.hidmaestro.installed = true;
+        report.hidmaestro.service_key = true;
+        let text = render_human(&report, &summarize(&report));
+
+        assert!(
+            !text.contains("personas available"),
+            "doctor must never advertise a persona it cannot plug:\n{text}"
+        );
+        for persona in ksx_platform::HidMaestroReport::gated_personas() {
+            assert!(text.contains(persona), "{persona} unmentioned:\n{text}");
+        }
+        assert!(
+            text.contains("installing the driver does not enable them"),
+            "{text}"
+        );
+        // The install is still reported — it is worth knowing, it just decides
+        // nothing — and it must not be dressed up as a fault.
+        assert!(text.contains("[INFO] installed"), "{text}");
+        assert_ne!(exit_code(&summarize(&report)), EXIT_CRITICAL);
     }
 
     #[test]

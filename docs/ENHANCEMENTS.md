@@ -41,8 +41,19 @@ So M8 shipped the **client, honestly gated**, and nothing that pretends:
 - `ksx-output`: `HidMaestroBackend` (adapter) + `RoutedBackend` (persona → stack).
 - `ksx-core`: `Persona::{DualSense, SwitchPro, XboxSeries}` + `PadBackend`, with
   `Persona::backend()` as the single statement of the routing rule.
-- `ksx doctor` reports HIDMaestro's absence at **Info** severity (`hidmaestro-missing`),
-  because a cabinet on xbox360/playstation loses nothing by not having it.
+- **The three personas are not offered until the section lands.**
+  `PadBackend::is_implemented()` says this build cannot create a HIDMaestro device, and
+  `Persona::can_plug()` is what the config validator (`Issue::PersonaNotImplemented`),
+  `RoutedBackend`, `ksx pads` and `ksx doctor` all read. The gate is that build fact and
+  **never a driver probe** — a probe flips to "installed" the moment a user installs
+  HIDMaestro, and the plug fails exactly as before, so a probe-based gate is wrong in
+  the one case it exists for. Flipping `is_implemented()` in the same commit that lands
+  a real driver re-opens every one of those paths with nothing else to change.
+- `ksx doctor` reports HIDMaestro's absence at **Info** severity (`hidmaestro-missing`)
+  and says nothing depends on it, because nothing does: a cabinet on
+  xbox360/playstation loses nothing by not having it, and neither does anyone else.
+  The separate `personas-not-implemented` note is what explains the three personas, and
+  it prints whether or not the driver is present.
 
 **Verified vs written-to-spec** is stated in `ksx-hidmaestro`'s crate docs as a table.
 Short version: the seqlock discipline, keepalive cadence, axis-by-name routing and

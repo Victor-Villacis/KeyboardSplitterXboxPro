@@ -57,47 +57,71 @@ pub struct RoutedBackend {
     vigem: Box<dyn VirtualPadBackend>,
     hidmaestro: Option<Box<dyn VirtualPadBackend>>,
     factory: Option<HidMaestroFactory>,
+    /// Whether [`Persona::can_plug`] is enforced before anything is dispatched.
+    ///
+    /// True for the routers ksx builds for itself, where the answer is a fact
+    /// about this binary and there is nothing to gain by handing a persona to a
+    /// stack that cannot create it. False for [`RoutedBackend::with_hidmaestro`]:
+    /// a caller who supplies a backend has supplied the very thing the build
+    /// fact says is missing, and that is how the two-stack dispatch below stays
+    /// under test while the second stack has no production driver.
+    enforce_build_capability: bool,
     pads: std::collections::BTreeMap<u32, Entry>,
     next_id: u32,
 }
 
 impl RoutedBackend {
-    /// A router with only ViGEmBus. Any HIDMaestro persona is refused with
-    /// [`OutputError::PersonaUnsupported`] — honest, since nothing can plug it.
+    /// A router with only ViGEmBus.
     pub fn vigem_only(vigem: Box<dyn VirtualPadBackend>) -> Self {
         Self {
             vigem,
             hidmaestro: None,
             factory: None,
+            enforce_build_capability: true,
             pads: Default::default(),
             next_id: 0,
         }
     }
 
     /// The production router: ViGEmBus now, HIDMaestro if and when a slot asks
-    /// for a persona that needs it.
+    /// for a persona that needs it **and this build can create one**.
     ///
     /// This is the one every entry point should use. It costs nothing on a
     /// cabinet that uses neither the DualSense, Switch Pro, nor Xbox Series
     /// persona: [`HidMaestroBackend::connect`](crate::HidMaestroBackend::connect)
     /// is never called, so the driver is never probed for and its absence
     /// cannot fail a run.
+    ///
+    /// The factory is wired even though today's build gate refuses every
+    /// persona that would reach it. That is deliberate and it is the point:
+    /// flipping [`ksx_core::PadBackend::is_implemented`] in the commit that
+    /// lands a real driver lights this path up with nothing else to change.
     pub fn standard(vigem: Box<dyn VirtualPadBackend>) -> Self {
-        Self::with_hidmaestro(
+        Self {
             vigem,
-            Box::new(|| {
+            hidmaestro: None,
+            factory: Some(Box::new(|| {
                 crate::HidMaestroBackend::connect()
                     .map(|b| Box::new(b) as Box<dyn VirtualPadBackend>)
-            }),
-        )
+            })),
+            enforce_build_capability: true,
+            pads: Default::default(),
+            next_id: 0,
+        }
     }
 
-    /// A router that will build the HIDMaestro backend on first need.
+    /// A router that will build the HIDMaestro backend on first need, from a
+    /// factory the caller vouches for.
+    ///
+    /// Does **not** apply the build-capability gate — see
+    /// [`RoutedBackend::enforce_build_capability`]. Use
+    /// [`RoutedBackend::standard`] for anything a user's config reaches.
     pub fn with_hidmaestro(vigem: Box<dyn VirtualPadBackend>, factory: HidMaestroFactory) -> Self {
         Self {
             vigem,
             hidmaestro: None,
             factory: Some(factory),
+            enforce_build_capability: false,
             pads: Default::default(),
             next_id: 0,
         }
@@ -168,6 +192,14 @@ impl VirtualPadBackend for RoutedBackend {
     }
 
     fn plug_persona(&mut self, persona: Persona) -> Result<PadHandle, OutputError> {
+        // Checked before the machine is consulted, because the machine is the
+        // wrong witness. Reaching the factory instead would probe for
+        // HIDMaestro and report whatever it found — so on a machine where the
+        // driver IS installed the failure would arrive as a driver error, from
+        // a stack that could not have created the pad either way.
+        if self.enforce_build_capability && !persona.can_plug() {
+            return Err(OutputError::PersonaNotImplemented(persona));
+        }
         let which = Self::backend_for(persona);
         let inner = self.stack(which)?.plug_persona(persona)?;
         let id = self.next_id;
@@ -321,13 +353,41 @@ mod tests {
     fn without_a_factory_a_hidmaestro_persona_is_refused_not_downgraded() {
         let mut r = RoutedBackend::vigem_only(Box::new(MockBackend::new()));
         let err = r.plug_persona(Persona::DualSense).unwrap_err();
+        // The build gate answers first, and it is the more fundamental fact:
+        // "no factory is wired up" invites someone to wire one, and there is
+        // nothing to wire.
         assert!(
-            matches!(err, OutputError::BackendUnavailable(PadBackend::HidMaestro)),
+            matches!(err, OutputError::PersonaNotImplemented(Persona::DualSense)),
             "{err}"
         );
-        // The message must name the backend, so the fix is obvious.
-        assert!(err.to_string().contains("hidmaestro"), "{err}");
         // A ViGEm persona still works on the same router.
+        assert!(r.plug_persona(Persona::PlayStation).is_ok());
+    }
+
+    /// The regression this whole change exists for.
+    ///
+    /// A production router must refuse the three HIDMaestro personas **without
+    /// consulting the machine**, because the machine's answer is the wrong one:
+    /// on a box where HIDMaestro is installed the probe says yes, and the pad
+    /// still cannot be created. A gate that flips with an install would offer a
+    /// persona that plugs no better than before.
+    #[test]
+    fn the_production_router_refuses_unbuildable_personas_without_probing() {
+        let mut r = RoutedBackend::standard(Box::new(MockBackend::new()));
+        for persona in [Persona::DualSense, Persona::SwitchPro, Persona::XboxSeries] {
+            let err = r.plug_persona(persona).unwrap_err();
+            assert!(
+                matches!(err, OutputError::PersonaNotImplemented(p) if p == persona),
+                "{persona}: {err}"
+            );
+            assert!(!err.is_hidmaestro_missing(), "{persona}: {err}");
+            assert!(err.is_not_implemented(), "{persona}: {err}");
+        }
+        // Nothing was constructed, so nothing was probed — the refusal is the
+        // same on a machine with HIDMaestro installed as on one without.
+        assert!(!r.hidmaestro_started());
+        // ...and the cabinet's own personas are untouched.
+        assert!(r.plug_persona(Persona::Xbox360).is_ok());
         assert!(r.plug_persona(Persona::PlayStation).is_ok());
     }
 
@@ -352,9 +412,8 @@ mod tests {
         assert!(!r.hidmaestro_started());
     }
 
-    /// `standard()` must be as lazy as the hand-wired router: on this machine
-    /// HIDMaestro is absent, so a run that touches only ViGEm personas has to
-    /// succeed anyway.
+    /// `standard()` must be as lazy as the hand-wired router: a run that
+    /// touches only ViGEm personas has to succeed whatever else is missing.
     #[test]
     fn the_standard_router_still_runs_a_full_cabinet_without_hidmaestro() {
         let mut r = RoutedBackend::standard(Box::new(MockBackend::new()));
@@ -365,12 +424,6 @@ mod tests {
             r.plug_persona(Persona::PlayStation).unwrap();
         }
         assert!(!r.hidmaestro_started());
-        // And a HIDMaestro persona fails honestly rather than silently
-        // downgrading — unless someone installed the driver, in which case it
-        // may legitimately work.
-        if let Err(err) = r.plug_persona(Persona::DualSense) {
-            assert!(err.is_hidmaestro_missing(), "{err}");
-        }
     }
 
     #[test]

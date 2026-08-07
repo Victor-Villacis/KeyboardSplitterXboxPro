@@ -1,9 +1,11 @@
 //! `ksx pads` — plug N virtual pads, show each pad's XInput identity, run a
 //! visible test pattern, then unplug cleanly.
 //!
-//! Exit code [`EXIT_DRIVER_MISSING`] (2) = ViGEmBus is not installed: the
-//! human-readable install hint goes to stderr; `--json` puts
-//! `{"error":{code,message}}` on stdout instead. Ctrl+C is handled by the
+//! Exit code [`EXIT_DRIVER_MISSING`] (2) = ViGEmBus is not installed, and
+//! [`EXIT_REFUSED`] (also 2) = `--persona` names something this build cannot
+//! create. Same code, different `--json` `code` — because only the first one
+//! has an install that fixes it. The human-readable hint goes to stderr;
+//! `--json` puts `{"error":{code,message}}` on stdout instead. Ctrl+C is handled by the
 //! shared [`crate::ctrl_c`] latch the pattern loop polls — no ctrlc crate. A
 //! `taskkill /f` mid-pattern runs no destructors; that case is covered by
 //! driver-side client-handle cleanup (see `VigemBackend` docs).
@@ -23,6 +25,13 @@ use ksx_platform::BusDriverReport;
 
 /// Exit code when ViGEmBus is not installed (documented in `--help`).
 pub const EXIT_DRIVER_MISSING: i32 = 2;
+
+/// Exit code when `--persona` names something this build cannot create.
+///
+/// Shares 2 with [`EXIT_DRIVER_MISSING`] because both mean "did not start, and
+/// not because anything broke". The `--json` `code` is what tells them apart,
+/// and it has to: one is fixed by installing a driver and the other by nothing.
+pub const EXIT_REFUSED: i32 = 2;
 
 /// One pattern frame per tick. Coarse on purpose — this is the demo path, not
 /// the input hot path.
@@ -113,7 +122,23 @@ pub fn run(
     json: bool,
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
-    use ksx_output::{RoutedBackend, VigemBackend, VirtualPadBackend as _};
+    use ksx_output::{OutputError, RoutedBackend, VigemBackend, VirtualPadBackend as _};
+
+    // Refused before ViGEmBus is opened. Connecting first would make a build
+    // limitation arrive after a driver handshake, in the shape of a driver
+    // problem — and `--json` would report it under a `vigembus`-flavoured code.
+    if !persona.can_plug() {
+        let err = OutputError::PersonaNotImplemented(persona);
+        if json {
+            println!(
+                "{}",
+                error_json("persona-not-implemented", &err.to_string())
+            );
+        } else {
+            eprintln!("error: {err}");
+        }
+        std::process::exit(EXIT_REFUSED);
+    }
 
     let vigem = match VigemBackend::connect() {
         Ok(backend) => backend,

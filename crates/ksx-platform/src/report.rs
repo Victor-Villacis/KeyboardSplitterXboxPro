@@ -29,10 +29,16 @@ pub struct DriverReport {
 
 /// HIDMaestro's install state.
 ///
-/// Reported even when absent, and absence is **not an error**: it costs exactly
-/// three personas and nothing else. A cabinet running Xbox 360 and PlayStation
-/// slots is fully functional with no HIDMaestro anywhere, which is why the
-/// verdict for this is [`crate::Severity::Info`] and never a warning.
+/// Reported even when absent, and absence is **not an error**: a cabinet
+/// running Xbox 360 and PlayStation slots is fully functional with no
+/// HIDMaestro anywhere, which is why the verdict for this is
+/// [`crate::Severity::Info`] and never a warning.
+///
+/// **This report does not decide which personas are available.** It cannot:
+/// which personas ksx can build is a fact about the ksx binary
+/// ([`ksx_core::Persona::can_plug`]), and today no build can create a
+/// HIDMaestro pad whatever this says. Reporting it as the gate is how a doctor
+/// row ends up promising a persona the moment a driver appears.
 ///
 /// `looked_for` is part of the report on purpose: "not installed" should be
 /// evidence a user can check, not a claim they have to take on faith.
@@ -50,9 +56,29 @@ pub struct HidMaestroReport {
 }
 
 impl HidMaestroReport {
-    /// The personas that are unavailable while this is not installed. Kept here
-    /// so the doctor text and the advice cannot drift apart.
-    pub const GATED_PERSONAS: &'static [&'static str] = &["dualsense", "switchpro", "xboxseries"];
+    /// The personas ksx cannot create, canonical names in
+    /// [`ksx_core::Persona::ALL`] order.
+    ///
+    /// **Derived, never listed.** This used to be a hand-written
+    /// `["dualsense", "switchpro", "xboxseries"]`, which made it a second
+    /// opinion about what ksx can do — one that could not be wrong today (all
+    /// three are unbuildable) and would be wrong the day one of them lands, in
+    /// the direction that keeps promising it. Asking the capability means the
+    /// doctor row and the config validator answer the same question.
+    ///
+    /// Empty when every persona works; callers must say nothing in that case
+    /// rather than print an empty list.
+    ///
+    /// Takes no `self`, and sits on this type only because every caller already
+    /// looked here — it is not derived from the report and cannot be. Read the
+    /// type's own docs for why that separation is load-bearing.
+    pub fn gated_personas() -> Vec<&'static str> {
+        ksx_core::Persona::ALL
+            .iter()
+            .filter(|p| !p.can_plug())
+            .map(|p| p.as_str())
+            .collect()
+    }
 
     /// A "nothing found" report — the shape every machine without HIDMaestro
     /// produces, and what non-Windows builds return.
