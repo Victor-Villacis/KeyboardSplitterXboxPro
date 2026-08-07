@@ -4,6 +4,7 @@ on:
   push:
     branches: [master]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -58,3 +59,50 @@ jobs:
           }
       - name: Check vendored vigem-client compiles
         run: cargo check -p vigem-client --all-features
+
+  # The shippable binary is built HERE, not on a developer machine, and that is
+  # deliberate. On 2026-08-07 the primary dev box (i9-14900K) began crashing
+  # rustc during `cargo build --release`: three runs on a byte-identical command
+  # line died three different ways (0xc0000409 twice in different crates, then
+  # 0xc0000005), with 28GB of 64GB free — so not OOM. A deterministic compiler
+  # that fails non-deterministically is hardware corrupting compute, and the
+  # release profile below (opt-level=3 + thin LTO + codegen-units=1) is the
+  # heaviest sustained load in the build, which is why it surfaces there first.
+  #
+  # The danger is NOT the crash. A crash is loud and safe. The danger is the run
+  # that *succeeds* on marginal hardware and emits a silently miscompiled binary
+  # — which then goes onto an arcade cabinet and misbehaves with no error
+  # anywhere to explain it. A clean runner removes that class of risk entirely.
+  #
+  # Keep this job even after the CPU is replaced: it also means anyone can get a
+  # working ksx.exe without a Rust toolchain.
+  release-binary:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # cabinet + studio is the shipping combination: the egui panel UI plus the
+      # local web config server. The feature matrix above proves it compiles;
+      # this builds it optimized.
+      - name: Build release
+        run: cargo build --release --features cabinet,studio
+      # Print the hash in the log so a downloaded artifact can be verified
+      # against the run that produced it.
+      - name: Hash
+        shell: pwsh
+        run: |
+          $exe = 'target/release/ksx.exe'
+          $h = (Get-FileHash $exe -Algorithm SHA256).Hash
+          $mb = [math]::Round((Get-Item $exe).Length / 1MB, 2)
+          Write-Host "ksx.exe  $mb MB"
+          Write-Host "SHA256   $h"
+          "### ksx.exe`n`n- size: $mb MB`n- SHA256: ``$h```n- commit: ``$env:GITHUB_SHA``" |
+            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ksx-windows-x86_64
+          path: target/release/ksx.exe
+          if-no-files-found: error
+          retention-days: 30
