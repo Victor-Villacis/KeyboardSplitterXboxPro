@@ -365,6 +365,24 @@ impl HotSwapSlot {
         self.0.lock().ok()?.clone()
     }
 
+    /// Do these two names refer to the SAME slot?
+    ///
+    /// The hot-swap handshake is two-sided — a control loop holds one end and
+    /// the session publishes into the other — and both ends are
+    /// `Default`-constructible, so wiring the wrong one type-checks perfectly
+    /// and fails silently at runtime. That is exactly what happened to the
+    /// daemon: it let `..RunOptions::default()` fill `hot_swap` in, published
+    /// its engine handle into a slot nobody read, and every binding edit fell
+    /// back to a full pad bounce. This is how a test says "the same one".
+    ///
+    /// Test-only on purpose: production code has no business asking whether two
+    /// slots are the same object, and a wiring bug should be caught before it
+    /// ships rather than branched on at runtime.
+    #[cfg(test)]
+    pub fn is_same_slot(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// Stand in for a real session's engine thread: publish a handle over a
     /// fresh channel and return the receiving end, so a test can assert what
     /// the daemon control loop pushed through it.
