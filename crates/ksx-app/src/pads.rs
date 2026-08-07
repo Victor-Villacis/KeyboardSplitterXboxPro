@@ -264,6 +264,332 @@ fn animate(
     }
 }
 
+// ---------------------------------------------------------------------------
+// `ksx pads --prune` — clearing pads that outlived whatever made them
+// ---------------------------------------------------------------------------
+
+/// What a prune would do, decided before anything is touched.
+///
+/// Pure so the whole decision surface — including the two refusals — is tested
+/// in CI with no ViGEmBus anywhere near it, the same shape `winusb::plan_claim`
+/// uses for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrunePlan {
+    /// The bus has no children. Nothing to do, and saying so is the answer.
+    Nothing,
+    /// ViGEmBus is not installed, or exposes no devnode to restart.
+    NoBus,
+    /// A session is live. Its pads are the ones a player is holding, and a bus
+    /// restart would yank them mid-game.
+    SessionRunning { count: usize },
+    /// Restart the bus devnode, which drops every child pad with it.
+    Restart {
+        bus_instance_id: String,
+        count: usize,
+    },
+}
+
+/// Decide, given the bus devnode, how many pads hang off it, and whether a
+/// session is running.
+///
+/// `session_running` is the input the ghost heuristic could never have: doctor
+/// matches an owner by PROCESS NAME, and the tray daemon is `ksx.exe` whether
+/// or not it has a session — so on a cabinet, where the daemon runs all day,
+/// stale pads are indistinguishable from working ones. Fifteen accumulated on
+/// the reference cabinet that way. Asking the daemon what it is actually doing
+/// is the difference between a guess and an answer.
+pub fn plan_prune(bus_instance_id: Option<&str>, count: usize, session_running: bool) -> PrunePlan {
+    if count == 0 {
+        return PrunePlan::Nothing;
+    }
+    if session_running {
+        return PrunePlan::SessionRunning { count };
+    }
+    match bus_instance_id {
+        Some(bus) => PrunePlan::Restart {
+            bus_instance_id: bus.to_owned(),
+            count,
+        },
+        None => PrunePlan::NoBus,
+    }
+}
+
+/// Why this render is or is not describing work that happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneMode {
+    /// No `--yes`. The trailer tells them how to mean it.
+    DryRun,
+    /// They meant it, and something else stopped it — elevation, so far. The
+    /// trailer must NOT tell them to add a flag they already passed.
+    Blocked,
+    /// Actually running.
+    Doing,
+}
+
+impl PrunePlan {
+    /// The command a user could run by hand instead. Printed in the dry run,
+    /// because a driver operation nobody can reproduce without ksx is one
+    /// nobody can undo without ksx either.
+    pub fn command(&self) -> Option<String> {
+        match self {
+            PrunePlan::Restart {
+                bus_instance_id, ..
+            } => Some(format!("pnputil /restart-device \"{bus_instance_id}\"")),
+            _ => None,
+        }
+    }
+
+    pub fn render(&self, mode: PruneMode) -> String {
+        let dry_run = mode != PruneMode::Doing;
+        match self {
+            PrunePlan::Nothing => "no virtual pads on the bus — nothing to prune\n".to_owned(),
+            PrunePlan::NoBus => {
+                "ViGEmBus exposes no devnode to restart. If joy.cpl still lists pads, reboot \
+                 — there is nothing here to act on.\n"
+                    .to_owned()
+            }
+            PrunePlan::SessionRunning { count } => format!(
+                "REFUSED: a session is running, and those {count} pad(s) are the ones it is \
+                 driving.\n\nPruning restarts the bus device, which unplugs every pad on it — \
+                 mid-game, for whoever is holding one. Stop emulation first \
+                 (`ksx session stop`), then prune.\n"
+            ),
+            PrunePlan::Restart { count, .. } => {
+                let head = if dry_run {
+                    format!("DRY RUN — would clear {count} virtual pad(s)")
+                } else {
+                    format!("clearing {count} virtual pad(s)")
+                };
+                let command = self.command().unwrap_or_default();
+                format!(
+                    "{head}\n\n  {command}\n\nRestarting the bus device drops every child pad \
+                     with it. No session is running, so nothing is holding one.\n{}",
+                    match mode {
+                        // Telling someone to "re-run with --yes" when they just
+                        // passed --yes is the kind of stale instruction that
+                        // makes a user doubt the rest of the output.
+                        PruneMode::DryRun =>
+                            "\nNothing was changed. Re-run with --yes from an elevated prompt.\n",
+                        PruneMode::Blocked => "\nNothing was changed.\n",
+                        PruneMode::Doing => "",
+                    }
+                )
+            }
+        }
+    }
+}
+
+/// Is a session running right now?
+///
+/// `None` means the daemon could not be asked — no daemon, or the pipe did not
+/// answer. Treated as "not running" by the caller, deliberately: with no daemon
+/// there is certainly no session, and a pruning refusal that fires because a
+/// diagnostic could not reach a process that is not there would block the fix
+/// exactly when the machine most needs it.
+#[cfg(windows)]
+fn session_running() -> Option<bool> {
+    use crate::daemon::pipe::{client, PIPE_NAME};
+    let response = client::request(PIPE_NAME, &serde_json::json!({ "verb": "status" })).ok()?;
+    response
+        .pointer("/session/running")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| response["running"].as_bool())
+}
+
+/// `ksx pads --prune` — clear pads that outlived whatever made them.
+#[cfg(windows)]
+pub fn prune(yes: bool, json: bool) -> anyhow::Result<()> {
+    let report = ksx_platform::collect();
+    let pads = &report.virtual_pads;
+    let running = session_running().unwrap_or(false);
+    let plan = plan_prune(pads.bus_instance_id.as_deref(), pads.count, running);
+
+    // Before narrating anything. `render(false)` opens with "clearing 15
+    // virtual pad(s)" — present tense, because that is what a real run is
+    // doing — and printing that above a refusal reads as though ksx acted and
+    // then changed its mind. Elevation is a property of THIS process and is
+    // knowable now, so it is answered before a word is said about clearing.
+    let blocked_on_elevation = yes
+        && matches!(plan, PrunePlan::Restart { .. })
+        && ksx_platform::process::is_elevated() == Some(false);
+    if blocked_on_elevation && !json {
+        print!("{}", plan.render(PruneMode::Blocked));
+        eprintln!(
+            "\nREFUSED: restarting a bus device needs an administrator token. ksx never \
+             self-elevates — open an elevated prompt and re-run the same command."
+        );
+        std::process::exit(crate::winusb::EXIT_REFUSED);
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "pads": pads.count,
+                "session_running": running,
+                "command": plan.command(),
+                "dry_run": !yes || blocked_on_elevation,
+                "refused": matches!(plan, PrunePlan::SessionRunning { .. })
+                    || blocked_on_elevation,
+                "refused_because": if matches!(plan, PrunePlan::SessionRunning { .. }) {
+                    Some("session-running")
+                } else if blocked_on_elevation {
+                    Some("needs-elevation")
+                } else {
+                    None
+                },
+            })
+        );
+    } else {
+        print!(
+            "{}",
+            plan.render(if yes {
+                PruneMode::Doing
+            } else {
+                PruneMode::DryRun
+            })
+        );
+    }
+
+    let PrunePlan::Restart { .. } = &plan else {
+        if matches!(plan, PrunePlan::SessionRunning { .. }) {
+            std::process::exit(crate::winusb::EXIT_REFUSED);
+        }
+        return Ok(());
+    };
+    if !yes {
+        return Ok(());
+    }
+    if blocked_on_elevation {
+        // The --json path: the object above already carried the refusal.
+        std::process::exit(crate::winusb::EXIT_REFUSED);
+    }
+    let Some(command) = plan.command() else {
+        return Ok(());
+    };
+    let PrunePlan::Restart {
+        bus_instance_id, ..
+    } = &plan
+    else {
+        return Ok(());
+    };
+    let planned = ksx_platform::winusb::PlannedCommand::pnputil(
+        &["/restart-device", bus_instance_id],
+        "restart the bus, which drops every child pad with it",
+    );
+    match ksx_platform::winusb::run_command(&planned) {
+        Ok(output) => {
+            println!("\n{output}");
+            println!("done — `ksx doctor` should now report no pads on the bus.");
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("\nFAILED: {err}");
+            eprintln!(
+                "\nRun it by hand from an elevated prompt:\n  {command}\n\nIf that also fails, \
+                 a reboot clears every pad on the bus."
+            );
+            std::process::exit(crate::winusb::EXIT_APPLY_FAILED);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn prune(_yes: bool, _json: bool) -> anyhow::Result<()> {
+    anyhow::bail!("`ksx pads --prune` restarts a Windows bus device and is Windows-only")
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    const BUS: &str = r"ROOT\SYSTEM\0002";
+
+    /// The refusal that matters: those pads belong to whoever is playing.
+    ///
+    /// A prune restarts the bus, which unplugs EVERY pad on it. Doing that
+    /// during a session takes the controller out of a player's hands mid-game,
+    /// and "there were a lot of pads" is not a reason a player would accept.
+    #[test]
+    fn a_running_session_is_refused_before_anything_is_touched() {
+        let plan = plan_prune(Some(BUS), 4, true);
+        assert_eq!(plan, PrunePlan::SessionRunning { count: 4 });
+        assert_eq!(
+            plan.command(),
+            None,
+            "a refusal must not hand over a command that would do the thing anyway"
+        );
+        let text = plan.render(PruneMode::DryRun);
+        assert!(text.contains("REFUSED"), "{text}");
+        assert!(
+            text.contains("ksx session stop"),
+            "a refusal with no way forward is just an error message: {text}"
+        );
+    }
+
+    /// The case on the reference cabinet: daemon up, no session, 15 pads.
+    #[test]
+    fn an_idle_daemon_with_pads_on_the_bus_is_prunable() {
+        let plan = plan_prune(Some(BUS), 15, false);
+        assert_eq!(
+            plan,
+            PrunePlan::Restart {
+                bus_instance_id: BUS.to_owned(),
+                count: 15,
+            }
+        );
+        assert_eq!(
+            plan.command().as_deref(),
+            Some(r#"pnputil /restart-device "ROOT\SYSTEM\0002""#),
+            "the dry run must print a command a user can run by hand"
+        );
+    }
+
+    /// Telling someone to "re-run with --yes" when they just passed --yes is
+    /// the kind of stale instruction that makes a user doubt the rest of the
+    /// output — and this path is reached exactly when they DID mean it and
+    /// something else stopped them.
+    #[test]
+    fn a_blocked_run_does_not_tell_you_to_pass_a_flag_you_already_passed() {
+        let text = plan_prune(Some(BUS), 15, false).render(PruneMode::Blocked);
+        assert!(text.contains("Nothing was changed"), "{text}");
+        assert!(
+            !text.contains("--yes"),
+            "they passed --yes; saying it again is wrong: {text}"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_says_it_changed_nothing_and_a_real_one_does_not() {
+        let plan = plan_prune(Some(BUS), 15, false);
+        assert!(plan
+            .render(PruneMode::DryRun)
+            .contains("Nothing was changed"));
+        assert!(
+            !plan
+                .render(PruneMode::Doing)
+                .contains("Nothing was changed"),
+            "a real prune must not claim it did nothing"
+        );
+    }
+
+    #[test]
+    fn an_empty_bus_is_not_an_error() {
+        assert_eq!(plan_prune(Some(BUS), 0, false), PrunePlan::Nothing);
+        // And "no session" must not turn an empty bus into work.
+        assert_eq!(plan_prune(Some(BUS), 0, true), PrunePlan::Nothing);
+    }
+
+    /// Pads counted but no devnode to restart is a hand-built report or a bus
+    /// that vanished mid-collect. Nothing to act on, and saying so beats
+    /// running pnputil against an empty string.
+    #[test]
+    fn pads_with_no_bus_devnode_has_nothing_to_restart() {
+        assert_eq!(plan_prune(None, 3, false), PrunePlan::NoBus);
+        assert_eq!(plan_prune(None, 3, false).command(), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ksx_platform::{DriverFileReport, ServiceInfo, ServiceState, StartType};

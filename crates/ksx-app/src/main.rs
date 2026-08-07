@@ -274,6 +274,16 @@ enum Command {
         /// One JSON object {driver, pads} on stdout; skips the test pattern
         #[arg(long)]
         json: bool,
+        /// Clear pads that outlived whatever made them, instead of plugging any
+        ///
+        /// Restarts the ViGEmBus devnode, which drops every child pad with it.
+        /// A dry run unless `--yes` is given, and refused outright while a
+        /// session is running — those pads belong to whoever is playing.
+        #[arg(long, conflicts_with_all = ["count", "persona", "hold_secs"])]
+        prune: bool,
+        /// Actually prune. Without it, `--prune` only says what it would do.
+        #[arg(long, requires = "prune")]
+        yes: bool,
     },
     /// Import legacy splitter_presets.xml / splitter_games.xml into ksx TOML
     ///
@@ -1326,7 +1336,15 @@ fn main() -> anyhow::Result<()> {
             persona,
             hold_secs,
             json,
-        } => pads::run(count, persona, hold_secs, json),
+            prune,
+            yes,
+        } => {
+            if prune {
+                pads::prune(yes, json)
+            } else {
+                pads::run(count, persona, hold_secs, json)
+            }
+        }
         Command::ImportLegacy {
             from,
             dry_run,
@@ -1655,8 +1673,33 @@ mod tests {
                 persona: ksx_core::Persona::Xbox360,
                 hold_secs: 10,
                 json: false,
+                prune: false,
+                yes: false,
             }
         ));
+    }
+
+    /// `--prune` is a different verb wearing the same command's name, so the
+    /// flags that describe pads to PLUG must be rejected beside it rather than
+    /// silently ignored — and `--yes` must be meaningless without it, or a
+    /// stray `--yes` on a pad test would read as consent to something.
+    #[test]
+    fn prune_refuses_the_flags_that_belong_to_plugging() {
+        let cli = Cli::try_parse_from(["ksx", "pads", "--prune"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Pads {
+                prune: true,
+                yes: false,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["ksx", "pads", "--prune", "--count", "4"]).is_err());
+        assert!(Cli::try_parse_from(["ksx", "pads", "--prune", "--hold-secs", "2"]).is_err());
+        assert!(
+            Cli::try_parse_from(["ksx", "pads", "--yes"]).is_err(),
+            "--yes without --prune must not parse: it would look like consent with no subject"
+        );
     }
 
     #[test]
@@ -1671,6 +1714,8 @@ mod tests {
                 persona: ksx_core::Persona::Xbox360,
                 hold_secs: 2,
                 json: true,
+                prune: false,
+                yes: false,
             }
         ));
     }
