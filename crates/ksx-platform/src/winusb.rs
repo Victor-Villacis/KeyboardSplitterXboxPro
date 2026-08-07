@@ -2726,6 +2726,54 @@ Anbietername:           ksx
         }
     }
 
+    /// **The one vendor branch on a live path, locked to being additive.**
+    ///
+    /// `docs/DEVICE-IDENTITY.md` §6: a vendor id may choose a display string; it
+    /// **may not** gate capture, claiming, refusal or backend selection. This
+    /// advice reads the VID — for a good reason, because it used to give every
+    /// user I-PAC interface numbers regardless of what they owned — and that
+    /// makes it the one place the rule could erode without anyone noticing.
+    ///
+    /// So the boundary is asserted rather than described: same refusal, same
+    /// code, same generic paragraph, and the recognised board gets *one extra
+    /// paragraph* on the end. A vendor id that ever decides whether to refuse,
+    /// or which code to refuse with, fails here.
+    ///
+    /// Breaks against: moving any part of the generic advice inside the `if`,
+    /// giving the Ultimarc case its own code, or refusing only for one vendor.
+    #[test]
+    fn the_ultimarc_hint_only_adds_a_paragraph_to_an_already_issued_refusal() {
+        let logitech = Refusal::NotAKeyboard {
+            instance_id: r"USB\VID_046D&PID_C31C&MI_01\7&1A2B3C4D&0&0001".into(),
+        };
+        let ultimarc = Refusal::NotAKeyboard {
+            instance_id: r"USB\VID_D209&PID_0430&MI_01\7&25EEA38C&0&0001".into(),
+        };
+
+        assert_eq!(
+            logitech.code(),
+            ultimarc.code(),
+            "the vendor may not change which refusal this is"
+        );
+
+        let (generic, specific) = (logitech.advice(), ultimarc.advice());
+        assert!(
+            !generic.is_empty(),
+            "an unrecognised board still gets usable advice — the whole point of \
+             the fix that produced this branch"
+        );
+        assert!(
+            specific.starts_with(&generic),
+            "the recognised board's advice must be the generic advice PLUS \
+             something, never instead of it:\n--- generic ---\n{generic}\n--- \
+             specific ---\n{specific}"
+        );
+        assert!(
+            !generic.contains("MI_00") && specific.contains("MI_00"),
+            "and the board-specific part must be board-specific"
+        );
+    }
+
     /// A survey is JSON-shaped for scripts, and the fields the runbook quotes
     /// must be there.
     #[test]

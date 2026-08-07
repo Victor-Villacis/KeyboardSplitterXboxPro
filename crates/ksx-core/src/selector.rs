@@ -9,14 +9,23 @@
 //! id = 'USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000'
 //! ```
 //!
-//! Everything after the last `\` is `usbccgp`'s `ParentIdPrefix` plus the
-//! interface number, and `ParentIdPrefix` is derived from **which physical USB
-//! socket the board is in**. Move the board one port over and that string
-//! changes. Nothing errors, nothing warns: the config now names a devnode that
-//! does not exist, the plan finds no candidate, and the panel is dead.
+//! Everything after the last `\` is the instance id Windows generated for that
+//! board, plus the interface number. **When the board reports no USB serial**
+//! that instance id follows the physical socket, so moving the board one port
+//! over changes the string — and nothing errors and nothing warns: the config
+//! names a devnode that does not exist, the plan finds no candidate, and the
+//! panel is dead.
 //!
-//! Identity that breaks when you unplug and replug into a different socket is
-//! not identity. It is a cache key.
+//! Measured on the cabinet 2026-08-07, because an earlier draft of this
+//! paragraph asserted it flatly: a board that *does* report a serial is keyed
+//! off the serial, and the I-PAC 4X's devnode survived a root-port move
+//! byte-for-byte. ksx cannot tell which kind it is holding once the board is
+//! absent — a serial lives in the descriptor of a device that is not there — so
+//! nothing in this crate asserts that a board moved (`docs/DEVICE-IDENTITY.md`
+//! §1, §3).
+//!
+//! Identity whose stability depends on a descriptor field the user has never
+//! seen is not identity. It is a cache key.
 //!
 //! # What replaces it
 //!
@@ -535,7 +544,12 @@ impl DeviceSelector {
     pub fn survives_replug(&self) -> bool {
         match self {
             Self::Usb { qualifier, .. } => qualifier.survives_replug(),
-            // The instance path IS the port. That is the bug.
+            // Answered by SHAPE, not by evidence: a full instance path *may*
+            // survive (§3 measured one that did, because the board reports a
+            // serial), but ksx chooses a rung before it knows whether the user
+            // will ever move the board, and a selector that survives by luck is
+            // not one that survives. `false` is the safe reading, and it is why
+            // no caller may quote this as proof that a board moved.
             Self::InstancePath(_) => false,
             // Interception hardware ids have no instance component at all, so
             // they survive a replug — and pay for it by being unable to tell
@@ -567,14 +581,23 @@ impl DeviceSelector {
                 Qualifier::Serial(sn) => format!(
                     "the board whose serial is \"{sn}\" — survives being moved to another USB port"
                 ),
+                // Worded as an instruction, not a prediction. §3 measured a
+                // board whose instance id did NOT change across a port move —
+                // Windows keys a devnode off the serial when the device reports
+                // one — so "moving it breaks this entry" is a claim ksx cannot
+                // make. What it can say is that this entry offers no protection
+                // if it does, and that is the whole content of the warning.
                 Qualifier::Port(port) => format!(
-                    "the board in one specific USB socket ({port}) — MOVING IT TO ANOTHER PORT \
-                     BREAKS THIS ENTRY, which is the price of telling two identical boards apart"
+                    "the board at one exact devnode ({port}) — the price of telling two identical \
+                     boards apart. TREAT IT AS SOCKET-SPECIFIC: an instance id follows the USB \
+                     socket unless the board reports a serial, and this rung is only ever written \
+                     when no weaker one could separate your boards"
                 ),
             },
-            Self::InstancePath(_) => "one specific USB socket (a legacy full instance path) — \
-                 MOVING THE BOARD TO ANOTHER PORT BREAKS THIS ENTRY; `ksx device scan` prints the \
-                 replug-proof replacement"
+            Self::InstancePath(_) => "one exact devnode (a legacy full instance path) — TREAT IT \
+                 AS SOCKET-SPECIFIC: an instance id follows the USB socket unless the board \
+                 reports a serial, and ksx cannot tell which yours is while it is unplugged. \
+                 `ksx device scan` prints the replug-proof replacement"
                 .to_owned(),
             Self::HardwareId(_) => {
                 "an Interception hardware id — it names a model, not a board, so \
@@ -786,8 +809,43 @@ mod tests {
             "usb:d209:0430:00:port=7&25EEA38C&0&0000"
         );
         assert!(!pinned.survives_replug());
-        assert!(pinned.explain().contains("BREAKS THIS ENTRY"));
+        assert!(pinned.explain().contains("TREAT IT AS SOCKET-SPECIFIC"));
         assert!(pinned.match_against(&[a, b]).is_one());
+    }
+
+    /// **No string this crate shows a user may assert that a board moved.**
+    ///
+    /// Measured on the cabinet 2026-08-07: an instance id follows the socket
+    /// only for a board that reports no USB serial, and the I-PAC 4X's devnode
+    /// survived root port 5 → 7 unchanged. `ResolveError::Missing` was
+    /// corrected for this and a `[WARN]` note thirty lines below it was not, so
+    /// the same wrong sentence shipped twice; `explain()` was the third copy.
+    ///
+    /// Breaks against any of them: "MOVING IT TO ANOTHER PORT BREAKS THIS
+    /// ENTRY" was the exact previous text of both port-rung explanations.
+    #[test]
+    fn no_explanation_asserts_a_move_it_cannot_know_happened() {
+        for text in [
+            "usb:d209:0430:00:port=7&25EEA38C&0&0000",
+            r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000",
+        ] {
+            let explained = sel(text).explain();
+            assert!(
+                !explained.to_lowercase().contains("breaks this entry"),
+                "an unconditional prediction about hardware ksx has not \
+                 measured: {explained}"
+            );
+            assert!(
+                explained.contains("unless the board reports a serial"),
+                "say what actually decides it, as the refusal does: {explained}"
+            );
+        }
+        // ...and the warning must still be a warning. Hedging it into nothing
+        // would be the opposite failure: this rung really does cost the user
+        // their ability to move the board freely.
+        assert!(sel("usb:d209:0430:00:port=7&X&0&0")
+            .explain()
+            .contains("SOCKET-SPECIFIC"));
     }
 
     /// A board with no serial at all (the common cheap-HID case) must not

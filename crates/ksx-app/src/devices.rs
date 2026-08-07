@@ -190,6 +190,30 @@ pub struct UsbRow {
     pub selected: bool,
 }
 
+/// The `[[device]] id` `ksx device pick` would write for each row, index-aligned
+/// with `rows`.
+///
+/// **One function, so no two surfaces can answer differently.** `ksx devices`,
+/// `ksx device scan` and the typed [`ksx_api::DevicesView`] all read this, and
+/// it is `DeviceSelector::strongest_for` — literally the call `plan_pick` makes,
+/// against the same enumeration — so what a surface *shows* is what the writer
+/// *writes* (`docs/SURFACES.md` §1, `docs/DEVICE-IDENTITY.md` §5).
+///
+/// Deriving it per surface was the alternative, and it is how the mapper's
+/// timing arithmetic ended up existing three times.
+///
+/// The whole enumeration is the second argument on purpose: the rung depends on
+/// what else is plugged in. One board of a model gets `usb:d209:0430:00`; while
+/// its twin is connected the same board gets a `port=` pin, which is both the
+/// honest answer and the ambiguity marker a picker needs.
+pub fn suggested_selectors(rows: &[UsbRow]) -> Vec<String> {
+    let connected: Vec<DeviceFacts> = rows.iter().map(|r| r.candidate.facts()).collect();
+    connected
+        .iter()
+        .map(|facts| ksx_core::DeviceSelector::strongest_for(facts, &connected).to_string())
+        .collect()
+}
+
 impl UsbRow {
     /// Is this row ready to be captured — configured for WinUSB *and* rebound?
     pub fn ready(&self) -> bool {
@@ -368,10 +392,12 @@ pub fn to_view(report: &DevicesReport) -> ksx_api::DevicesView {
         })
         .collect();
 
+    let selectors = suggested_selectors(&report.usb);
     let usb = report
         .usb
         .iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(i, row)| {
             let c = &row.candidate;
             // The vocabulary the CLI already prints, so a screen and a terminal
             // describe the same interface with the same words.
@@ -420,6 +446,9 @@ pub fn to_view(report: &DevicesReport) -> ksx_api::DevicesView {
                 boot_keyboard: c.interface_class == 0x03
                     && c.interface_subclass == 1
                     && c.interface_protocol == 1,
+                // Computed once, in the backend, by the same call the writer
+                // makes — see `suggested_selectors`.
+                selector: selectors.get(i).cloned(),
             }
         })
         .collect();
@@ -605,12 +634,22 @@ pub fn render_human(report: &DevicesReport) -> String {
     if !report.usb_available {
         let _ = writeln!(out, "usb enumeration unavailable");
     } else {
-        let rows: Vec<&UsbRow> = report.hid_rows().collect();
+        // Index-aligned with `report.usb`, so the filter below has to carry the
+        // selector along rather than re-deriving it from the surviving rows —
+        // the rung depends on what ELSE is plugged in, including the rows this
+        // filter drops.
+        let selectors = suggested_selectors(&report.usb);
+        let rows: Vec<(&UsbRow, &String)> = report
+            .usb
+            .iter()
+            .zip(&selectors)
+            .filter(|(row, _)| row.candidate.is_keyboard_candidate())
+            .collect();
         if rows.is_empty() {
             let _ = writeln!(out, "no HID USB interfaces found");
         } else {
             let _ = writeln!(out, "usb interfaces (winusb backend candidates):");
-            for row in rows {
+            for (row, selector) in rows {
                 let c = &row.candidate;
                 let friendly = c.friendly().unwrap_or("n/a");
                 let tag = ksx_core::vendors::name_for(c.vendor_id, c.product_id)
@@ -622,10 +661,17 @@ pub fn render_human(report: &DevicesReport) -> String {
                 } else {
                     ""
                 };
+                // The `id = '…'` line is not decoration. `ResolveError::Missing`
+                // tells a user, by name, that "`ksx devices` prints the id it
+                // has now, and the `usb:` selector that names the board either
+                // way" — and for a long time this command printed no selector
+                // at all, so a refusal sent people to a command that could not
+                // answer it (`docs/DEVICE-IDENTITY.md` §5).
                 let _ = writeln!(
                     out,
                     "  {}  \"{friendly}\"{tag}\n      bound to {} | interface MI_{:02X} | \
-                     backend {}{state}",
+                     backend {}{state}\n      id = '{selector}'   <- what `ksx device pick` \
+                     would write",
                     c.id.as_str(),
                     c.binding.label(),
                     c.interface_number,
@@ -861,6 +907,86 @@ mod tests {
             selected: configured.backend_for(&candidate.id) == Backend::Winusb,
             candidate,
         }
+    }
+
+    /// **What a surface shows must be what the writer writes.**
+    ///
+    /// `plan_pick` chooses an id with `DeviceSelector::strongest_for` against
+    /// the live enumeration. `ksx devices`, `ksx device scan` and the typed
+    /// view all print this function's answer, so a suggestion `pick` would not
+    /// commit is a lie in the one place a user is deciding what to commit.
+    ///
+    /// Breaks against the obvious surface-local re-derivation — building facts
+    /// out of the instance path, which is all a rendered row carries.
+    /// `DeviceFacts::from_instance_path` cannot read a serial (it lives in the
+    /// descriptor, not the path), so the third case below would climb to a
+    /// port pin where `pick` writes `sn=` — telling a user their board is now
+    /// socket-specific when it is not.
+    #[test]
+    fn the_suggested_id_is_the_one_pick_would_write_and_it_reads_the_whole_room() {
+        let none = ConfiguredDevices::default();
+
+        // One board of a model: the weakest rung, which survives a replug.
+        let alone = vec![row(IPAC_USB, Binding::HidUsb, &none)];
+        assert_eq!(suggested_selectors(&alone), vec!["usb:d209:0430:00"]);
+
+        // Its twin arrives, and neither reports a serial (the cheap-HID case):
+        // the port pin is the only thing left, and BOTH boards get one.
+        let twins = vec![
+            row(IPAC_USB, Binding::HidUsb, &none),
+            row(IPAC_USB_B, Binding::HidUsb, &none),
+        ];
+        assert_eq!(
+            suggested_selectors(&twins),
+            vec![
+                "usb:d209:0430:00:port=7&1A2B3C4D&0&0000",
+                "usb:d209:0430:00:port=7&5E6F7A8B&0&0000",
+            ],
+            "the rung depends on what else is plugged in, so the whole \
+             enumeration has to be the input"
+        );
+
+        // Twins whose firmware serials DO differ: the serial rung separates
+        // them and still survives a replug, so nothing gets pinned to a socket.
+        let mut a = row(IPAC_USB, Binding::HidUsb, &none);
+        a.candidate.serial = Some("A".into());
+        let mut b = row(IPAC_USB_B, Binding::HidUsb, &none);
+        b.candidate.serial = Some("B".into());
+        assert_eq!(
+            suggested_selectors(&[a, b]),
+            vec!["usb:d209:0430:00:sn=A", "usb:d209:0430:00:sn=B"],
+            "a serial read from the descriptor is invisible in the instance \
+             path, and this is where a path-derived re-derivation goes wrong"
+        );
+    }
+
+    /// The refusal a user reads names this command: *"`ksx devices` prints the
+    /// id it has now, and the `usb:` selector that names the board either
+    /// way."* It printed no selector at all, so the advice led nowhere.
+    ///
+    /// Breaks against that version of `render_human`.
+    #[test]
+    fn the_human_report_prints_the_usb_selector_the_missing_refusal_promises() {
+        let report = DevicesReport::build(
+            fixture(),
+            true,
+            vec![row(
+                IPAC_USB,
+                Binding::HidUsb,
+                &ConfiguredDevices::default(),
+            )],
+            true,
+            ConfiguredDevices::default(),
+        );
+        let text = render_human(&report);
+        assert!(
+            text.contains("id = 'usb:d209:0430:00'"),
+            "the selector that names the board either way:\n{text}"
+        );
+        assert!(
+            text.contains(IPAC_USB),
+            "beside the id it has right now:\n{text}"
+        );
     }
 
     #[test]

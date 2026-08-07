@@ -173,6 +173,33 @@ pub fn render(view: &DevicesView, all: bool) -> String {
             Some(kb) => {
                 let _ = writeln!(out, "    keyboard : {}", kb.instance_id);
                 let _ = writeln!(out, "    {}", kb.verdict);
+                // **The line §5 promised and nothing printed.** "A legacy entry
+                // that still resolves is never silently rewritten: `ksx device
+                // scan` prints the stronger selector it *would* write and leaves
+                // the decision with them." Two user-facing strings repeated that
+                // promise — `DeviceSelector::explain` for a legacy path, and
+                // `ResolveError::Missing` — while this report printed a board
+                // name, an interface list, a state and a verdict, and no
+                // selector at all.
+                //
+                // The value is computed in the backend, not here: same call the
+                // writer makes, so the suggestion cannot diverge from what
+                // `pick` would commit (`docs/SURFACES.md` §1).
+                if let Some(selector) = &kb.selector {
+                    let _ = writeln!(out, "    id       : '{selector}'");
+                    if selector.contains(":port=") {
+                        // A port pin is what `strongest_for` falls back to when
+                        // nothing weaker separates two boards — so printing it
+                        // IS the ambiguity marking, and the trade has to be
+                        // stated at the moment it is offered
+                        // (`docs/DEVICE-IDENTITY.md` §2).
+                        let _ = writeln!(
+                            out,
+                            "               ^ pinned to this socket: another board of the same \
+                             model is connected and nothing weaker tells them apart"
+                        );
+                    }
+                }
                 if !board.looks_like_a_keyboard() {
                     // The honest caveat. Saying "ksx could claim it" and
                     // stopping would read as a recommendation, and claiming a
@@ -212,9 +239,9 @@ pub fn render(view: &DevicesView, all: bool) -> String {
 
     let _ = writeln!(
         out,
-        "To use one: `ksx device pick <ID>` writes the config entry. It never \
-         claims — claiming is `ksx winusb claim`, which stays a dry run until \
-         --yes."
+        "To use one: `ksx device pick <ID>` writes the config entry — the `id` \
+         shown above is what it would put in it. It never claims — claiming is \
+         `ksx winusb claim`, which stays a dry run until --yes."
     );
     out
 }
@@ -251,6 +278,14 @@ mod tests {
             boot_keyboard: state == "claimed",
             vendor: vendor.map(str::to_owned),
             board: Some(board.to_owned()),
+            // What the backend would have computed for a board with no twin
+            // connected — `crate::devices::suggested_selectors` owns the real
+            // derivation and is tested there. `None` for a devnode no `usb:`
+            // selector could name, which is the SpinTrak's shape below.
+            selector: ksx_core::DeviceFacts::from_instance_path(id).map(|facts| {
+                ksx_core::DeviceSelector::strongest_for(&facts, std::slice::from_ref(&facts))
+                    .to_string()
+            }),
         }
     }
 
@@ -348,6 +383,77 @@ mod tests {
             text.contains("nothing was opened or claimed"),
             "the header must say the scan itself is read-only: {text}"
         );
+    }
+
+    /// **The line `docs/DEVICE-IDENTITY.md` §5 promised, and nothing printed.**
+    ///
+    /// "A legacy entry that still resolves is never silently rewritten. `ksx
+    /// device scan` prints the stronger selector it *would* write and leaves the
+    /// decision with them." Two user-facing strings repeated that promise —
+    /// `DeviceSelector::explain` for a legacy path, and `ResolveError::Missing`
+    /// — while this report printed a board name, an interface list, a state and
+    /// a verdict, and no selector anywhere. A user following the advice in a
+    /// refusal arrived at a command that could not answer it.
+    ///
+    /// Breaks against: that version. `render` had no `usb:` in it at all, and
+    /// the file did not even import `DeviceSelector`.
+    #[test]
+    fn the_report_prints_the_id_that_picking_this_board_would_write() {
+        let text = render(&cabinet(), false);
+        assert!(
+            text.contains("id       : 'usb:d209:0430:00'"),
+            "the board a user is choosing between must show what would land in \
+             config, not just a devnode to paste:\n{text}"
+        );
+        assert!(
+            text.contains("the `id` shown above is what it would put in it"),
+            "and it must say that is what it is, or it reads as another devnode:\n{text}"
+        );
+    }
+
+    /// A board no `usb:` selector can name gets **no** `id` line rather than a
+    /// wrong one. Printing a guess here is worse than printing nothing: the
+    /// whole value of the line is that it is what `pick` would commit.
+    #[test]
+    fn a_board_with_no_writable_selector_suggests_nothing_at_all() {
+        let mut view = cabinet();
+        // The SpinTrak enumerates as a non-composite devnode with no `MI_`, so
+        // there is no interface number to build a selector from.
+        view.usb[3].state = "claimable".into();
+        assert!(view.usb[3].selector.is_none(), "fixture precondition");
+        let text = render(&view, true);
+        assert!(text.contains("Ultimarc SpinTrak"), "{text}");
+        assert_eq!(
+            text.matches("id       : ").count(),
+            1,
+            "only the board that HAS a selector gets an id line:\n{text}"
+        );
+    }
+
+    /// **Ambiguity has to be visible in the picker, not only in the refusal.**
+    ///
+    /// The port rung is what `strongest_for` falls back to when a twin is
+    /// connected and nothing weaker separates them — so a `port=` suggestion IS
+    /// the "two identical boards are plugged in" signal, and offering it without
+    /// saying so hands the user a config entry that silently stops working when
+    /// they move the board (`docs/DEVICE-IDENTITY.md` §2: the trade is stated
+    /// out loud at the moment it is made).
+    ///
+    /// Breaks against: printing the selector bare, which is the obvious first
+    /// implementation of the test above.
+    #[test]
+    fn a_port_pinned_suggestion_says_why_it_is_pinned() {
+        let mut view = cabinet();
+        view.usb[0].selector = Some("usb:d209:0430:00:port=7&25EEA38C&0&0000".into());
+        let text = render(&view, false);
+        assert!(text.contains("port=7&25EEA38C&0&0000"), "{text}");
+        assert!(
+            text.contains("another board of the same model is connected"),
+            "a socket-pinned id must say why it is pinned:\n{text}"
+        );
+        // ...and the un-pinned board next to it must not acquire the caveat.
+        let plain = render(&cabinet(), false);
+        assert!(!plain.contains("pinned to this socket"), "{plain}");
     }
 
     /// The finding that came from running this on real hardware, not from a

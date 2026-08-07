@@ -57,7 +57,7 @@ use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-/// Is the name the client asked for a loopback name?
+/// Is the `Host` the client asked for a name **this server** answers to?
 ///
 /// **Name only — the port is deliberately not checked here.** What rebinding
 /// changes is the *name*: the attacker's page is served from `evil.com`, which
@@ -66,16 +66,58 @@ use axum::response::{IntoResponse, Response};
 /// way, so requiring it would reject honest clients (an HTTP/1.1 request may
 /// omit `:80`, and plenty of tools do) while catching nothing extra.
 ///
-/// The three spellings are all this server: a user types `localhost`, follows a
-/// link to `127.0.0.1`, and on a dual-stack machine may land on `[::1]` —
-/// refusing any of them would look like a bug rather than a defence.
-///
 /// Port strictness belongs on [`is_own_origin`] instead, where it is load
 /// bearing: `http://127.0.0.1:4461` is a *different origin*, so a second local
 /// web server must not be able to drive this one.
-fn is_loopback_host(host: &str) -> bool {
-    let (name, _port) = split_host_port(host);
-    name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "::1"
+fn is_own_host(host: &str, bind: SocketAddr) -> bool {
+    is_own_name(split_host_port(host).0, bind)
+}
+
+/// The same question about a name that has **already** been split off its port.
+///
+/// # Split once, ask once
+///
+/// Feeding an already-split name back through [`split_host_port`] is not
+/// harmless: a bare IPv6 address has colons in it, so `::1` re-split becomes
+/// `::` and stops being a loopback name. That was a real bug on the `Origin`
+/// arm — `http://[::1]:4460` was refused as cross-site on a dual-stack machine,
+/// which is exactly the "looks like a bug rather than a defence" failure the
+/// three-spelling rule below exists to avoid.
+///
+/// # Two ways to be this server
+///
+/// A loopback name first: a user types `localhost`, follows a link to
+/// `127.0.0.1`, and on a dual-stack machine may land on `[::1]`. All three are
+/// this server and refusing any of them looks like a bug.
+///
+/// Then the literal address ksx is bound to. `docs/SURFACES.md` §7 warns that
+/// "our own guard becomes the bug report" when LAN access arrives, and named
+/// one check — there are two, and a change-set that fixes only the `Host`
+/// allow-list ships a Studio that **renders on the phone and refuses every
+/// button**, a 403 from the `Origin` arm on every form. So both learn the bound
+/// address here, together, while the change is inert: the bind is loopback-only
+/// today (`error.rs` returns `NonLoopbackBind` for anything else), so
+/// `bind.ip()` is already a loopback address and nothing new is admitted. What
+/// is removed is the trap.
+///
+/// This never widens the rebinding defence. [`is_bound_address`] compares
+/// *parsed IP literals*: `evil.example` resolving to the bound address does not
+/// parse as one, so a rebound request is refused exactly as before.
+fn is_own_name(name: &str, bind: SocketAddr) -> bool {
+    name.eq_ignore_ascii_case("localhost")
+        || name == "127.0.0.1"
+        || name == "::1"
+        || is_bound_address(name, bind)
+}
+
+/// Is `name` the IP literal this server is bound to?
+///
+/// An IP **literal**, deliberately: a name is only ever this server if it is
+/// spelled as the address, never because it resolves to it. That distinction is
+/// the whole DNS-rebinding defence.
+fn is_bound_address(name: &str, bind: SocketAddr) -> bool {
+    name.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip == bind.ip())
 }
 
 /// Split `host:port`, tolerating the bracketed IPv6 literal form `[::1]:4460`.
@@ -109,7 +151,7 @@ fn is_own_origin(origin: &str, bind: SocketAddr) -> bool {
     let (name, port) = split_host_port(authority);
     // Here the port IS the point: another server on another local port is a
     // different origin, and must not be able to post to this one.
-    port == Some(bind.port()) && is_loopback_host(name)
+    port == Some(bind.port()) && is_own_name(name, bind)
 }
 
 /// Refuse cross-site writes and rebound reads, before any handler runs.
@@ -124,10 +166,10 @@ pub async fn same_origin(bind: SocketAddr, request: Request, next: Next) -> Resp
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    if !is_loopback_host(host) {
+    if !is_own_host(host, bind) {
         tracing::warn!(
             %host,
-            "refused: Host is not a loopback name for this bind (DNS rebinding looks exactly \
+            "refused: Host is not a name this bind answers to (DNS rebinding looks exactly \
              like this)"
         );
         return (
@@ -176,19 +218,19 @@ mod tests {
     #[test]
     fn the_three_loopback_spellings_are_all_this_server() {
         for host in ["127.0.0.1:4460", "localhost:4460", "LocalHost:4460"] {
-            assert!(is_loopback_host(host), "{host} must be allowed");
+            assert!(is_own_host(host, bind()), "{host} must be allowed");
         }
-        assert!(is_loopback_host("[::1]:4460"), "IPv6 literal");
+        assert!(is_own_host("[::1]:4460", bind()), "IPv6 literal");
     }
 
     #[test]
     fn a_rebound_host_is_refused_even_though_it_resolves_to_loopback() {
         // This is the whole DNS-rebinding trick: the packet genuinely arrives on
         // 127.0.0.1, so the bind cannot tell. Only the name it asked for can.
-        assert!(!is_loopback_host("evil.example:4460"));
-        assert!(!is_loopback_host("ksx.attacker.test:4460"));
+        assert!(!is_own_host("evil.example:4460", bind()));
+        assert!(!is_own_host("ksx.attacker.test:4460", bind()));
         assert!(
-            !is_loopback_host("127.0.0.1.evil.example:4460"),
+            !is_own_host("127.0.0.1.evil.example:4460", bind()),
             "a name that merely begins with a loopback address is not one"
         );
     }
@@ -197,14 +239,22 @@ mod tests {
     fn a_host_without_a_port_is_still_judged_by_its_name() {
         // HTTP/1.1 lets a client omit the port, and tools do. The name is what
         // rebinding changes, so the name is what is checked.
-        assert!(is_loopback_host("127.0.0.1"));
-        assert!(!is_loopback_host("evil.example"));
+        assert!(is_own_host("127.0.0.1", bind()));
+        assert!(!is_own_host("evil.example", bind()));
     }
 
     #[test]
     fn our_own_pages_origin_is_recognised() {
         assert!(is_own_origin("http://127.0.0.1:4460", bind()));
         assert!(is_own_origin("http://localhost:4460", bind()));
+        // The third loopback spelling, which the `Host` arm has always accepted
+        // and this arm did NOT: an already-split bare IPv6 name was being fed
+        // back through the port splitter, so `::1` became `::` and our own page
+        // on a dual-stack machine 403'd every form it submitted.
+        assert!(
+            is_own_origin("http://[::1]:4460", "[::1]:4460".parse().unwrap()),
+            "all three loopback spellings must agree across both checks"
+        );
     }
 
     #[test]
@@ -217,6 +267,66 @@ mod tests {
         assert!(
             !is_own_origin("http://127.0.0.1.evil.example:4460", bind()),
             "a suffix that merely starts with our address is not our address"
+        );
+    }
+
+    /// **The trap `docs/SURFACES.md` §7 half-described, as a test.**
+    ///
+    /// The doc named one check a LAN bind must clear (the `Host` allow-list)
+    /// and there are two. A change-set that fixes only that one produces a
+    /// Studio that renders on the phone and 403s every form, because
+    /// `is_own_origin` ended in *"and the host is a loopback name"* — so a page
+    /// served from `http://192.168.1.47:4460` was not its own origin.
+    ///
+    /// Breaks against that version: both assertions below were false when the
+    /// only accepted names were `localhost`, `127.0.0.1` and `::1`.
+    #[test]
+    fn the_address_ksx_is_bound_to_is_a_name_for_ksx_on_both_checks() {
+        let lan: SocketAddr = "192.168.1.47:4460".parse().unwrap();
+        assert!(
+            is_own_host("192.168.1.47:4460", lan),
+            "a request to the address we are serving on is not a rebinding attempt"
+        );
+        assert!(
+            is_own_origin("http://192.168.1.47:4460", lan),
+            "and our own page, served from that address, is our own origin — \
+             this is the one that turns the guard into the bug report"
+        );
+        // IPv6, spelled the way a browser sends it.
+        let v6: SocketAddr = "[fd00::1]:4460".parse().unwrap();
+        assert!(is_own_host("[fd00::1]:4460", v6));
+        assert!(is_own_origin("http://[fd00::1]:4460", v6));
+    }
+
+    /// The half that must NOT move when the other half does.
+    ///
+    /// Learning the bound address may not become "trust any address". The
+    /// comparison is against a parsed IP literal and the bind we are actually
+    /// on, so a rebound name still fails and a LAN page still cannot drive a
+    /// loopback Studio.
+    #[test]
+    fn learning_the_bound_address_admits_nothing_else() {
+        let lan: SocketAddr = "192.168.1.47:4460".parse().unwrap();
+        let loopback = bind();
+
+        assert!(
+            !is_own_origin("http://192.168.1.47:4460", loopback),
+            "a page on the LAN address is not the origin of a loopback bind"
+        );
+        assert!(!is_own_host("192.168.1.47:4460", loopback));
+        assert!(
+            !is_own_host("evil.example:4460", lan),
+            "a NAME that resolves to the bound address is still rebinding — \
+             only the literal counts"
+        );
+        assert!(
+            !is_own_host("192.168.1.48:4460", lan),
+            "the neighbour's address is not ours"
+        );
+        assert!(
+            !is_own_origin("http://192.168.1.47:4461", lan),
+            "and the port still decides: another server on this host is another \
+             origin"
         );
     }
 

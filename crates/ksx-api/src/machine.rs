@@ -210,6 +210,26 @@ pub struct UsbRow {
     /// keyboard; unset, it might still be one, and only claiming proves it.
     #[serde(default)]
     pub boot_keyboard: bool,
+    /// The `[[device]] id` `ksx device pick` **would** write for this interface
+    /// — the weakest rung that still names it alone, chosen against everything
+    /// else connected in the same pass.
+    ///
+    /// Computed in the backend, exactly once, by the same
+    /// `DeviceSelector::strongest_for` call the writer makes
+    /// (`docs/SURFACES.md` §1: a surface renders a result, it does not re-derive
+    /// one). Two surfaces cannot therefore print two different answers to "what
+    /// would you write for this board?", and no surface can print one the writer
+    /// would not have written.
+    ///
+    /// `docs/DEVICE-IDENTITY.md` §5 promises this out loud — *"`ksx device scan`
+    /// prints the stronger selector it would write and leaves the decision with
+    /// them"* — and so do two user-facing strings, `DeviceSelector::explain` and
+    /// `ResolveError::Missing`. It was a promise nothing kept until this field
+    /// existed.
+    ///
+    /// `None` only when no `usb:` selector could name the interface at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
 }
 
 /// `ksx winusb status`, presentation-shaped.

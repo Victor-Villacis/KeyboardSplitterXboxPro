@@ -107,15 +107,32 @@ ksx winusb status        # the row should now read  driver: WinUSB   verdict: CL
 ### Point ksx at the claimed interface: two lines in `config.toml`
 
 A claimed interface is a **different device identity** and a **different
-backend**, and both live in the same `[[device]]` block:
+backend**, and both live in the same `[[device]]` block.
+
+**Let the picker write it.** `ksx device pick` reads the live enumeration,
+chooses the weakest id that still names your board alone, and rewrites the entry
+in place — keeping the alias, so every `[[slot]]` keeps working:
+
+```powershell
+ksx device scan                 # confirm the board reads as CLAIMED
+ksx device pick "P1 I-PAC"      # an existing alias is a valid target
+```
+
+By hand, the same edit:
 
 ```toml
 [[device]]
 # was: id = "HID\\VID_D209&PID_0430&REV_0056&MI_00"   (Interception hardware id)
-id      = "USB\\VID_D209&PID_0430&MI_00\\7&25EEA38C&0&0000"
+id      = 'usb:d209:0430:00'
 alias   = "P1 I-PAC"
 backend = "winusb"          # was "interception" (the default)
 ```
+
+A full instance path — `id = "USB\\VID_D209&PID_0430&MI_00\\7&25EEA38C&0&0000"`
+— is still accepted and is what configs written before selectors existed hold.
+Prefer the `usb:` form: it is the same board, spelled in a way that does not
+depend on which socket it is in or on which machine wrote the file
+(`docs/DEVICE-IDENTITY.md` §2).
 
 **Every `[[slot]]` stays exactly as it is.** Slots reference the *alias*, not the
 id, so the whole migration is those two lines per board — presets, bindings,

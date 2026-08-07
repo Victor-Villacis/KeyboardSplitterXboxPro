@@ -5,10 +5,12 @@
 //!
 //! A `[[device]] id` used to be a raw string that was byte-compared against
 //! enumerated hardware, deep in the pipeline, in four separate places. Which
-//! meant the id had to *be* a devnode path — and a devnode path's tail is
-//! derived from which USB socket the board is in. Move the board one port over
-//! and the config named nothing: no error, no warning, a dead panel and a plan
-//! whose candidate list was simply empty several layers down.
+//! meant the id had to *be* a devnode path — a value the user cannot author,
+//! cannot verify, and whose stability depends on whether their board happens to
+//! report a USB serial (`docs/DEVICE-IDENTITY.md` §1, measured in §3). When it
+//! stopped matching, for that reason or any other, the config named nothing: no
+//! error, no warning, a dead panel and a plan whose candidate list was simply
+//! empty several layers down.
 //!
 //! Now the config holds a selector, and exactly one pass — this one — turns
 //! each selector into the id the rest of the session uses. Everything
@@ -17,8 +19,13 @@
 //! # Three outcomes, and none of them is a guess
 //!
 //! - [`Match::One`] — proceed, rewriting the plan's ids to the matched devnode.
-//! - [`Match::None`] — refuse, **naming the board**, at the top, before
-//!   anything is claimed or filtered.
+//! - [`Match::None`] — **degrade, naming the board**, at the top, before
+//!   anything is claimed or filtered: the slot that needed it is dropped with a
+//!   `[WARN]`, everyone else plays, and the refusal comes only when no slot
+//!   survives. An earlier draft of this list said "refuse" flatly, and so did
+//!   `docs/DEVICE-IDENTITY.md` §9 item 2 — but one loose cable behind an
+//!   eight-player cabinet must not blank the machine for everybody. See
+//!   [`drop_missing`] for the whole argument.
 //! - [`Match::Ambiguous`] — refuse, listing every hit *and* the port-pinned
 //!   selector that would separate each one. Never pick. Two identical boards
 //!   staying tellable apart is the entire reason WinUSB capture beats
@@ -233,8 +240,7 @@ pub fn apply(
         .map(|(device, id)| (device.id.as_device_id(), id.clone()))
         .collect();
     if rewrites.is_empty() {
-        classify_backends(plan, devices, connected);
-        return Ok(());
+        return classify_backends(plan, devices, connected);
     }
 
     let swap = |id: &mut DeviceId| {
@@ -266,8 +272,7 @@ pub fn apply(
             ));
         }
     }
-    classify_backends(plan, devices, connected);
-    Ok(())
+    classify_backends(plan, devices, connected)
 }
 
 /// Which captured boards are on `winusb.sys`, decided by **identity** rather
@@ -289,7 +294,11 @@ pub fn apply(
 /// A `[[device]]` entry declares what a board *is*, including which driver owns
 /// it, so that declaration has to reach the board however a slot happens to name
 /// it. Runs after the rewrites above, when every id is concrete.
-fn classify_backends(plan: &mut RunPlan, devices: &[DeviceEntry], connected: &[DeviceFacts]) {
+fn classify_backends(
+    plan: &mut RunPlan,
+    devices: &[DeviceEntry],
+    connected: &[DeviceFacts],
+) -> Result<(), ResolveError> {
     for device in devices {
         if device.backend != ksx_config::Backend::Winusb || !needs_matching(device.id.selector()) {
             continue;
@@ -297,15 +306,44 @@ fn classify_backends(plan: &mut RunPlan, devices: &[DeviceEntry], connected: &[D
         // Post-rewrite the entry may already be listed; matching is idempotent.
         let id = match device.id.selector().match_against(connected) {
             Match::One(facts) => facts.id.clone(),
-            // Ambiguous and None are refusals when a slot needs this entry, and
-            // that already happened above. An entry no slot uses is simply not
-            // this session's business.
-            _ => continue,
+            // Nothing answers. When a slot needs this entry `drop_missing` has
+            // already dealt with it; when no slot does, it is not this
+            // session's business.
+            Match::None => continue,
+            // **This used to be `_ => continue`, on the reasoning that an
+            // ambiguity had already been refused above. It had not.** `apply`'s
+            // loop only visits entries a slot names by THIS spelling, so an
+            // entry a slot spells longhand is skipped there and this is the
+            // first — and only — place its ambiguity can be seen. Falling
+            // through left `plan.winusb` empty for a board the session is about
+            // to capture, so the run fell back to Interception on a
+            // WinUSB-claimed interface: a dead panel that reports success,
+            // which is the exact failure this function exists to fix.
+            Match::Ambiguous(hits) => {
+                // Two boards answer, and this session captures neither of them:
+                // an unrelated entry's twins must not blank a cabinet, which is
+                // the same trade `drop_missing` makes for an absent board.
+                if !hits
+                    .iter()
+                    .any(|facts| plan.captureable.contains(&facts.id))
+                {
+                    continue;
+                }
+                return Err(ResolveError::Ambiguous {
+                    alias: device.alias.clone(),
+                    written: device.id.raw().to_owned(),
+                    candidates: hits
+                        .iter()
+                        .map(|facts| (facts.id.clone(), pin_to_port(facts).to_string()))
+                        .collect(),
+                });
+            }
         };
         if plan.captureable.contains(&id) && !plan.winusb.contains(&id) {
             plan.winusb.push(id);
         }
     }
+    Ok(())
 }
 
 /// A board a slot names is not connected: drop what cannot work, keep what can.
@@ -364,6 +402,15 @@ fn drop_missing(plan: &mut RunPlan, missing: &[&DeviceEntry]) -> Result<(), Reso
     }
 
     for device in missing {
+        // The same correction as `ResolveError::Missing`'s Display, thirty
+        // lines up, and it has to be made HERE too — this is the string a user
+        // actually reads, because a dropped slot is the common case and a total
+        // refusal is the rare one. Measured on the cabinet 2026-08-07: an
+        // instance path is port-derived only for a board that reports no USB
+        // serial; the I-PAC 4X reports "4" and its path survived a root-port
+        // move byte-for-byte. The board is absent, so ksx cannot read its
+        // serial and cannot know which kind of path this is. Offer both causes,
+        // assert neither (`docs/DEVICE-IDENTITY.md` §3).
         plan.notes.push(format!(
             "[WARN] device \"{}\" (id = '{}') is not connected{}",
             device.alias,
@@ -371,8 +418,11 @@ fn drop_missing(plan: &mut RunPlan, missing: &[&DeviceEntry]) -> Result<(), Reso
             if device.id.selector().survives_replug() {
                 ""
             } else {
-                " — this id names one specific USB socket, so moving the board \
-                 to another port breaks it (docs/DEVICE-IDENTITY.md §1)"
+                " — either it is unplugged, or it moved and this id followed the \
+                 socket: a full instance path is port-derived only for boards that \
+                 report no USB serial (docs/DEVICE-IDENTITY.md §1). `ksx devices` \
+                 prints the id it has now, and the `usb:` selector that names the \
+                 board either way"
             }
         ));
     }
@@ -557,6 +607,125 @@ mod tests {
             "the slot that lost its controls must be named: {:?}",
             plan.notes
         );
+    }
+
+    /// **The sentence that was refused once and survived thirty lines below.**
+    ///
+    /// `ResolveError::Missing`'s `Display` was corrected after the 2026-08-07
+    /// cabinet measurement (an instance path is port-derived only for a board
+    /// with no USB serial), and a test pins it. The `[WARN]` note a *dropped
+    /// slot* produces was not corrected, and that is the string most users
+    /// actually see: dropping one slot is the common case, refusing the whole
+    /// run is the rare one. The existing test could not catch it — it reads
+    /// `err.to_string()`, never `plan.notes`.
+    ///
+    /// Breaks against: the note re-acquiring any wording that asserts the board
+    /// moved, in either case.
+    #[test]
+    fn a_dropped_slots_warning_offers_both_causes_and_asserts_neither() {
+        let plan = resolve_config(
+            &format!(
+                "schema_version = 1\n\n\
+                 [[device]]\nid = '{LIVE_PATH}'\nalias = \"ipac\"\nbackend = \"winusb\"\n\n\
+                 [[device]]\nid = '{ABSENT}'\nalias = \"panel2\"\nbackend = \"winusb\"\n\n\
+                 [[slot]]\nnumber = 1\nkeyboard = \"ipac\"\npreset = \"P1\"\n\n\
+                 [[slot]]\nnumber = 2\nkeyboard = \"panel2\"\npreset = \"P1\"\n"
+            ),
+            &[ipac("7&25EEA38C&0&0000")],
+        )
+        .expect("one unplugged panel must not refuse the session");
+
+        let note = plan
+            .notes
+            .iter()
+            .find(|n| n.contains("panel2"))
+            .expect("the missing board is named");
+        assert!(
+            !note.to_lowercase().contains("one specific usb socket"),
+            "a note must not assert a move it cannot know happened — the board is \
+             absent, so its serial cannot be read: {note}"
+        );
+        assert!(
+            note.contains("unplugged"),
+            "offer the other cause, as the refusal does: {note}"
+        );
+        assert!(
+            note.contains("port-derived only for boards that report no USB serial"),
+            "and say what actually decides it: {note}"
+        );
+    }
+
+    /// **The dead panel, second edition.** The first fix taught a `[[device]]`
+    /// entry's backend to reach the board however a slot spells it; this is
+    /// what that fix does when the entry is AMBIGUOUS.
+    ///
+    /// `apply`'s loop skips the entry (no slot names it by this spelling), so
+    /// the ambiguity refusal at the top never runs for it, and
+    /// `classify_backends` used to answer `_ => continue`. Result: `Ok`, an
+    /// empty `plan.winusb`, `needs_interception()` true — an Interception
+    /// fallback on a WinUSB-claimed board, which is a session that starts
+    /// cleanly, reports success, and leaves the panel completely dead.
+    ///
+    /// Breaks against: any version that swallows `Match::Ambiguous` here.
+    #[test]
+    fn an_ambiguous_winusb_entry_is_refused_even_when_a_slot_spells_the_board_longhand() {
+        let config: ConfigFile = toml::from_str(&format!(
+            "schema_version = 1\n\n\
+             [[device]]\nid = 'usb:d209:0430:00'\nalias = \"ipac\"\nbackend = \"winusb\"\n\n\
+             [[slot]]\nnumber = 1\nkeyboard = '{LIVE_PATH}'\npreset = \"P1\"\n"
+        ))
+        .unwrap();
+        let mut plan =
+            crate::run::plan::build_plan(&config, &GamesFile::default(), &presets(), None).unwrap();
+        let twins = [ipac("7&25EEA38C&0&0000"), ipac("6&1B2C3D4E&0&0000")];
+
+        let err = apply(&mut plan, &config.devices, &twins)
+            .expect_err("two boards answer to this entry; ksx must not pick one");
+        let ResolveError::Ambiguous {
+            alias, candidates, ..
+        } = &err
+        else {
+            panic!("expected Ambiguous, got {err:?}");
+        };
+        assert_eq!(alias, "ipac");
+        assert_eq!(candidates.len(), 2, "every hit is carried");
+        let text = err.to_string();
+        assert!(
+            text.contains("usb:d209:0430:00:port=7&25EEA38C&0&0000")
+                && text.contains("usb:d209:0430:00:port=6&1B2C3D4E&0&0000"),
+            "and the selector that would pin each: {text}"
+        );
+    }
+
+    /// The other half of that trade: twins on a `[[device]]` entry **this
+    /// session does not capture** must not refuse the run. Refusing would be
+    /// the eight-players-down bug arriving by a different door — a spare board
+    /// in the config, plugged in twice, blanking a game that never used it.
+    #[test]
+    fn twins_on_an_entry_this_session_never_captures_do_not_refuse_the_run() {
+        let config: ConfigFile = toml::from_str(&format!(
+            "schema_version = 1\n\n\
+             [[device]]\nid = '{LIVE_PATH}'\nalias = \"ipac\"\nbackend = \"winusb\"\n\n\
+             [[device]]\nid = 'usb:d209:15a2:00'\nalias = \"spare\"\nbackend = \"winusb\"\n\n\
+             [[slot]]\nnumber = 1\nkeyboard = \"ipac\"\npreset = \"P1\"\n"
+        ))
+        .unwrap();
+        let mut plan =
+            crate::run::plan::build_plan(&config, &GamesFile::default(), &presets(), None).unwrap();
+        let mut spare_a = ipac("7&AAAAAAAA&0&0000");
+        spare_a.product_id = 0x15A2;
+        spare_a.id = DeviceId::new(r"USB\VID_D209&PID_15A2&MI_00\7&AAAAAAAA&0&0000");
+        let mut spare_b = spare_a.clone();
+        spare_b.instance = "6&BBBBBBBB&0&0000".into();
+        spare_b.id = DeviceId::new(r"USB\VID_D209&PID_15A2&MI_00\6&BBBBBBBB&0&0000");
+
+        apply(
+            &mut plan,
+            &config.devices,
+            &[ipac("7&25EEA38C&0&0000"), spare_a, spare_b],
+        )
+        .expect("the ambiguous entry feeds no slot in this plan");
+        assert_eq!(plan.winusb, vec![DeviceId::from(LIVE_PATH)]);
     }
 
     /// **The sharpest case in the audit.** M4 never sets the mouse class filter,

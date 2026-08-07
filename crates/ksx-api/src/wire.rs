@@ -1311,4 +1311,52 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 3, allow_sh
             .expect("slot 9 is a slot");
         assert_eq!(ninth.slot, 9);
     }
+
+    /// **A surface decision that is currently enforced by a missing field.**
+    ///
+    /// `docs/SURFACES.md` §10 settles the slot persona menu by observing that
+    /// `SlotAssignRequest` carries no persona, "so no surface can re-persona a
+    /// slot until the wire type changes". That is a real guarantee — this is the
+    /// whole config-writing wire, `slot-assign` is its only verb — but it is
+    /// guaranteed by *absence*, which is the kind of invariant that disappears
+    /// the moment someone adds a convenient field.
+    ///
+    /// So the field set is pinned. Adding `persona` here fails this test, and
+    /// whoever adds it has to come and delete the assertion — which is exactly
+    /// the moment the "which surface owns persona?" decision should be re-taken,
+    /// rather than settled by whoever needed the field.
+    ///
+    /// Breaks against: any new field on the request, in either direction.
+    #[test]
+    fn slot_assign_carries_no_persona_and_the_doc_depends_on_that() {
+        let full = SlotAssignRequest {
+            slot: 1,
+            preset: "P1".into(),
+            profile: Some("MAME 4P".into()),
+            reload: true,
+        };
+        let mut fields: Vec<String> = serde_json::to_value(&full)
+            .unwrap()
+            .as_object()
+            .expect("a request is an object")
+            .keys()
+            .cloned()
+            .collect();
+        fields.sort();
+        assert_eq!(
+            fields,
+            vec!["preset", "profile", "reload", "slot"],
+            "the config-writing wire's field set — see docs/SURFACES.md §10"
+        );
+
+        // ...and the two optional halves stay optional, so the minimal request
+        // a CLI or a form sends is still slot + preset and nothing else.
+        let minimal = SlotAssignRequest {
+            slot: 1,
+            preset: "P1".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&minimal).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 2, "{json}");
+    }
 }

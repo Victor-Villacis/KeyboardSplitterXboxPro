@@ -204,15 +204,35 @@ Two things to know before you start it:
 
 ## 6. Wire the slots
 
-`ksx setup` offers to do this for you. By hand, `config.toml` (or `ksx.toml`
-next to the exe, if you are running portable) looks like:
+`ksx setup` offers to do this for you, and so does the picker:
+
+```powershell
+ksx device scan                  # boards, not devnodes: which one is your panel
+ksx device pick <ID> --alias "Cabinet panel"
+```
+
+`pick` writes the `[[device]]` block for you, and it writes a **`usb:`
+selector** — `usb:d209:0430:00`, meaning "the I-PAC's keyboard interface" — so
+the entry keeps naming your board after you move it to another socket. Do not
+hand-author the id if you can avoid it: the full `USB\…\7&25EEA38C&0&0000`
+spelling below is one specific board in one specific machine, it is not
+something you can look up, and there is a whole design document about why
+(`docs/DEVICE-IDENTITY.md`).
+
+By hand, `config.toml` (or `ksx.toml` next to the exe, if you are running
+portable) looks like:
 
 ```toml
 schema_version = 1
 
 [[device]]
-id = 'HID\VID_D209&PID_0430&MI_00\8&2A0D0500&0&0000'   # from `ksx devices`
+# What `ksx device pick` writes. The alias is what slots refer to.
+id = 'usb:d209:0430:00'
 alias = "Cabinet panel"
+
+# A full devnode path still works — every config written before selectors
+# existed holds one — but it names one board on one machine:
+#   id = 'HID\VID_D209&PID_0430&MI_00\8&2A0D0500&0&0000'   # from `ksx devices`
 
 [[slot]]
 number = 1

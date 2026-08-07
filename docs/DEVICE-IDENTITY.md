@@ -1,13 +1,22 @@
 # Device identity
 
-> Status: design, partially built. `ksx-core::DeviceSelector` implements the
-> matching rule below and is fully tested. §9 items 1 and 2 are now built —
-> `[[device]] id` is a `DeviceRef` (raw + parsed) and `ksx-app/src/run/
-> resolve.rs` resolves it once per session inside `plan::resolve_as`. Items 3–5
-> (`scan`, `pick`, press-to-identify) are not.
+> Status: design, mostly built. `ksx-core::DeviceSelector` implements the
+> matching rule below and is fully tested. §9 items 1–4 are built: `[[device]]
+> id` is a `DeviceRef` (raw + parsed); `ksx-app/src/run/resolve.rs` resolves it
+> once per session inside `plan::resolve_as`; and `ksx device scan` / `ksx
+> device pick` / `ksx device remove` ship as CLI verbs
+> (`ksx-app/src/device_scan.rs`, `ksx-app/src/device_edit.rs`, wired in
+> `ksx-app/src/main.rs`). `remove` is a fifth verb this document never
+> specified — it is listed in §9 now. Only item 5, press-to-identify, is absent.
 >
-> Section numbers are load-bearing: `ksx-capture/src/winusb/enumerate.rs` cites
-> §6 and §3 by number. Renumber and those citations start lying.
+> Section numbers are load-bearing, and by far more than this note used to
+> admit. It named one file. It is **fifteen source files and fifty references,
+> around thirty of them by section number** (`rg 'DEVICE-IDENTITY\.md' crates/`).
+> Renumber and every one of them starts lying — and a citation is often the only
+> thing explaining why a refusal is worded the way it is. So
+> `crates/ksx-app/tests/docs.rs` asserts that every section number cited from
+> code still has a `## §N` heading here, and names the citing files when it
+> fails.
 
 `crates/ksx-core/src/selector.rs` references this file. This is that file.
 
@@ -22,23 +31,45 @@ alias = 'panel'
 backend = 'winusb'
 ```
 
-Everything after the last `\` is `usbccgp`'s `ParentIdPrefix` plus the interface
-number, and `ParentIdPrefix` is derived from **which physical USB socket the
-board is plugged into**. Move the board one port over and that string changes.
+Everything after the last `\` is the instance id Windows generated for that
+board, plus the interface number. **When the board reports no USB serial** that
+instance id is derived from which physical socket it is in, and moving the board
+one port over changes the string.
 
-Nothing errors and nothing warns. The config now names a devnode that does not
-exist, the plan finds no candidate, and the panel is dead — on a cabinet, that
-reads as "ksx broke", not as "the encoder moved".
+**This paragraph is hedged on purpose, and the hedge was measured** (§3, on the
+cabinet, 2026-08-07). A board that *does* report a serial is keyed off the
+serial instead, and its whole devnode chain survives a port move byte-for-byte —
+the I-PAC 4X is one of those. An earlier draft of this section said flatly that
+the tail "is derived from which physical USB socket the board is plugged into",
+three code sites cited §1 as the authority for it, and it is false for the only
+board this project has ever been run on. It is corrected here rather than
+deleted because the correction is the interesting part: **ksx cannot tell which
+kind of path it is holding once the board is absent** — it cannot read the
+serial of something that is not plugged in. So a refusal offers both causes and
+asserts neither (`ResolveError::Missing`, and the `[WARN]` note beside it).
 
-Identity that breaks when you replug into a different socket is not identity.
-It is a cache key.
+Either way the entry is a cache key rather than an identity: a value the user
+cannot author, cannot verify and does not control, whose stability depends on a
+descriptor field they have never seen.
+
+Before `run/resolve.rs` existed, nothing errored and nothing warned when it
+stopped matching: the config named a devnode that did not exist, the plan found
+no candidate, and the panel was dead — on a cabinet that reads as "ksx broke",
+not as "the encoder moved". That half is now fixed. A slot whose board is absent
+is dropped with a `[WARN]` that names it, and a plan with no slot left refuses
+outright (`ResolveError::Missing`) rather than starting dead. A better error
+message is not identity, though, which is what the rest of this document is for.
 
 There is a second, larger problem hiding behind the first: that string was
-typed by hand, and it is *one specific person's I-PAC 4X*. Every path that
-teaches a user to paste one — `QUICKSTART.md`, `MIGRATION-WINUSB.md`, the setup
-wizard's commit step — teaches them to hand-author a value they have no way to
-know. Anyone without that exact board, in that exact socket, has no working
-starting point.
+typed by hand, and it is *one specific person's I-PAC 4X*. Anyone without that
+exact board, in that exact socket, had no working starting point.
+
+All three paths that taught it now teach the picker instead. The setup wizard
+writes what Raw Input reported, so nobody types anything
+(`ksx-app/src/setup.rs`); `QUICKSTART.md` and `MIGRATION-WINUSB.md` show the
+`usb:` selector and the verb that produces it. `crates/ksx-app/tests/docs.rs`
+holds them to it: a `[[device]]` block containing a literal devnode path has to
+name `ksx device pick` on the same page.
 
 ## §2 The rule: weakest identity that is still unique
 
@@ -49,7 +80,16 @@ connected interface, and escalate only when it does not.
 |---|---|---|---|
 | serial | `usb:d209:0430:00:sn=4` | yes | only if the firmware serials differ |
 | model | `usb:d209:0430:00` | yes | **no** — refuses while twins are present |
-| port | `usb:d209:0430:00:port=7&25EEA38C&0&0000` | **no** | yes, always |
+| port | `usb:d209:0430:00:port=7&25EEA38C&0&0000` | **assume no** | yes, always |
+
+The port row says *assume* no because that column is a promise ksx makes at
+write time, not a fact about the socket. §3 measured a board whose instance tail
+did not change across a port move, so a `port=` selector for a serial-reporting
+board may well survive one. ksx must not rely on that: it chooses the rung
+before it knows whether the user will ever move the board, and a selector that
+survives by luck is not a selector that survives. `survives_replug()` therefore
+answers by selector **shape**, and every surface that prints the trade says what
+it costs without asserting what will happen.
 
 **Model is the default, and it is the 99% case.** One board of a given
 VID/PID connected means VID/PID alone names it unambiguously. The port is not
@@ -58,10 +98,28 @@ above, deleted.
 
 **Ambiguity is refused, never guessed.** A selector that matches more than one
 connected interface returns `Match::Ambiguous` carrying every candidate, and
-the caller refuses with all of them listed. Two identical boards staying
-tellable apart is the entire reason WinUSB capture beats Interception —
-Interception *cannot* do it — so a "simpler" scheme that silently picks one
-would be a regression wearing a cleanup costume.
+**every** caller refuses with all of them listed. "Every" is load-bearing and
+was once false: `resolve.rs::classify_backends` used to fall through an
+ambiguous match with a bare `_ => continue`, on the reasoning that a refusal had
+already been taken upstream. It had not — an entry a slot names by a *different*
+spelling is skipped by the loop upstream, so the fall-through left `plan.winusb`
+empty and the session fell back to Interception on a WinUSB-claimed board: a
+dead panel reporting success. Pinned by
+`an_ambiguous_winusb_entry_is_refused_even_when_a_slot_spells_the_board_longhand`.
+
+Two identical boards staying tellable apart is the entire reason WinUSB capture
+beats Interception — Interception *cannot* do it — so a "simpler" scheme that
+silently picks one would be a regression wearing a cleanup costume.
+
+**But identification is not claiming, and the claim path is worse off.** While
+two boards of one model are plugged in, `ksx-platform/src/winusb.rs` refuses
+`Refusal::SharedHardwareId` for *both* of them: an INF binds by hardware id, and
+both boards carry the same one, so installing the driver for one would claim
+every one of them. The port rung tells twins apart in config; the claim then
+declines to act on it until the user unplugs the sibling. Telling identical
+boards apart *during a claim* needs per-device installation, which ksx does not
+do. Do not read the paragraph above as "twins work" — read it as "twins are
+never silently confused".
 
 **Port is the honest fallback, written only when it is earned.** When the
 model rung is ambiguous and the serials collide too, the port rung is the only
@@ -113,6 +171,14 @@ Two consequences:
    problem they do not have. `survives_replug()` answers by selector *shape*,
    which is still the right input for choosing a `usb:` spelling, but it is
    **not** evidence that an instance path is fragile.
+
+   This applies to **every** string the user reads, not only the one that is
+   easiest to test. The first fix corrected `ResolveError::Missing`'s `Display`
+   and left the `[WARN]` note thirty lines below it still saying "this id names
+   one specific USB socket, so moving the board to another port breaks it" — and
+   the note is what a user actually sees, because a dropped slot is the common
+   case and a total refusal is the rare one. Both are now pinned, the note by
+   `a_dropped_slots_warning_offers_both_causes_and_asserts_neither`.
 2. **The twin-board risk gets sharper, not softer.** Two I-PAC 4X boards both
    reporting `"4"` collide in Windows' own instance namespace, before ksx sees
    anything — a stronger failure than the ambiguity §1 describes. Untested until
@@ -132,13 +198,25 @@ three devnodes to Windows:
 {4F67EA1D-…}  SpinTrak                        <- a different physical device
 ```
 
-`ContainerId` is how a picker says **"I-PAC 4X — 3 interfaces, keyboard on
-MI_00"** instead of listing three cryptic paths and asking the user to guess.
-It plays no part in matching — a selector never resolves via ContainerId — it
-is purely how discovery is *presented*.
+Grouping interfaces into boards is how a picker says **"I-PAC 4X — 3
+interfaces, keyboard on MI_00"** instead of listing three cryptic paths and
+asking the user to guess. Whatever key does it plays no part in matching — a
+selector never resolves via the group — it is purely how discovery is
+*presented*.
 
-Note: nothing in the repository reads `ContainerId` today. It is the one new
-fact enumeration must learn.
+**The picker shipped without `ContainerId`, and that is the interesting part.**
+This section named `ContainerId` "the one new fact enumeration must learn", and
+enumeration never learned it: nothing in the repository reads it today.
+`ksx device scan` groups on the **composite parent instance path**
+(`UsbCandidate::parent_id`, surfaced as `UsbRow::board`), which the enumerator
+already had for free and which the three interfaces of one I-PAC share. Tested
+by `three_devnodes_of_one_board_are_one_entry`.
+
+So the stated prerequisite was not one. `ContainerId` is still the more correct
+key in principle — it groups devices that do not share a composite parent, such
+as a keyboard and its dongle-mate — and it stays here as the answer if the
+parent-path grouping is ever found wanting. It is no longer described as
+required work.
 
 ## §5 Legacy spellings keep working — and parsing must be lenient
 
@@ -151,9 +229,11 @@ fact enumeration must learn.
   never matches a USB interface, which is what makes a half-migrated config
   *diagnosable* rather than merely broken.
 
-**And it must accept a fourth: anything else containing `\`, as an opaque id.**
-This is not a nicety. `parse` currently recognises only `usb:`, `USB\` and
-`HID\` prefixes — but ksx's own setup wizard writes whatever Raw Input reports,
+**And it accepts a fourth: anything else containing `\`, as an opaque id.**
+Built — `DeviceSelector::parse` returns `HardwareId` (opaque, byte-exact,
+never matches a USB interface) for any spelling with a backslash and no known
+prefix. The argument for it, kept because it is the reason the leniency must not
+be tidied away later: ksx's own setup wizard writes whatever Raw Input reports,
 and for a laptop or PS/2 keyboard that is an ACPI path:
 
 ```
@@ -161,10 +241,15 @@ and for a laptop or PS/2 keyboard that is an ACPI path:
 ```
 
 `rawinput.rs` pins that normalisation with a test, and `upsert_device` commits
-the result verbatim. So a config the wizard itself wrote, for a perfectly
-ordinary keyboard, holds a spelling `parse` rejects. Wire the selector in
-strictly and **that config stops loading** — a laptop user's setup breaks on
-upgrade, with an error about an unrecognised prefix for an id ksx chose.
+the result byte-for-byte. So a config the wizard itself wrote, for a perfectly
+ordinary keyboard, would hold a spelling a strict `parse` rejects — and **that
+config would stop loading**, a laptop user's setup breaking on upgrade with an
+error about an unrecognised prefix for an id ksx chose.
+
+(`upsert_device` is no longer the *unconditional* verbatim write this argument
+was built on: it is fallible now, and refuses rather than committing an id that
+would not load back. The bytes it does commit are still exactly what it was
+handed. The leniency above is what makes those two statements compatible.)
 
 The codebase already has the right rule and states it plainly at
 `ConfigFile::resolve_device`: *a literal instance path (contains `\`) passes
@@ -175,8 +260,17 @@ backslash and no known prefix is a parse error.
 
 A legacy entry that still resolves is never silently rewritten. Rewriting a
 user's config as a side effect of reading it is how you lose their trust once
-and permanently. `ksx device scan` prints the stronger selector it *would*
-write and leaves the decision with them.
+and permanently. `run/resolve.rs` therefore never touches the store; the only
+writer is the explicit `ksx device pick`.
+
+`ksx device scan` prints the stronger selector it *would* write and leaves the
+decision with them. This half was a promise for a while and is now a fact: the
+report prints an `id = 'usb:…'` line per board, `ksx devices` prints the same
+spelling per interface, and both are pinned by tests. It matters more than it
+looks, because two user-facing strings already told people this was happening —
+`DeviceSelector::explain` for a legacy path, and `ResolveError::Missing`, which
+says `ksx devices` "prints … the `usb:` selector that names the board either
+way". Neither did.
 
 **Round-trip constraint:** `parse` uppercases legacy paths and canonicalises
 `usb:` spellings, so a config layer that stores the parsed value and serialises
@@ -195,15 +289,25 @@ The rule the codebase already documents, restated because it is easy to erode:
 - **May not**: gate capture, claiming, refusal, or backend selection. No code
   path may ask "is this an Ultimarc?" to decide *what to do*.
 
-Today three separate copies of Ultimarc's VID exist (`ksx-app/src/devices.rs`,
-`ksx-capture/src/winusb/enumerate.rs`, `ksx-platform/src/winusb.rs`), all
-feeding display tags and JSON field names. None of them branches logic, so the
-rule holds — but the duplication means it can be broken in three places
-independently, and one refusal string currently gives I-PAC-specific advice to
-every user regardless of hardware.
+**Built.** `ksx-core/src/vendors.rs` is the one table — one place, display-only
+by construction: every public function returns a string type and none returns a
+`bool`, so there is nothing for a branch to ask. `ksx-capture` and `ksx-platform`
+re-export `ULTIMARC_VID` from it rather than each declaring their own, and
+`ksx-app/src/devices.rs` holds no copy at all. The SpinTrak-is-not-an-I-PAC
+regression this section was written after is a test in that module.
 
-The `crate::vendors` module those files cite does not exist either. It should:
-one table, one place, display-only by construction.
+The one refusal string that gave I-PAC-specific advice to every user regardless
+of hardware is fixed too: `Refusal::NotAKeyboard`'s advice is generic and
+unconditional, with the Ultimarc paragraph *appended* only when the instance id
+carries Ultimarc's VID.
+
+That append is the closest thing left to a vendor branch, and §6's literal
+wording ("may not gate … refusal") is strained by it, so the boundary is drawn
+explicitly: **a vendor id may add a sentence to a refusal that has already been
+issued; it may not decide whether to issue one, nor which code it carries.**
+`the_ultimarc_hint_only_adds_a_paragraph_to_an_already_issued_refusal` pins
+exactly that — same `code()`, same first paragraph, one extra paragraph — so the
+branch cannot grow into a gate without a test going red.
 
 ## §7 Selection stays opt-in
 
@@ -263,7 +367,7 @@ unnamed devices. It is display-only, and it must ride the same change-set.
 
 ## §9 What is not built
 
-The gap, smallest-first. Items 1 and 2 are **built**; the rest is not:
+The gap, smallest-first. Items 1–4 are **built**; only item 5 is not:
 
 1. ~~**Config stores a selector.**~~ Built. `DeviceEntry.id` is a
    `ksx_core::DeviceRef` — the raw string as written plus the parsed selector —
@@ -274,18 +378,38 @@ The gap, smallest-first. Items 1 and 2 are **built**; the rest is not:
 2. ~~**One resolution pass.**~~ Built, in `ksx-app/src/run/resolve.rs`, called
    from `plan::resolve_as` — the one call `ksx run`, `ksx daemon`, autostart
    and the tray's "Reload config" share, which is what keeps it upstream of the
-   hot-swap comparison in §8. `Match::One` proceeds; `Match::None` refuses
-   naming the board; `Match::Ambiguous` refuses listing every hit plus the
-   port-pinned selector that would disambiguate each; two entries landing on
-   one interface is a refusal naming both aliases. Interception hardware-id
-   spellings pass through verbatim — the byte-exact path M3–M5 depend on — and
-   a plan that needs none never enumerates at all.
-3. **`ksx device scan`.** A read-only, daemon-free report in the shape
-   `ksx devices` already uses: boards grouped by ContainerId, friendly names,
-   which interface is claimable, the selector each would get, ambiguity marked,
-   and a cross-reference showing which `[[device]]` entries match nothing.
-4. **`ksx device pick`.** One writer, three faces (CLI, pipe verb, cabinet
-   screen) — the shape `ksx slot assign` established in M9.
+   hot-swap comparison in §8. `Match::One` proceeds; `Match::Ambiguous` refuses
+   listing every hit plus the port-pinned selector that would disambiguate each;
+   two entries landing on one interface is a refusal naming both aliases.
+   Interception hardware-id spellings pass through verbatim — the byte-exact
+   path M3–M5 depend on — and a plan that needs none never enumerates at all.
+
+   **`Match::None` degrades rather than refusing, deliberately, and this item
+   used to say otherwise.** A blanket refusal means one loose cable behind an
+   eight-player cabinet blanks the machine for everybody, and before this pass
+   existed an absent device took down only what needed it — so refusing would
+   have been a regression wearing a safety check's clothes. `drop_missing`
+   therefore drops the affected slot, nulls a missing mouse, names both in
+   `[WARN]` notes, and refuses (`ResolveError::Missing`) only when no slot
+   survives, because *then* a "successful" start is a dead panel with no error
+   anywhere. `run/resolve.rs`'s own module header carries the same correction.
+3. ~~**`ksx device scan`.**~~ Built (`ksx-app/src/device_scan.rs`): a read-only,
+   daemon-free report — boards grouped, friendly names, which interface is
+   claimable, and the selector each would get. Two of the six things this item
+   asked for are **still missing**, and both are real: grouping is by composite
+   parent instance path rather than `ContainerId` (§4 — the substitute works, so
+   this is a note, not a defect), and there is **no cross-reference showing
+   which `[[device]]` entries match nothing**. The nearest thing is
+   `ksx devices`' `unmatched_winusb_config` warning, which covers only
+   WinUSB-backed entries; an orphaned Interception entry is still reported
+   nowhere. Doing it properly means `DevicesView` carrying the configured table,
+   not just the alias that happened to land on a live row.
+4. ~~**`ksx device pick`.**~~ Built as a CLI verb, correctly factored — a pure
+   `plan_pick` plus an `apply_pick` — so the other faces are wiring, not
+   rewriting. But it is **one writer, one face**: there is no pipe verb and no
+   cabinet screen. `ksx device remove` is in the same position. That is task #22
+   and `docs/SURFACES.md` §3 row 3, where the matrix has been corrected to say
+   so rather than implying a screen exists.
 5. **Press-to-identify**, for twins. Reuse the existing learn verbs rather than
    inventing a mechanism. Two honest limits, surfaced as refusals rather than
    silence: identify cannot hear a board that is already WinUSB-claimed (it is
@@ -298,9 +422,10 @@ The gap, smallest-first. Items 1 and 2 are **built**; the rest is not:
 alias is the stable name, and the selector is what the alias resolves through.
 Nothing new is required to express "always use this one on start".
 
-What changes is only *when* resolution happens: today the config's string is
+What changed is only *when* resolution happens. The config's string used to be
 carried into the plan unresolved and byte-compared against hardware deep in the
-pipeline. It should be resolved once, at start, against a fresh enumeration,
-so that a board in a new socket still matches — and so that a board that is
-genuinely missing is reported by name at the top, instead of surfacing as an
+pipeline; it is now resolved once, at start, against a fresh enumeration
+(`run/plan.rs` calls `resolve::apply` at the top, and everything downstream sees
+concrete ids only). So a board in a new socket still matches, and a board that
+is genuinely missing is reported by name at the top instead of surfacing as an
 empty candidate list several layers down.
