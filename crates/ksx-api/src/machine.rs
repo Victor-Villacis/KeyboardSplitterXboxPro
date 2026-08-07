@@ -42,6 +42,55 @@ pub trait MachineSource: Send + Sync {
         Err(Refusal::not_here("listing devices", "run `ksx devices`"))
     }
 
+    /// `ksx device scan` — the SAME enumeration [`Self::devices`] returns,
+    /// grouped into the physical boards a person picks from, with the
+    /// `[[device]]` entries that are configured against them.
+    ///
+    /// It exists beside `devices` for the reason `crates/ksx-app/src/
+    /// device_scan.rs` opens with: one interface per row is the right shape
+    /// for diagnosing a backend and the wrong shape for CHOOSING. On the
+    /// reference cabinet `ksx devices` prints 29 interfaces, three of which are
+    /// one I-PAC. A picker that offered those three would be asking the user to
+    /// know which `MI_` number carries the keys.
+    ///
+    /// Read-only and safe mid-session, exactly like `devices`: it enumerates
+    /// and describes. Nothing is opened, claimed or written.
+    fn device_scan(&self) -> Result<DeviceScanView, Refusal> {
+        Err(Refusal::not_here(
+            "grouping the devices into boards",
+            "run `ksx device scan`",
+        ))
+    }
+
+    /// `ksx device pick` — write the `[[device]]` entry for one board.
+    ///
+    /// Not a claim, and the distinction is load-bearing
+    /// (`docs/DEVICE-IDENTITY.md` §7): this writes four lines of TOML and
+    /// stops. Taking the board off the Windows keyboard stack is
+    /// [`Self::winusb_claim`], which needs elevation and a separate `--yes`.
+    /// A surface that renders "picked" as "claimed" produces a user who
+    /// discovers otherwise mid-game.
+    fn device_pick(&self, _spec: &DevicePickSpec) -> Result<DevicePickView, Refusal> {
+        Err(Refusal::not_here(
+            "writing a [[device]] entry",
+            "run `ksx device pick <ID>`",
+        ))
+    }
+
+    /// `ksx device remove` — delete one `[[device]]` entry.
+    ///
+    /// The narrowest of the three removals ksx has, and the three must never be
+    /// confused: `ksx pads --prune` drops stale VIRTUAL PADS off the ViGEm bus,
+    /// `ksx winusb release` puts a claimed board BACK on the keyboard stack,
+    /// and this forgets a config entry. Deleting the entry releases nothing —
+    /// which is why [`DeviceRemoveView::still_claimed`] exists.
+    fn device_remove(&self, _spec: &DeviceRemoveSpec) -> Result<DeviceRemoveView, Refusal> {
+        Err(Refusal::not_here(
+            "deleting a [[device]] entry",
+            "run `ksx device remove <ALIAS>`",
+        ))
+    }
+
     /// `ksx preset list [--templates]` — the presets on disk and the templates
     /// a new one can be seeded from.
     fn presets(&self) -> Result<PresetsView, Refusal> {
@@ -212,6 +261,166 @@ pub struct UsbRow {
     pub boot_keyboard: bool,
 }
 
+/// `ksx device scan`, presentation-shaped: one row per PHYSICAL board, plus
+/// the `[[device]]` entries this config already holds.
+///
+/// The two lists are separate on purpose and neither is derivable from the
+/// other. A board can be plugged in and unconfigured (the thing to pick), and
+/// an entry can be configured with its board unplugged (the thing that needs
+/// saying out loud, because it looks identical to a broken config from the
+/// slot's end).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceScanView {
+    pub generated_at: String,
+    /// Was USB enumeration possible? `false` means [`Self::boards`] is empty
+    /// because nothing could be READ, not because nothing is plugged in.
+    pub usb_available: bool,
+    /// Every board, in enumeration order (stable on one machine), probable
+    /// keyboards first.
+    pub boards: Vec<BoardRow>,
+    /// Every `[[device]]` entry in `config.toml`, resolved against the live
+    /// enumeration.
+    pub configured: Vec<ConfiguredDevice>,
+    /// Anything the report has to say out loud — rendered, never swallowed.
+    pub notes: Vec<String>,
+}
+
+/// One physical board: every interface that shares a composite parent
+/// (`crates/ksx-app/src/device_scan.rs` `Board`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardRow {
+    /// The vendor table's name, else the device's own product string, else the
+    /// parent path. Never empty.
+    pub name: String,
+    /// Every devnode this one board wears.
+    pub interfaces: Vec<UsbRow>,
+    /// The instance id of the interface a keyboard would be captured through,
+    /// when the board has one. `None` = ksx cannot capture this board, and it
+    /// cannot be picked either.
+    pub keyboard: Option<String>,
+    /// That interface's one-sentence verdict, straight from the enumerator.
+    pub keyboard_verdict: String,
+    /// Does anything here DECLARE itself a keyboard (HID boot protocol), or is
+    /// it merely HID? A mouse, an LED controller and a fan controller are all
+    /// claimable; only this separates them from a panel.
+    pub looks_like_a_keyboard: bool,
+    /// Is the keyboard interface bound to `winusb.sys` right now — i.e. off the
+    /// Windows keyboard stack?
+    pub claimed: bool,
+    /// The `[[device]]` alias bound to this board, if any.
+    pub alias: Option<String>,
+    /// `ksx winusb claim <ID>` — present only while the board is claimABLE.
+    /// A command, never an action: the claim needs elevation, so a surface
+    /// that cannot elevate SHOWS this rather than running it.
+    pub claim_command: Option<String>,
+    /// `ksx winusb release <ID> --yes` — present only while it is claimed.
+    pub release_command: Option<String>,
+}
+
+/// One `[[device]]` entry, resolved against the machine as it is right now.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfiguredDevice {
+    /// The name `[[slot]]` entries use.
+    pub alias: String,
+    /// The `id` as the FILE spells it.
+    pub id: String,
+    /// `winusb` | `interception`.
+    pub backend: String,
+    /// One word for the rung: `model` | `serial` | `port` | `hardware-id`.
+    pub rung: String,
+    /// Does this id still name the same board after a replug into another
+    /// socket? `false` is the PORT-PINNED case.
+    pub survives_replug: bool,
+    /// What the selector pins down and what it costs
+    /// (`DeviceSelector::explain`).
+    pub means: String,
+    /// The whole PORT-PINNED paragraph, verbatim from the writer that decided
+    /// it — including the half that is easy to miss, that a `port=` value names
+    /// THIS PC's USB topology and does not travel to another cabinet. `None`
+    /// when the id survives a replug.
+    ///
+    /// Carried rather than re-worded per surface: `ksx device pick` prints it
+    /// at write time, and this is the same sentence standing on the entry
+    /// afterwards, because the cost is a property of the entry and not of the
+    /// moment it was written.
+    pub port_pinned_warning: Option<String>,
+    /// Does the id resolve to exactly one connected interface right now?
+    pub present: bool,
+    /// The board's name, when it is present.
+    pub board: Option<String>,
+    /// The interface it resolved to, when it is present.
+    pub instance_id: Option<String>,
+    /// Is that interface bound to `winusb.sys`?
+    pub claimed: bool,
+    pub claim_command: Option<String>,
+    pub release_command: Option<String>,
+    /// Every slot that names this alias, in `config.toml` AND in every
+    /// games.toml profile — the list `remove` refuses on without `--force`.
+    pub used_by: Vec<String>,
+}
+
+/// One `ksx device pick`, as any surface spells it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevicePickSpec {
+    /// An instance path, an existing `[[device]]` alias, or any unique part of
+    /// an instance path.
+    pub query: String,
+    /// The name `[[slot]]` entries will use. `None`/empty derives one from the
+    /// board, and re-picking a configured board keeps the name it already has.
+    pub alias: Option<String>,
+}
+
+/// What `ksx device pick` wrote.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevicePickView {
+    pub alias: String,
+    /// The `id` value written: the weakest rung that is still unique.
+    pub id: String,
+    pub backend: String,
+    pub board: String,
+    pub instance_id: String,
+    /// The alias of the entry this replaced; `None` = a new entry.
+    pub replaced: Option<String>,
+    /// Was the interface ALREADY bound to `winusb.sys`? Nothing here ever
+    /// claims one.
+    pub claimed: bool,
+    /// Did the writer have to fall back to the socket to tell this board from
+    /// its twin? The entry then carries
+    /// [`ConfiguredDevice::port_pinned_warning`].
+    pub port_pinned: bool,
+    /// `ksx winusb claim <ID>`, when claiming is the sensible next step.
+    pub next_step: Option<String>,
+    pub backup: Option<String>,
+    /// ONE sentence — a flash is one line and capped, so the structured facts
+    /// above are what a page renders.
+    pub summary: String,
+}
+
+/// One `ksx device remove`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRemoveSpec {
+    pub alias: String,
+    /// Remove it even though slots still name it.
+    pub force: bool,
+}
+
+/// What `ksx device remove` deleted.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRemoveView {
+    pub alias: String,
+    pub id: String,
+    /// The interface still bound to `winusb.sys`. Deleting config does not
+    /// release a board, and this is how the user finds out before the panel is
+    /// dark rather than after.
+    pub still_claimed: Option<String>,
+    pub release_command: Option<String>,
+    /// Slots that now name a device which does not exist (`--force` only).
+    pub breaks: Vec<String>,
+    pub backup: Option<String>,
+    /// ONE sentence, for the flash.
+    pub summary: String,
+}
+
 /// `ksx winusb status`, presentation-shaped.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WinusbView {
@@ -312,6 +521,17 @@ mod tests {
 
         let checks: Vec<(&str, Refusal)> = vec![
             ("ksx devices", Nothing.devices().unwrap_err()),
+            ("ksx device scan", Nothing.device_scan().unwrap_err()),
+            (
+                "ksx device pick",
+                Nothing.device_pick(&DevicePickSpec::default()).unwrap_err(),
+            ),
+            (
+                "ksx device remove",
+                Nothing
+                    .device_remove(&DeviceRemoveSpec::default())
+                    .unwrap_err(),
+            ),
             ("ksx preset list", Nothing.presets().unwrap_err()),
             ("ksx autostart", Nothing.autostart().unwrap_err()),
             ("ksx doctor", Nothing.doctor().unwrap_err()),

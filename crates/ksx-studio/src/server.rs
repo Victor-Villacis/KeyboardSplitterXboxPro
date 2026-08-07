@@ -29,14 +29,23 @@ use serde::Deserialize;
 use crate::control::{BindOutcome, BindRequest, ControlSource, SessionView};
 use crate::error::StudioError;
 use crate::render::{render_status, Assets, BrandAssets, EmbeddedPage};
+use crate::render_devices::render_devices;
 use crate::render_map::render_map;
-use crate::snapshot::{MapPayload, StatusPayload, StatusSnapshot, StatusSource};
+use crate::snapshot::{DevicesPayload, MapPayload, StatusPayload, StatusSnapshot, StatusSource};
 
 struct AppState {
     page: EmbeddedPage,
     map_page: EmbeddedPage,
+    devices_page: EmbeddedPage,
     source: Box<dyn StatusSource>,
     control: Box<dyn ControlSource>,
+    /// The MACHINE verbs — device enumeration and the two `[[device]]` writes.
+    ///
+    /// A THIRD provider rather than more methods on the two above, because it
+    /// answers a different question and answers it with no daemon: `machine`
+    /// reads the USB tree and the config store directly, so `/devices` works
+    /// while the pipe is dead, exactly as the read-only mapper does.
+    machine: Box<dyn ksx_api::MachineSource>,
 }
 
 /// Serve the page until the process is killed (Ctrl+C included — no
@@ -52,17 +61,21 @@ pub fn serve(
     bind: SocketAddr,
     source: Box<dyn StatusSource>,
     control: Box<dyn ControlSource>,
+    machine: Box<dyn ksx_api::MachineSource>,
 ) -> Result<(), StudioError> {
     if !bind.ip().is_loopback() {
         return Err(StudioError::NonLoopbackBind { bind });
     }
     let page = EmbeddedPage::load("/")?;
     let mapper = EmbeddedPage::load("/map")?;
+    let devices = EmbeddedPage::load("/devices")?;
     let state = Arc::new(AppState {
         page,
         map_page: mapper,
+        devices_page: devices,
         source,
         control,
+        machine,
     });
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -134,6 +147,17 @@ pub fn serve(
             .route("/map/preset/restore", post(map_form_restore))
             .route("/map/preset/clear-all", post(map_form_clear_all))
             .route("/map/session/stop", post(map_form_session_stop))
+            // v17: the DEVICE PICKER — `ksx device scan` as a page, plus the
+            // two writes it exists for. Read is `MachineSource::device_scan`
+            // (boards, not devnodes); the writes are `device_pick` and
+            // `device_remove`, which are the CLI's own plan/apply pair and
+            // need no daemon. Claiming is NOT here and never will be: it needs
+            // elevation, which docs/SURFACES.md §3 marks "never" for the
+            // browser — the page prints the command instead.
+            .route("/devices", get(devices_page))
+            .route("/api/devices", get(api_devices))
+            .route("/devices/pick", post(devices_form_pick))
+            .route("/devices/remove", post(devices_form_remove))
             // Canon helper: correct no-cache + Service-Worker-Allowed
             // headers for free (replaced a hand-rolled handler).
             .route("/sw.js", get(forma_server::sw::serve_sw::<Assets>))
@@ -955,6 +979,193 @@ async fn map_form_session_stop(
     map_redirect(slot, outcome)
 }
 
+// ---------------------------------------------------------------------------
+// /devices — enumerate, pick, remove
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct DevicesQuery {
+    flash: Option<String>,
+}
+
+/// One fresh device scan + session view.
+///
+/// Blocking on both halves and then some: this walks the whole USB tree,
+/// re-reads config.toml and games.toml, and dials the daemon pipe for the
+/// session line. Never cached, for the reason `sources.rs` gives — a board
+/// that was unplugged ten minutes ago must stop being offered.
+///
+/// A panic here renders a page that SAYS the scan failed rather than a 500,
+/// the same contract `collect` and `collect_map` keep: a dead-end error page
+/// stops the refresh loop, and the user is then looking at a browser error
+/// instead of at their cabinet.
+async fn collect_devices(state: &Arc<AppState>) -> DevicesPayload {
+    let scan_state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let session = scan_state.control.session();
+        match scan_state.machine.device_scan() {
+            Ok(scan) => DevicesPayload {
+                scan,
+                session,
+                unavailable: String::new(),
+                flash: None,
+            },
+            Err(refusal) => DevicesPayload {
+                scan: ksx_api::DeviceScanView::default(),
+                session,
+                // The refusal's own sentence, plus its way out. This is the
+                // one place the remedy is NOT dropped: it is going onto a
+                // page, not into a 300-character flash, and "run `ksx
+                // devices`" is the whole value of the message.
+                unavailable: match &refusal.remedy {
+                    Some(remedy) => format!("{} — {remedy}", refusal.message),
+                    None => refusal.message.clone(),
+                },
+                flash: None,
+            },
+        }
+    })
+    .await
+    .unwrap_or_else(|_| DevicesPayload {
+        scan: ksx_api::DeviceScanView::default(),
+        session: SessionView::unreachable("the device scan panicked"),
+        unavailable: "the device scan panicked — nothing below is a reading of this machine"
+            .to_owned(),
+        flash: None,
+    })
+}
+
+async fn devices_page(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DevicesQuery>,
+) -> Response {
+    let mut payload = collect_devices(&state).await;
+    let flash = query
+        .flash
+        .as_deref()
+        .filter(|f| !f.trim().is_empty())
+        .map(str::to_owned);
+    payload.flash = flash.clone();
+    let out = render_devices(&state.devices_page, &payload, flash.as_deref());
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_str(&out.csp)
+                    .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'")),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        out.html,
+    )
+        .into_response()
+}
+
+/// The poller's endpoint: the SAME [`DevicesPayload`] shape the page embeds
+/// (parity unit-tested in render_devices.rs). `flash` is always null — a poll
+/// is not an action.
+async fn api_devices(State(state): State<Arc<AppState>>) -> Response {
+    let payload = collect_devices(&state).await;
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        axum::Json(payload),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct PickForm {
+    /// The interface the row's hidden field carries — an instance path. The
+    /// backend's own resolver accepts an alias or a unique substring too, and
+    /// this posts whatever the user's row held, so the two verbs cannot
+    /// disagree about what an argument means.
+    query: String,
+    /// The name `[[slot]]` entries will use. Blank means "derive one from the
+    /// board", exactly like the absent `--alias` flag — a web form always
+    /// submits the field, so the emptiness has to survive to the writer as
+    /// `None` rather than as an empty alias it would then refuse.
+    alias: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RemoveForm {
+    alias: String,
+    /// The row's checkbox. Present at all = ticked (HTML omits an unchecked
+    /// box entirely) — the same shape the mapper's cross-slot panel uses.
+    #[serde(default)]
+    force: Option<String>,
+}
+
+/// 303 back to the picker, carrying the outcome as the flash.
+///
+/// Errors flash exactly like successes: this page's whole job is deciding
+/// which board drives which slot, and a Remove that silently did nothing is
+/// how someone ends up debugging a cabinet that was never changed.
+fn devices_redirect(outcome: Result<String, String>) -> Response {
+    let flash = match outcome {
+        Ok(message) => message,
+        Err(error) => format!("error: {error}"),
+    };
+    Redirect::to(&format!("/devices?flash={}", urlencode(&flash))).into_response()
+}
+
+/// POST /devices/pick — write one `[[device]]` entry.
+///
+/// One backend verb, and deliberately the typed one: `device_edit::pick` (the
+/// CLI entry point) routes refusals through a function that calls
+/// `std::process::exit`, which would take the whole server down on a mistyped
+/// alias. `MachineSource::device_pick` is the same plan/apply pair with a
+/// `Refusal` on the error arm.
+async fn devices_form_pick(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<PickForm>,
+) -> Response {
+    let spec = ksx_api::DevicePickSpec {
+        query: form.query,
+        alias: form.alias,
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        state
+            .machine
+            .device_pick(&spec)
+            .map(|view| view.summary)
+            .map_err(flash_of)
+    })
+    .await
+    .unwrap_or_else(|_| Err("the device pick panicked".to_owned()));
+    devices_redirect(outcome)
+}
+
+/// POST /devices/remove — delete one `[[device]]` entry.
+///
+/// The narrowest of ksx's three removals, and the page says so beside the
+/// button. `RemoveOutcome`'s summary is what flashes, and it carries the one
+/// fact that surprises people: deleting the entry did not release a claimed
+/// board.
+async fn devices_form_remove(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<RemoveForm>,
+) -> Response {
+    let spec = ksx_api::DeviceRemoveSpec {
+        alias: form.alias,
+        force: form.force.is_some(),
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        state
+            .machine
+            .device_remove(&spec)
+            .map(|view| view.summary)
+            .map_err(flash_of)
+    })
+    .await
+    .unwrap_or_else(|_| Err("the device removal panicked".to_owned()));
+    devices_redirect(outcome)
+}
+
 #[derive(Deserialize)]
 struct StartForm {
     profile: Option<String>,
@@ -1155,13 +1366,25 @@ mod tests {
         }
     }
 
+    /// Every method defaulted: the trait refuses in words and names the CLI
+    /// verb that works, which is the honest provider for a test that never
+    /// gets as far as binding.
+    struct NullMachine;
+    impl ksx_api::MachineSource for NullMachine {}
+
     /// Rule C: no code path may open a non-loopback listener. The refusal
     /// happens before any socket exists.
     #[test]
     fn serve_refuses_non_loopback_binds() {
         for addr in ["0.0.0.0:4460", "192.168.1.10:4460", "[::]:4460"] {
             let bind: SocketAddr = addr.parse().unwrap();
-            let err = serve(bind, Box::new(NullSource), Box::new(NullControl)).unwrap_err();
+            let err = serve(
+                bind,
+                Box::new(NullSource),
+                Box::new(NullControl),
+                Box::new(NullMachine),
+            )
+            .unwrap_err();
             assert!(
                 matches!(err, StudioError::NonLoopbackBind { .. }),
                 "{addr}: {err}"

@@ -45,6 +45,25 @@ use ksx_platform::winusb::{Candidate, ClaimState, Refusal, Survey};
 // pick
 // ---------------------------------------------------------------------------
 
+/// The cost of a `port=` rung, in one paragraph, said once.
+///
+/// It lives here rather than inline in [`PickOutcome::message`] because it is
+/// not a property of the MOMENT the entry was written — it is a property of the
+/// entry. `ksx device pick` prints it at write time; a surface listing
+/// configured devices has to keep printing it, or the entry looks like every
+/// other one right up until the board moves socket.
+///
+/// The second half is the half people miss. A `port=` value names THIS PC's USB
+/// topology, so the entry does not travel — which matters the moment configs
+/// get shared or a cabinet gets rebuilt, and `pick` is the only place that
+/// knows enough to say it (by the time `run` sees a missing board it cannot
+/// tell a move from an unplug).
+pub const PORT_PINNED_WARNING: &str =
+    "PORT-PINNED — nothing weaker than the socket separates this board from its twin. Move \
+     it to another USB port and this entry stops matching. It is also specific to THIS \
+     machine: the port names this PC's USB topology, so do not copy this config to another \
+     cabinet — run `ksx device pick` there instead.";
+
 /// One `ksx device pick`, as any surface spells it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PickSpec {
@@ -388,24 +407,12 @@ impl PickOutcome {
         if !plan.selector.survives_replug() {
             // The trade has to be stated at the moment it is made: a user with
             // two identical encoders needs to know WHICH of their boards is now
-            // pinned to a socket.
-            //
-            // A `port=` rung means the port is what SEPARATES this board from
-            // its twin — which is why it appears exactly when the serials
-            // collide (measured: two I-PAC 4X boards both answer "4"). So the
-            // cost is twofold, and the second half is easy to miss: a port value
-            // describes THIS machine's USB topology, so the entry does not
-            // travel. That matters the moment configs get shared or a cabinet
-            // gets rebuilt, and `pick` is the only place that knows enough to
-            // say it — by the time `run` sees a missing board it cannot tell a
-            // move from an unplug (see `run::resolve`).
-            let _ = writeln!(
-                out,
-                "  [!] PORT-PINNED — nothing weaker than the socket separates this board from \
-                 its twin. Move it to another USB port and this entry stops matching. It is \
-                 also specific to THIS machine: the port names this PC's USB topology, so do \
-                 not copy this config to another cabinet — run `ksx device pick` there instead."
-            );
+            // pinned to a socket. A `port=` rung means the port is what
+            // SEPARATES this board from its twin — which is why it appears
+            // exactly when the serials collide (measured: two I-PAC 4X boards
+            // both answer "4"). The wording is [`PORT_PINNED_WARNING`], shared
+            // with every surface that lists a configured device.
+            let _ = writeln!(out, "  [!] {PORT_PINNED_WARNING}");
         }
         if let Some(backup) = &self.backup {
             let _ = writeln!(out, "  backup  : {}", backup.display());
@@ -622,7 +629,13 @@ pub fn plan_remove(
 /// Matching is byte-exact, like `ConfigFile::resolve_device`: a slot that says
 /// `"Panel"` when the entry says `"panel"` is already an unresolved reference
 /// and deleting this entry is not what broke it.
-fn references_to(config: &ConfigFile, games: &GamesFile, alias: &str) -> Vec<SlotRef> {
+///
+/// Public because it is the ONE answer to "what breaks if this goes away", and
+/// a surface that offers a Remove button has to show it BEFORE the click —
+/// `plan_remove` refuses on this list, and a page that re-derived its own
+/// version would be a second implementation of the refusal
+/// (`docs/SURFACES.md` §1). [`crate::device_scan::view`] renders it per entry.
+pub fn references_to(config: &ConfigFile, games: &GamesFile, alias: &str) -> Vec<SlotRef> {
     let mut out = Vec::new();
     let mut push =
         |slot: u8, profile: Option<&str>, field: &'static str, value: &Option<String>| {
@@ -809,7 +822,7 @@ fn board_name(candidate: &Candidate, facts: &DeviceFacts) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
-fn connected_facts() -> Vec<DeviceFacts> {
+pub(crate) fn connected_facts() -> Vec<DeviceFacts> {
     match ksx_capture::usb_candidates() {
         Ok(found) => found.iter().map(ksx_capture::UsbCandidate::facts).collect(),
         Err(err) => {
@@ -820,7 +833,7 @@ fn connected_facts() -> Vec<DeviceFacts> {
 }
 
 #[cfg(windows)]
-fn store() -> Result<Store, ConfigError> {
+pub(crate) fn store() -> Result<Store, ConfigError> {
     Ok(Store::new(ksx_config::ConfigRoot::discover()?))
 }
 

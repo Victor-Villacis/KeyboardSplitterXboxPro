@@ -3936,3 +3936,210 @@ a.strow:hover {
     content: "";
   }
 }
+
+/* ── 9. Devices (`/devices`) ──────────────────────────────────────────────
+   The picker. Its whole content is long identifier strings and long warning
+   paragraphs, which is a different problem from the status page's tiles and
+   the mapper's fixed-geometry grid — so the rules here are mostly about text
+   that must never be clipped and never push the page sideways.
+
+   Two conventions worth stating, because they look like laziness otherwise:
+
+   - EVERY optional line is rendered and hidden with `.dv-hide`, not omitted.
+     A `createShow` inside a `createList` is not a shape the compiler emits, so
+     a row that sometimes has a port-pinned warning carries the element always
+     and its class decides. The cost is a few empty nodes; the alternative was
+     four parallel lists.
+   - The row is a COLUMN, overriding `.plist li`'s centred flex row. A device
+     row is a stack of facts about one board, not a label with a button on the
+     right, and forcing it into that shape is what made the id and the warning
+     compete for one line. */
+
+.dv-hide {
+  display: none !important;
+}
+
+.dv-card {
+  overflow-wrap: anywhere;
+}
+
+.dv-list li.dv-row {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-3);
+}
+
+/* The quiet lists (unpickable boards, enumeration notes) stay one line each:
+   they are context, not choices. */
+.dv-list li.dv-row.quiet {
+  flex-direction: row;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--text-tertiary);
+}
+
+.dv-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.dv-name {
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-title);
+  margin-right: var(--sp-1);
+}
+
+.dv-line {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+}
+
+/* A configured entry whose id resolves to nothing right now. Amber, not red:
+   the board is unplugged or moved, which is a fact about the machine and not a
+   fault in the config — `ksx run` is where that becomes an error. */
+.dv-line.dv-miss {
+  color: var(--warn);
+}
+
+.dv-note {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  line-height: var(--lh-snug);
+  max-width: 82ch;
+}
+
+/* The two sentences this page exists to keep saying: the PORT-PINNED
+   paragraph on a socket-pinned entry, and the "not declared as a keyboard"
+   caveat on an HID interface that merely could be claimed. Both are warnings
+   about a choice that will look fine until it does not, so both get the amber
+   plate rather than a grey footnote. */
+.dv-warn {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--r-sm);
+  background: var(--warn-dim);
+  color: var(--warn);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-snug);
+  max-width: 82ch;
+}
+
+.dv-used {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  line-height: var(--lh-snug);
+  max-width: 82ch;
+}
+
+/* An elevated command, shown and never run (docs/SURFACES.md §3). It reads as
+   a quotation rather than as a control on purpose — nothing here is clickable
+   and the page must not pretend otherwise. */
+.dv-cmd {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px dashed var(--border-default);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+.dv-cmdlead {
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  line-height: var(--lh-snug);
+  max-width: 82ch;
+}
+
+.dv-form {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: var(--sp-1) 0 0;
+}
+
+.dv-lbl {
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: var(--track-eyebrow);
+}
+
+.dv-alias {
+  flex: 1 1 12rem;
+  min-width: 0;
+  max-width: 22rem;
+  height: var(--ctl-h);
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--fs-md);
+}
+
+.dv-force {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--warn);
+}
+
+.dv-empty {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-snug);
+  max-width: 82ch;
+}
+
+.devices .warn {
+  margin: 0 0 var(--sp-3);
+  color: var(--warn);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-snug);
+  max-width: 82ch;
+}
+
+.dv-legend .alarmways li {
+  color: var(--text-secondary);
+}
+
+@media (max-width: 45rem) {
+  /* The pick form stacks rather than scrolling: the name box and the button
+     are one decision and splitting them across a horizontal scroll would hide
+     half of it. Nothing on this page may push the PAGE sideways — the long
+     instance ids already wrap via `.dv-card { overflow-wrap: anywhere }`. */
+  .dv-form {
+    align-items: stretch;
+  }
+
+  .dv-alias {
+    flex: 1 1 100%;
+    max-width: none;
+  }
+
+  .dv-form .btn {
+    flex: 1 1 100%;
+  }
+
+  .dv-list li.dv-row.quiet {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--sp-1);
+  }
+}

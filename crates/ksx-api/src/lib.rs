@@ -66,8 +66,9 @@ pub use control::{
 };
 pub use live::{KeyHit, LiveFeed, LiveFrame, NoFeed, PadFeedback, SlotLive};
 pub use machine::{
-    AdviceRow, AutostartView, DevicesView, DoctorRow, DoctorView, KeyboardRow, MachineSource,
-    PresetRow, PresetsView, TemplateRow, UsbRow, WinusbView,
+    AdviceRow, AutostartView, BoardRow, ConfiguredDevice, DevicePickSpec, DevicePickView,
+    DeviceRemoveSpec, DeviceRemoveView, DeviceScanView, DevicesView, DoctorRow, DoctorView,
+    KeyboardRow, MachineSource, PresetRow, PresetsView, TemplateRow, UsbRow, WinusbView,
 };
 pub use pipe::{PipeTransport, TransportError, NO_CHANNEL};
 pub use refusal::{codes, Refusal, Refused};

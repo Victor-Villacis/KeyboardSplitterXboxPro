@@ -239,7 +239,18 @@ fn main() {
     let bind: SocketAddr = ([127, 0, 0, 1], port).into();
     let store = Store::new();
     println!("macro fixture on http://{bind}/map");
-    if let Err(err) = ksx_studio::serve(bind, Box::new(store.clone()), Box::new(store)) {
+    // The fixture drives the MAPPER, so the machine provider is the trait's
+    // own defaults: every method refuses in words and names the CLI verb that
+    // works. /devices under this fixture therefore renders its refusal banner,
+    // which is a real state of the page and worth being able to look at.
+    struct NoMachine;
+    impl ksx_api::MachineSource for NoMachine {}
+    if let Err(err) = ksx_studio::serve(
+        bind,
+        Box::new(store.clone()),
+        Box::new(store),
+        Box::new(NoMachine),
+    ) {
         eprintln!("fixture failed: {err}");
         std::process::exit(1);
     }

@@ -86,6 +86,7 @@ mod control;
 mod error;
 mod guard;
 mod render;
+mod render_devices;
 mod render_map;
 mod server;
 mod snapshot;
@@ -97,6 +98,6 @@ pub use control::{
 pub use error::StudioError;
 pub use server::serve;
 pub use snapshot::{
-    MacroSnapshot, MacroStepView, MacroView, MapPayload, MapperSlot, MapperSnapshot, PadRow,
-    ProfileRow, StatusSnapshot, StatusSource,
+    DevicesPayload, MacroSnapshot, MacroStepView, MacroView, MapPayload, MapperSlot,
+    MapperSnapshot, PadRow, ProfileRow, StatusSnapshot, StatusSource,
 };

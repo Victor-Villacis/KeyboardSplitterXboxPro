@@ -251,7 +251,12 @@ pub(crate) const REFRESH_SECS: u32 = 5;
 /// was a *different colour* from the stylesheet that replaced it. Nothing
 /// could catch that, because a wrong anti-flash colour looks like a flash.
 /// `ksx-studio/tests/contrast.rs` now parses studio.css and pins both.
-const PERSONALITY_CSS: &str = "body{background:#120c1c;color:#f0ebe0;margin:0}\
+/// `pub(crate)` so a THIRD page reuses this copy instead of minting another
+/// one. `render_map.rs` keeps a byte-identical copy from before the rule was
+/// worth stating, and `tests/contrast.rs` pins both against the `--bg`/`--text`
+/// tokens — but a copy that cannot drift is better than a copy that is checked,
+/// and the check only knows about the two files it names.
+pub(crate) const PERSONALITY_CSS: &str = "body{background:#120c1c;color:#f0ebe0;margin:0}\
 @media (prefers-color-scheme:light){body{background:#f6f3ee;color:#1c1428}}";
 
 /// The minimum number of pad tiles the signature card shows: live pads
