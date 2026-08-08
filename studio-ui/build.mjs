@@ -210,6 +210,13 @@ function reclassElement(el) {
 function cleanSvg(source, extraShapes) {
   return (
     readFileSync(join("art", source), "utf8")
+      // FIRST, before anything that reasons about newlines: the art sources
+      // are text files, so a checkout under core.autocrlf hands this function
+      // CRLF and the `\n{3,}` collapse below stops matching — the vendored
+      // svg then differs byte-for-byte between two checkouts of the same
+      // commit, which is exactly the "committed assets match a fresh build"
+      // check failing for no source change at all.
+      .replace(/\r\n?/g, "\n")
       .replace(/<sodipodi:namedview[\s\S]*?\/>/g, "")
       .replace(/<metadata[\s\S]*?<\/metadata>/g, "")
       // The hidden trace rasters and any other display:none leftovers.
