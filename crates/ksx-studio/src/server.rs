@@ -41,9 +41,10 @@ use crate::render_check::render_check;
 use crate::render_devices::render_devices;
 use crate::render_map::render_map;
 use crate::render_setup::render_setup;
+use crate::render_start::render_start;
 use crate::snapshot::{
     CheckPayload, DevicesPayload, MapPayload, PadsPayload, ProfilesPayload, SetupPayload,
-    SetupSnapshot, StatusPayload, StatusSnapshot, StatusSource,
+    SetupSnapshot, StartPayload, StatusPayload, StatusSnapshot, StatusSource,
 };
 
 struct AppState {
@@ -54,6 +55,7 @@ struct AppState {
     devices_page: EmbeddedPage,
     profiles_page: EmbeddedPage,
     setup_page: EmbeddedPage,
+    start_page: EmbeddedPage,
     source: Box<dyn StatusSource>,
     control: Box<dyn ControlSource>,
     /// The MACHINE reads and writes that are not a `DaemonCommand`: the
@@ -110,6 +112,7 @@ pub fn serve(
     let devices = EmbeddedPage::load("/devices")?;
     let profiles = EmbeddedPage::load("/profiles")?;
     let setup = EmbeddedPage::load("/setup")?;
+    let start = EmbeddedPage::load("/start")?;
     let state = Arc::new(AppState {
         page,
         map_page: mapper,
@@ -118,6 +121,7 @@ pub fn serve(
         devices_page: devices,
         profiles_page: profiles,
         setup_page: setup,
+        start_page: start,
         source,
         control,
         machine,
@@ -278,6 +282,38 @@ pub fn serve(
             // step works with scripting switched off.
             .route("/setup/prove", post(setup_form_prove))
             .route("/setup/prove/cancel", post(setup_form_prove_cancel))
+            // ── /start — THE FIRST RUN (docs/FIRST-RUN.md moments 4–7) ─────
+            //
+            // A new page rather than a rebuilt `/setup`, and the split is the
+            // contract, not the layout: every `/setup` step reads config.toml
+            // and writes to it, and NOTHING here touches a file until
+            // `/start/save`. One screen holding both rules would be a screen
+            // where the user cannot tell which controls commit — which is the
+            // whole thing staging exists to fix (`render_start.rs` has the
+            // longer version).
+            //
+            // Nine routes. The six `stage-*` ones are ONE `ControlSource` verb
+            // each and reach nothing outside the daemon's own memory — no file,
+            // no driver, no session — which is what makes exploring free.
+            // `/start/save` is one config write (the same shape as
+            // `/setup/slot`) and `/start/play` starts a session from a plan
+            // built in memory. There is no route that claims a board: §3 marks
+            // that "never" for the browser, and a first-run flow is the last
+            // place to make an exception.
+            //
+            // The RESCAN is deliberately not here. It is a link back to
+            // `/start`, because re-reading the machine writes nothing and a
+            // read wearing a POST is a lie the guard then has to work around
+            // (the same argument `/setup/export.json` makes).
+            .route("/start", get(start_page))
+            .route("/api/start", get(api_start))
+            .route("/start/device", post(start_form_device))
+            .route("/start/controller", post(start_form_controller))
+            .route("/start/controller/remove", post(start_form_remove))
+            .route("/start/blocking", post(start_form_blocking))
+            .route("/start/discard", post(start_form_discard))
+            .route("/start/save", post(start_form_save))
+            .route("/start/play", post(start_form_play))
             // Canon helper: correct no-cache + Service-Worker-Allowed
             // headers for free (replaced a hand-rolled handler).
             .route("/sw.js", get(forma_server::sw::serve_sw::<Assets>))
@@ -1374,6 +1410,275 @@ async fn devices_form_remove(
     .await
     .unwrap_or_else(|_| Err("the device removal panicked".to_owned()));
     devices_redirect(outcome)
+}
+
+// ── /start: the first run (docs/FIRST-RUN.md moments 4–7) ──────────────────
+
+/// One fresh first-run payload: the staged setup, the device enumeration and
+/// the presets on disk.
+///
+/// Three reads with three failure modes, kept apart all the way to the page —
+/// `SURFACES.md` §1b. A dead daemon must not read as "you have staged
+/// nothing", a refused enumeration must not read as "you have no keyboards",
+/// and an unreadable presets folder must not read as "nothing would be
+/// replaced". Each degrades to the honest value its own type provides
+/// (`StagedSetupView::unreachable`, `DeviceScanView::default`, a non-empty
+/// `presets_error`) and never to `Default::default()`.
+///
+/// Never cached, and that is `FIRST-RUN.md` §5's visible-rescan requirement
+/// met by construction: a user who plugs a keyboard in while this page is open
+/// sees it at the next 2 s poll, without knowing a scan exists.
+async fn collect_start(state: &Arc<AppState>) -> StartPayload {
+    let start_state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let staged = start_state.control.staged();
+        let session = start_state.control.session();
+        let (scan, unavailable) = match start_state.machine.device_scan() {
+            Ok(scan) => (scan, String::new()),
+            Err(refusal) => (ksx_api::DeviceScanView::default(), flash_of(refusal)),
+        };
+        let (presets, presets_error) = match start_state.machine.presets() {
+            Ok(view) => (view.presets, String::new()),
+            Err(refusal) => (Vec::new(), flash_of(refusal)),
+        };
+        StartPayload {
+            staged,
+            scan,
+            session,
+            unavailable,
+            presets,
+            presets_error,
+            flash: None,
+            ..StartPayload::default()
+        }
+        .composed()
+    })
+    .await
+    .unwrap_or_else(|_| {
+        StartPayload {
+            staged: ksx_api::StagedSetupView::unreachable("the first-run collection panicked"),
+            scan: ksx_api::DeviceScanView::default(),
+            session: SessionView::unreachable("the first-run collection panicked"),
+            unavailable: "the device scan panicked — nothing below is a reading of this machine"
+                .to_owned(),
+            presets_error: "the preset read panicked".to_owned(),
+            ..StartPayload::default()
+        }
+        .composed()
+    })
+}
+
+async fn start_page(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PageQuery>,
+) -> Response {
+    let mut payload = collect_start(&state).await;
+    let flash = query
+        .flash
+        .as_deref()
+        .filter(|f| !f.trim().is_empty())
+        .map(str::to_owned);
+    payload.flash = flash.clone();
+    let out = render_start(&state.start_page, &payload, flash.as_deref());
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_str(&out.csp)
+                    .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'")),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        out.html,
+    )
+        .into_response()
+}
+
+/// The poller's endpoint — the SAME [`StartPayload`] the page embeds (parity
+/// pinned in render_start.rs). `flash` is always null: a poll is not an action.
+async fn api_start(State(state): State<Arc<AppState>>) -> Response {
+    let payload = collect_start(&state).await;
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        axum::Json(payload),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct StartDeviceForm {
+    /// The `ksx_core::DeviceSelector` the row carried
+    /// (`ksx_api::BoardRow::selector`, served). **Never a path anybody typed**
+    /// — `FIRST-RUN.md` §6 forbids asking, and the page has no text input.
+    selector: String,
+    alias: String,
+    label: String,
+}
+
+#[derive(Deserialize)]
+struct StartControllerForm {
+    persona: String,
+    /// The preset name, from `StagedSetupView::next_preset`. Served rather than
+    /// typed, because it becomes a file name.
+    preset: String,
+}
+
+#[derive(Deserialize)]
+struct StartSlotForm {
+    number: u8,
+}
+
+#[derive(Deserialize)]
+struct StartBlockingForm {
+    blocking: String,
+}
+
+/// 303 back to the first-run page, carrying the outcome as the flash.
+///
+/// Refusals flash exactly like successes and carry ksx-core's own sentence:
+/// this flow is four decisions deep and a click that silently did nothing is
+/// how somebody ends up pressing Play on a setup they think has two controllers
+/// in it.
+fn start_redirect(outcome: Result<String, String>) -> Response {
+    let flash = match outcome {
+        Ok(message) => message,
+        Err(error) => format!("error: {error}"),
+    };
+    Redirect::to(&format!("/start?flash={}", urlencode(&flash))).into_response()
+}
+
+/// Run one staging edit off the async workers (the pipe client blocks) and
+/// 303 back.
+///
+/// Every one of these touches ONE value in the daemon and nothing else — no
+/// file, no driver, no session. That is `FIRST-RUN.md` §2, and it is why this
+/// helper has no confirm step, no backup and no dry run: there is nothing to
+/// undo, because there is nothing to have done.
+async fn stage_edit(state: Arc<AppState>, edit: ksx_api::StageEdit) -> Response {
+    let outcome = tokio::task::spawn_blocking(move || {
+        let outcome = state.control.stage_edit(&edit);
+        if outcome.ok {
+            Ok(outcome.headline())
+        } else {
+            Err(outcome.headline())
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err("the staging edit panicked".to_owned()));
+    start_redirect(outcome)
+}
+
+/// POST /start/device — moment 4. Replaces any earlier choice, freely.
+async fn start_form_device(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<StartDeviceForm>,
+) -> Response {
+    stage_edit(
+        state,
+        ksx_api::StageEdit::ChooseDevice {
+            selector: form.selector,
+            alias: form.alias,
+            label: form.label,
+        },
+    )
+    .await
+}
+
+/// POST /start/controller — moment 5. `number: None` so the backend picks the
+/// lowest free slot: a first-run user must never be asked for a slot number.
+async fn start_form_controller(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<StartControllerForm>,
+) -> Response {
+    stage_edit(
+        state,
+        ksx_api::StageEdit::AddSlot {
+            number: None,
+            persona: form.persona,
+            preset: form.preset,
+        },
+    )
+    .await
+}
+
+/// POST /start/controller/remove — moment 5's other half. Free and complete.
+async fn start_form_remove(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<StartSlotForm>,
+) -> Response {
+    stage_edit(
+        state,
+        ksx_api::StageEdit::RemoveSlot {
+            number: form.number,
+        },
+    )
+    .await
+}
+
+/// POST /start/blocking — moment 6's one question (`FIRST-RUN.md` §3).
+async fn start_form_blocking(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<StartBlockingForm>,
+) -> Response {
+    stage_edit(
+        state,
+        ksx_api::StageEdit::SetBlocking {
+            blocking: form.blocking,
+        },
+    )
+    .await
+}
+
+/// POST /start/discard — "Start over". §2 requires that it always works.
+async fn start_form_discard(State(state): State<Arc<AppState>>) -> Response {
+    stage_edit(state, ksx_api::StageEdit::Discard).await
+}
+
+/// POST /start/save — moment 7, half one. **One config write.**
+///
+/// The same shape `/setup/slot` and `/devices/pick` use: a backend verb that
+/// takes a timestamped backup and hands the I/O to the store's atomic save.
+/// It starts nothing — `Committed::message` says so in words, because "saved"
+/// and "playing" are the two states this flow must never let anyone confuse.
+async fn start_form_save(State(state): State<Arc<AppState>>) -> Response {
+    let outcome = tokio::task::spawn_blocking(move || {
+        let outcome = state.control.stage_commit();
+        if outcome.ok {
+            Ok(outcome.headline())
+        } else {
+            Err(outcome.headline())
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err("the save panicked".to_owned()));
+    start_redirect(outcome)
+}
+
+/// POST /start/play — moment 7, half two. **Starts a session and writes
+/// nothing.**
+///
+/// Separate from Save on purpose (§2: "saving and playing are separate acts"),
+/// and not a flag on it: a combined button would make the two indistinguishable
+/// at the moment a user is deciding whether to commit to anything at all. The
+/// plan is built in the daemon from the staged value with no file read
+/// (`ksx-app`'s `stage::plan`), so a session that starts here means exactly
+/// what the screen showed.
+async fn start_form_play(State(state): State<Arc<AppState>>) -> Response {
+    let outcome = tokio::task::spawn_blocking(move || {
+        let outcome = state.control.stage_play();
+        if outcome.ok {
+            Ok(outcome.headline())
+        } else {
+            Err(outcome.headline())
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err("the staged start panicked".to_owned()));
+    start_redirect(outcome)
 }
 
 /// 303 back to /setup with the outcome as the flash. Errors flash too — this

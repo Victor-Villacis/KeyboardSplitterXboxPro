@@ -6,15 +6,17 @@
 // spawned via execFileSync without shell:true, ENOENT — was fixed in 0.1.9,
 // so a `tailwind: true` cssEntry would now work if ever wanted.)
 //
-// THREE routes — "/" (status), "/map" (the mapper) and "/setup" (the
-// configuration: import, export, first run) — plus the vendored controller art
-// copied (cleaned) from art/ into the embed.
+// EIGHT routes — "/start" (the first run), "/" (status), "/map" (the mapper),
+// "/check", "/pads", "/devices", "/profiles" and "/setup" (the configuration:
+// import, export, first run) — plus the vendored controller art copied
+// (cleaned) from art/ into the embed.
 //
-// Adding a route is FOUR edits in this file and none of them is optional:
-// `entryPoints`, `routes`, `ssrEntryPoints`, and the FMIR version guard's list
-// at the bottom. Miss the last one and the route ships unverified; miss any of
-// the first three and `EmbeddedPage::load` fails at startup, so Studio does not
-// bind at all.
+// Adding a route is THREE edits in this file and none of them is optional:
+// `entryPoints`, `routes` and `ssrEntryPoints`. Miss any one and
+// `EmbeddedPage::load` fails at startup, so Studio does not bind at all.
+// (It used to be four: the FMIR version guard at the bottom kept its own list
+// until it was rewritten to walk `manifest.routes`, which is the same
+// declaration `routes` already is.)
 //
 // 2026-08-06: @getforma/compiler 0.3.1 + @getforma/build 0.2.0 are consumed
 // from disk (`file:` deps in package.json — npm publishing was down; the note
@@ -65,6 +67,7 @@ console.warn = (...args) => {
 
 await build({
   entryPoints: [
+    { entry: "src/start.ts", outfile: "start.js" },
     { entry: "src/status.ts", outfile: "status.js" },
     { entry: "src/map.ts", outfile: "map.js" },
     { entry: "src/check.ts", outfile: "check.js" },
@@ -75,6 +78,7 @@ await build({
   ],
   cssEntries: [{ input: "src/studio.css", outfile: "studio.css" }],
   routes: {
+    "/start": { js: ["start"], css: ["studio"] },
     "/": { js: ["status"], css: ["studio"] },
     "/map": { js: ["map"], css: ["studio"] },
     "/check": { js: ["check"], css: ["studio"] },
@@ -86,6 +90,7 @@ await build({
   outputDir,
   ssr: true,
   ssrEntryPoints: {
+    start: "src/start.ts",
     status: "src/status.ts",
     map: "src/map.ts",
     check: "src/check.ts",

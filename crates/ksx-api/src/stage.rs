@@ -139,6 +139,23 @@ pub struct BlockingOption {
     pub detail: String,
 }
 
+/// **The escape hatch, and it is always live.**
+///
+/// `docs/FIRST-RUN.md` §3: "Two things must be said on that screen, not
+/// buried." This is the first, and it is here rather than on a page because it
+/// is a fact about `ksx-capture`'s escape latch (`escape.rs` — the capture
+/// thread flips its OWN passthrough, which is why no UI can break it), not a
+/// reassurance a surface is free to word.
+pub const ESCAPE_HATCH_LINE: &str =
+    "LeftCtrl five times always stops emulation and gives every keyboard back — in both modes. It \
+     is handled in the capture thread itself, so no screen, no browser and no crashed UI can take \
+     it away.";
+
+/// **Freezing is not permanent and not global.** §3's second must-say.
+pub const BLOCKING_SCOPE_LINE: &str =
+    "This applies to the keyboard you picked, for this session only. Stopping the session ends it, \
+     and no other keyboard on this PC is affected either way.";
+
 impl BlockingOption {
     /// The two answers §3 asks about, plus the third the setting has always
     /// had. The wording lives HERE, once, so the browser and the cabinet cannot
@@ -216,6 +233,11 @@ pub struct StagedSetupView {
     pub personas: Vec<PersonaOption>,
     /// The blocking answers, in §3's own words.
     pub blocking_options: Vec<BlockingOption>,
+    /// [`ESCAPE_HATCH_LINE`], served so it cannot be paraphrased on the way to
+    /// a screen. §3 requires it beside the question, not buried.
+    pub escape_hatch: String,
+    /// [`BLOCKING_SCOPE_LINE`], same rule.
+    pub blocking_scope: String,
     /// Is this setup complete enough to save or play? A surface enables the two
     /// buttons off this rather than re-deriving the rule.
     pub ready: bool,
@@ -262,6 +284,8 @@ impl StagedSetupView {
             max_xinput_slots: MAX_XINPUT_SLOTS,
             personas: PersonaOption::roster(),
             blocking_options: BlockingOption::roster(),
+            escape_hatch: ESCAPE_HATCH_LINE.to_owned(),
+            blocking_scope: BLOCKING_SCOPE_LINE.to_owned(),
             not_ready: ready.as_ref().err().map(ToString::to_string),
             ready: ready.is_ok(),
         }
@@ -600,6 +624,33 @@ mod tests {
         // real options rather than a blank page.
         assert_eq!(view.max_slots, MAX_SLOTS);
         assert_eq!(view.personas.len(), Persona::ALL.len());
+    }
+
+    /// **§3's two must-says travel with the question.**
+    ///
+    /// Breaks against a view that served only the three options: the escape
+    /// hatch and the "this is per-keyboard, per-session" scope would then be
+    /// composed on whichever screen asked, in whatever words that screen chose,
+    /// and the browser's copy would be a second description of what the capture
+    /// thread does. The first one is not reassurance — it is the only thing
+    /// standing between a frozen keyboard and a reboot.
+    #[test]
+    fn the_blocking_question_carries_its_two_must_says() {
+        let view = StagedSetupView::of(&StagedSetup::new());
+        assert_eq!(view.escape_hatch, ESCAPE_HATCH_LINE);
+        assert_eq!(view.blocking_scope, BLOCKING_SCOPE_LINE);
+        assert!(view.escape_hatch.contains("LeftCtrl five times"));
+        assert!(
+            view.escape_hatch.contains("both modes"),
+            "the hatch works under Freeze AND Split; a sentence that said it only \
+             for one would be worse than none"
+        );
+        assert!(view.blocking_scope.contains("this session only"));
+        // A screen with no daemon still has to be able to say them — that
+        // screen is exactly where somebody is reading about how to get out.
+        let down = StagedSetupView::unreachable("no daemon answered");
+        assert_eq!(down.escape_hatch, ESCAPE_HATCH_LINE);
+        assert_eq!(down.blocking_scope, BLOCKING_SCOPE_LINE);
     }
 
     /// The whole first-run flow as a surface drives it, ending in a setup that
