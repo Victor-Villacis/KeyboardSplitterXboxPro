@@ -62,7 +62,19 @@ be composed identically in TS, and the layout test pins the Rust side.
 mouse and no keyboard at a cabinet — the arcade panel is the input, so anything
 you add must be panel-navigable.
 
-## The gate — run all of it before you commit
+## The gate — CI runs it, not your machine
+
+**Push your branch and let the runner gate it.** CI triggers on every branch,
+so `git push -u origin <branch>` is how you find out if your work is good. This
+is not a preference: this machine's CPU corrupts compute under sustained load,
+so a local pass is both slower (every rustc crash costs a full retry) and less
+trustworthy than the runner's.
+
+Locally, run the *narrow* thing — `cargo test -p <the crate you touched>` — to
+iterate. Do not run the full matrix locally; that is what the runner is for.
+
+For reference, this is what CI runs, and what you would have to reproduce if
+you ever gate by hand:
 
 ```
 cargo fmt --check                       # on the crates you touched
@@ -80,7 +92,8 @@ breakages have reached master through that gap**. `--features studio` alone has
 caught dead code twice.
 
 Touched `studio-ui/`? Also `cd studio-ui && node build.mjs`, commit the
-regenerated assets, and confirm a fresh rebuild is byte-identical.
+regenerated assets, and confirm a fresh rebuild is byte-identical. (That one is
+cheap and local — it is Node, not rustc.)
 
 ## Landmines — each one has already cost a day
 

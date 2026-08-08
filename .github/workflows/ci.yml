@@ -1,8 +1,13 @@
 name: CI
 
+# Every branch, not just master. The dev box's CPU corrupts compute under
+# sustained load (see the release-binary job below), so a local gate is slower
+# AND less trustworthy than this one: a rustc crash costs a full retry, and a
+# clean local run on a different toolchain once meant something different from
+# a clean run here. Pushing a feature branch is now how you gate it.
 on:
   push:
-    branches: [master]
+    branches: ['**']
   pull_request:
   workflow_dispatch:
 
