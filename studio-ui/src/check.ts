@@ -35,9 +35,14 @@ const FLASH_MS = 140;
  *  panel is pressing now. */
 const KEY_HISTORY = 12;
 
-/** The chips currently lit by a HIT, and when each stops being lit. Keyed by
- *  the element itself so a roster rebuild simply drops the stale entries. */
-const flashing = new Map<Element, number>();
+/** Pending flash-off timers, keyed by the chip. A chip that fires again while
+ *  still lit restarts its own timer rather than stacking a second one — which
+ *  is what a turbo button does, sixty times a second.
+ *
+ *  A TIMER and not a deadline swept on the next frame: frames only arrive when
+ *  something happens (plus a 2 s keepalive), so a swept deadline would leave a
+ *  single tap lit for up to two seconds on an otherwise idle panel. */
+const flashTimers = new Map<Element, number>();
 
 /** The key strip's contents, newest last. */
 let keys: { key: string; alias: string; state: string }[] = [];
@@ -74,33 +79,58 @@ async function pollRoster(): Promise<void> {
 function paint(envelope: LiveEnvelope): void {
   const grid = document.getElementById("chipgrid");
   if (!grid) return;
-  const now = Date.now();
 
-  // Clear last frame's holds. Flashes are left alone — they own their own
-  // deadline, which is the whole point of them.
-  for (const chip of Array.from(grid.querySelectorAll(".chip.down"))) {
-    chip.classList.remove("down");
+  // A session that has ended holds nothing. Without this, quitting the game
+  // with a button pressed would leave that chip lit for as long as the tab
+  // stayed open — a control shown as held on a pipeline that is not running.
+  if (!envelope.frame.running) {
+    clearHolds(grid, null);
   }
 
   for (const slot of envelope.frame.slots) {
+    // **Clear the holds of THIS SLOT ONLY.**
+    //
+    // A frame carries a slot only when that slot published a transition, so an
+    // absent slot means "nothing changed here" — NOT "nothing is pressed". The
+    // first version cleared every `.down` on the grid each frame and re-applied
+    // from `frame.slots`, which meant a button held on P1 went dark the instant
+    // P2 pressed anything, and dark permanently on a panel where nothing else
+    // moved. That is precisely the reading this screen exists to make
+    // trustworthy.
+    clearHolds(grid, slot.slot);
     for (const control of slot.down) {
-      const chip = chipFor(grid, slot.slot, control);
-      if (chip) chip.classList.add("down");
+      chipFor(grid, slot.slot, control)?.classList.add("down");
     }
     for (const control of slot.hit) {
       const chip = chipFor(grid, slot.slot, control);
-      if (!chip) continue;
-      chip.classList.add("flash");
-      flashing.set(chip, now + FLASH_MS);
+      if (chip) flash(chip);
     }
   }
+}
 
-  for (const [chip, until] of Array.from(flashing)) {
-    if (until <= now) {
-      chip.classList.remove("flash");
-      flashing.delete(chip);
-    }
+/** Drop the held state of one slot, or of every slot when `slot` is null. */
+function clearHolds(grid: HTMLElement, slot: number | null): void {
+  const selector =
+    slot === null
+      ? ".chip.down"
+      : `.chip.down[data-slot="${CSS.escape(String(slot))}"]`;
+  for (const chip of Array.from(grid.querySelectorAll(selector))) {
+    chip.classList.remove("down");
   }
+}
+
+/** Light a chip for [`FLASH_MS`], restarting the clock if it is already lit. */
+function flash(chip: Element): void {
+  const pending = flashTimers.get(chip);
+  if (pending !== undefined) window.clearTimeout(pending);
+  chip.classList.add("flash");
+  flashTimers.set(
+    chip,
+    window.setTimeout(() => {
+      chip.classList.remove("flash");
+      flashTimers.delete(chip);
+    }, FLASH_MS),
+  );
 }
 
 /** One chip, by the values the payload carried. `CSS.escape` because a control

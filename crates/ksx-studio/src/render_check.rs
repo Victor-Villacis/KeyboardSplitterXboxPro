@@ -511,6 +511,57 @@ mod tests {
         );
     }
 
+    /// **A frame carries a slot only when that slot MOVED.**
+    ///
+    /// `LiveSubscription::poll` folds transitions, so a slot that is absent
+    /// from a frame means "nothing changed here" — never "nothing is pressed".
+    /// A painter that cleared every held chip on the grid each frame and
+    /// re-applied from `frame.slots` would therefore drop P1's held button the
+    /// instant P2 pressed anything, and drop it permanently on a panel where
+    /// nothing else moved.
+    ///
+    /// That was the first version of `paint`, and it is the exact failure this
+    /// screen exists to make impossible: a control that IS held, shown as not
+    /// held. Pinned as a source guard because the repo has no browser harness —
+    /// the same shape as `the_live_echo_never_rewrites_the_roster` above.
+    #[test]
+    fn the_echo_clears_held_chips_per_slot_not_across_the_whole_grid() {
+        let paint = CHECK_TS
+            .split("function paint(")
+            .nth(1)
+            .expect("paint() exists")
+            .split("\nfunction ")
+            .next()
+            .expect("...and ends");
+        assert!(
+            paint.contains("clearHolds(grid, slot.slot)"),
+            "the per-slot clear is gone: {paint}"
+        );
+        assert!(
+            !paint.contains(r#"querySelectorAll(".chip.down")"#),
+            "a grid-wide clear inside the per-frame path drops other slots'              holds: {paint}"
+        );
+        // ...and a session that ended holds nothing at all.
+        assert!(
+            paint.contains("!envelope.frame.running"),
+            "a stopped session must not leave chips lit: {paint}"
+        );
+    }
+
+    /// A flash is turned off by its OWN timer, not swept on the next frame.
+    ///
+    /// Frames arrive only when something happens, plus a 2 s keepalive — so a
+    /// deadline swept per frame would leave a single tap lit for up to two
+    /// seconds on an otherwise idle panel, which reads as a stuck button on the
+    /// screen built to find stuck buttons.
+    #[test]
+    fn a_flash_expires_on_a_timer_rather_than_on_the_next_frame() {
+        assert!(
+            CHECK_TS.contains("setTimeout") && CHECK_TS.contains("clearTimeout"),
+            "the flash must own its clock, and restart it when a chip re-fires"
+        );
+    }
+
     /// Loss is REPORTED. Both counters have a place on the page and a distinct
     /// sentence — "the panel is dead" and "you are pressing the wrong
     /// keyboard" are different findings, and a page that showed one number for
