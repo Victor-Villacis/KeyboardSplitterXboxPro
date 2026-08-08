@@ -117,7 +117,11 @@ pub fn node_for(instance_id: &str) -> DeviceNode {
         registry::read_string(&key, "Service"),
         registry::read_string(&key, "DeviceDesc"),
         registry::read_string(&key, "ParentIdPrefix"),
-    );
+    )
+    // The name the device chose for itself. Rare on USB, the norm on
+    // Bluetooth — a paired device's `DeviceDesc` is the class INF's generic
+    // string and its `FriendlyName` is what it is actually called.
+    .with_friendly_name(registry::read_string(&key, "FriendlyName"));
     match status_for(instance_id) {
         Some(status) => node.with_status(status),
         None => node,

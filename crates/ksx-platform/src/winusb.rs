@@ -163,6 +163,16 @@ pub struct DeviceNode {
     pub service: Option<String>,
     /// Raw `DeviceDesc`, e.g. `@input.inf,%hid.devicedesc%;USB Input Device`.
     pub device_desc: Option<String>,
+    /// `FriendlyName` — the name the DEVICE chose or the user gave it, when the
+    /// bus writes one.
+    ///
+    /// Rare on USB and the norm on Bluetooth, which is why it exists: a paired
+    /// device's `DeviceDesc` is a generic string from the class INF
+    /// (`Bluetooth HID Device`), while its `FriendlyName` is what it is called
+    /// on the phone it was paired with — `ULT TOWER 9`, measured on this
+    /// machine. A list of four `Bluetooth HID Device` rows is not a list anyone
+    /// can pick from. See [`Self::display_name`].
+    pub friendly_name: Option<String>,
     /// Prefix Windows gives this node's children's instance ids. The only
     /// reliable registry-level link from a USB interface to its HID child.
     pub parent_id_prefix: Option<String>,
@@ -193,6 +203,7 @@ impl DeviceNode {
             class_guid,
             service,
             device_desc,
+            friendly_name: None,
             parent_id_prefix,
             status: None,
         }
@@ -202,6 +213,13 @@ impl DeviceNode {
     #[must_use]
     pub fn with_status(mut self, status: NodeStatus) -> Self {
         self.status = Some(status);
+        self
+    }
+
+    /// Attach the bus's `FriendlyName` for this node.
+    #[must_use]
+    pub fn with_friendly_name(mut self, name: Option<String>) -> Self {
+        self.friendly_name = name.filter(|n| !n.trim().is_empty());
         self
     }
 
@@ -224,6 +242,19 @@ impl DeviceNode {
         match &self.device_desc {
             Some(desc) => desc.rsplit(';').next().unwrap_or(desc).trim().to_owned(),
             None => String::new(),
+        }
+    }
+
+    /// The best name a human has for this node: what the device calls itself,
+    /// else the class INF's description, else nothing.
+    ///
+    /// Same precedence rule as `ksx_capture::UsbCandidate::friendly` and for
+    /// the same reason — a generic INF string is technically a description and
+    /// useless on a screen full of them.
+    pub fn display_name(&self) -> String {
+        match self.friendly_name.as_deref() {
+            Some(name) => name.trim().to_owned(),
+            None => self.description(),
         }
     }
 
@@ -687,10 +718,30 @@ pub fn why_unusable(node: &DeviceNode, nodes: &[DeviceNode]) -> Option<&'static 
     None
 }
 
+/// Every device the PnP manager reports as **present**, with its `Enum`
+/// properties and its live status. Read-only — see `win::devices`.
+///
+/// Public because the Bluetooth enumeration in `ksx-capture` reads the same
+/// tree this survey does, and reading it twice through two different
+/// mechanisms is how a device list ends up disagreeing with the refusal that
+/// guards it. One `CM_Get_Device_ID_ListW` walk, two consumers.
+///
+/// Off Windows there is no device tree, so the answer is an empty tree rather
+/// than a compile error — every caller already treats that conservatively.
+#[cfg(windows)]
+pub fn present_nodes() -> Vec<DeviceNode> {
+    crate::win::devices::present_nodes()
+}
+
+#[cfg(not(windows))]
+pub fn present_nodes() -> Vec<DeviceNode> {
+    Vec::new()
+}
+
 /// Survey the live machine. Read-only.
 #[cfg(windows)]
 pub fn survey() -> Survey {
-    Survey::from_nodes(&crate::win::devices::present_nodes())
+    Survey::from_nodes(&present_nodes())
 }
 
 /// Off Windows there is no device tree; every claim then refuses for want of a
