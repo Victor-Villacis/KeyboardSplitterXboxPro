@@ -791,8 +791,15 @@ Each one maps to a legacy defect or a measured constraint
   `SlotLive::hit`, and a 4 ms tap is invisible in `down` and unmistakable in
   `hit`. That is the property the button check rests on. One stream, three
   consumers by design (docs/MAPPER-UX.md Build C, docs/ENHANCEMENTS.md E8's
-  feedback bus, and Studio's live socket next); the shape lives in
-  `ksx-api::live` so none of them describes it twice.
+  feedback bus, and Studio's `/check` — SHIPPED 2026-08-08); the shape lives in
+  `ksx-api::live` so none of them describes it twice. The cabinet subscribes
+  IN-PROCESS; Studio is a separate process, so the same stream leaves the
+  daemon on its own outbound-only pipe (`ksx_api::LIVE_PIPE_NAME`, one thread
+  per viewer) and Studio re-emits it as Server-Sent Events. It is deliberately
+  NOT a verb on this control pipe: that one serves connections sequentially on
+  a single thread, so a stream held open for the life of a browser tab would
+  mean no `status`/`start`/`stop` was ever answered again
+  (`ksx_api::LiveSource`).
 - **Capture-thread purity.** No tokio, no allocation, no locks in the capture
   thread — and therefore no GUI-serving code anywhere near it. Any live
   monitor coalesces to display rate (~60 Hz); full fidelity lives in

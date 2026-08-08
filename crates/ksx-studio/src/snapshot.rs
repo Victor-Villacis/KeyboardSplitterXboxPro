@@ -54,6 +54,37 @@ pub struct MapPayload {
     pub macro_selected: String,
 }
 
+/// What `GET /api/check` serves AND what the button-check island's props carry
+/// — the same one-struct-one-serializer rule as [`StatusPayload`], parity
+/// pinned in `render_check.rs`.
+///
+/// **There is no live data in here, and that is the shape of the page.** This
+/// payload is the STRUCTURE — which slots exist, which controls each one's
+/// preset names, which keys drive them — read from disk on the server and
+/// re-read every few seconds. The lighting-up arrives on a different channel
+/// entirely (`GET /api/live`, `crate::live`), at display rate, and touches no
+/// signal on the page. Putting a frame in here would mean a button check whose
+/// echo was as fast as an HTTP poll, which is not a button check.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckPayload {
+    /// The slot roster with every preset's whole binding table — the SAME
+    /// `StatusSource::mapper()` read the mapper page uses.
+    ///
+    /// The control list per slot is `MapperSlot::bindings`' key set, which is
+    /// every function the preset names, unbound ones included. That is where
+    /// the roster has to come from: a list of "the controls an Xbox pad has"
+    /// written into the page would be a second answer to a question the
+    /// backend already answers, and docs/SURFACES.md §1 names that failure.
+    pub mapper: MapperSnapshot,
+    /// The daemon's session state — the page prints it, because "nothing is
+    /// lighting up" and "nothing is running" are the same picture and
+    /// different problems.
+    pub session: crate::control::SessionView,
+    /// One sentence saying what this screen watches and where the frames come
+    /// from. Composed in Rust so the island words nothing.
+    pub feed_hint: String,
+}
+
 /// What `GET /api/pads` serves AND what the pads island's props carry — the
 /// same one-struct-one-serializer rule as [`StatusPayload`], parity pinned in
 /// `render_pads.rs`.

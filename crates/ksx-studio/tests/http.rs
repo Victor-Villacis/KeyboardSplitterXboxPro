@@ -1133,6 +1133,13 @@ fn start_server_with_machine(
             Box::new(FixedStatus),
             Box::new(SharedControl(control)),
             Box::new(SharedMachine(machine)),
+            // These tests never open the feed; a source that refuses in words
+            // is the honest stand-in, and `/api/live` under it is a real state
+            // of the endpoint (no daemon) worth being able to assert against.
+            std::sync::Arc::new(
+                ksx_api::NoLiveSource::new("no live feed in this test")
+                    .with_remedy("start the daemon"),
+            ),
         );
     });
     // Wait until it accepts.
@@ -3602,4 +3609,159 @@ fn the_pads_api_serves_the_payload_and_never_arms_it() {
     assert_eq!(value["flash"], serde_json::json!(null));
     assert_eq!(value["pads"]["prune"]["kind"], serde_json::json!("restart"));
     assert_eq!(value["pads"]["pads"].as_array().unwrap().len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// /api/live — the live input feed, as Server-Sent Events.
+// ---------------------------------------------------------------------------
+
+/// **No daemon is an ANSWER, over real HTTP, and the browser keeps trying.**
+///
+/// The three things a browser needs from this endpoint when the feed is not
+/// there, all in one response: a 200 (an `EventSource` treats any other status
+/// as fatal and stops retrying — so a page opened before the daemon started
+/// would stay dead until somebody reloaded it by hand), a `text/event-stream`
+/// content type, and the refusal itself as an event it can put on screen.
+///
+/// Catches the shape that returned 503 with a JSON body: perfectly readable in
+/// curl, and a permanently dead feed in a browser.
+#[test]
+fn the_live_feed_answers_without_a_daemon_and_keeps_the_browser_retrying() {
+    let addr = start_server(Arc::new(ScriptedControl::new(false)));
+    let response = get(addr, "/api/live");
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "{response}"
+    );
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "a buffered live feed is worse than none: {response}"
+    );
+
+    let body = body_of(&response);
+    assert!(
+        body.contains("event: unavailable"),
+        "the refusal travels as an event: {body}"
+    );
+    assert!(
+        body.contains("retry: "),
+        "the SERVER sets the reconnect interval, not each browser: {body}"
+    );
+
+    let data = body
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("a data line");
+    let refusal: Refusal = serde_json::from_str(data).expect("the refusal is JSON");
+    assert!(!refusal.message.trim().is_empty(), "{refusal:?}");
+    assert!(
+        refusal.remedy.is_some(),
+        "a refusal owes a way out: {refusal:?}"
+    );
+}
+
+/// The feed is a READ, and reads are not what `guard.rs` polices — but the Host
+/// check covers every route, and a live stream is the one route somebody would
+/// be most tempted to exempt "because it is only a stream".
+///
+/// A rebound host reaching this endpoint would be a page on another origin
+/// watching what is typed on this cabinet's panel.
+#[test]
+fn the_live_feed_is_behind_the_guard_like_every_other_route() {
+    let addr = start_server(Arc::new(ScriptedControl::new(false)));
+    let response = http(
+        addr,
+        "GET /api/live HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 421"),
+        "a rebound host must not be able to watch the panel: {response}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// /check — BUILD C, the button check.
+// ---------------------------------------------------------------------------
+
+/// **The page is useful with the daemon down, and honest about which half.**
+///
+/// The binding table is a disk read, so it is correct whatever the pipe is
+/// doing — that half answers "what SHOULD this key do". The echo needs the
+/// feed, and the page must not imply it has one it has not opened.
+///
+/// Catches a paint that rendered the grid with a "live" state: on a machine
+/// with no daemon the chips would sit dark under the word "live", which is
+/// indistinguishable from a working check on a panel nobody is touching — this
+/// project's signature bug, on the one screen built to disprove it.
+#[test]
+fn the_button_check_renders_its_roster_and_never_claims_a_feed_it_has_not_opened() {
+    let addr = start_server(Arc::new(ScriptedControl::new(false)));
+    let response = get(addr, "/check");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    let body = body_of(&response);
+    // The roster came from the SAME `StatusSource::mapper()` the /map page
+    // reads, so the fixture's slot and its bindings are on the page.
+    assert!(body.contains("data-control="), "no chips at all: {body}");
+    assert!(body.contains("data-slot="), "chips with no slot: {body}");
+    // ...and the feed is not asserted.
+    assert!(body.contains("opening the live feed"), "{body}");
+}
+
+/// The nav has a way in. "One action away from the mapper" (docs/MAPPER-UX.md
+/// Build C) is a claim about navigation, and nothing else in the suite would
+/// notice it becoming false.
+#[test]
+fn the_mapper_is_one_click_from_the_button_check() {
+    let addr = start_server(Arc::new(ScriptedControl::new(false)));
+    let map = get(addr, "/map");
+    assert!(
+        body_of(&map).contains(r#"href="/check""#),
+        "the mapper lost its link to the button check"
+    );
+}
+
+/// The roster endpoint serves the same shape the page embeds — one struct, one
+/// serializer, so the poller cannot disagree with the paint.
+#[test]
+fn the_check_api_serves_the_roster_and_is_never_cached() {
+    let addr = start_server(Arc::new(ScriptedControl::new(true)));
+    let response = get(addr, "/api/check");
+    assert!(
+        response.contains("cache-control: no-store"),
+        "a stale roster is a wrong answer about what a key does: {response}"
+    );
+    let value: serde_json::Value = serde_json::from_str(body_of(&response)).expect("json");
+    assert!(value["mapper"].is_object(), "{value}");
+    assert!(value["session"].is_object(), "{value}");
+    assert!(
+        value["feed_hint"].as_str().is_some_and(|s| !s.is_empty()),
+        "the hint is composed in Rust and must reach the page: {value}"
+    );
+    // The frame data is NOT here, and that is the page's shape: the echo
+    // arrives on /api/live at display rate. A roster poll carrying a frame
+    // would be a button check as fast as an HTTP poll.
+    assert!(value.get("frame").is_none(), "{value}");
+}
+
+/// A rebound host must not be able to read this cabinet's binding table.
+#[test]
+fn the_check_routes_are_behind_the_guard() {
+    let addr = start_server(Arc::new(ScriptedControl::new(false)));
+    for path in ["/check", "/api/check"] {
+        let response = http(
+            addr,
+            &format!("GET {path} HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n"),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 421"),
+            "{path} answered a rebound host: {response}"
+        );
+    }
 }

@@ -15,6 +15,11 @@ rust-version.workspace = true
 # reach capture, output, or a live session.
 ksx-api.workspace = true
 axum.workspace = true
+# The `Stream` trait alone, for the live feed's SSE body (`live.rs`). Already
+# in the tree — axum's own response types are built on it — so this adds a name
+# to link against, not a crate to compile. Deliberately NOT `futures-util`:
+# nothing here needs combinators, and the smaller surface is the point.
+futures-core.workspace = true
 forma-ir.workspace = true
 forma-server.workspace = true
 rust-embed.workspace = true

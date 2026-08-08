@@ -98,7 +98,9 @@
 mod control;
 mod error;
 mod guard;
+mod live;
 mod render;
+mod render_check;
 mod render_devices;
 mod render_map;
 mod render_pads;
@@ -114,7 +116,7 @@ pub use control::{
 pub use error::StudioError;
 pub use server::serve;
 pub use snapshot::{
-    DevicesPayload, MacroSnapshot, MacroStepView, MacroView, MapPayload, MapperSlot,
+    CheckPayload, DevicesPayload, MacroSnapshot, MacroStepView, MacroView, MapPayload, MapperSlot,
     MapperSnapshot, PadRow, PadsPayload, ProfileRow, ProfilesPayload, SetupFlags, SetupLines,
     SetupPayload, SetupRows, SetupSnapshot, StatusSnapshot, StatusSource,
 };

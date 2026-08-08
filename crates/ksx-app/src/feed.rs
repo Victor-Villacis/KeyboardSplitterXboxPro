@@ -13,8 +13,9 @@
 //!                                            │
 //!                     ┌──────────────────────┼───────────────────────┐
 //!                     ▼                      ▼                       ▼
-//!             cabinet button check     Studio live socket        E8 light bus
-//!             (LiveSubscription)          (later)                  (later)
+//!             cabinet button check     Studio (SSE, via the      E8 light bus
+//!             (LiveSubscription)       live pipe — daemon/          (later)
+//!                                      live_pipe.rs)
 //! ```
 //!
 //! # The three properties, and how each one is structural rather than promised
@@ -48,17 +49,20 @@
 //! into [`ksx_api::SlotLive::hit`], so a 4 ms tap is invisible in `down` and
 //! unmistakable in `hit`.
 
-// In a build with NO UI feature there is no consumer for this stream: nothing
-// can call `subscribe`, so the fold, the frame builder and the event's fields
-// are genuinely unreachable there.
+// **This used to say "in a build with no UI feature there is nothing that can
+// call `subscribe`". That stopped being true when the live pipe landed**:
+// `crate::daemon::live_pipe` subscribes per connection and is compiled into
+// EVERY Windows build, feature flags or not, because its consumer (Studio, the
+// E8 bus) is a separate process rather than a linked window.
 //
-// They are still compiled, and that is deliberate. The producer half must be
-// byte-identical in every build — a feature flag that changes pipeline code is
-// a feature flag that changes what CI tested — and the consumer half is what
-// Studio's live socket and E8's feedback bus subscribe with next. So the
+// What is left is the NON-WINDOWS build, where there is no named pipe to serve
+// and no egui window either, so the fold and the frame builder really are
+// unreachable. They are still compiled there, and that is deliberate: the
+// producer half must be byte-identical in every build — a feature flag that
+// changes pipeline code is a feature flag that changes what CI tested — so the
 // unreachability is stated here rather than papered over with a `cfg` that
 // would fork the file.
-#![cfg_attr(not(any(test, feature = "cabinet")), allow(dead_code))]
+#![cfg_attr(not(any(test, windows, feature = "cabinet")), allow(dead_code))]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -537,6 +541,37 @@ impl Fold {
             off_panel: 0,
         }
     }
+}
+
+/// `[[device]]` id → alias, so a key hit says "IPAC P1" and not a
+/// 60-character instance path.
+///
+/// Read on the CONSUMER's own thread — the cabinet window's, or a live-pipe
+/// viewer's — because the engine thread that publishes those hits must not
+/// read a config file. The fan-out carries the instance path; the consumer
+/// names it ([`LiveSubscription::set_aliases`]).
+///
+/// The id handed over is the **written** spelling, not a resolved one: a
+/// window thread has no business enumerating USB, and it does not have to.
+/// [`LiveSubscription::alias_for`] matches a `usb:` selector against the
+/// concrete id on the wire, which is the whole reason it is selector-aware.
+///
+/// Lives here rather than in `crate::cabinet` (where it began) because it is
+/// not the cabinet's: the live pipe reads it per connection, and that server
+/// is compiled into **every** build — a default `ksx daemon` with neither UI
+/// feature still serves the feed, because its consumer is another process.
+pub fn device_aliases(root: &ksx_config::ConfigRoot) -> Vec<(String, String)> {
+    ksx_config::Store::new(root.clone())
+        .load_config()
+        .map(|loaded| {
+            loaded
+                .value
+                .devices
+                .iter()
+                .map(|device| (device.id.raw().to_owned(), device.alias.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The four axes, in the order [`SlotFold::hit_axes`] holds them.

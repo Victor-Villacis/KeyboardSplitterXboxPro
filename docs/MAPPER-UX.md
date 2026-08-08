@@ -17,8 +17,10 @@ complex tool with the simplest interface."
 2. **Every mapping screen is also a button-check screen.** Live echo on the
    mapping surface itself (x360ce's lit-up pad, MAME's Input Devices, Naomi
    INPUT TEST, Tekken-7-at-character-select). RetroArch had to retrofit one
-   by community bounty. Requires the live socket; until it lands, the learn
-   modal's capture feedback is the interim echo.
+   by community bounty. Requires the live socket — **which SHIPPED
+   2026-08-08**: `\\.\pipe\ksx-live` out of the daemon, Server-Sent Events
+   out of Studio, and `/check` is its first consumer. The mapper's own
+   in-place echo is the remaining half.
 3. **Two flows, one gesture each.** ES proves the sequential wizard (press,
    press, press — auto-advance, hold-to-skip, completeness audit, nothing
    saved until OK) is perfect for FIRST CONTACT and miserable for
@@ -173,13 +175,35 @@ visible). Per-slot, then "next slot →" chaining for P1→P4 first contact.
 This is also the seed of the M7 setup wizard — same component, pointed at a
 fresh machine.
 
-**Build C — button check (needs the live socket).** The test view one action
-away from the mapper, and eventually on it: press panel keys → the virtual
-controls light across ALL slot renders simultaneously (the fan-out made
-visible — four pads glowing from one keystroke is also the product demo).
-Doubles as wiring diagnostics (the operator TEST heritage) and as the
-mapper's live echo (commandment 2). Same socket feeds the E8 light bus and
-the 3D viewer later — one stream, three consumers.
+**Build C — button check: SHIPPED (2026-08-08), and so is the socket under
+it.** `/check`, one click from the mapper on every screen's nav: press panel
+keys → the virtual controls light across ALL slots simultaneously (the fan-out
+made visible — four pads glowing from one keystroke is also the product demo).
+Doubles as wiring diagnostics (the operator TEST heritage).
+
+*The socket.* The daemon's fan-out (`crate::feed::LiveSink`, which the cabinet
+window has subscribed to in-process since M9) now leaves the process on a
+channel of its own — `\\.\pipe\ksx-live`, outbound-only, one thread per
+viewer — and Studio re-emits it as Server-Sent Events at `/api/live`. It is
+NOT a verb on the control pipe, and the reason is on `ksx_api::LiveSource`:
+that pipe serves connections sequentially on one thread, so a stream held open
+would take the daemon's whole control surface down with the tab. SSE rather
+than a WebSocket because the stream is one-directional, inherits `guard.rs`
+and the CSP unchanged, and reconnects itself. **One stream, three consumers**
+holds: the E8 light bus and the 3D viewer subscribe to the same
+`LiveSubscription`, in-process or over the same pipe.
+
+*The rendering.* Chips, not four controller drawings — the mapper's 25
+absolutely-positioned hit zones per persona, four times over at quarter size
+on a phone, would be four sets of geometry to keep aligned and a fight with
+the responsive pass. So Build C is the other half of commandment 4 ("legend as
+TABLE"): one auto-fill grid of touch-floor chips carrying slot, canonical
+control name and the key that drives it. The roster is the BACKEND's —
+`MapperSlot::bindings`' key set, unbound controls included, because that is
+exactly the control somebody is standing at the cabinet trying to test.
+
+*What is left of commandment 2.* The echo ON the mapping surface itself. The
+feed it needs now exists and `/check` is the reference consumer.
 
 ## Explicitly deferred (recorded so they're chosen, not forgotten)
 

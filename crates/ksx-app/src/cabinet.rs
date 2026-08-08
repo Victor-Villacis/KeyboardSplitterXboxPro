@@ -265,7 +265,7 @@ pub fn spawn_in_daemon(
                     // the previous one went away with the previous `App`, and
                     // the config may have been edited in between.
                     let mut subscription = feed.subscribe();
-                    let aliases = device_aliases(&root);
+                    let aliases = crate::feed::device_aliases(&root);
                     tracing::info!(
                         open = opened,
                         aliases = aliases.len(),
@@ -344,31 +344,6 @@ pub fn spawn_in_daemon(
             tracing::error!("the cabinet window host is gone; no window can be opened");
         }
     }
-}
-
-/// `[[device]]` id → alias, so a key hit says "IPAC P1" and not a 60-character
-/// instance path.
-///
-/// Read HERE, on the window's own thread, because the engine thread that
-/// publishes those hits must not read a config file — the fan-out carries the
-/// instance path and the consumer names it (`crate::feed`).
-///
-/// The id handed over is the **written** spelling, not a resolved one: this
-/// thread has no business enumerating USB, and it does not have to.
-/// `LiveSubscription::alias_for` matches a `usb:` selector against the
-/// concrete id on the wire, which is the whole reason it is selector-aware.
-fn device_aliases(root: &ksx_config::ConfigRoot) -> Vec<(String, String)> {
-    ksx_config::Store::new(root.clone())
-        .load_config()
-        .map(|loaded| {
-            loaded
-                .value
-                .devices
-                .iter()
-                .map(|device| (device.id.raw().to_owned(), device.alias.clone()))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -473,9 +448,9 @@ mod tests {
             .split("pub fn spawn_in_daemon")
             .nth(1)
             .expect("the host lives here")
-            .split("fn device_aliases")
+            .split("#[cfg(test)]")
             .next()
-            .expect("device_aliases follows it");
+            .expect("the test module follows it");
         for forbidden in [
             "DaemonCommand::Quit",
             "PostQuitMessage",

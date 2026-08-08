@@ -49,10 +49,13 @@
 //! | [`machine`] | the local machine verbs (devices, pads, presets, autostart, doctor, WinUSB) |
 //! | [`client`] | [`VerbSink`] → [`ControlSource`], for either transport |
 //! | [`pipe`] | the named-pipe transport |
+//! | [`live`] | the live input fan-out: the frame shape, and [`LiveSource`] for a surface in another process |
+//! | [`live_pipe`] | the live feed's own one-directional pipe — why it is not a verb on [`pipe`] is on [`LiveSource`] |
 
 pub mod client;
 pub mod control;
 pub mod live;
+pub mod live_pipe;
 pub mod machine;
 pub mod pipe;
 pub mod refusal;
@@ -75,7 +78,11 @@ pub use control::{
     map_request, multi_key_refusal, with_key, without_key, BindConflict, BindOutcome, BindRequest,
     ControlSource, LearnView, MacroOutcome, MacroWrite, SessionView, SlotOutcome,
 };
-pub use live::{KeyHit, LiveFeed, LiveFrame, NoFeed, PadFeedback, SlotLive};
+pub use live::{
+    KeyHit, LiveEnvelope, LiveFeed, LiveFrame, LiveSource, LiveStream, NoFeed, NoLiveSource,
+    PadFeedback, SlotLive, LIVE_PIPE_NAME,
+};
+pub use live_pipe::PipeLiveSource;
 pub use machine::{
     setup_states, setup_steps, AdviceRow, AutostartView, BoardRow, ConfigExport, ConfiguredDevice,
     DevicePickSpec, DevicePickView, DeviceRemoveSpec, DeviceRemoveView, DeviceScanView,

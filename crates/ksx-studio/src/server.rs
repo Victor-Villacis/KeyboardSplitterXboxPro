@@ -37,17 +37,19 @@ use serde::Deserialize;
 use crate::control::{BindOutcome, BindRequest, ControlSource, SessionView};
 use crate::error::StudioError;
 use crate::render::{render_status, Assets, BrandAssets, EmbeddedPage};
+use crate::render_check::render_check;
 use crate::render_devices::render_devices;
 use crate::render_map::render_map;
 use crate::render_setup::render_setup;
 use crate::snapshot::{
-    DevicesPayload, MapPayload, PadsPayload, ProfilesPayload, SetupPayload, SetupSnapshot,
-    StatusPayload, StatusSnapshot, StatusSource,
+    CheckPayload, DevicesPayload, MapPayload, PadsPayload, ProfilesPayload, SetupPayload,
+    SetupSnapshot, StatusPayload, StatusSnapshot, StatusSource,
 };
 
 struct AppState {
     page: EmbeddedPage,
     map_page: EmbeddedPage,
+    check_page: EmbeddedPage,
     pads_page: EmbeddedPage,
     devices_page: EmbeddedPage,
     profiles_page: EmbeddedPage,
@@ -66,6 +68,20 @@ struct AppState {
     /// the config store, the bus device), readable while the pipe is dead,
     /// exactly as the read-only mapper is.
     machine: Box<dyn ksx_api::MachineSource>,
+    /// The FOURTH provider: the live input feed
+    /// (`ksx_api::LiveSource` over the `ksx-live` named pipe).
+    ///
+    /// Not a method on any of the other three, because it is not their shape.
+    /// Status is a point-in-time snapshot, control is one verb per call and
+    /// machine is what is on this box — all three are *questions with an
+    /// answer*. This is a subscription that outlives any answer, on its own
+    /// channel, for a reason [`ksx_api::LiveSource`] spells out: the control
+    /// pipe serves connections one at a time, so a stream on it would take the
+    /// daemon's whole control surface down with the tab.
+    ///
+    /// `Arc`, not `Box`, because every SSE connection hands a handle to its own
+    /// blocking bridge thread.
+    live: Arc<dyn ksx_api::LiveSource>,
 }
 
 /// Serve the page until the process is killed (Ctrl+C included — no
@@ -82,12 +98,14 @@ pub fn serve(
     source: Box<dyn StatusSource>,
     control: Box<dyn ControlSource>,
     machine: Box<dyn ksx_api::MachineSource>,
+    live: Arc<dyn ksx_api::LiveSource>,
 ) -> Result<(), StudioError> {
     if !bind.ip().is_loopback() {
         return Err(StudioError::NonLoopbackBind { bind });
     }
     let page = EmbeddedPage::load("/")?;
     let mapper = EmbeddedPage::load("/map")?;
+    let check = EmbeddedPage::load("/check")?;
     let pads = EmbeddedPage::load("/pads")?;
     let devices = EmbeddedPage::load("/devices")?;
     let profiles = EmbeddedPage::load("/profiles")?;
@@ -95,6 +113,7 @@ pub fn serve(
     let state = Arc::new(AppState {
         page,
         map_page: mapper,
+        check_page: check,
         pads_page: pads,
         devices_page: devices,
         profiles_page: profiles,
@@ -102,6 +121,7 @@ pub fn serve(
         source,
         control,
         machine,
+        live,
     });
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -178,6 +198,22 @@ pub fn serve(
             // `MachineSource` verb each, and the arming step is a GET
             // (`/pads?confirm=1`) because showing someone what a destructive
             // button will remove must not itself be a POST.
+            // BUILD C — the button check, one click from the mapper. Two
+            // routes and no verbs: the page is a READ of the slot roster, and
+            // the lighting-up arrives on /api/live beside it rather than
+            // through either of these. Nothing here writes, so nothing here
+            // needs the guard's mutating arm — the Host check still covers it,
+            // which is what stops a rebound origin watching the panel.
+            .route("/check", get(check_page))
+            .route("/api/check", get(api_check))
+            // ── THE LIVE FEED ─────────────────────────────────────────────
+            // One route, and it is the keystone the button check stands on:
+            // the daemon's input fan-out as Server-Sent Events. Read-only and
+            // one-directional by construction — the browser has nothing to say
+            // back, and everything it might want to say is already a verb on a
+            // route above. `crate::live` carries why SSE and not a WebSocket,
+            // and how a stalled tab is made to cost the pipeline nothing.
+            .route("/api/live", get(api_live))
             .route("/pads", get(pads_page))
             .route("/api/pads", get(api_pads))
             .route("/pads/spawn", post(pads_form_spawn))
@@ -1746,6 +1782,79 @@ async fn api_pads(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
+/// One fresh [`CheckPayload`]: the slot roster and the session, on a blocking
+/// worker like every other collector read.
+///
+/// Deliberately the SAME `StatusSource::mapper()` the mapper page calls. The
+/// button check's control roster is a preset's binding table — there is no
+/// second read of it and no second shape for it, so a preset edit made on
+/// /map is on /check at the next roster poll with nothing to keep in step.
+async fn collect_check(state: &Arc<AppState>) -> CheckPayload {
+    let check_state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        crate::render_check::payload(check_state.source.mapper(), check_state.control.session())
+    })
+    .await
+    .unwrap_or_else(|_| {
+        crate::render_check::payload(
+            ksx_api::MapperSnapshot::unavailable("reading the slots panicked"),
+            SessionView::unreachable("reading the slots panicked"),
+        )
+    })
+}
+
+/// `GET /check` — BUILD C, the button check (docs/MAPPER-UX.md).
+///
+/// The document is the binding table, read from disk; the lighting-up is
+/// `/api/live` beside it. Both halves are needed and only one of them is here
+/// — see `crate::render_check` for why that split IS the page.
+async fn check_page(State(state): State<Arc<AppState>>) -> Response {
+    let payload = collect_check(&state).await;
+    let out = render_check(&state.check_page, &payload);
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_str(&out.csp)
+                    .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'")),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        out.html,
+    )
+        .into_response()
+}
+
+/// The roster poller's endpoint — the same [`CheckPayload`] the /check page
+/// embeds as island props (parity unit-tested in render_check.rs).
+///
+/// Polled every few SECONDS, not at display rate: this is the structure, and
+/// the structure only changes when somebody edits a preset.
+async fn api_check(State(state): State<Arc<AppState>>) -> Response {
+    let payload = collect_check(&state).await;
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        axum::Json(payload),
+    )
+        .into_response()
+}
+
+/// `GET /api/live` — the daemon's input fan-out, as Server-Sent Events.
+///
+/// The one endpoint on this server that is a SUBSCRIPTION rather than an
+/// answer. It never touches the other three providers: it hands the request's
+/// own bridge thread a handle to [`AppState::live`] and gets out of the way.
+/// `crate::live` holds the design — why SSE, why the channel is one slot deep
+/// and blocking, and why "no daemon" is a 200 with a refusal event rather than
+/// a status code.
+async fn api_live(State(state): State<Arc<AppState>>) -> Response {
+    crate::live::stream(Arc::clone(&state.live))
+}
+
 /// 303 back to /pads, carrying the outcome as the flash. Errors flash exactly
 /// like successes — a page with no JavaScript must never fail silently.
 fn pads_redirect(outcome: Result<String, String>) -> Response {
@@ -2352,6 +2461,7 @@ mod tests {
                 Box::new(NullSource),
                 Box::new(NullControl),
                 Box::new(NullMachine),
+                Arc::new(ksx_api::NoLiveSource::new("no live feed in this test")),
             )
             .unwrap_err();
             assert!(

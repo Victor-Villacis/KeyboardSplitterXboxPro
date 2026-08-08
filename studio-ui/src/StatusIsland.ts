@@ -282,6 +282,7 @@ export function StatusIsland() {
         { class: "topnav", "aria-label": "screens" },
         h("a", { class: "navlink on", href: "/", "aria-current": "page" }, "Status"),
         h("a", { class: "navlink", href: "/map" }, "Mapper"),
+        h("a", { class: "navlink", href: "/check" }, "Check"),
         h("a", { class: "navlink", href: "/pads" }, "Pads"),
         h("a", { class: "navlink", href: "/devices" }, "Devices"),
         h("a", { class: "navlink", href: "/profiles" }, "Profiles"),

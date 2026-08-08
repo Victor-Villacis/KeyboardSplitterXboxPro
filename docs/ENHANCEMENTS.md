@@ -351,12 +351,16 @@ out to pluggable sinks behind a small trait:
 - **OpenRGB** — this PC already has Aura (VID 0B05) and an NZXT Kraken
   (VID 1E71) on WinUSB; rumble → case/room RGB flash is a spike away via
   OpenRGB's open SDK server;
-- **ksx Studio** — the same live socket the mapper UI needs; rumble pulses
-  rendered on the on-screen controller (the PadForge live-echo pattern,
-  outbound direction);
+- **ksx Studio** — the live feed already carries it. `LiveFrame::feedback`
+  is on the wire and reaches the browser through `/api/live`; what is missing
+  is only the RENDER (rumble pulses on the on-screen controller — the PadForge
+  live-echo pattern, outbound direction). No new transport is needed;
 - whatever else earns a sink (OBS overlay, marquee light, audio cue). Sinks
   are lossy consumers of a lossy stream by contract — a slow sink can never
   backpressure the engine (same rule as everything else near the pipeline).
 
-Status: **unblocked**, still post-M7 in sequence; the sink trait should be
-designed alongside the Studio live socket since they consume the same stream.
+Status: **unblocked**, still post-M7 in sequence. The Studio live socket it
+was to be designed alongside SHIPPED on 2026-08-08 (`ksx-app/src/daemon/
+live_pipe.rs` + `ksx-studio/src/live.rs`), so the sink trait now has a
+concrete second consumer to be shaped against rather than a hypothetical one —
+and `PadFeedback` is already a field of every frame both of them read.

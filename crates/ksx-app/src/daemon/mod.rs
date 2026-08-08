@@ -62,6 +62,11 @@
 
 pub mod learn;
 pub mod live;
+/// The live feed's own channel out of this process (`\\.\pipe\ksx-live`).
+/// `live.rs` is the session FACTORY; this is the fan-out's door. Two files,
+/// two unrelated meanings of "live", named apart so a reader does not have to
+/// guess.
+pub mod live_pipe;
 pub mod panel;
 pub mod pipe;
 #[cfg(windows)]
@@ -1171,6 +1176,35 @@ pub fn run(
                 // BOUNCE rather than a hot swap.
                 slot_assign: pipe::slot_assign_fn(map_root),
                 learn: learn::LearnService::with_rawinput(),
+            },
+        );
+    }
+
+    // THE LIVE FEED'S OWN CHANNEL, beside the control pipe and deliberately
+    // not on it. The control pipe is one line out, one line in, served
+    // sequentially on one thread — a connection held open to carry frames
+    // would hold that thread for as long as a browser tab was open and no
+    // `status`/`start`/`stop` would ever be answered again. So the stream gets
+    // its own name, its own thread per viewer, and its own failure: a wedged
+    // live feed must never stop somebody pressing Stop
+    // (`ksx_api::LiveSource`, `live_pipe`).
+    //
+    // The cabinet does NOT go through this — it runs inside this process and
+    // subscribes to `feed` directly. This exists for the surfaces that do not:
+    // Studio today, the E8 light bus and the 3D viewer next. One stream, three
+    // consumers (docs/MAPPER-UX.md Build C).
+    #[cfg(windows)]
+    {
+        let alias_root = factory.root.clone();
+        live_pipe::server::spawn(
+            ksx_api::LIVE_PIPE_NAME.to_owned(),
+            live_pipe::LiveDeps {
+                feed: feed.clone(),
+                // Read per connection, on the connection's own thread — the
+                // engine thread that publishes key hits must not read a config
+                // file, and a viewer that connects after a `[[device]]` edit
+                // must see the new names without a daemon restart.
+                aliases: Box::new(move || crate::feed::device_aliases(&alias_root)),
             },
         );
     }

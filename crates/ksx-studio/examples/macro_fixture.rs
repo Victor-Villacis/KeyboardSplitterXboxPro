@@ -253,6 +253,12 @@ fn main() {
         Box::new(store.clone()),
         Box::new(store),
         Box::new(NoMachine),
+        // The fixture has no daemon behind it, so the live feed refuses in
+        // words — which is the state the button check renders when nothing is
+        // running, and therefore a state worth being able to look at.
+        std::sync::Arc::new(ksx_api::NoLiveSource::new(
+            "this is the macro fixture — there is no daemon behind it, so there is no live feed",
+        )),
     ) {
         eprintln!("fixture failed: {err}");
         std::process::exit(1);
