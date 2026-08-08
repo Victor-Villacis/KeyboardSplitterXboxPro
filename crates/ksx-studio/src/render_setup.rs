@@ -1026,6 +1026,7 @@ mod tests {
         assert!(out.html.contains("ksx device pick"), "{}", out.html);
         assert!(out.html.contains(r#"href="/""#), "{}", out.html);
         assert!(out.html.contains(r#"href="/map""#), "{}", out.html);
+        assert!(out.html.contains(r#"href="/pads""#), "{}", out.html);
         assert!(
             out.html.contains(r#"class="navlink on" href="/setup""#),
             "the current route must be marked: {}",

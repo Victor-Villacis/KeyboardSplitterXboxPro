@@ -45,6 +45,17 @@ const VIGEMBUS_SERVICE: &str = "ViGEmBus";
 const HIDMAESTRO_SERVICE: &str = "HIDMaestro";
 const HIDMAESTRO_UMDF_DLL: &str = r"System32\drivers\UMDF\HIDMaestro.dll";
 
+/// Just the ViGEm bus's children, without the rest of the driver stack.
+///
+/// [`collect`] builds SIX reports — registry reads for two bus services, an
+/// Interception class-filter walk, `dll.is_file()` probes, a CI-policy read
+/// and a process snapshot — and a caller that wants the pad list pays for all
+/// of it. Studio's /pads polls every 2 s and discards five sixths of that
+/// report, which is what this exists to stop.
+pub fn collect_virtual_pads() -> VirtualPadReport {
+    virtual_pads()
+}
+
 /// Collect the full driver-health report from the live machine.
 pub fn collect() -> DriverReport {
     let windir = windir();

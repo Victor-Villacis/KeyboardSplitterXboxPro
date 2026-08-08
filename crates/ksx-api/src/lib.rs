@@ -46,7 +46,7 @@
 //! | [`wire`] | the protocol: one type per request and per response, and the ONE place the JSON shapes are derived from |
 //! | [`control`] | the write side — [`ControlSource`] and its view types |
 //! | [`status`] | the read side — [`StatusSource`] and its snapshots |
-//! | [`machine`] | the local machine verbs (devices, presets, autostart, doctor, WinUSB) |
+//! | [`machine`] | the local machine verbs (devices, pads, presets, autostart, doctor, WinUSB) |
 //! | [`client`] | [`VerbSink`] → [`ControlSource`], for either transport |
 //! | [`pipe`] | the named-pipe transport |
 
@@ -80,10 +80,11 @@ pub use machine::{
     setup_states, setup_steps, AdviceRow, AutostartView, BoardRow, ConfigExport, ConfiguredDevice,
     DevicePickSpec, DevicePickView, DeviceRemoveSpec, DeviceRemoveView, DeviceScanView,
     DevicesView, DoctorRow, DoctorView, ExportRequest, ImportReport, ImportRequest, ImportWrite,
-    KeyboardRow, MachineSource, NewPreset, NewProfile, PresetRow, PresetsView, ProfileDetail,
-    ProfilesView, SetupDeviceRow, SetupSlotRow, SetupStep, SetupView, TemplateRow, UsbRow,
-    WinusbView, CAVEAT_NOT_A_KEYBOARD, CLAIM_LEAD, NO_BOARDS_LINE, RELEASE_LEAD,
-    UNREAD_BOARDS_LINE, UNREAD_CONFIGURED_LINE,
+    KeyboardRow, MachineSource, NewPreset, NewProfile, PadsSpawnSpec, PadsView, PresetRow,
+    PresetsView, ProfileDetail, ProfilesView, PrunePlanView, SetupDeviceRow, SetupSlotRow,
+    SetupStep, SetupView, SpawnOffer, SpawnOption, TemplateRow, UsbRow, VirtualPadRow, WinusbView,
+    CAVEAT_NOT_A_KEYBOARD, CLAIM_LEAD, NO_BOARDS_LINE, RELEASE_LEAD, UNREAD_BOARDS_LINE,
+    UNREAD_CONFIGURED_LINE,
 };
 pub use pipe::{PipeTransport, TransportError, NO_CHANNEL};
 pub use refusal::{codes, Refusal, Refused};

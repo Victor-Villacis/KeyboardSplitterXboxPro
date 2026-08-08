@@ -42,6 +42,10 @@ windows-sys = { workspace = true, features = [
     # `winusb`: CM_Get_Device_ID_ListW — read-only present-device enumeration.
     # Nothing here opens, claims, or configures a device.
     "Win32_Devices_DeviceAndDriverInstallation",
+    # `xinput`: XInputGetState over indices 0..MAX_XINPUT_SLOTS — the only way
+    # to learn how many of Windows' four slots are actually taken. Counting
+    # ViGEmBus children answers a different question (see xinput.rs).
+    "Win32_UI_Input_XboxController",
 ] }
 
 [dev-dependencies]

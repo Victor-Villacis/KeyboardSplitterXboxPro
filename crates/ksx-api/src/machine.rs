@@ -163,15 +163,59 @@ pub trait MachineSource: Send + Sync {
         ))
     }
 
+    /// `ksx pads` / `ksx pads --prune`, as a page can read them: what is on
+    /// the bus, what would be removed, and what a spawn may legally offer.
+    ///
+    /// Read-only. Everything a surface needs to decide *before* a click —
+    /// including the XInput ceiling stated in words — arrives here, so no
+    /// surface has to know that four is the number (docs/SURFACES.md §1).
+    ///
+    /// **`session_running` is an input, not something this re-reads.** Both
+    /// pad verbs refuse while emulation is live, so the answer appears twice
+    /// on one screen: in the header pill and in the spawn panel's refusal. A
+    /// second daemon round-trip inside this call would make those two reads
+    /// separate points in time, and a session that starts between them paints
+    /// "idle" beside "a session is running". One read, one render.
+    fn pads_view(&self, _session_running: bool) -> Result<PadsView, Refusal> {
+        Err(Refusal::not_here(
+            "the virtual-pad report",
+            "run `ksx pads --prune` (a dry run) or `ksx doctor`",
+        ))
+    }
+
     /// `ksx pads` — plug N test pads, run the pattern, unplug.
     ///
-    /// Defaulted-refused deliberately: test pads COMPETE for the four XInput
-    /// slots, so this is only ever legal while emulation is stopped, and the
-    /// CLI is where that judgement (and the Ctrl+C that ends it) lives today.
-    fn pads(&self, _count: u8, _persona: &str) -> Result<String, Refusal> {
+    /// Defaulted-refused, and the default is still the honest answer for any
+    /// surface that has not thought about the two things the CLI carried
+    /// implicitly: test pads COMPETE for the four XInput slots, so this is
+    /// only ever legal while emulation is stopped, and the Ctrl+C that ends a
+    /// console run does not exist on a web page. An implementation owes both —
+    /// a refusal while a session is live, and a bounded hold that unplugs
+    /// itself — which is why the spec carries [`PadsSpawnSpec::hold_secs`]
+    /// rather than leaving "how does this end" to the caller.
+    fn pads(&self, _spec: &PadsSpawnSpec) -> Result<String, Refusal> {
         Err(Refusal::not_here(
             "the pad test",
             "run `ksx pads --count 4` with emulation stopped",
+        ))
+    }
+
+    /// `ksx pads --prune` — clear pads that outlived whatever made them.
+    ///
+    /// `confirm` is the CLI's `--yes`, and it means the same thing: without it
+    /// this is a DRY RUN that only says what it would do. The dry-run-first
+    /// consent shape is not the surface's to choose — a verb that restarts a
+    /// bus device and drops every pad on it keeps it wherever it is called
+    /// from.
+    ///
+    /// Restarting a bus devnode needs an administrator token and ksx never
+    /// self-elevates, so an implementation running unelevated must REFUSE in
+    /// words with the command to run instead — never silently do nothing.
+    /// [`PadsView::elevated`] is how a page says that before the click.
+    fn pads_prune(&self, _confirm: bool) -> Result<String, Refusal> {
+        Err(Refusal::not_here(
+            "clearing the bus",
+            "run `ksx pads --prune` (a dry run) and then `--yes` from an elevated prompt",
         ))
     }
 
@@ -971,6 +1015,220 @@ pub struct TemplateRow {
     pub players: Vec<u8>,
 }
 
+/// `ksx pads`, presentation-shaped: the bus, its children, and both verbs'
+/// preconditions in one read.
+///
+/// Composed sentences on purpose, like [`DevicesView`]'s `detail` and
+/// [`StatusSnapshot`](crate::StatusSnapshot)'s driver lines: the wording of
+/// "four XInput slots, two already taken" is a fact about ksx's own limits,
+/// and a surface that re-derives it is a surface that will disagree with the
+/// CLI about it (docs/SURFACES.md §1).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadsView {
+    pub generated_at: String,
+    /// One line: how many pads the bus is carrying.
+    pub summary: String,
+    /// The ViGEmBus devnode the children hang off — also the argument to the
+    /// prune command. `None` when the bus has no present devnode.
+    pub bus_instance_id: Option<String>,
+    /// [`Self::bus_instance_id`] as a sentence, including the case where there
+    /// is not one. A surface renders this; it does not compose it.
+    #[serde(default)]
+    pub bus_line: String,
+    pub pads: Vec<VirtualPadRow>,
+    /// Known splitter processes alive right now, as `name (pid N)` lines.
+    /// Heuristic by nature — a third-party ViGEm feeder is invisible to it.
+    pub owners: Vec<String>,
+    /// [`Self::owners`] as a sentence — and, when the list is empty, the
+    /// hedge the heuristic needs ("no KNOWN splitter", never "no owner").
+    #[serde(default)]
+    pub owners_line: String,
+    /// Is emulation live? Both verbs refuse while it is: a spawn would fight
+    /// the pads a player is holding, and a prune would yank them.
+    pub session_running: bool,
+    /// How many XInput slots Windows has (`ksx_core::MAX_XINPUT_SLOTS`).
+    pub xinput_ceiling: u8,
+    /// How many of those slots hold a pad right now — **any** pad on this
+    /// machine, real or virtual, read from XInput itself
+    /// (`ksx_platform::xinput::slots_in_use`).
+    ///
+    /// `None` means the reading FAILED. It is not zero, and a surface must
+    /// not render it as zero: counting only ksx's own virtual pads is how a
+    /// cabinet with two real wired Xbox pads gets told four more will be
+    /// readable when the true answer is two.
+    #[serde(default)]
+    pub xinput_in_use: Option<u8>,
+    /// **The ceiling, said out loud for this machine right now.** The reason
+    /// this is a backend string and not a page's `if`: `ksx pads --count 8
+    /// --persona xbox360` plugs eight pads and four of them are invisible to
+    /// every game (open task #16), and a surface must be able to say that
+    /// BEFORE the button is pressed without knowing why four is the number.
+    pub xinput_line: String,
+    /// Does THIS process hold an administrator token? `None` = unanswerable.
+    /// A prune restarts a bus device, which needs one; a page shows this
+    /// before the click rather than after the refusal.
+    pub elevated: Option<bool>,
+    /// [`Self::elevated`] as a sentence, including the "this prune WILL be
+    /// refused" consequence. Not neutral formatting — which is exactly why it
+    /// is composed once here instead of twice, in two languages, on two
+    /// surfaces that then disagree.
+    #[serde(default)]
+    pub elevation_line: String,
+    /// The destructive panel's lead: what a prune removes, and that it takes
+    /// every pad at once. Also not neutral formatting.
+    #[serde(default)]
+    pub confirm_line: String,
+    /// The failed-read banner's HEADING — "ksx could not read the ViGEm bus."
+    /// — set by [`Self::unreadable`] and empty on a read that answered.
+    ///
+    /// A field because the sentence used to exist twice: composed here, and
+    /// hardcoded again as an `<h2>` in `PadsIsland.ts`. Two copies of one
+    /// sentence in two languages is the drift docs/SURFACES.md §1a names, and
+    /// a heading is not an exception to it — reword this constructor and a
+    /// page with its own copy would keep announcing the old wording forever.
+    #[serde(default)]
+    pub unreadable_heading: String,
+    pub prune: PrunePlanView,
+    pub spawn: SpawnOffer,
+}
+
+impl PadsView {
+    /// The view for a read that **failed** — which is not the same view as an
+    /// empty bus, and must never render as one.
+    ///
+    /// This is the project's signature bug in miniature: a session once
+    /// reported success while the arcade panel was dead, because a board fell
+    /// back to a driver nobody had asked for. "I could not read this" and
+    /// "there is nothing here" are different sentences and a user acts on
+    /// them differently — the first sends them to `ksx doctor`, the second
+    /// tells them the machine is fine.
+    ///
+    /// So every composed sentence here says the reading failed, and the spawn
+    /// offer is REFUSED rather than served empty: an empty `<select>` beside a
+    /// live Spawn button is a page inviting a click it cannot describe.
+    pub fn unreadable(reason: &str) -> Self {
+        let failed = "ksx could not read the ViGEm bus.";
+        PadsView {
+            generated_at: String::new(),
+            summary: format!("{failed} Nothing below is a reading of this machine."),
+            bus_instance_id: None,
+            bus_line: format!("{failed} This is not a claim that the bus has no devnode."),
+            pads: Vec::new(),
+            owners: Vec::new(),
+            owners_line: format!("{failed} Nothing is known about who holds the pads."),
+            session_running: false,
+            // A fact about Windows, not a reading of this machine — it stays
+            // true whether or not the bus could be reached.
+            xinput_ceiling: ksx_core::MAX_XINPUT_SLOTS,
+            xinput_in_use: None,
+            xinput_line: format!(
+                "{failed} It cannot say how many XInput slots are free, or how many more pads a \
+                 game would see."
+            ),
+            elevated: None,
+            elevation_line: String::new(),
+            confirm_line: String::new(),
+            unreadable_heading: failed.to_owned(),
+            prune: PrunePlanView {
+                kind: "unreadable".to_owned(),
+                count: 0,
+                command: None,
+                detail: format!("{failed} It cannot say what a prune would remove."),
+            },
+            spawn: SpawnOffer {
+                counts: Vec::new(),
+                personas: Vec::new(),
+                holds: Vec::new(),
+                note: String::new(),
+                refused: Some(format!("{failed} {reason}")),
+            },
+        }
+    }
+}
+
+/// One pad hanging off the bus.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualPadRow {
+    /// Full device instance id — what a prune removes, named exactly.
+    pub instance_id: String,
+    /// The id the persona guess was made from, so an `unknown pad` row is
+    /// still actionable.
+    pub hardware_id: String,
+    /// What the bus says it is: `Xbox 360 pad`, `PlayStation (DS4) pad`, or
+    /// `unknown pad`.
+    pub persona: String,
+    /// Does this pad hold one of the four XInput slots?
+    pub xinput: bool,
+}
+
+/// What `ksx pads --prune` would do, as a page renders it.
+///
+/// The decision itself is the CLI's pure `plan_prune`; this is that plan on
+/// the wire, so no surface re-decides "is a bus restart allowed right now".
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrunePlanView {
+    /// `nothing` | `no-bus` | `session-running` | `restart`. Stable strings —
+    /// a surface keys its panels off these, not off the prose.
+    #[serde(default)]
+    pub kind: String,
+    /// How many pads it would remove.
+    pub count: usize,
+    /// The command a user could run by hand instead, when one exists. A
+    /// driver operation nobody can reproduce without ksx is one nobody can
+    /// undo without ksx either.
+    pub command: Option<String>,
+    /// The paragraph the CLI prints. Too long for a flash (Studio caps those
+    /// at 300 chars), which is exactly why it is a field and not a message.
+    pub detail: String,
+}
+
+/// What a spawn may offer right now, every option already labelled with what
+/// it will actually do.
+///
+/// The labels are the load-bearing part. "8" in a dropdown is a lie on a
+/// machine with four XInput slots; "8 pads — only 4 readable, 4 invisible to
+/// games" is the same click with the consequence attached, and putting that
+/// sentence here rather than in a page is what stops the second surface from
+/// disagreeing with the first.
+///
+/// **The first option in each list is the default**, because that is what a
+/// `<select>` does with no further help — so the ordering here IS the default,
+/// and there is no second field to keep in step with it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnOffer {
+    pub counts: Vec<SpawnOption>,
+    pub personas: Vec<SpawnOption>,
+    pub holds: Vec<SpawnOption>,
+    /// One sentence saying what a spawn will do, in advance — including the
+    /// fact that it unplugs itself when the hold expires.
+    pub note: String,
+    /// Why a spawn must not be offered at all right now (`None` = offer it).
+    pub refused: Option<String>,
+}
+
+/// One `<option>`: the value that goes on the wire, and what it means.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnOption {
+    pub value: String,
+    pub label: String,
+}
+
+/// `ksx pads --count N --persona P` as a typed spec.
+///
+/// `hold_secs` is not optional and not a detail: a console run ends at Ctrl+C
+/// and a web click has no Ctrl+C, so every caller states when the pads go
+/// away. See [`MachineSource::pads`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadsSpawnSpec {
+    pub count: u8,
+    /// A [`ksx_core::Persona`] name — `xbox360`, `playstation`, … Parsed by
+    /// the implementation with the same lenient parser the CLI uses, so a
+    /// surface never has to carry the alias table.
+    pub persona: String,
+    /// Seconds to hold the pads up before they unplug themselves.
+    pub hold_secs: u64,
+}
+
 /// `ksx autostart --status`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutostartView {
@@ -1245,6 +1503,60 @@ pub struct ImportWrite {
 mod tests {
     use super::*;
 
+    /// **A failed read must not render as an empty bus.**
+    ///
+    /// Fails against the version this replaced, which handed surfaces a
+    /// `PadsView::default()` when the provider refused: every composed
+    /// sentence came out either blank or, worse, an assertion of absence —
+    /// the devnode line read "none present — ViGEmBus is not installed" about
+    /// a bus ksx had never managed to look at, and the spawn offer arrived
+    /// un-refused with three empty dropdowns beside a live button.
+    #[test]
+    fn an_unreadable_view_says_so_everywhere_and_asserts_nothing() {
+        let view = PadsView::unreadable("the pipe did not answer");
+        let default = PadsView::default();
+
+        for (what, line) in [
+            ("summary", &view.summary),
+            ("bus_line", &view.bus_line),
+            ("owners_line", &view.owners_line),
+            ("xinput_line", &view.xinput_line),
+            ("prune.detail", &view.prune.detail),
+            // The banner's heading is composed HERE, once — the page renders
+            // it and owns no copy of the sentence.
+            ("unreadable_heading", &view.unreadable_heading),
+        ] {
+            assert!(
+                line.contains("could not read"),
+                "{what} must say the read failed, got: {line}"
+            );
+            assert_ne!(
+                line,
+                &"".to_string(),
+                "{what} must not be blank — a blank line says nothing at all"
+            );
+            assert!(
+                !line.contains("not installed") && !line.contains("no known splitter"),
+                "{what} asserts an absence about a machine ksx never read: {line}"
+            );
+        }
+
+        // The occupancy is UNKNOWN, not free.
+        assert_eq!(view.xinput_in_use, None);
+        // A verb must not be offered when the page cannot describe it.
+        assert!(
+            view.spawn
+                .refused
+                .is_some_and(|r| r.contains("the pipe did not answer")),
+            "a spawn offer with empty menus and no refusal is a live button with no meaning"
+        );
+        assert!(view.spawn.counts.is_empty());
+        // …and the prune's kind is its own state, so no panel keyed on
+        // "nothing" (the empty-bus kind) can render for a failed read.
+        assert_eq!(view.prune.kind, "unreadable");
+        assert_ne!(view.prune.kind, default.prune.kind);
+    }
+
     /// A surface that implements nothing still SAYS something, per call, with
     /// the command that works — the CONTROL-SURFACE invariant, as a default.
     #[test]
@@ -1281,7 +1593,18 @@ mod tests {
             ("ksx autostart", Nothing.autostart().unwrap_err()),
             ("ksx doctor", Nothing.doctor().unwrap_err()),
             ("ksx winusb status", Nothing.winusb().unwrap_err()),
-            ("ksx pads", Nothing.pads(4, "xbox360").unwrap_err()),
+            (
+                "ksx pads",
+                Nothing
+                    .pads(&PadsSpawnSpec {
+                        count: 4,
+                        persona: "xbox360".into(),
+                        hold_secs: 10,
+                    })
+                    .unwrap_err(),
+            ),
+            ("ksx pads --prune", Nothing.pads_view(false).unwrap_err()),
+            ("ksx pads --prune", Nothing.pads_prune(false).unwrap_err()),
             ("ksx winusb claim", Nothing.winusb_claim("ID").unwrap_err()),
             (
                 "ksx winusb release",

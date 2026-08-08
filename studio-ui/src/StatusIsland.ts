@@ -282,6 +282,7 @@ export function StatusIsland() {
         { class: "topnav", "aria-label": "screens" },
         h("a", { class: "navlink on", href: "/", "aria-current": "page" }, "Status"),
         h("a", { class: "navlink", href: "/map" }, "Mapper"),
+        h("a", { class: "navlink", href: "/pads" }, "Pads"),
         h("a", { class: "navlink", href: "/devices" }, "Devices"),
         h("a", { class: "navlink", href: "/profiles" }, "Profiles"),
         h("a", { class: "navlink", href: "/setup" }, "Setup"),
@@ -419,6 +420,14 @@ export function StatusIsland() {
         { class: "card wide padcard" },
         h("h2", null, "Virtual pads"),
         h("p", { class: "cardline" }, () => padsSummary()),
+        // The deep link that makes /pads findable. A page reachable only from
+        // the top nav is a page nobody finds, and "no virtual pads exposed by
+        // the bus" is exactly the sentence someone wants to act on.
+        h(
+          "p",
+          { class: "cardline" },
+          h("a", { class: "maplink", href: "/pads" }, "Spawn or prune pads →"),
+        ),
         h(
           "div",
           { class: "padgrid" },

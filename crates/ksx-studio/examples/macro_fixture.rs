@@ -241,9 +241,10 @@ fn main() {
     println!("macro fixture on http://{bind}/map");
     // The fixture drives the MAPPER, so the machine provider is the trait's
     // own defaults: every method refuses in words and names the CLI verb that
-    // works. /devices, /profiles and /setup under this fixture therefore
-    // render their refusal states, which are real states of those pages and
-    // worth being able to look at.
+    // works. /devices, /profiles, /setup and /pads under this fixture
+    // therefore render their refusal states — /pads honestly says it cannot
+    // read the bus rather than inventing one — which are real states of those
+    // pages and worth being able to look at.
     struct NoMachine;
     impl ksx_api::MachineSource for NoMachine {}
 

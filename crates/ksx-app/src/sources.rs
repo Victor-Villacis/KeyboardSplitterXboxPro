@@ -539,6 +539,36 @@ fn load_profiles() -> (Vec<ProfileRow>, String) {
     (profiles, root_display)
 }
 
+/// Is emulation live right now?
+///
+/// Through [`ksx_api::Client`] rather than a hand-built pipe request, because
+/// that is the one typed way every surface asks and a second JSON shape here
+/// is exactly what `ksx-api` exists to prevent.
+///
+/// An unreachable daemon answers `false`, deliberately — the same call
+/// `crate::pads::prune` makes and for the same reason: with no daemon there is
+/// certainly no session, and a refusal that fires because a diagnostic could
+/// not reach a process that is not there would block the fix exactly when the
+/// machine most needs it.
+fn session_is_running() -> bool {
+    use ksx_api::ControlSource as _;
+    ksx_api::Client::new(ksx_api::PipeTransport::new())
+        .session()
+        .running
+}
+
+/// A plan's refusal as a [`Refusal`], keeping the remedy when it has one.
+///
+/// `Refusal::with_remedy` and `Refusal::new` are two calls, and every plan
+/// that has no next step would otherwise carry an empty one — which reads on a
+/// page as an instruction with the words missing.
+fn refusal_of(code: &'static str, message: String, remedy: Option<String>) -> Refusal {
+    match remedy {
+        Some(remedy) => Refusal::with_remedy(code, message, remedy),
+        None => Refusal::new(code, message),
+    }
+}
+
 // Studio does not consume this yet — its pages read presets through the mapper
 // snapshot. The cabinet does, for its slot picker. Kept here rather than in
 // `crate::cabinet` because it is a MACHINE read like every other one in this
@@ -699,6 +729,199 @@ impl ksx_api::MachineSource for LocalMachine {
         request: &ksx_api::ImportRequest,
     ) -> Result<ksx_api::ImportReport, Refusal> {
         crate::onboard::import(request)
+    }
+
+    /// Everything `ksx pads` and `ksx pads --prune` know, in one read.
+    ///
+    /// The collectors are the same ones both CLI paths use; what this adds is
+    /// the two DECISIONS pre-computed — the prune plan, and what a spawn may
+    /// legally offer — so no surface re-derives "is a bus restart allowed" or
+    /// "how many of these will a game actually see" (docs/SURFACES.md §1).
+    fn pads_view(&self, session_running: bool) -> Result<ksx_api::PadsView, Refusal> {
+        use crate::pads::surface;
+
+        // The bus's children ONLY — not `collect()`, which also reads two
+        // service keys, walks the Interception class filters, probes for
+        // HIDMaestro's DLL and snapshots the process table. Studio polls this
+        // every 2 s and throws five sixths of that away.
+        let report = ksx_platform::collect_virtual_pads();
+        // From XInput, not from the bus: the bus can only ever show ksx its
+        // OWN virtual pads, so a real wired Xbox pad is invisible to it and
+        // every "N more will be readable" built on that count is wrong by
+        // however many real pads are plugged in. `None` stays `None` all the
+        // way to the page — see `PadsView::xinput_in_use`.
+        let xinput_in_use = ksx_platform::xinput::slots_in_use();
+        let owners: Vec<String> = report
+            .owners
+            .iter()
+            .map(|o| format!("{} (pid {})", o.name, o.pid))
+            .collect();
+        let elevated = ksx_platform::process::is_elevated();
+        let plan = crate::pads::plan_prune(
+            report.bus_instance_id.as_deref(),
+            report.count,
+            session_running,
+        );
+        let prune = surface::prune_plan_view(&plan);
+        Ok(ksx_api::PadsView {
+            generated_at: now_utc(),
+            summary: surface::summary_line(report.count),
+            bus_line: surface::bus_line(report.bus_instance_id.as_deref()),
+            bus_instance_id: report.bus_instance_id.clone(),
+            pads: report
+                .pads
+                .iter()
+                .map(|p| ksx_api::VirtualPadRow {
+                    instance_id: p.instance_id.clone(),
+                    hardware_id: p.hardware_id.clone(),
+                    persona: p.persona_guess.label().to_owned(),
+                    xinput: p.persona_guess == ksx_platform::PersonaGuess::Xbox360,
+                })
+                .collect(),
+            owners_line: surface::owners_line(&owners),
+            owners,
+            session_running,
+            xinput_ceiling: ksx_core::MAX_XINPUT_SLOTS,
+            xinput_in_use,
+            xinput_line: surface::xinput_line(xinput_in_use),
+            elevated,
+            elevation_line: surface::elevation_line(elevated),
+            confirm_line: surface::confirm_line(prune.count),
+            // Empty on purpose: this read ANSWERED. The heading belongs to
+            // `PadsView::unreadable` alone.
+            unreadable_heading: String::new(),
+            prune,
+            spawn: surface::spawn_offer(session_running, xinput_in_use, report.count),
+        })
+    }
+
+    /// `ksx pads --count N --persona P`, minus the console.
+    ///
+    /// The plan decides and this only carries it out — including the refusal
+    /// the CLI never needed to make, because whoever typed the command already
+    /// knew emulation was stopped and a page click knows nothing.
+    fn pads(&self, spec: &ksx_api::PadsSpawnSpec) -> Result<String, Refusal> {
+        use crate::pads::surface::{self, SpawnPlan};
+
+        let persona: ksx_core::Persona = spec.persona.parse().map_err(|err| {
+            Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                format!("'{}' is not a controller ksx knows: {err}", spec.persona),
+                "pick a persona from the list",
+            )
+        })?;
+        // Re-read at ACTION time, deliberately: the view a page is rendering
+        // may be two seconds old, and two seconds is long enough for a
+        // session to start or for another submit's pads to land on the bus.
+        let report = ksx_platform::collect_virtual_pads();
+        let plan = surface::plan_spawn(
+            spec.count,
+            persona,
+            spec.hold_secs,
+            session_is_running(),
+            ksx_platform::xinput::slots_in_use(),
+            report.count,
+        );
+        let SpawnPlan::Plug {
+            count,
+            persona,
+            hold_secs,
+            ..
+        } = plan
+        else {
+            return Err(refusal_of(
+                plan.code().unwrap_or(ksx_api::codes::REFUSED),
+                plan.message(),
+                plan.remedy(),
+            ));
+        };
+        surface::plug_and_hold(count, persona, hold_secs).map_err(|err| {
+            Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                err.to_string(),
+                "run `ksx doctor` — and `ksx install-drivers` if ViGEmBus is missing",
+            )
+        })?;
+        Ok(plan.message())
+    }
+
+    /// `ksx pads --prune`, keeping the CLI's consent shape exactly.
+    ///
+    /// `confirm == false` is `--yes` absent: a dry run that changes nothing
+    /// and says what it would have done. `confirm == true` still refuses
+    /// without an administrator token, because ksx never self-elevates — and
+    /// the refusal hands over the command that works, which is the whole
+    /// reason `PrunePlan::command()` exists.
+    fn pads_prune(&self, confirm: bool) -> Result<String, Refusal> {
+        use crate::pads::PrunePlan;
+
+        let report = ksx_platform::collect_virtual_pads();
+        let plan = crate::pads::plan_prune(
+            report.bus_instance_id.as_deref(),
+            report.count,
+            session_is_running(),
+        );
+        let PrunePlan::Restart {
+            bus_instance_id,
+            count,
+        } = &plan
+        else {
+            return match &plan {
+                PrunePlan::Nothing => {
+                    Ok("no virtual pads on the bus — nothing to prune.".to_owned())
+                }
+                PrunePlan::NoBus => Err(Refusal::with_remedy(
+                    ksx_api::codes::REFUSED,
+                    "ViGEmBus exposes no devnode to restart".to_owned(),
+                    "if joy.cpl still lists pads, reboot — there is nothing here to act on",
+                )),
+                PrunePlan::SessionRunning { count } => Err(Refusal::with_remedy(
+                    ksx_api::codes::REFUSED,
+                    format!(
+                        "a session is running, and those {count} pad(s) are the ones it is \
+                         driving — pruning would unplug them mid-game"
+                    ),
+                    "stop emulation first, then prune",
+                )),
+                // Unreachable: `Restart` is the pattern this `else` excludes.
+                PrunePlan::Restart { .. } => unreachable!(),
+            };
+        };
+        let command = plan
+            .command()
+            .unwrap_or_else(|| format!("pnputil /restart-device \"{bus_instance_id}\""));
+        if !confirm {
+            return Ok(format!(
+                "dry run — {count} virtual pad(s) would be cleared by restarting the bus. \
+                 Nothing was changed."
+            ));
+        }
+        // Answered BEFORE anything is narrated as done, the same ordering the
+        // CLI keeps: "clearing 15 pads" printed above a refusal reads as though
+        // ksx acted and then changed its mind.
+        if ksx_platform::process::is_elevated() == Some(false) {
+            return Err(Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                "restarting a bus device needs an administrator token, and ksx never \
+                 self-elevates"
+                    .to_owned(),
+                command,
+            ));
+        }
+        let planned = ksx_platform::winusb::PlannedCommand::pnputil(
+            &["/restart-device", bus_instance_id],
+            "restart the bus, which drops every child pad with it",
+        );
+        match ksx_platform::winusb::run_command(&planned) {
+            Ok(_) => Ok(format!(
+                "cleared {count} virtual pad(s) — the bus was restarted."
+            )),
+            Err(err) => Err(Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                format!("the bus restart failed: {err}"),
+                command,
+            )),
+        }
     }
 
     fn presets(&self) -> Result<PresetsView, Refusal> {

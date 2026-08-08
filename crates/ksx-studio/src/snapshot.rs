@@ -54,6 +54,34 @@ pub struct MapPayload {
     pub macro_selected: String,
 }
 
+/// What `GET /api/pads` serves AND what the pads island's props carry — the
+/// same one-struct-one-serializer rule as [`StatusPayload`], parity pinned in
+/// `render_pads.rs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadsPayload {
+    /// The bus, its children, and both verbs' preconditions — one
+    /// `MachineSource::pads_view` call, never re-derived here.
+    pub pads: ksx_api::PadsView,
+    /// Whether the daemon answers at all. Not a precondition for this page:
+    /// the pad list and the prune plan are collector reads, and the session is
+    /// shown because a running one is what REFUSES both verbs.
+    pub session: crate::control::SessionView,
+    /// Is the destructive panel armed (`/pads?confirm=1`)?
+    ///
+    /// Always `false` from `/api/pads` — a poll is not a user saying yes, and
+    /// a poll that could re-arm a prune would make the confirm panel reappear
+    /// after someone had deliberately navigated away from it.
+    #[serde(default)]
+    pub confirm: bool,
+    /// Why the machine read failed, if it did. Rendered as a banner instead of
+    /// an empty pad list, which would read as "your bus is clean".
+    #[serde(default)]
+    pub unavailable: Option<String>,
+    /// One-shot action feedback (the `?flash=` query). Always `None` from
+    /// `/api/pads`, `Some` only in the page-render props.
+    pub flash: Option<String>,
+}
+
 /// What `GET /api/devices` serves AND what the `/devices` island's props
 /// carry — the same one-struct-one-serializer rule as [`StatusPayload`],
 /// parity pinned in `render_devices.rs`.

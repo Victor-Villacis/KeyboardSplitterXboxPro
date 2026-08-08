@@ -737,8 +737,28 @@ pub(crate) fn payload_json<T: serde::Serialize>(payload: &T) -> String {
 ///   id ([`PAYLOAD_SCRIPT_ID`]).
 pub(crate) fn body_prefix<T: serde::Serialize>(payload: &T, refresh_url: &str) -> String {
     format!(
-        "<noscript><meta http-equiv=\"refresh\" content=\"{REFRESH_SECS}; url={refresh_url}\"></noscript>\
-         <script id=\"{PAYLOAD_SCRIPT_ID}\" type=\"application/json\">{}</script>",
+        "<noscript><meta http-equiv=\"refresh\" content=\"{REFRESH_SECS}; url={refresh_url}\"></noscript>{}",
+        payload_block(payload)
+    )
+}
+
+/// [`body_prefix`] with the no-JS refresh **suppressed**.
+///
+/// For the one kind of page where a timer that reloads the document is not a
+/// liveness feature but a bug: a destructive confirmation. `/pads` arms its
+/// prune at `/pads?confirm=1` and then asks the user to check every device id
+/// in a list that can be fifteen rows long — and the refresh URL deliberately
+/// carries no query string, so at five seconds the page would navigate itself
+/// back to the disarmed view mid-read. There is no window in which a full bus
+/// could be confirmed. A page that has asked a question waits for the answer.
+pub(crate) fn body_prefix_no_refresh<T: serde::Serialize>(payload: &T) -> String {
+    payload_block(payload)
+}
+
+/// The `application/json` data block both prefixes carry.
+fn payload_block<T: serde::Serialize>(payload: &T) -> String {
+    format!(
+        "<script id=\"{PAYLOAD_SCRIPT_ID}\" type=\"application/json\">{}</script>",
         payload_json(payload)
     )
 }
@@ -1196,6 +1216,15 @@ mod tests {
         // one links to it — which is exactly the regression this asserts.
         assert!(out.html.contains(r#"href="/map""#), "{}", out.html);
         assert!(out.html.contains(r#"href="/setup""#), "{}", out.html);
+        // …and into /pads, twice: the nav rail, and the deep link on the
+        // Virtual pads card — a page reachable only from the top nav is a
+        // page nobody finds.
+        assert_eq!(
+            out.html.matches(r#"href="/pads""#).count(),
+            2,
+            "the /pads nav link AND the pad-card deep link must both be here: {}",
+            out.html
+        );
     }
 
     /// The brand embed exists AND is the same bytes `tools/icongen` wrote.
