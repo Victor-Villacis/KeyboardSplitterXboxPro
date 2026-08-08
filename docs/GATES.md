@@ -461,6 +461,98 @@ before assuming the claim is broken (`RECOVERY.md` §2, first table).
 
 ---
 
+# GATE 3 — closing the books: M4 p99, M5 Phase C, M6 soak
+
+One cabinet evening, three milestone exits. Everything below is what the code
+cannot do for itself — measurements and removals only a person at the machine
+can perform. Nothing here changes source; the only writes are one BIOS-free
+uninstall, config lines the runbook names, and log entries at the bottom of
+this file.
+
+State going in (2026-08-08): the I-PAC is WinUSB-claimed and the daemon drives
+it daily; per-key typethrough shipped (the M6 user-choice requirement, Gate 2
+step 7's subject); GATE 1 passed except Phase C; GATE 2's steps were executed
+through step 7 across 2026-08-05/06 but never logged as a PASS, and steps 8–9
+(release, verify, re-claim) have run only as one-offs. Interception's
+`keyboard.sys` is still installed and loads at boot.
+
+## Preconditions
+
+- The current CI-built installer is what is installed (`ksx doctor` shows the
+  expected version; if in doubt, re-run the Desktop setup.exe first).
+- A second, never-claimed keyboard is plugged in and typing (the HP Elite).
+- `%APPDATA%\ksx\config.toml` backed up beside itself with today's date.
+- Nothing else important scheduled for the machine tonight: Phase 3 ends with
+  a driver uninstall and a reboot.
+
+## Phase 1 — M4 exit: the p99 number, written down
+
+1. `ksx doctor --latency` once, idle, to confirm the histogram plumbing.
+2. Start the real 4-player session (`ksx run --game "Steam"` or the daemon +
+   frontend, whichever tonight's play actually uses).
+3. Play something genuinely busy for ten minutes — four players mashing, not
+   one person pressing one button.
+4. `ksx doctor --latency` again. Record p50/p99/max in the run log below.
+
+**PASS**: p99 < 1 ms (ARCHITECTURE rule 5). A miss is not a tuning session
+tonight — it is a number in the log and an issue tomorrow.
+
+## Phase 2 — M5 exit: Phase C, the frontend wrapper
+
+GATE 1's Phase C verbatim (line ~137): the daemon wraps a real emulator run —
+frontend up, game launched from it, pads live inside the emulator, clean exit
+back to the frontend, nothing captured afterward. LaunchBox/RetroBat is the
+frontend of record on this cabinet. Ten minutes.
+
+**PASS**: GATE 1's Phase C criteria met; log it below and GATE 1 is fully
+closed.
+
+## Phase 3 — M6 exit begins: Interception comes out, the soak clock starts
+
+M6's exit line is explicit: *same session with Interception **uninstalled***,
+then a two-week soak. The claim is live and typethrough works, so the order
+tonight is:
+
+1. `ksx session stop` (leave the daemon up), then one last
+   `ksx devices --json > %APPDATA%\ksx\gate3-before.json` for the record.
+2. Uninstall Interception with its own installer, elevated:
+   `install-interception.exe /uninstall` (the same tool that installed it;
+   re-download from oblitum/Interception releases if it is not on disk), then
+   verify the filter is really gone — `keyboard.sys`'s Interception entries
+   absent from `pnputil /enum-drivers`, and the `keyboard` service no longer
+   listing Interception's filter. **Reboot.** (`RECOVERY.md` §1 covers this
+   driver *dying on its own*; tonight is the deliberate version.)
+3. After the reboot: the panel must still be captured (WinUSB claim survives
+   reboots by design — it is a driver binding, not a session), the HP Elite
+   must still type, and `ksx doctor` must exit 0 with the Interception rows
+   now reporting absent-and-unneeded.
+4. Run the same 4-player session as Phase 1. This is the actual M6 sentence.
+5. Exercise Gate 2 steps 8–9 once, deliberately: `ksx winusb release … --yes`,
+   watch the panel become a plain keyboard, then re-claim and confirm capture
+   again. Release/re-claim is the recovery muscle; it gets one rep while the
+   spare keyboard is plugged in, not its first rep during a failure.
+6. Write the soak start date below. **Soak = fourteen days of normal cabinet
+   use with zero recovery actions.** Any Code-39, any dead panel, any manual
+   pnputil: the soak restarts and the incident goes in the log.
+
+**PASS (tonight's half)**: steps 1–5 clean. **PASS (M6 itself)**: the soak
+completing 14 days later — put the end date in the calendar now.
+
+## GATE 3 rollback
+
+Phases 1–2 change nothing; stop anytime. Phase 3's ladder is GATE 2's ladder
+above, unchanged — plus one addition: if anything smells wrong *after* the
+Interception uninstall, do NOT reinstall Interception as a reflex. The 2012
+cross-signed driver is the thing this whole milestone removes; reinstalling it
+under pressure at midnight re-adds a boot-critical EOL filter to fix what is
+almost always "the daemon is not running" (`RECOVERY.md` §2, first table).
+
+## GATE 3 RUN LOG
+
+*(empty — filled at the cabinet)*
+
+---
+
 # GATE 1 RUN LOG — 2026-08-05 (Victor + session)
 
 **Phase A — PASSED.** Tray lifecycle clean: idle tooltip, Start → 4 X360 pads
