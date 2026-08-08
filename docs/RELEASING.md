@@ -78,7 +78,10 @@ file.
 
 1. **`on: push: tags` runs the workflow file as it exists at the tagged
    commit.** A `release.yml` that only exists on a branch will not run. Tag
-   master, after merging.
+   master, after merging. The visible symptom of not having merged yet is that
+   `gh workflow view release.yml` answers *"not found on the default branch"*
+   and the Actions tab lists only CI — GitHub registers workflows from the
+   default branch, so an unmerged release workflow is invisible AND inert.
 2. **A tag pushed by `GITHUB_TOKEN` from inside Actions does not trigger
    workflows.** A tag you push from your machine does, which is the path above.
 
