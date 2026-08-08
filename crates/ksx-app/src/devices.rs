@@ -748,17 +748,24 @@ pub fn devices_json(report: &DevicesReport) -> serde_json::Value {
         })
         .collect();
     serde_json::json!({
+        // BACKENDS are what ksx captures WITH; TRANSPORTS are how a device is
+        // attached. Keeping them in separate objects is the schema saying the
+        // thing this whole list exists to teach: `bluetooth` is not a third
+        // backend that ksx has not written, it is a transport one of the two
+        // backends can never reach.
         "backends": {
             "interception": { "available": report.interception_available },
             "winusb": { "available": report.usb_available },
         },
+        "transports": {
+            // Two enumerations, two flags. A consumer that read an empty
+            // device array as "nothing attached" without checking these would
+            // be making the exact assertion a failed read cannot support.
+            "usb": { "available": report.usb_available },
+            "bluetooth": { "available": report.bluetooth_available },
+        },
         "keyboards": keyboards,
         "mice_visible": report.mice_visible,
-        // Two enumerations, two availability flags. A consumer that read an
-        // empty `bluetooth` array as "nothing paired" without checking this
-        // would be making the exact assertion a failed read may not support.
-        "usb_available": report.usb_available,
-        "bluetooth_available": report.bluetooth_available,
         "usb_candidates": usb,
         "bluetooth_devices": bluetooth,
         "health": {
@@ -1509,6 +1516,49 @@ mod tests {
 
     /// The M6 exit state: Interception uninstalled, everything on WinUSB. The
     /// command must still work — it is how you check the machine survived.
+    /// **A backend and a transport are different kinds of thing, and `--json`
+    /// says so with its shape.**
+    ///
+    /// `bluetooth` is not a third backend ksx has not got round to writing; it
+    /// is a transport that one of the two backends can never reach. A payload
+    /// that listed it beside `interception` and `winusb` would teach a script
+    /// author the same wrong thing this whole list exists to correct.
+    ///
+    /// Breaks against the obvious first shape — a flat `bluetooth_available`
+    /// beside `backends` — which also duplicated `backends.winusb.available`
+    /// under a second name, so two keys could disagree about one fact.
+    #[test]
+    fn the_json_keeps_backends_and_transports_apart() {
+        let report = DevicesReport::build(
+            Vec::new(),
+            true,
+            Vec::new(),
+            true,
+            Vec::new(),
+            false,
+            ConfiguredDevices::default(),
+        );
+        let v = devices_json(&report);
+        assert_eq!(
+            v.pointer("/transports/bluetooth/available"),
+            Some(&serde_json::json!(false)),
+            "a failed Bluetooth walk is reported, not hidden behind the USB one"
+        );
+        assert_eq!(
+            v.pointer("/transports/usb/available"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(
+            v.pointer("/backends/bluetooth").is_none(),
+            "bluetooth is a transport, never a backend: {v}"
+        );
+        assert!(
+            v.pointer("/bluetooth_available").is_none(),
+            "one fact, one key — a flat duplicate can disagree with the nested \
+             one: {v}"
+        );
+    }
+
     #[test]
     fn listing_works_with_the_interception_driver_gone() {
         let cfg = config(&[(IPAC_USB, "P1 I-PAC", Backend::Winusb)]);

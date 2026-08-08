@@ -11,7 +11,6 @@ expression: "serde_json::to_string_pretty(&devices_json(&report)).unwrap()"
       "available": false
     }
   },
-  "bluetooth_available": false,
   "bluetooth_devices": [],
   "health": {
     "duplicate_hardware_ids": [],
@@ -42,6 +41,13 @@ expression: "serde_json::to_string_pretty(&devices_json(&report)).unwrap()"
     }
   ],
   "mice_visible": 1,
-  "usb_available": false,
+  "transports": {
+    "bluetooth": {
+      "available": false
+    },
+    "usb": {
+      "available": false
+    }
+  },
   "usb_candidates": []
 }

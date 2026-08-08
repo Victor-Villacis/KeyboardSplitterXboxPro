@@ -893,7 +893,7 @@ pub enum Refusal {
     /// This means *the interface is right and the BACKEND is wrong* — use
     /// Interception, which captures this device today. Nothing about it changes
     /// with a reboot, a driver, or a future ksx release, so the advice must not
-    /// read as "not yet".
+    /// read as "not yet". `docs/DEVICE-IDENTITY.md` §11.
     #[error("{instance_id} is a {transport} keyboard, and a WinUSB claim can never bind one")]
     TransportCannotClaim {
         instance_id: String,

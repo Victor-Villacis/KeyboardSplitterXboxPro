@@ -16,6 +16,10 @@
 //!   the transport, not a feature ksx has not written yet, and saying "not
 //!   supported" would invite someone to wait for a release that cannot come.
 //!
+//! `docs/DEVICE-IDENTITY.md` §11 is the normative statement of both halves,
+//! including the two refusals that fall out of them and the reason a Bluetooth
+//! id has no rung to climb.
+//!
 //! # Why it lives in `ksx-core`
 //!
 //! `docs/SURFACES.md` §1: the backend owns state and every surface is a view.
