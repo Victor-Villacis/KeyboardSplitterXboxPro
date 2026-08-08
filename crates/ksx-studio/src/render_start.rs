@@ -955,9 +955,18 @@ mod tests {
             .find(r#"<option value=""#)
             .map(|at| &out.html[menu + at..menu + at + 40])
             .unwrap_or_default();
+        // Compared against the SERVED default, not a literal. This asserted
+        // `arcade-6button` and passed only while that happened to be what
+        // `default_layout()` returned — so when the default moved to one that
+        // binds Guide (FIRST-RUN.md moment 7), a page that was correct failed a
+        // test that was checking the wrong thing. The property is "the first
+        // option IS the default", and it is worth keeping precisely because a
+        // select shows its first option to someone who never opens the menu.
+        let served = ksx_api::stage::StagedSetupView::of(&ksx_core::stage::StagedSetup::new())
+            .default_layout;
         assert!(
-            first.contains("arcade-6button"),
-            "the first layout option is not the served default: {first}"
+            first.contains(&served),
+            "the first layout option is not the served default ({served}): {first}"
         );
         // The panel note is ksx-core's, verbatim, so somebody can tell the
         // layouts apart.
