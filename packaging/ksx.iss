@@ -456,7 +456,20 @@ begin
     // a user must not do here is kill setup mid driver install.
     if not WizardSilent then
       WizardForm.StatusLabel.Caption := 'Installing the ViGEmBus controller driver...';
-    InstallControllerDriver;
+    // Belt and braces on "nothing here may fail the install". An exception
+    // raised anywhere below - a constant that did not expand, a log path that
+    // cannot be written - propagates out of CurStepChanged and ROLLS THE
+    // INSTALL BACK, which is the single outcome this whole section exists to
+    // prevent. It would also be invisible until somebody ran the shipped
+    // setup.exe: ISCC compiles a broken ExpandConstant perfectly happily, so
+    // the CI job that proves this file COMPILES proves nothing about this.
+    try
+      InstallControllerDriver;
+    except
+      DriverNote :=
+        'The ViGEmBus controller driver step could not be run: ' + GetExceptionMessage + #13#10#13#10 +
+        DriverRetryAdvice;
+    end;
   end
   else
     // Their choice, and it is a real one - but a choice they can only reverse

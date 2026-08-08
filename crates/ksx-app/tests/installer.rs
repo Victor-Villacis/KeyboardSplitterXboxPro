@@ -377,6 +377,16 @@ fn a_failed_driver_install_reports_and_continues() {
         );
     }
 
+    // An EXCEPTION out of `CurStepChanged` rolls the install back just as
+    // effectively as an `Abort`, and it is the failure mode ISCC cannot catch:
+    // a constant that does not expand compiles perfectly and throws at run
+    // time, on a shipped setup.exe, on somebody else's machine.
+    assert!(
+        code.contains("try") && code.contains("except"),
+        "the driver step must be wrapped in try..except — CI proves this file \
+         COMPILES and proves nothing about what it does when run"
+    );
+
     // The retry the user can actually perform comes first: they are looking at
     // the installer that offers it. `FIRST-RUN.md` §6 puts "the only way out of
     // a mistake is a shell command" on the list of things that must never
