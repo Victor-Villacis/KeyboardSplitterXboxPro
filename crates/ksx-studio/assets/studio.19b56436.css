@@ -788,22 +788,9 @@ footer a {
   }
 }
 
-/* Touch: the WHOLE control vocabulary grows to a 40 px target. Desktop keeps
-   the dense ladder — a cabinet screen is touched, a desk is not. */
-@media (pointer: coarse) {
-  .btn,
-  select,
-  input[type="text"],
-  input[type="number"] {
-    min-height: 2.5rem;
-  }
-
-  .btn-row,
-  .btn-mini,
-  .btn-sm {
-    min-height: 2.25rem;
-  }
-}
+/* Touch grows the whole vocabulary — see the ladder shift at the end of §4.4.
+   It lives there, below the field rules, and it moves the TOKENS rather than
+   listing components, because a list of components here was silently dead. */
 
 /* A row of actions. Primary first, destructive last and visually apart. */
 .btn-group,
@@ -857,6 +844,10 @@ input::placeholder {
 }
 
 input[type="checkbox"] {
+  /* Never a flex item that shrinks: both consent boxes in this app sit in a
+     flex row beside a sentence, and a squashed 19 px checkbox beside a
+     `--force` warning is a control that reads as an artefact. */
+  flex: 0 0 auto;
   width: 1.05rem;
   height: 1.05rem;
   accent-color: var(--accent-fill);
@@ -880,6 +871,69 @@ input[type="checkbox"] {
 .bindlabel input {
   max-width: 18rem;
 }
+
+/* ── 4.4b TOUCH: move the LADDER, do not list its consumers ──────────────
+   DESIGN-SYSTEM §2 and §11 both claim that under `(pointer: coarse)` the
+   whole control vocabulary grows to a 40 px minimum (36 px for the small
+   tier). Until now that claim was written as a list of component selectors
+   in §4.3, and **in the output it was false for every field on every page**:
+   `select` / `input[type=text|number]` re-declare `min-height: var(--ctl-h)`
+   in §4.4 above, at equal specificity and LATER in the file, so the later
+   rule won. Measured with touch emulation on, against the SSR HTML the
+   server actually sends: /pads' three spawn selects, /profiles' six
+   new-profile fields, /setup's four selects and /devices' alias box all came
+   back 36 px. The rule had been there since the design system landed; nobody
+   had read the output, only the source — the same failure mode
+   `render.rs::assert_complete_head` documents for the viewport meta.
+
+   Redefining the LADDER is the fix that cannot rot again. A custom property
+   set on `:root` is not in the cascade with the component rules that read
+   it, so no rule added below can shadow it, and every consumer moves
+   together — `.btn`, `.navlink`, `.tab`/`.mactab`, the fields, `.dv-alias`,
+   and §6.1's sticky `calc(var(--ctl-h) + …)`, which stays correct because
+   the header it offsets grew by the same amount. That is what "one height
+   ladder, so a button and the select beside it line up without either being
+   told twice" was supposed to mean.
+
+   Everything below the `:root` block is something that does NOT read the
+   ladder and therefore cannot move with it. */
+@media (pointer: coarse) {
+  :root {
+    --ctl-h-sm: 2.25rem; /* 28 → 36 — the small tier's touch size */
+    --ctl-h: 2.5rem; /* 36 → 40 — the floor §11 promises */
+    /* --ctl-h-lg is 44 already: a screen's primary action never shrinks. */
+  }
+
+  /* A checkbox is painted by the platform and reads no token of ours. */
+  input[type="checkbox"] {
+    width: 1.5rem;
+    height: 1.5rem;
+  }
+
+  /* A row whose ONLY action is a `.btn-row` is not a row accelerator, and
+     the small tier is not for it. The dense tier exists for the mapper's
+     per-legend-row shortcuts (a legend ✕, a macro step verb) — not for
+     "Start" on the status page, "Switch" on /profiles, or "Use this board" /
+     "Remove entry" on /devices, which are those pages' primary and
+     destructive writes and the only two things on /devices that write
+     anything at all. Those take the full target.
+
+     A phone (`max-width: 40rem`, §7) pushes `.plist .btn-row` further still,
+     to 44 px; that rule is later in the file and keeps winning. */
+  .plist .btn-row,
+  .dv-form .btn-row {
+    --btn-h: var(--ctl-h);
+    padding-inline: var(--sp-4);
+  }
+}
+
+/* A component's OWN touch exception is declared beside that component, after
+   its own rules — `.maplink` in §5.2, `.dv-force label` in §9, `.importopt`
+   in §6b. Hoisting them up here would re-create the exact bug this block
+   exists for: a later rule at equal specificity wins, and both
+   `.maplink { padding: … }` and `.importopt { display: inline-flex }` are
+   later. `crates/ksx-studio/tests/touch_targets.rs` fails the build on any
+   coarse declaration an unconditional rule cancels that way. */
 
 /* ── 4.5 Pills & badges ─────────────────────────────────────────────────
    A pill is a STATE. It carries a dot so the meaning survives a colour-blind
@@ -1899,6 +1953,20 @@ details.card[open] > summary::before,
   border-color: var(--accent-line);
 }
 
+/* On a desk this is a hover-revealed accessory and 24 px is right for it. On
+   a panel it is the tile's ONLY control — and the pad card's "Spawn or prune
+   pads →" is the same element — so it takes the ladder's target. Declared
+   here, after `.maplink`'s own `padding` shorthand, because §4.4b's block is
+   above it and a `padding-inline` up there loses to this shorthand at equal
+   specificity. That is not a hypothetical: it is what the first attempt at
+   this fix did, and the measurement caught it (40 px tall, still 38.8 wide). */
+@media (pointer: coarse) {
+  .maplink {
+    min-height: var(--ctl-h);
+    padding: 0 var(--sp-3);
+  }
+}
+
 .instance {
   margin-top: var(--sp-2);
   font-family: var(--mono);
@@ -2644,8 +2712,22 @@ details.card[open] > summary::before,
   border-bottom: 1px solid var(--border-subtle);
 }
 
+/* The no-JS bind strip: a key `<select>`, a fixed 3.6rem turbo box, and up to
+   four verbs. It WRAPS, and that is not a phone concession — it was the only
+   thing on any of the six screens that pushed the PAGE sideways, and it did it
+   at the desk too. Measured on the rendered /map: 1430 px of row against a
+   1270 px viewport at 1280, 820 against 768, 461 against 360 — the select has
+   `min-width: 0` so it collapses to a 22 px stub first and the fixed-width
+   items behind it run off the end anyway, with no scrolling ancestor.
+
+   Wrapping rather than scrolling, because these are one row's verbs and not a
+   wide table: a horizontal scroller would hide half of a single decision (the
+   argument `.dv-form` already records at 45rem). `flex-wrap` costs nothing at
+   a width where the row fits, which is why it belongs here and not in a
+   breakpoint. */
 .lbind {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--sp-1);
   padding: 0 var(--sp-2) var(--sp-2);
@@ -3996,6 +4078,18 @@ a.strow:hover {
   cursor: pointer;
 }
 
+/* …and on a panel, "one target" has to be a target you can hit. The box grows
+   to 24 px with every other checkbox (§4.4b); the sentence is what carries the
+   remaining height, which is the point of writing the consent as text. These
+   two — "write it" and "write even if it does not validate" — measured 17 px
+   with a 23 px label before this rule. Declared here rather than in §4.4b
+   because `.importopt`'s own `display` is above and would win. */
+@media (pointer: coarse) {
+  .importopt {
+    min-height: var(--ctl-h);
+  }
+}
+
 /* ── The inventory, and the one path on the page ───────────────────────── */
 
 .notelist li {
@@ -4167,6 +4261,31 @@ a.strow:hover {
     padding-inline: var(--sp-5);
   }
 
+  /* 18rem is a MEASURE cap — it stops a lone field running the width of a
+     74 rem desk column — and at 360 px it is 288 px against a 294 px card, so
+     it stopped being a cap and became a 6 px ragged right edge on every field
+     of /pads and /profiles, while the plain `<select>`s beside them (not
+     `.bindlabel` children) went full width. Below the cap there is nothing to
+     cap.
+
+     `.bindlabel` needs the basis and the `min-width: 0` with it. Lifting the
+     cap alone made /pads' spawn row scroll the PAGE to 543 px: the label's
+     flex base size is the select's max-content, i.e. the longest option
+     ("xbox360 — takes one of the 4 XInput slots…"), and uncapped it simply
+     grew. Full-width rows are what the other two forms on this page already
+     are. */
+  .bindlabel {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+
+  .bindlabel select,
+  .bindlabel input {
+    max-width: none;
+    width: 100%;
+    min-width: 0;
+  }
+
   .toasts {
     left: var(--sp-2);
     right: var(--sp-2);
@@ -4228,6 +4347,17 @@ a.strow:hover {
 
   .machold.both::after {
     content: "";
+  }
+
+  /* `.lbind` wraps at every width (§6.4). Here the select also takes the
+     whole first line, because at 360 px sharing it means collapsing to a
+     22 px stub — a key picker too narrow to show a key name. */
+  .lbind {
+    gap: var(--sp-2) var(--sp-1);
+  }
+
+  .lbind .keysel {
+    flex: 1 1 100%;
   }
 }
 
@@ -4411,33 +4541,19 @@ a.strow:hover {
   color: var(--warn);
 }
 
-/* TOUCH TARGETS: this page's two buttons are not row accelerators.
-   `.btn-row` is the dense size the mapper uses for per-row shortcuts, and the
-   coarse-pointer block above caps it at 2.25rem for that reason. Here "Use
-   this board" and "Remove entry" are the primary and the destructive action of
-   the whole card — the only two things on the page that write anything — so
-   they take the full 2.5rem target the design system's own comment claims for
-   "the WHOLE control vocabulary". The --force checkbox goes with them: it is
-   the consent gate on the destructive one, and a 17 px box is not a thing you
-   tick on a cabinet screen. */
+/* TOUCH TARGETS: this page's two buttons are not row accelerators, and the
+   `--force` checkbox is the consent gate on the destructive one. Both used to
+   be handled by a `(pointer: coarse)` block right here, in three rules that
+   restated 2.5rem as a literal. The buttons and the box size are §4.4b's now
+   — one copy, from `--ctl-h`, so they move with the ladder instead of
+   drifting away from it. What stays here is the part that is only true of
+   this page: the label is half the target, because missing a 24 px box beside
+   a `--force` warning and hitting nothing reads as "the button is broken". */
 @media (pointer: coarse) {
-  .dv-form .btn-row {
-    min-height: 2.5rem;
-    --btn-h: 2.5rem;
-    padding-inline: var(--sp-4);
-  }
-
-  .dv-force input[type="checkbox"] {
-    width: 1.5rem;
-    height: 1.5rem;
-  }
-
-  /* The label is half the target: on a checkbox this consequential, missing
-     the box and hitting nothing reads as "the button is broken". */
   .dv-force label {
-    min-height: 2.5rem;
     display: flex;
     align-items: center;
+    min-height: var(--ctl-h);
   }
 }
 

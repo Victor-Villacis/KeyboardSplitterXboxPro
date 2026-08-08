@@ -134,6 +134,24 @@ being told twice:
 not, and paying the touch tax on both would make the desk view sparse for
 nothing.
 
+That growth is implemented by **redefining the three ladder tokens on `:root`**
+inside the coarse query (studio.css §4.4b), not by listing the components that
+should grow. The distinction is the whole finding of the 2026-08-08 responsive
+pass: it *was* a list, and in the rendered output the list was false. `select`
+and `input[type=text|number]` re-declare `min-height: var(--ctl-h)` in §4.4,
+below the list and at equal specificity, so the later rule won and **every
+field on every screen rendered 36 px on a touch panel** — /pads' three spawn
+selects, /profiles' six new-profile fields, /setup's four selects, /devices'
+alias box, all measured with touch emulation against the HTML the server
+actually sends. A custom property set on `:root` is not in the cascade with the
+component rules that read it, so nothing added later can shadow it, and every
+consumer moves together — including §6.1's sticky `calc(var(--ctl-h) + …)`,
+which stays correct because the header it offsets grew by the same amount.
+
+A component that needs its own touch exception (`.maplink`, the tile's only
+control, sized as a marking rather than as a button) declares it **after** that
+component's own rules, for the same cascade reason.
+
 ---
 
 ## 3. Colour, as meaning
