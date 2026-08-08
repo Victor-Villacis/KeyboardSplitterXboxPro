@@ -90,8 +90,27 @@ fn winusb_survey_runs_and_is_internally_consistent() {
             ClaimState::NotAKeyboard | ClaimState::ForeignDriver => {
                 assert!(c.keyboard.is_none(), "{}", c.interface.instance_id);
             }
+            // A Bluetooth keyboard: it HAS a keyboard node (that is the whole
+            // point — Interception can capture it) and no USB interface for a
+            // claim to bind.
+            ClaimState::InterceptionOnly => {
+                assert!(
+                    c.keyboard.is_some(),
+                    "{} is interception-only with no keyboard node",
+                    c.interface.instance_id
+                );
+                assert_eq!(c.transport, winusb::Transport::Bluetooth);
+                assert!(!c.transport.can_winusb());
+            }
         }
-        assert!(c.interface.enumerator.eq_ignore_ascii_case("USB"));
+        match c.transport {
+            winusb::Transport::Usb => {
+                assert!(c.interface.enumerator.eq_ignore_ascii_case("USB"))
+            }
+            winusb::Transport::Bluetooth => {
+                assert!(c.interface.enumerator.eq_ignore_ascii_case("BTHENUM"))
+            }
+        }
         assert!(!c.ksx_device_id().is_empty());
     }
 

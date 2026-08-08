@@ -90,6 +90,19 @@ pub struct PickSpec {
     pub query: String,
     /// The name `[[slot]]` entries will use. `None` derives one from the board.
     pub alias: Option<String>,
+    /// The backend the caller is asking for, when they asked for one.
+    ///
+    /// `None` — the normal case, and what every surface sends — means *decide
+    /// from the binding*, which is rule (b) of `docs/DEVICE-IDENTITY.md` §7:
+    /// `winusb` is a statement of fact about what the interface IS, never an
+    /// intention.
+    ///
+    /// `Some` exists because the two ways of not getting `winusb` are not the
+    /// same answer and a user is entitled to be told which one they hit. On an
+    /// unclaimed USB board it is "not yet — claim it first". On a Bluetooth
+    /// keyboard it is "never, and here is the transport fact", and no claim,
+    /// replug or future release changes it.
+    pub backend: Option<Backend>,
 }
 
 /// Everything `pick` decided, before a byte is written.
@@ -156,6 +169,23 @@ pub enum PickError {
     },
     #[error("{instance_id} is not in the USB enumeration, so ksx cannot describe it")]
     NotEnumerable { instance_id: String },
+    /// The caller asked for a backend this device's TRANSPORT can never offer.
+    ///
+    /// Kept apart from every "not yet" refusal on purpose. `backend = "winusb"`
+    /// on an unclaimed USB board is a claim nobody has performed; the same
+    /// request on a Bluetooth keyboard is a claim nobody can perform, and the
+    /// advice for the first sends the second's user to a command that refuses
+    /// forever.
+    #[error(
+        "the {backend} backend cannot reach {instance_id}: it is a {transport} device, and \
+         {reason}"
+    )]
+    BackendTransport {
+        instance_id: String,
+        backend: &'static str,
+        transport: ksx_core::Transport,
+        reason: &'static str,
+    },
     #[error(
         "no selector ksx can write names {instance_id} and nothing else — `{selector}` \
          matches {} connected interface(s)",
@@ -179,6 +209,7 @@ impl PickError {
             Self::RenameOrphansSlots { .. } => "rename-orphans-slots",
             Self::BadAlias { .. } => "bad-alias",
             Self::NotEnumerable { .. } => "not-enumerable",
+            Self::BackendTransport { .. } => "backend-transport",
             Self::NotUnique { .. } => "ambiguous-selector",
             Self::Config(_) => "config-error",
         }
@@ -212,6 +243,14 @@ impl PickError {
                     .map(SlotRef::to_string)
                     .collect::<Vec<_>>()
                     .join("\n  ")
+            ),
+            // Never "not yet". The device is capturable RIGHT NOW on the other
+            // backend, and the instruction is the command that does it.
+            Self::BackendTransport { instance_id, .. } => format!(
+                "this is not a device ksx cannot use — it is a device ONE backend cannot use, and \
+                 the other one captures it today. Ask for nothing and let the binding decide:\n  \
+                 ksx device pick {instance_id}\n\nThat writes backend = \"interception\", which \
+                 is the only backend this transport will ever have."
             ),
             Self::NotEnumerable { .. } => {
                 "run `ksx devices`. The USB enumeration ksx builds selectors from did not return \
@@ -314,38 +353,74 @@ pub fn plan_pick(
             }
             .into())
         }
-        ClaimState::Claimed | ClaimState::Claimable => {}
+        // A Bluetooth keyboard IS pickable — Interception captures it today.
+        // Refusing it here (which is what happened while the survey could not
+        // see one at all) would tell a user their keyboard does not exist.
+        ClaimState::Claimed | ClaimState::Claimable | ClaimState::InterceptionOnly => {}
+    }
+
+    // **The transport refusal, before anything else is computed.** A caller
+    // that explicitly asked for `winusb` on a device whose transport has no USB
+    // interface must hear the transport fact, not `NotEnumerable` — which is
+    // what it would hit two lines below, and which reads as "ksx could not find
+    // it" about a device ksx just resolved by name.
+    if spec.backend == Some(Backend::Winusb) && !candidate.transport.can_winusb() {
+        return Err(PickError::BackendTransport {
+            instance_id: candidate.interface.instance_id.to_uppercase(),
+            backend: "winusb",
+            transport: candidate.transport,
+            reason: ksx_core::transport::WINUSB_NEEDS_A_USB_INTERFACE,
+        });
     }
 
     // Uppercase deliberately, like `ksx winusb status`: this is the string a
     // user pastes into the claim command, and the enumerator canonicalizes
     // every id it produces the same way.
     let instance_id = candidate.interface.instance_id.to_uppercase();
-    let facts = connected
-        .iter()
-        .find(|f| f.id.as_str().eq_ignore_ascii_case(&instance_id))
-        .ok_or_else(|| PickError::NotEnumerable {
-            instance_id: instance_id.clone(),
-        })?;
 
-    // The weakest rung that survives a replug — and then the check
-    // `docs/DEVICE-IDENTITY.md` §8 spells out, because `strongest_for` can hand
-    // back a PORT selector that is still ambiguous: twins whose instance tails
-    // are identical get the same `port=` value, and the port rung is the last
-    // one there is. An id that names two boards would drive whichever one
-    // Windows enumerated first, which is the exact failure this whole design
-    // exists to prevent.
-    let selector = DeviceSelector::strongest_for(facts, connected);
-    match selector.match_against(connected) {
-        Match::One(hit) if hit.id == facts.id => {}
-        other => {
-            return Err(PickError::NotUnique {
-                instance_id,
-                selector: selector.to_string(),
-                hits: hits_of(&other),
-            })
-        }
-    }
+    // Off the USB transport there are no `DeviceFacts` to reason with — a
+    // `usb:` selector names a vendor, product and interface number, and a
+    // Bluetooth device has none of the three. The id is the keyboard devnode's
+    // path, byte-exact, which is exactly `DeviceSelector::HardwareId`. It is
+    // unique by construction (Windows does not issue one instance path twice),
+    // so the ambiguity check below has nothing to check.
+    let (selector, facts, name) =
+        if candidate.transport.can_winusb() {
+            let facts = connected
+                .iter()
+                .find(|f| f.id.as_str().eq_ignore_ascii_case(&instance_id))
+                .ok_or_else(|| PickError::NotEnumerable {
+                    instance_id: instance_id.clone(),
+                })?;
+
+            // The weakest rung that survives a replug — and then the check
+            // `docs/DEVICE-IDENTITY.md` §8 spells out, because `strongest_for` can
+            // hand back a PORT selector that is still ambiguous: twins whose
+            // instance tails are identical get the same `port=` value, and the port
+            // rung is the last one there is. An id that names two boards would
+            // drive whichever one Windows enumerated first, which is the exact
+            // failure this whole design exists to prevent.
+            let selector = DeviceSelector::strongest_for(facts, connected);
+            match selector.match_against(connected) {
+                Match::One(hit) if hit.id == facts.id => {}
+                other => {
+                    return Err(PickError::NotUnique {
+                        instance_id,
+                        selector: selector.to_string(),
+                        hits: hits_of(&other),
+                    })
+                }
+            }
+            let name = board_name(candidate, facts);
+            (selector, Some(facts), name)
+        } else {
+            let selector = DeviceSelector::parse(&candidate.ksx_device_id().to_uppercase())
+                .map_err(|_| PickError::NotEnumerable {
+                    instance_id: instance_id.clone(),
+                })?;
+            let name = non_usb_name(candidate);
+            (selector, None, name)
+        };
 
     // Rule (b), §7: `winusb` is a statement of fact about the binding, never an
     // intention. Setting it for a claimable interface would flip a working
@@ -360,9 +435,12 @@ pub fn plan_pick(
     let replaces = config
         .devices
         .iter()
-        .find(|d| names_the_same_board(d, facts, connected))
+        .find(|d| match facts {
+            Some(facts) => names_the_same_board(d, facts, connected),
+            // Byte-exact, like the selector this entry would be written with.
+            None => d.id.raw().eq_ignore_ascii_case(&selector.to_string()),
+        })
         .map(|d| d.alias.clone());
-    let name = board_name(candidate, facts);
     let alias = match (&spec.alias, &replaces) {
         (Some(wanted), _) => wanted.trim().to_owned(),
         // Re-picking a board keeps the name the user gave it: renaming it would
@@ -877,6 +955,25 @@ fn names_the_same_board(
 }
 
 /// Best available name for a board, in the order a human would prefer it.
+/// The default alias for a device with no USB vendor/product to look up.
+///
+/// The vendors table is keyed on a USB VID/PID, so it has nothing to say about
+/// a Bluetooth device — and the device usually has: `FriendlyName` is what it
+/// was called on the phone it was paired with (`ULT TOWER 9`, measured here).
+/// The fallback is the transport plus its address, never a bare index: an alias
+/// is what `[[slot]]` entries name, and `bluetooth-1` tells a user nothing when
+/// they come back to the file in six months.
+fn non_usb_name(candidate: &Candidate) -> String {
+    let name = candidate.interface.display_name();
+    if !name.is_empty() {
+        return name;
+    }
+    match ksx_platform::winusb::bd_addr(&candidate.interface) {
+        Some(addr) => format!("bluetooth-{}", addr.to_lowercase()),
+        None => candidate.transport.code().to_owned(),
+    }
+}
+
 fn board_name(candidate: &Candidate, facts: &DeviceFacts) -> String {
     if let Some(vendor) = ksx_core::vendors::name_for(facts.vendor_id, facts.product_id) {
         return vendor.to_owned();
@@ -1040,6 +1137,27 @@ mod tests {
         Survey::from_nodes(&nodes)
     }
 
+    /// The Bluetooth keyboard on this cabinet — the shape measured here, where
+    /// the keyboard-class devnode IS the `BTHENUM` node.
+    const BT_KEYBOARD: &str = r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002045E_PID&0800\7&3562C725&0&001BDC0F1FE7_C00000000";
+
+    fn cabinet_with_bluetooth() -> Survey {
+        let mut nodes = keyboard_nodes(PANEL, "8&2A0D0500&0");
+        nodes.extend(keyboard_nodes(
+            r"USB\VID_046D&PID_C31C&MI_00\5&1E4F2A&0&0000",
+            "9&1F3E5D7C&0",
+        ));
+        nodes.push(node(AUX, HID_CLASS, "HidUsb", Some("8&2A0D0501&0")));
+        nodes.push(DeviceNode::new(
+            BT_KEYBOARD,
+            Some(KEYBOARD_CLASS_GUID.to_owned()),
+            Some("kbdhid".to_owned()),
+            Some("@keyboard.inf,%hid.keyboarddevice%;Bluetooth Keyboard".to_owned()),
+            None,
+        ));
+        Survey::from_nodes(&nodes)
+    }
+
     fn facts(id: &str, interface: u8, serial: Option<&str>) -> DeviceFacts {
         DeviceFacts {
             id: DeviceId::new(id),
@@ -1059,6 +1177,15 @@ mod tests {
         PickSpec {
             query: query.to_owned(),
             alias: None,
+            backend: None,
+        }
+    }
+
+    /// The spec a surface sends when the user asked for one backend by name.
+    fn spec_for(query: &str, backend: Backend) -> PickSpec {
+        PickSpec {
+            backend: Some(backend),
+            ..spec(query)
         }
     }
 
@@ -1334,8 +1461,8 @@ mod tests {
             &config,
             &GamesFile::default(),
             &PickSpec {
-                query: PANEL.to_owned(),
                 alias: Some("panel".to_owned()),
+                ..spec(PANEL)
             },
         )
         .expect_err("the name is taken");
@@ -1377,6 +1504,144 @@ mod tests {
         assert_eq!(written.devices.len(), 1, "upgraded, not duplicated");
         assert_eq!(written.devices[0].alias, "P1 panel");
         assert_eq!(written.devices[0].id.raw(), "usb:d209:0430:00");
+    }
+
+    // ── picking across transports ─────────────────────────────────────────
+
+    /// **A Bluetooth keyboard is pickable, and it lands on Interception.**
+    ///
+    /// The id written is the keyboard devnode's path, byte-exact — no `usb:`
+    /// selector can name a device with no vendor, product or interface number,
+    /// and inventing one would be a suggestion the writer could not honour.
+    ///
+    /// FAILS against the shipped writer twice over: `Survey::from_nodes` never
+    /// produced a Bluetooth candidate, so `resolve` answered "no device matches
+    /// that" about a keyboard on the desk; and had it resolved, the facts
+    /// lookup would have refused with `not-enumerable`, which reads as "ksx
+    /// could not find it" about a device ksx had just found.
+    #[test]
+    fn a_bluetooth_keyboard_can_be_picked_and_gets_the_interception_backend() {
+        let plan = plan_pick(
+            &cabinet_with_bluetooth(),
+            &one_ipac(),
+            &ConfigFile::default(),
+            &GamesFile::default(),
+            &spec("001BDC0F1FE7"),
+        )
+        .expect("a Bluetooth keyboard is a keyboard ksx can capture");
+
+        assert_eq!(
+            plan.backend,
+            Backend::Interception,
+            "the only backend this transport will ever have"
+        );
+        assert!(!plan.claimed);
+        assert_eq!(plan.selector.to_string(), BT_KEYBOARD.to_uppercase());
+        assert_eq!(
+            plan.selector.rung(),
+            "hardware-id",
+            "byte-exact on the devnode path — there is no weaker rung to climb"
+        );
+        assert_eq!(
+            plan.alias, "Bluetooth Keyboard",
+            "the name the DEVICE chose; a vendors table keyed on USB VID/PID \
+             has nothing to say about this device"
+        );
+        // …and the entry it would write parses back to the same thing.
+        let entry = plan.entry();
+        assert_eq!(entry.id.raw(), BT_KEYBOARD.to_uppercase());
+        assert_eq!(entry.backend, Backend::Interception);
+    }
+
+    /// **The refusal this task is about.** Asking for `winusb` on a Bluetooth
+    /// keyboard is refused for the TRANSPORT, in those words, and the advice
+    /// points at the backend that captures it today.
+    ///
+    /// It must not be `not-enumerable` — which is what the writer reaches two
+    /// lines later, and which reads as "ksx could not find it" about a device
+    /// it resolved by name — and it must not read as "not yet", because no
+    /// claim, replug or future release changes the answer.
+    #[test]
+    fn plan_pick_refuses_a_bluetooth_device_for_the_winusb_backend() {
+        let err = plan_pick(
+            &cabinet_with_bluetooth(),
+            &one_ipac(),
+            &ConfigFile::default(),
+            &GamesFile::default(),
+            &spec_for("001BDC0F1FE7", Backend::Winusb),
+        )
+        .expect_err("no INF can bind a device with no USB interface");
+
+        assert_eq!(err.code(), "backend-transport");
+        assert_ne!(err.code(), "not-enumerable");
+
+        let message = err.to_string();
+        assert!(message.contains("winusb"), "{message}");
+        assert!(message.contains("Bluetooth"), "{message}");
+        assert!(
+            message.contains("no USB interface to bind"),
+            "the transport fact must be IN the refusal, not only in a doc: {message}"
+        );
+
+        let advice = err.advice();
+        assert!(
+            advice.contains("ksx device pick"),
+            "and the way forward is the command that works: {advice}"
+        );
+        assert!(
+            advice.contains("interception"),
+            "naming the backend that captures it today: {advice}"
+        );
+    }
+
+    /// Asking for `winusb` on a USB board is a different answer, and it must
+    /// stay different: that board CAN be claimed, so the request is "not yet",
+    /// and rule (b) of §7 still decides the backend from the binding.
+    ///
+    /// Without this half the Bluetooth refusal could be "fixed" by refusing
+    /// every explicit `--backend winusb`, which would say "never" about a board
+    /// one command away from being claimed.
+    #[test]
+    fn asking_for_winusb_on_an_unclaimed_usb_board_is_not_the_transport_refusal() {
+        let plan = plan_pick(
+            &cabinet_with_bluetooth(),
+            &one_ipac(),
+            &ConfigFile::default(),
+            &GamesFile::default(),
+            &spec_for(PANEL, Backend::Winusb),
+        )
+        .expect("a USB board is reachable by winusb — it just is not claimed yet");
+        assert_eq!(
+            plan.backend,
+            Backend::Interception,
+            "rule (b), §7: the binding decides, and this interface is not bound \
+             to winusb.sys"
+        );
+    }
+
+    /// Re-picking a configured Bluetooth keyboard updates the entry in place
+    /// rather than adding a second one under the same path.
+    #[test]
+    fn re_picking_a_bluetooth_keyboard_replaces_its_entry() {
+        let config = config_with(vec![entry(
+            &BT_KEYBOARD.to_uppercase(),
+            "desk",
+            Backend::Interception,
+        )]);
+        let plan = plan_pick(
+            &cabinet_with_bluetooth(),
+            &one_ipac(),
+            &config,
+            &GamesFile::default(),
+            &spec("001BDC0F1FE7"),
+        )
+        .expect("it resolves");
+        assert_eq!(
+            plan.replaces.as_deref(),
+            Some("desk"),
+            "one device, one entry — and the name the user gave it survives"
+        );
+        assert_eq!(plan.alias, "desk");
     }
 
     /// Both halves of the paragraph, pinned on the CONSTANT rather than on a
@@ -1425,8 +1690,8 @@ mod tests {
             ..ConfigFile::default()
         };
         let renamed = PickSpec {
-            query: "P1 panel".to_owned(),
             alias: Some("panel".to_owned()),
+            ..spec("P1 panel")
         };
         let err = plan_pick(
             &cabinet(),

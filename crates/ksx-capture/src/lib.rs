@@ -34,6 +34,11 @@
 //! - The mouse filter is never set in M3 — mouse.sys is never touched.
 
 pub mod backend;
+/// The Bluetooth half of "what input devices are attached", beside
+/// [`winusb::enumerate`]'s USB half. Not `cfg(windows)`: the decision surface
+/// is a pure function of an already-collected device tree, so every wording —
+/// including the paired-but-disconnected case — runs in CI on any platform.
+pub mod bluetooth;
 pub mod composite;
 pub mod decision;
 pub mod escape;
@@ -64,6 +69,8 @@ pub mod winusb;
 pub use backend::{
     CaptureBackend, CaptureCtl, CaptureError, DeviceInfo, DeviceKind, ExitReason, Handles,
 };
+/// Named to read beside `usb_candidates`: two enumeration passes, one list.
+pub use bluetooth::{candidates as bt_candidates, BtCandidate};
 pub use composite::CompositeBackend;
 pub use decision::{
     key_event, process_keyboard_stroke, should_resend, CaptureSet, KeySet, StrokeOutcome, Take,

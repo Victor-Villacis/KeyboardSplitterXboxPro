@@ -53,6 +53,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub use ksx_core::Transport;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -163,6 +165,16 @@ pub struct DeviceNode {
     pub service: Option<String>,
     /// Raw `DeviceDesc`, e.g. `@input.inf,%hid.devicedesc%;USB Input Device`.
     pub device_desc: Option<String>,
+    /// `FriendlyName` — the name the DEVICE chose or the user gave it, when the
+    /// bus writes one.
+    ///
+    /// Rare on USB and the norm on Bluetooth, which is why it exists: a paired
+    /// device's `DeviceDesc` is a generic string from the class INF
+    /// (`Bluetooth HID Device`), while its `FriendlyName` is what it is called
+    /// on the phone it was paired with — `ULT TOWER 9`, measured on this
+    /// machine. A list of four `Bluetooth HID Device` rows is not a list anyone
+    /// can pick from. See [`Self::display_name`].
+    pub friendly_name: Option<String>,
     /// Prefix Windows gives this node's children's instance ids. The only
     /// reliable registry-level link from a USB interface to its HID child.
     pub parent_id_prefix: Option<String>,
@@ -193,6 +205,7 @@ impl DeviceNode {
             class_guid,
             service,
             device_desc,
+            friendly_name: None,
             parent_id_prefix,
             status: None,
         }
@@ -202,6 +215,13 @@ impl DeviceNode {
     #[must_use]
     pub fn with_status(mut self, status: NodeStatus) -> Self {
         self.status = Some(status);
+        self
+    }
+
+    /// Attach the bus's `FriendlyName` for this node.
+    #[must_use]
+    pub fn with_friendly_name(mut self, name: Option<String>) -> Self {
+        self.friendly_name = name.filter(|n| !n.trim().is_empty());
         self
     }
 
@@ -224,6 +244,19 @@ impl DeviceNode {
         match &self.device_desc {
             Some(desc) => desc.rsplit(';').next().unwrap_or(desc).trim().to_owned(),
             None => String::new(),
+        }
+    }
+
+    /// The best name a human has for this node: what the device calls itself,
+    /// else the class INF's description, else nothing.
+    ///
+    /// Same precedence rule as `ksx_capture::UsbCandidate::friendly` and for
+    /// the same reason — a generic INF string is technically a description and
+    /// useless on a screen full of them.
+    pub fn display_name(&self) -> String {
+        match self.friendly_name.as_deref() {
+            Some(name) => name.trim().to_owned(),
+            None => self.description(),
         }
     }
 
@@ -285,6 +318,56 @@ impl DeviceNode {
     }
 }
 
+/// The `BTHENUM` enumerator — a paired Bluetooth device's service nodes.
+pub const BTHENUM: &str = "BTHENUM";
+
+/// The Bluetooth device address inside an instance path, uppercased.
+///
+/// Lives beside the device tree rather than in `ksx-capture` because two
+/// consumers need the same answer and a second copy would be a second answer:
+/// [`Survey::from_nodes`] groups a Bluetooth keyboard's service nodes with it,
+/// and `ksx_capture::bluetooth` groups the device list with it. Two spellings
+/// appear on this machine and both are handled:
+///
+/// ```text
+/// BTHENUM\{00001124-…}_VID&0002045E_PID&02E0\7&3562C725&0&EC8350B88A10_C00000000
+///                                                         ^^^^^^^^^^^^
+/// BTHENUM\DEV_EC8350B88A10\7&3562C725&0&BLUETOOTHDEVICE_EC8350B88A10
+///             ^^^^^^^^^^^^
+/// ```
+///
+/// `None` rather than a partial match when nothing in the path is twelve hex
+/// digits: a wrong address merges two different devices into one row, which is
+/// exactly the ambiguity the USB side's `ParentIdPrefix` join exists to avoid.
+pub fn bd_addr(node: &DeviceNode) -> Option<String> {
+    let key = node.device_key.to_uppercase();
+    if let Some(rest) = key.strip_prefix("DEV_") {
+        let addr: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+        if is_bd_addr(&addr) {
+            return Some(addr);
+        }
+    }
+    // Otherwise the address is the last `&`-separated segment of the instance,
+    // up to the `_` that starts the per-service suffix.
+    let instance = node.instance.to_uppercase();
+    let tail = instance.rsplit('&').next()?;
+    let candidate = tail.split('_').find(|part| is_bd_addr(part))?;
+    Some(candidate.to_owned())
+}
+
+/// Twelve hex digits, and not the all-zero address.
+///
+/// The zero address is not a device. Measured on this machine: the LOCAL
+/// radio's own service nodes — `Bluetooth Peripheral Device`, `Virtual
+/// Bluetooth HID Device`, `Standard Serial over Bluetooth link (COM4)` — all
+/// spell `…&0&000000000000_0000000n`. Accepting it would file three unrelated
+/// pseudo-devices under one row named after whichever enumerated first.
+fn is_bd_addr(text: &str) -> bool {
+    text.len() == 12
+        && text.chars().all(|c| c.is_ascii_hexdigit())
+        && text.chars().any(|c| c != '0')
+}
+
 /// Parse the hex value after `marker` in a device key (`VID_D209` → `0xD209`).
 /// Crate-visible: `virtual_pads` classifies bus children with the same parse.
 pub(crate) fn hex_after(key: &str, marker: &str) -> Option<u32> {
@@ -319,6 +402,16 @@ pub enum ClaimState {
     NotAKeyboard,
     /// Somebody else's function driver (`CyUsb`, a vendor stack). Out of scope.
     ForeignDriver,
+    /// A keyboard on a transport a WinUSB claim can never bind — today, a
+    /// Bluetooth one.
+    ///
+    /// Deliberately NOT `NotAKeyboard`: it *is* a keyboard, Interception can
+    /// capture it, and splitting it into virtual pads works right now. What it
+    /// has no answer to is a claim, because a claim is an INF binding a USB
+    /// interface by hardware id and there is no USB interface here. That is
+    /// permanent, which is why it is its own state rather than a variant of
+    /// "not yet" (`ksx_core::transport`).
+    InterceptionOnly,
 }
 
 impl ClaimState {
@@ -328,6 +421,7 @@ impl ClaimState {
             ClaimState::Claimable => "claimable",
             ClaimState::NotAKeyboard => "not-a-keyboard",
             ClaimState::ForeignDriver => "foreign-driver",
+            ClaimState::InterceptionOnly => "interception-only",
         }
     }
 }
@@ -347,6 +441,13 @@ pub struct Candidate {
     /// Claiming an interface takes its whole board out of the keyboard count,
     /// so this is what the last-keyboard refusal subtracts.
     pub board: String,
+    /// How this device is attached — and therefore which backends can ever
+    /// reach it (`ksx_core::transport`).
+    ///
+    /// Carried rather than re-derived from [`Self::interface`]'s enumerator at
+    /// each call site, because "which enumerator prefix means what" is a rule
+    /// that would then exist in as many places as there are refusals.
+    pub transport: Transport,
 }
 
 impl Candidate {
@@ -455,6 +556,51 @@ impl Survey {
                 interface: node.clone(),
                 keyboard,
                 state,
+                transport: Transport::Usb,
+            });
+        }
+
+        // Bluetooth keyboards, in the SAME list. They belong here for two
+        // reasons and neither is cosmetic: `resolve` is what `ksx device pick`
+        // calls, so a device missing from this list produces "no device matches
+        // that" for a keyboard sitting right there — and `plan_claim` cannot
+        // refuse with the transport reason a device it has never heard of.
+        //
+        // One candidate per physical device, not per service node: a paired
+        // keyboard wears several `BTHENUM` nodes and they are one keyboard.
+        let mut seen: Vec<String> = Vec::new();
+        for node in nodes
+            .iter()
+            .filter(|n| n.enumerator.eq_ignore_ascii_case(BTHENUM))
+        {
+            let address = bd_addr(node);
+            let board = match &address {
+                Some(addr) => format!("{BTHENUM}\\{addr}").to_lowercase(),
+                None => node.instance_id.to_lowercase(),
+            };
+            // Only devices with a keyboard behind them. The rest of a radio's
+            // service nodes — audio sinks, serial ports, the local pseudo-
+            // devices — are listed by the DEVICE LIST, which is a different
+            // question from "what could ksx capture or claim".
+            let keyboard = keyboards
+                .iter()
+                .find(|kb| {
+                    kb.node.instance_id.eq_ignore_ascii_case(&node.instance_id)
+                        || (address.is_some() && bd_addr(&kb.node) == address)
+                })
+                .map(|kb| kb.node.clone());
+            if keyboard.is_none() || seen.contains(&board) {
+                continue;
+            }
+            seen.push(board.clone());
+            candidates.push(Candidate {
+                board,
+                interface: node.clone(),
+                keyboard,
+                // Permanent, and its own state: it IS a keyboard and
+                // Interception can capture it today. See the variant's docs.
+                state: ClaimState::InterceptionOnly,
+                transport: Transport::Bluetooth,
             });
         }
         candidates.sort_by(|a, b| a.interface.instance_id.cmp(&b.interface.instance_id));
@@ -687,10 +833,30 @@ pub fn why_unusable(node: &DeviceNode, nodes: &[DeviceNode]) -> Option<&'static 
     None
 }
 
+/// Every device the PnP manager reports as **present**, with its `Enum`
+/// properties and its live status. Read-only — see `win::devices`.
+///
+/// Public because the Bluetooth enumeration in `ksx-capture` reads the same
+/// tree this survey does, and reading it twice through two different
+/// mechanisms is how a device list ends up disagreeing with the refusal that
+/// guards it. One `CM_Get_Device_ID_ListW` walk, two consumers.
+///
+/// Off Windows there is no device tree, so the answer is an empty tree rather
+/// than a compile error — every caller already treats that conservatively.
+#[cfg(windows)]
+pub fn present_nodes() -> Vec<DeviceNode> {
+    crate::win::devices::present_nodes()
+}
+
+#[cfg(not(windows))]
+pub fn present_nodes() -> Vec<DeviceNode> {
+    Vec::new()
+}
+
 /// Survey the live machine. Read-only.
 #[cfg(windows)]
 pub fn survey() -> Survey {
-    Survey::from_nodes(&crate::win::devices::present_nodes())
+    Survey::from_nodes(&present_nodes())
 }
 
 /// Off Windows there is no device tree; every claim then refuses for want of a
@@ -719,6 +885,20 @@ pub enum Refusal {
     },
     #[error("{instance_id} is not a keyboard interface")]
     NotAKeyboard { instance_id: String },
+    /// The device is a keyboard, and it is on a transport a claim can never
+    /// bind.
+    ///
+    /// Separate from [`Self::NotAKeyboard`] because the two send a user to
+    /// opposite places. "Not a keyboard" means *pick a different interface*.
+    /// This means *the interface is right and the BACKEND is wrong* — use
+    /// Interception, which captures this device today. Nothing about it changes
+    /// with a reboot, a driver, or a future ksx release, so the advice must not
+    /// read as "not yet". `docs/DEVICE-IDENTITY.md` §11.
+    #[error("{instance_id} is a {transport} keyboard, and a WinUSB claim can never bind one")]
+    TransportCannotClaim {
+        instance_id: String,
+        transport: Transport,
+    },
     #[error("{instance_id} is already bound to winusb.sys")]
     AlreadyClaimed { instance_id: String },
     #[error("{instance_id} is not claimed by ksx (driver: {driver})")]
@@ -763,6 +943,7 @@ impl Refusal {
             Refusal::UnknownDevice { .. } => "unknown-device",
             Refusal::Ambiguous { .. } => "ambiguous-device",
             Refusal::NotAKeyboard { .. } => "not-a-keyboard",
+            Refusal::TransportCannotClaim { .. } => "transport-cannot-claim",
             Refusal::AlreadyClaimed { .. } => "already-claimed",
             Refusal::NotClaimed { .. } => "not-claimed",
             Refusal::LastKeyboard { .. } => "last-keyboard",
@@ -810,6 +991,16 @@ impl Refusal {
                 }
                 advice
             }
+            // Never "not supported yet". The instruction is to use the backend
+            // that works, right now, on this exact device — because it does.
+            Refusal::TransportCannotClaim { instance_id, .. } => format!(
+                "{}\n\nThis keyboard is NOT out of reach: Interception captures it today — it is \
+                 a keyboard on the Windows input stack like any other, so ksx can split it into \
+                 virtual pads with no claim at all. Pick it and leave the backend alone:\n  ksx \
+                 device pick {instance_id}\n\nThat writes backend = \"interception\", which is \
+                 the only backend this device will ever have.",
+                ksx_core::transport::WINUSB_NEEDS_A_USB_INTERFACE
+            ),
             Refusal::AlreadyClaimed { .. } => {
                 "nothing to do. `ksx winusb release <device>` puts it back on the keyboard \
                  driver."
@@ -1042,6 +1233,16 @@ pub fn plan_claim(survey: &Survey, requested: &str, inf_dir: &Path) -> Result<Cl
         ClaimState::NotAKeyboard | ClaimState::ForeignDriver => {
             return Err(Refusal::NotAKeyboard {
                 instance_id: candidate.interface.instance_id.clone(),
+            })
+        }
+        // The interface is right and the BACKEND is wrong. Saying "not a
+        // keyboard" here would send someone hunting for a different interface
+        // of a device that has exactly one, and there is no interface on it a
+        // claim could bind.
+        ClaimState::InterceptionOnly => {
+            return Err(Refusal::TransportCannotClaim {
+                instance_id: candidate.interface.instance_id.clone(),
+                transport: candidate.transport,
             })
         }
         ClaimState::Claimable => {}
@@ -2126,6 +2327,233 @@ mod tests {
             3,
             "two I-PACs and the spare are three keyboards, not one model"
         );
+    }
+
+    // ── Bluetooth: in the survey, and permanently unclaimable ─────────────
+
+    /// A paired Bluetooth keyboard, in the shape this machine spells them.
+    fn bluetooth_keyboard_tree() -> Vec<DeviceNode> {
+        let mut tree = healthy_cabinet_tree();
+        tree.push(live(node(
+            r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002045E_PID&0800\7&3562C725&0&001BDC0F1FE7_C00000000",
+            KEYBOARD_CLASS_GUID,
+            "kbdhid",
+            "@keyboard.inf,%hid.keyboarddevice%;Bluetooth Keyboard",
+            None,
+        )));
+        tree
+    }
+
+    /// **A Bluetooth keyboard has to BE in the survey.**
+    ///
+    /// `resolve` is what `ksx device pick` calls and what every refusal is
+    /// worded against. A keyboard missing from this list produces "no device
+    /// matches that" for a keyboard sitting on the desk — and `plan_claim`
+    /// cannot refuse with the transport reason a device it has never heard of.
+    ///
+    /// FAILS against the shipped `Survey::from_nodes`, which iterated
+    /// `enumerator == "USB"` and nothing else.
+    #[test]
+    fn a_bluetooth_keyboard_is_a_candidate_the_survey_can_resolve() {
+        let survey = Survey::from_nodes(&bluetooth_keyboard_tree());
+        let bt = survey
+            .resolve("001BDC0F1FE7")
+            .expect("the Bluetooth keyboard must be findable by name");
+        assert_eq!(bt.transport, Transport::Bluetooth);
+        assert_eq!(bt.state, ClaimState::InterceptionOnly);
+        assert!(
+            bt.keyboard.is_some(),
+            "it IS a keyboard — that is why Interception can capture it"
+        );
+    }
+
+    /// **The rule this list exists to teach, at the refusal.**
+    ///
+    /// A claim on a Bluetooth keyboard is refused for the TRANSPORT, and the
+    /// refusal says so and points at the backend that works today. It must not
+    /// read as "not a keyboard" (which sends someone hunting for a different
+    /// interface of a device that has one) and it must not read as "not
+    /// supported yet" (which invites waiting for a release that cannot come).
+    ///
+    /// FAILS against routing Bluetooth through `Refusal::NotAKeyboard`, which
+    /// is the obvious first implementation and is wrong in both directions.
+    #[test]
+    fn claiming_a_bluetooth_keyboard_is_refused_for_the_transport_not_for_being_a_keyboard() {
+        let survey = Survey::from_nodes(&bluetooth_keyboard_tree());
+        let err = plan_claim(&survey, "001BDC0F1FE7", &inf_dir())
+            .expect_err("no INF can bind a Bluetooth device");
+        assert_eq!(err.code(), "transport-cannot-claim");
+        assert_ne!(err.code(), "not-a-keyboard");
+
+        let message = err.to_string();
+        assert!(message.contains("Bluetooth"), "{message}");
+        assert!(message.contains("never"), "{message}");
+
+        let advice = err.advice();
+        assert!(
+            advice.contains("no USB interface to bind"),
+            "the transport fact, not a vague refusal: {advice}"
+        );
+        assert!(
+            advice.contains("Interception captures it today"),
+            "and the backend that DOES work, right now: {advice}"
+        );
+        assert!(
+            advice.contains("ksx device pick"),
+            "with the command that uses it: {advice}"
+        );
+    }
+
+    /// A Bluetooth keyboard counts as a keyboard for the last-keyboard
+    /// refusal — it is a real spare, and refusing a legitimate claim because
+    /// ksx would not count it is its own failure.
+    #[test]
+    fn a_bluetooth_keyboard_counts_as_a_spare_for_the_last_keyboard_refusal() {
+        // The panel alone — the lifeline keyboard unplugged.
+        let mut lonely = healthy_cabinet_tree();
+        lonely.retain(|n| !n.instance_id.contains("VID_3434"));
+        let boards = Survey::from_nodes(&lonely).keyboard_count();
+        assert_eq!(boards, 1, "fixture precondition: only the panel is left");
+
+        let mut with_bt = lonely.clone();
+        with_bt.push(live(node(
+            r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002045E_PID&0800\7&3562C725&0&001BDC0F1FE7_C00000000",
+            KEYBOARD_CLASS_GUID,
+            "kbdhid",
+            "@keyboard.inf,%hid.keyboarddevice%;Bluetooth Keyboard",
+            None,
+        )));
+        assert_eq!(
+            Survey::from_nodes(&with_bt).keyboard_count(),
+            boards + 1,
+            "a connected Bluetooth keyboard is a keyboard you can type on"
+        );
+    }
+
+    /// **The trap, at the arithmetic that matters.** A paired-but-disconnected
+    /// Bluetooth keyboard is PRESENT and must NOT be counted as the spare that
+    /// licenses claiming the panel — someone reads "2 keyboards", claims their
+    /// panel, and is locked out by a keyboard in a drawer with dead batteries.
+    ///
+    /// FAILS against counting rows in the keyboard class, which is what a
+    /// registry-only survey does.
+    #[test]
+    fn a_disconnected_bluetooth_keyboard_never_licenses_claiming_the_panel() {
+        let mut tree = healthy_cabinet_tree();
+        tree.retain(|n| !n.instance_id.contains("VID_3434"));
+        tree.push(
+            node(
+                r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002045E_PID&0800\7&3562C725&0&001BDC0F1FE7_C00000000",
+                KEYBOARD_CLASS_GUID,
+                "kbdhid",
+                "@keyboard.inf,%hid.keyboarddevice%;Bluetooth Keyboard",
+                None,
+            )
+            .with_status(NodeStatus {
+                started: false,
+                problem: CM_PROB_DEVICE_NOT_CONNECTED,
+            }),
+        );
+        let survey = Survey::from_nodes(&tree);
+
+        assert!(
+            survey
+                .keyboards
+                .iter()
+                .any(|kb| kb.node.enumerator.eq_ignore_ascii_case("BTHENUM")),
+            "it stays LISTED — hiding it would be its own lie"
+        );
+        assert_eq!(
+            survey.keyboard_count(),
+            1,
+            "…and it is not counted: it cannot type the command that undoes a claim"
+        );
+        let err = plan_claim(&survey, "PID_0430&MI_00", &inf_dir())
+            .expect_err("the panel is the only keyboard that can type");
+        assert_eq!(err.code(), "last-keyboard");
+    }
+
+    /// One physical Bluetooth device wears several service nodes; it is ONE
+    /// candidate. Two rows for one keyboard would put the same device twice in
+    /// a picker and twice in the keyboard arithmetic.
+    #[test]
+    fn several_service_nodes_of_one_bluetooth_keyboard_are_one_candidate() {
+        let mut tree = healthy_cabinet_tree();
+        for suffix in ["_C00000000", "_C00000001"] {
+            tree.push(live(node(
+                &format!(
+                    r"BTHENUM\{{00001124-0000-1000-8000-00805F9B34FB}}_VID&0002045E_PID&0800\7&3562C725&0&001BDC0F1FE7{suffix}"
+                ),
+                KEYBOARD_CLASS_GUID,
+                "kbdhid",
+                "@keyboard.inf,%hid.keyboarddevice%;Bluetooth Keyboard",
+                None,
+            )));
+        }
+        let survey = Survey::from_nodes(&tree);
+        assert_eq!(
+            survey
+                .candidates
+                .iter()
+                .filter(|c| c.transport == Transport::Bluetooth)
+                .count(),
+            1,
+            "one keyboard, one row"
+        );
+    }
+
+    /// A Bluetooth device that is not a keyboard — a speaker, a controller —
+    /// is not a claim candidate at all. The DEVICE LIST still shows it
+    /// (`ksx_capture::bluetooth`); this survey answers a narrower question.
+    #[test]
+    fn a_bluetooth_device_with_no_keyboard_is_not_a_claim_candidate() {
+        let mut tree = healthy_cabinet_tree();
+        tree.push(live(node(
+            r"BTHENUM\DEV_24C4069CF1F4\7&3562C725&0&BLUETOOTHDEVICE_24C4069CF1F4",
+            "{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}",
+            "BthEnum",
+            "@bth.inf,%token%;ULT TOWER 9",
+            None,
+        )));
+        let survey = Survey::from_nodes(&tree);
+        assert!(survey
+            .candidates
+            .iter()
+            .all(|c| c.transport == Transport::Usb));
+    }
+
+    /// Both measured spellings of a Bluetooth address, and the all-zero
+    /// address that is NOT one.
+    ///
+    /// FAILS against `len() == 12 && all hex`: the local radio's own service
+    /// nodes all spell `…&0&000000000000_0000000n`, and accepting that files
+    /// three unrelated pseudo-devices under one identity.
+    #[test]
+    fn a_bluetooth_address_is_read_from_either_spelling_and_never_zero() {
+        let of = |id: &str| bd_addr(&DeviceNode::new(id, None, None, None, None));
+        assert_eq!(
+            of(r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002045E_PID&02E0\7&3562C725&0&EC8350B88A10_C00000000")
+                .as_deref(),
+            Some("EC8350B88A10")
+        );
+        assert_eq!(
+            of(r"BTHENUM\DEV_EC8350B88A10\7&3562C725&0&BLUETOOTHDEVICE_EC8350B88A10").as_deref(),
+            Some("EC8350B88A10"),
+            "the DEV_ node and the service node name one device"
+        );
+        assert_eq!(
+            of(r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002045E_PID&02E0\2&21119A68&0&F2424BE71501")
+                .as_deref(),
+            Some("F2424BE71501")
+        );
+        assert_eq!(
+            of(
+                r"BTHENUM\{E836F634-9100-4CA8-95EE-F7B6E9115185}_LOCALMFG&0000\7&3562C725&0&000000000000_00000008"
+            ),
+            None,
+            "the local radio's zero address is not a device"
+        );
+        assert_eq!(of(r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000"), None);
     }
 
     /// The release order is load-bearing, and the plan says so.

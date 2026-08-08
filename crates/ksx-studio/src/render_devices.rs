@@ -160,6 +160,13 @@ fn configured_row(device: &ConfiguredDevice, index: usize) -> SlotValue {
         ("alias".to_owned(), SlotValue::Text(device.alias.clone())),
         ("id".to_owned(), SlotValue::Text(device.id.clone())),
         ("rung".to_owned(), SlotValue::Text(device.rung.clone())),
+        // The third fact the claim pill is reasoning about. `winusb` on a
+        // bluetooth transport is not a claim somebody forgot to perform, it is
+        // one nobody can perform — and `health_line` says so, in `ksx_api`.
+        (
+            "transport".to_owned(),
+            SlotValue::Text(device.transport.clone()),
+        ),
         // Both RENDERED, on their own line beside the id. `backend` used to be
         // computed into this object and read by nothing, which meant the page
         // never said whether an entry was `winusb` or `interception` — the one
@@ -270,8 +277,23 @@ fn board_row(board: &BoardRow, index: usize) -> SlotValue {
     let keyboard = board.keyboard.clone().unwrap_or_default();
     let (command_lead, command_cls) = optional_line(&board.command_lead, "dv-cmd");
     let (caveat, caveat_cls) = optional_line(&board.caveat, "dv-warn");
+    // Both SERVED by `DeviceScanView::read`. The transport word decides whether
+    // the WinUSB half of the backends line reads "after a claim" or "never", so
+    // a seam that mapped either itself would be re-deciding the one rule this
+    // column exists to state — and its TypeScript twin would decide it again.
+    let (cant_type, cant_type_cls) = optional_line(&board.cannot_type_line, "dv-warn");
     SlotValue::object(vec![
         ("name".to_owned(), SlotValue::Text(board.name.clone())),
+        (
+            "transport".to_owned(),
+            SlotValue::Text(board.transport_label.clone()),
+        ),
+        (
+            "backends".to_owned(),
+            SlotValue::Text(board.backends.clone()),
+        ),
+        ("cantType".to_owned(), SlotValue::Text(cant_type)),
+        ("cantTypeCls".to_owned(), SlotValue::Text(cant_type_cls)),
         (
             "ifaces".to_owned(),
             SlotValue::Text(format!(
@@ -364,11 +386,22 @@ fn other_row(board: &BoardRow) -> SlotValue {
     SlotValue::object(vec![
         ("name".to_owned(), SlotValue::Text(board.name.clone())),
         (
+            "transport".to_owned(),
+            SlotValue::Text(board.transport_label.clone()),
+        ),
+        (
             "ifaces".to_owned(),
             SlotValue::Text(format!(
                 "{} interface(s) · no keyboard interface",
                 board.interfaces.len()
             )),
+        ),
+        // Why no backend reaches it. "ksx cannot see my device" gets a
+        // different answer per transport, and on Bluetooth that answer is
+        // permanent — worth saying even on the quiet list.
+        (
+            "backends".to_owned(),
+            SlotValue::Text(board.backends.clone()),
         ),
     ])
 }
@@ -522,6 +555,56 @@ mod tests {
     const AUX: &str = r"USB\VID_D209&PID_0430&MI_01\7&25EEA38C&0&0001";
     const FAN: &str = r"USB\VID_1E71&PID_300E&MI_01\7&8FBF878&0&0001";
 
+    /// A Bluetooth keyboard, in the shape `ksx-app`'s collector produces.
+    const BT_KEYBOARD: &str = r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002045E_PID&0800\7&3562C725&0&001BDC0F1FE7_C00000000";
+
+    /// Backend eligibility from `ksx_core::Reach`, never spelled by hand: a
+    /// fixture that wrote its own answer could not disagree with the page even
+    /// when the page was wrong, and the transport rule is the thing these tests
+    /// hold.
+    fn reach(
+        transport: ksx_api::Transport,
+        keyboard: bool,
+        claimed: bool,
+        can_type: bool,
+    ) -> UsbRow {
+        let reach = ksx_core::Reach {
+            transport,
+            keyboard,
+            claimed,
+            can_type,
+        };
+        let eligibility = reach.eligibility();
+        UsbRow {
+            transport: transport.code().to_owned(),
+            interception_eligible: eligibility.interception,
+            winusb_eligible: eligibility.winusb,
+            backends: eligibility.line,
+            can_type,
+            ..UsbRow::default()
+        }
+    }
+
+    fn bt_iface(can_type: bool) -> UsbRow {
+        UsbRow {
+            instance_id: BT_KEYBOARD.to_owned(),
+            description: "Bluetooth Keyboard".to_owned(),
+            state: "interception-only".to_owned(),
+            verdict: "a Bluetooth keyboard on the Windows input stack — ksx can capture it \
+                      through Interception and split it into virtual pads"
+                .to_owned(),
+            board: Some(r"BTHENUM\001BDC0F1FE7".to_owned()),
+            boot_keyboard: true,
+            selector: Some(BT_KEYBOARD.to_owned()),
+            cannot_type_reason: if can_type {
+                String::new()
+            } else {
+                "not connected (paired but absent?)".to_owned()
+            },
+            ..reach(ksx_api::Transport::Bluetooth, true, false, can_type)
+        }
+    }
+
     fn iface(id: &str, state: &str) -> UsbRow {
         UsbRow {
             instance_id: id.to_owned(),
@@ -540,6 +623,12 @@ mod tests {
             // (`docs/SURFACES.md` §1), and a fixture that computed it would be
             // re-deriving it in a third place to test the other two.
             selector: Some("usb:d209:0430:00".to_owned()),
+            ..reach(
+                ksx_api::Transport::Usb,
+                state == "claimed" || state == "claimable",
+                state == "claimed",
+                state != "claimed",
+            )
         }
     }
 
@@ -553,44 +642,53 @@ mod tests {
     /// these tests are asking about, and it could not disagree with the page
     /// even when the page was wrong.
     fn cabinet_scan() -> DeviceScanView {
+        cabinet_scan_with(Vec::new())
+    }
+
+    /// The reference cabinet plus whatever else is attached — the Bluetooth
+    /// rows go through here so the fixture cannot special-case them.
+    fn cabinet_scan_with(extra: Vec<ksx_api::BoardRow>) -> DeviceScanView {
+        let mut boards = vec![
+            ksx_api::BoardRow {
+                name: "Ultimarc I-PAC 4X".into(),
+                interfaces: vec![iface(PANEL, "claimed"), iface(AUX, "not-a-keyboard")],
+                keyboard: Some(PANEL.to_owned()),
+                keyboard_verdict: "bound to winusb.sys — ksx can capture this".into(),
+                looks_like_a_keyboard: true,
+                claimed: true,
+                alias: Some("panel".into()),
+                claim_command: None,
+                release_command: Some(format!("ksx winusb release {PANEL} --yes")),
+                ..ksx_api::BoardRow::default()
+            },
+            ksx_api::BoardRow {
+                name: "NZXT fan controller".into(),
+                interfaces: vec![UsbRow {
+                    boot_keyboard: false,
+                    ..iface(FAN, "not-a-keyboard")
+                }],
+                keyboard: None,
+                keyboard_verdict: "no keyboard interface — ksx cannot capture this board".into(),
+                looks_like_a_keyboard: false,
+                claimed: false,
+                alias: None,
+                claim_command: None,
+                release_command: None,
+                ..ksx_api::BoardRow::default()
+            },
+        ];
+        boards.extend(extra);
         DeviceScanView::read(
             "2026-08-07 12:00:00 UTC".into(),
             true,
-            vec![
-                ksx_api::BoardRow {
-                    name: "Ultimarc I-PAC 4X".into(),
-                    interfaces: vec![iface(PANEL, "claimed"), iface(AUX, "not-a-keyboard")],
-                    keyboard: Some(PANEL.to_owned()),
-                    keyboard_verdict: "bound to winusb.sys — ksx can capture this".into(),
-                    looks_like_a_keyboard: true,
-                    claimed: true,
-                    alias: Some("panel".into()),
-                    claim_command: None,
-                    release_command: Some(format!("ksx winusb release {PANEL} --yes")),
-                    ..ksx_api::BoardRow::default()
-                },
-                ksx_api::BoardRow {
-                    name: "NZXT fan controller".into(),
-                    interfaces: vec![UsbRow {
-                        boot_keyboard: false,
-                        ..iface(FAN, "not-a-keyboard")
-                    }],
-                    keyboard: None,
-                    keyboard_verdict: "no keyboard interface — ksx cannot capture this board"
-                        .into(),
-                    looks_like_a_keyboard: false,
-                    claimed: false,
-                    alias: None,
-                    claim_command: None,
-                    release_command: None,
-                    ..ksx_api::BoardRow::default()
-                },
-            ],
+            true,
+            boards,
             vec![ksx_api::ConfiguredDevice {
                 alias: "panel".into(),
                 id: "port=7&25EEA38C&0&0000".into(),
                 backend: "winusb".into(),
                 rung: "port".into(),
+                transport: "usb".into(),
                 survives_replug: false,
                 means: "this exact USB socket".into(),
                 port_pinned_warning: Some(ksx_app_port_pinned_warning_stand_in().to_owned()),
@@ -894,6 +992,126 @@ mod tests {
         assert!(out.html.contains("slots naming it"), "{}", out.html);
     }
 
+    /// A `BoardRow` for the Bluetooth keyboard, with everything derived by
+    /// `DeviceScanView::read` from its interface — nothing spelled here.
+    fn bt_board(can_type: bool) -> ksx_api::BoardRow {
+        ksx_api::BoardRow {
+            name: "Bluetooth Keyboard".into(),
+            interfaces: vec![bt_iface(can_type)],
+            keyboard: Some(BT_KEYBOARD.to_owned()),
+            keyboard_verdict: "a Bluetooth keyboard on the Windows input stack — ksx can \
+                               capture it through Interception and split it into virtual pads"
+                .into(),
+            looks_like_a_keyboard: true,
+            claimed: false,
+            alias: None,
+            claim_command: None,
+            release_command: None,
+            ..ksx_api::BoardRow::default()
+        }
+    }
+
+    fn bt_payload(can_type: bool) -> DevicesPayload {
+        DevicesPayload {
+            scan: cabinet_scan_with(vec![bt_board(can_type)]),
+            ..cabinet()
+        }
+    }
+
+    /// **The rule the seam has to put on the page.** Both transports in one
+    /// list; every row states which backends can reach it; the Bluetooth row's
+    /// "never" names the transport fact.
+    ///
+    /// FAILS against the shipped seam three ways over — the payload carried no
+    /// transport, the row composed no backend line, and the enumeration behind
+    /// it walked USB only, so the device never reached this file at all.
+    #[test]
+    fn the_seam_renders_the_transport_and_the_backends_for_both_transports() {
+        let page = EmbeddedPage::load("/devices").unwrap();
+        let out = render_devices(&page, &bt_payload(true), None);
+
+        assert!(out.html.contains("Bluetooth Keyboard"), "{}", out.html);
+        // The transport is on EVERY row, not only the surprising one.
+        assert!(out.html.contains(">Bluetooth<"), "{}", out.html);
+        assert!(out.html.contains(">USB<"), "{}", out.html);
+        assert!(out.html.contains("winusb: never"), "{}", out.html);
+        assert!(
+            out.html.contains("no USB interface to bind"),
+            "the transport fact, not a vague refusal: {}",
+            out.html
+        );
+        assert!(
+            out.html.contains("interception: yes, now"),
+            "and the backend that captures it today: {}",
+            out.html
+        );
+    }
+
+    /// The seam's Bluetooth row must carry the SERVED strings verbatim — the
+    /// moment it composes its own, the TypeScript twin composes a different one
+    /// per poll and the page changes wording when it hydrates.
+    #[test]
+    fn the_seam_copies_the_served_backend_line_rather_than_composing_one() {
+        let page = EmbeddedPage::load("/devices").unwrap();
+        let scan = cabinet_scan_with(vec![bt_board(true)]);
+        let bt = scan
+            .boards
+            .iter()
+            .find(|b| b.name == "Bluetooth Keyboard")
+            .expect("the Bluetooth board");
+        let out = render_devices(&page, &bt_payload(true), None);
+
+        assert!(!bt.backends.is_empty(), "read() must have filled it");
+        assert_eq!(bt.transport_label, "Bluetooth");
+        // The `&` in the served sentence is escaped on the way into HTML, so
+        // the check is on the payload the island hydrates from — which is the
+        // string the twin will re-render, and the one that must not differ.
+        assert!(
+            out.html.contains(&bt.backends.replace('&', "&amp;")),
+            "the seam must render the SERVED line: {}",
+            bt.backends
+        );
+    }
+
+    /// **The trap, at the seam.** A paired-but-disconnected keyboard keeps its
+    /// row and gains the caveat; a CLAIMED board must not gain it, because a
+    /// claim stopping a board typing is the point of a claim rather than a
+    /// fault.
+    ///
+    /// FAILS against gating the caveat on `!can_type` alone — the obvious
+    /// implementation, which decorates the working claimed I-PAC with "does not
+    /// count as the spare keyboard a claim needs".
+    #[test]
+    fn only_a_device_that_should_be_typing_is_warned_that_it_is_not() {
+        let page = EmbeddedPage::load("/devices").unwrap();
+
+        let absent = render_devices(&page, &bt_payload(false), None);
+        assert!(absent.html.contains("Bluetooth Keyboard"), "still listed");
+        assert!(
+            absent.html.contains("not connected (paired but absent?)"),
+            "{}",
+            absent.html
+        );
+        assert!(
+            absent
+                .html
+                .contains("does not count as the spare keyboard a claim needs"),
+            "{}",
+            absent.html
+        );
+
+        // The connected one, and the CLAIMED I-PAC beside it, carry nothing.
+        let live = render_devices(&page, &bt_payload(true), None);
+        assert!(
+            !live
+                .html
+                .contains("does not count as the spare keyboard a claim needs"),
+            "a deliberate claim is not a fault, and a connected keyboard is not \
+             one either: {}",
+            live.html
+        );
+    }
+
     /// The health verdict is `ksx_api`'s, and the page renders BOTH halves of
     /// it — the sentence and the severity the sentence is worth.
     ///
@@ -907,6 +1125,7 @@ mod tests {
         let loose = |used_by: Vec<String>| {
             let scan = DeviceScanView::read(
                 "t".into(),
+                true,
                 true,
                 Vec::new(),
                 vec![ksx_api::ConfiguredDevice {
@@ -1094,6 +1313,7 @@ mod tests {
                 scan: DeviceScanView::read(
                     "2026-08-07 12:00:00 UTC".into(),
                     false,
+                    false,
                     Vec::new(),
                     Vec::new(),
                     vec!["the USB enumeration returned no interfaces".into()],
@@ -1123,6 +1343,7 @@ mod tests {
             &DevicesPayload {
                 scan: DeviceScanView::read(
                     "2026-08-07 12:00:00 UTC".into(),
+                    true,
                     true,
                     Vec::new(),
                     Vec::new(),

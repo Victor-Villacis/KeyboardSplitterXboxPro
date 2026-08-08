@@ -11,6 +11,7 @@ expression: "serde_json::to_string_pretty(&devices_json(&report)).unwrap()"
       "available": false
     }
   },
+  "bluetooth_devices": [],
   "health": {
     "duplicate_hardware_ids": [],
     "highest_keyboard_slot": 2,
@@ -18,7 +19,8 @@ expression: "serde_json::to_string_pretty(&devices_json(&report)).unwrap()"
     "pending_rebinds": [],
     "reboot_required": false,
     "slot_budget": 10,
-    "unmatched_winusb_config": []
+    "unmatched_winusb_config": [],
+    "winusb_on_bluetooth": []
   },
   "keyboards": [
     {
@@ -39,5 +41,13 @@ expression: "serde_json::to_string_pretty(&devices_json(&report)).unwrap()"
     }
   ],
   "mice_visible": 1,
+  "transports": {
+    "bluetooth": {
+      "available": false
+    },
+    "usb": {
+      "available": false
+    }
+  },
   "usb_candidates": []
 }

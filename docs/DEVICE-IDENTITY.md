@@ -429,3 +429,59 @@ pipeline; it is now resolved once, at start, against a fresh enumeration
 concrete ids only). So a board in a new socket still matches, and a board that
 is genuinely missing is reported by name at the top instead of surfacing as an
 empty candidate list several layers down.
+
+## §11 Transport decides which backends can reach a device
+
+A device's **transport** — how it is attached — is a separate fact from its
+identity, and it decides something identity does not: which capture backends
+can ever reach it. Two devices with equally good ids can have completely
+different answers.
+
+The case that matters today is Bluetooth, and both halves of it surprise
+people:
+
+- **A Bluetooth keyboard CAN be captured by Interception.** Interception is a
+  class filter on the Windows keyboard stack, and a paired Bluetooth keyboard
+  is a keyboard-class devnode on that stack exactly like a USB one. Splitting
+  it into virtual pads works today, with no new code.
+- **A Bluetooth keyboard can NEVER be WinUSB-claimed.** A claim is an INF that
+  binds a **USB interface** by hardware id (`USB\VID_xxxx&PID_yyyy&MI_zz`).
+  There is no USB interface on a Bluetooth device for such an INF to match.
+
+That second half is a property of the transport, not a feature ksx has not
+written yet, and the wording matters: "not supported" invites someone to wait
+for a release that cannot come. Every surface says *why* — `ksx_core::transport`
+holds the sentence and `Reach::eligibility` composes the per-row line, so the
+CLI, Studio's Rust seam and Studio's TypeScript island cannot word it three
+ways. This is the same rule as §6 in a different costume: the fact may pick a
+sentence and gate a *backend*, and it may not be re-derived at a surface.
+
+Two consequences fall out, and both are refusals rather than silence:
+
+1. `ksx winusb claim` on a Bluetooth keyboard refuses with
+   `transport-cannot-claim`, **not** `not-a-keyboard`. The two send a user to
+   opposite places — "not a keyboard" means *pick a different interface*, and
+   this means *the interface is right and the backend is wrong*.
+2. `backend = "winusb"` on a `[[device]]` entry that resolves to a Bluetooth
+   device is a permanently broken entry, not one awaiting a claim. `ksx devices`
+   and Studio call it out separately from "no such interface is present",
+   because the fix is to edit the entry rather than to plug something in.
+
+### Identity on a transport with no `usb:` selector
+
+A `usb:` selector names a vendor, product and interface number (§2). A
+Bluetooth device has none of the three, so `ksx device pick` writes the
+keyboard devnode's **instance path**, byte-exact — `DeviceSelector::HardwareId`
+semantics, the same lenient legacy spelling §5 keeps working. That id has no
+rung to climb: it is already the weakest thing that names the device, and there
+is no port to pin.
+
+### The trap: present is not typing
+
+A **paired but disconnected** Bluetooth keyboard is PRESENT in the device tree
+all day — pairing is what puts it there, and the batteries have nothing to do
+with it (`CM_PROB_DEVICE_NOT_CONNECTED`). It stays listed, because hiding it
+would be its own lie, and every row says it cannot deliver a keystroke right
+now. It is **excluded from the last-keyboard arithmetic**
+(`Survey::keyboard_count`): otherwise someone reads "2 keyboards", claims their
+panel, and is locked out by a keyboard in a drawer with dead batteries.

@@ -667,6 +667,14 @@ impl ksx_api::MachineSource for LocalMachine {
                 .map(str::trim)
                 .filter(|alias| !alias.is_empty())
                 .map(str::to_owned),
+            // `None`, and there is no control to make it anything else. The
+            // backend is a statement of fact about the binding
+            // (`docs/DEVICE-IDENTITY.md` §7 rule (b)), and the one thing a
+            // surface could ask for — `winusb` — needs a claim, which
+            // `docs/SURFACES.md` §3 marks "never" for the browser. A picker
+            // that offered the choice would be offering an outcome this
+            // surface cannot produce.
+            backend: None,
         };
         let plan = crate::device_edit::plan_pick(&survey, &connected, &config, &games, &wanted)
             .map_err(pick_refusal)?;

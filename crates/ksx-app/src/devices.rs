@@ -190,6 +190,33 @@ pub struct UsbRow {
     pub selected: bool,
 }
 
+/// One Bluetooth-side row: a paired device plus what config wants from it.
+///
+/// The Bluetooth twin of [`UsbRow`], and it exists for the same reason: the
+/// enumerator says what is attached, and config says what ksx has been told to
+/// do with it. The two are joined here, once, rather than at each surface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtRow {
+    pub candidate: ksx_capture::BtCandidate,
+    /// The `[[device]]` alias bound to this device, if any.
+    pub alias: Option<String>,
+    /// `true` when a `[[device]]` entry selects `backend = "winusb"` for it —
+    /// which, on this transport, is a config that can never work. It is
+    /// reported rather than corrected: ksx does not silently rewrite a file.
+    pub selected_winusb: bool,
+}
+
+impl BtRow {
+    /// The id a `[[device]]` entry for this device holds: the keyboard-class
+    /// devnode, else the service node ksx found it through.
+    pub fn config_id(&self) -> &DeviceId {
+        self.candidate
+            .keyboard_id
+            .as_ref()
+            .unwrap_or(&self.candidate.id)
+    }
+}
+
 /// The `[[device]] id` `ksx device pick` would write for each row, index-aligned
 /// with `rows`.
 ///
@@ -241,6 +268,14 @@ pub struct DevicesReport {
     pub usb: Vec<UsbRow>,
     /// Was USB enumeration possible?
     pub usb_available: bool,
+    /// Paired Bluetooth devices — the other half of "what is attached".
+    ///
+    /// A separate field from [`Self::usb`] because they come from separate
+    /// passes with separate failure modes; they are UNIFIED at the view, which
+    /// is where a human reads them, and never here.
+    pub bluetooth: Vec<BtRow>,
+    /// Was Bluetooth enumeration possible?
+    pub bluetooth_available: bool,
     /// `[[device]]` entries, for the backend column.
     pub configured: ConfiguredDevices,
 }
@@ -258,15 +293,20 @@ impl DevicesReport {
             true,
             Vec::new(),
             false,
+            Vec::new(),
+            false,
             ConfiguredDevices::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         mut devices: Vec<DeviceInfo>,
         interception_available: bool,
         usb: Vec<UsbRow>,
         usb_available: bool,
+        bluetooth: Vec<BtRow>,
+        bluetooth_available: bool,
         configured: ConfiguredDevices,
     ) -> Self {
         let mice_visible = devices
@@ -281,8 +321,31 @@ impl DevicesReport {
             mice_visible,
             usb,
             usb_available,
+            bluetooth,
+            bluetooth_available,
             configured,
         }
+    }
+
+    /// Bluetooth devices that are keyboards — the ones with a backend.
+    pub fn bt_keyboards(&self) -> impl Iterator<Item = &BtRow> {
+        self.bluetooth.iter().filter(|r| r.candidate.is_keyboard)
+    }
+
+    /// `[[device]] backend = "winusb"` entries that resolved to a BLUETOOTH
+    /// device.
+    ///
+    /// A different fault from [`Self::unmatched_winusb_config`] and it must not
+    /// be folded into it: that one means "the board is not here or the id is
+    /// wrong", and the fix is to plug it in or re-pick. This one means the
+    /// entry names the right device and asks for a backend that transport can
+    /// never offer, and the fix is to change the entry — no claim, replug or
+    /// future release does anything for it.
+    pub fn winusb_on_bluetooth(&self) -> Vec<&BtRow> {
+        self.bluetooth
+            .iter()
+            .filter(|r| r.selected_winusb)
+            .collect()
     }
 
     pub fn slots_used(&self) -> usize {
@@ -343,6 +406,18 @@ impl DevicesReport {
                         || entry.selector().matches(&r.candidate.facts())
                 })
             })
+            // An entry that names a BLUETOOTH device is not unmatched — it
+            // matched, and the fault is the backend it asks for. Without this
+            // the same entry is reported twice with contradictory advice:
+            // "no such interface is present" (plug it in or re-pick) beside
+            // "it is a Bluetooth device" (edit the entry). The first is simply
+            // wrong, and it is the one a user would act on first.
+            .filter(|entry| {
+                !self
+                    .bluetooth
+                    .iter()
+                    .any(|r| r.config_id().as_str().eq_ignore_ascii_case(entry.raw()))
+            })
             .collect()
     }
 }
@@ -393,7 +468,7 @@ pub fn to_view(report: &DevicesReport) -> ksx_api::DevicesView {
         .collect();
 
     let selectors = suggested_selectors(&report.usb);
-    let usb = report
+    let mut usb: Vec<ksx_api::UsbRow> = report
         .usb
         .iter()
         .enumerate()
@@ -426,9 +501,21 @@ pub fn to_view(report: &DevicesReport) -> ksx_api::DevicesView {
                     ),
                 }
             };
+            // Which backends can reach this interface — decided by
+            // `ksx_core::Reach`, never here. `claimed` is the binding, and a
+            // claimed interface is off the Windows keyboard stack by
+            // construction, so it cannot type either.
+            let reach = ksx_core::Reach {
+                transport: ksx_core::Transport::Usb,
+                keyboard: c.is_keyboard_candidate(),
+                claimed: c.binding.is_winusb(),
+                can_type: !c.binding.is_winusb(),
+            };
+            let eligibility = reach.eligibility();
             ksx_api::UsbRow {
                 instance_id: c.id.as_str().to_owned(),
                 description: c.friendly().unwrap_or_default().to_owned(),
+                transport: ksx_core::Transport::Usb.code().to_owned(),
                 state: state.to_owned(),
                 verdict,
                 alias: row.alias.clone(),
@@ -449,9 +536,84 @@ pub fn to_view(report: &DevicesReport) -> ksx_api::DevicesView {
                 // Computed once, in the backend, by the same call the writer
                 // makes — see `suggested_selectors`.
                 selector: selectors.get(i).cloned(),
+                interception_eligible: eligibility.interception,
+                winusb_eligible: eligibility.winusb,
+                backends: eligibility.line,
+                can_type: reach.can_type,
+                cannot_type_reason: if reach.can_type {
+                    String::new()
+                } else {
+                    ksx_core::transport::INTERCEPTION_NEEDS_THE_STACK.to_owned()
+                },
             }
         })
         .collect();
+
+    // ── the Bluetooth half, into the SAME list ────────────────────────────
+    //
+    // One list is the whole point. Two lists is what shipped, and it meant the
+    // detailed view (`ksx device scan`) could not see a Bluetooth keyboard at
+    // all while the other one saw it and said nothing useful about it.
+    for row in &report.bluetooth {
+        let c = &row.candidate;
+        let reach = c.reach();
+        let eligibility = reach.eligibility();
+        let (state, verdict) = if !c.is_keyboard {
+            (
+                "not-a-keyboard",
+                "not a keyboard — ksx leaves it alone".to_owned(),
+            )
+        } else if !c.can_type {
+            (
+                "interception-only",
+                format!(
+                    "a Bluetooth keyboard, but it {} — pairing puts it in the device tree; \
+                     connecting it is what makes it type",
+                    c.trouble.unwrap_or("cannot deliver a keystroke right now")
+                ),
+            )
+        } else {
+            (
+                "interception-only",
+                "a Bluetooth keyboard on the Windows input stack — ksx can capture it through \
+                 Interception and split it into virtual pads"
+                    .to_owned(),
+            )
+        };
+        usb.push(ksx_api::UsbRow {
+            instance_id: c.id.as_str().to_owned(),
+            description: c.name.clone(),
+            transport: ksx_core::Transport::Bluetooth.code().to_owned(),
+            state: state.to_owned(),
+            verdict,
+            alias: row.alias.clone(),
+            // `selected` means "config asks for winusb here". On this transport
+            // that is a config that can never work, and it is REPORTED rather
+            // than quietly treated as interception — ksx does not decide that a
+            // user meant something other than what their file says.
+            selected: row.selected_winusb,
+            // A Bluetooth device is never rebound, so it is never READY in the
+            // WinUSB sense. Saying otherwise would put it in the "ksx run will
+            // capture this" column of a backend that cannot see it.
+            ready: false,
+            vendor: None,
+            board: Some(c.device.clone()),
+            // The positive keyboard signal on this transport is the
+            // keyboard-class devnode, not a HID boot protocol byte — there is
+            // no USB interface descriptor to read one from.
+            boot_keyboard: c.is_keyboard,
+            // What `ksx device pick` would write: the keyboard devnode's path,
+            // byte-exact. No `usb:` selector can name a device with no USB
+            // interface, and inventing one would be a suggestion the writer
+            // could not honour.
+            selector: c.keyboard_id.as_ref().map(|id| id.as_str().to_owned()),
+            interception_eligible: eligibility.interception,
+            winusb_eligible: eligibility.winusb,
+            backends: eligibility.line,
+            can_type: c.can_type,
+            cannot_type_reason: c.trouble.unwrap_or_default().to_owned(),
+        });
+    }
 
     // Notes are the things a LIST cannot say, and every one of them is a
     // condition a user would otherwise diagnose by reading rows carefully.
@@ -487,6 +649,25 @@ pub fn to_view(report: &DevicesReport) -> ksx_api::DevicesView {
             "config names {id} for winusb, but no such interface is present"
         ));
     }
+    // Not folded into the note above. "No such interface is present" sends a
+    // user to plug something in or re-pick; this entry names the right device
+    // and asks for a backend its transport can never offer, so the only fix is
+    // to edit the entry.
+    for row in report.winusb_on_bluetooth() {
+        notes.push(format!(
+            "config names {} for winusb, but it is a Bluetooth device: {} Set backend = \
+             \"interception\" for it.",
+            row.config_id(),
+            ksx_core::transport::WINUSB_NEEDS_A_USB_INTERFACE
+        ));
+    }
+    if !report.bluetooth_available {
+        notes.push(
+            "Bluetooth enumeration failed — any paired device is MISSING from this list, and its \
+             absence here is not evidence that it is unpaired"
+                .to_owned(),
+        );
+    }
     if report.reboot_required() {
         notes.push("a rebind is pending a reboot before it takes effect".to_owned());
     }
@@ -497,6 +678,7 @@ pub fn to_view(report: &DevicesReport) -> ksx_api::DevicesView {
         interception_available: report.interception_available,
         usb,
         usb_available: report.usb_available,
+        bluetooth_available: report.bluetooth_available,
         notes,
     }
 }
@@ -549,14 +731,55 @@ pub fn devices_json(report: &DevicesReport) -> serde_json::Value {
             })
         })
         .collect();
+    let bluetooth: Vec<serde_json::Value> = report
+        .bluetooth
+        .iter()
+        .map(|row| {
+            let c = &row.candidate;
+            let eligibility = c.reach().eligibility();
+            serde_json::json!({
+                "id": c.id.as_str(),
+                "config_id": row.config_id().as_str(),
+                "device": c.device,
+                "address": c.address,
+                "friendly": c.name,
+                "transport": ksx_core::Transport::Bluetooth.code(),
+                "keyboard": c.is_keyboard,
+                // PRESENT and TYPING are different questions for a paired
+                // device, so both are in the payload and neither is inferred.
+                "can_type": c.can_type,
+                "cannot_type_reason": c.trouble,
+                "alias": row.alias,
+                "backends": {
+                    "interception": eligibility.interception,
+                    "winusb": eligibility.winusb,
+                },
+                "winusb_reason": eligibility.winusb_reason,
+                "selected_backend": if row.selected_winusb { "winusb" } else { "interception" },
+            })
+        })
+        .collect();
     serde_json::json!({
+        // BACKENDS are what ksx captures WITH; TRANSPORTS are how a device is
+        // attached. Keeping them in separate objects is the schema saying the
+        // thing this whole list exists to teach: `bluetooth` is not a third
+        // backend that ksx has not written, it is a transport one of the two
+        // backends can never reach.
         "backends": {
             "interception": { "available": report.interception_available },
             "winusb": { "available": report.usb_available },
         },
+        "transports": {
+            // Two enumerations, two flags. A consumer that read an empty
+            // device array as "nothing attached" without checking these would
+            // be making the exact assertion a failed read cannot support.
+            "usb": { "available": report.usb_available },
+            "bluetooth": { "available": report.bluetooth_available },
+        },
         "keyboards": keyboards,
         "mice_visible": report.mice_visible,
         "usb_candidates": usb,
+        "bluetooth_devices": bluetooth,
         "health": {
             "keyboard_slots_used": report.slots_used(),
             "highest_keyboard_slot": report.highest_slot(),
@@ -574,6 +797,15 @@ pub fn devices_json(report: &DevicesReport) -> serde_json::Value {
                 .unmatched_winusb_config()
                 .iter()
                 .map(|entry| entry.raw())
+                .collect::<Vec<_>>(),
+            // Deliberately its own key. `unmatched_winusb_config` means "not
+            // here, or the id is wrong" and is fixed by plugging in or
+            // re-picking; this means the entry names the right device and asks
+            // for a backend its transport can never offer.
+            "winusb_on_bluetooth": report
+                .winusb_on_bluetooth()
+                .iter()
+                .map(|row| row.config_id().as_str())
                 .collect::<Vec<_>>(),
         },
     })
@@ -685,7 +917,62 @@ pub fn render_human(report: &DevicesReport) -> String {
         }
     }
 
+    // -- Bluetooth half ---------------------------------------------------
+    //
+    // The same story `ksx device scan` tells, in this command's vocabulary. A
+    // Bluetooth keyboard used to be visible here only as an Interception
+    // hardware id in the list above, with nothing saying which backends could
+    // reach it — so the one fact a user needs (WinUSB never can, and that is
+    // the transport rather than a gap) was nowhere on the screen.
+    if !report.bluetooth_available {
+        let _ = writeln!(
+            out,
+            "bluetooth enumeration unavailable — any paired device is MISSING below, and its \
+             absence is not evidence that it is unpaired"
+        );
+    } else {
+        let paired: Vec<&BtRow> = report.bt_keyboards().collect();
+        if paired.is_empty() {
+            let _ = writeln!(out, "no Bluetooth keyboards paired");
+        } else {
+            let _ = writeln!(out, "bluetooth keyboards (interception backend only):");
+            for row in paired {
+                let c = &row.candidate;
+                let _ = writeln!(
+                    out,
+                    "  {}  \"{}\"\n      {}\n      id = '{}'   <- what `ksx device pick` would \
+                     write",
+                    c.id.as_str(),
+                    c.name,
+                    c.reach().eligibility().line,
+                    row.config_id().as_str(),
+                );
+                // PRESENT is not TYPING. A paired keyboard with dead batteries
+                // is in the tree all day, and someone reading this list to find
+                // a spare before claiming their panel has to see the
+                // difference.
+                if let Some(trouble) = c.trouble {
+                    let _ = writeln!(
+                        out,
+                        "      [!] {trouble} — it is paired and present and CANNOT type right \
+                         now, so it does not count as the spare keyboard a claim needs"
+                    );
+                }
+            }
+        }
+    }
+
     // -- Findings ---------------------------------------------------------
+    for row in report.winusb_on_bluetooth() {
+        let _ = writeln!(
+            out,
+            "[WARN] config selects backend = \"winusb\" for {}, which is a Bluetooth device. {} \
+             No claim, replug or future ksx release changes that — set backend = \
+             \"interception\" for this entry, which CAN capture it.",
+            row.config_id(),
+            ksx_core::transport::WINUSB_NEEDS_A_USB_INTERFACE
+        );
+    }
     for id in report.duplicates() {
         let _ = writeln!(
             out,
@@ -791,11 +1078,45 @@ pub fn collect() -> DevicesReport {
         }
     };
 
+    // Bluetooth half. Enumeration only — the same read-only PnP walk.
+    let (bluetooth, bluetooth_available) = match ksx_capture::bt_candidates() {
+        Ok(found) => {
+            let rows = found
+                .into_iter()
+                .map(|candidate| {
+                    // A Bluetooth device is named in config by the instance
+                    // path of its keyboard devnode, so that is the id config is
+                    // looked up by. Byte-exact: no `usb:` selector can name a
+                    // device with no USB interface.
+                    let id = candidate
+                        .keyboard_id
+                        .clone()
+                        .unwrap_or_else(|| candidate.id.clone());
+                    BtRow {
+                        alias: configured.alias_for(&id).map(str::to_owned),
+                        selected_winusb: configured.backend_for(&id) == Backend::Winusb,
+                        candidate,
+                    }
+                })
+                .collect();
+            (rows, true)
+        }
+        Err(err) => {
+            // Reported as a FAILED READ, never as "nothing is paired" — the
+            // note this raises is the difference between "your keyboard is not
+            // paired" and "ksx could not look".
+            tracing::warn!("Bluetooth enumeration failed: {err}");
+            (Vec::new(), false)
+        }
+    };
+
     DevicesReport::build(
         keyboards,
         interception_available,
         usb,
         usb_available,
+        bluetooth,
+        bluetooth_available,
         configured,
     )
 }
@@ -846,6 +1167,8 @@ mod tests {
     const MOUSE: &str = "HID\\VID_046D&PID_C077&REV_7200";
     const IPAC_USB: &str = "USB\\VID_D209&PID_0430&MI_00\\7&1A2B3C4D&0&0000";
     const IPAC_USB_B: &str = "USB\\VID_D209&PID_0430&MI_00\\7&5E6F7A8B&0&0000";
+    /// A paired Bluetooth keyboard — the shape measured on this machine.
+    const BT_KEYBOARD: &str = r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002045E_PID&0800\7&3562C725&0&001BDC0F1FE7_C00000000";
 
     fn keyboard(id: &str, slot: u8, friendly: Option<&str>) -> DeviceInfo {
         DeviceInfo {
@@ -889,6 +1212,28 @@ mod tests {
             bus_id: "1".into(),
             binding,
         }
+    }
+
+    /// A report from a machine whose Bluetooth walk ANSWERED and found nothing
+    /// paired — not one where it failed. The fixtures below are about the USB
+    /// half, and defaulting the flag to `false` would quietly put every one of
+    /// them on a half-blind machine.
+    fn usb_only_report(
+        keyboards: Vec<DeviceInfo>,
+        interception_available: bool,
+        usb: Vec<UsbRow>,
+        usb_available: bool,
+        configured: ConfiguredDevices,
+    ) -> DevicesReport {
+        DevicesReport::build(
+            keyboards,
+            interception_available,
+            usb,
+            usb_available,
+            Vec::new(),
+            true,
+            configured,
+        )
     }
 
     fn config(entries: &[(&str, &str, Backend)]) -> ConfiguredDevices {
@@ -967,7 +1312,7 @@ mod tests {
     /// Breaks against that version of `render_human`.
     #[test]
     fn the_human_report_prints_the_usb_selector_the_missing_refusal_promises() {
-        let report = DevicesReport::build(
+        let report = usb_only_report(
             fixture(),
             true,
             vec![row(
@@ -1082,7 +1427,7 @@ mod tests {
             (IPAC_USB, "P1 I-PAC", Backend::Winusb),
             (IPAC_USB_B, "P2 I-PAC", Backend::Winusb),
         ]);
-        let report = DevicesReport::build(
+        let report = usb_only_report(
             Vec::new(),
             false,
             vec![
@@ -1130,7 +1475,7 @@ mod tests {
     #[test]
     fn a_selected_but_unrebound_board_is_called_out() {
         let cfg = config(&[(IPAC_USB, "P1 I-PAC", Backend::Winusb)]);
-        let report = DevicesReport::build(
+        let report = usb_only_report(
             vec![keyboard(IPAC, 1, Some("I-PAC"))],
             true,
             vec![row(IPAC_USB, Binding::HidUsb, &cfg)],
@@ -1157,7 +1502,7 @@ mod tests {
     #[test]
     fn an_interception_id_left_on_a_winusb_entry_is_diagnosed() {
         let cfg = config(&[(IPAC, "P1 I-PAC", Backend::Winusb)]);
-        let report = DevicesReport::build(
+        let report = usb_only_report(
             Vec::new(),
             false,
             vec![row(IPAC_USB, Binding::WinUsb, &cfg)],
@@ -1185,10 +1530,120 @@ mod tests {
 
     /// The M6 exit state: Interception uninstalled, everything on WinUSB. The
     /// command must still work — it is how you check the machine survived.
+    /// A paired Bluetooth keyboard, in the shape `bt_candidates` produces.
+    fn bt_row(configured: &ConfiguredDevices, can_type: bool) -> BtRow {
+        let id = DeviceId::new(BT_KEYBOARD.to_owned());
+        let candidate = ksx_capture::BtCandidate {
+            id: id.clone(),
+            device: r"BTHENUM\001BDC0F1FE7".to_owned(),
+            address: Some("001BDC0F1FE7".to_owned()),
+            name: "Bluetooth Keyboard".to_owned(),
+            service: Some("kbdhid".to_owned()),
+            is_keyboard: true,
+            keyboard_id: Some(id.clone()),
+            can_type,
+            trouble: (!can_type).then_some("not connected (paired but absent?)"),
+        };
+        BtRow {
+            alias: configured.alias_for(&id).map(str::to_owned),
+            selected_winusb: configured.backend_for(&id) == Backend::Winusb,
+            candidate,
+        }
+    }
+
+    /// **One fault, one message.** An entry that names a Bluetooth device and
+    /// asks for `winusb` matched a real device; what is wrong is the backend.
+    /// Reporting it ALSO as "no such interface is present" would give a user
+    /// two contradictory instructions — plug it in / re-pick, versus edit the
+    /// entry — and the wrong one comes first.
+    ///
+    /// Breaks against `unmatched_winusb_config` as written, which searched the
+    /// USB rows alone and therefore called every Bluetooth entry unmatched.
+    #[test]
+    fn a_winusb_entry_on_bluetooth_is_reported_once_as_the_backend_fault() {
+        let cfg = config(&[(BT_KEYBOARD, "desk", Backend::Winusb)]);
+        let report = DevicesReport::build(
+            Vec::new(),
+            true,
+            Vec::new(),
+            true,
+            vec![bt_row(&cfg, true)],
+            true,
+            cfg,
+        );
+
+        assert_eq!(
+            report.winusb_on_bluetooth().len(),
+            1,
+            "the fault is that winusb can never reach this transport"
+        );
+        assert!(
+            report.unmatched_winusb_config().is_empty(),
+            "…and it is NOT also 'no such interface is present': the interface \
+             is present, and telling someone to plug it in sends them to fix a \
+             machine that is fine"
+        );
+
+        let text = render_human(&report);
+        assert_eq!(
+            text.matches("[WARN]").count(),
+            1,
+            "one fault, one warning:\n{text}"
+        );
+        assert!(text.contains("no USB interface to bind"), "{text}");
+        assert!(
+            !text.contains("no USB interface has that instance path"),
+            "the unmatched wording must not appear beside it:\n{text}"
+        );
+    }
+
+    /// **A backend and a transport are different kinds of thing, and `--json`
+    /// says so with its shape.**
+    ///
+    /// `bluetooth` is not a third backend ksx has not got round to writing; it
+    /// is a transport that one of the two backends can never reach. A payload
+    /// that listed it beside `interception` and `winusb` would teach a script
+    /// author the same wrong thing this whole list exists to correct.
+    ///
+    /// Breaks against the obvious first shape — a flat `bluetooth_available`
+    /// beside `backends` — which also duplicated `backends.winusb.available`
+    /// under a second name, so two keys could disagree about one fact.
+    #[test]
+    fn the_json_keeps_backends_and_transports_apart() {
+        let report = DevicesReport::build(
+            Vec::new(),
+            true,
+            Vec::new(),
+            true,
+            Vec::new(),
+            false,
+            ConfiguredDevices::default(),
+        );
+        let v = devices_json(&report);
+        assert_eq!(
+            v.pointer("/transports/bluetooth/available"),
+            Some(&serde_json::json!(false)),
+            "a failed Bluetooth walk is reported, not hidden behind the USB one"
+        );
+        assert_eq!(
+            v.pointer("/transports/usb/available"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(
+            v.pointer("/backends/bluetooth").is_none(),
+            "bluetooth is a transport, never a backend: {v}"
+        );
+        assert!(
+            v.pointer("/bluetooth_available").is_none(),
+            "one fact, one key — a flat duplicate can disagree with the nested \
+             one: {v}"
+        );
+    }
+
     #[test]
     fn listing_works_with_the_interception_driver_gone() {
         let cfg = config(&[(IPAC_USB, "P1 I-PAC", Backend::Winusb)]);
-        let report = DevicesReport::build(
+        let report = usb_only_report(
             Vec::new(),
             false,
             vec![row(IPAC_USB, Binding::WinUsb, &cfg)],
@@ -1218,7 +1673,7 @@ mod tests {
         let cfg = ConfiguredDevices::default();
         let mut vendor = row(IPAC_USB, Binding::None, &cfg);
         vendor.candidate.interface_class = 0xFF;
-        let report = DevicesReport::build(Vec::new(), false, vec![vendor], true, cfg);
+        let report = usb_only_report(Vec::new(), false, vec![vendor], true, cfg);
         assert_eq!(report.hid_rows().count(), 0);
         assert!(render_human(&report).contains("no HID USB interfaces"));
     }
@@ -1264,7 +1719,7 @@ mod tests {
         assert_eq!(cfg.alias_for_facts(&facts), Some("P1 I-PAC"));
         assert_eq!(cfg.backend_for_facts(&facts), Backend::Winusb);
 
-        let report = DevicesReport::build(
+        let report = usb_only_report(
             Vec::new(),
             false,
             vec![UsbRow {
@@ -1303,7 +1758,7 @@ mod tests {
             (IPAC_USB_B, "P2 I-PAC", Backend::Winusb),
             (LOGI, "Desk", Backend::Interception),
         ]);
-        let report = DevicesReport::build(
+        let report = usb_only_report(
             vec![keyboard(LOGI, 1, Some("Logitech Keyboard"))],
             true,
             vec![
@@ -1352,7 +1807,7 @@ mod tests {
         spintrak.parent_id = r"USB\VID_D209&PID_15A2\6".into();
         spintrak.product = Some("SpinTrak".into());
 
-        let report = DevicesReport::build(
+        let report = usb_only_report(
             Vec::new(),
             false,
             vec![
