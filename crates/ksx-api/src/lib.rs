@@ -45,6 +45,7 @@
 //! |---|---|
 //! | [`wire`] | the protocol: one type per request and per response, and the ONE place the JSON shapes are derived from |
 //! | [`control`] | the write side — [`ControlSource`] and its view types |
+//! | [`stage`] | the STAGED SETUP a visit accumulates before anything is written (docs/FIRST-RUN.md §2) |
 //! | [`status`] | the read side — [`StatusSource`] and its snapshots |
 //! | [`machine`] | the local machine verbs (devices, pads, presets, autostart, doctor, WinUSB) |
 //! | [`client`] | [`VerbSink`] → [`ControlSource`], for either transport |
@@ -59,6 +60,7 @@ pub mod live_pipe;
 pub mod machine;
 pub mod pipe;
 pub mod refusal;
+pub mod stage;
 pub mod status;
 pub mod wire;
 
@@ -98,6 +100,10 @@ pub use machine::{
 };
 pub use pipe::{PipeTransport, TransportError, NO_CHANNEL};
 pub use refusal::{codes, Refusal, Refused};
+pub use stage::{
+    BlockingOption, PersonaOption, StageEdit, StageOutcome, StagedDeviceView, StagedSetupView,
+    StagedSlotView,
+};
 pub use status::{
     MacroSnapshot, MacroStepView, MacroView, MapperSlot, MapperSnapshot, PadRow, ProfileRow,
     StatusSnapshot, StatusSource,
