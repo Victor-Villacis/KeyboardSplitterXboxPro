@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use ksx_core::stage::{StagedDevice, StagedSetup};
 use ksx_core::{Blocking, DeviceSelector, Persona, MAX_SLOTS, MAX_XINPUT_SLOTS};
 
+use crate::machine::TemplateRow;
 use crate::refusal::{codes, Refusal};
 
 /// The chosen input device, as a surface shows it.
@@ -84,9 +85,18 @@ pub struct StagedSlotView {
     pub is_xinput: bool,
     /// The preset name — and the name of the file a save would write.
     pub preset: String,
-    /// How many controls this slot binds so far. `0` is a real answer: a pad
-    /// with no bindings plugs and does nothing, and a surface should be able
-    /// to say so before the user finds out in a game.
+    /// **How many bindings a key can actually reach**
+    /// ([`ksx_core::Preset::live_bindings`]).
+    ///
+    /// `0` is a real answer and it is the one that matters: a pad with no
+    /// bindings plugs, appears in the game, and does nothing — so
+    /// `StagedSetup::commit` refuses it and a surface must be able to say why
+    /// before anyone finds out with a stick in their hand.
+    ///
+    /// It counts LIVE rows, not `entries.len()`: `Preset::builtin_empty` lists
+    /// every control with a `Key::None` placeholder, so the obvious count
+    /// reports two dozen bindings for a pad on which nothing works. This field
+    /// shipped as `entries.len() + chords.len()` and did exactly that.
     pub bindings: usize,
 }
 
@@ -231,6 +241,29 @@ pub struct StagedSetupView {
     pub max_xinput_slots: u8,
     /// Every persona, with the flags that decide whether it may be offered.
     pub personas: Vec<PersonaOption>,
+    /// **Every in-box layout a staged controller can be dressed in**, served
+    /// for the reason the persona roster is: a list of panels typed into a
+    /// surface is a second description of `ksx_core::templates`.
+    ///
+    /// It travels with the STAGED SETUP rather than being read alongside it,
+    /// and that matters: layouts live in the binary, so a surface must be able
+    /// to offer them on a machine whose presets folder cannot be read. The
+    /// same rows are served by [`crate::PresetsView`] for seeding a new preset
+    /// FILE — one [`TemplateRow::roster`], two consumers.
+    ///
+    /// This is what makes moment 6 reachable at all without a mapper: a pad
+    /// has to bind something before `commit()` will play it, and an I-PAC on
+    /// its factory chart is already described by `arcade-6button`
+    /// (`docs/MAPPER-UX.md` commandment 9 — "the best mapping session is
+    /// none").
+    pub layouts: Vec<TemplateRow>,
+    /// The layout id "Add a controller" offers first.
+    ///
+    /// **Served, because a first-run user must not have to choose one to get
+    /// moving.** It is the first non-blank template in the roster, which is
+    /// `arcade-6button` — the factory chart an unprogrammed I-PAC already
+    /// sends, and what MAME has read for thirty years.
+    pub default_layout: String,
     /// The blocking answers, in §3's own words.
     pub blocking_options: Vec<BlockingOption>,
     /// [`ESCAPE_HATCH_LINE`], served so it cannot be paraphrased on the way to
@@ -273,7 +306,7 @@ impl StagedSetupView {
                     persona_label: slot.persona.label().to_owned(),
                     is_xinput: slot.persona.is_xinput(),
                     preset: slot.preset.name.clone(),
-                    bindings: slot.preset.entries.len() + slot.preset.chords.len(),
+                    bindings: slot.preset.live_bindings(),
                 })
                 .collect(),
             blocking: setup.blocking().map(|b| b.as_str().to_owned()),
@@ -283,6 +316,8 @@ impl StagedSetupView {
             max_slots: MAX_SLOTS,
             max_xinput_slots: MAX_XINPUT_SLOTS,
             personas: PersonaOption::roster(),
+            layouts: TemplateRow::roster(),
+            default_layout: default_layout(),
             blocking_options: BlockingOption::roster(),
             escape_hatch: ESCAPE_HATCH_LINE.to_owned(),
             blocking_scope: BLOCKING_SCOPE_LINE.to_owned(),
@@ -321,9 +356,42 @@ pub enum StageEdit {
         persona: String,
         /// The preset name this controller's bindings live under.
         preset: String,
+        /// **The layout it starts from** — a [`TemplateRow::id`], served.
+        ///
+        /// Absent stages a controller that binds NOTHING, which
+        /// `StagedSetup::commit` then refuses by name: that is the honest
+        /// shape for a caller that means to map from scratch, and it is not
+        /// something a first-run flow should reach by omission. The wire keeps
+        /// it optional rather than required because the alternative is a
+        /// caller inventing a template id.
+        #[serde(default)]
+        layout: Option<String>,
     },
     /// Moment 5 again: change their mind. Free, and the whole point.
     SetPersona { number: u8, persona: String },
+    /// **Moment 6, the menu half: dress a staged controller in an in-box
+    /// layout.**
+    ///
+    /// Instantiates one of [`ksx_core::templates`]'s tables into the slot's
+    /// preset, keeping its NAME (the name is the file a save writes, and
+    /// changing the layout does not rename anything). It lands through
+    /// `StagedSetup::set_bindings` — the same core operation
+    /// [`Self::SetBindings`] takes — so a layout is bindings in the stage, in
+    /// memory, with no file written and no mapper opened.
+    ///
+    /// The surface names a template; it never composes a preset. That split is
+    /// why a keyboard chart is not describable in TypeScript.
+    SetLayout {
+        number: u8,
+        /// A [`TemplateRow::id`] (`arcade-6button`, `keyboard-wasd`…).
+        layout: String,
+        /// Which player block of the layout to use. Absent takes the block of
+        /// the slot's own number, so a two-player panel dresses slots 1 and 2
+        /// with the two halves it was authored for and nobody has to know that
+        /// is what "player 2" means in the chart.
+        #[serde(default)]
+        player: Option<u8>,
+    },
     /// Moment 6: the bindings so far, as a whole preset table — the same
     /// whole-value rule `ControlSource::bind_keys` and `MacroWrite` follow.
     SetBindings {
@@ -379,25 +447,53 @@ impl StageEdit {
                 number,
                 persona,
                 preset,
+                layout,
             } => {
                 let persona = parse_persona(persona)?;
-                let preset = ksx_core::Preset {
-                    name: preset.trim().to_owned(),
-                    entries: Vec::new(),
-                    chords: Vec::new(),
-                    macros: Default::default(),
-                    turbo: Vec::new(),
-                    protected: false,
+                let name = preset.trim();
+                // The slot this will take, decided BEFORE the layout is built,
+                // because the player block follows the slot number.
+                let number = match number {
+                    Some(number) => *number,
+                    None => setup
+                        .next_free_slot()
+                        .ok_or_else(|| refuse(ksx_core::StageRefusal::NoFreeSlot))?,
                 };
-                match number {
-                    Some(number) => setup.add_slot(*number, persona, preset),
-                    None => setup.add_next_slot(persona, preset),
-                }
-                .map_err(refuse)
+                let preset = match layout.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+                    Some(layout) => instantiate(layout, name, number, None)?,
+                    // No layout named: a controller that binds nothing, which
+                    // `commit()` refuses by name. Kept reachable on purpose —
+                    // see the variant's docs.
+                    None => ksx_core::Preset {
+                        name: name.to_owned(),
+                        entries: Vec::new(),
+                        chords: Vec::new(),
+                        macros: Default::default(),
+                        turbo: Vec::new(),
+                        protected: false,
+                    },
+                };
+                setup.add_slot(number, persona, preset).map_err(refuse)
             }
             Self::SetPersona { number, persona } => setup
                 .set_persona(*number, parse_persona(persona)?)
                 .map_err(refuse),
+            Self::SetLayout {
+                number,
+                layout,
+                player,
+            } => {
+                // The NAME survives: it is the file a save writes, and
+                // changing what a controller does must not rename it.
+                let name = setup
+                    .slot(*number)
+                    .map(|slot| slot.preset.name.clone())
+                    .ok_or_else(|| {
+                        refuse(ksx_core::StageRefusal::NoSuchSlot { number: *number })
+                    })?;
+                let preset = instantiate(layout, &name, *number, *player)?;
+                setup.set_bindings(*number, preset).map_err(refuse)
+            }
             Self::SetBindings { number, preset } => {
                 // Through the preset file's OWN serde types, so a binding that
                 // would be refused on disk is refused here in the identical
@@ -435,6 +531,66 @@ impl StageEdit {
 /// after a save, and on a file.
 pub fn preset_name_for_slot(number: u8) -> String {
     format!("Player {number}")
+}
+
+/// The layout id "Add a controller" offers first: the first roster entry that
+/// actually binds something.
+///
+/// Read off the roster rather than spelled, so a build whose first template
+/// changed cannot end up offering a blank one by default — which would put a
+/// first-run user one click from a pad that does nothing.
+fn default_layout() -> String {
+    TemplateRow::roster()
+        .into_iter()
+        .find(|layout| !layout.blank)
+        .map(|layout| layout.id)
+        .unwrap_or_default()
+}
+
+/// One in-box layout as a real preset, or the refusal that names what to send.
+///
+/// `player` defaults to the SLOT NUMBER: a two-player panel dresses slots 1
+/// and 2 with the two halves it was authored for, which is what the chart
+/// means and not something a first-run user should have to know.
+fn instantiate(
+    layout: &str,
+    name: &str,
+    number: u8,
+    player: Option<u8>,
+) -> Result<ksx_core::Preset, Refusal> {
+    let player = player.unwrap_or(number);
+    ksx_core::templates::instantiate(layout.trim(), name, player).map_err(|err| {
+        let remedy = match &err {
+            // The template exists and does not reach this slot. Name the ones
+            // that do rather than leaving "player 3" as the user's problem —
+            // this is the ordinary case for player 3 on a two-player panel.
+            ksx_core::templates::TemplateError::NoSuchPlayer { players, .. } => format!(
+                "this layout carries {players} player block(s), so slot {number} has none of its \
+                 own — pick a layout with more blocks ({}), or send an explicit player block to \
+                 share one deliberately",
+                blocks_at_least(number).join(" | ")
+            ),
+            _ => format!(
+                "send one of the served layout ids ({})",
+                TemplateRow::roster()
+                    .iter()
+                    .map(|l| l.id.clone())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ),
+        };
+        Refusal::with_remedy(codes::BAD_REQUEST, err.to_string(), remedy)
+    })
+}
+
+/// The layout ids carrying a block for slot `number` — read off the roster, so
+/// a refusal never names a layout this build does not have.
+fn blocks_at_least(number: u8) -> Vec<String> {
+    TemplateRow::roster()
+        .into_iter()
+        .filter(|layout| layout.players.contains(&number) && !layout.blank)
+        .map(|layout| layout.id)
+        .collect()
 }
 
 fn parse_persona(name: &str) -> Result<Persona, Refusal> {
@@ -674,6 +830,7 @@ mod tests {
             number: None,
             persona: "ps4".into(), // an alias a human would type
             preset: "Player 1".into(),
+            layout: Some("arcade-6button".into()),
         }
         .apply(&setup)
         .unwrap();
@@ -682,20 +839,34 @@ mod tests {
         assert_eq!(view.slots[0].persona, "playstation");
         assert_eq!(view.slots[0].persona_label, "PlayStation");
         assert!(!view.slots[0].is_xinput);
-        assert_eq!(view.slots[0].bindings, 0, "nothing mapped yet");
+        assert!(
+            view.slots[0].bindings > 0,
+            "a controller staged from a layout binds something"
+        );
         assert_eq!(view.xinput_used, 0);
-        assert!(view.ready, "a device and a controller is enough to play");
+        assert!(
+            !view.ready,
+            "§3's question has not been asked, and it decides whether the keyboard can \
+             still type"
+        );
         assert_eq!(view.blocking, None, "§3 has not been asked yet");
+        assert!(
+            view.not_ready
+                .as_deref()
+                .unwrap()
+                .contains("split-or-freeze"),
+            "{:?}",
+            view.not_ready
+        );
 
         let setup = StageEdit::SetBlocking {
             blocking: "bound-keys".into(),
         }
         .apply(&setup)
         .unwrap();
-        assert_eq!(
-            StagedSetupView::of(&setup).blocking.as_deref(),
-            Some("bound-keys")
-        );
+        let view = StagedSetupView::of(&setup);
+        assert_eq!(view.blocking.as_deref(), Some("bound-keys"));
+        assert!(view.ready, "a keyboard, a mapped controller and an answer");
 
         // Change of mind, then delete — both free.
         let setup = StageEdit::SetPersona {
@@ -727,6 +898,7 @@ mod tests {
             number: None,
             persona: "gamecube".into(),
             preset: "P1".into(),
+            layout: None,
         }
         .apply(&setup)
         .unwrap_err();
@@ -737,6 +909,7 @@ mod tests {
             number: None,
             persona: "dualsense".into(),
             preset: "P1".into(),
+            layout: None,
         }
         .apply(&setup)
         .unwrap_err();
@@ -785,6 +958,7 @@ mod tests {
                 number: Some(n),
                 persona: "xbox360".into(),
                 preset: format!("P{n}"),
+                layout: Some("arcade-4way".into()),
             }
             .apply(&setup)
             .unwrap();
@@ -793,6 +967,7 @@ mod tests {
             number: Some(5),
             persona: "xbox360".into(),
             preset: "P5".into(),
+            layout: None,
         }
         .apply(&setup)
         .unwrap_err();
@@ -812,6 +987,7 @@ mod tests {
             number: Some(5),
             persona: "playstation".into(),
             preset: "P5".into(),
+            layout: None,
         }
         .apply(&setup)
         .unwrap();
@@ -819,6 +995,208 @@ mod tests {
         assert!(ok.ok);
         assert_eq!(ok.setup.slots.len(), 5);
         assert_eq!(ok.setup.xinput_used, 4);
+    }
+
+    /// **A controller staged from a layout binds real keys, in the stage, with
+    /// no file written — and the roster it was picked from is SERVED.**
+    ///
+    /// Breaks against the shipped `AddSlot`, which staged
+    /// `entries: Vec::new()` unconditionally. That version left mapping as
+    /// something that could only happen in the mapper, and the mapper edits
+    /// preset FILES — so the only journey to a working pad was Save (a write
+    /// nobody asked for) → leave → map → come back → and then Play started the
+    /// STAGED, still-empty preset anyway.
+    ///
+    /// It also breaks against a page that listed the layouts itself: the panel
+    /// text and the player counts are `ksx_core::templates`', and a second copy
+    /// in TypeScript is `CLAUDE.md`'s one rule, broken.
+    #[test]
+    fn a_controller_can_be_dressed_in_a_served_layout_without_touching_a_file() {
+        let view = StagedSetupView::of(&ksx_core::stage::StagedSetup::new());
+        assert_eq!(view.layouts.len(), ksx_core::TEMPLATES.len());
+        assert!(
+            !view.default_layout.is_empty(),
+            "a first-run user must not have to choose a layout to get moving"
+        );
+        let default = view
+            .layouts
+            .iter()
+            .find(|l| l.id == view.default_layout)
+            .expect("the default is one of the served options");
+        assert!(
+            !default.blank,
+            "the offered default must bind something, or Add-a-controller is one click \
+             from a pad that does nothing"
+        );
+        assert!(!default.detail.is_empty(), "a layout nobody can identify");
+        // The one option that binds nothing is FLAGGED, not hidden: hiding it
+        // would decide for the user, and offering it silently would offer the
+        // one choice that cannot play.
+        assert!(view.layouts.iter().any(|l| l.blank && l.id == "empty"));
+
+        // Staged, and the bindings are really there — in memory.
+        let setup = StageEdit::AddSlot {
+            number: None,
+            persona: "xbox360".into(),
+            preset: "Player 1".into(),
+            layout: Some(view.default_layout.clone()),
+        }
+        .apply(&staged())
+        .unwrap();
+        assert!(setup.slot(1).unwrap().preset.live_bindings() > 10);
+        assert_eq!(
+            setup.slot(1).unwrap().preset.name,
+            "Player 1",
+            "the layout dresses the preset; it does not rename it"
+        );
+
+        // Slot 2 takes the layout's SECOND player block, so a two-player panel
+        // gives two players different keys without anybody being asked what a
+        // "player block" is.
+        let two = StageEdit::AddSlot {
+            number: None,
+            persona: "playstation".into(),
+            preset: "Player 2".into(),
+            layout: Some("arcade-6button".into()),
+        }
+        .apply(&setup)
+        .unwrap();
+        let p1: Vec<_> = two.slot(1).unwrap().preset.bound_keys().collect();
+        let p2: Vec<_> = two.slot(2).unwrap().preset.bound_keys().collect();
+        assert!(!p2.is_empty());
+        assert!(
+            p1.iter().all(|key| !p2.contains(key)),
+            "two players on one panel must not share a key: {p1:?} vs {p2:?}"
+        );
+
+        // Changing the layout is as free as changing the persona — §2.
+        let rewired = StageEdit::SetLayout {
+            number: 1,
+            layout: "keyboard-wasd".into(),
+            player: None,
+        }
+        .apply(&two)
+        .unwrap();
+        assert!(rewired
+            .slot(1)
+            .unwrap()
+            .preset
+            .bound_keys()
+            .any(|key| key == ksx_core::Key::W));
+    }
+
+    /// A layout that has no block for this slot refuses by naming the layouts
+    /// that do — never by silently reusing player 1's keys, which would give
+    /// two players the same stick.
+    #[test]
+    fn a_layout_with_no_block_for_this_slot_names_the_ones_that_have_it() {
+        let setup = StageEdit::AddSlot {
+            number: Some(3),
+            persona: "playstation".into(),
+            // One player block, and slot 3 is asking for a third.
+            preset: "Player 3".into(),
+            layout: Some("keyboard-wasd".into()),
+        }
+        .apply(&staged())
+        .unwrap_err();
+        assert_eq!(setup.code, codes::BAD_REQUEST);
+        assert!(setup.message.contains("player block"), "{setup}");
+        let remedy = setup.remedy.as_deref().unwrap();
+        assert!(remedy.contains("arcade-4way"), "{remedy}");
+        assert!(
+            !remedy.contains("empty"),
+            "a remedy must not send anybody at the layout that binds nothing: {remedy}"
+        );
+
+        // An id nobody could have meant names the served ids.
+        let one = StageEdit::AddSlot {
+            number: None,
+            persona: "xbox360".into(),
+            preset: "Player 1".into(),
+            layout: Some("arcade-6button".into()),
+        }
+        .apply(&staged())
+        .unwrap();
+        let unknown = StageEdit::SetLayout {
+            number: 1,
+            layout: "hitbox".into(),
+            player: None,
+        }
+        .apply(&one)
+        .unwrap_err();
+        assert_eq!(unknown.code, codes::BAD_REQUEST);
+        assert!(
+            unknown
+                .remedy
+                .as_deref()
+                .unwrap()
+                .contains("arcade-6button"),
+            "{unknown}"
+        );
+    }
+
+    /// **`ready` is false until the setup can actually be played, and the
+    /// reason is ksx-core's own sentence.**
+    ///
+    /// Breaks against the shipped view in two places at once: a slot with no
+    /// bindings was `ready` (Play plugged a dead pad), and an unanswered
+    /// split-or-freeze question was `ready` (Save wrote Freeze from a question
+    /// nobody was shown). Both were reachable from the page as it shipped, in
+    /// two clicks.
+    #[test]
+    fn ready_is_false_for_a_dead_pad_and_for_an_unanswered_question() {
+        let blank = StageEdit::AddSlot {
+            number: None,
+            persona: "xbox360".into(),
+            preset: "Player 1".into(),
+            layout: None,
+        }
+        .apply(&staged())
+        .unwrap();
+        let view = StagedSetupView::of(&blank);
+        assert_eq!(view.slots[0].bindings, 0);
+        assert!(!view.ready, "a pad with no bindings is not ready to play");
+        let why = view.not_ready.as_deref().unwrap();
+        assert!(why.contains("slot 1"), "it names the slot: {why}");
+
+        // Answering the question does NOT make a dead pad playable — the two
+        // gates are independent, and the dead pad is the one that gets named.
+        let answered = StageEdit::SetBlocking {
+            blocking: "whole".into(),
+        }
+        .apply(&blank)
+        .unwrap();
+        let view = StagedSetupView::of(&answered);
+        assert!(!view.ready);
+        assert!(view.not_ready.as_deref().unwrap().contains("slot 1"));
+
+        // A real layout, no answer: still not ready, and now the QUESTION is
+        // what it says.
+        let mapped = StageEdit::SetLayout {
+            number: 1,
+            layout: "arcade-6button".into(),
+            player: None,
+        }
+        .apply(&blank)
+        .unwrap();
+        let view = StagedSetupView::of(&mapped);
+        assert!(!view.ready);
+        assert!(view
+            .not_ready
+            .as_deref()
+            .unwrap()
+            .contains("split-or-freeze"));
+        assert_eq!(view.blocking, None, "and it is still NOT pre-answered");
+
+        // Both, and only then.
+        let ready = StageEdit::SetBlocking {
+            blocking: "bound-keys".into(),
+        }
+        .apply(&mapped)
+        .unwrap();
+        let view = StagedSetupView::of(&ready);
+        assert!(view.ready, "{:?}", view.not_ready);
+        assert_eq!(view.not_ready, None);
     }
 
     /// A surface with no staged setup says so, per click — never a silent
@@ -846,6 +1224,12 @@ mod tests {
                 number: None,
                 persona: "xbox360".into(),
                 preset: "P1".into(),
+                layout: Some("arcade-6button".into()),
+            },
+            StageEdit::SetLayout {
+                number: 1,
+                layout: "keyboard-wasd".into(),
+                player: None,
             },
             StageEdit::SetPersona {
                 number: 1,

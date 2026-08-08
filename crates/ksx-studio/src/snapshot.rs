@@ -1299,9 +1299,10 @@ fn controller_line(staged: &ksx_api::StagedSetupView) -> String {
 /// claim about the presets folder, and when the read refused nothing is known
 /// about it. Saying "this will create it" there is `SURFACES.md` §1b's bug.
 fn preset_line(p: &StartPayload) -> String {
-    const LEAD: &str = "Mapping happens in the mapper, and the mapper edits preset FILES. Save \
-                        first: that writes one preset per controller and puts the slot in the \
-                        list the mapper reads.";
+    const LEAD: &str = "Give each controller a layout and its bindings live HERE, in the staged \
+                        setup — no file is written and no mapper is opened, and Play starts \
+                        exactly what this screen shows. (The mapper edits preset FILES, so it \
+                        is the place to change one button once you have saved.)";
     if !p.presets_error.trim().is_empty() {
         return format!(
             "{LEAD} What is already in the presets folder could not be read, so nothing here can \
@@ -1363,6 +1364,9 @@ pub struct StartFlags {
     pub slots_full: bool,
     /// Personas this build cannot plug, listed with the reason.
     pub has_gaps: bool,
+    /// A staged controller can be dressed in a layout — there is one to dress
+    /// and a daemon to hold the result.
+    pub can_layout: bool,
     /// §3 has been answered.
     pub blocking_answered: bool,
     /// The setup is complete enough to save or play.
@@ -1407,6 +1411,7 @@ impl StartFlags {
                 && staged.personas.iter().any(|p| p.can_plug),
             slots_full: staged.reachable && staged.device.is_some() && staged.next_slot.is_none(),
             has_gaps: staged.personas.iter().any(|p| !p.can_plug),
+            can_layout: staged.reachable && !staged.slots.is_empty() && !staged.layouts.is_empty(),
             blocking_answered: staged.blocking.is_some(),
             ready: staged.reachable && staged.ready,
             not_ready: !staged.reachable || !staged.ready,
@@ -1487,6 +1492,19 @@ pub struct StartOptionRow {
     pub label: String,
 }
 
+/// One in-box layout, as a row somebody reads before choosing it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartLayoutRow {
+    pub label: String,
+    /// `TemplateRow::detail` — the panel this is for, verbatim from
+    /// `ksx_core::templates`. Never paraphrased here.
+    pub panel: String,
+    /// Which players it dresses, and — for the one that binds nothing — what
+    /// choosing it costs. Both in one line, because a `createShow` inside a
+    /// `createList` is not a shape this compiler emits.
+    pub players: String,
+}
+
 /// One persona this build cannot plug, with `PadBackend::gap()`'s own sentence.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartGapRow {
@@ -1529,6 +1547,20 @@ pub struct StartRows {
     /// drops three of eight choices teaches a user the product has five.
     pub gaps: Vec<StartGapRow>,
     pub blocking: Vec<StartBlockingRow>,
+    /// The in-box layouts as `<option>`s, **the served default first** — a
+    /// `<select>` shows its first option, so this is how "Add a controller"
+    /// means "with the arcade chart" without anybody choosing.
+    pub layouts: Vec<StartOptionRow>,
+    /// The same layouts as readable rows: what panel each one is for, which
+    /// player blocks it carries, and whether it binds anything at all. A
+    /// layout nobody can identify from a list is a layout nobody picks.
+    pub layout_details: Vec<StartLayoutRow>,
+    /// The staged slot numbers, as the options of "give slot N this layout".
+    ///
+    /// A second `<select>` rather than a form per row: a `createList` inside a
+    /// `createList` is not a shape this compiler emits, and the per-row
+    /// alternative would be a layout menu drawn once per staged controller.
+    pub slot_numbers: Vec<StartOptionRow>,
 }
 
 impl StartRows {
@@ -1597,7 +1629,15 @@ impl StartRows {
                 .map(|slot| StartSlotRow {
                     number: slot.number.to_string(),
                     title: format!("Player {}", slot.number),
-                    state: "ready — it will exist the moment you press Play".to_owned(),
+                    // The state a row claims follows its BINDINGS. A row that
+                    // said "ready" over a pad on which nothing works is
+                    // `FIRST-RUN.md` §6's "a screen reports success while
+                    // nothing works", one line long.
+                    state: if slot.bindings == 0 {
+                        "not ready — nothing is bound to it".to_owned()
+                    } else {
+                        "ready — it will exist the moment you press Play".to_owned()
+                    },
                     persona: slot.persona_label.clone(),
                     xinput: if slot.is_xinput {
                         "uses an XInput slot".to_owned()
@@ -1606,7 +1646,9 @@ impl StartRows {
                     },
                     preset: slot.preset.clone(),
                     bindings: match slot.bindings {
-                        0 => "nothing mapped yet — this pad would plug and do nothing".to_owned(),
+                        0 => "nothing mapped yet — this pad would plug and do nothing, so Play \
+                              refuses it by name. Give it a layout below."
+                            .to_owned(),
                         1 => "1 control bound".to_owned(),
                         n => format!("{n} controls bound"),
                     },
@@ -1656,7 +1698,69 @@ impl StartRows {
                     }
                 })
                 .collect(),
+            // The SERVED default first, because a `<select>` shows its first
+            // option: "Add this controller" then means "with the layout ksx
+            // recommends" for anybody who does not touch the menu.
+            layouts: layout_options(staged),
+            layout_details: staged
+                .layouts
+                .iter()
+                .map(|layout| StartLayoutRow {
+                    label: layout.label.clone(),
+                    panel: layout.detail.clone(),
+                    players: layout_players_line(layout),
+                })
+                .collect(),
+            slot_numbers: staged
+                .slots
+                .iter()
+                .map(|slot| StartOptionRow {
+                    value: slot.number.to_string(),
+                    label: format!("Player {}", slot.number),
+                })
+                .collect(),
         }
+    }
+}
+
+/// The layout `<option>`s, served default first.
+///
+/// Sorted rather than trusted to arrive in a helpful order: the roster is
+/// `ksx_core::templates::TEMPLATES`, whose order exists for
+/// `ksx preset list --templates`, and "the first option is the recommended
+/// one" is a claim this page makes and must therefore make true.
+fn layout_options(staged: &ksx_api::StagedSetupView) -> Vec<StartOptionRow> {
+    let mut rows: Vec<&ksx_api::TemplateRow> = staged.layouts.iter().collect();
+    rows.sort_by_key(|layout| layout.id != staged.default_layout);
+    rows.into_iter()
+        .map(|layout| StartOptionRow {
+            value: layout.id.clone(),
+            label: layout.label.clone(),
+        })
+        .collect()
+}
+
+/// Which players a layout dresses — and, for the one that binds nothing, what
+/// picking it costs, in the same line.
+///
+/// The blank one is `TemplateRow::blank`, served, never matched on an id here:
+/// "does this bind anything" is a fact about the rows, and a second blank
+/// template must not be offered as if it were a working layout.
+fn layout_players_line(layout: &ksx_api::TemplateRow) -> String {
+    if layout.blank {
+        return "Binds nothing at all — every control listed, no keys. Pick this only if you \
+                mean to map every button yourself; until you do, the pad it makes would plug \
+                and do nothing, and Play will refuse it by name."
+            .to_owned();
+    }
+    match layout.players.len() {
+        0 | 1 => "One player block: every controller staged from it gets the same keys, so it \
+                  suits a keyboard each rather than one shared panel."
+            .to_owned(),
+        n => format!(
+            "{n} player blocks — player 1's keys go to slot 1, player 2's to slot 2, and so on, \
+             so two people on one board never share a key."
+        ),
     }
 }
 
@@ -1692,6 +1796,7 @@ mod tests {
             label: String::new(),
             detail: String::new(),
             players: vec![1],
+            blank: false,
         };
         let templates = [row("arcade-6button"), row("keyboard-2p"), row("empty")];
 

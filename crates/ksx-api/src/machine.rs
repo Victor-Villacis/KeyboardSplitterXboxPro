@@ -1282,6 +1282,46 @@ pub struct TemplateRow {
     pub detail: String,
     /// Player blocks it can instantiate (P1–P4), when it has them.
     pub players: Vec<u8>,
+    /// **This template binds nothing** (`empty` — every control listed, no
+    /// keys on any of them).
+    ///
+    /// Served rather than left to a surface to notice, because it is the one
+    /// option that produces something that cannot play: `StagedSetup::commit`
+    /// refuses a controller with no bindings, so a menu that offered this
+    /// silently would be offering the choice that dead-ends, with nothing on
+    /// screen to say so.
+    #[serde(default)]
+    pub blank: bool,
+}
+
+impl TemplateRow {
+    /// **The roster, from the one registry that holds it** —
+    /// [`ksx_core::templates::TEMPLATES`], the same slice
+    /// `ksx preset list --templates` prints.
+    ///
+    /// One composition, two consumers: the preset list (seed a new FILE) and
+    /// the staged setup (dress a controller that is not a file yet). They ask
+    /// the same question — "what layouts does this build know" — and a second
+    /// mapping from `Template` to a row is a second chance to describe a panel
+    /// differently on two screens.
+    pub fn roster() -> Vec<Self> {
+        ksx_core::templates::TEMPLATES
+            .iter()
+            .map(|t| Self {
+                id: t.id.to_owned(),
+                label: t.summary.to_owned(),
+                detail: t.panel.to_owned(),
+                players: (1..=t.players).collect(),
+                // Asked of the template rather than matched on its id: "does
+                // this bind anything" is a property of the rows, and a second
+                // blank template would otherwise be offered as a working one.
+                blank: t
+                    .instantiate("probe", 1)
+                    .map(|preset| preset.binds_nothing())
+                    .unwrap_or(true),
+            })
+            .collect()
+    }
 }
 
 /// `ksx pads`, presentation-shaped: the bus, its children, and both verbs'

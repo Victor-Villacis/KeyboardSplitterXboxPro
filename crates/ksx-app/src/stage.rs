@@ -570,23 +570,17 @@ mod tests {
         store.save_preset(&mapped).unwrap();
         let before = std::fs::read_to_string(store.preset_path("Player 1").unwrap()).unwrap();
 
-        // The second visit stages an EMPTY "Player 1" and saves it.
+        // The second visit stages a DIFFERENT "Player 1" — a fresh layout,
+        // under the name the flow offers first — and saves it. (An empty one
+        // cannot get this far any more: `commit()` refuses a controller that
+        // binds nothing. The collision is the same either way, and this is the
+        // shape a second visit really has.)
         let spec = StagedSetup::new()
             .choose_device(device())
             .unwrap()
-            .add_slot(
-                1,
-                Persona::Xbox360,
-                Preset {
-                    name: "Player 1".to_owned(),
-                    entries: Vec::new(),
-                    chords: Vec::new(),
-                    macros: Default::default(),
-                    turbo: Vec::new(),
-                    protected: false,
-                },
-            )
+            .add_slot(1, Persona::Xbox360, preset("Player 1", Key::Q, XButton::Y))
             .unwrap()
+            .set_blocking(Blocking::Whole)
             .commit()
             .unwrap();
         let committed = apply(&store, &spec).unwrap();

@@ -309,6 +309,13 @@ pub fn serve(
             .route("/api/start", get(api_start))
             .route("/start/device", post(start_form_device))
             .route("/start/controller", post(start_form_controller))
+            // Moment 6 IN THE STAGE: dress a staged controller in one of
+            // ksx's in-box layouts. One `stage-edit`, so it reaches nothing
+            // outside the daemon's memory — the bindings a first-run user
+            // needs arrive without a file write and without the mapper, which
+            // edits FILES and could therefore never have been step 3 of a flow
+            // that has not saved anything yet.
+            .route("/start/controller/layout", post(start_form_layout))
             .route("/start/controller/remove", post(start_form_remove))
             .route("/start/blocking", post(start_form_blocking))
             .route("/start/discard", post(start_form_discard))
@@ -1525,6 +1532,20 @@ struct StartControllerForm {
     /// The preset name, from `StagedSetupView::next_preset`. Served rather than
     /// typed, because it becomes a file name.
     preset: String,
+    /// The in-box layout it starts from — a `TemplateRow::id` off the SERVED
+    /// roster (`StagedSetupView::layouts`), never a name anybody typed.
+    ///
+    /// Optional on the wire because a form without the field is a legal thing
+    /// for a client to send, and the backend has one honest answer for it: a
+    /// controller that binds nothing, which `commit()` then refuses by name.
+    #[serde(default)]
+    layout: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StartLayoutForm {
+    number: u8,
+    layout: String,
 }
 
 #[derive(Deserialize)]
@@ -1600,6 +1621,29 @@ async fn start_form_controller(
             number: None,
             persona: form.persona,
             preset: form.preset,
+            layout: form.layout,
+        },
+    )
+    .await
+}
+
+/// POST /start/controller/layout — moment 6's menu half.
+///
+/// The surface names a layout; ksx-core builds the preset. Nothing here writes
+/// a file: the bindings land in the staged slot, which is what makes "map it"
+/// a step this flow can actually perform before anything has been saved. The
+/// player block follows the slot number, so nobody is asked what a player block
+/// is.
+async fn start_form_layout(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<StartLayoutForm>,
+) -> Response {
+    stage_edit(
+        state,
+        ksx_api::StageEdit::SetLayout {
+            number: form.number,
+            layout: form.layout,
+            player: None,
         },
     )
     .await

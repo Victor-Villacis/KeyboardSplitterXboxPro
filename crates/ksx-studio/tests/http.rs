@@ -778,6 +778,7 @@ impl ksx_api::MachineSource for ScriptedMachine {
                 label: "Two players sharing ONE keyboard: WASD vs the arrows".into(),
                 detail: "Two people on one ordinary keyboard, no encoder.".into(),
                 players: vec![1, 2],
+                blank: false,
             }],
         })
     }

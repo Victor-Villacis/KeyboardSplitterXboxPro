@@ -889,7 +889,8 @@ fn handle_stage_edit(request: &serde_json::Value, deps: &PipeDeps) -> serde_json
                 "code": ksx_api::codes::BAD_REQUEST,
                 "error": format!(
                     "stage-edit needs an \"edit\" naming one of choose-device | add-slot | \
-                     set-persona | set-bindings | remove-slot | set-blocking | discard: {err}"
+                     set-persona | set-layout | set-bindings | remove-slot | set-blocking | \
+                     discard: {err}"
                 ),
             })
         }
@@ -917,8 +918,19 @@ fn describe(edit: &ksx_api::StageEdit) -> String {
         ksx_api::StageEdit::ChooseDevice { label, .. } => {
             format!("using \"{label}\" — nothing has been claimed or written")
         }
-        ksx_api::StageEdit::AddSlot { .. } => {
-            "controller staged — nothing is plugged until you play".to_owned()
+        ksx_api::StageEdit::AddSlot { layout, .. } => match layout {
+            Some(_) => "controller staged with its layout — nothing is plugged, and nothing has \
+                        been written"
+                .to_owned(),
+            // Said out loud, because it is the state `commit()` refuses: the
+            // pad would plug and do nothing, and the flash is where a user
+            // finds that out while it is still one click to fix.
+            None => "controller staged with NO bindings — give it a layout or map a control, or \
+                     it will plug a pad that does nothing"
+                .to_owned(),
+        },
+        ksx_api::StageEdit::SetLayout { number, layout, .. } => {
+            format!("slot {number} now uses the \"{layout}\" layout — in memory, not in a file")
         }
         ksx_api::StageEdit::SetPersona { number, .. } => {
             format!("slot {number} changed — free, because nothing was written")
@@ -1846,6 +1858,12 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
                 number: None,
                 persona: "playstation".into(),
                 preset: "IPAC P1".into(),
+                layout: Some("arcade-6button".into()),
+            })),
+            Request::StageEdit(Box::new(ksx_api::StageEdit::SetLayout {
+                number: 1,
+                layout: "keyboard-wasd".into(),
+                player: None,
             })),
             Request::StageEdit(Box::new(ksx_api::StageEdit::SetBlocking {
                 blocking: "bound-keys".into(),
@@ -2142,8 +2160,12 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
 
     // -- the staged setup (docs/FIRST-RUN.md §2) ----------------------------
 
-    /// Stage a device and a controller over the pipe, in the shape a surface
-    /// sends.
+    /// Stage a device and a controller — with a real layout, so the pad it
+    /// would plug does something — in the shape a surface sends.
+    ///
+    /// §3's question is deliberately NOT answered here: that is the state a
+    /// visit is in between moments 5 and 6, and the tests below assert what it
+    /// costs.
     fn stage_up(deps: &PipeDeps) {
         let chosen = handle_request(
             r#"{"verb":"stage-edit","edit":"choose-device","selector":"usb:d209:0430:00",
@@ -2153,11 +2175,24 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
         );
         assert_eq!(chosen["ok"], true, "{chosen}");
         let added = handle_request(
-            r#"{"verb":"stage-edit","edit":"add-slot","persona":"playstation","preset":"Player 1"}"#,
+            r#"{"verb":"stage-edit","edit":"add-slot","persona":"playstation",
+                "preset":"Player 1","layout":"arcade-6button"}"#,
             deps,
             FAST,
         );
         assert_eq!(added["ok"], true, "{added}");
+    }
+
+    /// [`stage_up`] plus §3's answer — the smallest setup that may be saved or
+    /// played.
+    fn stage_ready(deps: &PipeDeps) {
+        stage_up(deps);
+        let answered = handle_request(
+            r#"{"verb":"stage-edit","edit":"set-blocking","blocking":"bound-keys"}"#,
+            deps,
+            FAST,
+        );
+        assert_eq!(answered["ok"], true, "{answered}");
     }
 
     /// **The whole point of §2, over the wire: staging writes nothing and
@@ -2183,7 +2218,25 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
         assert_eq!(view["setup"]["device"]["selector"], "usb:d209:0430:00");
         assert_eq!(view["setup"]["slots"][0]["number"], 1);
         assert_eq!(view["setup"]["slots"][0]["persona"], "playstation");
-        assert_eq!(view["setup"]["ready"], true);
+        // The layout came back as real bindings, held in the daemon, with no
+        // file anywhere — §2's "the bindings so far" is a thing the stage can
+        // actually hold rather than a field nobody fills.
+        assert!(
+            view["setup"]["slots"][0]["bindings"].as_u64().unwrap() > 10,
+            "{view}"
+        );
+        // ...and it is still NOT ready, because §3 has not been asked. That is
+        // the difference between "the setup is complete" and "the setup is
+        // complete except for the one question that decides whether this
+        // keyboard can still type".
+        assert_eq!(view["setup"]["ready"], false);
+        assert!(
+            view["setup"]["not_ready"]
+                .as_str()
+                .unwrap()
+                .contains("split-or-freeze"),
+            "{view}"
+        );
         // The ceilings and the roster are SERVED, so no surface has to know
         // them (docs/CLAUDE.md's one rule).
         assert_eq!(view["setup"]["max_slots"], ksx_core::MAX_SLOTS);
@@ -2197,6 +2250,16 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
         );
         // §3 has not been asked, and that is not the same as "whole".
         assert_eq!(view["setup"]["blocking"], serde_json::Value::Null);
+
+        // Answering it — and only that — completes the setup.
+        handle_request(
+            r#"{"verb":"stage-edit","edit":"set-blocking","blocking":"bound-keys"}"#,
+            &deps,
+            FAST,
+        );
+        let view = handle_request(r#"{"verb":"stage"}"#, &deps, FAST);
+        assert_eq!(view["setup"]["ready"], true, "{view}");
+        assert_eq!(view["setup"]["not_ready"], serde_json::Value::Null);
 
         // Nothing was enqueued and no session state moved.
         assert!(rx.try_recv().is_err(), "staging enqueues nothing");
@@ -2340,7 +2403,7 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
         let state = shared(RunState::Stopped);
         let (tx, rx) = unbounded();
         let deps = deps(tx, state.clone(), no_profiles());
-        stage_up(&deps);
+        stage_ready(&deps);
 
         let worker = std::thread::spawn({
             let state = state.clone();
@@ -2372,6 +2435,78 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
         );
     }
 
+    /// **Play refuses a controller that binds nothing, and it refuses an
+    /// unanswered split-or-freeze question — over the wire, before anything is
+    /// enqueued.**
+    ///
+    /// This is the shipped bug, end to end: `add-slot` staged an empty preset,
+    /// `stage` reported `ready: true`, and `stage-play` plugged a pad on which
+    /// every button was dead — moments after a screen said the controller was
+    /// ready. The refusal names the SLOT, so a four-player setup says which
+    /// pad would be the dead one.
+    ///
+    /// Breaks against the shipped daemon on both arms: the empty-preset arm
+    /// answered `ok: true` and enqueued `PlayStaged`, and the unanswered-
+    /// question arm answered `ok: true` after silently resolving §3 to Freeze.
+    #[test]
+    fn playing_a_dead_pad_or_an_unanswered_question_is_refused_and_enqueues_nothing() {
+        let state = shared(RunState::Stopped);
+        let (tx, rx) = unbounded();
+        let deps = deps(tx, state.clone(), no_profiles());
+
+        handle_request(
+            r#"{"verb":"stage-edit","edit":"choose-device","selector":"usb:d209:0430:00",
+                "alias":"panel","label":"I-PAC"}"#,
+            &deps,
+            FAST,
+        );
+        // A controller with no layout: exactly what the shipped `add-slot`
+        // staged for EVERY controller.
+        let added = handle_request(
+            r#"{"verb":"stage-edit","edit":"add-slot","persona":"xbox360","preset":"Player 1"}"#,
+            &deps,
+            FAST,
+        );
+        assert_eq!(added["ok"], true, "staging it is still free");
+        assert_eq!(added["setup"]["slots"][0]["bindings"], 0);
+        assert_eq!(added["setup"]["ready"], false, "{added}");
+
+        for verb in [r#"{"verb":"stage-play"}"#, r#"{"verb":"stage-commit"}"#] {
+            let refused = handle_request(verb, &deps, FAST);
+            assert_eq!(refused["ok"], false, "{verb} → {refused}");
+            assert_eq!(refused["code"], "no-bindings", "{refused}");
+            assert!(
+                refused["error"].as_str().unwrap().contains("slot 1"),
+                "the refusal names the slot: {refused}"
+            );
+            // ...and it is the sentence the screen was ALREADY showing, so
+            // neither button can produce a surprise.
+            assert_eq!(refused["error"], refused["setup"]["not_ready"]);
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a dead pad must not reach the control loop"
+        );
+
+        // Give it a real layout and the bindings gate opens — but §3's is
+        // still shut, and Save must not write an answer nobody gave.
+        let dressed = handle_request(
+            r#"{"verb":"stage-edit","edit":"set-layout","number":1,"layout":"arcade-6button"}"#,
+            &deps,
+            FAST,
+        );
+        assert_eq!(dressed["ok"], true, "{dressed}");
+        assert!(dressed["setup"]["slots"][0]["bindings"].as_u64().unwrap() > 10);
+        let refused = handle_request(r#"{"verb":"stage-play"}"#, &deps, FAST);
+        assert_eq!(refused["code"], "blocking-unanswered", "{refused}");
+        assert_eq!(
+            refused["setup"]["blocking"],
+            serde_json::Value::Null,
+            "a refusal must not answer the question on the user's behalf either"
+        );
+        assert!(rx.try_recv().is_err(), "nothing may be enqueued");
+    }
+
     /// Playing an incomplete setup is refused before anything is enqueued, and
     /// so is playing while a session is already running.
     #[test]
@@ -2384,7 +2519,7 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
         assert_eq!(refused["code"], "no-device");
         assert!(rx.try_recv().is_err(), "nothing may be enqueued");
 
-        stage_up(&deps);
+        stage_ready(&deps);
         state.lock().unwrap().run = RunState::Running { slots: 4 };
         let busy = handle_request(r#"{"verb":"stage-play"}"#, &deps, FAST);
         assert_eq!(busy["ok"], false, "{busy}");
