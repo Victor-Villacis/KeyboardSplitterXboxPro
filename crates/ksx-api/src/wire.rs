@@ -57,6 +57,21 @@ pub enum Request {
     MapClearAll(ClearAllRequest),
     MapBackups(BackupsRequest),
     SlotAssign(SlotAssignRequest),
+    /// Read the STAGED setup (docs/FIRST-RUN.md §2). A read: it changes
+    /// nothing, and it is the only staging verb that cannot refuse for a
+    /// domain reason.
+    Stage,
+    /// One edit to the staged setup. The payload is internally tagged by
+    /// `edit`, so this lands on the wire as one flat object —
+    /// `{"verb":"stage-edit","edit":"add-slot","persona":"playstation",…}`.
+    ///
+    /// Boxed because [`crate::StageEdit::SetBindings`] carries a whole preset
+    /// table, and an enum is as wide as its widest arm.
+    StageEdit(Box<crate::StageEdit>),
+    /// **Save** the staged setup. The one staging verb that writes.
+    StageCommit,
+    /// **Play** the staged setup, with nothing written.
+    StagePlay,
     LearnKey,
     LearnPoll,
     LearnCancel,
@@ -76,6 +91,10 @@ impl Request {
             Self::MapClearAll(_) => "map-clear-all",
             Self::MapBackups(_) => "map-backups",
             Self::SlotAssign(_) => "slot-assign",
+            Self::Stage => "stage",
+            Self::StageEdit(_) => "stage-edit",
+            Self::StageCommit => "stage-commit",
+            Self::StagePlay => "stage-play",
             Self::LearnKey => "learn-key",
             Self::LearnPoll => "learn-poll",
             Self::LearnCancel => "learn-cancel",
@@ -574,6 +593,11 @@ pub enum Response {
     Restore(RestoreResponse),
     Backups(BackupsResponse),
     SlotAssign(SlotAssignResponse),
+    /// Every staging verb answers the same shape: what it did, plus the setup
+    /// as it stands now. One shape rather than four because a surface
+    /// re-renders from it after every one of them, and four would be four
+    /// chances for the same page to be built from a different view type.
+    Stage(Box<crate::StageOutcome>),
     Learn(LearnResponse),
 }
 
@@ -612,6 +636,9 @@ impl Response {
             Request::SlotAssign(_) => {
                 Self::SlotAssign(serde_json::from_value(value).map_err(read(verb))?)
             }
+            Request::Stage | Request::StageEdit(_) | Request::StageCommit | Request::StagePlay => {
+                Self::Stage(serde_json::from_value(value).map_err(read(verb))?)
+            }
             Request::LearnKey | Request::LearnPoll | Request::LearnCancel => {
                 Self::Learn(serde_json::from_value(value).map_err(read(verb))?)
             }
@@ -629,6 +656,7 @@ impl Response {
             Self::Restore(r) => serde_json::to_value(r),
             Self::Backups(r) => serde_json::to_value(r),
             Self::SlotAssign(r) => serde_json::to_value(r),
+            Self::Stage(r) => serde_json::to_value(r),
             Self::Learn(r) => serde_json::to_value(r),
         };
         value.unwrap_or(serde_json::Value::Null)

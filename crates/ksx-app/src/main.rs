@@ -58,6 +58,11 @@ mod slot_cli;
 mod slots;
 #[cfg(any(feature = "studio", feature = "cabinet"))]
 mod sources;
+// The staged setup's two exits — save it, or play it without saving
+// (docs/FIRST-RUN.md §2). Not feature-gated: `ksx_core::StagedSetup` lives in
+// the daemon for the length of a visit, so every build that can run a daemon
+// needs the paths that turn one into a config write or a run plan.
+mod stage;
 #[cfg(feature = "studio")]
 mod studio;
 #[cfg(feature = "studio")]

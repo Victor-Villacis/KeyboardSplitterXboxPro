@@ -411,22 +411,38 @@ pub fn resolve_as(
     let mut plan = build_plan(&config.value, &games.value, &presets.value, game)
         .map_err(|err| err.invoked_as(invoked_as))?;
 
-    // THE one resolution pass (`crate::run::resolve`). Here, and only here,
-    // because this is the single call `ksx run`, `ksx daemon`, autostart and
-    // the tray's "Reload config" all funnel through — which is what makes
-    // "what start sees" and "what the hot-swap check compares" the same values.
-    // Resolving downstream of `SessionShape` would bounce a live session on
-    // every preset edit.
-    if crate::run::resolve::needs_enumeration(&plan, &config.value.devices) {
-        let connected = crate::run::resolve::connected().map_err(PlanError::Enumeration)?;
-        crate::run::resolve::apply(&mut plan, &config.value.devices, &connected)
-            .map_err(PlanError::Device)?;
-    }
+    resolve_devices(&mut plan, &config.value.devices)?;
 
     plan.config_path = root.config_path();
     notes.extend(std::mem::take(&mut plan.notes));
     plan.notes = notes;
     Ok(plan)
+}
+
+/// **THE one resolution pass** (`crate::run::resolve`): `[[device]]` selectors
+/// become concrete devnodes, against one fresh enumeration.
+///
+/// Here, and only here, because this is what [`resolve_as`] — the single call
+/// `ksx run`, `ksx daemon`, autostart and the tray's "Reload config" all funnel
+/// through — performs, and what "what start sees" and "what the hot-swap check
+/// compares" both have to be. Resolving downstream of `SessionShape` would
+/// bounce a live session on every preset edit
+/// (`docs/DEVICE-IDENTITY.md` §8).
+///
+/// A function rather than a block inside [`resolve_as`] because a **staged**
+/// setup needs the identical pass on a plan that came from memory rather than
+/// from disk (`crate::stage::resolve`). A second copy of these four lines there
+/// would be a second answer to "which board is this", which is the one question
+/// this project has already been wrong about.
+pub fn resolve_devices(
+    plan: &mut RunPlan,
+    devices: &[ksx_config::DeviceEntry],
+) -> Result<(), PlanError> {
+    if crate::run::resolve::needs_enumeration(plan, devices) {
+        let connected = crate::run::resolve::connected().map_err(PlanError::Enumeration)?;
+        crate::run::resolve::apply(plan, devices, &connected).map_err(PlanError::Device)?;
+    }
+    Ok(())
 }
 
 /// The pure core: no filesystem, no clock, no drivers.

@@ -22,6 +22,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::refusal::{codes, Refusal};
+use crate::stage::{StageEdit, StageOutcome, StagedSetupView};
 use crate::status::MacroStepView;
 use crate::wire::{
     BackupView, MacroWriteKind, MapMacroRequest, MapRequest, MapResponse, RestoreMode,
@@ -168,6 +169,66 @@ pub trait ControlSource: Send + Sync {
         SlotOutcome::failed(
             "this control source cannot re-wire slots",
             "run `ksx slot assign --slot N --preset NAME`",
+        )
+    }
+
+    // ── The staged setup (docs/FIRST-RUN.md §2) ──────────────────────────
+    //
+    // The setup a visit is still deciding on: which keyboard, which persona
+    // per slot, the bindings so far, and the split-or-freeze answer. It lives
+    // in the daemon for the length of the visit and NEVER touches disk, which
+    // is what makes "pick PS4, look at it, change to Xbox 360" free instead of
+    // three file writes and two backups.
+    //
+    // Reach, stated: [`Self::staged`] and [`Self::stage_edit`] touch one value
+    // in the daemon's own state — no file, no driver, no session, so they are
+    // strictly *less* than this trait's other verbs. [`Self::stage_commit`] is
+    // one config write, exactly like [`Self::assign_slot`]. [`Self::stage_play`]
+    // is one `DaemonCommand::Start`, exactly like [`Self::start`] — the
+    // difference being the plan it starts was built in memory rather than read
+    // off disk. Nothing new is reachable from here.
+
+    /// Where the staged setup stands. Called per page load, like
+    /// [`Self::session`].
+    fn staged(&self) -> StagedSetupView {
+        StagedSetupView::unreachable("this control source has no staged setup")
+    }
+
+    /// One edit — choose a device, add or remove a controller, change a
+    /// persona, set bindings, answer split-or-freeze, or start over.
+    ///
+    /// **Nothing here writes.** A refused edit leaves the setup exactly as it
+    /// was and the outcome carries it back unchanged, so the screen the user is
+    /// looking at stays true.
+    fn stage_edit(&self, _edit: &StageEdit) -> StageOutcome {
+        StageOutcome::unavailable(
+            "this control source has no staged setup to edit — a daemon holds it \
+             (`ksx daemon`)",
+        )
+    }
+
+    /// **Save.** Turn the staged setup into `config.toml` + preset files,
+    /// through the one translation the play path also uses, behind one
+    /// timestamped backup.
+    ///
+    /// Saving does NOT start anything and does not claim anything — moment 7's
+    /// "saving and playing are separate acts".
+    fn stage_commit(&self) -> StageOutcome {
+        StageOutcome::unavailable(
+            "this control source cannot save a staged setup — a daemon holds it (`ksx daemon`)",
+        )
+    }
+
+    /// **Play without saving.** Start a session from the staged setup, with no
+    /// file written at all.
+    ///
+    /// The counterpart of [`Self::stage_commit`], and deliberately not a flag
+    /// on it: §2 requires that a user may leave without saving and lose only
+    /// what they typed, which is only true if playing is reachable without
+    /// writing.
+    fn stage_play(&self) -> StageOutcome {
+        StageOutcome::unavailable(
+            "this control source cannot start a staged setup — a daemon holds it (`ksx daemon`)",
         )
     }
 }
