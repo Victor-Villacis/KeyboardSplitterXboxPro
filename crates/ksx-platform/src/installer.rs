@@ -646,7 +646,11 @@ pub struct InstallPlan {
 /// What is already on the machine, distilled from [`crate::collect`].
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct InstalledState {
+    /// The `ViGEmBus` service key exists. On its own this is **not** an
+    /// install — see [`Self::healthy`].
     pub vigembus_installed: bool,
+    /// `ViGEmBus.sys` is really in `System32\drivers`.
+    pub vigembus_file_present: bool,
     pub vigembus_running: bool,
     pub vigembus_version: Option<String>,
     /// Interception's keyboard class filter — reported, never installed by ksx
@@ -658,6 +662,7 @@ impl InstalledState {
     pub fn from_report(report: &DriverReport) -> Self {
         Self {
             vigembus_installed: report.vigembus.installed,
+            vigembus_file_present: report.vigembus.driver_file.is_some(),
             vigembus_running: matches!(
                 report.vigembus.service.as_ref().map(|s| s.state),
                 Some(crate::report::ServiceState::Running)
@@ -669,6 +674,24 @@ impl InstalledState {
                 .and_then(|f| f.file_version.clone()),
             interception_installed: report.interception.installed,
         }
+    }
+
+    /// **Is there an install here worth leaving alone?**
+    ///
+    /// A service key plus the driver file it points at. The service being
+    /// *stopped* is deliberately not disqualifying: a fresh install before a
+    /// reboot looks exactly like that, and re-running setup is not what fixes
+    /// it (`vigembus-not-running` says "reboot, or start the service").
+    ///
+    /// The key alone is not enough, and that is the whole reason this exists.
+    /// `ksx doctor` calls a registered service with no `ViGEmBus.sys` a
+    /// **broken install** and tells the user to "re-run `ksx install-drivers`"
+    /// — and `install-drivers` used to answer that with "already installed;
+    /// nothing to do", because the plan asked only whether the key existed.
+    /// The one machine that most needed setup to run was the one machine it
+    /// refused to run on, and the advice pointed straight at it.
+    pub fn healthy(&self) -> bool {
+        self.vigembus_installed && self.vigembus_file_present
     }
 }
 
@@ -727,7 +750,12 @@ pub fn plan(
         },
         // Verification comes first on purpose: "already installed" must never
         // be able to mask a tampered bundle sitting in the release directory.
-        (Some(_), Some(_)) if installed.vigembus_installed && !repair => Action::AlreadyInstalled {
+        //
+        // `healthy()`, not `vigembus_installed`: a registered service whose
+        // driver file is gone is the one state where running setup again is
+        // exactly right, and it is the state `ksx doctor` already sends people
+        // here for. See `InstalledState::healthy`.
+        (Some(_), Some(_)) if installed.healthy() && !repair => Action::AlreadyInstalled {
             version: installed.vigembus_version.clone(),
         },
         (Some(_), Some(_)) if elevated != Some(true) => Action::NeedsElevation,
@@ -773,10 +801,15 @@ impl InstallPlan {
         let _ = writeln!(
             out,
             "  ViGEmBus      {}{}",
-            if self.installed.vigembus_installed {
-                "installed"
-            } else {
-                "NOT installed"
+            match (
+                self.installed.vigembus_installed,
+                self.installed.vigembus_file_present
+            ) {
+                (true, true) => "installed",
+                // A service key with no ViGEmBus.sys behind it. Naming it as an
+                // install would hide the reason setup is about to run again.
+                (true, false) => "BROKEN install (service registered, ViGEmBus.sys missing)",
+                (false, _) => "NOT installed",
             },
             match (
                 &self.installed.vigembus_version,
@@ -1559,6 +1592,7 @@ mod tests {
         let bad = verify_with(Path::new("x"), None, Ok([0u8; 32]));
         let installed = InstalledState {
             vigembus_installed: true,
+            vigembus_file_present: true,
             vigembus_running: true,
             vigembus_version: Some("1.22.0.0".into()),
             interception_installed: true,
@@ -1571,6 +1605,7 @@ mod tests {
     fn already_installed_short_circuits_unless_repairing() {
         let installed = InstalledState {
             vigembus_installed: true,
+            vigembus_file_present: true,
             vigembus_running: true,
             vigembus_version: Some("1.22.0.0".into()),
             interception_installed: false,
@@ -1601,6 +1636,46 @@ mod tests {
             true,
         );
         assert_eq!(repairing.action, Action::Ready);
+    }
+
+    /// **A service key with no `ViGEmBus.sys` behind it is not an install.**
+    ///
+    /// Fails against every build before this one, where the arm read
+    /// `installed.vigembus_installed` — the SERVICE KEY alone. On that build
+    /// the plan was `AlreadyInstalled` and `install-drivers` exited 0 having
+    /// done nothing, while `ksx doctor` was simultaneously telling the user
+    /// this machine has a "broken install. Re-run `ksx install-drivers`". The
+    /// advice and the command disagreed, and the command won.
+    ///
+    /// It is also the case the Inno task hits: a driver whose file has been
+    /// removed leaves the key, and the installer must repair rather than
+    /// congratulate.
+    #[test]
+    fn a_registered_service_with_no_driver_file_is_repaired_not_congratulated() {
+        let broken = InstalledState {
+            vigembus_installed: true,
+            vigembus_file_present: false,
+            vigembus_running: false,
+            vigembus_version: None,
+            interception_installed: false,
+        };
+        assert!(!broken.healthy());
+
+        let p = plan(
+            located(),
+            Some(trusted()),
+            broken,
+            Some(true),
+            &args(),
+            // No --repair. The point is that this state needs no flag.
+            false,
+        );
+        assert_eq!(p.action, Action::Ready);
+        assert!(p.action.is_executable());
+        // ...and the report says WHY setup is about to run on a machine whose
+        // service key exists, rather than printing a flat "installed".
+        let text = p.render_human(true);
+        assert!(text.contains("BROKEN install"), "{text}");
     }
 
     #[test]

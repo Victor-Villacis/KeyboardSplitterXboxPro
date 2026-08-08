@@ -58,6 +58,22 @@ pub fn collect_virtual_pads() -> VirtualPadReport {
     virtual_pads()
 }
 
+/// Just the ViGEm bus's own health, without the rest of the driver stack.
+///
+/// Same reason as [`collect_virtual_pads`], for a different caller: `/start`
+/// polls every 2 s and needs exactly one fact — can a pad be plugged right now
+/// — while [`collect`] walks the Interception class filters, probes HIDMaestro,
+/// reads the CI policy and takes a process snapshot. This is two registry
+/// reads, one SCM query and one file-version read.
+///
+/// It is the SAME [`bus_driver`] call [`collect`] makes, so the judgement
+/// [`crate::advice::vigembus_advice`] reaches from it is the judgement
+/// `ksx doctor` reaches. A second, cheaper probe that answered differently
+/// would be worse than the cost it saved.
+pub fn collect_vigembus() -> BusDriverReport {
+    bus_driver(VIGEMBUS_SERVICE, &windir())
+}
+
 /// Collect the full driver-health report from the live machine.
 pub fn collect() -> DriverReport {
     let windir = windir();

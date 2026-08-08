@@ -739,6 +739,36 @@ impl ksx_api::MachineSource for LocalMachine {
         crate::onboard::import(request)
     }
 
+    /// **Can a pad be plugged on this machine right now?**
+    ///
+    /// One read (`collect_vigembus`) and one judgement
+    /// (`ksx_platform::advice::vigembus_advice`) — deliberately the SAME
+    /// judgement `ksx doctor` prints, reached through the same function, so a
+    /// first-run page and the driver report can never disagree about whether
+    /// this machine has a bus. Re-deriving "installed and running" here would
+    /// have been three lines and a second opinion.
+    ///
+    /// Read-only: two registry reads, one service query, one file-version
+    /// read. Nothing is installed, and nothing here could install anything —
+    /// `docs/SURFACES.md` §3 marks driver installation `never` for the browser
+    /// surface, and this is what lets a browser page obey that while still
+    /// saying, before the button, that the button cannot work.
+    fn pad_bus(&self) -> Result<ksx_api::PadBusView, Refusal> {
+        let bus = ksx_platform::collect_vigembus();
+        let version = bus
+            .driver_file
+            .as_ref()
+            .and_then(|file| file.file_version.clone());
+        // At most one piece of advice comes back per bus (each arm returns),
+        // and none at all means healthy. `first()` rather than an index so a
+        // future second entry degrades to "the worst thing doctor said" rather
+        // than a panic.
+        let code = ksx_platform::advice::vigembus_advice(&bus)
+            .first()
+            .map_or(ksx_api::pad_bus_codes::HEALTHY, |advice| advice.code);
+        Ok(ksx_api::PadBusView::from_doctor(code, version))
+    }
+
     /// Everything `ksx pads` and `ksx pads --prune` know, in one read.
     ///
     /// The collectors are the same ones both CLI paths use; what this adds is
