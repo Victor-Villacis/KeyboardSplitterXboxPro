@@ -1060,6 +1060,622 @@ impl SetupPayload {
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// /start — the first run, moments 4 to 7 (docs/FIRST-RUN.md)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// What `GET /api/start` serves AND what the `/start` island's props carry —
+/// the same one-struct-one-serializer rule as [`StatusPayload`], parity pinned
+/// in `render_start.rs`.
+///
+/// **Four reads, four failure modes, four fields.** They are kept apart for the
+/// reason `docs/SURFACES.md` §1b gives: a daemon that is down and a machine
+/// with no boards are opposite advice, and collapsing either into an empty
+/// value is how a page ends up saying "you have staged nothing" when the truth
+/// is "nothing answered". [`Self::staged`] carries its own `reachable` +
+/// `error`; the other two carry theirs beside them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartPayload {
+    /// The staged setup, from `ControlSource::staged` — the DAEMON's memory,
+    /// not a file. Its own `reachable`/`error` fields say when there is none.
+    pub staged: ksx_api::StagedSetupView,
+    /// The device enumeration, from `MachineSource::device_scan` — the same
+    /// read `/devices` renders.
+    pub scan: ksx_api::DeviceScanView,
+    pub session: crate::control::SessionView,
+    /// Empty when the scan answered. Otherwise the refusal, verbatim.
+    #[serde(default)]
+    pub unavailable: String,
+    /// The presets ON DISK, from `MachineSource::presets`. Not what the stage
+    /// holds — what a save would land next to, which is the only way this page
+    /// can say "a preset of that name is already there" before the click.
+    #[serde(default)]
+    pub presets: Vec<ksx_api::PresetRow>,
+    /// Empty when the preset read answered; otherwise the refusal. Separate
+    /// from an empty list, because "no presets yet" is a first run and "I could
+    /// not read the presets folder" is a broken install.
+    #[serde(default)]
+    pub presets_error: String,
+    /// One-shot action feedback (the `?flash=` query). Always `None` from
+    /// `/api/start` — a poll is not an action.
+    pub flash: Option<String>,
+    /// The page's sentences, composed from the four above. Derived, never
+    /// authored — [`StartPayload::composed`] fills it.
+    #[serde(default)]
+    pub lines: StartLines,
+    /// The page's `createShow` booleans, decided from the same four.
+    #[serde(default)]
+    pub flags: StartFlags,
+    /// The page's list rows, same rule again.
+    #[serde(default)]
+    pub rows: StartRows,
+}
+
+impl StartPayload {
+    /// Recompose [`lines`](Self::lines), [`flags`](Self::flags) and
+    /// [`rows`](Self::rows) from this payload's own facts. Called on the way
+    /// OUT, like [`SetupPayload::composed`], so a payload assembled field by
+    /// field can never serve sentences that contradict the facts beside them.
+    #[must_use]
+    pub fn composed(mut self) -> Self {
+        self.lines = StartLines::of(&self);
+        self.flags = StartFlags::of(&self);
+        self.rows = StartRows::of(&self);
+        self
+    }
+
+    /// Is the device enumeration a reading of this machine at all?
+    fn scan_read(&self) -> bool {
+        self.unavailable.trim().is_empty()
+    }
+}
+
+/// **Every sentence `/start` states as a fact, composed once, in Rust.**
+///
+/// Same rule and same reason as [`SetupLines`]: the SSR paint and the island's
+/// poll show identical words because there is one implementation of them. The
+/// island assigns these to signals and composes nothing.
+///
+/// What is deliberately NOT here: the split-or-freeze wording, the escape hatch
+/// and the per-session scope. Those are `ksx_api::BlockingOption::roster()`,
+/// `ESCAPE_HATCH_LINE` and `BLOCKING_SCOPE_LINE` — `docs/FIRST-RUN.md` §3 is a
+/// question about what the CAPTURE THREAD does, so its words belong beside the
+/// type that answers it and not on the one screen that currently asks.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartLines {
+    /// The keyboard step's heading line — chosen, or what to do about it.
+    pub device_line: String,
+    /// The chosen board's id, as SMALL PRINT. `FIRST-RUN.md` §5: the path
+    /// belongs in small print for support, never as the identifier on screen.
+    pub device_detail: String,
+    /// `scan.boards_summary`, verbatim — the one line that distinguishes "no
+    /// keyboard-capable board" from "nothing could be read".
+    pub boards_line: String,
+    /// The controller step's line: how many are staged and what that costs.
+    pub controller_line: String,
+    /// The XInput occupancy, from the SERVED numbers.
+    pub xinput_line: String,
+    /// Where the one question stands: the answer, or that it has not been
+    /// asked. Never a pre-selected default — §3.
+    pub blocking_line: String,
+    /// What the mapper edits and where the staged preset stands relative to
+    /// the presets on disk.
+    pub preset_line: String,
+    /// Ready to save or play, or ksx-core's own reason it is not.
+    pub ready_line: String,
+    /// What pressing Play actually does — moment 7's first sentence.
+    pub play_line: String,
+    /// Moment 7's one fact about the pad itself.
+    pub guide_line: String,
+    /// The daemon refusal that makes staging impossible, if any.
+    pub stage_error: String,
+    /// The scan refusal, if any.
+    pub scan_error: String,
+    /// The preset-read refusal, if any.
+    pub presets_error: String,
+}
+
+impl StartLines {
+    /// Compose every line for one payload. The only implementation.
+    pub fn of(p: &StartPayload) -> Self {
+        let staged = &p.staged;
+        Self {
+            device_line: match (&staged.device, staged.reachable) {
+                (Some(device), _) => format!(
+                    "Using {} — nothing has been claimed, plugged or written.",
+                    device.label
+                ),
+                (None, true) => {
+                    "Pick the keyboard you want to play with. Nothing happens when you pick it: \
+                     it is remembered for this visit and written only if you save."
+                        .to_owned()
+                }
+                // No daemon: the list below is still a real reading of the
+                // machine, so the sentence is about the button, not the boards.
+                (None, false) => "No keyboard can be chosen until a daemon answers — the staged \
+                                  setup lives in it, not in this page."
+                    .to_owned(),
+            },
+            device_detail: match &staged.device {
+                Some(device) => format!(
+                    "saved as [[device]] \"{}\" with id {} ({}) — {}",
+                    device.alias,
+                    device.selector,
+                    device.rung,
+                    if device.survives_replug {
+                        "it still names this board after a move to another USB socket"
+                    } else {
+                        "it names THIS USB socket, so moving the board stops it matching"
+                    }
+                ),
+                None => String::new(),
+            },
+            boards_line: p.scan.boards_summary.clone(),
+            controller_line: controller_line(staged),
+            xinput_line: format!(
+                "{} of Windows' {} XInput slots would be used. Past that, PlayStation pads are \
+                 how players {}+ exist — they are plain HID, so a game can read all of them.",
+                staged.xinput_used,
+                staged.max_xinput_slots,
+                usize::from(staged.max_xinput_slots) + 1
+            ),
+            blocking_line: match &staged.blocking {
+                Some(name) => match staged.blocking_options.iter().find(|o| &o.name == name) {
+                    Some(chosen) => format!("Answered: {}.", chosen.title),
+                    // A word the roster does not carry is a wire the surfaces
+                    // disagree about, and saying so is better than rendering
+                    // an unanswered screen over an answered setup.
+                    None => format!(
+                        "Answered with \"{name}\", which this build's list of answers does not \
+                         contain — the setup and this page disagree, so treat the answer as \
+                         unknown."
+                    ),
+                },
+                None => "Not asked yet. There is no default here on purpose: a screen showing one \
+                         option pre-selected has answered the question for you."
+                    .to_owned(),
+            },
+            preset_line: preset_line(p),
+            ready_line: match (&staged.not_ready, staged.reachable) {
+                (_, false) => "Nothing can be saved or played until a daemon answers.".to_owned(),
+                (Some(why), true) => why.clone(),
+                (None, true) => "Ready. Save writes it, Play starts it, and either one works \
+                                 without the other."
+                    .to_owned(),
+            },
+            play_line: PLAY_LINE.to_owned(),
+            guide_line: GUIDE_LINE.to_owned(),
+            stage_error: staged.error.clone().unwrap_or_default(),
+            scan_error: p.unavailable.trim().to_owned(),
+            presets_error: p.presets_error.trim().to_owned(),
+        }
+    }
+}
+
+/// **What Play does**, stated before the button rather than after it.
+///
+/// The two halves are the ones a first-run user has no way to predict: a pad
+/// appears on the ViGEm bus (so a game finds a controller that was not there a
+/// second ago) and their keyboard changes behaviour (which, under Freeze, means
+/// it stops typing). Both are reversible and the sentence says how — Stop, or
+/// the escape latch, which is the same one §3's card carries.
+const PLAY_LINE: &str =
+    "Play plugs a virtual pad for each controller above and starts capturing the keyboard you \
+     picked, so it becomes a controller. Stopping the session unplugs the pads and gives the \
+     keyboard back — and so does LeftCtrl five times, from the keyboard itself.";
+
+/// Moment 7's one fact about the pad that is not about ksx.
+///
+/// `ksx_core::pad::XButton::Guide` already exists and every persona publishes
+/// it; what a first-run user does not know is that Windows answers it. Composed
+/// here rather than in `ksx-api` because it is a sentence about this SCREEN's
+/// last step, and no other surface has that step yet. The day the cabinet grows
+/// one, it moves — the same way §3's wording already lives in `ksx-api`.
+const GUIDE_LINE: &str =
+    "Whatever you map to GUIDE opens the Xbox Game Bar, so you can start a game without going \
+     back to a keyboard. It is an ordinary button on every persona — map it like any other.";
+
+fn controller_line(staged: &ksx_api::StagedSetupView) -> String {
+    match staged.slots.len() {
+        0 => format!(
+            "Pick what the keyboard should become. Nothing is plugged and nothing is written — \
+             changing your mind costs a click. Up to {} controllers.",
+            staged.max_slots
+        ),
+        1 => "1 controller staged. It does not exist yet: no pad is on the bus, no file has been \
+              touched, and Remove leaves no trace."
+            .to_owned(),
+        n => format!(
+            "{n} controllers staged. None of them exists yet: no pad is on the bus, no file has \
+             been touched, and Remove leaves no trace."
+        ),
+    }
+}
+
+/// What the mapper step can honestly say, which depends on whether the presets
+/// were readable at all.
+///
+/// The failed-read arm is the point: a preset name that "is not on disk" is a
+/// claim about the presets folder, and when the read refused nothing is known
+/// about it. Saying "this will create it" there is `SURFACES.md` §1b's bug.
+fn preset_line(p: &StartPayload) -> String {
+    const LEAD: &str = "Mapping happens in the mapper, and the mapper edits preset FILES. Save \
+                        first: that writes one preset per controller and puts the slot in the \
+                        list the mapper reads.";
+    if !p.presets_error.trim().is_empty() {
+        return format!(
+            "{LEAD} What is already in the presets folder could not be read, so nothing here can \
+             say whether saving would replace something."
+        );
+    }
+    let clashes: Vec<&str> = p
+        .staged
+        .slots
+        .iter()
+        .filter(|slot| {
+            p.presets
+                .iter()
+                .any(|row| row.name.eq_ignore_ascii_case(&slot.preset))
+        })
+        .map(|slot| slot.preset.as_str())
+        .collect();
+    if clashes.is_empty() {
+        return format!("{LEAD} None of the names below is on disk yet, so saving creates them.");
+    }
+    format!(
+        "{LEAD} {} already exists on disk — saving REPLACES it, keeping a timestamped copy the \
+         mapper's \"Restore backup\" can put back.",
+        clashes.join(", ")
+    )
+}
+
+/// **Every `createShow` boolean on `/start`, decided once, in Rust.**
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartFlags {
+    pub pill_running: bool,
+    pub pill_idle: bool,
+    pub pill_down: bool,
+    /// The staged setup could not be reached — every verb on the page is inert
+    /// and the banner says why.
+    pub stage_down: bool,
+    /// The device scan refused. NOT the same as an empty machine.
+    pub scan_down: bool,
+    /// The preset read refused.
+    pub presets_down: bool,
+    /// A keyboard is staged.
+    pub has_device: bool,
+    /// Boards that can be picked.
+    pub has_boards: bool,
+    /// **The enumeration ANSWERED and found no keyboard-capable board.** The
+    /// only flag that licenses the "there is nothing here" paragraph; false
+    /// whenever the list is empty because nothing could be read.
+    pub no_boards: bool,
+    /// Boards with no keyboard interface, listed so "why is my device not
+    /// here" has an answer.
+    pub has_other: bool,
+    pub has_notes: bool,
+    /// Controllers are staged.
+    pub has_slots: bool,
+    /// A controller can still be added (a free slot AND a persona to put in
+    /// it AND a keyboard to drive it).
+    pub can_add: bool,
+    /// Every slot is taken — the ceiling, said before the button vanishes.
+    pub slots_full: bool,
+    /// Personas this build cannot plug, listed with the reason.
+    pub has_gaps: bool,
+    /// §3 has been answered.
+    pub blocking_answered: bool,
+    /// The setup is complete enough to save or play.
+    pub ready: bool,
+    pub not_ready: bool,
+    /// Anything at all is staged, so "Start over" means something.
+    pub can_discard: bool,
+    /// A session is already running — starting a staged one replaces it, which
+    /// the page says before the click.
+    pub session_live: bool,
+    pub flash_ok: bool,
+    pub flash_error: bool,
+}
+
+impl StartFlags {
+    /// Decide every branch for one payload. The only implementation.
+    pub fn of(p: &StartPayload) -> Self {
+        let staged = &p.staged;
+        let session = &p.session;
+        let scan_read = p.scan_read();
+        let flash = p.flash.as_deref().unwrap_or_default().trim();
+        let flash_error = flash.starts_with("error");
+        Self {
+            pill_running: session.reachable && session.running,
+            pill_idle: session.reachable && !session.running,
+            pill_down: !session.reachable,
+            stage_down: !staged.reachable,
+            scan_down: !scan_read,
+            presets_down: !p.presets_error.trim().is_empty(),
+            has_device: staged.device.is_some(),
+            has_boards: scan_read && p.scan.pickable_boards > 0,
+            // `no_pickable_board_found` and nothing else. `boards.is_empty()`
+            // is the version that tells a cabinet with four boards plugged in
+            // that it has none, on the one read where that is most wrong.
+            no_boards: scan_read && p.scan.no_pickable_board_found,
+            has_other: scan_read && p.scan.other_boards > 0,
+            has_notes: !p.scan.notes.is_empty(),
+            has_slots: !staged.slots.is_empty(),
+            can_add: staged.reachable
+                && staged.device.is_some()
+                && staged.next_slot.is_some()
+                && staged.personas.iter().any(|p| p.can_plug),
+            slots_full: staged.reachable && staged.device.is_some() && staged.next_slot.is_none(),
+            has_gaps: staged.personas.iter().any(|p| !p.can_plug),
+            blocking_answered: staged.blocking.is_some(),
+            ready: staged.reachable && staged.ready,
+            not_ready: !staged.reachable || !staged.ready,
+            can_discard: staged.reachable && !staged.empty,
+            session_live: session.reachable && session.running,
+            flash_ok: !flash.is_empty() && !flash_error,
+            flash_error,
+        }
+    }
+}
+
+/// One board a first-run user could pick.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartBoardRow {
+    /// **The identifier on screen** — the vendor table's name (`FIRST-RUN.md`
+    /// §5).
+    pub name: String,
+    /// `USB` | `Bluetooth`, as a human reads it.
+    pub transport: String,
+    /// What can reach it, served by `DeviceScanView::read` — the sentence that
+    /// says a Bluetooth keyboard can be split but never WinUSB-claimed.
+    pub backends: String,
+    /// Its keyboard interface's verdict.
+    pub verdict: String,
+    /// The honest caveat when nothing on it DECLARES itself a keyboard, else
+    /// empty. Rendered on every row and hidden when empty — a `createShow`
+    /// inside a `createList` is not a shape this compiler emits.
+    pub caveat: String,
+    pub caveat_cls: String,
+    /// "it is present and cannot type right now", when that applies.
+    pub cannot_type: String,
+    pub cannot_type_cls: String,
+    /// SMALL PRINT: the Windows instance path, for a support conversation.
+    /// Never the identifier — §5.
+    pub path: String,
+    /// What the form posts: the SERVED `DeviceSelector`, and the alias a pick
+    /// would write. Neither is derived here and neither is ever typed.
+    pub selector: String,
+    pub alias: String,
+    /// Is this the board already staged?
+    pub chosen_cls: String,
+    pub button: String,
+}
+
+/// One board that cannot be picked at all, and why.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartOtherRow {
+    pub name: String,
+    pub transport: String,
+    pub reason: String,
+    pub backends: String,
+}
+
+/// One staged controller.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartSlotRow {
+    /// The form value.
+    pub number: String,
+    pub title: String,
+    /// **Both halves of moment 5 in one line.** `FIRST-RUN.md` §1 says the
+    /// controller "appears **ready**", and §2 says nothing has been plugged,
+    /// claimed or written — and a row that said only the second reads as a
+    /// half-finished thing rather than a decision that has been made.
+    pub state: String,
+    pub persona: String,
+    /// Whether it occupies one of Windows' four XInput slots, as a sentence.
+    pub xinput: String,
+    /// The preset it binds, and how many controls that is — including zero,
+    /// which is a real answer a page should say before a game does.
+    pub preset: String,
+    pub bindings: String,
+}
+
+/// One `<option>`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartOptionRow {
+    pub value: String,
+    pub label: String,
+}
+
+/// One persona this build cannot plug, with `PadBackend::gap()`'s own sentence.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartGapRow {
+    pub label: String,
+    pub gap: String,
+    pub instead: String,
+}
+
+/// One answer to §3's question.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartBlockingRow {
+    pub name: String,
+    pub title: String,
+    pub detail: String,
+    /// Marks the answer that was actually given. Empty otherwise — no option
+    /// is ever pre-marked, which is the whole point of `blocking` being
+    /// optional.
+    pub chosen_cls: String,
+    pub button: String,
+}
+
+/// One plain-text row.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartTextRow {
+    pub text: String,
+}
+
+/// **Every list row `/start` draws, composed once, in Rust.**
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartRows {
+    pub boards: Vec<StartBoardRow>,
+    pub other: Vec<StartOtherRow>,
+    pub notes: Vec<StartTextRow>,
+    pub slots: Vec<StartSlotRow>,
+    /// The personas this build CAN plug, in `Persona::ALL` order. Nothing here
+    /// is spelled in TypeScript: `docs/SURFACES.md` §10 already settled that
+    /// the roster is served with a `can_plug` flag per entry.
+    pub personas: Vec<StartOptionRow>,
+    /// The ones it cannot, listed rather than hidden — a menu that silently
+    /// drops three of eight choices teaches a user the product has five.
+    pub gaps: Vec<StartGapRow>,
+    pub blocking: Vec<StartBlockingRow>,
+}
+
+impl StartRows {
+    /// Compose every row for one payload. The only implementation.
+    pub fn of(p: &StartPayload) -> Self {
+        let staged = &p.staged;
+        let chosen = staged.device.as_ref().map(|d| d.selector.as_str());
+        Self {
+            boards: p
+                .scan
+                .boards
+                .iter()
+                // `pickable`, never `keyboard.is_some()`: the partition is
+                // `DeviceScanView::read`'s one decision and re-deriving it here
+                // is how a seam and its island came to disagree about a count.
+                .filter(|b| b.pickable)
+                .map(|b| {
+                    let selector = b.selector.clone().unwrap_or_default();
+                    let is_chosen = !selector.is_empty() && chosen == Some(selector.as_str());
+                    StartBoardRow {
+                        name: b.name.clone(),
+                        transport: b.transport_label.clone(),
+                        backends: b.backends.clone(),
+                        verdict: b.keyboard_verdict.clone(),
+                        caveat: b.caveat.clone(),
+                        caveat_cls: hidden_when_empty(&b.caveat, "dv-warn"),
+                        cannot_type: b.cannot_type_line.clone(),
+                        cannot_type_cls: hidden_when_empty(&b.cannot_type_line, "dv-warn"),
+                        path: b.keyboard.clone().unwrap_or_default(),
+                        selector,
+                        alias: b.alias_hint.clone(),
+                        chosen_cls: if is_chosen {
+                            "pill pill-ok".to_owned()
+                        } else {
+                            "pill pill-none".to_owned()
+                        },
+                        button: if is_chosen {
+                            "Chosen — pick it again".to_owned()
+                        } else {
+                            "Use this keyboard".to_owned()
+                        },
+                    }
+                })
+                .collect(),
+            other: p
+                .scan
+                .boards
+                .iter()
+                .filter(|b| !b.pickable)
+                .map(|b| StartOtherRow {
+                    name: b.name.clone(),
+                    transport: b.transport_label.clone(),
+                    reason: b.keyboard_verdict.clone(),
+                    backends: b.backends.clone(),
+                })
+                .collect(),
+            notes: p
+                .scan
+                .notes
+                .iter()
+                .map(|note| StartTextRow { text: note.clone() })
+                .collect(),
+            slots: staged
+                .slots
+                .iter()
+                .map(|slot| StartSlotRow {
+                    number: slot.number.to_string(),
+                    title: format!("Player {}", slot.number),
+                    state: "ready — it will exist the moment you press Play".to_owned(),
+                    persona: slot.persona_label.clone(),
+                    xinput: if slot.is_xinput {
+                        "uses an XInput slot".to_owned()
+                    } else {
+                        "plain HID — past the XInput four".to_owned()
+                    },
+                    preset: slot.preset.clone(),
+                    bindings: match slot.bindings {
+                        0 => "nothing mapped yet — this pad would plug and do nothing".to_owned(),
+                        1 => "1 control bound".to_owned(),
+                        n => format!("{n} controls bound"),
+                    },
+                })
+                .collect(),
+            personas: staged
+                .personas
+                .iter()
+                .filter(|p| p.can_plug)
+                .map(|p| StartOptionRow {
+                    value: p.name.clone(),
+                    label: p.label.clone(),
+                })
+                .collect(),
+            gaps: staged
+                .personas
+                .iter()
+                .filter(|p| !p.can_plug)
+                .map(|p| StartGapRow {
+                    label: p.label.clone(),
+                    // `PadBackend::gap()`'s own sentence. A surface that
+                    // paraphrased it into "install HIDMaestro" would be
+                    // promising a fix that does not exist for two of the three.
+                    gap: p.gap.clone().unwrap_or_default(),
+                    instead: format!("Use {} instead.", p.instead),
+                })
+                .collect(),
+            blocking: staged
+                .blocking_options
+                .iter()
+                .map(|option| {
+                    let is_chosen = staged.blocking.as_deref() == Some(option.name.as_str());
+                    StartBlockingRow {
+                        name: option.name.clone(),
+                        title: option.title.clone(),
+                        detail: option.detail.clone(),
+                        chosen_cls: if is_chosen {
+                            "pill pill-ok".to_owned()
+                        } else {
+                            "pill pill-none".to_owned()
+                        },
+                        button: if is_chosen {
+                            "This is the answer".to_owned()
+                        } else {
+                            option.title.clone()
+                        },
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A line that is rendered on every row and HIDDEN when it has nothing to say
+/// — `render_devices.rs`'s `optional_line`, and the same constraint: a
+/// `createShow` inside a `createList` is not a shape this compiler emits.
+///
+/// The `dv-*` classes are `/devices`'s and are reused deliberately: this page
+/// draws the same KIND of thing — a list of boards, each a stack of facts with
+/// optional warnings — and a second set of class names for it would be a second
+/// place to keep the amber plate and the hide rule in step.
+fn hidden_when_empty(text: &str, class: &str) -> String {
+    if text.trim().is_empty() {
+        format!("{class} dv-hide")
+    } else {
+        class.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

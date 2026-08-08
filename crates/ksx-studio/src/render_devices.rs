@@ -364,9 +364,16 @@ fn board_row(board: &BoardRow, index: usize) -> SlotValue {
             "aliasId".to_owned(),
             SlotValue::Text(format!("dv-alias-{index}")),
         ),
+        // SERVED (`BoardRow::alias_hint`), not derived. This line used to be
+        // `board.alias.clone().unwrap_or_else(|| board.name.clone())` — which
+        // is `device_edit::plan_pick`'s rule for an absent `--alias`, written
+        // out a second time in a surface. It was correct, and it was still the
+        // shape §1 forbids: the day the derivation changes (a slug, a
+        // de-duplicating suffix) the form's placeholder and the alias the
+        // backend actually writes stop agreeing, and nothing fails.
         (
             "aliasHint".to_owned(),
-            SlotValue::Text(board.alias.clone().unwrap_or_else(|| board.name.clone())),
+            SlotValue::Text(board.alias_hint.clone()),
         ),
         (
             "pickLabel".to_owned(),
@@ -1382,6 +1389,41 @@ mod tests {
         assert_ne!(refused.html, blind.html);
         assert_ne!(blind.html, empty.html);
         assert_ne!(refused.html, empty.html);
+    }
+
+    /// **The alias the pick form suggests is the one the WRITER would choose.**
+    ///
+    /// Proved by moving it: the fixture goes through `DeviceScanView::read`
+    /// (which fills `alias_hint` the way `plan_pick` decides it) and then
+    /// overwrites the served value, so a seam still deriving
+    /// `alias.unwrap_or(name)` renders the board's name and fails here.
+    ///
+    /// FAILS against this page as shipped, which did derive it — correctly, and
+    /// in a second place. The cost is not visible until the rule changes: a
+    /// de-duplicating suffix or a slug in `plan_pick` would leave the form
+    /// showing one alias and the backend writing another, with no test between
+    /// them.
+    #[test]
+    fn the_suggested_alias_is_served_not_re_derived() {
+        let page = EmbeddedPage::load("/devices").unwrap();
+        let mut scan = cabinet_scan();
+        let board = scan
+            .boards
+            .iter_mut()
+            .find(|b| b.pickable)
+            .expect("the I-PAC is pickable");
+        assert_eq!(
+            board.alias_hint, "panel",
+            "read() fills it from the configured alias"
+        );
+        board.alias_hint = "what-the-writer-would-choose".to_owned();
+
+        let out = render_devices(&page, &DevicesPayload { scan, ..cabinet() }, None);
+        assert!(
+            out.html.contains("what-the-writer-would-choose"),
+            "the form suggested an alias this page invented: {}",
+            out.html
+        );
     }
 
     /// A hostile flash is a query-string value and is attacker-writable. It

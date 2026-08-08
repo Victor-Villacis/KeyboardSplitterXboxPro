@@ -139,6 +139,23 @@ pub struct BlockingOption {
     pub detail: String,
 }
 
+/// **The escape hatch, and it is always live.**
+///
+/// `docs/FIRST-RUN.md` §3: "Two things must be said on that screen, not
+/// buried." This is the first, and it is here rather than on a page because it
+/// is a fact about `ksx-capture`'s escape latch (`escape.rs` — the capture
+/// thread flips its OWN passthrough, which is why no UI can break it), not a
+/// reassurance a surface is free to word.
+pub const ESCAPE_HATCH_LINE: &str =
+    "LeftCtrl five times always stops emulation and gives every keyboard back — in both modes. It \
+     is handled in the capture thread itself, so no screen, no browser and no crashed UI can take \
+     it away.";
+
+/// **Freezing is not permanent and not global.** §3's second must-say.
+pub const BLOCKING_SCOPE_LINE: &str =
+    "This applies to the keyboard you picked, for this session only. Stopping the session ends it, \
+     and no other keyboard on this PC is affected either way.";
+
 impl BlockingOption {
     /// The two answers §3 asks about, plus the third the setting has always
     /// had. The wording lives HERE, once, so the browser and the cabinet cannot
@@ -196,6 +213,16 @@ pub struct StagedSetupView {
     /// The lowest slot number "Add a controller" would use, or `None` when
     /// every slot is staged.
     pub next_slot: Option<u8>,
+    /// The preset name "Add a controller" would use, or `None` when there is no
+    /// free slot.
+    ///
+    /// **Served, because it becomes a FILE NAME.** A save writes one preset per
+    /// staged slot (`ksx-app`'s `stage::apply`), so this string is the name of
+    /// something that lands on disk — and a surface that invented it would be
+    /// deciding, in TypeScript, what a first-run user's files are called. The
+    /// first-run user is the whole audience here and `FIRST-RUN.md` §1 gives
+    /// them no keyboard-and-shell step to rename anything afterwards.
+    pub next_preset: Option<String>,
     /// How many staged slots occupy one of Windows' four XInput slots.
     pub xinput_used: usize,
     /// **Served, never hardcoded**: `ksx_core::MAX_SLOTS`.
@@ -206,6 +233,11 @@ pub struct StagedSetupView {
     pub personas: Vec<PersonaOption>,
     /// The blocking answers, in §3's own words.
     pub blocking_options: Vec<BlockingOption>,
+    /// [`ESCAPE_HATCH_LINE`], served so it cannot be paraphrased on the way to
+    /// a screen. §3 requires it beside the question, not buried.
+    pub escape_hatch: String,
+    /// [`BLOCKING_SCOPE_LINE`], same rule.
+    pub blocking_scope: String,
     /// Is this setup complete enough to save or play? A surface enables the two
     /// buttons off this rather than re-deriving the rule.
     pub ready: bool,
@@ -246,11 +278,14 @@ impl StagedSetupView {
                 .collect(),
             blocking: setup.blocking().map(|b| b.as_str().to_owned()),
             next_slot: setup.next_free_slot(),
+            next_preset: setup.next_free_slot().map(preset_name_for_slot),
             xinput_used: setup.xinput_slots(),
             max_slots: MAX_SLOTS,
             max_xinput_slots: MAX_XINPUT_SLOTS,
             personas: PersonaOption::roster(),
             blocking_options: BlockingOption::roster(),
+            escape_hatch: ESCAPE_HATCH_LINE.to_owned(),
+            blocking_scope: BLOCKING_SCOPE_LINE.to_owned(),
             not_ready: ready.as_ref().err().map(ToString::to_string),
             ready: ready.is_ok(),
         }
@@ -390,6 +425,16 @@ impl StageEdit {
             Self::Discard => Ok(setup.discard()),
         }
     }
+}
+
+/// The preset a controller staged into slot `number` binds, by default.
+///
+/// "Player 1", not "slot1" or "preset-1": it is shown to someone who has never
+/// seen ksx, and it is the name of the file the mapper will then list. One
+/// implementation, because the string is on the staging screen, in the flash
+/// after a save, and on a file.
+pub fn preset_name_for_slot(number: u8) -> String {
+    format!("Player {number}")
 }
 
 fn parse_persona(name: &str) -> Result<Persona, Refusal> {
@@ -581,6 +626,33 @@ mod tests {
         assert_eq!(view.personas.len(), Persona::ALL.len());
     }
 
+    /// **§3's two must-says travel with the question.**
+    ///
+    /// Breaks against a view that served only the three options: the escape
+    /// hatch and the "this is per-keyboard, per-session" scope would then be
+    /// composed on whichever screen asked, in whatever words that screen chose,
+    /// and the browser's copy would be a second description of what the capture
+    /// thread does. The first one is not reassurance — it is the only thing
+    /// standing between a frozen keyboard and a reboot.
+    #[test]
+    fn the_blocking_question_carries_its_two_must_says() {
+        let view = StagedSetupView::of(&StagedSetup::new());
+        assert_eq!(view.escape_hatch, ESCAPE_HATCH_LINE);
+        assert_eq!(view.blocking_scope, BLOCKING_SCOPE_LINE);
+        assert!(view.escape_hatch.contains("LeftCtrl five times"));
+        assert!(
+            view.escape_hatch.contains("both modes"),
+            "the hatch works under Freeze AND Split; a sentence that said it only \
+             for one would be worse than none"
+        );
+        assert!(view.blocking_scope.contains("this session only"));
+        // A screen with no daemon still has to be able to say them — that
+        // screen is exactly where somebody is reading about how to get out.
+        let down = StagedSetupView::unreachable("no daemon answered");
+        assert_eq!(down.escape_hatch, ESCAPE_HATCH_LINE);
+        assert_eq!(down.blocking_scope, BLOCKING_SCOPE_LINE);
+    }
+
     /// The whole first-run flow as a surface drives it, ending in a setup that
     /// is ready to save or play.
     #[test]
@@ -591,6 +663,10 @@ mod tests {
         assert_eq!(view.device.as_ref().unwrap().rung, "model");
         assert!(view.device.as_ref().unwrap().survives_replug);
         assert_eq!(view.next_slot, Some(1));
+        // The preset name travels WITH the slot number, because it is the name
+        // of the file a save writes. A surface that composed "Player 1" for
+        // itself would be naming someone's files in TypeScript.
+        assert_eq!(view.next_preset.as_deref(), Some("Player 1"));
         assert!(!view.ready, "a keyboard with no controller drives nothing");
         assert!(view.not_ready.as_deref().unwrap().contains("controller"));
 

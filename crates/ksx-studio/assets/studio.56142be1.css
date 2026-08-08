@@ -1,0 +1,4791 @@
+/* ksx Studio — the design system.
+ *
+ * See docs/DESIGN-SYSTEM.md for the rationale. The short version:
+ *
+ *   PRIMITIVES (§1)  raw values, named by what they ARE (--gray-700, --sp-4)
+ *   ROLES      (§2)  what a value MEANS (--surface-raised, --text-secondary)
+ *   BASE       (§3)  element defaults, focus, motion
+ *   COMPONENTS (§4)  one vocabulary of classes — button, field, pill, panel,
+ *                    list, tabs, modal, toast, disclosure
+ *   SCREENS    (§5)  status page, §6 mapper — layout only; every widget on
+ *                    them is a component from §4
+ *
+ * Rules this file keeps:
+ *   - No raw hex outside §1/§2. Components consume ROLES only, so both themes
+ *     (and any future one) come out right without a second rule.
+ *   - No one-off font sizes. Every `font-size` is a `--fs-*` step.
+ *   - No one-off spacing. Every margin/padding/gap is a `--sp-*` step.
+ *   - Every interactive element declares :hover, :active, :focus-visible and
+ *     its disabled look. A control with no focus ring is a bug.
+ *   - Color carries MEANING: accent = live/primary, ok/warn/danger = state,
+ *     cool = identity (device/persona names). Decoration gets the neutral ramp.
+ */
+
+/* ═══ §1 PRIMITIVES ═══════════════════════════════════════════════════════ */
+
+:root {
+  /* ── Type: a 1.125–1.25 ratio scale, tuned so the small end stays legible
+     at cabinet distance. `--fs-hero` is the across-the-room size. ───────── */
+  --fs-micro: 0.6875rem; /* 11px — uppercase eyebrows, badges */
+  --fs-xs: 0.75rem; /* 12px — mono tags, meta, footnotes */
+  --fs-sm: 0.8125rem; /* 13px — secondary body, dense rows */
+  --fs-md: 0.875rem; /* 14px — body, control text */
+  --fs-base: 0.9375rem; /* 15px — emphasised body */
+  --fs-lg: 1.0625rem; /* 17px — card titles, subheads */
+  --fs-xl: 1.375rem; /* 22px — page title */
+  --fs-2xl: 1.75rem; /* 28px — screen headline */
+  --fs-hero: 2.375rem; /* 38px — the one line you read across a room */
+
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-bold: 700; /* mono legends/keycaps only — UI chrome stops at 600 */
+
+  --lh-flat: 1;
+  --lh-tight: 1.2;
+  --lh-snug: 1.35;
+  --lh-normal: 1.55;
+  --lh-loose: 1.65;
+
+  --track-hero: -0.02em;
+  --track-title: -0.011em;
+  --track-eyebrow: 0.045em;
+  --track-mono: 0.01em;
+
+  --font-sans:
+    system-ui, -apple-system, "Segoe UI Variable Text", "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", "Cascadia Code", Consolas, monospace;
+
+  /* ── Space: 4pt base, 8pt rhythm. Nothing between steps. ─────────────── */
+  --sp-0: 0;
+  --sp-1: 0.25rem; /* 4 */
+  --sp-2: 0.5rem; /* 8 */
+  --sp-3: 0.75rem; /* 12 */
+  --sp-4: 1rem; /* 16 */
+  --sp-5: 1.25rem; /* 20 */
+  --sp-6: 1.5rem; /* 24 */
+  --sp-8: 2rem; /* 32 */
+  --sp-10: 2.5rem; /* 40 */
+  --sp-12: 3rem; /* 48 */
+  --sp-16: 4rem; /* 64 */
+
+  /* ── Radii ───────────────────────────────────────────────────────────── */
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+  --r-pill: 999px;
+  --radius: var(--r-lg); /* legacy alias */
+
+  /* ── Control geometry: one ladder, so a button and a select beside it are
+     the same height without either being told twice. ───────────────────── */
+  --ctl-h-sm: 1.75rem; /* 28 — inline row accelerators */
+  --ctl-h: 2.25rem; /* 36 — the default */
+  --ctl-h-lg: 2.75rem; /* 44 — the primary action of a screen */
+
+  /* ── Motion: fast, few, purposeful. ──────────────────────────────────── */
+  --dur-1: 90ms; /* state change on an element under the cursor */
+  --dur-2: 150ms; /* something appearing */
+  --dur-3: 240ms; /* an overlay */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+
+  --z-sticky: 5;
+  --z-selbar: 8;
+  --z-toast: 9;
+  --z-modal: 20;
+
+  /* ── Hardware markings ────────────────────────────────────────────────
+     The colours PRINTED ON THE PHYSICAL PADS, reproduced on the controller
+     art. Theme-independent on purpose: a real Xbox B is that red under any
+     stylesheet, so these do not belong in either theme block.
+
+     These are NOT the palette and NOT slot identity. Slot identity is
+     `--cool` and only `--cool` — colouring slot 2 red because P2 is red on
+     the mark would read as "slot 2 has failed", since red means danger
+     everywhere else in this app.
+
+     CONTRAST EXEMPTION, deliberate: `--hw-xbox-b` and `--hw-xbox-x` carry
+     white letters at 4.00:1 and 3.94:1, under the 4.5 floor. They stay,
+     because this is a PICTURE of a device — repainting it would make the
+     drawing wrong — and because the letter is not the accessible name:
+     every hit zone gets an `aria-label` naming the control and every key
+     bound to it (`render_map.rs`, `zone_label`). The floor applies to text
+     that carries meaning; this glyph is decoration on top of a label that
+     already exists. The contrast gate encodes this exemption explicitly so
+     it is a decision on record, not an oversight. */
+  --hw-xbox-a: #57c04a;
+  --hw-xbox-a-on: #08170a;
+  --hw-xbox-b: #e04b3f;
+  --hw-xbox-x: #3f7fe0;
+  --hw-xbox-y: #f0b429;
+  --hw-xbox-y-on: #201603;
+  --hw-xbox-on: #ffffff; /* B and X take white, as the hardware does */
+
+  /* The DS4 prints coloured SHAPES on grey plastic, so the glyph carries the
+     colour and the disc stays neutral. The disc is the one value here that is
+     ours rather than the hardware's — it was blue-grey (#2b3346), which read
+     as a second hue against a violet ground; it is now the same violet-grey
+     family as the rest of the page. All four glyphs gained contrast on it
+     (4.60→5.17 worst, the cross). */
+  --hw-ps-disc: #2e2740;
+  --hw-ps-circle: #6ea8ff;
+  --hw-ps-cross: #ff6b7d;
+  --hw-ps-triangle: #46d6a8;
+  --hw-ps-square: #f083c6;
+}
+
+/* ── Dark: the default. A deep violet ground — the app's own colour, taken
+   from the mark; surfaces climb by LIGHTNESS, borders do the separating,
+   shadows only mark true depth.
+
+   PURPLE IS THE GROUND, NOT THE ACCENT. That is a measured decision, not a
+   taste: `#8b5cf6` as an accent scores 4.20:1 on `--panel` and fails the
+   4.5 floor, and every lavender that passes is the same hue as the ground,
+   so it stops reading as "live". Teal stays the accent and scores BETTER
+   here than it did on the old blue-steel (9.96:1 vs 9.75:1) because teal
+   and violet are near-complementary. See DESIGN-SYSTEM §3. ─────────────── */
+:root {
+  color-scheme: dark;
+
+  --bg: #120c1c;
+  --bg-2: #0b0714;
+  --panel: #1c1428;
+  --panel-2: #171021;
+  --panel-3: #241a33;
+
+  --line: #3b2c52;
+  --line-soft: #2a1f3a;
+  --line-strong: #54406f;
+
+  /* Cream, not blue-white: on a violet ground a cool white reads as a second
+     hue. It is also not pure white — that blooms on a cabinet panel. */
+  --text: #f0ebe0;
+  --text-2: #bcb0c9;
+  --text-3: #8f83a3;
+
+  --accent: #2fd8c5;
+  --accent-strong: #4ee5d4;
+  --accent-fill: #2fd8c5;
+  --accent-on: #04241f; /* text ON an accent fill */
+  --accent-dim: rgba(47, 216, 197, 0.13);
+  --accent-dim-2: rgba(47, 216, 197, 0.22);
+  --accent-line: rgba(47, 216, 197, 0.42);
+  --accent-glow: rgba(47, 216, 197, 0.16);
+
+  /* Identity: a device, a persona, a group of keys. Violet, so it belongs to
+     the ground's family — identity is NOT liveness and must not compete with
+     the accent for that meaning. */
+  --cool: #a98ae0;
+  --cool-line: rgba(169, 138, 224, 0.45);
+
+  --ok: #4ed185;
+  --ok-dim: rgba(78, 209, 133, 0.12);
+  --ok-line: rgba(78, 209, 133, 0.4);
+
+  --warn: #edbb46;
+  --warn-dim: rgba(237, 187, 70, 0.12);
+  --warn-line: rgba(237, 187, 70, 0.42);
+
+  --danger: #f4675f;
+  /* Was #d93f36, which put `--danger-on` at 4.16:1 — below the floor, and it
+     had been that way since before this palette (the fill is ground
+     independent, so no theme ever caught it). 5.10:1 now. */
+  --danger-fill: #c5312a;
+  --danger-on: #fff5f4;
+  --danger-dim: rgba(244, 103, 95, 0.12);
+  --danger-line: rgba(244, 103, 95, 0.44);
+
+  --focus: #5ee0d0;
+  --overlay-scrim: rgba(7, 4, 13, 0.72);
+  --sel-tint: rgba(169, 138, 224, 0.07);
+
+  --e-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --e-2:
+    0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 12px -4px rgba(0, 0, 0, 0.5);
+  --e-3:
+    0 2px 6px rgba(0, 0, 0, 0.4), 0 12px 28px -8px rgba(0, 0, 0, 0.6);
+  --e-4:
+    0 4px 10px rgba(0, 0, 0, 0.45), 0 28px 64px -16px rgba(0, 0, 0, 0.75);
+
+  /* The page ground is not flat: a single very low-contrast wash gives the
+     screen a top and a bottom, which is most of why a dark UI reads as a
+     surface rather than as "the app failed to paint". */
+  --ground:
+    radial-gradient(1200px 620px at 50% -10%, #1e1530 0%, transparent 70%),
+    linear-gradient(180deg, #120c1c 0%, #0d0817 100%);
+}
+
+/* ── Light: warm paper, not cool grey — the same violet family read as a
+   tint rather than a ground. Every coloured role here is DARKER than its
+   pre-purple value, because a cream ground has less luminance headroom than
+   the blue-white one it replaces; the numbers are in DESIGN-SYSTEM §3. ─── */
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+
+    --bg: #f6f3ee;
+    --bg-2: #ece7df;
+    --panel: #ffffff;
+    --panel-2: #efe9e2;
+    --panel-3: #e8e1d8;
+
+    --line: #ddd3ca;
+    --line-soft: #eae3da;
+    --line-strong: #bfb2a4;
+
+    --text: #1c1428;
+    --text-2: #4c4059;
+    /* Was #6d6180, which clears 4.5 on every ground EXCEPT `--panel-3` — the
+       hover fill — where it lands at 4.41. The gate used to skip that one
+       pair on the grounds that "every rule that sets --panel-3 also sets
+       --text or --text-2"; `.tab .tabnum` is a counter-example that already
+       exists in this stylesheet, so the claim was one markup change away from
+       being false. Fixed the token instead of the exclusion (rule 13.6):
+       4.76:1 on `--panel-3`, and every other tertiary pair gains with it. */
+    --text-3: #685c7a;
+
+    /* Was #0b7d72. That is 4.53:1 on `--bg` — the number this palette was
+       specified against — but only 3.33:1 once the accent's own 16 % tint
+       sits on `--bg-2`, which is exactly what `.btn-undo:hover` inside a
+       sunken card draws. Darkened until the WORST composition clears 4.5. */
+    --accent: #09645c;
+    --accent-strong: #074f49;
+    --accent-fill: #09645c;
+    --accent-on: #ffffff;
+    --accent-dim: rgba(9, 100, 92, 0.09);
+    --accent-dim-2: rgba(9, 100, 92, 0.16);
+    --accent-line: rgba(9, 100, 92, 0.4);
+    --accent-glow: rgba(9, 100, 92, 0.14);
+
+    --cool: #6b3fa8;
+    --cool-line: rgba(107, 63, 168, 0.4);
+
+    --ok: #156c43;
+    --ok-dim: rgba(21, 108, 67, 0.1);
+    --ok-line: rgba(21, 108, 67, 0.35);
+
+    --warn: #7c5805;
+    --warn-dim: rgba(124, 88, 5, 0.1);
+    --warn-line: rgba(124, 88, 5, 0.35);
+
+    --danger: #ac2a23;
+    --danger-fill: #c0342b;
+    --danger-on: #ffffff;
+    --danger-dim: rgba(172, 42, 35, 0.08);
+    --danger-line: rgba(172, 42, 35, 0.35);
+
+    --focus: #09645c;
+    --overlay-scrim: rgba(28, 20, 40, 0.42);
+    --sel-tint: rgba(60, 30, 90, 0.04);
+
+    --e-1: 0 1px 2px rgba(28, 20, 40, 0.06);
+    --e-2:
+      0 1px 2px rgba(28, 20, 40, 0.06), 0 4px 12px -4px rgba(28, 20, 40, 0.1);
+    --e-3:
+      0 2px 6px rgba(28, 20, 40, 0.08), 0 12px 28px -8px rgba(28, 20, 40, 0.16);
+    --e-4:
+      0 4px 10px rgba(28, 20, 40, 0.1), 0 28px 64px -16px rgba(28, 20, 40, 0.28);
+
+    --ground:
+      radial-gradient(1200px 620px at 50% -10%, #ffffff 0%, transparent 70%),
+      linear-gradient(180deg, #f6f3ee 0%, #f0ebe3 100%);
+  }
+}
+
+/* ═══ §2 ROLE ALIASES ═════════════════════════════════════════════════════
+   Components below reference these, never the raw ramp — so re-theming is a
+   §1 edit and nothing else. The old token names stay as the ramp itself, so
+   markup and build.mjs's SVG palette keep working. */
+
+:root {
+  --surface: var(--bg);
+  --surface-sunken: var(--bg-2);
+  --surface-raised: var(--panel);
+  --surface-inset: var(--panel-2);
+  --surface-hover: var(--panel-3);
+  --surface-overlay: var(--panel);
+
+  --text-primary: var(--text);
+  --text-secondary: var(--text-2);
+  --text-tertiary: var(--text-3);
+
+  --border-subtle: var(--line-soft);
+  --border-default: var(--line);
+  --border-strong: var(--line-strong);
+
+  --muted: var(--text-3); /* legacy alias, still referenced by markup */
+}
+
+/* ═══ §3 BASE ═════════════════════════════════════════════════════════════ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  background-image: var(--ground);
+  background-attachment: fixed;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--fs-md);
+  line-height: var(--lh-normal);
+  font-synthesis-weight: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+h4,
+p,
+ul,
+ol,
+figure,
+pre {
+  margin: 0;
+}
+
+a {
+  color: var(--accent);
+  text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  text-underline-offset: 2px;
+}
+
+a:hover {
+  color: var(--accent-strong);
+  text-decoration-color: currentColor;
+}
+
+code,
+pre,
+.mono {
+  font-family: var(--mono);
+  font-variant-ligatures: none;
+  /* Live readouts (countdowns, durations, rates) update in place; tabular
+     figures keep the column from reflowing on every tick. */
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── ONE focus ring for the whole app. Two pixels, offset, in the accent —
+   visible on every surface, never removed. Anything that sets
+   `outline: none` without replacing it is a defect. ────────────────────── */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+::selection {
+  background: var(--accent-dim-2);
+}
+
+/* Scrollbars: part of the surface, not the OS. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: var(--r-pill);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
+  background-clip: content-box;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ═══ §4 COMPONENTS ═══════════════════════════════════════════════════════ */
+
+/* ── 4.1 App shell ───────────────────────────────────────────────────────
+   A real top bar: brand, route nav, live state. Sticky, full-bleed, one
+   hairline. The content column below it is what everything else measures
+   against. */
+
+.studio {
+  --page: 74rem;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.studio.mapper {
+  --page: 80rem;
+}
+
+header.top {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-6);
+  background: color-mix(in srgb, var(--surface-sunken) 88%, transparent);
+  backdrop-filter: saturate(140%) blur(12px);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-title);
+  margin-right: auto;
+  min-width: 0;
+}
+
+.brand-ksx {
+  font-family: var(--mono);
+  font-weight: var(--fw-bold);
+  font-size: var(--fs-base);
+  letter-spacing: 0.02em;
+  color: var(--accent-on);
+  background: var(--accent-fill);
+  border-radius: var(--r-sm);
+  padding: 0.15em 0.45em;
+  line-height: var(--lh-tight);
+}
+
+.brand-studio {
+  color: var(--text-primary);
+}
+
+.crumb {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--text-tertiary);
+  letter-spacing: 0;
+}
+
+.crumb::before {
+  content: "/";
+  margin-right: var(--sp-2);
+  color: var(--border-strong);
+}
+
+/* Route nav — a real link, sized like one, with a hover plate. */
+.navlink {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  height: var(--ctl-h);
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-md);
+  font-size: var(--fs-md);
+  font-weight: var(--fw-medium);
+  color: var(--text-secondary);
+  text-decoration: none;
+  transition:
+    background var(--dur-1) var(--ease-standard),
+    color var(--dur-1) var(--ease-standard);
+}
+
+.navlink:hover {
+  color: var(--text-primary);
+  background: var(--surface-inset);
+}
+
+.navlink:active {
+  background: var(--surface-hover);
+}
+
+.topnav {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-lg);
+  background: var(--surface-inset);
+}
+
+.topnav .navlink {
+  min-height: 1.75rem;
+}
+
+.navlink.on {
+  color: var(--text-primary);
+  font-weight: var(--fw-semibold);
+  background: var(--surface-raised);
+  box-shadow:
+    var(--e-1),
+    inset 0 0 0 1px var(--accent-line);
+}
+
+.studio > main {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: var(--page);
+  margin: 0 auto;
+  padding: var(--sp-6) var(--sp-6) var(--sp-12);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+}
+
+footer {
+  width: 100%;
+  max-width: var(--page);
+  margin: 0 auto;
+  padding: var(--sp-5) var(--sp-6) var(--sp-8);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-tertiary);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-loose);
+}
+
+footer p {
+  margin: var(--sp-1) 0;
+  overflow-wrap: anywhere;
+}
+
+footer a {
+  color: var(--text-secondary);
+}
+
+/* ── 4.2 Panels (`.card`) ────────────────────────────────────────────────
+   The one container. Border does the separating; shadow is a whisper. The
+   heading is an EYEBROW with an accent tick — small, tracked, tertiary — so
+   the content inside it is always the loudest thing in the box. */
+
+.card {
+  position: relative;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-lg);
+  padding: var(--sp-5) var(--sp-5) var(--sp-5);
+  box-shadow: var(--e-1);
+}
+
+.card h2 {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-4);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.card h2::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 3px;
+  height: 0.85em;
+  border-radius: 2px;
+  background: var(--accent-fill);
+  opacity: 0.85;
+}
+
+/* One line of orientation under a heading. Never the loudest thing. */
+.cardline,
+.savenote {
+  margin: calc(var(--sp-4) * -1 + var(--sp-1)) 0 var(--sp-4);
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-snug);
+  max-width: 82ch;
+}
+
+.savenote + .savenote {
+  margin-top: calc(var(--sp-3) * -1);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
+  gap: var(--sp-5);
+}
+
+/* ── 4.3 Buttons ─────────────────────────────────────────────────────────
+   Four intents (secondary / primary / ghost / danger), three sizes, every
+   state declared. Secondary is the default because most buttons are. */
+
+.btn {
+  --btn-h: var(--ctl-h);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  min-height: var(--btn-h);
+  padding: 0 var(--sp-4);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--fs-md);
+  font-weight: var(--fw-medium);
+  line-height: var(--lh-flat);
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background var(--dur-1) var(--ease-standard),
+    border-color var(--dur-1) var(--ease-standard),
+    color var(--dur-1) var(--ease-standard),
+    box-shadow var(--dur-1) var(--ease-standard);
+}
+
+.btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+}
+
+.btn:active {
+  background: var(--surface-inset);
+  transform: translateY(0.5px);
+}
+
+.btn[disabled],
+.btn:disabled,
+.btn[aria-disabled="true"] {
+  opacity: 0.42;
+  cursor: not-allowed;
+  transform: none;
+  background: var(--surface-inset);
+  border-color: var(--border-default);
+}
+
+.btn-primary {
+  background: var(--accent-fill);
+  border-color: transparent;
+  color: var(--accent-on);
+  font-weight: var(--fw-semibold);
+  padding-inline: var(--sp-5);
+  box-shadow: var(--e-1);
+}
+
+.btn-primary:hover {
+  background: var(--accent-strong);
+  border-color: transparent;
+  box-shadow:
+    var(--e-1),
+    0 0 0 3px var(--accent-glow);
+}
+
+.btn-primary:active {
+  background: var(--accent-fill);
+}
+
+.btn-primary[disabled],
+.btn-primary:disabled {
+  background: var(--accent-fill);
+  border-color: transparent;
+}
+
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-secondary);
+}
+
+.btn-ghost:hover {
+  background: var(--surface-inset);
+  border-color: var(--border-subtle);
+  color: var(--text-primary);
+}
+
+.btn-danger {
+  background: var(--danger-fill);
+  border-color: transparent;
+  color: var(--danger-on);
+  font-weight: var(--fw-semibold);
+}
+
+.btn-danger:hover {
+  background: color-mix(in srgb, var(--danger-fill) 84%, #000);
+  border-color: transparent;
+  box-shadow:
+    var(--e-1),
+    0 0 0 3px var(--danger-dim);
+}
+
+/* Destructive, but SECONDARY: the outline says "this is the dangerous one"
+   without competing with the primary action beside it. */
+.btn-danger-ghost {
+  background: transparent;
+  border-color: var(--danger-line);
+  color: var(--danger);
+}
+
+.btn-danger-ghost:hover {
+  background: var(--danger-dim);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.btn-lg {
+  --btn-h: var(--ctl-h-lg);
+  font-size: var(--fs-base);
+  padding-inline: var(--sp-6);
+}
+
+.btn-row,
+.btn-mini,
+.btn-sm {
+  --btn-h: var(--ctl-h-sm);
+  font-size: var(--fs-sm);
+  padding-inline: var(--sp-3);
+  border-radius: var(--r-sm);
+}
+
+/* Loading: the label stays (so the button does not resize), a spinner leads. */
+.btn.is-loading {
+  pointer-events: none;
+  color: transparent;
+}
+
+.btn.is-loading::after {
+  content: "";
+  position: absolute;
+  width: 0.9em;
+  height: 0.9em;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 620ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(1turn);
+  }
+}
+
+/* Touch grows the whole vocabulary — see the ladder shift at the end of §4.4.
+   It lives there, below the field rules, and it moves the TOKENS rather than
+   listing components, because a list of components here was silently dead. */
+
+/* A row of actions. Primary first, destructive last and visually apart. */
+.btn-group,
+.pactrow,
+.mbtns {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+/* ── 4.4 Fields ─────────────────────────────────────────────────────────── */
+
+select,
+input[type="text"],
+input[type="number"],
+input[type="search"] {
+  min-height: var(--ctl-h);
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--fs-md);
+  line-height: var(--lh-flat);
+  transition:
+    border-color var(--dur-1) var(--ease-standard),
+    background var(--dur-1) var(--ease-standard);
+}
+
+select {
+  padding-right: var(--sp-2);
+  cursor: pointer;
+}
+
+select:hover,
+input[type="text"]:hover,
+input[type="number"]:hover {
+  border-color: var(--border-strong);
+}
+
+select:disabled,
+input:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+input::placeholder {
+  color: var(--text-tertiary);
+}
+
+input[type="checkbox"] {
+  /* Never a flex item that shrinks: both consent boxes in this app sit in a
+     flex row beside a sentence, and a squashed 19 px checkbox beside a
+     `--force` warning is a control that reads as an artefact. */
+  flex: 0 0 auto;
+  width: 1.05rem;
+  height: 1.05rem;
+  accent-color: var(--accent-fill);
+  cursor: pointer;
+}
+
+/* Label above field — the shape every settings row here uses. */
+.bindlabel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-mono);
+  color: var(--text-tertiary);
+  text-transform: none;
+}
+
+.bindlabel select,
+.bindlabel input {
+  max-width: 18rem;
+}
+
+/* ── 4.4b TOUCH: move the LADDER, do not list its consumers ──────────────
+   DESIGN-SYSTEM §2 and §11 both claim that under `(pointer: coarse)` the
+   whole control vocabulary grows to a 40 px minimum (36 px for the small
+   tier). Until now that claim was written as a list of component selectors
+   in §4.3, and **in the output it was false for every field on every page**:
+   `select` / `input[type=text|number]` re-declare `min-height: var(--ctl-h)`
+   in §4.4 above, at equal specificity and LATER in the file, so the later
+   rule won. Measured with touch emulation on, against the SSR HTML the
+   server actually sends: /pads' three spawn selects, /profiles' six
+   new-profile fields, /setup's four selects and /devices' alias box all came
+   back 36 px. The rule had been there since the design system landed; nobody
+   had read the output, only the source — the same failure mode
+   `render.rs::assert_complete_head` documents for the viewport meta.
+
+   Redefining the LADDER is the fix that cannot rot again. A custom property
+   set on `:root` is not in the cascade with the component rules that read
+   it, so no rule added below can shadow it, and every consumer moves
+   together — `.btn`, `.navlink`, `.tab`/`.mactab`, the fields, `.dv-alias`,
+   and §6.1's sticky `calc(var(--ctl-h) + …)`, which stays correct because
+   the header it offsets grew by the same amount. That is what "one height
+   ladder, so a button and the select beside it line up without either being
+   told twice" was supposed to mean.
+
+   Everything below the `:root` block is something that does NOT read the
+   ladder and therefore cannot move with it. */
+@media (pointer: coarse) {
+  :root {
+    --ctl-h-sm: 2.25rem; /* 28 → 36 — the small tier's touch size */
+    --ctl-h: 2.5rem; /* 36 → 40 — the floor §11 promises */
+    /* --ctl-h-lg is 44 already: a screen's primary action never shrinks. */
+  }
+
+  /* A checkbox is painted by the platform and reads no token of ours. */
+  input[type="checkbox"] {
+    width: 1.5rem;
+    height: 1.5rem;
+  }
+
+  /* A row whose ONLY action is a `.btn-row` is not a row accelerator, and
+     the small tier is not for it. The dense tier exists for the mapper's
+     per-legend-row shortcuts (a legend ✕, a macro step verb) — not for
+     "Start" on the status page, "Switch" on /profiles, or "Use this board" /
+     "Remove entry" on /devices, which are those pages' primary and
+     destructive writes and the only two things on /devices that write
+     anything at all. Those take the full target.
+
+     A phone (`max-width: 40rem`, §7) pushes `.plist .btn-row` further still,
+     to 44 px; that rule is later in the file and keeps winning. */
+  .plist .btn-row,
+  .dv-form .btn-row {
+    --btn-h: var(--ctl-h);
+    padding-inline: var(--sp-4);
+  }
+}
+
+/* A component's OWN touch exception is declared beside that component, after
+   its own rules — `.maplink` in §5.2, `.dv-force label` in §9, `.importopt`
+   in §6b. Hoisting them up here would re-create the exact bug this block
+   exists for: a later rule at equal specificity wins, and both
+   `.maplink { padding: … }` and `.importopt { display: inline-flex }` are
+   later. `crates/ksx-studio/tests/touch_targets.rs` fails the build on any
+   coarse declaration an unconditional rule cancels that way. */
+
+/* ── 4.5 Pills & badges ─────────────────────────────────────────────────
+   A pill is a STATE. It carries a dot so the meaning survives a colour-blind
+   reader and a bad cabinet panel; the word carries it for everyone else. */
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  line-height: var(--lh-flat);
+  padding: 0.4rem 0.6rem;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--border-default);
+  background: var(--surface-inset);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.pill::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0.45em;
+  height: 0.45em;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 22%, transparent);
+}
+
+.pill-run {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+}
+
+.pill-run::before {
+  animation: pulse 2.4s var(--ease-standard) infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 22%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 5px color-mix(in srgb, currentColor 4%, transparent);
+  }
+}
+
+.pill-ok {
+  color: var(--ok);
+  border-color: var(--ok-line);
+  background: var(--ok-dim);
+}
+
+.pill-warn,
+.pill-down {
+  color: var(--warn);
+  border-color: var(--warn-line);
+  background: var(--warn-dim);
+}
+
+.pill-down {
+  color: var(--danger);
+  border-color: var(--danger-line);
+  background: var(--danger-dim);
+}
+
+.pill-paused {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+}
+
+.pill-idle {
+  color: var(--text-secondary);
+}
+
+/* A pill whose backend judged there is nothing to say — `health_level: "none"`
+   on a configured device whose board is not connected. The level word comes
+   from the wire and the class is built from it (`pill pill-<level>`), so a
+   level ksx-api adds later renders unstyled-but-visible instead of silently
+   wrong; this is the one level that is deliberately invisible. */
+.pill-none {
+  display: none;
+}
+
+/* ── 4.6 Tabs / segmented nav ───────────────────────────────────────────
+   Reads as NAVIGATION: a rail with a track, the active item lifted onto a
+   filled plate. Used by the slot switcher and the macro switcher. */
+
+.tabs,
+.mactabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  padding: var(--sp-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-lg);
+  background: var(--surface-inset);
+}
+
+.tab,
+.mactab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: var(--ctl-h);
+  padding: 0 var(--sp-4);
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: var(--fs-md);
+  font-weight: var(--fw-medium);
+  line-height: var(--lh-flat);
+  text-decoration: none;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background var(--dur-1) var(--ease-standard),
+    color var(--dur-1) var(--ease-standard);
+}
+
+.tab:hover,
+.mactab:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.tab.active,
+.mactab.active {
+  background: var(--surface-raised);
+  border-color: var(--border-default);
+  color: var(--text-primary);
+  font-weight: var(--fw-semibold);
+  box-shadow: var(--e-1);
+}
+
+.tab.active {
+  box-shadow:
+    var(--e-1),
+    inset 0 0 0 1px var(--accent-line);
+}
+
+.mactab {
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+}
+
+/* ── 4.7 Key/value rows (`.drow`) ───────────────────────────────────────
+   Label left, value right, hairline between — the settings-list shape every
+   pro tool uses for plumbing. Dense without being a table. */
+
+.drow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 2.25rem;
+  padding: var(--sp-2) 0;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.drow:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
+.dname {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-medium);
+  color: var(--text-primary);
+}
+
+.drow .pill,
+.dvalue {
+  margin-left: auto;
+}
+
+/* A reported FACT, so it takes the neutral ramp — this card's own subtitle
+   says "Nothing here is a control — it is what the machine reports right
+   now", and §3.4 gives the accent exactly one job (live / primary /
+   selected / the current binding).
+
+   It was `--accent`, which is only defensible for the "yes" case: the same
+   rule painted "no" and "unknown" in the primary-action colour, so on the
+   no-daemon page a red banner reading "No daemon — ksx Studio can see your
+   config but cannot change anything" sat directly above the word "no" in
+   the brightest, most alive colour on the page. Colour has to mean the same
+   thing every time it appears or it means nothing. Weight and the mono face
+   still make this the value in its row. */
+.dvalue {
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--text-primary);
+}
+
+.dvalue.mono {
+  min-width: 0;
+  font-weight: var(--fw-regular);
+  color: var(--text-secondary);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.ddetail {
+  margin: 0 0 var(--sp-1);
+  color: var(--text-tertiary);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  overflow-wrap: anywhere;
+}
+
+/* ── 4.8 Lists (`.plist`) ───────────────────────────────────────────────── */
+
+.plist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.plist li {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-3) var(--sp-3);
+  margin: 0 calc(var(--sp-3) * -1);
+  border-radius: var(--r-md);
+  border-top: 1px solid var(--border-subtle);
+  transition: background var(--dur-1) var(--ease-standard);
+}
+
+.plist li:first-child {
+  border-top: none;
+}
+
+.plist li:hover {
+  background: var(--sel-tint);
+}
+
+.plist form {
+  margin: 0 0 0 auto;
+}
+
+.pmeta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  min-width: 0;
+}
+
+.ptitle {
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-title);
+}
+
+.pdetail {
+  color: var(--text-tertiary);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  overflow-wrap: anywhere;
+}
+
+/* ── 4.9 Callouts / banners (`.alarm`, `.warnbox`, `.flash`) ─────────────
+   A banner is a STATE with a way out. Left rule in the state colour, tinted
+   ground, title in the state colour, body in normal text — never a wall of
+   coloured prose. */
+
+.alarm {
+  border-color: var(--danger-line);
+  border-left: 3px solid var(--danger);
+  background:
+    linear-gradient(var(--danger-dim), var(--danger-dim)),
+    var(--surface-raised);
+}
+
+.alarm > h2,
+.card.alarm h2 {
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-title);
+  text-transform: none;
+  color: var(--danger);
+  margin-bottom: var(--sp-2);
+}
+
+.alarm h2::before {
+  display: none;
+}
+
+.alarm.warn {
+  border-color: var(--warn-line);
+  border-left-color: var(--warn);
+  background:
+    linear-gradient(var(--warn-dim), var(--warn-dim)), var(--surface-raised);
+}
+
+.alarm.warn h2 {
+  color: var(--warn);
+}
+
+.alarm.paused {
+  border-color: var(--accent-line);
+  border-left-color: var(--accent);
+  background:
+    linear-gradient(var(--accent-dim), var(--accent-dim)),
+    var(--surface-raised);
+}
+
+.alarm.paused h2 {
+  color: var(--accent);
+}
+
+.alarmlead {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-md);
+  color: var(--text-secondary);
+  max-width: 76ch;
+}
+
+.alarmways {
+  margin: 0 0 var(--sp-3);
+  padding-left: var(--sp-5);
+  font-size: var(--fs-md);
+  color: var(--text-secondary);
+}
+
+.alarmways li {
+  margin: var(--sp-1) 0;
+}
+
+.warnbox {
+  border-left: 3px solid var(--warn);
+  background:
+    linear-gradient(var(--warn-dim), var(--warn-dim)), var(--surface-raised);
+}
+
+.warnbox .warn {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-md);
+  font-weight: var(--fw-medium);
+  color: var(--warn);
+}
+
+.session .warn {
+  flex-basis: 100%;
+  margin: var(--sp-1) 0 0;
+  color: var(--warn);
+  font-size: var(--fs-sm);
+}
+
+.flash {
+  margin: 0 0 var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--accent-line);
+  border-left-width: 3px;
+  border-radius: var(--r-md);
+  font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
+}
+
+.flash-ok {
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.flash-err {
+  color: var(--danger);
+  border-color: var(--danger-line);
+  background: var(--danger-dim);
+}
+
+/* Selectable command / path — a code chip you can click once and copy. */
+.copyable,
+.clifall code,
+.mactoml {
+  display: inline-block;
+  padding: var(--sp-1) var(--sp-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  color: var(--text-primary);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.clifall {
+  margin: 0;
+}
+
+/* ── 4.10 Disclosure (`<details>`) ───────────────────────────────────────
+   Progressive disclosure is how a dense tool stays calm: the deep controls
+   exist, reachable in one click, and are not shouting on arrival. */
+
+details.card > summary,
+.disclosure > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin: calc(var(--sp-5) * -1);
+  padding: var(--sp-4) var(--sp-5);
+  border-radius: var(--r-lg);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  transition: background var(--dur-1) var(--ease-standard);
+}
+
+details.card[open] > summary,
+.disclosure[open] > summary {
+  margin-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--border-subtle);
+  border-end-start-radius: 0;
+  border-end-end-radius: 0;
+}
+
+details.card > summary:hover,
+.disclosure > summary:hover {
+  background: var(--sel-tint);
+}
+
+details.card > summary::-webkit-details-marker,
+.disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.card > summary::before,
+.disclosure > summary::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-right: 1.5px solid var(--text-tertiary);
+  border-bottom: 1.5px solid var(--text-tertiary);
+  transform: rotate(-45deg);
+  transition: transform var(--dur-2) var(--ease-out);
+}
+
+details.card[open] > summary::before,
+.disclosure[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+.sumtitle {
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.sr-head {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.sumnote {
+  margin-left: auto;
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 4.11 Modal ─────────────────────────────────────────────────────────── */
+
+.mlayer {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-4);
+  background: var(--overlay-scrim);
+  backdrop-filter: blur(3px);
+}
+
+.modal {
+  width: min(94vw, 30rem);
+  max-height: 90vh;
+  overflow-y: auto;
+  padding: var(--sp-6);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-xl);
+  background: var(--surface-overlay);
+  box-shadow: var(--e-4);
+  text-align: center;
+}
+
+.modal h3 {
+  margin: 0 0 var(--sp-4);
+  font-size: var(--fs-xl);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-title);
+  line-height: var(--lh-tight);
+}
+
+.count {
+  margin: 0 0 var(--sp-2);
+  font-family: var(--mono);
+  font-size: var(--fs-2xl);
+  font-weight: var(--fw-bold);
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  line-height: var(--lh-flat);
+}
+
+.cdtrack {
+  height: 4px;
+  margin-bottom: var(--sp-3);
+  border-radius: var(--r-pill);
+  background: var(--surface-inset);
+  overflow: hidden;
+}
+
+.cdbar {
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: var(--accent-fill);
+  transition: width 60ms linear;
+}
+
+.mhint {
+  margin: var(--sp-3) 0 0;
+  color: var(--text-tertiary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-snug);
+}
+
+.conflict {
+  margin: 0 0 var(--sp-4);
+  padding: var(--sp-3);
+  border: 1px solid var(--warn-line);
+  border-radius: var(--r-md);
+  background: var(--warn-dim);
+  color: var(--warn);
+  font-size: var(--fs-sm);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.mbtns {
+  justify-content: center;
+}
+
+.mbound {
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.mcurrent {
+  margin: 0 0 var(--sp-4);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+  color: var(--text-secondary);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+}
+
+.mturbo {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: flex-end;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.mturbo .mturboin {
+  width: 5rem;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .mlayer {
+    animation: fade-in var(--dur-2) var(--ease-out);
+  }
+
+  .modal {
+    animation: modal-in var(--dur-3) var(--ease-out);
+  }
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+  }
+
+  @keyframes modal-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px) scale(0.985);
+    }
+  }
+}
+
+/* ── 4.12 Toasts ────────────────────────────────────────────────────────── */
+
+.toasts {
+  position: fixed;
+  right: var(--sp-4);
+  bottom: var(--sp-4);
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  width: min(26rem, 40vw);
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-3) var(--sp-3) var(--sp-4);
+  border: 1px solid var(--border-default);
+  border-left: 3px solid var(--text-tertiary);
+  border-radius: var(--r-lg);
+  background: var(--surface-overlay);
+  box-shadow: var(--e-3);
+}
+
+.toast-ok {
+  border-left-color: var(--accent);
+}
+
+.toast-warn {
+  border-left-color: var(--warn);
+  background: linear-gradient(var(--warn-dim), var(--warn-dim)), var(--surface-overlay);
+}
+
+.toast-err {
+  border-left-color: var(--danger);
+  background: linear-gradient(var(--danger-dim), var(--danger-dim)), var(--surface-overlay);
+}
+
+.tmsg {
+  flex: 1 1 auto;
+  margin: 0;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-snug);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.toast-err .tmsg {
+  color: var(--danger);
+}
+
+.tbtns {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex: 0 0 auto;
+}
+
+.btn-undo {
+  min-height: var(--ctl-h-sm);
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--accent);
+  border: 1px solid var(--accent-line);
+  background: var(--accent-dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-undo:hover {
+  background: var(--accent-dim-2);
+  border-color: var(--accent);
+}
+
+.btn-undo.off {
+  display: none;
+}
+
+.tclose {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--text-tertiary);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  transition:
+    background var(--dur-1) var(--ease-standard),
+    color var(--dur-1) var(--ease-standard);
+}
+
+.tclose:hover {
+  color: var(--text-primary);
+  background: var(--surface-inset);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .toast {
+    animation: toast-in var(--dur-2) var(--ease-out);
+  }
+
+  @keyframes toast-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+  }
+}
+
+/* ═══ §5 SCREEN — STATUS ══════════════════════════════════════════════════
+   Three tiers, and they LOOK like three tiers:
+     PRIMARY   the session — one huge line and one big button
+     SECONDARY the players, then the profiles that start them
+     TERTIARY  the plumbing — drivers and autostart, in a quiet strip */
+
+/* ── 5.1 The session hero ───────────────────────────────────────────────── */
+
+.card.hero {
+  padding: var(--sp-6);
+  border-color: var(--border-strong);
+  background:
+    linear-gradient(180deg, var(--surface-inset), transparent 70%),
+    var(--surface-raised);
+  box-shadow: var(--e-2);
+  transition:
+    background var(--dur-3) var(--ease-standard),
+    border-color var(--dur-3) var(--ease-standard);
+}
+
+/* LIVE looks different from the other side of the room. Accent is reserved for
+   "something is running", so the hero only wears it while a session is up —
+   detected from the one control that only exists then, rather than from a new
+   class (no new signal, no new show). */
+.card.hero:has(form[action="/session/stop"]) {
+  border-color: var(--accent-line);
+  background:
+    radial-gradient(90rem 26rem at 0% 0%, var(--accent-dim), transparent 62%),
+    var(--surface-raised);
+}
+
+.session .state {
+  margin: 0 0 var(--sp-4);
+  font-size: var(--fs-hero);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--track-hero);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+  /* The first word up to the em dash is the STATE; the rest is detail. The
+     browser cannot split it, so the whole line stays one weight and the size
+     does the shouting — which is what reads from six feet away. */
+  text-wrap: balance;
+}
+
+.session .controls {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.session .controls form {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin: 0;
+}
+
+.session .controls label {
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.session .controls select {
+  min-height: var(--ctl-h-lg);
+  min-width: 13rem;
+  font-size: var(--fs-base);
+}
+
+.session .controls .btn {
+  --btn-h: var(--ctl-h-lg);
+  font-size: var(--fs-base);
+  padding-inline: var(--sp-6);
+}
+
+.controls.off select,
+.controls.off .btn {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+@media (min-width: 56rem) {
+  .card.hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: var(--sp-8);
+    align-items: center;
+  }
+
+  .card.hero > h2 {
+    grid-column: 1 / -1;
+  }
+
+  .card.hero > .state {
+    grid-column: 1;
+    margin-bottom: 0;
+  }
+
+  .card.hero > .flash {
+    grid-column: 1 / -1;
+    margin: var(--sp-3) 0 0;
+  }
+
+  .card.hero > .controls {
+    grid-column: 2;
+    justify-content: flex-end;
+    max-width: 34rem;
+  }
+
+  /* The daemon-down variant carries its reason inside the control group. Keep
+     the dead controls on one row and drop the reason under them, so the
+     column stays the same height as the state line it sits beside. */
+  .card.hero > .controls.off {
+    justify-content: flex-end;
+  }
+
+  .card.hero > .controls.off .warn {
+    flex-basis: 100%;
+    margin: 0;
+    text-align: right;
+  }
+}
+
+/* ── Two columns where the page stops being a single narrative: the profiles
+   you can act on beside the plumbing you only read. ──────────────────────── */
+@media (min-width: 68rem) {
+  .studio:not(.mapper) > main {
+    display: grid;
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    align-items: start;
+    gap: var(--sp-5);
+  }
+
+  .studio:not(.mapper) > main > * {
+    grid-column: 1 / -1;
+  }
+
+  .studio:not(.mapper) > main > .profilecard {
+    grid-column: 1 / span 7;
+  }
+
+  .studio:not(.mapper) > main > .sysinfo {
+    grid-column: span 5 / -1;
+  }
+}
+
+/* ── 5.2 Player tiles ───────────────────────────────────────────────────── */
+
+.padgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr));
+  gap: var(--sp-2);
+}
+
+.padtile {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: var(--sp-3) var(--sp-3) var(--sp-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-lg);
+  background: var(--surface-inset);
+  transition:
+    border-color var(--dur-1) var(--ease-standard),
+    background var(--dur-1) var(--ease-standard);
+}
+
+.padtile.live {
+  border-color: var(--accent-line);
+  background:
+    linear-gradient(180deg, var(--accent-dim), transparent 55%),
+    var(--surface-inset);
+}
+
+.padtile.ghost {
+  border-style: dashed;
+  border-color: var(--border-default);
+  background: transparent;
+}
+
+.tileart {
+  display: block;
+  width: 100%;
+  max-width: 5.75rem;
+  height: auto;
+  margin: 0 auto var(--sp-2);
+}
+
+.padtile.ghost .tileart {
+  opacity: 0.22;
+}
+
+.padmeta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-2);
+  min-width: 0;
+}
+
+/* Row 1 is the identity chip and the jump; row 2 is the full persona name,
+   which is what the user actually reads to tell P2 from P3. */
+.padmeta .persona {
+  order: 3;
+  flex-basis: 100%;
+}
+
+.padmeta .maplink {
+  order: 2;
+}
+
+.player {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-bold);
+  letter-spacing: var(--track-mono);
+  line-height: var(--lh-flat);
+  color: var(--accent-on);
+  background: var(--accent-fill);
+  border-radius: var(--r-xs);
+  padding: 0.28em 0.45em;
+}
+
+.padtile.ghost .player {
+  color: var(--text-tertiary);
+  background: transparent;
+  border: 1px solid var(--border-default);
+}
+
+.persona {
+  min-width: 0;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--cool);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.padtile.ghost .persona {
+  color: var(--text-tertiary);
+  font-weight: var(--fw-regular);
+}
+
+/* The tile's jump into the mapper — a ghost button, revealed on hover, always
+   present for keyboard users. */
+.maplink {
+  margin-left: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  height: 1.5rem;
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-sm);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  text-decoration: none;
+  opacity: 0.75;
+  transition:
+    opacity var(--dur-1) var(--ease-standard),
+    color var(--dur-1) var(--ease-standard),
+    border-color var(--dur-1) var(--ease-standard);
+}
+
+.padtile:hover .maplink,
+.maplink:focus-visible {
+  opacity: 1;
+  color: var(--accent);
+  border-color: var(--accent-line);
+}
+
+/* On a desk this is a hover-revealed accessory and 24 px is right for it. On
+   a panel it is the tile's ONLY control — and the pad card's "Spawn or prune
+   pads →" is the same element — so it takes the ladder's target. Declared
+   here, after `.maplink`'s own `padding` shorthand, because §4.4b's block is
+   above it and a `padding-inline` up there loses to this shorthand at equal
+   specificity. That is not a hypothetical: it is what the first attempt at
+   this fix did, and the measurement caught it (40 px tall, still 38.8 wide). */
+@media (pointer: coarse) {
+  .maplink {
+    min-height: var(--ctl-h);
+    padding: 0 var(--sp-3);
+  }
+}
+
+.instance {
+  margin-top: var(--sp-2);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  line-height: var(--lh-snug);
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-height: 1em;
+}
+
+/* ── 5.3 The plumbing strip ─────────────────────────────────────────────
+   Tertiary by design: inset ground, no lift, small type. It is a reading, not
+   a control, and it should never pull the eye off the session. */
+
+.grid .card {
+  background: var(--surface-sunken);
+  border-color: var(--border-subtle);
+  box-shadow: none;
+  padding: var(--sp-4) var(--sp-5);
+}
+
+/* ═══ §6 SCREEN — MAPPER ══════════════════════════════════════════════════
+   The controller is the hero. Everything else is either NAVIGATION above it
+   or REFERENCE below it, and nothing else gets a lift. */
+
+.mapper > main {
+  gap: var(--sp-4);
+}
+
+/* ── 6.1 The slot rail: navigation, not a card ──────────────────────────── */
+
+.slotstrip {
+  position: sticky;
+  top: calc(var(--ctl-h) + var(--sp-6) + 1px);
+  z-index: calc(var(--z-sticky) - 1);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+  padding: var(--sp-3) var(--sp-4);
+  background: color-mix(in srgb, var(--surface-raised) 92%, transparent);
+  backdrop-filter: saturate(140%) blur(10px);
+}
+
+.slotstrip .tabs {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+.slotstrip .slotmeta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 0.1rem;
+}
+
+.slotline {
+  margin: 0;
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-title);
+  line-height: var(--lh-tight);
+  color: var(--text-primary);
+}
+
+.srcline {
+  margin: 0;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  color: var(--text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+/* Slot tab: player number as a chip, preset name beside it. */
+.tab .tabnum {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-bold);
+  color: var(--text-tertiary);
+}
+
+.tab.active .tabnum {
+  color: var(--accent);
+}
+
+/* ── 6.2 The hint: one line, the manual behind a disclosure ─────────────── */
+
+.hint {
+  margin: 0;
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-lg);
+  background: var(--surface-sunken);
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-snug);
+}
+
+.hint > summary {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  list-style: none;
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+
+.hint > summary::-webkit-details-marker {
+  display: none;
+}
+
+.hint > summary::after {
+  content: "how mapping works";
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--accent);
+}
+
+.hint[open] > summary::after {
+  content: "hide";
+}
+
+.hintlead {
+  font-weight: var(--fw-medium);
+  color: var(--text-primary);
+}
+
+.hintbody {
+  margin: var(--sp-3) 0 0;
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  max-width: 78ch;
+}
+
+/* ── 6.3 The stage: CONTROLLER HUGE ─────────────────────────────────────── */
+
+.stagecard {
+  padding: var(--sp-4) var(--sp-6) var(--sp-6);
+  background:
+    radial-gradient(70% 60% at 50% 30%, var(--surface-inset), transparent 70%),
+    var(--surface-raised);
+  border-color: var(--border-strong);
+  box-shadow: var(--e-2);
+}
+
+.stagehead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-2);
+}
+
+.stagehead h2 {
+  margin: 0;
+}
+
+.seltoggle {
+  display: none;
+}
+
+.studio.js .seltoggle {
+  display: inline-flex;
+}
+
+.seltoggle.on {
+  color: var(--accent-on);
+  background: var(--accent-fill);
+  border-color: transparent;
+  font-weight: var(--fw-semibold);
+}
+
+.seltoggle.on:hover {
+  background: var(--accent-strong);
+  border-color: transparent;
+}
+
+/* The stage is a size CONTAINER: every glyph on the art is sized in cqh, so
+   the identities scale with the controller instead of with the root font —
+   the same layout reads at 1600 px and at 420 px. Every cq declaration is
+   preceded by a rem fallback for browsers without container queries. */
+.stage {
+  position: relative;
+  width: 100%;
+  max-width: 52rem;
+  margin: 0 auto;
+  container: padstage / size;
+}
+
+.stage-xbox {
+  aspect-ratio: 112.456 / 89.143;
+}
+
+.stage-ds4 {
+  aspect-ratio: 112.689 / 84.34;
+}
+
+.padart {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 100%;
+  height: 86%;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+.zonelayer {
+  position: absolute;
+  inset: 0;
+}
+
+/* Hit zones over the art. Each carries its own IDENTITY (the vendored drawing
+   has no letters on it) with the bound key as a small mono tag underneath.
+   Stacked, never side by side. */
+.zone {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.1rem;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+  font: inherit;
+  transition:
+    background var(--dur-1) var(--ease-standard),
+    border-color var(--dur-1) var(--ease-standard),
+    box-shadow var(--dur-1) var(--ease-standard);
+}
+
+.zid {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-weight: 800;
+  line-height: var(--lh-flat);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* Face buttons — the four canonical colours, drawn as the filled discs the
+   hardware prints. */
+.id-xa,
+.id-xb,
+.id-xx,
+.id-xy,
+.id-pc,
+.id-po,
+.id-pt,
+.id-psq {
+  width: 1.7rem;
+  height: 1.7rem;
+  width: 5.4cqh;
+  height: 5.4cqh;
+  border-radius: 50%;
+  font-size: 0.85rem;
+  font-size: 2.9cqh;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+.id-xa {
+  background: var(--hw-xbox-a);
+  color: var(--hw-xbox-a-on);
+}
+
+.id-xb {
+  background: var(--hw-xbox-b);
+  color: var(--hw-xbox-on);
+}
+
+.id-xx {
+  background: var(--hw-xbox-x);
+  color: var(--hw-xbox-on);
+}
+
+.id-xy {
+  background: var(--hw-xbox-y);
+  color: var(--hw-xbox-y-on);
+}
+
+/* Sony glyph colours: the DS4 prints coloured shapes on grey buttons, so the
+   glyph carries the colour and the disc stays neutral. */
+.id-pc,
+.id-po,
+.id-pt,
+.id-psq {
+  background: var(--hw-ps-disc);
+  font-size: 1rem;
+  font-size: 3.4cqh;
+}
+
+.id-pc {
+  color: var(--hw-ps-circle);
+}
+
+.id-po {
+  color: var(--hw-ps-cross);
+}
+
+.id-pt {
+  color: var(--hw-ps-triangle);
+}
+
+.id-psq {
+  color: var(--hw-ps-square);
+}
+
+/* Dpad + stick arrows, hubs, small named chips and the shoulders sit ON the
+   art's own shapes, which are DARK in light and LIGHT in dark — the exact
+   inverse of the page text. So each carries a halo of the page background. */
+.zid.id-dir,
+.zid.id-hub,
+.zid.id-txt {
+  color: var(--text-primary);
+  text-shadow:
+    0 0 2px var(--bg),
+    0 0 4px var(--bg),
+    0 0 6px var(--bg);
+}
+
+.id-dir {
+  font-size: 0.72rem;
+  font-size: 2.8cqh;
+}
+
+.id-hub {
+  font-size: 0.66rem;
+  font-size: 2.3cqh;
+  letter-spacing: 0.04em;
+}
+
+.id-txt {
+  font-size: max(0.48rem, 2cqh);
+  letter-spacing: 0;
+}
+
+.id-sh {
+  font-size: 0.66rem;
+  font-size: 2.2cqh;
+  color: var(--text-tertiary);
+  letter-spacing: var(--track-eyebrow);
+}
+
+/* Bound controls wear an accent ring on their identity — the one glance that
+   answers "what have I actually mapped?". */
+.zone:not(.z-unbound) .zid {
+  box-shadow: 0 0 0 1.5px var(--accent-line);
+}
+
+.zone:not(.z-unbound) .id-dir,
+.zone:not(.z-unbound) .id-hub,
+.zone:not(.z-unbound) .id-txt,
+.zone:not(.z-unbound) .id-sh {
+  color: var(--text-primary);
+  box-shadow: none;
+}
+
+.ztag {
+  font-family: var(--mono);
+  font-weight: var(--fw-bold);
+  font-size: 0.58rem;
+  font-size: 2cqh;
+  line-height: 1.15;
+  color: var(--accent);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-xs);
+  padding: 0.05rem 0.24rem;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.ztag:empty,
+.z-unbound .ztag {
+  display: none;
+}
+
+/* A shared key is information, not a fault: the tag switches to the identity
+   tone, and the legend row spells out which controls it drives. */
+.z-shared .ztag {
+  color: var(--cool);
+  border-color: var(--cool-line);
+}
+
+@container padstage (max-width: 26rem) {
+  .ztag {
+    display: none;
+  }
+}
+
+.z-round {
+  border-radius: 50%;
+}
+
+.z-chip {
+  border-radius: var(--r-md);
+}
+
+/* Shoulders sit above the art (LB/RB/LT/RT are not drawn): slim
+   hardware-shaped chips, triggers stacked over bumpers like the real pad. */
+.z-trigger,
+.z-bumper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-inset);
+  border-color: var(--border-default);
+}
+
+.z-trigger {
+  border-radius: 45% 45% 30% 30% / 80% 80% 35% 35%;
+}
+
+.z-bumper {
+  border-radius: 40% 40% 22% 22% / 95% 95% 30% 30%;
+}
+
+.zone.z-trigger[data-fn="lt"],
+.zone.z-bumper[data-fn="lb"] {
+  transform: rotate(-3deg);
+}
+
+.zone.z-trigger[data-fn="rt"],
+.zone.z-bumper[data-fn="rb"] {
+  transform: rotate(3deg);
+}
+
+.z-bumper::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  width: 2px;
+  height: 55%;
+  background: linear-gradient(var(--border-default), transparent);
+}
+
+.zone:hover,
+.zone.z-hot {
+  border-color: var(--accent);
+  border-style: solid;
+  background: var(--accent-dim);
+  box-shadow: 0 0 0 4px var(--accent-glow);
+  z-index: 2;
+}
+
+/* Keyboard focus keeps the real ring — it must be findable without a mouse. */
+.zone:focus-visible {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  z-index: 3;
+}
+
+.zone.z-sel {
+  border-color: var(--accent);
+  border-style: solid;
+  background: var(--accent-dim-2);
+  box-shadow: 0 0 0 2px var(--accent-line);
+  z-index: 3;
+}
+
+.zone.z-sel::after {
+  content: "✓";
+  position: absolute;
+  top: -0.35rem;
+  right: -0.35rem;
+  font: 700 0.55rem/1 var(--mono);
+  font-size: 1.9cqh;
+  color: var(--accent-on);
+  background: var(--accent-fill);
+  border-radius: 50%;
+  padding: 0.12rem 0.2rem;
+  pointer-events: none;
+}
+
+/* Controls that cannot work look like it (but still answer a click — a click
+   on an unmappable control has to say WHY, so never `disabled`). */
+.zone.z-dead,
+.lrow.l-dead {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.zone.z-dead .ztag {
+  filter: grayscale(1);
+}
+
+/* ── 6.4 Bindings legend ────────────────────────────────────────────────
+   Reference, not chrome: an inset panel of dense rows, quieter than the
+   stage above it. */
+
+.legendcard {
+  background: var(--surface-sunken);
+  border-color: var(--border-subtle);
+  box-shadow: none;
+}
+
+.legend {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(13.5rem, 1fr));
+  gap: 0 var(--sp-4);
+}
+
+.lrow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  min-width: 0;
+  min-height: 2rem;
+  padding: var(--sp-1) var(--sp-2);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  color: var(--text-primary);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition:
+    background var(--dur-1) var(--ease-standard),
+    border-color var(--dur-1) var(--ease-standard);
+}
+
+.lrow:hover,
+.lrow.l-hot {
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+}
+
+.lid {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.35rem;
+  height: 1.35rem;
+  font: 800 0.72rem/1 var(--mono);
+}
+
+.lid.id-xa,
+.lid.id-xb,
+.lid.id-xx,
+.lid.id-xy,
+.lid.id-pc,
+.lid.id-po,
+.lid.id-pt,
+.lid.id-psq {
+  width: 1.35rem;
+  font-size: 0.75rem;
+}
+
+.lid.id-dir {
+  color: var(--text-primary);
+  font-size: 0.8rem;
+}
+
+.lid.id-hub,
+.lid.id-txt,
+.lid.id-sh {
+  color: var(--text-tertiary);
+  font-size: 0.7rem;
+  justify-content: flex-start;
+}
+
+.llabel {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.llabel:empty {
+  display: none;
+}
+
+.lkey {
+  display: none;
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  color: var(--text-tertiary);
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.l-unbound .lkey {
+  display: block;
+}
+
+/* A shared key is a decision, not a warning — the identity tone, own line. */
+.lshare {
+  display: none;
+  flex-basis: 100%;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-snug);
+  color: var(--cool);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.l-shared .lshare {
+  display: block;
+}
+
+.lturbo {
+  flex-basis: 100%;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-bold);
+  line-height: var(--lh-snug);
+  color: var(--warn);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lturbo:empty {
+  display: none;
+}
+
+.lrow.l-sel {
+  border-color: var(--accent);
+  background: var(--accent-dim-2);
+}
+
+.lrow.l-sel .lid::after {
+  content: "✓";
+  position: absolute;
+  margin: -1.1rem 0 0 1rem;
+  font: 700 0.6rem/1 var(--mono);
+  color: var(--accent);
+}
+
+/* One key = one chip; each chip carries its own ✕ that removes JUST that key.
+   Absence is a CLASS, never `:empty` (an SSR text slot leaves marker nodes
+   inside the span). */
+.lkc {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-bold);
+  line-height: var(--lh-snug);
+  color: var(--accent);
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lkc.lk1 {
+  margin-left: auto;
+}
+
+.lkc.off,
+.lkx.off,
+.lkmore.off {
+  display: none;
+}
+
+.lkx,
+.lclear {
+  flex: 0 0 auto;
+  text-align: center;
+  line-height: var(--lh-flat);
+  color: var(--text-tertiary);
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity var(--dur-1) var(--ease-standard);
+}
+
+.lclear {
+  width: 1.1rem;
+  font-size: var(--fs-sm);
+}
+
+.lkx {
+  width: 0.85rem;
+  font-size: var(--fs-micro);
+}
+
+.lclear:empty {
+  display: none;
+}
+
+.lrow:hover .lclear,
+.lrow:focus-visible .lclear,
+.lrow.l-hot .lclear,
+.lrow:hover .lkx,
+.lrow:focus-visible .lkx,
+.lrow.l-hot .lkx {
+  opacity: 1;
+}
+
+.lclear:hover,
+.lkx:hover {
+  color: var(--danger);
+}
+
+@media (hover: none) {
+  .lclear,
+  .lkx {
+    opacity: 0.75;
+  }
+}
+
+.lkmore {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-bold);
+  color: var(--cool);
+}
+
+/* A multi-key control reads as a GROUP of alternatives, like a shared key. */
+.l-multi .lkc {
+  color: var(--cool);
+}
+
+.lrowwrap {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+/* The no-JS bind strip: a key `<select>`, a fixed 3.6rem turbo box, and up to
+   four verbs. It WRAPS, and that is not a phone concession — it was the only
+   thing on any of the six screens that pushed the PAGE sideways, and it did it
+   at the desk too. Measured on the rendered /map: 1430 px of row against a
+   1270 px viewport at 1280, 820 against 768, 461 against 360 — the select has
+   `min-width: 0` so it collapses to a 22 px stub first and the fixed-width
+   items behind it run off the end anyway, with no scrolling ancestor.
+
+   Wrapping rather than scrolling, because these are one row's verbs and not a
+   wide table: a horizontal scroller would hide half of a single decision (the
+   argument `.dv-form` already records at 45rem). `flex-wrap` costs nothing at
+   a width where the row fits, which is why it belongs here and not in a
+   breakpoint. */
+.lbind {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 0 var(--sp-2) var(--sp-2);
+  min-width: 0;
+}
+
+.lbind .keysel {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--fs-xs);
+}
+
+.lbind .turboin {
+  flex: 0 0 auto;
+  width: 3.6rem;
+  font-size: var(--fs-xs);
+}
+
+.lbind.off,
+.pactions.off .pactform {
+  opacity: 0.55;
+}
+
+/* ── 6.5 Bind by name (no-JS panel) ─────────────────────────────────────── */
+
+.bindform {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--sp-3);
+}
+
+.bindforce {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+}
+
+.pactform {
+  display: contents;
+}
+
+.studio.js .nojs {
+  display: none;
+}
+
+/* ── 6.6 The preset & files surface ─────────────────────────────────────
+   Was a bare row of four buttons with no context. It is the answer to "where
+   do my files live and how do I get back?", so it gets an identity block, a
+   table of every slot's preset, and actions graded by consequence. */
+
+.phead {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+.phead h2 {
+  margin: 0;
+}
+
+.savedat {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--accent);
+}
+
+.savedat:empty {
+  display: none;
+}
+
+/* The identity block: what this preset IS, where it lives, when it was saved. */
+.presetid {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  margin-bottom: var(--sp-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-lg);
+  background: var(--surface-inset);
+}
+
+.presetname {
+  font-family: var(--mono);
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-bold);
+  color: var(--text-primary);
+  letter-spacing: var(--track-mono);
+}
+
+.presetfact {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  min-width: 0;
+  font-size: var(--fs-xs);
+}
+
+.presetfact > b {
+  flex: 0 0 auto;
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.presetfact > span {
+  font-family: var(--mono);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+/* Which slot uses which preset — the "see all presets" read, from the same
+   slot list the rail above is built from. */
+.slottable {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: var(--sp-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  background: var(--surface-inset);
+}
+
+.strow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 2.25rem;
+  padding: var(--sp-2) var(--sp-3);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: var(--fs-sm);
+  transition: background var(--dur-1) var(--ease-standard);
+}
+
+.strow:first-child {
+  border-top: none;
+}
+
+.strow.sthead {
+  background: var(--surface-sunken);
+  min-height: 1.9rem;
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+a.strow:hover {
+  background: var(--sel-tint);
+  color: var(--text-primary);
+}
+
+.strow.on {
+  background: var(--accent-dim);
+}
+
+.stcell {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stnum {
+  flex: 0 0 3rem;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--text-tertiary);
+}
+
+.strow.on .stnum {
+  color: var(--accent);
+}
+
+.stpreset {
+  flex: 1 1 40%;
+  font-family: var(--mono);
+  font-weight: var(--fw-semibold);
+  color: var(--text-primary);
+}
+
+.sthead .stpreset,
+.sthead .stnum,
+.sthead .stpersona,
+.sthead .stkbd {
+  font-family: inherit;
+  font-weight: var(--fw-semibold);
+  color: var(--text-tertiary);
+}
+
+.stpersona {
+  flex: 1 1 30%;
+  color: var(--cool);
+}
+
+.stkbd {
+  flex: 1 1 30%;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  text-align: right;
+}
+
+/* Actions, graded. The destructive one is pushed to the end of the row and
+   wears the outline, not a fill — it can undo everything above it. */
+.pactrow {
+  gap: var(--sp-2);
+}
+
+.pactrow .btn-danger-ghost {
+  margin-left: auto;
+}
+
+/* ── 6.7 The macro editor (the piano roll) ──────────────────────────────── */
+
+.macrocard {
+  --macrow: 1.9rem;
+  /* v16: the ring made every direction group eight columns wide (37 in all), so
+     the cell narrows a little and the matrix keeps its share of the card. It
+     still scrolls — `.macscroll` — but a whole persona now fits on a desktop. */
+  --maccol: 1.5rem;
+  background: var(--surface-sunken);
+  border-color: var(--border-subtle);
+  box-shadow: none;
+}
+
+.macrocard.off {
+  opacity: 0.8;
+}
+
+.macdirty {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+}
+
+.macsave.dirty + .macdirty {
+  color: var(--warn);
+  font-weight: var(--fw-bold);
+}
+
+.macsave {
+  display: none;
+  margin-left: auto;
+}
+
+.studio.js .macsave {
+  display: inline-flex;
+}
+
+.macsave.dirty {
+  color: var(--accent-on);
+  background: var(--accent-fill);
+  border-color: transparent;
+  font-weight: var(--fw-semibold);
+}
+
+.macsave.off {
+  opacity: 0.6;
+}
+
+/* FIX 1 — THE ONE SENTENCE. Permanent, above the grid, and styled as a rule
+   rather than as prose: it is the fact the piano roll cannot draw. Not behind
+   a disclosure, a tooltip or a hover, because the evening it cost was spent
+   looking for a timing bug that was never there. */
+.macconcept {
+  margin: 0 0 var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  background: var(--accent-dim);
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  line-height: 1.45;
+}
+
+/* FIX 2 — Save's short-step question. It sits between the button and the
+   grid, so the answer is where the click was. */
+.macconfirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-3);
+  margin: 0 0 var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--warn-line);
+  border-left-width: 3px;
+  border-radius: var(--r-sm);
+  background: var(--warn-dim);
+}
+
+.macconfirm.off {
+  display: none;
+}
+
+.macconfirmline {
+  flex: 1 1 18rem;
+  margin: 0;
+  min-width: 0;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--text-primary);
+}
+
+.macconfirmbtns {
+  display: flex;
+  flex: 0 0 auto;
+  gap: var(--sp-2);
+}
+
+.macsaveyes {
+  border-color: var(--warn-line);
+  color: var(--warn);
+  font-weight: var(--fw-semibold);
+}
+
+/* FIX 1c — the common-motion helpers. JS-only, like every other draft edit on
+   this card: without JavaScript there is nothing for them to append to. */
+.macmotions {
+  display: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-3);
+}
+
+.studio.js .macmotions {
+  display: flex;
+}
+
+.macmotlbl {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.macmot {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+}
+
+.macmotnote {
+  flex: 1 1 100%;
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  line-height: 1.4;
+}
+
+.macnewbox {
+  display: none;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-4);
+}
+
+.studio.js .macnewbox {
+  display: flex;
+}
+
+.macnewin {
+  width: 12rem;
+}
+
+.machead {
+  margin: var(--sp-4) 0 var(--sp-1);
+  font-family: var(--mono);
+  font-size: var(--fs-base);
+  font-weight: var(--fw-bold);
+  color: var(--cool);
+}
+
+.macpolicy {
+  margin: 0 0 var(--sp-4);
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+}
+
+.macgrid {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-lg);
+  background: var(--surface-raised);
+  overflow: hidden;
+}
+
+/* No steps is a STATE, not a blank box: say what to do about it. */
+.macgrid.empty {
+  justify-content: center;
+  padding: var(--sp-8) var(--sp-4);
+  border-style: dashed;
+  background: transparent;
+  color: var(--text-tertiary);
+  font-size: var(--fs-sm);
+  text-align: center;
+}
+
+.macgrid.empty::after {
+  content: "No steps to show — pick a macro above, or create one with “＋ New macro”.";
+}
+
+.macrowbar {
+  flex: 0 0 auto;
+  min-width: 0;
+  /* The MATRIX is the instrument; the bar beside it is the label. v16 added the
+     ledger column to the bar, so the cap comes down to keep the balance the
+     other way round. */
+  max-width: 52%;
+}
+
+.macrowhead,
+.maccols {
+  height: var(--macrow);
+  display: flex;
+  align-items: center;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.macrow {
+  height: var(--macrow);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-1);
+  border-radius: var(--r-xs);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.macrow:nth-child(even) {
+  background: var(--sel-tint);
+}
+
+.macrow.sel {
+  background: var(--accent-dim);
+  box-shadow: inset 0 0 0 1px var(--accent-line);
+}
+
+.macnum {
+  flex: 0 0 1.4rem;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-bold);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+}
+
+/* A COLUMN, not "whatever is left after the text before it": the durations are
+   compared down the list ("which step is the odd one out?"), and numbers that
+   start at a different x on every row cannot be. */
+.macdur {
+  flex: 0 0 6rem;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-bold);
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+
+/* FIX 2 — THE DURATION, EDITABLE ON ITS OWN ROW.
+   The words above are the no-JS readout; with JavaScript this pair replaces
+   them in the same column, so the number is changed exactly where it is read
+   and no step has to be "selected" first. Same fixed basis as `.macdur`, for
+   the same reason: the durations are compared down the list. */
+.macdured {
+  display: none;
+  flex: 0 0 6rem;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.studio.js .macdured {
+  display: flex;
+}
+
+.studio.js .macdur {
+  display: none;
+}
+
+.macrowdur {
+  width: 3.4rem;
+  padding: 1px var(--sp-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-xs);
+  /* Was `--surface-base`, which is not a token in this file and resolved to
+     transparent — the one editable field in the piano roll had no field
+     ground at all. Every other input uses `--surface-inset`. */
+  background: var(--surface-inset);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-bold);
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+
+.macrowdur:focus {
+  border-color: var(--accent-line);
+  outline: none;
+}
+
+/* The offending FIELD wears the warning — a below-floor step is a fact about
+   the number in this box, not about a note somewhere under the grid. */
+.macrowdur.short {
+  border-color: var(--warn);
+  background: var(--warn-dim);
+  color: var(--warn);
+}
+
+/* The unit, as a two-state BUTTON: it reads as the unit the step is authored
+   in and switches it on click (converting, never reinterpreting). A <select>
+   here would need its value written by hand on every row after every poll. */
+.macrowunit {
+  flex: 0 0 auto;
+  min-width: 1.6rem;
+  padding: 1px var(--sp-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-xs);
+  background: transparent;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+
+.macrowunit:hover {
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+
+.macwarn {
+  flex: 0 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  color: var(--warn);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.macwarn::before {
+  content: "⚠ ";
+}
+
+.macwarn.off {
+  display: none;
+}
+
+/* FIX 2 — a below-floor row is MARKED, not merely annotated: the amber runs
+   down its edge and tints the whole row, so it is visible from the number
+   column without reading a word. */
+.macrow.short {
+  border-left: 3px solid var(--warn);
+  padding-left: calc(var(--sp-1) - 3px);
+  background: var(--warn-dim);
+}
+
+.macrow.short:nth-child(even) {
+  background: var(--warn-dim);
+}
+
+.macrow.short .macnum,
+.macrow.short .macdur {
+  color: var(--warn);
+}
+
+/* FIX 1 — THE STEP TOOLBAR. Above the grid, and deliberately NOT attached to a
+   row: every other way to grow a macro (＋↑ / ＋↓) hangs off a step that
+   exists, which is exactly the affordance that disappears when somebody
+   presses ✕ enough times. */
+.macsteptools {
+  display: none;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-2);
+}
+
+.studio.js .macsteptools {
+  display: flex;
+}
+
+.macstephint {
+  min-width: 0;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  color: var(--text-tertiary);
+}
+
+/* FIX 1 — WHAT THE ROW HOLDS, in words. First-class text: this is the row's
+   MEANING, and it used to be tertiary-grey filler at the end of the line. */
+.machold {
+  /* 14rem, not 10rem: the widest honest readout on this card is the
+     CONTRADICTORY row — "D-pad ↓ + D-pad → + D-pad ↑ · together", the step that
+     must never fold — and at 10rem it ellipsized to "D-pad ↓ + D-pad → + D-pa…"
+     at every viewport tested, 1920 included. The row whose whole point is that
+     it is three separate directions was the one row you could not read.
+
+     STILL `flex-shrink: 0`. Making it shrinkable looked tidier and was worse:
+     with `.macexp` holding a min-width beside it, a 420px viewport squeezed the
+     readout to LITERALLY ZERO pixels — the words gone entirely rather than
+     merely clipped. A fixed basis that overflows the bar is clipped by
+     `.macgrid`'s `overflow: hidden` and still shows its first words, which on
+     this row is the difference between "D-pad ↘…" and nothing at all. */
+  flex: 0 0 14rem;
+  min-width: 0;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* THE ONE THE GRID CANNOT TEACH: a row holding two or more controls at once.
+   That row is the diagonal, and it gets the accent plus a `2 controls` tail so
+   "one step, two things held" is legible without counting lit cells. */
+.machold.both {
+  color: var(--accent);
+}
+
+.machold.both::after {
+  content: " · together";
+  font-weight: var(--fw-regular);
+  color: var(--text-tertiary);
+}
+
+/* A neutral gap is a step too — it says so rather than reading as an empty
+   row somebody forgot to fill in. */
+.machold.none {
+  font-weight: var(--fw-regular);
+  font-style: italic;
+  color: var(--text-tertiary);
+}
+
+.macbtns {
+  display: none;
+  flex: 0 0 auto;
+  gap: 1px;
+}
+
+.studio.js .macbtns {
+  display: inline-flex;
+}
+
+.macbtn {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  color: var(--text-tertiary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-xs);
+  padding: 0.15rem 0.28rem;
+  cursor: pointer;
+  transition:
+    color var(--dur-1) var(--ease-standard),
+    background var(--dur-1) var(--ease-standard);
+}
+
+.macbtn:hover {
+  color: var(--text-primary);
+  border-color: var(--border-default);
+  background: var(--surface-inset);
+}
+
+.macbtn.macdel:hover {
+  color: var(--danger);
+  border-color: var(--danger-line);
+  background: var(--danger-dim);
+}
+
+.macbtn.off {
+  opacity: 0.25;
+  pointer-events: none;
+}
+
+.macscroll {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.macgrps,
+.maccols,
+.macmatrix {
+  display: grid;
+  /* 37, not 25: every direction group is now its whole ring — ↑ ↖ ← ↙ ↓ ↘ → ↗ —
+     so the four diagonals are things you point at rather than things you have
+     to know how to build. */
+  grid-template-columns: repeat(37, var(--maccol));
+  width: max-content;
+}
+
+/* THE GROUP BAND. Not decoration: without it the header carries three
+   identical eight-arrow runs told apart only by a tooltip. */
+.macgrps {
+  height: calc(var(--macrow) * 0.8);
+  align-items: end;
+}
+
+.macgrp {
+  grid-column: span 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-bold);
+  letter-spacing: var(--track-eyebrow);
+  color: var(--text-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
+  padding-bottom: 0.1rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.macgrp.g3 { grid-column: span 3; }
+.macgrp.g4 { grid-column: span 4; }
+.macgrp.g8 { grid-column: span 8; }
+.macgrp.g9 { grid-column: span 9; }
+
+/* UNIFORM by design: the identity colours earn their place on the art and in
+   the legend; here the column is NAMED, in one type treatment. */
+.maccolid {
+  height: var(--macrow);
+  /* BLOCK, not flex: `text-overflow: ellipsis` does nothing on a flex
+     container, so the long text chips (guide / view / menu) used to clip
+     mid-glyph with no sign that anything was missing. */
+  display: block;
+  line-height: var(--macrow);
+  text-align: center;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-bold);
+  color: var(--text-secondary);
+  padding: 0 0.1rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: none;
+  border-radius: 0;
+  box-shadow: none;
+  width: auto;
+}
+
+.macmatrix {
+  grid-auto-rows: var(--macrow);
+}
+
+.maccell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-bold);
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  margin: -0.5px;
+  padding: 0;
+  pointer-events: none;
+}
+
+.studio.js .maccell {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.studio.js .maccell:hover {
+  background: var(--accent-glow);
+}
+
+.maccell.on {
+  background: var(--accent-dim-2);
+  border-color: var(--accent-line);
+}
+
+/* A cardinal that is HALF of a folded diagonal. Subordinate on purpose: the
+   diagonal's own cell carries the filled mark and is what the row reads as —
+   but the cardinal really is in the file, and a lens that hid it would be
+   lying about the storage it exists to explain. */
+.maccell.part {
+  color: var(--text-tertiary);
+  background: var(--sel-tint);
+}
+
+/* A diagonal whose members are not the canonical extremes (a hand-written
+   `ly.-16384 + lx.max`). It IS the diagonal — this is a label, never a
+   rewrite, and the title says what the file actually holds. */
+.maccell.on.approx {
+  border-style: dashed;
+}
+
+/* The four picks read one notch stronger than the cardinals between them:
+   they are the columns nobody has had before. */
+.maccell.isdiag {
+  border-left-color: var(--border-default);
+  border-right-color: var(--border-default);
+}
+
+.maccell.inrow {
+  border-top-color: var(--accent-line);
+  border-bottom-color: var(--accent-line);
+}
+
+/* The four diagonal HEADERS, same one notch. */
+.maccolid.diag {
+  color: var(--text-primary);
+}
+
+.maccolid.card {
+  color: var(--text-secondary);
+}
+
+/* THE LEDGER: the pair a diagonal on this row is stored as. Mono, quiet, and
+   right beside the words — "↘" and "dpad.down + dpad.right" are the same fact
+   said twice, which is the only way the presentation stays honest. */
+.macexp {
+  /* Takes whatever the bar has left, but never less than `min-width`. The old
+     `min-width: 0` let flex shrink it to a sliver and then to NOTHING while it
+     stayed `display: block` — measured on the real page at 154px (1440
+     viewport), 60px (1100) and 0px (820). A ledger that silently becomes
+     invisible is not a ledger, and this one is the whole reason the fold is
+     allowed to call two holds one control. Below the width where any of it can
+     be read it is dropped DELIBERATELY (see the media rule), and the row's own
+     title carries the pair either way — see render_map.rs `row_title`. */
+  flex: 1 1 auto;
+  min-width: 11ch;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.macexp.off {
+  display: none;
+}
+
+.macring {
+  margin: var(--sp-3) 0 0;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  color: var(--text-tertiary);
+  max-width: 82ch;
+}
+
+.macrule {
+  margin: var(--sp-3) 0 var(--sp-4);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  color: var(--text-tertiary);
+  max-width: 82ch;
+}
+
+.macedit {
+  display: none;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+  padding: var(--sp-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-lg);
+  background: var(--surface-raised);
+}
+
+.studio.js .macedit {
+  display: flex;
+}
+
+.macjs {
+  display: none;
+}
+
+.studio.js .macjs {
+  display: flex;
+}
+
+.macsteplbl {
+  flex-basis: 100%;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--cool);
+}
+
+/* `.macdurin` (the panel's one duration field) and its `.short` amber lived
+   here until FIX 2 moved the duration editor onto every row — see `.macrowdur`
+   up beside `.macrow`, which is where the number it warns about now is. */
+.macturboin {
+  width: 5.5rem;
+}
+
+.macturbounit {
+  max-width: 12rem;
+}
+
+.macnamein {
+  width: 10rem;
+}
+
+.macmath {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+  color: var(--text-tertiary);
+}
+
+.macrate {
+  width: 6rem;
+}
+
+/* v14: the per-macro ON/OFF switch. It sits beside Delete because they are the
+   two answers to "not this macro, not now" — and it has to look like the
+   cheaper one. Enabled is quiet; DISABLED is loud, because a card whose every
+   other line describes a sequence that will not run must say so at a glance. */
+.macen {
+  margin-left: auto;
+}
+
+.macen.on {
+  color: var(--text-tertiary);
+}
+
+.macen.offstate {
+  color: var(--warn);
+  border-color: var(--warn);
+  background: var(--warn-dim, transparent);
+  font-weight: var(--fw-semibold);
+}
+
+/* No macro loaded: inert, not a switch for something that is not there. */
+.macen.dead {
+  opacity: 0.5;
+}
+
+/* The SLOT's `macros = "off"`, above everything it silences. Empty (and so
+   invisible) on every slot that runs macros. */
+.macslotoff:not(:empty) {
+  margin: 0 0 var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border-left: 3px solid var(--warn);
+  font-size: var(--fs-xs);
+  color: var(--warn);
+}
+
+.macdelmac {
+  margin-left: var(--sp-2);
+  color: var(--danger);
+  border-color: var(--danger-line);
+}
+
+.macdelmac:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: var(--danger-dim);
+}
+
+.macshortlbl {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+}
+
+.macnew,
+.maccopy,
+.mactriglearn {
+  display: none;
+}
+
+.studio.js .macnew,
+.studio.js .maccopy {
+  display: inline-flex;
+}
+
+.studio.js .mactriglearn {
+  display: inline-flex;
+}
+
+.macpolicies {
+  display: grid;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-5);
+}
+
+.macpol {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-md);
+  background: var(--surface-raised);
+}
+
+.machint {
+  flex: 1 1 18rem;
+  min-width: 0;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+  color: var(--text-tertiary);
+}
+
+.mactrigger {
+  padding: var(--sp-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-lg);
+  background: var(--surface-raised);
+}
+
+.mactrigger h3 {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-title);
+}
+
+.mactrigger.off {
+  opacity: 0.55;
+}
+
+.mactrigline {
+  margin: 0 0 var(--sp-3);
+  font-family: var(--mono);
+  font-size: var(--fs-md);
+  font-weight: var(--fw-bold);
+  color: var(--accent);
+}
+
+.macbind {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+
+.macbind .keysel {
+  max-width: 14rem;
+}
+
+.mactomlbox {
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.mactomlbox > summary {
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  color: var(--text-tertiary);
+}
+
+.mactomlbox > summary:hover {
+  color: var(--text-primary);
+}
+
+.mactoml {
+  display: block;
+  margin: var(--sp-3) 0;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-lg);
+  overflow-x: auto;
+  white-space: pre;
+  user-select: text;
+}
+
+/* ── 6.8 The multi-select action bar ────────────────────────────────────── */
+
+.selbar {
+  position: fixed;
+  left: 50%;
+  bottom: var(--sp-4);
+  transform: translateX(-50%);
+  z-index: var(--z-selbar);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: min(94vw, 44rem);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-pill);
+  background: var(--surface-overlay);
+  box-shadow: var(--e-3);
+}
+
+.selcount {
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-bold);
+  color: var(--accent);
+  white-space: nowrap;
+  padding-inline: var(--sp-2);
+}
+
+/* ═══ §6b SCREEN — SETUP ══════════════════════════════════════════════════
+   Layout only; every widget here is a §4 component. Two tiers, and the order
+   is the argument:
+     FIRST     the configuration itself — what you have, and the two verbs
+               (Export, Import) that are the only things you do to it
+     THEN      the first run, as a checklist the backend decides
+     LAST      the inventory, quiet, with the config root in small print
+
+   A path is never a control on this screen. `.smallprint` is the one place one
+   appears, at the bottom, sized and coloured so it reads as a support detail
+   rather than as somewhere to go. */
+
+.setupcard .state {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-2xl);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--track-title);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+  text-wrap: balance;
+}
+
+.setupcard .controls,
+.setupsteps .controls,
+.importcard .controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+
+.setupcard .controls label,
+.setupsteps .controls label {
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+/* The two verbs, side by side and equally reachable — Export is primary
+   because it is the one that can never do harm. */
+.setupverbs {
+  margin-bottom: var(--sp-4);
+}
+
+/* ── The checklist ─────────────────────────────────────────────────────── */
+
+.steplist {
+  list-style: none;
+  margin: 0 0 var(--sp-5);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.steplist .step {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid var(--border-subtle);
+  border-left-width: 3px;
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+.stepbadge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--border-default);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--text-secondary);
+}
+
+.stepbody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.steptitle {
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.stepdetail {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-snug);
+  color: var(--text-secondary);
+  max-width: 82ch;
+}
+
+/* State by COLOUR ROLE, not by decoration: ok = already true, accent = the one
+   thing to do next, neutral = real but not yet. Exactly one row is ever
+   `now` (ksx-app `onboard::plan_steps` guarantees it). */
+.steplist .step.done {
+  border-left-color: var(--ok-line);
+}
+
+.steplist .step.done .stepbadge {
+  border-color: var(--ok-line);
+  background: var(--ok-dim);
+  color: var(--ok);
+}
+
+.steplist .step.now {
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+}
+
+.steplist .step.now .stepbadge {
+  border-color: var(--accent-line);
+  background: var(--accent-dim-2);
+  color: var(--accent);
+}
+
+.steplist .step.later {
+  opacity: 0.72;
+}
+
+/* ── One step's action ─────────────────────────────────────────────────── */
+
+.stepact {
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.stepact + .stepact {
+  margin-top: var(--sp-4);
+}
+
+.stepact h3 {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.stepact .warn {
+  margin-top: var(--sp-3);
+}
+
+/* The learned key, big enough to read from behind the cabinet with the phone
+   in your hand (docs/SURFACES.md §8). */
+.provekey {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-2xl);
+  font-weight: var(--fw-bold);
+  letter-spacing: var(--track-mono);
+  color: var(--accent);
+  overflow-wrap: anywhere;
+}
+
+/* ── Import ────────────────────────────────────────────────────────────── */
+
+.importform {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+.importlabel {
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.importbox {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: var(--sp-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+  color: var(--text-primary);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+}
+
+/* Consent reads as text, not as chrome: the box and its sentence are one
+   target, and the sentence is the part you read. */
+.importopt {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-regular);
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+/* …and on a panel, "one target" has to be a target you can hit. The box grows
+   to 24 px with every other checkbox (§4.4b); the sentence is what carries the
+   remaining height, which is the point of writing the consent as text. These
+   two — "write it" and "write even if it does not validate" — measured 17 px
+   with a 23 px label before this rule. Declared here rather than in §4.4b
+   because `.importopt`'s own `display` is above and would win. */
+@media (pointer: coarse) {
+  .importopt {
+    min-height: var(--ctl-h);
+  }
+}
+
+/* ── The inventory, and the one path on the page ───────────────────────── */
+
+.notelist li {
+  border-left: 3px solid var(--warn-line);
+}
+
+.smallprint {
+  margin: var(--sp-5) 0 0;
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border-subtle);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  color: var(--text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 40rem) {
+  .setupcard .state {
+    font-size: var(--fs-xl);
+  }
+
+  /* A phone gets one verb per row rather than two half-legible ones. */
+  .setupverbs .btn,
+  .setupsteps .controls .btn,
+  .setupsteps .controls select,
+  .importcard .controls .btn {
+    width: 100%;
+  }
+
+  .setupsteps .controls,
+  .importcard .controls {
+    align-items: stretch;
+  }
+}
+
+/* ═══ §7 RESPONSIVE ═══════════════════════════════════════════════════════ */
+
+@media (max-width: 60rem) {
+  .session .state {
+    font-size: var(--fs-2xl);
+  }
+
+  .slotstrip {
+    position: static;
+  }
+}
+
+@media (max-width: 40rem) {
+  header.top {
+    padding: var(--sp-2) var(--sp-4);
+    gap: var(--sp-2);
+    /* The rail grew a third screen (Profiles) and will grow more. Measured at
+       360px: brand + two links + the state pill already came to ~434px against
+       360 of viewport, so the bar was one nav item away from scrolling the
+       whole PAGE sideways — and the item that fell off the end would have been
+       the state pill, the one thing on the header that says anything. Wrap the
+       pill to its own line instead. */
+    flex-wrap: wrap;
+  }
+
+  /* Same treatment, and the same reason, as `.slotstrip .tabs` below: the top
+     nav is NAVIGATION, so on a phone it scrolls sideways on its own line
+     rather than clipping the last screen out of reach. This is what keeps a
+     fourth and fifth page cheap — they cost a link, not a layout. */
+  .topnav {
+    flex: 1 1 100%;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .studio > main {
+    padding: var(--sp-4) var(--sp-4) var(--sp-10);
+    gap: var(--sp-4);
+  }
+
+  footer {
+    padding: var(--sp-4) var(--sp-4) var(--sp-6);
+  }
+
+  .card {
+    padding: var(--sp-4);
+    border-radius: var(--r-md);
+  }
+
+  .card.hero,
+  .stagecard {
+    padding: var(--sp-4);
+  }
+
+  details.card > summary,
+  .disclosure > summary {
+    margin: calc(var(--sp-4) * -1);
+    padding: var(--sp-3) var(--sp-4);
+  }
+
+  .session .state {
+    font-size: var(--fs-xl);
+  }
+
+  .session .controls,
+  .session .controls form {
+    width: 100%;
+  }
+
+  .session .controls select,
+  .session .controls .btn {
+    flex: 1 1 auto;
+  }
+
+  .brand {
+    font-size: var(--fs-md);
+  }
+
+  .navlink {
+    padding: 0 var(--sp-2);
+  }
+
+  .strow {
+    font-size: var(--fs-xs);
+  }
+
+  /* The slot rail is navigation and must stay reachable: on a phone it scrolls
+     sideways on its own line rather than clipping the last player. */
+  .slotstrip {
+    align-items: stretch;
+    gap: var(--sp-2);
+  }
+
+  .slotstrip .tabs {
+    flex: 1 1 100%;
+    flex-wrap: nowrap;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .stpersona,
+  .stkbd {
+    display: none;
+  }
+
+  /* A long path is a second line, never an overflow. */
+  .drow {
+    flex-wrap: wrap;
+  }
+
+  .drow .dvalue.mono {
+    flex-basis: 100%;
+    margin-left: 0;
+    text-align: left;
+  }
+
+  /* Same rule, same reason, for `.plist li` — which the profiles page is the
+     first to give THREE children (meta column + state pill + a Switch form).
+     `.pmeta{min-width:0}` and `.pdetail{overflow-wrap:anywhere}` stop the
+     page scrolling sideways, but at 360px they do it by squeezing the meta
+     column to ~160px while it carries four stacked lines including a full
+     Windows path. Wrapping puts the pill and the button on their own line and
+     gives the text the width. */
+  .plist li {
+    flex-wrap: wrap;
+  }
+
+  /* …and the button that lands on that second line is a row's only action.
+     `--ctl-h-sm` is 28px, and `(pointer: coarse)` lifts it only to 36 — still
+     under the 44px iOS / 48px Android floor, on the one control a phone user
+     has to hit. Width comes free from the wrap above. */
+  .plist .btn-row {
+    min-height: 2.75rem;
+    padding-inline: var(--sp-5);
+  }
+
+  /* 18rem is a MEASURE cap — it stops a lone field running the width of a
+     74 rem desk column — and at 360 px it is 288 px against a 294 px card, so
+     it stopped being a cap and became a 6 px ragged right edge on every field
+     of /pads and /profiles, while the plain `<select>`s beside them (not
+     `.bindlabel` children) went full width. Below the cap there is nothing to
+     cap.
+
+     `.bindlabel` needs the basis and the `min-width: 0` with it. Lifting the
+     cap alone made /pads' spawn row scroll the PAGE to 543 px: the label's
+     flex base size is the select's max-content, i.e. the longest option
+     ("xbox360 — takes one of the 4 XInput slots…"), and uncapped it simply
+     grew. Full-width rows are what the other two forms on this page already
+     are. */
+  .bindlabel {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+
+  .bindlabel select,
+  .bindlabel input {
+    max-width: none;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .toasts {
+    left: var(--sp-2);
+    right: var(--sp-2);
+    bottom: 4.75rem;
+    width: auto;
+  }
+
+  .selbar {
+    left: var(--sp-2);
+    right: var(--sp-2);
+    transform: none;
+    max-width: none;
+    border-radius: var(--r-lg);
+  }
+
+  .pactrow .btn-danger-ghost {
+    margin-left: 0;
+  }
+}
+
+@media (max-width: 45rem) {
+  /* The hold readout used to be the first thing dropped here — which left a
+     narrow window showing exactly the piano roll that taught nobody what a
+     diagonal is. It stays; the MATRIX gives up the width instead (it scrolls,
+     and the row height stays fixed so the two columns keep their alignment).
+     Only the "· held together" tail goes, because the accent already says it.
+
+     KEPT, and worth defending, because at this width the matrix loses badly:
+     measured at a 420px viewport it is 89px of a 889px grid — three columns,
+     all of them shoulder buttons, not one direction reachable. Giving it a
+     bigger slice would not rescue it (a single eight-position ring is 12rem)
+     and would cost the only thing that still works here. So below 45rem this
+     card is a READOUT, and the job is to make the readout honest rather than to
+     pretend the instrument still fits. Which is why the two rules below exist:
+     both of the things the readout is FOR were being lost silently. */
+  .macrowbar {
+    max-width: 78%;
+  }
+
+  /* Was 8rem, which truncated the contradictory row — the one row whose meaning
+     IS that it did not fold — to "D-pad ↓ + D-pad → + D-pa…". 11rem is as far
+     as it goes here: past that it pushes the duration off the card, and a step
+     with no visible duration is its own kind of lie. */
+  .machold {
+    flex-basis: 11rem;
+  }
+
+  /* DROPPED ON PURPOSE, and this is the difference that matters: it was already
+     gone here (flex-shrunk to 0px while still `display: block`), so the page
+     was losing the ledger without deciding to. Now the drop is a decision, and
+     the pair survives it in the row's title — see render_map.rs `row_title`. */
+  .macexp {
+    display: none;
+  }
+
+  .macdur {
+    flex-basis: 5.5rem;
+  }
+
+  .machold.both::after {
+    content: "";
+  }
+
+  /* `.lbind` wraps at every width (§6.4). Here the select also takes the
+     whole first line, because at 360 px sharing it means collapsing to a
+     22 px stub — a key picker too narrow to show a key name. */
+  .lbind {
+    gap: var(--sp-2) var(--sp-1);
+  }
+
+  .lbind .keysel {
+    flex: 1 1 100%;
+  }
+}
+
+/* ── 9. Devices (`/devices`) ──────────────────────────────────────────────
+   The picker. Its whole content is long identifier strings and long warning
+   paragraphs, which is a different problem from the status page's tiles and
+   the mapper's fixed-geometry grid — so the rules here are mostly about text
+   that must never be clipped and never push the page sideways.
+
+   Two conventions worth stating, because they look like laziness otherwise:
+
+   - EVERY optional line is rendered and hidden with `.dv-hide`, not omitted.
+     A `createShow` inside a `createList` is not a shape the compiler emits, so
+     a row that sometimes has a port-pinned warning carries the element always
+     and its class decides. The cost is a few empty nodes; the alternative was
+     four parallel lists.
+   - The row is a COLUMN, overriding `.plist li`'s centred flex row. A device
+     row is a stack of facts about one board, not a label with a button on the
+     right, and forcing it into that shape is what made the id and the warning
+     compete for one line. */
+
+.dv-hide {
+  display: none !important;
+}
+
+.dv-card {
+  overflow-wrap: anywhere;
+}
+
+.dv-list li.dv-row {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-3);
+}
+
+/* The quiet lists (unpickable boards, enumeration notes) stay one line each:
+   they are context, not choices. */
+.dv-list li.dv-row.quiet {
+  flex-direction: row;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--text-tertiary);
+}
+
+.dv-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.dv-name {
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-title);
+  margin-right: var(--sp-1);
+}
+
+.dv-line {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+}
+
+/* A configured entry whose id resolves to nothing right now. Amber, not red:
+   the board is unplugged or moved, which is a fact about the machine and not a
+   fault in the config — `ksx run` is where that becomes an error. */
+.dv-line.dv-miss {
+  color: var(--warn);
+}
+
+.dv-note {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  line-height: var(--lh-snug);
+  max-width: 82ch;
+}
+
+/* The two sentences this page exists to keep saying: the PORT-PINNED
+   paragraph on a socket-pinned entry, and the "not declared as a keyboard"
+   caveat on an HID interface that merely could be claimed. Both are warnings
+   about a choice that will look fine until it does not, so both get the amber
+   plate rather than a grey footnote. */
+.dv-warn {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--r-sm);
+  background: var(--warn-dim);
+  color: var(--warn);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-snug);
+  max-width: 82ch;
+}
+
+.dv-used {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  line-height: var(--lh-snug);
+  max-width: 82ch;
+}
+
+/* An elevated command, shown and never run (docs/SURFACES.md §3). It reads as
+   a quotation rather than as a control on purpose — nothing here is clickable
+   and the page must not pretend otherwise. */
+.dv-cmd {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px dashed var(--border-default);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+.dv-cmdlead {
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  line-height: var(--lh-snug);
+  max-width: 82ch;
+}
+
+.dv-form {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: var(--sp-1) 0 0;
+}
+
+.dv-lbl {
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: var(--track-eyebrow);
+}
+
+/* `backend  winusb   rung  port` — the two words that decide whether this
+   entry can capture anything, on one line beside the id. Label/value pairs
+   rather than a composed sentence, because the island may not concatenate
+   inside its h() tree. */
+.dv-facts {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-2);
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+}
+
+.dv-facts .dv-lbl + .mono {
+  margin-right: var(--sp-3);
+}
+
+.dv-alias {
+  flex: 1 1 12rem;
+  min-width: 0;
+  max-width: 22rem;
+  height: var(--ctl-h);
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--fs-md);
+}
+
+.dv-force {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--warn);
+}
+
+/* TOUCH TARGETS: this page's two buttons are not row accelerators, and the
+   `--force` checkbox is the consent gate on the destructive one. Both used to
+   be handled by a `(pointer: coarse)` block right here, in three rules that
+   restated 2.5rem as a literal. The buttons and the box size are §4.4b's now
+   — one copy, from `--ctl-h`, so they move with the ladder instead of
+   drifting away from it. What stays here is the part that is only true of
+   this page: the label is half the target, because missing a 24 px box beside
+   a `--force` warning and hitting nothing reads as "the button is broken". */
+@media (pointer: coarse) {
+  .dv-force label {
+    display: flex;
+    align-items: center;
+    min-height: var(--ctl-h);
+  }
+}
+
+.dv-empty {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-snug);
+  max-width: 82ch;
+}
+
+.devices .warn {
+  margin: 0 0 var(--sp-3);
+  color: var(--warn);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-snug);
+  max-width: 82ch;
+}
+
+.dv-legend .alarmways li {
+  color: var(--text-secondary);
+}
+
+@media (max-width: 45rem) {
+  /* The pick form stacks rather than scrolling: the name box and the button
+     are one decision and splitting them across a horizontal scroll would hide
+     half of it. Nothing on this page may push the PAGE sideways — the long
+     instance ids already wrap via `.dv-card { overflow-wrap: anywhere }`. */
+  .dv-form {
+    align-items: stretch;
+  }
+
+  .dv-alias {
+    flex: 1 1 100%;
+    max-width: none;
+  }
+
+  .dv-form .btn {
+    flex: 1 1 100%;
+  }
+
+  .dv-list li.dv-row.quiet {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--sp-1);
+  }
+}
+
+/* ═══ §7 SCREEN — /check, the BUTTON CHECK ════════════════════════════════
+ *
+ * docs/MAPPER-UX.md Build C. This screen has exactly one job — press a panel
+ * key, watch every virtual control it drives light on every slot at once — and
+ * its whole layout follows from where it is read: a phone, held one-handed,
+ * behind a cabinet, while the other hand is on the panel.
+ *
+ * Hence: no absolute positioning, no controller geometry, one flowing grid of
+ * generous chips that reflows from four columns to one without a media query.
+ * `auto-fill` + `minmax` is doing the responsive work here — the responsive
+ * pass is a separate branch and this screen must not need it, nor fight it. */
+
+.check .keystrip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  min-height: 2.75rem;
+  align-items: center;
+}
+
+/* The one thing you are looking at from arm's length: which key just fired.
+ * Mono and BOLD is the keycap vocabulary the mapper's legend already uses, so
+ * a key on this screen looks like the same object as a key on that one. */
+.check .keyhit {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-md);
+  background: var(--accent-dim);
+}
+
+.check .keyname {
+  font-family: var(--mono);
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-bold);
+  letter-spacing: var(--track-mono);
+  color: var(--text-primary);
+}
+
+/* Which BOARD it came from. `--cool` because that is this design system's
+ * identity colour — a device name is an identity, not a state. */
+.check .keyfrom {
+  font-size: var(--fs-micro);
+  color: var(--cool);
+}
+
+.check .chipgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
+  gap: var(--sp-2);
+}
+
+/* 44px is the touch floor. A chip is not a button — nothing here is clickable
+ * yet — but it is read and pointed at by somebody holding a screwdriver, and
+ * sizing it below that would make the grid unreadable long before it made it
+ * untappable. */
+.check .chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 2.75rem;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+  transition: background-color 90ms linear, border-color 90ms linear;
+}
+
+.check .chipslot {
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--cool);
+}
+
+.check .chipname {
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  color: var(--text-primary);
+}
+
+.check .chipkeys {
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+/* HELD, and FLASHED-and-already-released, are the same colour on purpose:
+ * they answer one question ("did this control fire?") and the difference
+ * between them is a fact about timing, not about wiring. What separates them
+ * is duration — a hold stays lit while the button is down, a flash is 140 ms —
+ * and that reads correctly without needing a second colour to decode. */
+.check .chip.down,
+.check .chip.flash {
+  background: var(--accent-dim-2);
+  border-color: var(--accent);
+}
+
+.check .chip.down .chipname,
+.check .chip.flash .chipname {
+  color: var(--accent-strong);
+}
+
+/* A flash is a 140 ms class, so its fade has to be a transition ON THE WAY
+ * OUT, not an animation: an animation would restart mid-flight every time the
+ * same chip fired again, which is exactly what a turbo button does. */
+@media (prefers-reduced-motion: reduce) {
+  .check .chip {
+    transition: none;
+  }
+}
+
+/* Loss and off-panel keys are REPORTED, in the warning colour, above the grid.
+ * Hiding either is the failure this whole stream is built to avoid. */
+.check .warnline {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--warn-line);
+  border-radius: var(--r-md);
+  background: var(--warn-dim);
+  color: var(--warn);
+  font-size: var(--fs-sm);
+}
+
+.check .feedcard .dvalue {
+  font-size: var(--fs-lg);
+}
+
+/* ── 11. Start (`/start`) ─────────────────────────────────────────────────
+   The first run, moments 4–7 (docs/FIRST-RUN.md). Almost all of it is the
+   Devices page's vocabulary — a list of boards, each a stack of facts with
+   optional amber warnings — so this section is small on purpose: reusing
+   `.dv-*` there is the whole point, and a second set of class names for the
+   same shape would be a second place to keep the hide rule and the warning
+   plate in step.
+
+   What is genuinely new is ONE thing: an inline disclosure. The page has
+   three of them — the device path, the boards that cannot be picked, and the
+   personas this build cannot create — and every one is the same move. None of
+   the three may be omitted (a hidden fact is a fact this page is claiming does
+   not exist) and none may shout, because a first-run user reading them is
+   already on the wrong track. `.disclosure` cannot serve: its summary carries
+   a negative `--sp-5` margin sized to sit flush inside `details.card`, and
+   these are nested inside a card that already has one. */
+
+.st-more {
+  margin: var(--sp-2) 0 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+.st-more > summary {
+  padding: var(--sp-2) var(--sp-3);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: var(--track-eyebrow);
+}
+
+.st-more > summary::-webkit-details-marker {
+  display: none;
+}
+
+.st-more > summary:hover {
+  color: var(--text-secondary);
+}
+
+.st-more[open] > summary {
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.st-more > *:not(summary) {
+  margin: var(--sp-2) var(--sp-3);
+}
+
+/* The lists inside a disclosure keep their own padding, so the wrapper's
+   margin would double it. */
+.st-more > ul {
+  margin: 0;
+}

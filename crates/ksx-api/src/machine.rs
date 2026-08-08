@@ -618,7 +618,20 @@ impl DeviceScanView {
                 board.backends = row.backends.clone();
                 board.can_type = row.can_type;
                 board.cannot_type_reason = row.cannot_type_reason.clone();
+                // The selector of the SAME interface, so "which board did I
+                // pick" and "which board will be captured" cannot answer
+                // differently. A board with no keyboard interface keeps `None`
+                // even though its first devnode has one: it is not pickable,
+                // and handing a surface a selector for it would be offering a
+                // choice the backend then refuses.
+                board.selector = board.keyboard.as_ref().and(row.selector.clone());
             }
+            board.alias_hint = board
+                .alias
+                .clone()
+                .unwrap_or_else(|| board.name.clone())
+                .trim()
+                .to_owned();
             board.transport_label = transport_label(&board.transport);
             // A CLAIMED board also cannot type to Windows — that is what a
             // claim does — and it must not wear this alarm: the row already
@@ -977,6 +990,28 @@ pub struct BoardRow {
     /// say. Filled by [`DeviceScanView::read`] — see [`CANNOT_TYPE_TAIL`].
     #[serde(default)]
     pub cannot_type_line: String,
+    /// The [`ksx_core::DeviceSelector`] spelling of the interface a pick would
+    /// name — `usb:d209:0430:00`. `None` on a board with no keyboard interface,
+    /// and on one whose devnode the enumerator could not describe.
+    ///
+    /// **This is what a surface sends back when a user picks a board**, and it
+    /// exists so that no surface has to derive it from
+    /// [`Self::interfaces`]. `docs/FIRST-RUN.md` §6 forbids ever asking a user
+    /// for a device path; §5 forbids ever showing one as the identifier. A
+    /// surface that had to pick the keyboard interface out of the list itself
+    /// would be re-taking the decision [`Self::keyboard`] already records — and
+    /// it would take it in TypeScript as well as in Rust.
+    #[serde(default)]
+    pub selector: Option<String>,
+    /// The alias a pick would write for this board: the one it already has,
+    /// else its name.
+    ///
+    /// One derivation, served. `device_edit::plan_pick` decides it the same way
+    /// for an absent `--alias`, and re-picking a configured board deliberately
+    /// keeps the name the user gave it, because renaming orphans every
+    /// `[[slot]]` that refers to it.
+    #[serde(default)]
+    pub alias_hint: String,
 }
 
 /// What has to follow the reason a device cannot type.
@@ -1892,6 +1927,66 @@ mod tests {
             keyboard: Some("USB\\VID_D209&PID_0430&MI_00\\X".to_owned()),
             ..BoardRow::default()
         }
+    }
+
+    /// **A surface picks a board by SELECTOR, and it never derives one.**
+    ///
+    /// `docs/FIRST-RUN.md` §5 makes the human name the identifier on screen and
+    /// §6 forbids ever asking anyone for a device path, so what a picked row
+    /// sends back has to be the id ksx would write — and it has to arrive
+    /// already chosen, because the choice is *which of a board's devnodes
+    /// carries the keys* and [`BoardRow::keyboard`] is where that was decided.
+    ///
+    /// Breaks against a surface that reached into `interfaces` for itself: the
+    /// obvious implementation takes `interfaces[0].selector`, which on the
+    /// reference I-PAC is the AUX devnode — a selector that resolves, captures
+    /// nothing, and looks correct on screen. It also breaks against filling the
+    /// field on an unpickable board, which offers a choice `add_slot` then
+    /// refuses.
+    #[test]
+    fn a_board_carries_the_selector_and_the_alias_a_pick_would_use() {
+        let kb = "USB\\VID_D209&PID_0430&MI_00\\X";
+        let aux = "USB\\VID_D209&PID_0430&MI_01\\X";
+        let iface = |id: &str, selector: &str| UsbRow {
+            instance_id: id.to_owned(),
+            selector: Some(selector.to_owned()),
+            ..UsbRow::default()
+        };
+        // The AUX devnode is FIRST, which is the ordering that catches a
+        // surface reaching for `interfaces[0]`.
+        let board = BoardRow {
+            interfaces: vec![
+                iface(aux, "usb:d209:0430:01"),
+                iface(kb, "usb:d209:0430:00"),
+            ],
+            ..keyboard_board()
+        };
+        let no_keyboard = BoardRow {
+            name: "NZXT fan controller".to_owned(),
+            keyboard: None,
+            interfaces: vec![iface("USB\\VID_1E71&PID_300E&MI_01\\X", "usb:1e71:300e:01")],
+            ..BoardRow::default()
+        };
+
+        let view = scan(true, vec![board, no_keyboard]);
+        assert_eq!(view.boards[0].selector.as_deref(), Some("usb:d209:0430:00"));
+        assert_eq!(
+            view.boards[1].selector, None,
+            "a board that cannot be picked must not be handed a selector to pick it with"
+        );
+
+        // The alias is the one `plan_pick` would write: the board's name when
+        // nothing is configured, and the name the USER gave it when something
+        // is — renaming orphans every [[slot]] that refers to the old alias.
+        assert_eq!(view.boards[0].alias_hint, "Ultimarc I-PAC 4X");
+        let configured = scan(
+            true,
+            vec![BoardRow {
+                alias: Some("panel".to_owned()),
+                ..keyboard_board()
+            }],
+        );
+        assert_eq!(configured.boards[0].alias_hint, "panel");
     }
 
     /// **A refused read must not render as an assertion of absence.**

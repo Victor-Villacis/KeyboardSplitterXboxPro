@@ -162,6 +162,7 @@ surface does a human perform this task on*, and that is answered by the matrix.
 
 | Capability | CLI | egui (cabinet) | Studio (browser) |
 |---|---|---|---|
+| First run: stage a setup, save or play | planned (`ksx stage`) | — | **primary** |
 | Author presets / key mappings | owns | — | **primary** |
 | Edit config, profiles | owns | slot→preset only | **primary** |
 | Device pick / remove | owns | planned | **primary** |
@@ -222,6 +223,30 @@ and harder to notice, a face that SHIPPED while the cell still said `planned`:
   `/devices`, `/devices/pick` and `/devices/remove`. The egui half stays planned
   and drops the issue number, because #22 was never about the cabinet — its five
   screens are still ButtonCheck, Status, Session, Profiles, Presets.
+
+### §3c The first-run row, and the build order it ran backwards
+
+Row 1 is new on 2026-08-08, and it is the first row in this table whose **CLI
+cell is honestly `planned`**. `docs/FIRST-RUN.md` is a spec for a product
+someone who is not us can use, and its §1 premise is that no step may require a
+shell — so the surface came first and `ksx stage` is owed. That is §2's build
+order run 1 → 3 with 2 skipped, the same way `/profiles/new` did it, and it is
+recorded here rather than quietly for the reason that entry gives: the backend
+half then has no second caller checking its shape.
+
+What exists: `ksx_core::StagedSetup` (the value, with no path to a file), the
+four `stage*` pipe verbs, and Studio's `/start` performing all of them. What
+does not: any way to stage a setup from a terminal. The four verbs are on the
+control pipe, so the CLI half is a driver over `ControlSource`, not new logic.
+
+**This row is also why the guard's bookkeeping changed.** It used to require
+every CLI anchor to exist in the clap tree, whatever its cell said — which is
+right for a cell claiming `owns` and wrong for one saying `planned`, where a
+name that does not resolve is exactly the claim being made. The egui and Studio
+columns have always worked that way (`Screen::Mapper` and `/buttons` name
+nothing, which is what makes their `—` honest); the CLI column now does too, and
+`every_cell_claiming_a_shipped_face_has_one` is what holds the shipped
+direction.
 
 ### §3a Why the pad verbs get a Studio face and WinUSB claim does not
 
@@ -314,9 +339,21 @@ profile. Anything requiring text entry belongs elsewhere.
 
 Studio binds `127.0.0.1` and refuses anything else — `ksx-studio/src/error.rs`
 returns `NonLoopbackBind` rather than serving a LAN address. Its **pages** are
-`/` (status), `/map` (the mapper), `/check` (the button check), `/pads` (the
-ViGEm bus and its two verbs), `/devices` (the picker), `/profiles` (profiles &
-presets) and `/setup` (the configuration).
+`/start` (the first run), `/` (status), `/map` (the mapper), `/check` (the
+button check), `/pads` (the ViGEm bus and its two verbs), `/devices` (the
+picker), `/profiles` (profiles & presets) and `/setup` (the configuration).
+
+`/start` and `/setup` are the two that look like each other and are not, and
+the difference is a contract rather than a layout. **Every `/setup` step reads
+`config.toml` and writes to it** (§9 flow 1: "each reads the config as it
+stands and writes one complete thing"). **`/start` reads no config and writes
+no file at all** until the button marked Save — it drives
+`ksx_core::StagedSetup`, which is held in the daemon for the length of a visit
+and has no path to a file (`FIRST-RUN.md` §2). Rebuilding `/setup` around a
+staged value was the alternative and it was rejected: one screen holding both
+rules is a screen where a user cannot tell which controls commit, which is the
+confusion staging exists to remove. Two pages, and the flash after Save is
+where the first becomes the second.
 
 `/check` is the one page that performs no verb at all, and the one fed by a
 channel that is not the control pipe: `GET /api/live` is Server-Sent Events
@@ -325,7 +362,7 @@ the panel light a control in a browser at display rate. It is still a VIEW —
 it writes nothing, and it decides nothing, because its whole control roster is
 `MapperSlot::bindings`' key set arriving from the backend (§1).
 
-Seven pages, dozens of routes: the rest are the `/api/*` reads, the mutating
+Eight pages, dozens of routes: the rest are the `/api/*` reads, the mutating
 form endpoints, the service worker, the asset handler and three icons. The
 distinction is not pedantry — it is the whole reason the CSRF guard is one
 layer over the router rather than a check per handler, because "the mapper
@@ -450,7 +487,19 @@ smallest screen.
 Four journeys carry nearly all the product's surface area:
 
 1. **First-time setup** — no config: find the board, name it, claim it, wire a
-   slot, prove a button lights. **Studio's `/setup`** (§5): the checklist is
+   slot, prove a button lights. Since 2026-08-08 this is **two** journeys on
+   two pages, and which one a person is on is decided by whether they have ever
+   run ksx.
+
+   **Studio's `/start`** is the download-to-gaming path (`docs/FIRST-RUN.md`
+   moments 4–7): pick a keyboard from a list nobody had to ask for, pick what it
+   should become, answer split-or-freeze, then save or play. It reads no config
+   and writes no file until Save, because the person walking it has not decided
+   anything yet and must not be punished for exploring. Its whole state is one
+   `ksx_core::StagedSetup` in the daemon.
+
+   **Studio's `/setup`** (§5) is the same territory for someone who already has
+   a configuration: the checklist is
    decided in the backend (`ksx-app::onboard::plan_steps`, pure) and rendered,
    never re-derived per surface; each step is one backend verb, and the board
    step LINKS to the devices screen instead of duplicating it. Every step is

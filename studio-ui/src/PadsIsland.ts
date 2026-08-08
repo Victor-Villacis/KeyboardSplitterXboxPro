@@ -329,6 +329,7 @@ export function PadsIsland() {
       h(
         "nav",
         { class: "topnav", "aria-label": "screens" },
+        h("a", { class: "navlink", href: "/start" }, "Start"),
         h("a", { class: "navlink", href: "/" }, "Status"),
         h("a", { class: "navlink", href: "/map" }, "Mapper"),
         h("a", { class: "navlink", href: "/check" }, "Check"),

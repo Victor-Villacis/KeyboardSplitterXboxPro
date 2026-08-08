@@ -106,6 +106,7 @@ mod render_map;
 mod render_pads;
 mod render_profiles;
 mod render_setup;
+mod render_start;
 mod server;
 mod snapshot;
 

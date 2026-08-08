@@ -70,6 +70,12 @@ pub struct Committed {
     /// The preset files written, in slot order (deduplicated: two slots may
     /// deliberately share one preset).
     pub presets: Vec<PathBuf>,
+    /// The timestamped copies taken of preset files that ALREADY EXISTED.
+    ///
+    /// Empty on a first run, and that is the ordinary case. It is non-empty
+    /// when a staged preset name collided with one on disk — see [`apply`] for
+    /// why that is a backup and not a refusal.
+    pub preset_backups: Vec<PathBuf>,
     /// The `[[device]]` alias every saved slot now names.
     pub alias: String,
     pub slots: Vec<u8>,
@@ -78,10 +84,24 @@ pub struct Committed {
 impl Committed {
     /// The one line a surface prints. It never says "claimed" and never says
     /// "plugged", because saving does neither.
+    ///
+    /// It DOES say when an existing preset was replaced, and it says it in the
+    /// same sentence as the success. A save that quietly overwrote somebody's
+    /// mapped preset and reported only "saved" is the shape `FIRST-RUN.md` §6
+    /// bans — a screen reporting a success that is not the whole truth — and
+    /// the note names the button that undoes it rather than a command.
     pub fn message(&self) -> String {
+        let replaced = match self.preset_backups.len() {
+            0 => String::new(),
+            n => format!(
+                ". {n} preset(s) of the same name were already there and have been REPLACED — a \
+                 timestamped copy of each was kept, and the mapper's \"Restore backup\" puts one \
+                 back"
+            ),
+        };
         format!(
             "saved {} controller(s) on \"{}\" to {} — nothing was claimed and no pad was plugged; \
-             Play starts them",
+             Play starts them{replaced}",
             self.slots.len(),
             self.alias,
             self.config.display()
@@ -213,11 +233,41 @@ pub fn resolve(spec: &CommitSpec) -> Result<RunPlan, PlanError> {
 /// `[[slot]]` pointing at a preset that does not exist is the one ordering that
 /// leaves a machine worse than it started — it refuses to start at the next
 /// boot, long after whoever pressed Save walked away.
+///
+/// # A preset that already exists is BACKED UP, not silently replaced
+///
+/// `Store::save_preset` is an atomic overwrite with no backup of its own —
+/// correct for the mapper, which is editing the file it just read. A staged
+/// setup is not: it names a preset the user picked from a menu, and the name
+/// it offers first (`ksx_api::preset_name_for_slot` — "Player 1") is exactly
+/// the name a previous run of this same flow would have left on disk. So a
+/// second visit through the journey could replace a mapped preset with an empty
+/// one, and the only surviving evidence would be a pad that does nothing in a
+/// game.
+///
+/// It is a backup rather than a refusal because the collision is usually the
+/// user re-doing the setup they already did, and refusing that would leave them
+/// with no way forward that is not a shell. The road back is the one the mapper
+/// already renders: `MapperSlot::backup` reads these files and
+/// `/map/preset/restore` puts one back — `FIRST-RUN.md` §6's "the way out of a
+/// mistake is never a shell command", satisfied by a button that already
+/// exists.
 pub fn apply(store: &Store, spec: &CommitSpec) -> Result<Committed, ksx_config::ConfigError> {
-    let presets = preset_files(spec)
-        .iter()
-        .map(|preset| store.save_preset(preset))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut preset_backups = Vec::new();
+    let mut presets = Vec::with_capacity(spec.slots.len());
+    for preset in preset_files(spec) {
+        // `preset_path` resolves to the file this store would actually write —
+        // the `.json` interop spelling when that is the only one on disk — so
+        // the backup and the overwrite cannot land on two different files.
+        if let Some(existing) = store
+            .preset_path(&preset.name)
+            .ok()
+            .filter(|path| path.exists())
+        {
+            preset_backups.extend(store.backup(&existing)?);
+        }
+        presets.push(store.save_preset(&preset)?);
+    }
 
     let base = store.load_config()?.value;
     let config = to_config(&base, spec);
@@ -229,6 +279,7 @@ pub fn apply(store: &Store, spec: &CommitSpec) -> Result<Committed, ksx_config::
         config: config_path,
         backup,
         presets,
+        preset_backups,
         alias: spec.device.alias.clone(),
         slots: spec.slots.iter().map(|s| s.spec.number).collect(),
     })
@@ -494,6 +545,79 @@ mod tests {
         let numbers: Vec<u8> = after.slots.iter().map(|s| s.number).collect();
         assert_eq!(numbers, vec![1, 2, 4], "player 4 is still there");
         assert_eq!(after.slots[2].preset, "Player 4");
+    }
+
+    /// **A preset the save would replace is copied first.**
+    ///
+    /// Breaks against the shipped `apply`, which called `Store::save_preset`
+    /// straight — an atomic overwrite with no backup of its own. The staging
+    /// flow offers "Player 1" as the FIRST preset name it suggests
+    /// (`ksx_api::preset_name_for_slot`), so the second visit through the
+    /// journey silently replaced the mapped preset from the first one with an
+    /// empty table. The only symptom is a pad that does nothing in a game, and
+    /// by then there is no file left to compare against.
+    ///
+    /// The assertion is on the CONTENTS of the backup, not merely on its
+    /// existence: a copy taken after the write would satisfy "a .bak exists"
+    /// and preserve nothing.
+    #[test]
+    fn a_save_copies_a_preset_it_is_about_to_replace() {
+        let root = TempRoot::new("preset-backup");
+        let store = root.store();
+
+        // What the user mapped on their first visit.
+        let mapped = PresetFile::from_core(&preset("Player 1", Key::Z, XButton::X));
+        store.save_preset(&mapped).unwrap();
+        let before = std::fs::read_to_string(store.preset_path("Player 1").unwrap()).unwrap();
+
+        // The second visit stages an EMPTY "Player 1" and saves it.
+        let spec = StagedSetup::new()
+            .choose_device(device())
+            .unwrap()
+            .add_slot(
+                1,
+                Persona::Xbox360,
+                Preset {
+                    name: "Player 1".to_owned(),
+                    entries: Vec::new(),
+                    chords: Vec::new(),
+                    macros: Default::default(),
+                    turbo: Vec::new(),
+                    protected: false,
+                },
+            )
+            .unwrap()
+            .commit()
+            .unwrap();
+        let committed = apply(&store, &spec).unwrap();
+
+        assert_eq!(
+            committed.preset_backups.len(),
+            1,
+            "an existing preset was overwritten with no copy kept: {committed:?}"
+        );
+        let kept = std::fs::read_to_string(&committed.preset_backups[0]).unwrap();
+        assert_eq!(
+            kept, before,
+            "the copy must be of the file as it was BEFORE the write"
+        );
+        assert!(kept.contains("Z"), "{kept}");
+        // …and the flash says so. A save that reported only "saved" while it
+        // had replaced a mapped preset is a screen reporting a success that is
+        // not the whole truth.
+        let said = committed.message();
+        assert!(said.contains("REPLACED"), "{said}");
+        assert!(said.contains("Restore backup"), "{said}");
+
+        // ...and a preset that did NOT exist leaves no backup behind, so a
+        // first run does not litter the presets folder with copies of nothing.
+        let root = TempRoot::new("preset-no-backup");
+        let store = root.store();
+        let committed = apply(&store, &spec).unwrap();
+        assert!(
+            committed.preset_backups.is_empty(),
+            "{committed:?} backed up a file that was not there"
+        );
     }
 
     /// The device is written as the SELECTOR the stage held, never as a raw

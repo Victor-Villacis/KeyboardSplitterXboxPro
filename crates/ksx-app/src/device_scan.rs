@@ -401,6 +401,8 @@ fn board_row(board: &Board<'_>) -> ksx_api::BoardRow {
         can_type: false,
         cannot_type_reason: String::new(),
         cannot_type_line: String::new(),
+        selector: None,
+        alias_hint: String::new(),
     }
 }
 

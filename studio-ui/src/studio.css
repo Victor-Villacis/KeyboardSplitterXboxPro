@@ -4732,3 +4732,60 @@ a.strow:hover {
 .check .feedcard .dvalue {
   font-size: var(--fs-lg);
 }
+
+/* ── 11. Start (`/start`) ─────────────────────────────────────────────────
+   The first run, moments 4–7 (docs/FIRST-RUN.md). Almost all of it is the
+   Devices page's vocabulary — a list of boards, each a stack of facts with
+   optional amber warnings — so this section is small on purpose: reusing
+   `.dv-*` there is the whole point, and a second set of class names for the
+   same shape would be a second place to keep the hide rule and the warning
+   plate in step.
+
+   What is genuinely new is ONE thing: an inline disclosure. The page has
+   three of them — the device path, the boards that cannot be picked, and the
+   personas this build cannot create — and every one is the same move. None of
+   the three may be omitted (a hidden fact is a fact this page is claiming does
+   not exist) and none may shout, because a first-run user reading them is
+   already on the wrong track. `.disclosure` cannot serve: its summary carries
+   a negative `--sp-5` margin sized to sit flush inside `details.card`, and
+   these are nested inside a card that already has one. */
+
+.st-more {
+  margin: var(--sp-2) 0 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+.st-more > summary {
+  padding: var(--sp-2) var(--sp-3);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: var(--track-eyebrow);
+}
+
+.st-more > summary::-webkit-details-marker {
+  display: none;
+}
+
+.st-more > summary:hover {
+  color: var(--text-secondary);
+}
+
+.st-more[open] > summary {
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.st-more > *:not(summary) {
+  margin: var(--sp-2) var(--sp-3);
+}
+
+/* The lists inside a disclosure keep their own padding, so the wrapper's
+   margin would double it. */
+.st-more > ul {
+  margin: 0;
+}

@@ -101,8 +101,8 @@ pub use machine::{
 pub use pipe::{PipeTransport, TransportError, NO_CHANNEL};
 pub use refusal::{codes, Refusal, Refused};
 pub use stage::{
-    BlockingOption, PersonaOption, StageEdit, StageOutcome, StagedDeviceView, StagedSetupView,
-    StagedSlotView,
+    preset_name_for_slot, BlockingOption, PersonaOption, StageEdit, StageOutcome, StagedDeviceView,
+    StagedSetupView, StagedSlotView,
 };
 pub use status::{
     MacroSnapshot, MacroStepView, MacroView, MapperSlot, MapperSnapshot, PadRow, ProfileRow,
