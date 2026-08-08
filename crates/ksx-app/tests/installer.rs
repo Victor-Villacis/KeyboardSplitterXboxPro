@@ -1,4 +1,4 @@
-//! `packaging/ksx.iss`, as tests.
+//! `packaging/ksx.iss` and the release workflow, as tests.
 //!
 //! # Why a Rust test crate reads an Inno Setup script
 //!
@@ -22,6 +22,26 @@
 //! the driver payload, the uninstall hook, every comment — is free to change
 //! without touching this file.
 //!
+//! # And why it also reads `.github/workflows/`
+//!
+//! Moment 2 is only reachable through moment 1: "a `.exe` from the releases
+//! page. One file." The installer this file guards is built by
+//! `build-installer.yml` and published by `release.yml`, and **both of those
+//! run on a runner that no local command reproduces** — `release.yml` fires on
+//! a tag push and on nothing else, so an ordinary branch push never executes a
+//! line of it. Its first execution is a real release, of a real version number,
+//! for real customers, and a version number spent on a failed run is spent.
+//!
+//! So the parts of it that can be checked without running it, are:
+//!
+//! - the version in `ksx.iss` and the version in `Cargo.toml` agree, which is
+//!   the precondition the tag has to satisfy;
+//! - the trigger really is a pushed tag, in a pattern this repo's own version
+//!   can produce;
+//! - the file that gets attached is the installer `ksx.iss` actually emits;
+//! - the release body says how to verify the download, and what the unsigned
+//!   installer's SmartScreen dialog is.
+//!
 //! Line endings: the script is CRLF in a Windows checkout and LF in a fresh
 //! clone elsewhere, so every line is `trim()`ed before it is read. A test that
 //! compared against `"\n"` would pass here and fail on CI, which this
@@ -42,6 +62,16 @@ fn script() -> String {
     let path = repo_root().join("packaging").join("ksx.iss");
     std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("{} could not be read: {err}", path.display()))
+}
+
+fn read(relative: &str) -> String {
+    let path = repo_root().join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("{} could not be read: {err}", path.display()))
+}
+
+fn workflow(name: &str) -> String {
+    read(&format!(".github/workflows/{name}"))
 }
 
 /// Every meaningful line of one `[Section]`, in order: comments and blanks
@@ -111,6 +141,228 @@ fn field(entry: &str, key: &str) -> Option<String> {
         .into_iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(key))
         .map(|(_, value)| value)
+}
+
+/// The value of a `#define NAME "value"` line.
+fn define(text: &str, name: &str) -> String {
+    text.lines()
+        .find_map(|line| {
+            let rest = line.trim().strip_prefix("#define")?.trim_start();
+            let rest = rest.strip_prefix(name)?;
+            if !rest.starts_with(char::is_whitespace) {
+                return None;
+            }
+            Some(rest.trim().trim_matches('"').to_owned())
+        })
+        .unwrap_or_else(|| panic!("ksx.iss has no `#define {name}`"))
+}
+
+/// `{#AppName}-{#AppVersion}-setup` → `ksx-0.1.0-setup`.
+fn expand(text: &str, value: &str) -> String {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(at) = rest.find("{#") {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + 2..];
+        let end = tail
+            .find('}')
+            .unwrap_or_else(|| panic!("unterminated `{{#` in ksx.iss: {value}"));
+        out.push_str(&define(text, &tail[..end]));
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The value of one `Key=Value` line in `[Setup]`, with `{#defines}` expanded.
+fn setup_value(text: &str, key: &str) -> String {
+    let line = section(text, "[Setup]")
+        .into_iter()
+        .find(|line| {
+            line.split_once('=')
+                .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(key))
+        })
+        .unwrap_or_else(|| panic!("[Setup] has no {key}"));
+    let (_, value) = line.split_once('=').expect("matched above");
+    expand(text, value.trim())
+}
+
+/// `[workspace.package] version` from the workspace manifest.
+fn workspace_version() -> String {
+    let manifest = read("Cargo.toml");
+    let mut inside = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            inside = line == "[workspace.package]";
+            continue;
+        }
+        if inside {
+            if let Some(value) = line
+                .strip_prefix("version")
+                .and_then(|rest| rest.trim_start().strip_prefix('='))
+            {
+                return value.trim().trim_matches('"').to_owned();
+            }
+        }
+    }
+    panic!("Cargo.toml has no [workspace.package] version")
+}
+
+// ---------------------------------------------------------------------------
+// A YAML subset, which is not a YAML parser
+// ---------------------------------------------------------------------------
+//
+// Block mappings, block sequences, and `- key: value` step lists: everything
+// the three workflow files in this repository use, and nothing else. It is here
+// so the tests below can assert STRUCTURE — "the only trigger is a tag push" —
+// rather than substrings — "the file contains the word tags". The second kind
+// passes against a workflow that mentions tags in a comment and publishes on
+// every push to master.
+//
+// A dev-dependency on a YAML crate would be the other way to get this. It is
+// forty lines against a new dependency in the crate `docs/GATES.md` watches, on
+// a file format three files use, so: forty lines.
+
+/// A line's leading-space count.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// One line with any trailing `# comment` removed. Quotes are tracked, so a `#`
+/// inside a string stays.
+fn strip_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (at, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'\'' | b'"' => match quote {
+                Some(open) if open == *byte => quote = None,
+                None => quote = Some(*byte),
+                _ => {}
+            },
+            b'#' if quote.is_none() && (at == 0 || bytes[at - 1] == b' ') => {
+                return line[..at].trim_end();
+            }
+            _ => {}
+        }
+    }
+    line.trim_end()
+}
+
+/// A workflow's meaningful lines: blanks and comments gone, indentation kept.
+fn yaml_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(strip_comment)
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The lines nested under a key path, e.g. `["on", "push"]`.
+fn yaml_block(lines: &[String], path: &[&str]) -> Vec<String> {
+    let mut current = lines.to_vec();
+    for key in path {
+        let base = current
+            .iter()
+            .map(|line| indent_of(line))
+            .min()
+            .unwrap_or_else(|| panic!("nothing is nested under {path:?}"));
+        let at = current
+            .iter()
+            .position(|line| {
+                indent_of(line) == base
+                    && line
+                        .trim_start()
+                        .strip_prefix(key)
+                        .is_some_and(|rest| rest.starts_with(':'))
+            })
+            .unwrap_or_else(|| panic!("no `{key}:` where {path:?} expects one"));
+        current = current[at + 1..]
+            .iter()
+            // A sequence may sit at its key's own indentation, so `- ` counts as
+            // inside the block too.
+            .take_while(|line| {
+                indent_of(line) > base
+                    || (indent_of(line) == base && line.trim_start().starts_with("- "))
+            })
+            .cloned()
+            .collect();
+    }
+    current
+}
+
+/// The keys of the mapping at the top level of `lines`.
+fn yaml_keys(lines: &[String]) -> Vec<String> {
+    let Some(base) = lines.iter().map(|line| indent_of(line)).min() else {
+        return Vec::new();
+    };
+    lines
+        .iter()
+        .filter(|line| indent_of(line) == base)
+        .filter_map(|line| {
+            let line = line.trim_start();
+            if line.starts_with("- ") {
+                return None;
+            }
+            Some(line.split_once(':')?.0.trim().to_owned())
+        })
+        .collect()
+}
+
+/// The items of the sequence at the top level of `lines`, unquoted.
+fn yaml_items(lines: &[String]) -> Vec<String> {
+    let Some(base) = lines.iter().map(|line| indent_of(line)).min() else {
+        return Vec::new();
+    };
+    lines
+        .iter()
+        .filter(|line| indent_of(line) == base)
+        .filter_map(|line| line.trim_start().strip_prefix("- "))
+        .map(|item| item.trim().trim_matches(['\'', '"']).to_owned())
+        .collect()
+}
+
+/// `(artifact name, path)` for every `actions/<verb>-artifact` step in a
+/// workflow. `verb` is `upload` or `download`.
+fn artifact_steps(text: &str, verb: &str) -> Vec<(String, String)> {
+    let lines = yaml_lines(text);
+    let marker = format!("uses: actions/{verb}-artifact");
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(&marker))
+        .map(|(at, line)| {
+            let base = indent_of(line);
+            let body: Vec<&String> = lines[at + 1..]
+                .iter()
+                .take_while(|line| indent_of(line) > base)
+                .collect();
+            let value = |key: &str| -> String {
+                body.iter()
+                    .find_map(|line| {
+                        line.trim_start()
+                            .strip_prefix(key)?
+                            .strip_prefix(':')
+                            .map(|value| value.trim().trim_matches(['\'', '"']).to_owned())
+                    })
+                    .unwrap_or_default()
+            };
+            (value("name"), value("path"))
+        })
+        .collect()
+}
+
+/// `*` matches any run of characters. Nothing else is special — these are two
+/// patterns out of two files, not a shell.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == text,
+        Some((head, tail)) => text.strip_prefix(head).is_some_and(|rest| {
+            (0..=rest.len())
+                .any(|at| rest.is_char_boundary(at) && glob_matches(tail, &rest[at..]))
+        }),
+    }
 }
 
 /// **`docs/FIRST-RUN.md` §4 bullet 2.** The post-install offer hands over the
@@ -460,5 +712,217 @@ fn the_code_section_uses_line_comments_only() {
                 _ => {}
             }
         }
+    }
+}
+
+/// **One version, spelled in two files, and a tag that has to equal both.**
+///
+/// `#define AppVersion` is the installer's filename, its `VersionInfoVersion`,
+/// and the "ksx 0.1.0" row in Apps & Features — what the INSTALLED program says
+/// about itself. `[workspace.package] version` is what `ksx --version` prints.
+/// `.github/workflows/build-installer.yml` refuses to build a release unless the
+/// tag equals both, and it is the release that makes the disagreement expensive:
+/// a tag is a public name you cannot reuse, so learning ten minutes into a
+/// release run that two files disagree costs a deleted tag and a burned version
+/// number.
+///
+/// Fails against the ordinary broken tree: someone bumps `Cargo.toml` to 0.2.0
+/// and `ksx.iss` keeps 0.1.0. Nothing else in this repository notices — the
+/// build is fine, the tests are green, the installer compiles — until the tag.
+#[test]
+fn the_installer_version_and_the_workspace_version_cannot_drift() {
+    let installer = define(&script(), "AppVersion");
+    let workspace = workspace_version();
+    assert_eq!(
+        installer, workspace,
+        "packaging/ksx.iss says AppVersion {installer} and Cargo.toml's \
+         [workspace.package] says {workspace}. A release tag has to equal both \
+         (.github/workflows/build-installer.yml, \"Version agreement\"), so one \
+         of these two files is wrong right now — decide which before tagging."
+    );
+}
+
+/// **The release is a pushed tag, and nothing else is a release.**
+///
+/// Fails against three broken versions, each of which has a plausible author:
+///
+/// 1. `on: release: types: [published]` — the belief that publishing requires
+///    creating a Release in the web UI first. It does not: the UI works only
+///    *because* it creates a tag. Under that trigger `git push origin v0.1.0`
+///    does nothing at all, which is indistinguishable from a broken workflow
+///    and is how a repo ends up with tags and an empty releases page.
+/// 2. `branches:` added beside `tags:`, which cuts a release on every push.
+/// 3. A pattern this repository's own version cannot produce (`release-v*`,
+///    `v*.*.*-*`): the workflow then exists, is valid, and never fires.
+#[test]
+fn the_release_is_triggered_by_pushing_a_version_tag() {
+    let lines = yaml_lines(&workflow("release.yml"));
+    let triggers = yaml_keys(&yaml_block(&lines, &["on"]));
+    assert_eq!(
+        triggers,
+        vec!["push"],
+        "the only trigger may be a push. A `release:` trigger would wait for a \
+         human to create a Release in the browser, and then a CLI-pushed tag \
+         publishes nothing; a `workflow_dispatch` would run the publish job on a \
+         branch, where there is no tag to attach a release to."
+    );
+
+    let push = yaml_block(&lines, &["on", "push"]);
+    assert_eq!(
+        yaml_keys(&push),
+        vec!["tags"],
+        "a `branches:` filter beside `tags:` would publish a release on every \
+         branch push: {push:?}"
+    );
+
+    let patterns = yaml_items(&yaml_block(&lines, &["on", "push", "tags"]));
+    assert!(!patterns.is_empty(), "no tag patterns in release.yml");
+    let tag = format!("v{}", workspace_version());
+    assert!(
+        patterns.iter().any(|pattern| glob_matches(pattern, &tag)),
+        "this repository is at version {}, so the tag to push is `{tag}` — and \
+         none of release.yml's patterns {patterns:?} match it. A workflow that \
+         cannot fire for the version in the tree is a workflow that never fires.",
+        workspace_version()
+    );
+}
+
+/// **What gets attached is the installer, under the name `ksx.iss` emits.**
+///
+/// `docs/FIRST-RUN.md` §1 moment 1 is "a `.exe` from the releases page. One
+/// file" — and that file is the setup.exe. The chain from the Inno script to the
+/// release asset runs through three files, and every link is a string:
+///
+/// ```text
+///   ksx.iss OutputDir + OutputBaseFilename
+///     -> build-installer.yml upload path glob
+///       -> artifact name
+///         -> release.yml download
+///           -> gh release create <asset>
+/// ```
+///
+/// Fails against:
+///
+/// - `OutputDir=dist` in `ksx.iss` (one word; ISCC compiles it happily) — the
+///   upload glob then matches nothing;
+/// - an artifact renamed in one file and not the other, which fails the publish
+///   AFTER a ten-minute build, on a tag that is already public;
+/// - a release that attaches only `ksx.exe`. A bare console binary with no
+///   driver folder beside it is not what moment 1 means by "one file".
+#[test]
+fn the_release_attaches_the_installer_that_ksx_iss_actually_produces() {
+    let iss = script();
+    // OutputDir is relative to the .iss, which lives in packaging/.
+    let produced = format!(
+        "packaging/{}/{}.exe",
+        setup_value(&iss, "OutputDir"),
+        setup_value(&iss, "OutputBaseFilename")
+    );
+
+    let build = workflow("build-installer.yml");
+    let uploads = artifact_steps(&build, "upload");
+    assert!(!uploads.is_empty(), "build-installer.yml uploads nothing");
+    let (installer_artifact, glob) = uploads
+        .iter()
+        .find(|(_, path)| glob_matches(path, &produced))
+        .unwrap_or_else(|| {
+            panic!(
+                "ksx.iss writes {produced}, and no upload in build-installer.yml \
+                 collects it: {uploads:?}"
+            )
+        });
+    assert!(
+        glob.contains("setup"),
+        "the installer upload should still name the installer: {glob}"
+    );
+
+    let release = workflow("release.yml");
+    let downloads = artifact_steps(&release, "download");
+    let names: Vec<&str> = downloads.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(
+        names.contains(&installer_artifact.as_str()),
+        "build-installer.yml uploads the installer as `{installer_artifact}` and \
+         release.yml downloads {names:?} — the publish would fail after the build, \
+         with the tag already pushed."
+    );
+    for (name, _) in &downloads {
+        assert!(
+            uploads.iter().any(|(uploaded, _)| uploaded == name),
+            "release.yml downloads an artifact `{name}` that build-installer.yml \
+             never uploads: {uploads:?}"
+        );
+    }
+
+    // The assets, as data rather than as a command line, so this can read them.
+    let assets = release
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("$assets") && line.contains("@("))
+        .expect(
+            "release.yml's publish step must name its release assets in one \
+             `$assets = @(...)` line, so this test can see what gets attached",
+        );
+    assert!(
+        assets.contains("SETUP_NAME"),
+        "the installer must be a release asset (FIRST-RUN.md §1 moment 1): {assets}"
+    );
+    assert!(
+        assets.contains("ksx.exe"),
+        "the bare ksx.exe rides along for people who want it: {assets}"
+    );
+}
+
+/// **The release body explains the scary dialog, and lets a download be
+/// checked.**
+///
+/// Two sentences carry the whole weight of moment 1 and neither can be
+/// generated:
+///
+/// - The installer is unsigned, so Windows shows "Windows protected your PC"
+///   with only a *Don't run* button visible. A first-time user who meets an
+///   unexplained warning stops there, and no later screen gets a turn. The body
+///   has to name the dialog and the two clicks through it.
+/// - The SHA-256 and the commit are what make "click Run anyway" checkable
+///   rather than a request for trust. Both already exist — the build computes
+///   them — so the only failure mode is not printing them.
+///
+/// Fails against a body that drops either, and against a template that grows a
+/// placeholder `release.yml` does not substitute: `{{SIZE}}` would then appear
+/// on a public page as five literal characters.
+#[test]
+fn the_release_body_carries_the_hash_the_commit_and_the_smartscreen_step() {
+    let notes = read("packaging/release-notes.md");
+    for placeholder in ["{{SETUP_NAME}}", "{{SETUP_SHA256}}", "{{COMMIT}}"] {
+        assert!(
+            notes.contains(placeholder),
+            "the release body must carry {placeholder}: a download nobody can \
+             verify against the run that built it is a download nobody can verify"
+        );
+    }
+    for phrase in ["Windows protected your PC", "More info", "Run anyway"] {
+        assert!(
+            notes.contains(phrase),
+            "the release body must say \"{phrase}\". The installer is not \
+             code-signed; SmartScreen's dialog shows a single `Don't run` button, \
+             and a first-time user who is not told about it does not reach moment 2."
+        );
+    }
+
+    // Every placeholder the template uses is one the workflow fills in.
+    let release = workflow("release.yml");
+    let mut rest = notes.as_str();
+    while let Some(at) = rest.find("{{") {
+        let tail = &rest[at + 2..];
+        let end = tail
+            .find("}}")
+            .unwrap_or_else(|| panic!("unterminated `{{{{` in packaging/release-notes.md"));
+        let placeholder = format!("{{{{{}}}}}", &tail[..end]);
+        assert!(
+            release.contains(&placeholder),
+            "packaging/release-notes.md uses {placeholder} and \
+             .github/workflows/release.yml never substitutes it — it would reach \
+             the releases page as literal braces"
+        );
+        rest = &tail[end + 2..];
     }
 }

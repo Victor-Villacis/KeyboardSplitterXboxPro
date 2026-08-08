@@ -10,6 +10,27 @@ on:
     branches: ['**']
   pull_request:
   workflow_dispatch:
+  # `release.yml` calls this whole file on a version tag, so a release runs the
+  # exact gate every branch runs — same tests, same feature matrix, same build
+  # — and then publishes what it built. A release path that skipped this, or
+  # that rebuilt the binary its own way, would be shipping something CI never
+  # saw.
+  workflow_call:
+    inputs:
+      release_tag:
+        description: >
+          Set by release.yml to the tag being released, e.g. `v0.1.0`. Empty
+          for ordinary CI. Threaded down to build-installer.yml, whose version
+          guard refuses to build when the tag and the tree disagree.
+        type: string
+        default: ''
+    outputs:
+      setup_name:
+        description: The installer's filename, e.g. `ksx-0.1.0-setup.exe`.
+        value: ${{ jobs.release-binary.outputs.setup_name }}
+      setup_sha256:
+        description: SHA-256 of the installer, as built.
+        value: ${{ jobs.release-binary.outputs.setup_sha256 }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -68,80 +89,19 @@ jobs:
       - name: Check vendored vigem-client compiles
         run: cargo check -p vigem-client --all-features
 
-  # The shippable binary is built HERE, not on a developer machine, and that is
-  # deliberate. On 2026-08-07 the primary dev box (i9-14900K) began crashing
-  # rustc during `cargo build --release`: three runs on a byte-identical command
-  # line died three different ways (0xc0000409 twice in different crates, then
-  # 0xc0000005), with 28GB of 64GB free — so not OOM. A deterministic compiler
-  # that fails non-deterministically is hardware corrupting compute, and the
-  # release profile below (opt-level=3 + thin LTO + codegen-units=1) is the
-  # heaviest sustained load in the build, which is why it surfaces there first.
+  # The shippable binary and the installer. The steps live in
+  # `build-installer.yml` because `release.yml` needs the SAME build — the file
+  # a customer downloads must be the file this gate proved, not a second build
+  # that happens to use the same command line. That file also carries the long
+  # explanation of why a release binary is never compiled on the dev box.
   #
-  # The danger is NOT the crash. A crash is loud and safe. The danger is the run
-  # that *succeeds* on marginal hardware and emits a silently miscompiled binary
-  # — which then goes onto an arcade cabinet and misbehaves with no error
-  # anywhere to explain it. A clean runner removes that class of risk entirely.
-  #
-  # Keep this job even after the CPU is replaced: it also means anyone can get a
-  # working ksx.exe without a Rust toolchain.
+  # Until a tag is pushed this produces CI artifacts, which are perfectly good
+  # for us and useless to a customer: reaching one needs a GitHub login and a
+  # walk through the Actions tab. `release.yml` is what turns the same two files
+  # into a releases-page download (docs/FIRST-RUN.md §1 moment 1).
   release-binary:
     needs: test
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v5
-      - name: Toolchain (pinned by rust-toolchain.toml)
-        run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@v2
-      # cabinet + studio is the shipping combination: the egui panel UI plus the
-      # local web config server. The feature matrix above proves it compiles;
-      # this builds it optimized.
-      - name: Build release
-        run: cargo build --release --features cabinet,studio
-      # Print the hash in the log so a downloaded artifact can be verified
-      # against the run that produced it.
-      - name: Hash
-        shell: pwsh
-        run: |
-          $exe = 'target/release/ksx.exe'
-          $h = (Get-FileHash $exe -Algorithm SHA256).Hash
-          $mb = [math]::Round((Get-Item $exe).Length / 1MB, 2)
-          Write-Host "ksx.exe  $mb MB"
-          Write-Host "SHA256   $h"
-          "### ksx.exe`n`n- size: $mb MB`n- SHA256: ``$h```n- commit: ``$env:GITHUB_SHA``" |
-            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ksx-windows-x86_64
-          path: target/release/ksx.exe
-          if-no-files-found: error
-          retention-days: 30
-      # A bare ksx.exe is not something a person can use. `packaging/ksx.iss`
-      # already describes the whole install — Start-menu entries for the tray
-      # daemon, Studio and the cabinet panel, an optional desktop icon, PATH
-      # integration, the bundled ViGEmBus driver, and an uninstaller — but
-      # nothing ever ran it, so the design existed and the artifact did not.
-      #
-      # Inno Setup ships preinstalled on windows-latest, so this needs no new
-      # dependency. ISCC is not on PATH, hence the explicit path.
-      - name: Build installer
-        shell: pwsh
-        run: |
-          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
-          if (-not (Test-Path $iscc)) { throw "Inno Setup not found at $iscc" }
-          & $iscc /Qp 'packaging\ksx.iss'
-          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
-          # OutputDir=out in ksx.iss, and it is relative to the .iss file.
-          $setup = Get-ChildItem packaging\out\*setup.exe | Select-Object -First 1
-          if (-not $setup) { throw 'ISCC reported success but produced no setup.exe' }
-          $h = (Get-FileHash $setup -Algorithm SHA256).Hash
-          $mb = [math]::Round($setup.Length / 1MB, 2)
-          Write-Host "$($setup.Name)  $mb MB"
-          Write-Host "SHA256   $h"
-          "### $($setup.Name)`n`n- size: $mb MB`n- SHA256: ``$h```n" |
-            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ksx-windows-installer
-          path: packaging/out/*setup.exe
-          if-no-files-found: error
-          retention-days: 30
+    uses: ./.github/workflows/build-installer.yml
+    with:
+      # Empty on every ordinary push; the tag when release.yml is the caller.
+      release_tag: ${{ inputs.release_tag || '' }}
