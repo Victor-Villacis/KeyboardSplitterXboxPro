@@ -97,6 +97,7 @@ fn scalar_slots(payload: &StartPayload, flash: Option<&str>) -> serde_json::Valu
         "blockingLine": lines.blocking_line,
         "presetLine": lines.preset_line,
         "readyLine": lines.ready_line,
+        "playLine": lines.play_line,
         "guideLine": lines.guide_line,
         // §3's two must-says, straight off the staged view. Composed in
         // `ksx-api` beside the type that answers the question, never here.
@@ -171,6 +172,7 @@ fn slot_row(slot: &StartSlotRow) -> SlotValue {
     SlotValue::object(vec![
         ("number".to_owned(), SlotValue::Text(slot.number.clone())),
         ("title".to_owned(), SlotValue::Text(slot.title.clone())),
+        ("state".to_owned(), SlotValue::Text(slot.state.clone())),
         ("persona".to_owned(), SlotValue::Text(slot.persona.clone())),
         ("xinput".to_owned(), SlotValue::Text(slot.xinput.clone())),
         ("preset".to_owned(), SlotValue::Text(slot.preset.clone())),
@@ -762,6 +764,17 @@ mod tests {
 
         assert!(out.html.contains("Player 1"), "{}", out.html);
         assert!(out.html.contains("PlayStation"), "{}", out.html);
+        // BOTH halves of moment 5. §1 says the controller appears READY; §2
+        // says nothing has been plugged, claimed or written. A row carrying
+        // only the second reads as half-finished work rather than a decision
+        // that has been made — which is the state a first-run user is trying
+        // to get OUT of.
+        assert!(
+            out.html
+                .contains("ready — it will exist the moment you press Play"),
+            "{}",
+            out.html
+        );
         assert!(out.html.contains("no pad is on the bus"), "{}", out.html);
         assert!(out.html.contains("Remove leaves no trace"), "{}", out.html);
         // A pad with no bindings plugs and does nothing. Say it before a game
@@ -889,6 +902,20 @@ mod tests {
         assert!(
             ready.html.contains("Either works without the other"),
             "{}",
+            ready.html
+        );
+        // WHAT PLAY DOES, before the button rather than after it: a pad
+        // appears and the keyboard changes behaviour, and both are reversible.
+        // Under Freeze the second one means the keyboard stops typing, which is
+        // not a thing to discover by pressing a button.
+        assert!(
+            ready.html.contains("becomes a controller"),
+            "{}",
+            ready.html
+        );
+        assert!(
+            ready.html.contains("gives the keyboard back"),
+            "the way out has to be beside the way in: {}",
             ready.html
         );
         // The Guide fact — moment 7's one thing about the pad itself.

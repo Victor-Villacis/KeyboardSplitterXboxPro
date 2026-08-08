@@ -41,6 +41,7 @@ export interface StartLines {
   blocking_line: string;
   preset_line: string;
   ready_line: string;
+  play_line: string;
   guide_line: string;
   stage_error: string;
   scan_error: string;
@@ -98,6 +99,7 @@ export interface StartOtherRow {
 export interface StartSlotRow {
   number: string;
   title: string;
+  state: string;
   persona: string;
   xinput: string;
   preset: string;
@@ -179,6 +181,7 @@ const [xinputLine, setXinputLine] = createSignal("not collected");
 const [blockingLine, setBlockingLine] = createSignal("not collected");
 const [presetLine, setPresetLine] = createSignal("not collected");
 const [readyLine, setReadyLine] = createSignal("not collected");
+const [playLine, setPlayLine] = createSignal("not collected");
 const [guideLine, setGuideLine] = createSignal("not collected");
 const [escapeLine, setEscapeLine] = createSignal("not collected");
 const [scopeLine, setScopeLine] = createSignal("not collected");
@@ -238,6 +241,7 @@ export function applyStart(p: StartPayload): void {
   setBlockingLine(l.blocking_line);
   setPresetLine(l.preset_line);
   setReadyLine(l.ready_line);
+  setPlayLine(l.play_line);
   setGuideLine(l.guide_line);
   setStageError(l.stage_error);
   setScanError(l.scan_error);
@@ -591,6 +595,8 @@ export function StartIsland() {
               "|" +
               s.title +
               "|" +
+              s.state +
+              "|" +
               s.persona +
               "|" +
               s.xinput +
@@ -606,6 +612,7 @@ export function StartIsland() {
                   "div",
                   { class: "pmeta" },
                   h("span", { class: "ptitle" }, s.title),
+                  h("span", { class: "pill pill-ok" }, s.state),
                   h("span", { class: "pdetail" }, s.persona),
                   h("span", { class: "pdetail" }, s.xinput),
                   h("span", { class: "pdetail mono" }, s.preset),
@@ -760,6 +767,7 @@ export function StartIsland() {
         { class: "card wide" },
         h("h2", null, "4 · Play"),
         h("p", { class: "cardline" }, () => readyLine()),
+        h("p", { class: "cardline" }, () => playLine()),
         h(
           "p",
           { class: "cardline" },

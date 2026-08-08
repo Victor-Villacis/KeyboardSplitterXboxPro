@@ -1163,6 +1163,8 @@ pub struct StartLines {
     pub preset_line: String,
     /// Ready to save or play, or ksx-core's own reason it is not.
     pub ready_line: String,
+    /// What pressing Play actually does — moment 7's first sentence.
+    pub play_line: String,
     /// Moment 7's one fact about the pad itself.
     pub guide_line: String,
     /// The daemon refusal that makes staging impossible, if any.
@@ -1241,6 +1243,7 @@ impl StartLines {
                                  without the other."
                     .to_owned(),
             },
+            play_line: PLAY_LINE.to_owned(),
             guide_line: GUIDE_LINE.to_owned(),
             stage_error: staged.error.clone().unwrap_or_default(),
             scan_error: p.unavailable.trim().to_owned(),
@@ -1248,6 +1251,18 @@ impl StartLines {
         }
     }
 }
+
+/// **What Play does**, stated before the button rather than after it.
+///
+/// The two halves are the ones a first-run user has no way to predict: a pad
+/// appears on the ViGEm bus (so a game finds a controller that was not there a
+/// second ago) and their keyboard changes behaviour (which, under Freeze, means
+/// it stops typing). Both are reversible and the sentence says how — Stop, or
+/// the escape latch, which is the same one §3's card carries.
+const PLAY_LINE: &str =
+    "Play plugs a virtual pad for each controller above and starts capturing the keyboard you \
+     picked, so it becomes a controller. Stopping the session unplugs the pads and gives the \
+     keyboard back — and so does LeftCtrl five times, from the keyboard itself.";
 
 /// Moment 7's one fact about the pad that is not about ksx.
 ///
@@ -1451,6 +1466,11 @@ pub struct StartSlotRow {
     /// The form value.
     pub number: String,
     pub title: String,
+    /// **Both halves of moment 5 in one line.** `FIRST-RUN.md` §1 says the
+    /// controller "appears **ready**", and §2 says nothing has been plugged,
+    /// claimed or written — and a row that said only the second reads as a
+    /// half-finished thing rather than a decision that has been made.
+    pub state: String,
     pub persona: String,
     /// Whether it occupies one of Windows' four XInput slots, as a sentence.
     pub xinput: String,
@@ -1577,6 +1597,7 @@ impl StartRows {
                 .map(|slot| StartSlotRow {
                     number: slot.number.to_string(),
                     title: format!("Player {}", slot.number),
+                    state: "ready — it will exist the moment you press Play".to_owned(),
                     persona: slot.persona_label.clone(),
                     xinput: if slot.is_xinput {
                         "uses an XInput slot".to_owned()
