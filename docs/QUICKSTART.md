@@ -40,16 +40,29 @@ Two drivers, different jobs:
 
 ### ViGEmBus
 
-ksx ships the installer and verifies it against two independent pins — its
-SHA-256 and its Authenticode signer — before it will run it. It never downloads
-anything.
+**If you installed ksx from the setup `.exe` and left "Install the ViGEmBus
+controller driver" ticked, this is already done and you can skip to §2.** The
+wizard is where it happens because that is the one moment ksx has an
+administrator token — it never asks for one on its own. If the install could
+not be completed, the wizard said so on its last page and named the way back.
+
+Not sure? ksx tells you rather than making you check: the Start screen says
+before the Play button whether a controller can be created on this machine,
+and `ksx doctor` prints the same verdict with the version.
+
+The driver is bundled, never downloaded, and verified against two independent
+pins — its SHA-256 and its Authenticode signer — before anything runs it. That
+is true from the wizard and from a shell, because both go through the same
+command:
 
 ```powershell
 ksx install-drivers                 # report + verify, run nothing
 ksx install-drivers --yes           # execute (elevated terminal required)
 ```
 
-ksx never self-elevates. If it needs an admin token it says so and stops.
+ksx never self-elevates. If it needs an admin token it says so and stops — and
+with ViGEmBus already installed and healthy, the command above does nothing at
+all and says so.
 
 ### Interception
 
