@@ -619,6 +619,18 @@ impl DeviceScanView {
                 board.can_type = row.can_type;
                 board.cannot_type_reason = row.cannot_type_reason.clone();
             }
+            board.transport_label = transport_label(&board.transport);
+            // A CLAIMED board also cannot type to Windows — that is what a
+            // claim does — and it must not wear this alarm: the row already
+            // says `claimed`, the backends line already says why, and warning
+            // about the one state that is working exactly as asked is how a
+            // page teaches people to ignore its warnings.
+            board.cannot_type_line =
+                if board.claimed || board.can_type || board.cannot_type_reason.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} {CANNOT_TYPE_TAIL}", board.cannot_type_reason)
+                };
         }
         for device in &mut configured {
             let (line, level) = device_health(device);
@@ -794,6 +806,22 @@ fn found_line(count: usize) -> String {
     }
 }
 
+/// `usb` → `USB`, `bluetooth` → `Bluetooth`.
+///
+/// An unknown or empty code renders as `?` rather than defaulting to USB: a
+/// collector that forgot to set a transport is a bug, and it must LOOK like one
+/// instead of quietly mislabelling a Bluetooth device as USB — which is the
+/// label that decides whether the WinUSB advice on the same row is true.
+fn transport_label(code: &str) -> String {
+    match code {
+        c if c == crate::Transport::Usb.code() => crate::Transport::Usb.label().to_owned(),
+        c if c == crate::Transport::Bluetooth.code() => {
+            crate::Transport::Bluetooth.label().to_owned()
+        }
+        _ => "?".to_owned(),
+    }
+}
+
 fn other_summary_line(count: usize) -> String {
     match count {
         0 => String::new(),
@@ -936,7 +964,30 @@ pub struct BoardRow {
     /// Why not, when not. Filled by [`DeviceScanView::read`].
     #[serde(default)]
     pub cannot_type_reason: String,
+    /// The transport as a HUMAN reads it (`USB`, `Bluetooth`), not as a
+    /// consumer keys on it.
+    ///
+    /// Served rather than mapped per surface. The mapping is three lines, which
+    /// is exactly the size of thing that gets written in Rust and again in
+    /// TypeScript and then disagrees — and a device labelled two ways in two
+    /// places is the specific confusion this column exists to remove.
+    #[serde(default)]
+    pub transport_label: String,
+    /// The whole "it cannot type" caveat, or empty when there is nothing to
+    /// say. Filled by [`DeviceScanView::read`] — see [`CANNOT_TYPE_TAIL`].
+    #[serde(default)]
+    pub cannot_type_line: String,
 }
+
+/// What has to follow the reason a device cannot type.
+///
+/// The reason alone (`not connected (paired but absent?)`) is a fact about a
+/// devnode. This is what it MEANS to the person reading a device list before
+/// they claim their panel, and it is the whole point of listing an unusable
+/// keyboard rather than hiding it.
+pub const CANNOT_TYPE_TAIL: &str =
+    "— it is present and CANNOT type right now, so it does not count as the spare keyboard a \
+     claim needs";
 
 /// One `[[device]]` entry, resolved against the machine as it is right now.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

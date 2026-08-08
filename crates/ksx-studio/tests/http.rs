@@ -466,6 +466,8 @@ struct ScriptedMachine {
 const IPAC_KB: &str = r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000";
 const IPAC_AUX: &str = r"USB\VID_D209&PID_0430&MI_01\7&25EEA38C&0&0001";
 const FAN_HID: &str = r"USB\VID_1E71&PID_300E&MI_01\7&8FBF878&0&0001";
+/// A paired Bluetooth keyboard — the shape measured on the reference machine.
+const BT_KEYBOARD: &str = r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002045E_PID&0800\7&3562C725&0&001BDC0F1FE7_C00000000";
 
 impl ScriptedMachine {
     fn refusing() -> Self {
@@ -508,6 +510,48 @@ impl ScriptedMachine {
             // decided (docs/SURFACES.md section 1), and a fixture that computed it
             // would be re-deriving it in a third place to test the other two.
             selector: Some("usb:d209:0430:00".to_owned()),
+            // Backend eligibility from `ksx_core::Reach`, never spelled by
+            // hand — a fixture that wrote its own answer could not disagree
+            // with the page even when the page was wrong.
+            ..Self::reach(
+                ksx_api::Transport::Usb,
+                boot || state == "claimed",
+                state == "claimed",
+            )
+        }
+    }
+
+    /// A paired Bluetooth keyboard: Interception-eligible, never claimable.
+    fn bt_keyboard() -> ksx_api::UsbRow {
+        ksx_api::UsbRow {
+            instance_id: BT_KEYBOARD.to_owned(),
+            description: "Bluetooth Keyboard".to_owned(),
+            state: "interception-only".to_owned(),
+            verdict: "a Bluetooth keyboard on the Windows input stack — ksx can capture it \
+                      through Interception and split it into virtual pads"
+                .to_owned(),
+            board: Some(r"BTHENUM\001BDC0F1FE7".to_owned()),
+            boot_keyboard: true,
+            selector: Some(BT_KEYBOARD.to_owned()),
+            ..Self::reach(ksx_api::Transport::Bluetooth, true, false)
+        }
+    }
+
+    fn reach(transport: ksx_api::Transport, keyboard: bool, claimed: bool) -> ksx_api::UsbRow {
+        let reach = ksx_core::Reach {
+            transport,
+            keyboard,
+            claimed,
+            can_type: !claimed,
+        };
+        let eligibility = reach.eligibility();
+        ksx_api::UsbRow {
+            transport: transport.code().to_owned(),
+            interception_eligible: eligibility.interception,
+            winusb_eligible: eligibility.winusb,
+            backends: eligibility.line,
+            can_type: !claimed,
+            ..ksx_api::UsbRow::default()
         }
     }
 }
@@ -524,6 +568,7 @@ impl ksx_api::MachineSource for ScriptedMachine {
             return Ok(ksx_api::DeviceScanView::read(
                 "test".to_owned(),
                 false,
+                false,
                 Vec::new(),
                 Vec::new(),
                 vec!["the USB enumeration returned no interfaces".to_owned()],
@@ -536,7 +581,27 @@ impl ksx_api::MachineSource for ScriptedMachine {
         Ok(ksx_api::DeviceScanView::read(
             "test".to_owned(),
             true,
+            true,
             vec![
+                // A Bluetooth keyboard FIRST, so nothing downstream can be
+                // right by accident about which row it looked at.
+                ksx_api::BoardRow {
+                    name: "Bluetooth Keyboard".to_owned(),
+                    interfaces: vec![Self::bt_keyboard()],
+                    keyboard: Some(BT_KEYBOARD.to_owned()),
+                    keyboard_verdict: "a Bluetooth keyboard on the Windows input stack — ksx \
+                                       can capture it through Interception and split it into \
+                                       virtual pads"
+                        .to_owned(),
+                    looks_like_a_keyboard: true,
+                    claimed: false,
+                    alias: None,
+                    // Never a claim command: on this transport a claim refuses
+                    // every time it is run.
+                    claim_command: None,
+                    release_command: None,
+                    ..ksx_api::BoardRow::default()
+                },
                 ksx_api::BoardRow {
                     name: "Ultimarc I-PAC 4X".to_owned(),
                     interfaces: vec![
@@ -2207,7 +2272,7 @@ fn the_devices_page_lists_boards_not_devnodes_and_keeps_the_port_pinned_warning(
     let body = body_of(&page);
 
     assert!(body.contains("Ultimarc I-PAC 4X"), "{body}");
-    assert!(body.contains("1 keyboard-capable board"), "{body}");
+    assert!(body.contains("2 keyboard-capable boards"), "{body}");
     assert!(body.contains("1 [[device]] entry in config.toml"), "{body}");
     // The board with no keyboard interface is LISTED, not hidden: "ksx cannot
     // see my board" is a real support question.
@@ -2308,7 +2373,64 @@ fn a_failed_enumeration_never_renders_as_an_empty_cabinet() {
 
     // And the ordinary cabinet is unaffected — it still has boards and says so.
     let ok = start_server(Arc::new(ScriptedControl::new(true)));
-    assert!(body_of(&get(ok, "/devices")).contains("1 keyboard-capable board"));
+    assert!(body_of(&get(ok, "/devices")).contains("2 keyboard-capable boards"));
+}
+
+/// **The rule this page has to teach, rendered.** A Bluetooth keyboard is in
+/// the SAME list as the USB boards, its row says Interception yes / WinUSB
+/// never, and the "never" names the transport fact.
+///
+/// FAILS against the shipped page in three separate ways: the payload had no
+/// transport at all, the row had no backend line, and the enumeration behind it
+/// walked USB only so the device was not on the page to begin with.
+#[test]
+fn the_devices_page_states_which_backends_each_transport_can_use() {
+    let addr = start_server(Arc::new(ScriptedControl::new(true)));
+    let body = body_of(&get(addr, "/devices")).to_owned();
+
+    assert!(body.contains("Bluetooth Keyboard"), "{body}");
+    // The transport column, on BOTH rows — a label that only appears on the
+    // surprising one reads as a special case rather than as the rule.
+    assert!(body.contains(">Bluetooth<"), "{body}");
+    assert!(body.contains(">USB<"), "{body}");
+    // The backend line, and the reason.
+    assert!(
+        body.contains("winusb: never"),
+        "the Bluetooth row must say WinUSB never applies: {body}"
+    );
+    assert!(
+        body.contains("no USB interface to bind"),
+        "and name the transport fact rather than refusing vaguely: {body}"
+    );
+    assert!(
+        body.contains("not a missing feature"),
+        "'not supported' invites waiting for a release that cannot come: {body}"
+    );
+    assert!(
+        body.contains("interception: yes, now"),
+        "and the backend that DOES capture it today: {body}"
+    );
+    // Never an elevated claim command on that row: a claim on this device
+    // refuses every time it is run, and a page that printed one would be
+    // handing out a command that cannot work. Asserted on the row the page
+    // renders FROM, because the raw HTML also carries the hydration payload
+    // and a substring search cannot tell the two apart.
+    let json: serde_json::Value =
+        serde_json::from_str(body_of(&get(addr, "/api/devices"))).unwrap();
+    let bt = json.pointer("/scan/boards/0").expect("the Bluetooth board");
+    assert_eq!(
+        bt.pointer("/name"),
+        Some(&serde_json::json!("Bluetooth Keyboard"))
+    );
+    assert_eq!(bt.pointer("/claim_command"), Some(&serde_json::json!(null)));
+    assert_eq!(bt.pointer("/command"), Some(&serde_json::json!("")));
+    assert_eq!(bt.pointer("/command_lead"), Some(&serde_json::json!("")));
+    // …but it IS pickable, which is the whole point.
+    assert_eq!(bt.pointer("/pickable"), Some(&serde_json::json!(true)));
+    assert!(
+        body.contains(r#"action="/devices/pick""#),
+        "and the pick form is on the page: {body}"
+    );
 }
 
 /// A refusal degrades to `DeviceScanView::default()`, and that default must
@@ -2354,12 +2476,36 @@ fn api_devices_serves_the_same_payload_the_page_embeds() {
     let json: serde_json::Value =
         serde_json::from_str(body_of(&get(addr, "/api/devices"))).unwrap();
     assert_eq!(
-        json.pointer("/scan/boards/0/name"),
+        json.pointer("/scan/boards/1/name"),
         Some(&serde_json::json!("Ultimarc I-PAC 4X"))
     );
     assert_eq!(
         json.pointer("/scan/configured/0/alias"),
         Some(&serde_json::json!("panel"))
+    );
+    // Both transports, in one list, each saying which backends reach it —
+    // the poller and the SSR seam read the same fields off the same payload.
+    assert_eq!(
+        json.pointer("/scan/boards/0/transport"),
+        Some(&serde_json::json!("bluetooth"))
+    );
+    assert_eq!(
+        json.pointer("/scan/boards/0/winusb_eligible"),
+        Some(&serde_json::json!(false))
+    );
+    assert_eq!(
+        json.pointer("/scan/boards/0/interception_eligible"),
+        Some(&serde_json::json!(true))
+    );
+    assert_eq!(
+        json.pointer("/scan/boards/1/transport"),
+        Some(&serde_json::json!("usb"))
+    );
+    // Two separate reads, two separate flags: a dead Bluetooth walk must not
+    // hide behind a healthy USB one.
+    assert_eq!(
+        json.pointer("/scan/bluetooth_available"),
+        Some(&serde_json::json!(true))
     );
     // A poll is not an action.
     assert_eq!(json.pointer("/flash"), Some(&serde_json::json!(null)));

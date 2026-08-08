@@ -43,6 +43,8 @@ import { h, createSignal, createList, createShow } from "@getforma/core";
 export interface UsbRow {
   instance_id: string;
   description: string;
+  /** `usb` | `bluetooth`. Never inferred from anything else on the row. */
+  transport: string;
   state: string;
   verdict: string;
   alias: string | null;
@@ -51,6 +53,11 @@ export interface UsbRow {
   vendor?: string | null;
   board?: string | null;
   boot_keyboard: boolean;
+  interception_eligible: boolean;
+  winusb_eligible: boolean;
+  backends: string;
+  can_type: boolean;
+  cannot_type_reason: string;
 }
 
 export interface BoardRow {
@@ -68,6 +75,25 @@ export interface BoardRow {
   command_lead: string;
   command: string;
   caveat: string;
+  /** `usb` | `bluetooth` — decided by DeviceScanView::read from the interface
+   *  a pick would name. */
+  transport: string;
+  /** `USB` | `Bluetooth`, as a human reads it. SERVED, not mapped here: a
+   *  three-line mapping is exactly the size of thing that gets written twice
+   *  and then disagrees, and a device labelled two ways is the confusion this
+   *  column exists to remove. */
+  transport_label: string;
+  interception_eligible: boolean;
+  winusb_eligible: boolean;
+  /** Which backends can reach it, and with what caveat. Composed by
+   *  ksx_core::Reach — the rule is NOT derivable from `state`. */
+  backends: string;
+  can_type: boolean;
+  cannot_type_reason: string;
+  /** The whole "present but cannot type" caveat, or "". Composed by
+   *  DeviceScanView::read, which also decides that a CLAIMED board does not
+   *  get it. */
+  cannot_type_line: string;
 }
 
 export interface ConfiguredDevice {
@@ -81,6 +107,10 @@ export interface ConfiguredDevice {
   present: boolean;
   board: string | null;
   instance_id: string | null;
+  /** `usb` | `bluetooth` for the device this entry resolved to; "" while it
+   *  resolves to nothing. `backend = "winusb"` on a bluetooth one is a config
+   *  that can NEVER work, which is why health_line below reads it. */
+  transport: string;
   claimed: boolean;
   claim_command: string | null;
   release_command: string | null;
@@ -96,6 +126,11 @@ export interface ConfiguredDevice {
 export interface DeviceScanView {
   generated_at: string;
   usb_available: boolean;
+  /** A SEPARATE read from usb_available, and either can fail alone. Collapsing
+   *  them lets a dead Bluetooth walk hide behind a healthy USB one and print a
+   *  list that silently omits half the machine. Nothing here reads it directly
+   *  — boards_summary and no_pickable_board_found already account for it. */
+  bluetooth_available: boolean;
   boards: BoardRow[];
   configured: ConfiguredDevice[];
   notes: string[];
@@ -147,6 +182,7 @@ interface ConfiguredTile {
   id: string;
   backend: string;
   rung: string;
+  transport: string;
   means: string;
   presence: string;
   presenceCls: string;
@@ -167,6 +203,10 @@ interface ConfiguredTile {
 
 interface BoardTile {
   name: string;
+  transport: string;
+  backends: string;
+  cantType: string;
+  cantTypeCls: string;
   ifaces: string;
   verdict: string;
   caveat: string;
@@ -186,7 +226,11 @@ interface BoardTile {
 
 interface OtherTile {
   name: string;
+  transport: string;
   ifaces: string;
+  /** Why no backend can reach it. On Bluetooth that answer is PERMANENT, and
+   *  "ksx cannot see my device" is answered differently depending on which. */
+  backends: string;
 }
 
 interface NoteTile {
@@ -252,6 +296,10 @@ function configuredTile(d: ConfiguredDevice, i: number): ConfiguredTile {
     id: d.id,
     backend: d.backend,
     rung: d.rung,
+    // "" while the entry resolves to nothing: a transport is a fact about a
+    // device that is HERE, and a guess from the id's spelling would be a claim
+    // about hardware nobody found.
+    transport: d.transport,
     means: d.means,
     presence: present ? "connected" : "not connected right now",
     presenceCls: present ? "pill pill-ok" : "pill pill-warn",
@@ -280,8 +328,16 @@ function boardTile(b: BoardRow, i: number): BoardTile {
   const keyboard = b.keyboard ?? "";
   const [commandLead, commandCls] = optionalLine(b.command_lead, "dv-cmd");
   const [caveat, caveatCls] = optionalLine(b.caveat, "dv-warn");
+  // Both SERVED. The transport word decides whether the WinUSB half of the
+  // backends line is "after a claim" or "never", so a page that mapped either
+  // itself would be re-deciding the one rule this column exists to state.
+  const [cantType, cantTypeCls] = optionalLine(b.cannot_type_line, "dv-warn");
   return {
     name: b.name,
+    transport: b.transport_label,
+    backends: b.backends,
+    cantType,
+    cantTypeCls,
     ifaces: `${b.interfaces.length} interface(s) · keyboard on ${keyboard}`,
     verdict: b.keyboard_verdict,
     caveat,
@@ -336,7 +392,9 @@ export function applyDevices(p: DevicesPayload): void {
       .filter((b) => !b.pickable)
       .map((b) => ({
         name: b.name,
+        transport: b.transport_label,
         ifaces: `${b.interfaces.length} interface(s) · no keyboard interface`,
+        backends: b.backends,
       })),
   );
   setNoteRows(scan.notes.map((note) => ({ note })));
@@ -526,6 +584,11 @@ export function DevicesIsland() {
                       h("span", { class: "mono" }, r.backend),
                       h("span", { class: "dv-lbl" }, "rung"),
                       h("span", { class: "mono" }, r.rung),
+                      // The third fact the pill above is reasoning about:
+                      // `winusb` on a bluetooth transport is not a claim
+                      // somebody forgot, it is one nobody can perform.
+                      h("span", { class: "dv-lbl" }, "transport"),
+                      h("span", { class: "mono" }, r.transport),
                     ),
                     h("p", { class: "dv-note" }, r.means),
                     h("p", { class: r.boardCls }, r.board),
@@ -581,16 +644,27 @@ export function DevicesIsland() {
       h(
         "section",
         { class: "card wide dv-card" },
-        h("h2", null, "Boards found"),
+        h("h2", null, "Devices found"),
         h(
           "p",
           { class: "cardline" },
-          "One row per PHYSICAL board, not per devnode: an I-PAC is one device ",
+          "One row per PHYSICAL device, not per devnode: an I-PAC is one device ",
           "to you and three interfaces to Windows, and picking the wrong one of ",
           "the three is how a slot ends up silently never firing. Picking writes ",
           "the [[device]] entry. It never claims — a claim takes the board off ",
           "the Windows keyboard stack and needs an elevated shell, so this page ",
           "shows that command instead of running it.",
+        ),
+        h(
+          "p",
+          { class: "cardline" },
+          "USB and Bluetooth are in one list, and each row says which backends ",
+          "can reach it. A Bluetooth keyboard is capturable TODAY through ",
+          "Interception — it is a keyboard on the Windows input stack like any ",
+          "other, so ksx can split it into virtual pads. It can never be ",
+          "WinUSB-claimed: a claim binds a USB interface through an INF hardware ",
+          "id, and a Bluetooth device has none. That is the transport, not a ",
+          "feature waiting to be written.",
         ),
         h("p", { class: "cardline mono" }, () => boardsSummary()),
         createShow(
@@ -610,11 +684,22 @@ export function DevicesIsland() {
                       "div",
                       { class: "dv-head" },
                       h("span", { class: "dv-name" }, b.name),
+                      // The transport, on the head line, because it decides
+                      // everything below it — and on EVERY row, not only the
+                      // surprising one: a rule stated where it bites reads as
+                      // a special case rather than as the rule.
+                      h("span", { class: "pill pill-idle" }, b.transport),
                       h("span", { class: b.configuredCls }, b.configured),
                       h("span", { class: b.claimCls }, b.claimText),
                     ),
                     h("p", { class: "dv-line mono" }, b.ifaces),
                     h("p", { class: "dv-note" }, b.verdict),
+                    // Which backends can reach this device, and why the ones
+                    // that cannot, cannot. Composed by ksx_core::Reach — the
+                    // answer is not derivable from anything else on the row,
+                    // which is exactly why it is a line and not an inference.
+                    h("p", { class: "dv-note" }, b.backends),
+                    h("p", { class: b.cantTypeCls }, b.cantType),
                     h("p", { class: b.caveatCls }, b.caveat),
                     h(
                       "div",
@@ -671,12 +756,14 @@ export function DevicesIsland() {
           h(
             "section",
             { class: "card dv-card" },
-            h("h2", null, "Other USB interfaces"),
+            h("h2", null, "Other devices"),
             h(
               "p",
               { class: "cardline" },
-              "Here because \"ksx cannot see my board\" is a real question and ",
-              "the answer is sometimes \"it is there, it is just not a keyboard\".",
+              "Here because \"ksx cannot see my device\" is a real question and ",
+              "the answer is sometimes \"it is there, it is just not a keyboard\". ",
+              "Both transports are in this list: a Bluetooth speaker and a USB ",
+              "hub are equally not keyboards, and each row says which it is.",
             ),
             h("p", { class: "cardline mono" }, () => otherSummary()),
             h(
@@ -684,13 +771,15 @@ export function DevicesIsland() {
               { class: "plist dv-list" },
               createList(
                 () => otherRows(),
-                (o) => o.name + "|" + o.ifaces,
+                (o) => o.name + "|" + o.transport + "|" + o.ifaces,
                 (o) =>
                   h(
                     "li",
                     { class: "dv-row quiet" },
                     h("span", { class: "dv-name" }, o.name),
+                    h("span", { class: "pill pill-idle" }, o.transport),
                     h("span", { class: "dv-line mono" }, o.ifaces),
+                    h("span", { class: "dv-note" }, o.backends),
                   ),
               ),
             ),

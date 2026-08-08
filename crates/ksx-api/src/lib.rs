@@ -62,6 +62,9 @@ pub mod refusal;
 pub mod status;
 pub mod wire;
 
+/// The roster a device row's backend column is decided from — served, never
+/// re-decided per surface (`docs/SURFACES.md` §1, same rule as `MAX_SLOTS`).
+pub use ksx_core::Transport;
 /// **How many slots exist**, re-exported so a surface can size a list against
 /// it without naming `ksx-core`.
 ///
