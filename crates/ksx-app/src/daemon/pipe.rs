@@ -2414,6 +2414,8 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
                     key: "G".into(),
                     preset: "IPAC P2".into(),
                     function: "A".into(),
+                    scope: crate::mapping::ConflictScope::Profile,
+                    file: "games.toml".into(),
                     profile: Some("Steam".into()),
                     slot: Some(2),
                 }],

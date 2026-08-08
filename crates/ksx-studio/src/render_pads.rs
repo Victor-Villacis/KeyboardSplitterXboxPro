@@ -22,8 +22,8 @@
 //!
 //! The reason that boundary is drawn hard here rather than loosely: the number
 //! four is not a fact about a web page. `ksx pads --count 8 --persona xbox360`
-//! plugs eight pads and Windows hands four of them to nobody (open task #16),
-//! and the page's whole job is to say so BEFORE the button is pressed. A page
+//! plugs eight pads and Windows hands four of them to nobody, and the page's
+//! whole job is to say so BEFORE the button is pressed. A page
 //! that worked that out for itself would be a second answer to a question the
 //! CLI already answers, and docs/SURFACES.md §1 names that exact failure.
 

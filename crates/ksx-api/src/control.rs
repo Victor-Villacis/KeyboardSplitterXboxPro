@@ -720,13 +720,20 @@ impl From<MapResponse> for BindOutcome {
 /// One conflicting binding, as the pipe reports it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BindConflict {
-    /// Always `"profile"` from a current daemon: another slot's preset, never
-    /// auto-edited. (`"preset"` was the same-preset case, which is now a
-    /// multi-bind reported as [`BindOutcome::also_drives`] instead of a
-    /// conflict; the field stays because the wire word is contract.)
+    /// `"profile"` (another slot's preset inside a games.toml profile) or
+    /// `"config"` (inside config.toml's `[[slot]]` table) from a current
+    /// daemon. Neither is ever auto-edited. (`"preset"` was the same-preset
+    /// case, which is now a multi-bind reported as
+    /// [`BindOutcome::also_drives`] instead of a conflict; the field stays
+    /// because the wire word is contract.)
     pub scope: String,
     pub preset: String,
     pub function: String,
+    /// The file to go and edit. Empty from an old daemon, which sent none —
+    /// and an empty file name is left OUT of the line rather than printed as a
+    /// blank address.
+    #[serde(default)]
+    pub file: String,
     pub profile: Option<String>,
     pub slot: Option<u8>,
 }
@@ -737,6 +744,7 @@ impl From<crate::wire::ConflictView> for BindConflict {
             scope: view.scope,
             preset: view.preset,
             function: view.function,
+            file: view.file,
             profile: view.profile,
             slot: view.slot,
         }
@@ -744,18 +752,27 @@ impl From<crate::wire::ConflictView> for BindConflict {
 }
 
 impl BindConflict {
-    /// The dialog line: `G is "IPAC P2"'s A (slot 2 of "Steam")`.
+    /// The dialog line: `G is "IPAC P2"'s A (slot 2 of "Steam" in
+    /// games.toml)`, or `G is "IPAC P2"'s A (slot 2 in config.toml)`.
     pub fn describe(&self, key: &str) -> String {
         if self.scope == "preset" {
-            format!("{key} is already this preset's {}", self.function)
-        } else {
-            let where_ = match (&self.profile, self.slot) {
-                (Some(profile), Some(slot)) => format!(" (slot {slot} of \"{profile}\")"),
-                (Some(profile), None) => format!(" (\"{profile}\")"),
-                _ => String::new(),
-            };
-            format!("{key} is \"{}\"'s {}{where_}", self.preset, self.function)
+            return format!("{key} is already this preset's {}", self.function);
         }
+        // The file is what makes this an address; an old daemon sends none, so
+        // the line degrades to what it always said rather than to "( in )".
+        let in_file = if self.file.is_empty() {
+            String::new()
+        } else {
+            format!(" in {}", self.file)
+        };
+        let where_ = match (&self.profile, self.slot) {
+            (Some(profile), Some(slot)) => format!(" (slot {slot} of \"{profile}\"{in_file})"),
+            (Some(profile), None) => format!(" (\"{profile}\"{in_file})"),
+            (None, Some(slot)) => format!(" (slot {slot}{in_file})"),
+            (None, None) if in_file.is_empty() => String::new(),
+            (None, None) => format!(" ({})", in_file.trim_start()),
+        };
+        format!("{key} is \"{}\"'s {}{where_}", self.preset, self.function)
     }
 }
 
@@ -835,6 +852,65 @@ impl From<crate::wire::StatusResponse> for SessionView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A conflict line has to be an ADDRESS.**
+    ///
+    /// Fails against the version this replaced, whose location clause was
+    /// built from `profile`/`slot` alone: a config.toml `[[slot]]` row carries
+    /// no profile, so the whole clause collapsed to nothing and the dialog
+    /// said "G is \"IPAC P2\"'s A" — true, unactionable, and identical to what
+    /// it would say about a profile it had failed to name.
+    #[test]
+    fn a_conflict_line_names_the_file_and_the_slot_that_holds_it() {
+        let profile = BindConflict {
+            scope: "profile".into(),
+            preset: "IPAC P2".into(),
+            function: "A".into(),
+            file: "games.toml".into(),
+            profile: Some("Steam".into()),
+            slot: Some(2),
+        };
+        assert_eq!(
+            profile.describe("G"),
+            "G is \"IPAC P2\"'s A (slot 2 of \"Steam\" in games.toml)"
+        );
+
+        let config = BindConflict {
+            scope: "config".into(),
+            profile: None,
+            file: "config.toml".into(),
+            ..profile.clone()
+        };
+        assert_eq!(
+            config.describe("G"),
+            "G is \"IPAC P2\"'s A (slot 2 in config.toml)"
+        );
+
+        // An OLD daemon sends no file. The line degrades to what it always
+        // said rather than to a blank address like "( in )".
+        let old = BindConflict {
+            file: String::new(),
+            ..profile.clone()
+        };
+        assert_eq!(
+            old.describe("G"),
+            "G is \"IPAC P2\"'s A (slot 2 of \"Steam\")"
+        );
+        let bare = BindConflict {
+            file: String::new(),
+            profile: None,
+            slot: None,
+            ..profile.clone()
+        };
+        assert_eq!(bare.describe("G"), "G is \"IPAC P2\"'s A");
+
+        // The same-preset case an old daemon can still send is untouched.
+        let same = BindConflict {
+            scope: "preset".into(),
+            ..profile
+        };
+        assert_eq!(same.describe("G"), "G is already this preset's A");
+    }
 
     /// The set arithmetic behind "Add another key" and the per-key ✕. Both are
     /// read-modify-write on the control's key LIST, so the order the file holds

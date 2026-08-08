@@ -752,13 +752,19 @@ pub struct MovedFromView {
 /// One cross-slot conflict.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictView {
-    /// Always `"profile"` from a current daemon.
+    /// `"profile"` (a games.toml profile) or `"config"` (config.toml's
+    /// `[[slot]]` table) from a current daemon.
     #[serde(default)]
     pub scope: String,
     #[serde(default)]
     pub preset: String,
     #[serde(default)]
     pub function: String,
+    /// The file that holds it, as the daemon resolved it — `"config.toml"`,
+    /// `"games.toml"`, or the portable/interop spelling of either. Empty from
+    /// an OLD daemon, which sent no such field.
+    #[serde(default)]
+    pub file: String,
     #[serde(default)]
     pub profile: Option<String>,
     #[serde(default)]

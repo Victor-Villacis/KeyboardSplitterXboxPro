@@ -302,9 +302,14 @@ The M7 mapper slice adds four verbs on the same channel:
 ← {"ok":true,"message":"\"IPAC P1\": rt = D+F", …,
    "when":["F"],"unless":[],"flash":[]}   (a CHORD — see "chords" below)
 ← {"ok":false,"code":"conflict",
-   "error":"refusing to bind G: G is \"IPAC P2\"'s A (slot 2 of \"Steam\") — use --force …",
+   "error":"refusing to bind G: G is \"IPAC P2\"'s A (slot 2 of \"Steam\" in games.toml)
+            — use --force …",
    "conflicts":[{"scope":"profile","preset":"IPAC P2","function":"A",
-                 "profile":"Steam","slot":2}]}
+                 "file":"games.toml","profile":"Steam","slot":2}]}
+← {"ok":false,"code":"conflict",       (the same refusal from the OTHER slot list)
+   "error":"refusing to bind G: G is \"IPAC P2\"'s A (slot 2 in config.toml) — …",
+   "conflicts":[{"scope":"config","preset":"IPAC P2","function":"A",
+                 "file":"config.toml","profile":null,"slot":2}]}
 
 → {"verb":"learn-key"}      (refused while a session runs — see semantics below)
 ← {"ok":true,"state":"listening","generation":3,"remaining_ms":9998,
@@ -575,14 +580,20 @@ if it names the function being bound, a function that does not hold that key
 `bad-move-from`, exit 2.
 
 **The one conflict left is CROSS-SLOT, and it still blocks**: the key bound in
-another slot's preset within any games.toml profile that uses the target
-preset. That preset is **never auto-edited** — `force` writes the target
-anyway and keeps reporting the double binding (`conflicts`, `scope` always
-`"profile"` now); silently rewriting a preset the caller did not name would be
-worse. So `force` means exactly one thing — "yes, both slots should see that
-key" — and it **removes no binding, anywhere, ever**. The genuinely
-destructive writes are their own verbs (`map-restore`, `map-clear-all`), each
-taking a timestamped backup first.
+another slot's preset, within a slot list that also uses the target preset.
+**A machine has two slot lists and both are searched** — config.toml's
+`[[slot]]` table (`"scope":"config"`, the panel whenever no profile was
+chosen) and each games.toml profile (`"scope":"profile"`). Every row carries
+`file`, the file name as the daemon RESOLVED it (`config.toml`, `games.toml`,
+or the portable/interop spelling of either), because "another slot" is not an
+address a user can act on; a row from an old daemon has no `file` and the line
+degrades to what it always said. That preset is **never auto-edited** —
+`force` writes the target anyway and keeps reporting the double binding;
+silently rewriting a preset the caller did not name would be worse. So `force`
+means exactly one thing — "yes, both slots should see that key" — and it
+**removes no binding, anywhere, ever**. The genuinely destructive writes are
+their own verbs (`map-restore`, `map-clear-all`), each taking a timestamped
+backup first.
 
 ### `"reload":true` — the binding hot-swap (2026-08-05)
 

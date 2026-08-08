@@ -375,6 +375,7 @@ impl ControlSource for ScriptedControl {
                     scope: "profile".into(),
                     preset: "IPAC P2".into(),
                     function: "A".into(),
+                    file: "games.toml".into(),
                     profile: Some("Steam".into()),
                     slot: Some(2),
                 }],

@@ -201,10 +201,15 @@ driver" is not the line. The two that matter are:
   unplugs; the worst case is four pads a game cannot see, which the page says
   out loud before the click.
 - **Can the surface state the consequence in advance?** `ksx pads --count 8
-  --persona xbox360` plugs eight pads and Windows hands four of them to nobody
-  (open task #16). That is the exact failure a web page is *better* at than a
-  console: the option can carry its own label. The backend composes it
-  (`MachineSource::pads_view`); the page renders it.
+  --persona xbox360` plugs eight pads and Windows hands four of them to nobody.
+  That is the exact failure a web page is *better* at than a console: the
+  option can carry its own label. The backend composes it
+  (`MachineSource::pads_view`); the page renders it. The console says the same
+  thing from the same constant before it plugs (`pads::ceiling_warning`, task
+  #16) — a warning, not a refusal, because plugging dead pads on purpose is a
+  legitimate thing to ask a *test* command for. The configuration layer is
+  where that ceiling refuses (`ksx_config::Issue::TooManyXinputSlots`), and the
+  split is the general rule: a test verb warns, a verb that persists refuses.
 
 Elevation does not change the answer either — it changes the wording. A prune
 restarts a bus devnode, which needs an administrator token, and ksx never
