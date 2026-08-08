@@ -196,6 +196,16 @@ pub struct StagedSetupView {
     /// The lowest slot number "Add a controller" would use, or `None` when
     /// every slot is staged.
     pub next_slot: Option<u8>,
+    /// The preset name "Add a controller" would use, or `None` when there is no
+    /// free slot.
+    ///
+    /// **Served, because it becomes a FILE NAME.** A save writes one preset per
+    /// staged slot (`ksx-app`'s `stage::apply`), so this string is the name of
+    /// something that lands on disk — and a surface that invented it would be
+    /// deciding, in TypeScript, what a first-run user's files are called. The
+    /// first-run user is the whole audience here and `FIRST-RUN.md` §1 gives
+    /// them no keyboard-and-shell step to rename anything afterwards.
+    pub next_preset: Option<String>,
     /// How many staged slots occupy one of Windows' four XInput slots.
     pub xinput_used: usize,
     /// **Served, never hardcoded**: `ksx_core::MAX_SLOTS`.
@@ -246,6 +256,7 @@ impl StagedSetupView {
                 .collect(),
             blocking: setup.blocking().map(|b| b.as_str().to_owned()),
             next_slot: setup.next_free_slot(),
+            next_preset: setup.next_free_slot().map(preset_name_for_slot),
             xinput_used: setup.xinput_slots(),
             max_slots: MAX_SLOTS,
             max_xinput_slots: MAX_XINPUT_SLOTS,
@@ -390,6 +401,16 @@ impl StageEdit {
             Self::Discard => Ok(setup.discard()),
         }
     }
+}
+
+/// The preset a controller staged into slot `number` binds, by default.
+///
+/// "Player 1", not "slot1" or "preset-1": it is shown to someone who has never
+/// seen ksx, and it is the name of the file the mapper will then list. One
+/// implementation, because the string is on the staging screen, in the flash
+/// after a save, and on a file.
+pub fn preset_name_for_slot(number: u8) -> String {
+    format!("Player {number}")
 }
 
 fn parse_persona(name: &str) -> Result<Persona, Refusal> {
@@ -591,6 +612,10 @@ mod tests {
         assert_eq!(view.device.as_ref().unwrap().rung, "model");
         assert!(view.device.as_ref().unwrap().survives_replug);
         assert_eq!(view.next_slot, Some(1));
+        // The preset name travels WITH the slot number, because it is the name
+        // of the file a save writes. A surface that composed "Player 1" for
+        // itself would be naming someone's files in TypeScript.
+        assert_eq!(view.next_preset.as_deref(), Some("Player 1"));
         assert!(!view.ready, "a keyboard with no controller drives nothing");
         assert!(view.not_ready.as_deref().unwrap().contains("controller"));
 
