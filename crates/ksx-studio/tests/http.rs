@@ -928,6 +928,9 @@ impl ksx_api::MachineSource for FixedMachine {
             confirm_line: "This removes 2 pad(s) by restarting the ViGEmBus devnode. Every pad \
                            listed here goes, at once:"
                 .into(),
+            // Empty: this fixture ANSWERS. Only `PadsView::unreadable` fills
+            // the banner heading.
+            unreadable_heading: String::new(),
             prune: ksx_api::PrunePlanView {
                 kind: "restart".into(),
                 count: 2,

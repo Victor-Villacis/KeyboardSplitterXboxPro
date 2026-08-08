@@ -81,6 +81,10 @@ export interface PadsView {
   elevated: boolean | null;
   elevation_line: string;
   confirm_line: string;
+  /** The failed-read banner's heading — composed by `PadsView::unreadable`,
+   *  empty on a read that answered. The h2 renders it verbatim; this file
+   *  owns no copy of the sentence. */
+  unreadable_heading: string;
   prune: PrunePlanView;
   spawn: SpawnOffer;
 }
@@ -137,6 +141,7 @@ const [elevationLine, setElevationLine] = createSignal("not collected");
 const [spawnNote, setSpawnNote] = createSignal("not collected");
 const [spawnRefusal, setSpawnRefusal] = createSignal("");
 const [confirmLine, setConfirmLine] = createSignal("");
+const [unreadableHeading, setUnreadableHeading] = createSignal("");
 const [unavailableLine, setUnavailableLine] = createSignal("");
 const [flashLine, setFlashLine] = createSignal("");
 
@@ -144,6 +149,7 @@ const [pillRunning, setPillRunning] = createSignal(false);
 const [pillIdle, setPillIdle] = createSignal(false);
 const [pillDown, setPillDown] = createSignal(false);
 const [unavailable, setUnavailable] = createSignal(false);
+const [busRead, setBusRead] = createSignal(false);
 const [flashOk, setFlashOk] = createSignal(false);
 const [flashError, setFlashError] = createSignal(false);
 const [canSpawn, setCanSpawn] = createSignal(false);
@@ -201,6 +207,7 @@ export function applyPads(p: PadsPayload): void {
   setSpawnNote(v.spawn.note);
   setSpawnRefusal(v.spawn.refused ?? "");
   setConfirmLine(v.confirm_line);
+  setUnreadableHeading(v.unreadable_heading ?? "");
   setUnavailableLine(p.unavailable ?? "");
 
   if (p.confirm) armed = true;
@@ -210,6 +217,11 @@ export function applyPads(p: PadsPayload): void {
   setPillIdle(session.reachable && !session.running);
   setPillDown(!session.reachable);
   setUnavailable(!readable);
+  // The ceiling card's standing paragraph is a claim about this machine's
+  // spawn menu, so it renders only when the read HAPPENED — under a failed
+  // read it would contradict the xinput_line two lines above it, which is
+  // busy saying ksx cannot count the slots.
+  setBusRead(readable);
   setCanSpawn(v.spawn.refused === null || v.spawn.refused === undefined);
   setSpawnBlocked(v.spawn.refused !== null && v.spawn.refused !== undefined);
   // "Nothing for this panel to do right now" is an assertion of absence, so it
@@ -320,6 +332,9 @@ export function PadsIsland() {
         h("a", { class: "navlink", href: "/" }, "Status"),
         h("a", { class: "navlink", href: "/map" }, "Mapper"),
         h("a", { class: "navlink on", href: "/pads", "aria-current": "page" }, "Pads"),
+        h("a", { class: "navlink", href: "/devices" }, "Devices"),
+        h("a", { class: "navlink", href: "/profiles" }, "Profiles"),
+        h("a", { class: "navlink", href: "/setup" }, "Setup"),
       ),
       createShow(
         () => pillRunning(),
@@ -345,7 +360,10 @@ export function PadsIsland() {
           h(
             "section",
             { class: "card alarm" },
-            h("h2", null, "ksx could not read the ViGEm bus."),
+            // The heading is the PROVIDER's (`PadsView::unreadable_heading`),
+            // like every other sentence here — it was hardcoded once and that
+            // was a second copy of a machine.rs string in another language.
+            h("h2", null, () => unreadableHeading()),
             h("p", { class: "alarmlead" }, () => unavailableLine()),
             h(
               "p",
@@ -443,14 +461,23 @@ export function PadsIsland() {
         { class: "card warnbox" },
         h("h2", null, "The XInput ceiling"),
         h("p", { class: "warn" }, () => xinputLine()),
-        h(
-          "p",
-          { class: "cardline" },
-          "This is why every count below carries its own label. ksx will plug ",
-          "whatever you ask for — it does not refuse a fifth Xbox pad — and ",
-          "Windows will still only ever hand four of them to a game. ",
-          "PlayStation pads are the way past it: they are plain HID, so eight ",
-          "players is eight readable pads.",
+        // Gated on the read having HAPPENED: this paragraph claims the counts
+        // below carry labels and that four is the number games see, and under
+        // a failed read the spawn offer is refused (no counts exist) while
+        // the xinput_line above says ksx cannot count the slots. A standing
+        // paragraph that contradicts the banner is the banner losing.
+        createShow(
+          () => busRead(),
+          () =>
+            h(
+              "p",
+              { class: "cardline" },
+              "This is why every count below carries its own label. ksx will plug ",
+              "whatever you ask for — it does not refuse a fifth Xbox pad — and ",
+              "Windows will still only ever hand four of them to a game. ",
+              "PlayStation pads are the way past it: they are plain HID, so eight ",
+              "players is eight readable pads.",
+            ),
         ),
       ),
       // ── SPAWN: the pad test, bounded ────────────────────────────────────
@@ -469,6 +496,13 @@ export function PadsIsland() {
                 "label",
                 { class: "bindlabel", for: "count" },
                 "how many",
+                // These three option lists key on value AND label (the key
+                // rule above), so a relabelled option is a REBUILT option —
+                // and a rebuilt <option> list resets its <select> to the
+                // first entry. pads.ts captures the user's choice before
+                // every applyPads and restores it after, so a 2 s reading
+                // that moved does not discard what they picked
+                // (render_pads.rs pins the pairing).
                 h(
                   "select",
                   { id: "count", name: "count" },

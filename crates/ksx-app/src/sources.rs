@@ -787,6 +787,9 @@ impl ksx_api::MachineSource for LocalMachine {
             elevated,
             elevation_line: surface::elevation_line(elevated),
             confirm_line: surface::confirm_line(prune.count),
+            // Empty on purpose: this read ANSWERED. The heading belongs to
+            // `PadsView::unreadable` alone.
+            unreadable_heading: String::new(),
             prune,
             spawn: surface::spawn_offer(session_running, xinput_in_use, report.count),
         })

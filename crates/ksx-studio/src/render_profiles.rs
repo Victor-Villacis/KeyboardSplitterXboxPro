@@ -749,6 +749,7 @@ mod tests {
         let out = render_profiles(&page(), &sample(), None);
         assert!(out.html.contains(r#"href="/""#), "{}", out.html);
         assert!(out.html.contains(r#"href="/map""#), "{}", out.html);
+        assert!(out.html.contains(r#"href="/pads""#), "{}", out.html);
         assert!(out.html.contains(r#"aria-current="page""#), "{}", out.html);
     }
 

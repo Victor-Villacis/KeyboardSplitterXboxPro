@@ -1078,6 +1078,16 @@ pub struct PadsView {
     /// every pad at once. Also not neutral formatting.
     #[serde(default)]
     pub confirm_line: String,
+    /// The failed-read banner's HEADING — "ksx could not read the ViGEm bus."
+    /// — set by [`Self::unreadable`] and empty on a read that answered.
+    ///
+    /// A field because the sentence used to exist twice: composed here, and
+    /// hardcoded again as an `<h2>` in `PadsIsland.ts`. Two copies of one
+    /// sentence in two languages is the drift docs/SURFACES.md §1a names, and
+    /// a heading is not an exception to it — reword this constructor and a
+    /// page with its own copy would keep announcing the old wording forever.
+    #[serde(default)]
+    pub unreadable_heading: String,
     pub prune: PrunePlanView,
     pub spawn: SpawnOffer,
 }
@@ -1118,6 +1128,7 @@ impl PadsView {
             elevated: None,
             elevation_line: String::new(),
             confirm_line: String::new(),
+            unreadable_heading: failed.to_owned(),
             prune: PrunePlanView {
                 kind: "unreadable".to_owned(),
                 count: 0,
@@ -1511,6 +1522,9 @@ mod tests {
             ("owners_line", &view.owners_line),
             ("xinput_line", &view.xinput_line),
             ("prune.detail", &view.prune.detail),
+            // The banner's heading is composed HERE, once — the page renders
+            // it and owns no copy of the sentence.
+            ("unreadable_heading", &view.unreadable_heading),
         ] {
             assert!(
                 line.contains("could not read"),

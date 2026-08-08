@@ -388,6 +388,7 @@ export function SetupIsland() {
         { class: "topnav", "aria-label": "screens" },
         h("a", { class: "navlink", href: "/" }, "Status"),
         h("a", { class: "navlink", href: "/map" }, "Mapper"),
+        h("a", { class: "navlink", href: "/pads" }, "Pads"),
         h("a", { class: "navlink", href: "/devices" }, "Devices"),
         h("a", { class: "navlink", href: "/profiles" }, "Profiles"),
         h("a", { class: "navlink on", href: "/setup", "aria-current": "page" }, "Setup"),

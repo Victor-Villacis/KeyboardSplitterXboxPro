@@ -4250,7 +4250,13 @@ mod tests {
     #[test]
     fn the_nav_reaches_every_screen() {
         let out = render_map(&page(), &sample(), None);
-        for href in [r#"href="/""#, r#"href="/pads""#] {
+        for href in [
+            r#"href="/""#,
+            r#"href="/pads""#,
+            r#"href="/devices""#,
+            r#"href="/profiles""#,
+            r#"href="/setup""#,
+        ] {
             assert!(out.html.contains(href), "missing {href}: {}", out.html);
         }
         assert!(

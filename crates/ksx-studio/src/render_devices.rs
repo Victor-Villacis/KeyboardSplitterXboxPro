@@ -1202,6 +1202,7 @@ mod tests {
         let out = render_devices(&page, &cabinet(), None);
         assert!(out.html.contains(r#"href="/""#), "{}", out.html);
         assert!(out.html.contains(r#"href="/map""#), "{}", out.html);
+        assert!(out.html.contains(r#"href="/pads""#), "{}", out.html);
         assert!(
             out.html.contains(r#"aria-current="page""#),
             "the current route must be marked: {}",

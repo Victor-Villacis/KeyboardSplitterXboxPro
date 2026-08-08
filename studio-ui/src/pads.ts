@@ -22,9 +22,48 @@ void PadsPage; // compile-time anchor only (see above)
  *  list IS the feedback. */
 const POLL_MS = 2000;
 
+/** The three spawn `<select>`s, by the ids PadsIsland.ts renders. */
+const SPAWN_SELECTS = ["count", "persona", "hold_secs"] as const;
+
+/** What the user has picked in each spawn `<select>`, right now.
+ *
+ *  Needed because the option rows key on value AND label (the reconcile rule
+ *  in PadsIsland.ts): a label that tracks the machine is a row that REBUILDS
+ *  when the reading moves, and a rebuilt `<option>` list resets its `<select>`
+ *  to the first entry. Without this, every poll on which the XInput occupancy
+ *  or the bus headroom changed silently discarded the user's choice while
+ *  they were lining up a click. render_pads.rs pins this pairing by name. */
+function spawnChoices(): Map<string, string> {
+  const chosen = new Map<string, string>();
+  for (const id of SPAWN_SELECTS) {
+    const el = document.getElementById(id) as HTMLSelectElement | null;
+    if (el && el.value !== "") chosen.set(id, el.value);
+  }
+  return chosen;
+}
+
+/** Put the user's choice back — but only where the fresh offer still carries
+ *  it. A value the backend withdrew stays withdrawn: the first option is the
+ *  backend's default, and resurrecting a vanished choice would re-offer a
+ *  click the provider just took off the table. */
+function restoreSpawnChoices(chosen: Map<string, string>): void {
+  for (const [id, value] of chosen) {
+    const el = document.getElementById(id) as HTMLSelectElement | null;
+    if (!el) continue;
+    if (Array.from(el.options).some((o) => o.value === value)) {
+      el.value = value;
+    }
+  }
+}
+
 async function poll(): Promise<void> {
   try {
-    applyPads(await fetchJSON<PadsPayload>("/api/pads"));
+    const payload = await fetchJSON<PadsPayload>("/api/pads");
+    // Capture BEFORE applyPads: the signal writes inside it patch the lists
+    // synchronously, and the reset-to-first happens as part of that patch.
+    const chosen = spawnChoices();
+    applyPads(payload);
+    restoreSpawnChoices(chosen);
   } catch {
     applyUnreachable();
   }

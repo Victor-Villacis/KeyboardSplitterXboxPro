@@ -54,7 +54,7 @@ const ISLAND_COMPONENT: &str = "PadsIsland";
 
 /// How many `createShow` pairs this page has; the layout test pins both the
 /// count and every name.
-const SHOW_COUNT: usize = 13;
+const SHOW_COUNT: usize = 14;
 
 /// Bare-named slots this page renders and the seam deliberately never fills.
 /// EMPTY, and that is the claim: every signal `PadsIsland.ts` binds to the DOM
@@ -89,6 +89,10 @@ fn scalar_slots(payload: &PadsPayload) -> serde_json::Value {
         "spawnNote": view.spawn.note,
         "spawnRefusal": view.spawn.refused.clone().unwrap_or_default(),
         "confirmLine": view.confirm_line,
+        // The banner's h2. The PROVIDER's sentence (`PadsView::unreadable`),
+        // never this file's or the island's — a heading is not exempt from
+        // "this seam words nothing".
+        "unreadableHeading": view.unreadable_heading,
         "unavailableLine": payload.unavailable.clone().unwrap_or_default(),
         "flashLine": payload.flash.clone().unwrap_or_default(),
     })
@@ -209,6 +213,13 @@ fn show_values(payload: &PadsPayload) -> [(&'static str, bool); SHOW_COUNT] {
         ("show:flashError", flash_err),
         ("show:canSpawn", can_spawn),
         ("show:spawnBlocked", !can_spawn),
+        // The ceiling card's standing paragraph ("ksx will plug whatever you
+        // ask for … Windows will still only ever hand four of them to a
+        // game") is a CLAIM about this machine's spawn menu, so it is gated
+        // on the read having happened: under a failed read it would sit two
+        // lines below an xinput_line saying ksx cannot count the slots,
+        // flatly contradicting it.
+        ("show:busRead", readable),
         // "Nothing for this panel to do right now" is an assertion of
         // absence, so it is gated on the read having HAPPENED. A refused read
         // gets the banner; it does not get told its bus is clean.
@@ -346,6 +357,7 @@ mod tests {
             confirm_line: "This removes 2 pad(s) by restarting the ViGEmBus devnode. Every pad \
                            listed here goes, at once:"
                 .into(),
+            unreadable_heading: String::new(),
             prune: ksx_api::PrunePlanView {
                 kind: "restart".into(),
                 count: 2,
@@ -865,6 +877,14 @@ mod tests {
             "Nothing for this panel to do",
             // The summary, counting a bus that was never counted.
             "no virtual pads on the ViGEm bus",
+            // The ceiling card's standing paragraph. "Every count below
+            // carries its own label" is a sentence about a spawn menu that is
+            // NOT below (the offer is refused), and "Windows will still only
+            // ever hand four of them to a game" is machine advice under a
+            // banner saying the machine could not be read — the exact
+            // contradiction the `show:busRead` gate exists to prevent.
+            "carries its own label",
+            "PlayStation pads are the way past it",
         ] {
             assert!(
                 !out.contains(absence),
@@ -926,8 +946,15 @@ mod tests {
     fn the_nav_reaches_the_other_screens() {
         let page = EmbeddedPage::load("/pads").unwrap();
         let out = render_pads(&page, &payload());
-        assert!(out.html.contains(r#"href="/""#), "{}", out.html);
-        assert!(out.html.contains(r#"href="/map""#), "{}", out.html);
+        for href in [
+            r#"href="/""#,
+            r#"href="/map""#,
+            r#"href="/devices""#,
+            r#"href="/profiles""#,
+            r#"href="/setup""#,
+        ] {
+            assert!(out.html.contains(href), "missing {href}: {}", out.html);
+        }
         assert!(
             out.html.contains(r#"aria-current="page""#),
             "the current screen must be marked: {}",
@@ -997,6 +1024,51 @@ mod tests {
         assert!(
             !PADS_ISLAND_TS.contains("no known splitter"),
             "PadsIsland.ts still composes the owner line itself"
+        );
+        assert!(
+            !PADS_ISLAND_TS.contains("could not read the ViGEm bus"),
+            "PadsIsland.ts still hardcodes the failed-read banner heading — it is \
+             `PadsView::unreadable_heading` now, and a second copy in TypeScript is \
+             the drift docs/SURFACES.md §1a names"
+        );
+    }
+
+    /// **The poller must hand back the user's `<select>` choice.**
+    ///
+    /// The key rule above makes every option row rebuild when its label
+    /// changes — that is the point, the label IS the warning — but a rebuilt
+    /// `<option>` list resets its `<select>` to the first entry. On a page
+    /// whose labels track a 2 s reading, that silently discarded whatever the
+    /// user had picked every time the XInput occupancy or the bus headroom
+    /// moved between polls. `pads.ts` owns the fix: capture the three spawn
+    /// selects before `applyPads`, restore any still-offered value after.
+    ///
+    /// A source lint, same justification as the key rule: the failure is a
+    /// browser behaviour and the repo's only browser harness needs a runtime
+    /// CI does not have.
+    #[test]
+    fn the_poller_restores_the_spawn_choice_the_rebuild_discards() {
+        const PADS_TS: &str = include_str!("../../../studio-ui/src/pads.ts");
+        let capture = PADS_TS
+            .find("const chosen = spawnChoices()")
+            .expect("pads.ts must capture the spawn selects before applying a payload");
+        let apply = PADS_TS[capture..]
+            .find("applyPads(")
+            .map(|at| capture + at)
+            .expect("pads.ts must apply the payload after capturing");
+        let restore = PADS_TS[apply..]
+            .find("restoreSpawnChoices(chosen)")
+            .map(|at| apply + at)
+            .expect("pads.ts must restore the captured choices after applying");
+        assert!(
+            capture < apply && apply < restore,
+            "capture must precede applyPads and the restore must follow it"
+        );
+        // And the restore must never resurrect a value the offer withdrew —
+        // the backend's ordering IS the default when the choice is gone.
+        assert!(
+            PADS_TS.contains("some((o) => o.value === value)"),
+            "restoreSpawnChoices must check the option still exists before selecting it"
         );
     }
 }
