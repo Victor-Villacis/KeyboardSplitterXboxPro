@@ -167,6 +167,12 @@ pub struct ProfilesDerived {
     pub broken_summary: String,
     pub presets_summary: String,
     pub templates_summary: String,
+    /// The sentence above the template list, roster included. It was static
+    /// copy in `ProfilesIsland.ts` naming four templates while the registry
+    /// ships six — the copy-is-logic drift docs/SURFACES.md §1a is about,
+    /// already stale on the day it was reviewed. Composed here from the same
+    /// list the rows and the `<select>` options are built from.
+    pub templates_intro: String,
     /// The exact `ksx daemon …` line for this cabinet.
     pub daemon_cmd: String,
     /// `ksx_core::MAX_SLOTS`, as the slot-count input's `max`. The ONE place
@@ -289,6 +295,7 @@ impl ProfilesDerived {
             broken_summary: broken_summary(broken.len()),
             presets_summary: presets_summary(p.presets.presets.len(), presets_failed),
             templates_summary: templates_summary(p.presets.templates.len(), presets_failed),
+            templates_intro: templates_intro(&p.presets.templates, presets_failed),
             daemon_cmd: crate::render::daemon_command(&p.session),
             max_slots: ksx_api::MAX_SLOTS,
             max_player: p
@@ -448,6 +455,33 @@ fn templates_summary(count: usize, failed: bool) -> String {
     }
 }
 
+/// The intro sentence for the template card, ROSTER INCLUDED.
+///
+/// The roster was static copy in the island — "an I-PAC on its factory chart,
+/// MAME's four-player chart, a desk keyboard, and two players sharing one
+/// keyboard" — which names four templates. `ksx_core::templates::TEMPLATES`
+/// ships six; `default` and `empty` are templates too, and both were already
+/// in the form's `<select>` below the sentence that omitted them. That is
+/// docs/SURFACES.md §1a drift that had ALREADY happened, in the very change
+/// that added §1a. The ids are the roster here because they are the string
+/// the rows below lead with and the value the `<select>` submits.
+///
+/// When the read that carries the templates refused, the sentence claims no
+/// roster at all: enumerating from a failed read would be §1b's bug in copy.
+fn templates_intro(templates: &[ksx_api::TemplateRow], failed: bool) -> String {
+    const CLOSE: &str =
+        "Instantiating one writes an ordinary, editable preset file; from then on it is yours.";
+    if failed || templates.is_empty() {
+        return format!("The layouts that ship in the binary. {CLOSE}");
+    }
+    let ids: Vec<&str> = templates.iter().map(|t| t.id.as_str()).collect();
+    let roster = match ids.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => ids.concat(),
+    };
+    format!("The layouts that ship in the binary — {roster}. {CLOSE}")
+}
+
 /// A profile's state as the pill class that carries it.
 ///
 /// `launcher` gets the NEUTRAL pill, not the OK one, and that is not a style
@@ -498,6 +532,39 @@ fn player_range(players: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The template-card intro's roster is DERIVED, never copy. Every offered
+    /// template's id is in the sentence — so a seventh template shows up
+    /// without anyone remembering prose — and a FAILED read enumerates
+    /// nothing, because a roster composed from a read that refused would be
+    /// §1b's bug wearing §1a's clothes.
+    #[test]
+    fn the_template_intro_names_every_offered_template_and_none_on_a_failed_read() {
+        let row = |id: &str| ksx_api::TemplateRow {
+            id: id.to_owned(),
+            label: String::new(),
+            detail: String::new(),
+            players: vec![1],
+        };
+        let templates = [row("arcade-6button"), row("keyboard-2p"), row("empty")];
+
+        let intro = templates_intro(&templates, false);
+        for t in &templates {
+            assert!(intro.contains(&t.id), "{} missing from: {intro}", t.id);
+        }
+        assert!(
+            intro.contains("keyboard-2p and empty"),
+            "the roster reads as a sentence: {intro}"
+        );
+
+        let refused = templates_intro(&templates, true);
+        for t in &templates {
+            assert!(
+                !refused.contains(&t.id),
+                "a failed read must not enumerate templates: {refused}"
+            );
+        }
+    }
 
     /// The payload's field names are client contract (StatusIsland.ts reads
     /// them); pin the envelope on top of the snapshot's own pinned names

@@ -136,6 +136,11 @@ export interface ProfilesDerived {
   broken_summary: string;
   presets_summary: string;
   templates_summary: string;
+  /** The template-card intro, ROSTER INCLUDED. It was static copy here that
+   *  named four templates while the registry ships six — SURFACES.md §1a
+   *  drift, live in the first review. snapshot.rs composes it from the same
+   *  list `template_rows` renders. */
+  templates_intro: string;
   daemon_cmd: string;
   /** `ksx_core::MAX_SLOTS`. The ONE place this number comes from. */
   max_slots: number;
@@ -192,6 +197,7 @@ const [profilesSummary, setProfilesSummary] = createSignal("not collected");
 const [brokenSummary, setBrokenSummary] = createSignal("");
 const [presetsSummary, setPresetsSummary] = createSignal("not collected");
 const [templatesSummary, setTemplatesSummary] = createSignal("not collected");
+const [templatesIntro, setTemplatesIntro] = createSignal("not collected");
 const [profilesError, setProfilesError] = createSignal("");
 const [presetsError, setPresetsError] = createSignal("");
 // NO compile-time ceiling. These were `createSignal("16")` and `max: "4"`,
@@ -247,6 +253,7 @@ export function applyProfiles(p: ProfilesPayload): void {
   setBrokenSummary(d.broken_summary);
   setPresetsSummary(d.presets_summary);
   setTemplatesSummary(d.templates_summary);
+  setTemplatesIntro(d.templates_intro);
   setProfilesError(p.profiles_error ?? "");
   setPresetsError(p.presets_error ?? "");
   setMaxSlots(String(d.max_slots));
@@ -330,6 +337,7 @@ export function ProfilesIsland() {
         { class: "topnav", "aria-label": "screens" },
         h("a", { class: "navlink", href: "/" }, "Status"),
         h("a", { class: "navlink", href: "/map" }, "Mapper"),
+        h("a", { class: "navlink", href: "/devices" }, "Devices"),
         h(
           "a",
           { class: "navlink on", href: "/profiles", "aria-current": "page" },
@@ -471,8 +479,9 @@ export function ProfilesIsland() {
               h(
                 "p",
                 { class: "cardline" },
-                "Nothing below this line is a statement about your profiles. ",
-                "The file ksx tried to read is ",
+                "This is not an empty games.toml — it is a read that refused, ",
+                "so ksx does not know what is in it. The file it tried to ",
+                "read is ",
                 h("span", { class: "mono" }, () => gamesPath()),
                 ".",
               ),
@@ -723,14 +732,13 @@ export function ProfilesIsland() {
         "section",
         { class: "card wide" },
         h("h2", null, "New preset from a template"),
-        h(
-          "p",
-          { class: "cardline" },
-          "The layouts that ship in the binary — an I-PAC on its factory ",
-          "chart, MAME's four-player chart, a desk keyboard, and two players ",
-          "sharing one keyboard. Instantiating one writes an ordinary, ",
-          "editable preset file; from then on it is yours.",
-        ),
+        // SERVED, roster and all. This paragraph used to be static copy that
+        // named four templates — while the registry ships six, and the
+        // <select> below already offered all six. A roster in prose is the
+        // template list implemented a second time in copy, which is exactly
+        // the drift docs/SURFACES.md §1a bans; snapshot.rs composes this
+        // sentence from the same list the rows below render.
+        h("p", { class: "cardline" }, () => templatesIntro()),
         h("p", { class: "cardline mono" }, () => templatesSummary()),
         // The summary above ends in a colon and used to be followed by a
         // FORM. `TemplateRow.detail` — the panel note ksx-api describes as

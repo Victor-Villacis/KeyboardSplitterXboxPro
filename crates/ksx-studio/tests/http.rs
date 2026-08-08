@@ -2507,10 +2507,15 @@ fn a_rebound_host_cannot_read_the_profiles() {
 fn every_page_links_to_every_other_page() {
     let control = Arc::new(ScriptedControl::new(true));
     let addr = start_server(control);
-    for route in ["/", "/map", "/profiles"] {
+    for route in ["/", "/map", "/devices", "/profiles"] {
         let response = get(addr, route);
         let body = body_of(&response);
-        for link in [r#"href="/""#, r#"href="/map""#, r#"href="/profiles""#] {
+        for link in [
+            r#"href="/""#,
+            r#"href="/map""#,
+            r#"href="/devices""#,
+            r#"href="/profiles""#,
+        ] {
             assert!(
                 body.contains(link),
                 "{route} does not link to {link} — the page is unreachable from it"

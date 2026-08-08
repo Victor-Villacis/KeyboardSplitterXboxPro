@@ -83,6 +83,9 @@ fn scalar_slots(view: &ProfilesPayload, flash: Option<&str>) -> serde_json::Valu
         "brokenSummary": d.broken_summary,
         "presetsSummary": d.presets_summary,
         "templatesSummary": d.templates_summary,
+        // Roster included — the island used to carry it as static copy, four
+        // templates named while the registry ships six (SURFACES.md §1a).
+        "templatesIntro": d.templates_intro,
         // The refusal sentences themselves. Empty when the read succeeded;
         // shown by `show:profilesUnreadable` / `show:presetsUnreadable`.
         "profilesError": view.profiles_error.clone().unwrap_or_default(),
