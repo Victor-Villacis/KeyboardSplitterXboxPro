@@ -1381,9 +1381,25 @@ enum SlotCommand {
             help = slot_arg::ASSIGN_SLOT.as_str(),
         )]
         slot: u8,
-        /// Preset name — `ksx preset list` names them (case-insensitive)
-        #[arg(long, value_name = "NAME")]
-        preset: String,
+        /// Preset name — `ksx preset list` names them (case-insensitive).
+        /// Omit it to keep the preset the slot already uses (with --persona)
+        #[arg(long, value_name = "NAME", required_unless_present = "persona")]
+        preset: Option<String>,
+        /// Which controller this slot presents itself as: xbox360,
+        /// playstation, dualsense, switchpro, xboxseries
+        ///
+        /// Aliases are accepted (ds4, ps4, "Xbox 360", xsx). Omit it to leave
+        /// the slot's persona exactly as it is — this never defaults to
+        /// xbox360, because that would quietly un-PlayStation a slot every
+        /// time its preset changed.
+        ///
+        /// Windows exposes 4 XInput slots: xbox360 and xboxseries each take
+        /// one, so a fifth of those is refused. playstation is plain HID and
+        /// takes none, which is how players 5+ exist at all. dualsense,
+        /// switchpro and xboxseries need HIDMaestro (M8) and are refused by
+        /// this build with the reason attached.
+        #[arg(long, value_name = "NAME", value_parser = parse_persona)]
+        persona: Option<ksx_core::Persona>,
         /// Write into this games.toml profile instead of config.toml
         #[arg(long, value_name = "TITLE")]
         profile: Option<String>,
@@ -1477,6 +1493,7 @@ fn main() -> anyhow::Result<()> {
             SlotCommand::Assign {
                 slot,
                 preset,
+                persona,
                 profile,
                 reload,
                 json,
@@ -1484,6 +1501,7 @@ fn main() -> anyhow::Result<()> {
                 action: slot_cli::Action::Assign {
                     slot,
                     preset,
+                    persona,
                     profile,
                     reload,
                 },
@@ -3281,6 +3299,7 @@ mod tests {
                 SlotCommand::Assign {
                     slot,
                     preset,
+                    persona,
                     profile,
                     reload,
                     json,
@@ -3290,11 +3309,18 @@ mod tests {
             panic!("an assign");
         };
         assert_eq!(slot, 3);
-        assert_eq!(preset, "IPAC P3");
+        assert_eq!(preset.as_deref(), Some("IPAC P3"));
+        assert_eq!(
+            persona, None,
+            "no --persona means the slot keeps the one it has; it must NOT \
+             parse as the xbox360 default"
+        );
         assert_eq!(profile, None, "config.toml unless a profile is named");
         assert!(!reload, "nothing is disturbed unless asked");
         assert!(!json);
 
+        // A bare `--slot N` asks for nothing, and is refused. `--preset` with
+        // no slot has no slot to point.
         assert!(Cli::try_parse_from(["ksx", "slot", "assign", "--slot", "3"]).is_err());
         assert!(Cli::try_parse_from(["ksx", "slot", "assign", "--preset", "P"]).is_err());
         // 1..=MAX_SLOTS, enforced by clap before anything reads a file.
@@ -3311,6 +3337,97 @@ mod tests {
             "P"
         ])
         .is_err());
+    }
+
+    /// **`ksx slot assign --slot 5 --persona playstation` is a whole command.**
+    ///
+    /// The persona menu's CLI face (task #8). Three properties, and each one is
+    /// a way the obvious implementation gets it wrong:
+    ///
+    /// 1. `--persona` alone satisfies the parser — a `--preset` that stayed
+    ///    required would force anyone changing a persona to re-type a preset
+    ///    name they are not changing, and a script that filled it in from an
+    ///    earlier read would write back a name the file may have moved on from;
+    /// 2. an alias parses, through the SAME `Persona::FromStr` the config files
+    ///    and `ksx pads --persona` use. `slot_arg`'s module comment exists
+    ///    because a second copy of a rule drifts;
+    /// 3. no `--persona` parses to `None`, NOT to `Persona::default()`. A clap
+    ///    `default_value = "xbox360"` here would compile, read beautifully, and
+    ///    silently un-PlayStation slots 5-8 on every preset re-point.
+    ///
+    /// Breaks against: `preset: String` (1), a hand-rolled persona parser (2),
+    /// and `persona: Persona` with a clap default (3).
+    #[test]
+    fn slot_assign_takes_a_persona_on_its_own_and_never_defaults_one() {
+        let cli = Cli::try_parse_from([
+            "ksx",
+            "slot",
+            "assign",
+            "--slot",
+            "5",
+            // An alias, and one with a space in it, so the lenient parser is
+            // demonstrably the one on this flag.
+            "--persona",
+            "PS4",
+        ])
+        .expect("--persona alone is a complete command");
+        let Command::Slot {
+            command:
+                SlotCommand::Assign {
+                    slot,
+                    preset,
+                    persona,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("an assign");
+        };
+        assert_eq!(slot, 5);
+        assert_eq!(preset, None, "the slot keeps the preset it has");
+        assert_eq!(persona, Some(ksx_core::Persona::PlayStation));
+
+        // Both together is the third legal shape.
+        let both = Cli::try_parse_from([
+            "ksx",
+            "slot",
+            "assign",
+            "--slot",
+            "5",
+            "--preset",
+            "P",
+            "--persona",
+            "xbox360",
+        ])
+        .expect("preset and persona together");
+        let Command::Slot {
+            command: SlotCommand::Assign {
+                preset, persona, ..
+            },
+        } = both.command
+        else {
+            panic!("an assign");
+        };
+        assert_eq!(preset.as_deref(), Some("P"));
+        assert_eq!(persona, Some(ksx_core::Persona::Xbox360));
+
+        // A persona nothing knows is refused by clap, in ksx-core's words —
+        // which name every valid one, so a typo is answered with the menu.
+        let Err(err) = Cli::try_parse_from([
+            "ksx",
+            "slot",
+            "assign",
+            "--slot",
+            "1",
+            "--persona",
+            "gamecube",
+        ]) else {
+            panic!("gamecube is not a persona");
+        };
+        let err = err.to_string();
+        for persona in ksx_core::Persona::ALL {
+            assert!(err.contains(persona.as_str()), "{err} omits {persona}");
+        }
     }
 
     /// The pad bounce is in `--help`, because it is the one consequence a user

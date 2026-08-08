@@ -458,11 +458,41 @@ pub struct SlotAssignRequest {
     /// 1..=`ksx_core::MAX_SLOTS`.
     pub slot: u8,
     /// The preset's `name` (its file's `name` field), e.g. `"IPAC P1"`.
-    pub preset: String,
+    ///
+    /// ABSENT means "the preset this slot already uses", which is what makes a
+    /// persona-only write possible — `ksx slot assign --slot 5 --persona
+    /// playstation` must not oblige anyone to re-type a name they are not
+    /// changing, and a surface that filled it in from its last read would
+    /// write back a preset the file may have moved on from. A request with
+    /// neither a preset nor a persona is refused: it asks for nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
     /// A games.toml profile title. ABSENT means config.toml's `[[slot]]` list —
     /// the same either/or `ksx setup` asks about, spelled the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// **Which controller this slot presents itself as** — a
+    /// [`ksx_core::Persona`] NAME (`xbox360`, `playstation`, `ds4`, …).
+    ///
+    /// ABSENT means "not asked about", which leaves the slot's current persona
+    /// exactly as it is — the same rule [`MapRequest::turbo_hz`] follows, and
+    /// the reason this is `Option<String>` rather than a persona with a
+    /// default: `Persona::default()` is `xbox360`, so a defaulted field would
+    /// silently rewrite every PlayStation slot back to Xbox the first time
+    /// somebody re-pointed its preset.
+    ///
+    /// A **string**, not a parsed persona, for the same reason
+    /// [`crate::PadsSpawnSpec::persona`] is: ksx-core carries no serde, the
+    /// alias table (`ds4`, `PS4`, `Xbox 360`) lives in one `FromStr`, and a
+    /// surface should never have to hold a copy of it to fill this field. The
+    /// backend parses it and refuses an unknown name in words that list the
+    /// valid ones.
+    ///
+    /// Until 2026-08-08 this field did not exist, and docs/SURFACES.md §10
+    /// cited its absence as the reason no surface could re-persona a slot.
+    /// It exists now; §10 records the decision that was re-taken to add it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
     /// Apply it to a RUNNING session.
     ///
     /// Unlike every other `reload` on this protocol this one is a **bounce**,
@@ -492,15 +522,25 @@ impl SlotAssignRequest {
                 format!("slot {slot} is not a slot number (1..={max})"),
             ));
         };
-        let Some(preset) = field(request, "preset") else {
+        let preset = field(request, "preset");
+        let persona = field(request, "persona");
+        if preset.is_none() && persona.is_none() {
             return Err(bad_request(
-                r#"slot-assign needs a "preset" (the preset this slot should use)"#,
+                r#"slot-assign needs a "preset" (which preset this slot uses), a "persona" (which controller it presents itself as), or both — with neither there is nothing to change"#,
             ));
-        };
+        }
         Ok(Self {
             slot,
             preset,
             profile: field(request, "profile"),
+            // Both verbatim, both already read above. `field` drops a blank,
+            // which is what an empty `<select>` submission looks like, and a
+            // blank must read as "not asked about" rather than as a persona
+            // named "". The persona NAME is not validated here: this reader
+            // has no persona vocabulary, and inventing one would be the second
+            // copy of the alias table that field's doc comment exists to
+            // prevent.
+            persona,
             reload: flag(request, "reload"),
         })
     }
@@ -894,6 +934,17 @@ pub struct SlotAssignResponse {
     /// able to say "slot 3: IPAC P3 → Player 3" rather than only the new half.
     #[serde(default)]
     pub previous_preset: Option<String>,
+    /// The persona the slot presents itself as NOW, whether or not this request
+    /// changed it. Always the canonical [`ksx_core::Persona::as_str`] spelling,
+    /// so a surface echoing it back into the next request cannot introduce a
+    /// second spelling of one persona.
+    #[serde(default)]
+    pub persona: Option<String>,
+    /// What it was BEFORE, and `None` when this request left it alone. Same
+    /// pairing as [`Self::previous_preset`]: without it a surface can only say
+    /// "playstation", never "xbox360 → playstation".
+    #[serde(default)]
+    pub previous_persona: Option<String>,
     #[serde(default)]
     pub profile: Option<String>,
     /// The slot did not exist in that file and was ADDED.
@@ -1318,27 +1369,27 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 3, allow_sh
         assert_eq!(ninth.slot, 9);
     }
 
-    /// **A surface decision that is currently enforced by a missing field.**
+    /// **The config-writing wire's field set, pinned.**
     ///
-    /// `docs/SURFACES.md` §10 settles the slot persona menu by observing that
-    /// `SlotAssignRequest` carries no persona, "so no surface can re-persona a
-    /// slot until the wire type changes". That is a real guarantee — this is the
-    /// whole config-writing wire, `slot-assign` is its only verb — but it is
-    /// guaranteed by *absence*, which is the kind of invariant that disappears
-    /// the moment someone adds a convenient field.
+    /// This assertion used to read `["preset", "profile", "reload", "slot"]`
+    /// and was named `slot_assign_carries_no_persona_and_the_doc_depends_on_that`
+    /// — `docs/SURFACES.md` §10 settled the slot persona menu by observing that
+    /// no surface *could* re-persona a slot, because this type had no field for
+    /// one. The comment said whoever added `persona` would have to come and
+    /// re-take that decision rather than settle it by needing a field. That
+    /// happened on 2026-08-08 (task #8): the decision is re-taken in §10, the
+    /// field is here, and the pin stays — because the reason it existed (this
+    /// is the WHOLE config-writing wire, and `slot-assign` is its only verb)
+    /// did not go away.
     ///
-    /// So the field set is pinned. Adding `persona` here fails this test, and
-    /// whoever adds it has to come and delete the assertion — which is exactly
-    /// the moment the "which surface owns persona?" decision should be re-taken,
-    /// rather than settled by whoever needed the field.
-    ///
-    /// Breaks against: any new field on the request, in either direction.
+    /// Breaks against: any further field on the request, in either direction.
     #[test]
-    fn slot_assign_carries_no_persona_and_the_doc_depends_on_that() {
+    fn slot_assign_carries_slot_preset_profile_persona_and_reload() {
         let full = SlotAssignRequest {
             slot: 1,
-            preset: "P1".into(),
+            preset: Some("P1".into()),
             profile: Some("MAME 4P".into()),
+            persona: Some("playstation".into()),
             reload: true,
         };
         let mut fields: Vec<String> = serde_json::to_value(&full)
@@ -1351,18 +1402,84 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 3, allow_sh
         fields.sort();
         assert_eq!(
             fields,
-            vec!["preset", "profile", "reload", "slot"],
+            vec!["persona", "preset", "profile", "reload", "slot"],
             "the config-writing wire's field set — see docs/SURFACES.md §10"
         );
 
-        // ...and the two optional halves stay optional, so the minimal request
-        // a CLI or a form sends is still slot + preset and nothing else.
-        let minimal = SlotAssignRequest {
-            slot: 1,
-            preset: "P1".into(),
-            ..Default::default()
-        };
-        let json = serde_json::to_value(&minimal).unwrap();
-        assert_eq!(json.as_object().unwrap().len(), 2, "{json}");
+        // ...and every optional half stays optional, so a request carries
+        // exactly what it asks for and nothing else. A preset re-point is two
+        // keys; a persona-only change is two keys; neither mentions the other.
+        for asked in [
+            SlotAssignRequest {
+                slot: 1,
+                preset: Some("P1".into()),
+                ..Default::default()
+            },
+            SlotAssignRequest {
+                slot: 1,
+                persona: Some("playstation".into()),
+                ..Default::default()
+            },
+        ] {
+            let json = serde_json::to_value(&asked).unwrap();
+            assert_eq!(json.as_object().unwrap().len(), 2, "{json}");
+        }
+    }
+
+    /// **Every slot-assign document ever written still parses, and still means
+    /// the same thing.**
+    ///
+    /// The compatibility half of adding a field to a live verb, and the reason
+    /// `persona` is `Option<String>` rather than a `Persona` with a serde
+    /// default. `Persona::default()` is `xbox360`. A defaulted field would read
+    /// every pre-2026-08-08 request — every `ksx slot assign`, every
+    /// `/setup/slot` form post, every tray click — as "make this slot an Xbox
+    /// 360 pad", and would therefore silently un-PlayStation a cabinet's slots
+    /// 5–8 the first time somebody re-pointed one at a different preset. Absent
+    /// has to mean ABSENT.
+    ///
+    /// Breaks against: `pub persona: String`, `Option<Persona>` with
+    /// `#[serde(default)]` resolving to a persona, or a missing
+    /// `skip_serializing_if` (which would put a `"persona": null` on the wire
+    /// that an older daemon's allowlist-shaped reader has never seen).
+    #[test]
+    fn a_request_written_before_persona_existed_asks_for_no_persona_change() {
+        // The exact bytes docs/CONTROL-SURFACE.md documents, and the exact
+        // bytes the pre-persona CLI sent.
+        let old = serde_json::json!({"verb": "slot-assign", "slot": 3, "preset": "IPAC P3"});
+        let parsed = SlotAssignRequest::from_json(&old).expect("an old document still parses");
+        assert_eq!(parsed.persona, None, "absent must not mean xbox360");
+        assert_eq!(parsed.slot, 3);
+        assert_eq!(parsed.preset.as_deref(), Some("IPAC P3"));
+
+        // The same in the typed direction: a request that asks for no persona
+        // change puts no persona key on the wire at all, so a daemon older
+        // than this binary sees byte-identical input to what it always saw.
+        let line = Request::SlotAssign(parsed).to_line();
+        assert!(!line.contains("persona"), "{line}");
+
+        // And a blank is a blank, not a persona named "". An empty `<select>`
+        // submission is the shape this arrives in from a browser.
+        let blank = serde_json::json!({"slot": 1, "preset": "P", "persona": "  "});
+        assert_eq!(SlotAssignRequest::from_json(&blank).unwrap().persona, None);
+    }
+
+    /// The persona NAME crosses the wire exactly as it was typed, aliases and
+    /// all — this reader owns no persona vocabulary.
+    ///
+    /// Breaks against: a `from_json` that parses/canonicalizes the persona
+    /// here. That looks tidier and puts a second copy of `Persona::FromStr`'s
+    /// alias table (`ds4`, `PS4`, `Xbox 360`, `xbox-series-xs-bt`) on the
+    /// client side of the boundary, where it can go stale against ksx-core
+    /// with nothing to notice — the drift docs/SURFACES.md §1 is about.
+    #[test]
+    fn a_persona_alias_reaches_the_backend_unchanged() {
+        for alias in ["ds4", "PS4", "Xbox 360", "dualsense"] {
+            let request =
+                serde_json::json!({"slot": 2, "preset": "P", "persona": alias, "reload": true});
+            let parsed = SlotAssignRequest::from_json(&request).unwrap();
+            assert_eq!(parsed.persona.as_deref(), Some(alias), "alias {alias}");
+            assert!(parsed.reload);
+        }
     }
 }

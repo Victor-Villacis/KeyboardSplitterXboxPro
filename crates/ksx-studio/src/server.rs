@@ -1522,6 +1522,12 @@ struct SetupSlotForm {
     /// no profile, so `config.toml`'s `[[slot]]` list.
     #[serde(default)]
     profile: Option<String>,
+    /// The persona `<select>`, whose "(leave it as it is)" sentinel is the
+    /// empty string. Blank never means `xbox360`: it means the form was not
+    /// asked about the persona, and the slot keeps whatever it presents itself
+    /// as today. See [`ksx_api::SlotAssignRequest::persona`].
+    #[serde(default)]
+    persona: Option<String>,
 }
 
 /// POST /setup/slot — step 2, one `ControlSource::assign_slot` (pipe
@@ -1547,9 +1553,19 @@ async fn setup_form_slot(
     };
     let request = ksx_api::SlotAssignRequest {
         slot,
-        preset,
+        preset: Some(preset),
         profile: form
             .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned),
+        // Verbatim, blank dropped — the persona NAME is the backend's to
+        // parse and to refuse. A page that validated it here would be the
+        // second copy of `Persona::FromStr` docs/SURFACES.md §1 forbids, and
+        // it would go stale against ksx-core silently.
+        persona: form
+            .persona
             .as_deref()
             .map(str::trim)
             .filter(|p| !p.is_empty())

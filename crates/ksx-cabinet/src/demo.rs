@@ -115,8 +115,21 @@ impl ControlSource for DemoControl {
             ok: false,
             error: Some(format!(
                 "this is `ksx cabinet --demo` — nothing was written. The real verb is \
-                 `ksx slot assign --slot {} --preset \"{}\"`",
-                request.slot, request.preset
+                 `ksx slot assign --slot {}{}{}`",
+                request.slot,
+                // Echo only the halves the caller actually asked for: a demo
+                // that printed `--preset ""` would be teaching a command that
+                // does not work.
+                request
+                    .preset
+                    .as_deref()
+                    .map(|preset| format!(" --preset \"{preset}\""))
+                    .unwrap_or_default(),
+                request
+                    .persona
+                    .as_deref()
+                    .map(|persona| format!(" --persona {persona}"))
+                    .unwrap_or_default()
             )),
             code: Some(codes::NOT_HERE.to_owned()),
             ..SlotOutcome::default()
@@ -265,8 +278,9 @@ mod tests {
         }
         let assigned = control.assign_slot(&ksx_api::SlotAssignRequest {
             slot: 1,
-            preset: "IPAC P2".into(),
+            preset: Some("IPAC P2".into()),
             profile: None,
+            persona: None,
             reload: true,
         });
         assert!(!assigned.ok);

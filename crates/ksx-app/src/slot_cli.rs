@@ -30,7 +30,11 @@ pub enum Action {
     },
     Assign {
         slot: u8,
-        preset: String,
+        /// `None` = keep the preset the slot already uses.
+        preset: Option<String>,
+        /// `None` = leave the slot's persona exactly as it is. Never
+        /// `Persona::default()`: see [`crate::slots::SlotSpec::persona`].
+        persona: Option<ksx_core::Persona>,
         profile: Option<String>,
         /// Ask a RUNNING daemon to take the new wiring now. A bounce: the pads
         /// replug. With nothing running there is nothing to do.
@@ -50,6 +54,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
         Action::Assign {
             slot,
             preset,
+            persona,
             profile,
             reload,
         } => assign(
@@ -57,6 +62,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
             &SlotSpec {
                 slot,
                 preset,
+                persona,
                 profile,
             },
             reload,
@@ -83,6 +89,11 @@ fn list(store: &Store, profile: Option<&str>, json: bool) -> anyhow::Result<()> 
                 "slots": rows.iter().map(|row| serde_json::json!({
                     "slot": row.slot,
                     "preset": row.preset,
+                    // Canonical spelling, from ksx-core. A file that says
+                    // `persona = "ds4"` reports `playstation` here, so a
+                    // script never has to hold the alias table either.
+                    "persona": row.persona.as_str(),
+                    "persona_label": row.persona.label(),
                     "keyboard": row.keyboard,
                     "profile": row.profile,
                 })).collect::<Vec<_>>(),
@@ -100,12 +111,16 @@ fn list(store: &Store, profile: Option<&str>, json: bool) -> anyhow::Result<()> 
     println!();
     for row in &rows {
         println!(
-            "  slot {}  {:<24} keyboard: {}",
-            row.slot, row.preset, row.keyboard
+            "  slot {}  {:<24} {:<12} keyboard: {}",
+            row.slot,
+            row.preset,
+            row.persona.as_str(),
+            row.keyboard
         );
     }
     println!();
     println!("Repoint one:  ksx slot assign --slot N --preset \"<preset>\"");
+    println!("Re-persona one:  ksx slot assign --slot N --persona playstation");
     Ok(())
 }
 
@@ -134,6 +149,8 @@ fn assign(store: &Store, spec: &SlotSpec, reload: bool, json: bool) -> anyhow::R
                 "slot": applied.slot,
                 "preset": applied.preset,
                 "previous_preset": applied.previous,
+                "persona": applied.persona.as_str(),
+                "previous_persona": applied.previous_persona.map(|p| p.as_str()),
                 "profile": applied.profile,
                 "created": applied.created,
                 "unchanged": applied.unchanged,

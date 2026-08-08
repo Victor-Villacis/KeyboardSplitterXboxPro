@@ -742,10 +742,33 @@ fn handle_slot_assign(
             })
         }
     };
+    // The persona NAME becomes a persona HERE, in the daemon, through
+    // `ksx_core`'s one lenient `FromStr` — the parser `ksx pads --persona` and
+    // every config file already go through, aliases and all. Not in
+    // `SlotAssignRequest::from_json`: ksx-api would then need a persona
+    // vocabulary of its own, which is the second copy of the alias table the
+    // wire field's doc comment refuses. An unknown name is refused in
+    // `UnknownPersona`'s own words, which list every valid one.
+    let persona = match assign
+        .persona
+        .as_deref()
+        .map(str::parse::<ksx_core::Persona>)
+    {
+        None => None,
+        Some(Ok(persona)) => Some(persona),
+        Some(Err(unknown)) => {
+            return serde_json::json!({
+                "ok": false,
+                "code": "unknown-persona",
+                "error": unknown.to_string(),
+            })
+        }
+    };
     let applied = match (deps.slot_assign)(&crate::slots::SlotSpec {
         slot: assign.slot,
         preset: assign.preset.clone(),
         profile: assign.profile.clone(),
+        persona,
     }) {
         Ok(applied) => applied,
         Err(err) => {
@@ -764,6 +787,11 @@ fn handle_slot_assign(
         "slot": applied.slot,
         "preset": applied.preset,
         "previous_preset": applied.previous,
+        // Canonical spelling, from `Persona::as_str` — so a surface that
+        // echoes this straight back into the next request cannot introduce a
+        // second spelling of one persona.
+        "persona": applied.persona.as_str(),
+        "previous_persona": applied.previous_persona.map(|p| p.as_str()),
         "profile": applied.profile,
         "created": applied.created,
         "unchanged": applied.unchanged,
@@ -1526,8 +1554,9 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
             }),
             Request::SlotAssign(ksx_api::SlotAssignRequest {
                 slot: 1,
-                preset: "IPAC P1".into(),
+                preset: Some("IPAC P1".into()),
                 profile: None,
+                persona: None,
                 reload: false,
             }),
             Request::LearnKey,
@@ -1709,7 +1738,7 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
     fn no_slot_assign() -> SlotAssignFn {
         Box::new(|spec| {
             Err(crate::slots::SlotError::UnknownPreset {
-                preset: spec.preset.clone(),
+                preset: spec.preset.clone().unwrap_or_default(),
                 available: Vec::new(),
             })
         })
@@ -3125,6 +3154,91 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
             !headline.contains("nothing was running"),
             "the lie this test exists for: {headline}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The persona crosses the pipe and lands in the file** — the end of the
+    /// wire that task #8 opened, exercised through `handle_request` rather than
+    /// through the writer, because the parse happens HERE and nowhere else.
+    ///
+    /// Three things at once, each of which was a way to get this wrong:
+    ///
+    /// 1. an ALIAS (`ds4`) is accepted and canonicalized. The alias table lives
+    ///    in one `Persona::FromStr`; a daemon that only took canonical names
+    ///    would make every surface carry a copy of it to be useful;
+    /// 2. an unknown name is refused in `UnknownPersona`'s own words, which
+    ///    list every valid persona — so the answer to a typo is the menu;
+    /// 3. a request with NO persona leaves the slot's persona alone, and says
+    ///    so by reporting `previous_persona: null`.
+    ///
+    /// Breaks against: a `from_json` that parses the persona in ksx-api (which
+    /// would put the alias table on the client side of the boundary), a
+    /// handler that drops the field, and any writer that treats absent as
+    /// `xbox360`.
+    #[test]
+    fn a_persona_crosses_the_pipe_by_alias_and_an_unknown_one_gets_the_menu() {
+        let dir = std::env::temp_dir().join(format!(
+            "ksx-slot-persona-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = ksx_config::ConfigRoot::at(&dir);
+        let store = ksx_config::Store::new(root.clone());
+        let file: ksx_config::PresetFile =
+            toml::from_str("name = \"IPAC P1\"\n[bindings]\nA = \"S\"\n").unwrap();
+        store.save_preset(&file).unwrap();
+        store
+            .save_config(&ksx_config::ConfigFile::default())
+            .unwrap();
+
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let mut d = deps(tx, state, no_profiles());
+        d.slot_assign = slot_assign_fn(root);
+
+        // 1 — an alias, on a slot this call creates.
+        let v = handle_request(
+            r#"{"verb":"slot-assign","slot":5,"preset":"IPAC P1","persona":"ds4"}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["persona"], "playstation", "canonical, not the alias: {v}");
+        assert_eq!(v["created"], true);
+        assert_eq!(
+            v["previous_persona"],
+            serde_json::Value::Null,
+            "a new slot presented itself as nothing before: {v}"
+        );
+        let text = std::fs::read_to_string(store.root().config_path()).unwrap();
+        assert!(text.contains("persona = \"playstation\""), "{text}");
+
+        // 2 — a name nothing knows. The refusal IS the menu.
+        let bad = handle_request(
+            r#"{"verb":"slot-assign","slot":5,"preset":"IPAC P1","persona":"gamecube"}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(bad["ok"], false, "{bad}");
+        assert_eq!(bad["code"], "unknown-persona");
+        let error = bad["error"].as_str().unwrap();
+        for persona in ksx_core::Persona::ALL {
+            assert!(error.contains(persona.as_str()), "{error} omits {persona}");
+        }
+
+        // 3 — no persona at all: the slot keeps the PlayStation it just got,
+        // and nothing claims a change.
+        let kept = handle_request(
+            r#"{"verb":"slot-assign","slot":5,"preset":"IPAC P1"}"#,
+            &d,
+            FAST,
+        );
+        assert_eq!(kept["ok"], true, "{kept}");
+        assert_eq!(kept["persona"], "playstation", "NOT re-personaed: {kept}");
+        assert_eq!(kept["previous_persona"], serde_json::Value::Null);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
