@@ -62,6 +62,11 @@ jobs:
       # does. The built-in GITHUB_TOKEN, no PAT, no third-party action, no
       # secret to rotate.
       contents: write
+      # Naming any permission zeroes the rest, and this job downloads the
+      # artifacts the build produced. Same-run downloads are not documented to
+      # need this; a permission that grants nothing beyond reading this run is
+      # cheaper than discovering the answer on a pushed tag.
+      actions: read
     steps:
       # For packaging/release-notes.md. The release body's prose lives in the
       # repository, reviewable and diffable, rather than inside a YAML string.
@@ -110,6 +115,11 @@ jobs:
           SETUP_SHA256: ${{ needs.ci.outputs.setup_sha256 }}
         run: |
           $notes = Get-Content 'packaging/release-notes.md' -Raw
+          # The note at the top of the template is addressed to whoever edits
+          # it. Markdown would hide it, but "hidden" is not "absent": it is
+          # still the raw body `gh release view` prints and the text a plain
+          # reader sees. Drop it.
+          $notes = $notes -replace '(?s)^\s*<!--.*?-->\s*', ''
           $notes = $notes.Replace('{{VERSION}}', ($env:TAG -replace '^v', ''))
           $notes = $notes.Replace('{{TAG}}', $env:TAG)
           $notes = $notes.Replace('{{SETUP_NAME}}', $env:SETUP_NAME)
