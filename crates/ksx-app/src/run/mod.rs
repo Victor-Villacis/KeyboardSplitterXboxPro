@@ -130,7 +130,7 @@ pub fn run(
 
 /// Find the profile again and turn it into a launch spec, refusing anything
 /// that cannot possibly work.
-fn resolve_launch(
+pub(crate) fn resolve_launch(
     root: &ksx_config::ConfigRoot,
     title: &str,
 ) -> anyhow::Result<ksx_games::LaunchSpec> {
@@ -188,6 +188,41 @@ fn run_live(
     live_latency: bool,
     json: bool,
 ) -> anyhow::Result<()> {
+    let hook: Box<dyn supervisor::SessionHook> = match launch {
+        Some(spec) => Box::new(game::GameHook::new(
+            spec,
+            ksx_games::RealHost::new(),
+            games_toml,
+        )),
+        None => Box::new(supervisor::NoHook),
+    };
+    // Backend selection is per device (`[[device]] backend = ...`). This claims
+    // any WinUSB interfaces the plan names, and only creates an Interception
+    // context if something still needs one — see `crate::capture`.
+    live_session(&plan, crate::capture::build, hook, live_latency, json)
+}
+
+/// One live session, from "is the bus there" to the final report.
+///
+/// The capture backend arrives as a **closure**, not a value, and that is the
+/// whole reason this is a seam rather than three arguments: pads are connected
+/// first, deliberately (see below), so the backend cannot already exist by the
+/// time this is called. `ksx run` passes `crate::capture::build`; `ksx play`
+/// passes one that puts a recording in front of the same pipeline
+/// (`crate::play`). Everything between those two lines — teardown order, the
+/// escape banner, the exit codes — is shared by construction instead of by two
+/// people remembering to keep it that way.
+#[cfg(windows)]
+pub(crate) fn live_session(
+    plan: &RunPlan,
+    capture: impl FnOnce(
+        &RunPlan,
+    )
+        -> Result<Box<dyn ksx_capture::CaptureBackend>, crate::capture::SetupError>,
+    hook: Box<dyn supervisor::SessionHook>,
+    live_latency: bool,
+    json: bool,
+) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use ksx_output::{RoutedBackend, VigemBackend};
 
@@ -208,11 +243,8 @@ fn run_live(
         Err(err) => return Err(err).context("connecting to ViGEmBus"),
     };
     let pads = RoutedBackend::standard(Box::new(vigem));
-    // Backend selection is per device (`[[device]] backend = ...`). This claims
-    // any WinUSB interfaces the plan names, and only creates an Interception
-    // context if something still needs one — see `crate::capture`. Every
-    // failure here is a refusal: no pad is plugged and no filter is armed.
-    let capture = match crate::capture::build(&plan) {
+    // Every failure here is a refusal: no pad is plugged and no filter is armed.
+    let capture = match capture(plan) {
         Ok(backend) => backend,
         Err(err) => {
             let hint = match &err {
@@ -241,14 +273,6 @@ fn run_live(
         tracing::warn!("SetConsoleCtrlHandler failed; Ctrl+C will abort without a clean teardown");
     }
 
-    let hook: Box<dyn supervisor::SessionHook> = match launch {
-        Some(spec) => Box::new(game::GameHook::new(
-            spec,
-            ksx_games::RealHost::new(),
-            games_toml,
-        )),
-        None => Box::new(supervisor::NoHook),
-    };
     let mut options = RunOptions {
         live_latency,
         beep: true,
@@ -277,13 +301,13 @@ fn run_live(
     // session) and cannot deadlock.
     let outcome = if json {
         let mut err = std::io::stderr();
-        supervisor::supervise(&plan, wiring, &mut options, &mut err)?
+        supervisor::supervise(plan, wiring, &mut options, &mut err)?
     } else {
         let mut out = std::io::stdout();
         for note in &plan.notes {
             writeln!(out, "{note}")?;
         }
-        supervisor::supervise(&plan, wiring, &mut options, &mut out)?
+        supervisor::supervise(plan, wiring, &mut options, &mut out)?
     };
 
     // The hook outlives the session, so its final word is available here — and

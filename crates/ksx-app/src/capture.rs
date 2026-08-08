@@ -98,17 +98,26 @@ impl SetupError {
 /// that merely wants to *look* at devices uses `ksx_capture::usb_candidates()`,
 /// which opens nothing.
 pub fn build(plan: &RunPlan) -> Result<Box<dyn CaptureBackend>, SetupError> {
+    // One shared health state and — the part that matters when you are standing
+    // at a wedged cabinet — one shared escape latch across every backend, so
+    // `LeftCtrl x5` on any board frees them all.
+    build_with(plan, Handles::new())
+}
+
+/// [`build`], publishing into handles the caller already holds.
+///
+/// The seam `ksx play` needs: it composes this backend with a replay source,
+/// and the two have to share one escape latch or a gesture on the real panel
+/// would flip a latch the supervisor is not watching — the hatch would look
+/// dead at exactly the moment somebody needed it.
+pub fn build_with(plan: &RunPlan, handles: Handles) -> Result<Box<dyn CaptureBackend>, SetupError> {
     if plan.winusb.is_empty() {
-        // Unchanged from M3–M5: one backend, its own handles, no composition.
-        return InterceptionBackend::new()
+        // Unchanged from M3–M5: one backend, no composition.
+        return InterceptionBackend::new_with(handles)
             .map(|b| Box::new(b) as Box<dyn CaptureBackend>)
             .map_err(SetupError::Interception);
     }
 
-    // One shared health state and — the part that matters when you are standing
-    // at a wedged cabinet — one shared escape latch across every backend, so
-    // `LeftCtrl x5` on any board frees them all.
-    let handles = Handles::new();
     let candidates = ksx_capture::usb_candidates().map_err(SetupError::Enumeration)?;
 
     let mut children: Vec<Box<dyn CaptureBackend>> = Vec::with_capacity(plan.winusb.len() + 1);

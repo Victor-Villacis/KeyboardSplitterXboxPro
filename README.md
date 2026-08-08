@@ -140,6 +140,8 @@ ksx preset list --templates       # ready-made layouts for standard panels
 ksx preset new "P1" --from-template arcade-6button --player 1
 ksx devices                       # keyboards as the driver sees them (read-only)
 ksx monitor --for-secs 10         # live per-device key stream, never blocks
+ksx monitor --record demo.jsonl   # ...and write it down as a session recording
+ksx play demo.jsonl               # play that recording back into the real pipeline
 ksx pads --count 4                # plug 4 test pads, LED order, kill-recovery
 ksx doctor                        # driver health, CI-policy state, verdicts
 ksx import-legacy --dry-run       # legacy XML -> TOML
@@ -160,6 +162,40 @@ nothing; `--json` prints the outcome.
 
 Stop emulation first: a captured panel's keys are suppressed below win32k and
 the wizard cannot hear them.
+
+### `ksx play` — replay a recorded session
+
+`ksx monitor --record demo.jsonl` writes a timeline: one JSON object per key
+event, with the milliseconds it happened at. `ksx play demo.jsonl` makes that
+file the session's input device. Same plan, same presets, same personas, same
+pads, same teardown — the only thing that changed is where the key events came
+from, which is what makes it worth having: an attract-mode loop for a cabinet,
+and a full-stack regression test that needs no hardware.
+
+```sh
+ksx monitor --record demo.jsonl --for-secs 30   # mash buttons; it writes them down
+ksx play demo.jsonl                             # watch it run
+ksx play demo.jsonl --loop --speed 1.5          # attract mode, half again as fast
+ksx play demo.jsonl --game "MAME" --as ipac     # in a game profile, onto a named board
+```
+
+**Live input is suppressed while it plays.** The boards the recording drives
+are captured exactly as `ksx run` captures them, so their keystrokes do not
+reach Windows, and their events are discarded rather than mixed into the
+recorded timeline — otherwise you fight the recording inside the game, which
+sees both. The emergency escapes still work: `LeftCtrl ×5` frees the keyboards,
+`Ctrl+Alt+Del` stops the session.
+
+**A recording names devices by the id they had when it was recorded**, which
+after a replug — or on another machine — can name nothing. `--as` points a
+recorded device at a configured one, by `[[device]]` alias or by selector, and
+a recording where *nothing* drives a slot is refused before a pad is plugged,
+naming what it holds, what this session drives, and the command to type. A
+recorded device that drives no slot is played and ignored — exactly what an
+unassigned keyboard does in a live session.
+
+`--dry-run` resolves the recording against the plan and prints what would drive
+what, touching no driver.
 
 ### `ksx daemon` — stay resident with a tray icon
 

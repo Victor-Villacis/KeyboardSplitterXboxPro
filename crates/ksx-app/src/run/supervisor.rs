@@ -145,6 +145,9 @@ pub enum HookStop {
     /// The game could not be started. Emulation is already up by then, so this
     /// is a runtime failure: exit 3.
     LaunchFailed(String),
+    /// `ksx play`'s recording ran out. Also clean, and for the same reason a
+    /// game exiting is: the thing the session was started to do is done.
+    ReplayFinished,
 }
 
 /// One conversion point, so a hook's vocabulary and the session's stay in sync.
@@ -153,6 +156,7 @@ impl From<HookStop> for StopReason {
         match stop {
             HookStop::GameExited => StopReason::GameExited,
             HookStop::LaunchFailed(message) => StopReason::GameLaunchFailed(message),
+            HookStop::ReplayFinished => StopReason::ReplayFinished,
         }
     }
 }
@@ -482,6 +486,13 @@ pub enum StopReason {
     /// The `--game` profile could not be started. This happens *after* the pads
     /// are up (see [`SessionHook`]), so it is a runtime failure, not a refusal.
     GameLaunchFailed(String),
+    /// `ksx play`'s recording ran out (and it was not looping).
+    ///
+    /// Its own reason rather than a `CtrlC` in disguise: "the recording ended"
+    /// and "somebody stopped it" are different things to read in a summary, and
+    /// an attract loop that ends by itself must not report a keypress nobody
+    /// made.
+    ReplayFinished,
     /// Pads could not be plugged; nothing was ever captured.
     PlugFailed {
         message: String,
@@ -513,6 +524,7 @@ impl StopReason {
                 | StopReason::EmergencyStop
                 | StopReason::EventLimit
                 | StopReason::GameExited
+                | StopReason::ReplayFinished
         )
     }
 
@@ -523,6 +535,7 @@ impl StopReason {
             StopReason::EventLimit => "event-limit",
             StopReason::GameExited => "game-exited",
             StopReason::GameLaunchFailed(_) => "game-launch-failed",
+            StopReason::ReplayFinished => "replay-finished",
             StopReason::PlugFailed { .. } => "plug-failed",
             StopReason::AmbiguousDevices { .. } => "ambiguous-devices",
             StopReason::CaptureEnded(_) => "capture-ended",
@@ -541,6 +554,9 @@ impl StopReason {
             StopReason::EventLimit => "stopped at the configured event limit".to_owned(),
             StopReason::GameExited => {
                 "the game exited; emulation stopped and the pads were unplugged".to_owned()
+            }
+            StopReason::ReplayFinished => {
+                "the recording ran out; emulation stopped and the pads were unplugged".to_owned()
             }
             StopReason::GameLaunchFailed(err) => format!(
                 "the game could not be started: {err}. Emulation was torn down, so the \
