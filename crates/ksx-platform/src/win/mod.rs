@@ -4,7 +4,9 @@
 
 pub(crate) mod devices;
 mod filever;
-mod registry;
+// `crate::app_paths` reads a different hive through the same wrappers rather
+// than opening a second registry binding beside this one.
+pub(crate) mod registry;
 mod services;
 pub(crate) mod signature;
 mod vigem_pads;

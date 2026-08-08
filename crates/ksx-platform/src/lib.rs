@@ -22,6 +22,7 @@
 //! helpers.
 
 pub mod advice;
+pub mod app_paths;
 pub mod autostart;
 pub mod inject;
 pub mod installer;
