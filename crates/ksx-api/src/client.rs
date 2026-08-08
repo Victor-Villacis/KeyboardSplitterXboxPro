@@ -21,6 +21,7 @@ use crate::control::{
     SessionView, SlotOutcome,
 };
 use crate::refusal::{codes, Refusal};
+use crate::stage::{StageEdit, StageOutcome, StagedSetupView};
 use crate::wire::{
     BackupView, BackupsRequest, ClearAllRequest, LearnResponse, Request, Response, RestoreMode,
     RestoreRequest, SlotAssignRequest,
@@ -95,6 +96,35 @@ impl<S: VerbSink> Client<S> {
                 refusal
             }
         })
+    }
+
+    /// The shared tail of every staging verb: one request, one
+    /// [`StageOutcome`].
+    ///
+    /// A transport failure becomes an `unavailable` outcome rather than an
+    /// empty one, so the page renders "I could not reach the daemon" with the
+    /// rosters still served — never a blank staging screen, which reads as
+    /// "you have staged nothing" (docs/SURFACES.md §1b).
+    fn stage(&self, request: Request) -> StageOutcome {
+        match self.call(&request) {
+            Ok(Response::Stage(outcome)) => *outcome,
+            Ok(_) => StageOutcome::unavailable(Self::mismatch(&request).message),
+            Err(refusal) => {
+                // The REMEDY goes into the sentence, not into a field nothing
+                // reads. `Client::call` decorates a no-channel refusal with
+                // the exact `ksx daemon` line this cabinet needs (`--game` and
+                // all), and a staging page that dropped it would print "no
+                // daemon answered" with no way forward — which is the same
+                // dead end `Refusal::remedy` exists to prevent.
+                let message = match &refusal.remedy {
+                    Some(remedy) => format!("{} — {remedy}", refusal.message),
+                    None => refusal.message.clone(),
+                };
+                let mut outcome = StageOutcome::unavailable(message);
+                outcome.code = Some(refusal.code);
+                outcome
+            }
+        }
     }
 
     /// The daemon answered a shape this verb never produces — a protocol
@@ -273,6 +303,40 @@ impl<S: VerbSink> ControlSource for Client<S> {
                 ..SlotOutcome::default()
             },
         }
+    }
+
+    // ── The staged setup (docs/FIRST-RUN.md §2) ──────────────────────────
+    //
+    // All four go through [`Self::stage`], because all four answer the same
+    // shape: what the verb did, plus the setup as it stands now. A surface
+    // re-renders from that after every one of them, and four private readers
+    // would be four chances for one page to be built from a different view.
+
+    fn staged(&self) -> StagedSetupView {
+        match self.stage(Request::Stage) {
+            outcome if outcome.setup.reachable => outcome.setup,
+            // A transport failure is a failed READ, and a failed read is not
+            // an absence (docs/SURFACES.md §1b): the page must say "I could
+            // not reach the daemon", never render as "you have staged
+            // nothing". `StageOutcome`'s own error is already that sentence.
+            outcome => StagedSetupView::unreachable(
+                outcome
+                    .error
+                    .unwrap_or_else(|| "the staged setup could not be read".to_owned()),
+            ),
+        }
+    }
+
+    fn stage_edit(&self, edit: &StageEdit) -> StageOutcome {
+        self.stage(Request::StageEdit(Box::new(edit.clone())))
+    }
+
+    fn stage_commit(&self) -> StageOutcome {
+        self.stage(Request::StageCommit)
+    }
+
+    fn stage_play(&self) -> StageOutcome {
+        self.stage(Request::StagePlay)
     }
 
     fn save_macro(&self, request: &MacroWrite) -> MacroOutcome {
@@ -525,5 +589,86 @@ mod tests {
             refusal.message.contains("different verb's shape"),
             "{refusal}"
         );
+    }
+
+    /// The staging verbs go over the same seam every other verb does, so a
+    /// surface written against `ControlSource` drives the daemon's staged setup
+    /// with no code of its own.
+    ///
+    /// Breaks against leaving the trait defaults in place: `stage_edit` would
+    /// answer "this control source has no staged setup" on a machine whose
+    /// daemon is holding one, and Studio's staging screens would be inert with
+    /// an honest-sounding message — which is worse than a crash, because it
+    /// looks intentional.
+    #[test]
+    fn the_staging_verbs_reach_the_daemon_through_the_same_sink() {
+        let staged = crate::stage::StagedSetupView {
+            reachable: true,
+            ready: true,
+            ..crate::stage::StagedSetupView::default()
+        };
+        let client = Client::new(Fake::answering(Response::Stage(Box::new(StageOutcome {
+            ok: true,
+            message: Some("controller staged".into()),
+            setup: staged,
+            ..StageOutcome::default()
+        }))));
+
+        assert!(client.staged().ready);
+        assert_eq!(client.sink().last(), Request::Stage);
+
+        let edit = StageEdit::SetPersona {
+            number: 1,
+            persona: "playstation".into(),
+        };
+        assert!(client.stage_edit(&edit).ok);
+        assert_eq!(
+            client.sink().last(),
+            Request::StageEdit(Box::new(edit)),
+            "the edit crosses the wire whole, not re-derived at the daemon"
+        );
+
+        assert!(client.stage_commit().ok);
+        assert_eq!(client.sink().last(), Request::StageCommit);
+        assert!(client.stage_play().ok);
+        assert_eq!(
+            client.sink().last(),
+            Request::StagePlay,
+            "Play is its own verb — saving and playing are separate acts"
+        );
+    }
+
+    /// **A failed read is not an absence** (docs/SURFACES.md §1b).
+    ///
+    /// Breaks against a `staged()` that returned `StagedSetupView::default()`
+    /// when the pipe was dead: `reachable: false, empty: true` with no error
+    /// renders as "you have staged nothing" at somebody whose daemon is not
+    /// running — and their next act is to stage it all again.
+    #[test]
+    fn an_unreachable_daemon_never_renders_as_an_empty_stage() {
+        let client = Client::new(Fake::failing(Refusal::new(
+            codes::NO_CHANNEL,
+            "no daemon answered",
+        )))
+        .with_offline_profile(|| Some("Steam".to_owned()));
+
+        let view = client.staged();
+        assert!(!view.reachable);
+        let error = view.error.clone().expect("the reason is on screen");
+        assert!(error.contains("no daemon answered"), "{error}");
+        // The remedy the no-channel decoration adds names THIS cabinet's
+        // start command, not a generic one.
+        assert!(error.contains("ksx daemon --game \"Steam\""), "{error}");
+        // The rosters are still served, so the disabled screen shows the real
+        // options rather than a blank page.
+        assert_eq!(view.max_slots, ksx_core::MAX_SLOTS);
+        assert!(!view.personas.is_empty());
+
+        // ...and an edit against a dead pipe is a refusal with the code, never
+        // a silent success.
+        let outcome = client.stage_edit(&StageEdit::Discard);
+        assert!(!outcome.ok);
+        assert_eq!(outcome.code.as_deref(), Some(codes::NO_CHANNEL));
+        assert_eq!(outcome.saved, None);
     }
 }

@@ -1831,6 +1831,26 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
                 persona: None,
                 reload: false,
             }),
+            // The staged setup, in the order a first-run visit walks it:
+            // choose a keyboard, add a controller, answer split-or-freeze,
+            // read it back. `stage-commit` and `stage-play` are deliberately
+            // NOT here — this fixture's writer refuses and there is no control
+            // loop to reap a session from — and both are covered above by
+            // their own tests, with the assertions those cases need.
+            Request::StageEdit(Box::new(ksx_api::StageEdit::ChooseDevice {
+                selector: "usb:d209:0430:00".into(),
+                alias: "panel".into(),
+                label: "Ultimarc I-PAC 4".into(),
+            })),
+            Request::StageEdit(Box::new(ksx_api::StageEdit::AddSlot {
+                number: None,
+                persona: "playstation".into(),
+                preset: "IPAC P1".into(),
+            })),
+            Request::StageEdit(Box::new(ksx_api::StageEdit::SetBlocking {
+                blocking: "bound-keys".into(),
+            })),
+            Request::Stage,
             Request::LearnKey,
             Request::LearnPoll,
             Request::LearnCancel,
@@ -1867,6 +1887,13 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
                     )
                     | (Request::MapBackups(_), Response::Backups(_))
                     | (Request::SlotAssign(_), Response::SlotAssign(_))
+                    | (
+                        Request::Stage
+                            | Request::StageEdit(_)
+                            | Request::StageCommit
+                            | Request::StagePlay,
+                        Response::Stage(_)
+                    )
                     | (
                         Request::LearnKey | Request::LearnPoll | Request::LearnCancel,
                         Response::Learn(_)
@@ -1916,6 +1943,23 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
                     let message = answer.message.clone().unwrap_or_default();
                     assert!(message.contains("pads replugged"), "{message}");
                     assert!(!answer.restarted, "nothing was running to restart");
+                }
+                (_, Response::Stage(answer)) => {
+                    assert!(answer.ok, "{said}");
+                    // The setup is HELD across requests, so by the last one
+                    // every earlier edit is still there — and the ceilings and
+                    // the roster are served on every answer, so a surface
+                    // never has to know a number.
+                    assert!(answer.setup.reachable);
+                    assert_eq!(answer.setup.max_slots, ksx_core::MAX_SLOTS);
+                    assert_eq!(
+                        answer.setup.personas.len(),
+                        ksx_core::Persona::ALL.len(),
+                        "the persona roster is served, never hardcoded by a surface"
+                    );
+                    // Nothing staging does may claim a write.
+                    assert_eq!(answer.saved, None);
+                    assert!(!answer.playing);
                 }
                 (_, Response::Learn(answer)) => {
                     assert!(answer.ok, "{said}");
