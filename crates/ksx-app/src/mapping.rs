@@ -64,8 +64,14 @@
 //!   (`moved_from`).
 //! - **The one remaining conflict is CROSS-SLOT, and it blocks** (the PadForge
 //!   gap this closes — docs/research/padforge-code-audit.md §1.2 "Conflict
-//!   handling: none"): the key is also bound in ANOTHER slot's preset inside a
-//!   games.toml profile that uses the target preset. `force` is the caller
+//!   handling: none"): the key is also bound in ANOTHER slot's preset, in a
+//!   slot list that also uses the target preset. **A machine has two such
+//!   lists and both are searched**: config.toml's `[[slot]]` table (the panel
+//!   whenever no profile was chosen — `ksx run`, the daemon with no `--game`)
+//!   and each games.toml profile (the panel for one title). Reading only the
+//!   profiles is why a collision with a live `[[slot]]` used to come back "no
+//!   conflict"; every conflict row now names the FILE and the slot that holds
+//!   it, because "somewhere else" is not an address. `force` is the caller
 //!   saying "yes, I mean both slots to see that key" — it writes the target,
 //!   keeps reporting the double binding, and **never edits the other preset**,
 //!   because silently rewriting a file the caller did not name is worse than a
@@ -136,13 +142,38 @@ pub struct MapSpec {
     pub turbo_hz: Option<u32>,
 }
 
+/// WHICH slot list a conflict was found in — the two a machine has.
+///
+/// Not cosmetic: the two lists are live at different times and are edited in
+/// different files, so a refusal that does not say which one it means cannot
+/// be acted on. `as_str` is the wire word (see [`conflicts_json`]), kept in
+/// one place so the CLI, the pipe and docs/CONTROL-SURFACE.md cannot drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictScope {
+    /// config.toml's `[[slot]]` table — the panel whenever no profile was
+    /// chosen (`ksx run`, the daemon with no `--game`).
+    Config,
+    /// One games.toml profile's `[[game.slot]]` list — the panel for one title.
+    Profile,
+}
+
+impl ConflictScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ConflictScope::Config => "config",
+            ConflictScope::Profile => "profile",
+        }
+    }
+}
+
 /// One conflicting binding — always CROSS-SLOT.
 ///
 /// There is deliberately no "same preset" variant any more: a key on another
 /// function of the SAME preset is a multi-bind, reported as
-/// [`AppliedMap::also_drives`], not as a conflict. The wire keeps emitting
-/// `"scope": "profile"` (see [`conflicts_json`]) so existing readers that
-/// switch on it are unaffected.
+/// [`AppliedMap::also_drives`], not as a conflict. `"profile"` stays the wire
+/// word for a games.toml row (see [`conflicts_json`]) so existing readers that
+/// switch on it are unaffected; `"config"` is the row that used to not exist
+/// at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MapConflict {
     /// The key that conflicts. Carried per row because ONE write can now
@@ -152,25 +183,42 @@ pub struct MapConflict {
     pub preset: String,
     /// Canonical function name the key is bound to there.
     pub function: String,
-    /// Profile title.
+    /// Which of the two slot lists holds it.
+    pub scope: ConflictScope,
+    /// The file that holds it, as the store actually RESOLVED it — never the
+    /// spelled-out "config.toml". The same store reads `ksx.toml` on a
+    /// portable install and `config.json` through interop, and a refusal that
+    /// sends its reader to a file they do not have is a refusal they cannot
+    /// act on.
+    pub file: String,
+    /// Profile title — `None` for a config.toml row, which has no profile.
     pub profile: Option<String>,
-    /// Slot number inside that profile.
+    /// Slot number inside that list.
     pub slot: Option<u8>,
 }
 
 impl MapConflict {
-    /// One human line, e.g. `G is "IPAC P2"'s A (slot 2 of "Steam")`.
+    /// One human line, e.g. `G is "IPAC P2"'s A (slot 2 of "Steam" in
+    /// games.toml)`, or `G is "IPAC P2"'s A (slot 2 in config.toml)`.
     pub fn describe(&self, key: &str) -> String {
         format!(
             "{key} is \"{}\"'s {}{}",
             self.preset,
             self.function,
-            match (&self.profile, self.slot) {
-                (Some(profile), Some(slot)) => format!(" (slot {slot} of \"{profile}\")"),
-                (Some(profile), None) => format!(" (\"{profile}\")"),
-                _ => String::new(),
-            }
+            self.location()
         )
+    }
+
+    /// Where that other binding lives: the slot, its profile if it has one,
+    /// and always the file — "somewhere else" is not an address.
+    fn location(&self) -> String {
+        let file = &self.file;
+        match (&self.profile, self.slot) {
+            (Some(profile), Some(slot)) => format!(" (slot {slot} of \"{profile}\" in {file})"),
+            (Some(profile), None) => format!(" (\"{profile}\" in {file})"),
+            (None, Some(slot)) => format!(" (slot {slot} in {file})"),
+            (None, None) => format!(" (in {file})"),
+        }
     }
 
     /// The same line, about this row's OWN key — what a multi-key write has to
@@ -624,7 +672,7 @@ pub fn apply(store: &Store, spec: &MapSpec) -> Result<AppliedMap, MapError> {
         // the order given, so the refusal names the first key that hits one
         // and nothing is written for any of them.
         for key in &keys {
-            let conflicts = find_profile_conflicts(store, &spec.preset, *key);
+            let conflicts = find_cross_slot_conflicts(store, &spec.preset, *key);
             if !conflicts.is_empty() && !spec.force {
                 return Err(MapError::Conflicts {
                     key: key.name().to_owned(),
@@ -847,7 +895,7 @@ fn apply_macro_trigger(store: &Store, spec: &MapSpec, name: &str) -> Result<Appl
     // is checked with exactly the same rule and the same `--force` escape.
     let mut overridden = Vec::new();
     for key in &keys {
-        let conflicts = find_profile_conflicts(store, &spec.preset, *key);
+        let conflicts = find_cross_slot_conflicts(store, &spec.preset, *key);
         if !conflicts.is_empty() && !spec.force {
             return Err(MapError::Conflicts {
                 key: key.name().to_owned(),
@@ -1894,32 +1942,97 @@ fn load_preset_by_name(store: &Store, name: &str) -> Result<PresetFile, MapError
         })
 }
 
+/// One slot list as the conflict search sees it: where it lives, and the
+/// (slot number, preset) pairs in it.
+///
+/// The two lists are the same shape to this search and differ only in where a
+/// reader has to go to change one — which is exactly what a refusal has to
+/// say, so it is carried rather than derived.
+struct SlotList {
+    scope: ConflictScope,
+    /// File name as the store RESOLVED it (see [`MapConflict::file`]).
+    file: String,
+    profile: Option<String>,
+    slots: Vec<(u8, String)>,
+}
+
+/// Every slot list on this machine, config.toml first.
+///
+/// Order is load-bearing for the dedupe below: the `[[slot]]` table is live
+/// whenever no profile was chosen, so when the same pairing appears in both it
+/// is the one worth naming first.
+///
+/// A file that cannot be read contributes nothing and is not an error — the
+/// preset write stands on its own, and a config that cannot be read simply
+/// cannot warn. (games.toml has always worked this way; config.toml now joins
+/// it.)
+fn slot_lists(store: &Store) -> Vec<SlotList> {
+    let mut lists = Vec::new();
+    if let Ok(config) = store.load_config() {
+        if !config.value.slots.is_empty() {
+            lists.push(SlotList {
+                scope: ConflictScope::Config,
+                file: file_label(&store.config_source().path),
+                profile: None,
+                slots: config
+                    .value
+                    .slots
+                    .iter()
+                    .map(|s| (s.number, s.preset.clone()))
+                    .collect(),
+            });
+        }
+    }
+    if let Ok(games) = store.load_games() {
+        let file = file_label(&store.games_source().path);
+        for game in &games.value.games {
+            lists.push(SlotList {
+                scope: ConflictScope::Profile,
+                file: file.clone(),
+                profile: Some(game.title.clone()),
+                slots: game
+                    .slots
+                    .iter()
+                    .map(|s| (s.number, s.preset.clone()))
+                    .collect(),
+            });
+        }
+    }
+    lists
+}
+
+/// The file name a refusal points at, from the path the store resolved.
+fn file_label(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 /// The one conflict scope left: `key` bound in ANOTHER slot's preset, inside a
-/// games.toml profile that also uses `preset_name`.
+/// slot list that also uses `preset_name` — config.toml's `[[slot]]` table or
+/// a games.toml profile, both searched.
 ///
 /// The same key on another function of the SAME preset is deliberately not
 /// here — it is a multi-bind, reported as `also_drives`.
-fn find_profile_conflicts(store: &Store, preset_name: &str, key: Key) -> Vec<MapConflict> {
+fn find_cross_slot_conflicts(store: &Store, preset_name: &str, key: Key) -> Vec<MapConflict> {
     let mut conflicts = Vec::new();
-
-    // games.toml being unreadable is not a mapping error — the preset write
-    // stands on its own; an unreadable profile list just cannot warn.
-    let Ok(games) = store.load_games() else {
-        return conflicts;
-    };
     let mut cache: BTreeMap<String, Vec<(Key, String)>> = BTreeMap::new();
-    let mut seen: Vec<(String, String)> = Vec::new(); // dedupe (preset, function)
-    for game in &games.value.games {
-        if !game.slots.iter().any(|s| s.preset == preset_name) {
+    // Deduped per SCOPE, not globally. Several games.toml profiles pairing the
+    // same two presets are one fact and have always been reported once (the
+    // first profile names it); the SAME pairing in config.toml is a second
+    // file to go and edit, so it is a second row.
+    let mut seen: Vec<(ConflictScope, String, String)> = Vec::new();
+    for list in slot_lists(store) {
+        if !list.slots.iter().any(|(_, preset)| preset == preset_name) {
             continue;
         }
-        for slot in &game.slots {
-            if slot.preset == preset_name {
+        for (number, preset) in &list.slots {
+            if preset == preset_name {
                 continue; // same-preset scope already covers it
             }
-            let bound = cache.entry(slot.preset.clone()).or_insert_with(|| {
+            let bound = cache.entry(preset.clone()).or_insert_with(|| {
                 store
-                    .load_preset(&slot.preset)
+                    .load_preset(preset)
                     .ok()
                     .flatten()
                     .and_then(|loaded| loaded.value.to_core().ok())
@@ -1935,17 +2048,19 @@ fn find_profile_conflicts(store: &Store, preset_name: &str, key: Key) -> Vec<Map
                 if *k != key {
                     continue;
                 }
-                let dedupe = (slot.preset.clone(), function.clone());
+                let dedupe = (list.scope, preset.clone(), function.clone());
                 if seen.contains(&dedupe) {
                     continue;
                 }
                 seen.push(dedupe);
                 conflicts.push(MapConflict {
                     key: key.name().to_owned(),
-                    preset: slot.preset.clone(),
+                    preset: preset.clone(),
                     function: function.clone(),
-                    profile: Some(game.title.clone()),
-                    slot: Some(slot.number),
+                    scope: list.scope,
+                    file: list.file.clone(),
+                    profile: list.profile.clone(),
+                    slot: Some(*number),
                 });
             }
         }
@@ -1982,18 +2097,22 @@ pub fn moved_from_json(moved: Option<&MovedFrom>) -> serde_json::Value {
 
 /// The conflicts as pipe/Studio JSON rows — one shape everywhere.
 ///
-/// `scope` is the constant `"profile"`: every conflict this writer reports is
-/// cross-slot now, and the field stays on the wire so readers that switch on
-/// it (studio's `BindConflict`, studio-ui's dialog) keep working unchanged.
+/// `scope` is `"profile"` for a games.toml row — the word it has always been,
+/// so readers that switch on it (studio's `BindConflict`, studio-ui's dialog)
+/// keep working unchanged — and `"config"` for a config.toml `[[slot]]` row,
+/// which is the row that used to not exist at all. `file` is the file name to
+/// go and edit, and it is on every row: a surface that only knows "another
+/// slot" cannot tell a user where to look.
 pub fn conflicts_json(conflicts: &[MapConflict]) -> serde_json::Value {
     serde_json::Value::Array(
         conflicts
             .iter()
             .map(|c| {
                 serde_json::json!({
-                    "scope": "profile",
+                    "scope": c.scope.as_str(),
                     "preset": c.preset,
                     "function": c.function,
+                    "file": c.file,
                     "profile": c.profile,
                     "slot": c.slot,
                 })
@@ -2038,6 +2157,14 @@ mod tests {
     fn games(store: &Store, toml: &str) {
         let file: GamesFile = toml::from_str(toml).unwrap();
         store.save_games(&file).unwrap();
+    }
+
+    /// The OTHER slot list: config.toml's `[[slot]]` table — the panel that is
+    /// live whenever no profile was chosen.
+    fn config(store: &Store, toml: &str) {
+        let file: ksx_config::ConfigFile =
+            toml::from_str(&format!("schema_version = 1\n{toml}")).unwrap();
+        store.save_config(&file).unwrap();
     }
 
     fn spec(preset: &str, function: &str, key: Option<&str>, force: bool) -> MapSpec {
@@ -2651,10 +2778,19 @@ preset = "P2"
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].preset, "P2");
         assert_eq!(conflicts[0].function, "A");
+        assert_eq!(conflicts[0].scope, ConflictScope::Profile);
         assert_eq!(conflicts[0].profile.as_deref(), Some("Steam"));
         assert_eq!(conflicts[0].slot, Some(2));
         assert!(err.to_string().contains("\"P2\"'s A"), "{err}");
         assert!(err.to_string().contains("another SLOT's preset"), "{err}");
+        // A profile row names its file too — "slot 2 of Steam" is an address
+        // only once you know which of the two slot lists Steam lives in.
+        assert_eq!(conflicts[0].file, "games.toml");
+        assert!(
+            err.to_string()
+                .contains("slot 2 of \"Steam\" in games.toml"),
+            "{err}"
+        );
 
         // Force writes the target, reports the override, leaves P2 alone.
         let p2_before = std::fs::read_to_string(store.preset_path("P2").unwrap()).unwrap();
@@ -2667,6 +2803,153 @@ preset = "P2"
         );
         let p2_after = std::fs::read_to_string(store.preset_path("P2").unwrap()).unwrap();
         assert_eq!(p2_before, p2_after, "other presets are never edited");
+    }
+
+    /// **A config.toml `[[slot]]` is a slot too.**
+    ///
+    /// Fails against the version this replaced (`find_profile_conflicts`),
+    /// which read games.toml and nothing else: a key already bound in the
+    /// panel that runs whenever no profile is chosen came back "no conflict",
+    /// and `ksx map` wrote it. Two slots then heard one key in every plain
+    /// `ksx run` — the exact collision this refusal exists to prevent, missed
+    /// because the writer only knew about one of the machine's two slot lists.
+    #[test]
+    fn a_config_toml_slot_conflicts_exactly_as_a_profile_slot_does() {
+        let root = TempRoot::new("config-scope");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\n");
+        preset(&store, "P2", "A = \"G\"\n");
+        config(
+            &store,
+            r#"
+[[slot]]
+number = 1
+preset = "P1"
+[[slot]]
+number = 2
+preset = "P2"
+"#,
+        );
+
+        let err = apply(&store, &spec("P1", "B", Some("G"), false)).unwrap_err();
+        let MapError::Conflicts { conflicts, .. } = &err else {
+            panic!("expected conflicts, got {err:?}");
+        };
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].preset, "P2");
+        assert_eq!(conflicts[0].function, "A");
+        assert_eq!(conflicts[0].scope, ConflictScope::Config);
+        assert_eq!(
+            conflicts[0].profile, None,
+            "config.toml has no profile to name, and inventing one would be a lie"
+        );
+        assert_eq!(conflicts[0].slot, Some(2));
+
+        // The refusal is an ADDRESS: which file, and which slot in it.
+        let text = err.to_string();
+        assert!(text.contains("config.toml"), "{text}");
+        assert!(text.contains("slot 2"), "{text}");
+        assert!(!text.contains("games.toml"), "wrong file named: {text}");
+
+        // …and the file name comes from the store's own resolution, so it is
+        // the file a reader would actually find on disk.
+        assert_eq!(
+            conflicts[0].file,
+            store
+                .config_source()
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+        );
+
+        // Force writes the target, reports the override, leaves P2 alone —
+        // the same bargain the profile scope has always made.
+        let p2_before = std::fs::read_to_string(store.preset_path("P2").unwrap()).unwrap();
+        let applied = apply(&store, &spec("P1", "B", Some("G"), true)).unwrap();
+        assert_eq!(applied.overridden.len(), 1);
+        assert_eq!(
+            p2_before,
+            std::fs::read_to_string(store.preset_path("P2").unwrap()).unwrap(),
+            "other presets are never edited"
+        );
+    }
+
+    /// The same pairing in BOTH files is two places to go and edit, so it is
+    /// two rows — each naming its own file — and config.toml comes first
+    /// because it is the list that is live when nothing else was chosen.
+    ///
+    /// Fails against a version that deduped globally on (preset, function):
+    /// only one of the two files would ever be named, and which one would
+    /// depend on search order rather than on anything the user did.
+    #[test]
+    fn a_pairing_in_both_files_names_both_files() {
+        let root = TempRoot::new("both-files");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\n");
+        preset(&store, "P2", "A = \"G\"\n");
+        config(
+            &store,
+            r#"
+[[slot]]
+number = 1
+preset = "P1"
+[[slot]]
+number = 3
+preset = "P2"
+"#,
+        );
+        games(
+            &store,
+            r#"
+[[game]]
+title = "Steam"
+path = "C:\\steam.exe"
+[[game.slot]]
+number = 1
+preset = "P1"
+[[game.slot]]
+number = 2
+preset = "P2"
+"#,
+        );
+
+        let err = apply(&store, &spec("P1", "B", Some("G"), false)).unwrap_err();
+        let MapError::Conflicts { conflicts, .. } = &err else {
+            panic!("expected conflicts, got {err:?}");
+        };
+        assert_eq!(conflicts.len(), 2, "{conflicts:?}");
+        assert_eq!(conflicts[0].scope, ConflictScope::Config);
+        assert_eq!(conflicts[0].slot, Some(3));
+        assert_eq!(conflicts[1].scope, ConflictScope::Profile);
+        assert_eq!(conflicts[1].profile.as_deref(), Some("Steam"));
+        assert_eq!(conflicts[1].slot, Some(2));
+
+        let text = err.to_string();
+        assert!(text.contains("slot 3 in config.toml"), "{text}");
+        assert!(text.contains("slot 2 of \"Steam\" in games.toml"), "{text}");
+    }
+
+    /// A config.toml that does not use the target preset is not conflict
+    /// scope — the same rule the profiles have always obeyed. Without it,
+    /// every preset on disk would collide with every other one the moment a
+    /// machine had any slots at all, and `--force` would become mandatory.
+    #[test]
+    fn a_config_not_using_the_target_preset_is_not_conflict_scope() {
+        let root = TempRoot::new("config-out-of-scope");
+        let store = root.store();
+        preset(&store, "P1", "A = \"S\"\n");
+        preset(&store, "Other", "A = \"G\"\n");
+        config(
+            &store,
+            r#"
+[[slot]]
+number = 1
+preset = "Other"
+"#,
+        );
+        // The configured panel does not run P1, so Other's G is not in scope.
+        assert!(apply(&store, &spec("P1", "B", Some("G"), false)).is_ok());
     }
 
     #[test]
@@ -3188,19 +3471,38 @@ preset = "Other"
 
     #[test]
     fn conflicts_serialize_to_the_documented_rows() {
-        let rows = conflicts_json(&[MapConflict {
-            key: "G".into(),
-            preset: "P2".into(),
-            function: "A".into(),
-            profile: Some("Steam".into()),
-            slot: Some(2),
-        }]);
+        let rows = conflicts_json(&[
+            MapConflict {
+                key: "G".into(),
+                preset: "P2".into(),
+                function: "A".into(),
+                scope: ConflictScope::Profile,
+                file: "games.toml".into(),
+                profile: Some("Steam".into()),
+                slot: Some(2),
+            },
+            MapConflict {
+                key: "G".into(),
+                preset: "P2".into(),
+                function: "A".into(),
+                scope: ConflictScope::Config,
+                file: "config.toml".into(),
+                profile: None,
+                slot: Some(2),
+            },
+        ]);
         assert_eq!(
             rows,
-            serde_json::json!([{
-                "scope": "profile", "preset": "P2", "function": "A",
-                "profile": "Steam", "slot": 2
-            }])
+            serde_json::json!([
+                {
+                    "scope": "profile", "preset": "P2", "function": "A",
+                    "file": "games.toml", "profile": "Steam", "slot": 2
+                },
+                {
+                    "scope": "config", "preset": "P2", "function": "A",
+                    "file": "config.toml", "profile": null, "slot": 2
+                }
+            ])
         );
     }
 
