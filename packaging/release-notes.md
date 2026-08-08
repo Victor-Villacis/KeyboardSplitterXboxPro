@@ -20,6 +20,14 @@ Download **{{SETUP_NAME}}** from Assets below and double-click it. Click through
 the wizard; at the end it offers to open ksx, and it leaves an icon on your
 desktop either way.
 
+One box in that wizard is worth reading: **Install the ViGEmBus controller
+driver**. It is ticked, and it is what makes a virtual controller possible at
+all - leave it ticked unless you already have ViGEmBus from something else. The
+driver is bundled here, nothing is downloaded, and ksx checks its SHA-256 and
+its signature before running it. If you clear it, ksx still installs and still
+maps; it just cannot create a controller until you run the installer again with
+the box ticked.
+
 ## Windows will say "Windows protected your PC"
 
 A blue box, with only a "Don't run" button showing. Click **More info**, then
@@ -52,5 +60,7 @@ developer machine touched these bytes.
   menu entry, no desktop icon, and none of the bundled ViGEmBus driver that ksx
   expects to find in a `drivers` folder beside it.
 
-Neither one installs a driver on its own. ksx installs ViGEmBus only when you
-ask it to, and checks the bundle's hash and its signature first.
+Neither one installs a driver behind your back. The installer asks, on the
+ticked box described above; `ksx.exe` on its own installs nothing and has no
+bundled driver to install. Either way ksx checks the bundle's hash and its
+signature before anything runs.
