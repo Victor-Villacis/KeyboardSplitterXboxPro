@@ -10,6 +10,10 @@
 //! - `rawinput` (M3): identify-only device picker; NEVER a blocking backend
 //!   (the RawInput+LLHOOK correlation hack is rejected by design).
 //!
+//! …and one that reads no hardware at all: [`replay`] plays a recorded session
+//! (`ksx monitor --record`) back through the same trait, so a file drives the
+//! identical pipeline a person does.
+//!
 //! Hot-path rule: the capture thread only receives, evaluates emergency escapes
 //! ([`escape`]), decides pass/suppress from an arc-swap snapshot, re-sends what
 //! must pass (byte-for-byte), and pushes into a bounded channel with `try_send`
@@ -49,6 +53,7 @@ pub mod hid;
 pub mod keymap;
 pub mod mock;
 pub mod presence;
+pub mod replay;
 pub mod watchdog;
 
 #[cfg(windows)]
@@ -80,6 +85,10 @@ pub use exhaustion::{Exhaustion, ExhaustionDetector, MAX_KEYBOARD_SLOT};
 pub use health::{CaptureHealth, HealthHandle, HealthView};
 pub use mock::{MockCaptureBackend, MockStroke, ResentStroke};
 pub use presence::PresenceHandle;
+pub use replay::{
+    RealClock, RecordedEvent, Recording, RecordingError, ReplayBackend, ReplayClock,
+    ReplayProgress, Silenced, Speed, SpeedError, VirtualClock,
+};
 pub use watchdog::Watchdog;
 
 #[cfg(windows)]
