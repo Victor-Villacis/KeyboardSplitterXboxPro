@@ -8,6 +8,22 @@ This is a ground-up **Rust** rebuild of djlastnight's
 (2016, C#/.NET 4.0, unmaintained). The original lives on in [`legacy/`](legacy/) as the
 behavior reference; the Rust workspace at the repo root is the project now.
 
+## Download
+
+**[Releases](https://github.com/Victor-Villacis/KeyboardSplitterXboxPro/releases)**
+— one file, `ksx-<version>-setup.exe`. Double-click it, click through the
+wizard, and ksx opens. Windows 11, 64-bit. Nothing else to install first.
+
+Windows will say **"Windows protected your PC"**, because the installer is not
+code-signed: click **More info**, then **Run anyway**. Every release body
+carries the installer's SHA-256 and the commit it was built from, so you can
+check the file rather than take that on faith.
+
+Each release is built on a GitHub runner from a pushed `v*` tag and never on a
+developer machine — [`docs/RELEASING.md`](docs/RELEASING.md). The bare `ksx.exe`
+is attached beside the installer for people who want no installer; it is not the
+file to start with.
+
 **New here?** [`docs/QUICKSTART.md`](docs/QUICKSTART.md) goes from a fresh
 machine to four working players: drivers, which capture mode to pick, and then
 either `ksx preset new --from-template arcade-6button` (a standard panel needs

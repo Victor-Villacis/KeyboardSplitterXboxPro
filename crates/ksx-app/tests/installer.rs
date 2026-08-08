@@ -353,14 +353,33 @@ fn artifact_steps(text: &str, verb: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The placeholders `release.yml` actually substitutes: the `{{NAME}}` of every
+/// `.Replace('{{NAME}}', …)` call.
+///
+/// NOT every `{{NAME}}` the file mentions. The comment above that step names one
+/// as an example of the failure it prevents, and a placeholder named in a
+/// comment substitutes nothing — which is exactly how the first version of this
+/// scan passed against a template carrying the placeholder from that example.
+fn substituted_placeholders(release: &str) -> Vec<String> {
+    const CALL: &str = ".Replace('{{";
+    let mut out = Vec::new();
+    let mut rest = release;
+    while let Some(at) = rest.find(CALL) {
+        let tail = &rest[at + CALL.len()..];
+        let Some(end) = tail.find("}}'") else { break };
+        out.push(tail[..end].to_owned());
+        rest = &tail[end..];
+    }
+    out
+}
+
 /// `*` matches any run of characters. Nothing else is special — these are two
 /// patterns out of two files, not a shell.
 fn glob_matches(pattern: &str, text: &str) -> bool {
     match pattern.split_once('*') {
         None => pattern == text,
         Some((head, tail)) => text.strip_prefix(head).is_some_and(|rest| {
-            (0..=rest.len())
-                .any(|at| rest.is_char_boundary(at) && glob_matches(tail, &rest[at..]))
+            (0..=rest.len()).any(|at| rest.is_char_boundary(at) && glob_matches(tail, &rest[at..]))
         }),
     }
 }
@@ -909,19 +928,25 @@ fn the_release_body_carries_the_hash_the_commit_and_the_smartscreen_step() {
     }
 
     // Every placeholder the template uses is one the workflow fills in.
-    let release = workflow("release.yml");
+    let filled = substituted_placeholders(&workflow("release.yml"));
+    assert!(
+        !filled.is_empty(),
+        "no `.Replace('{{{{NAME}}}}', …)` calls found in release.yml — either the \
+         compose step is gone or it stopped substituting by that spelling, and \
+         this test can no longer see what it fills in"
+    );
     let mut rest = notes.as_str();
     while let Some(at) = rest.find("{{") {
         let tail = &rest[at + 2..];
         let end = tail
             .find("}}")
             .unwrap_or_else(|| panic!("unterminated `{{{{` in packaging/release-notes.md"));
-        let placeholder = format!("{{{{{}}}}}", &tail[..end]);
+        let name = &tail[..end];
         assert!(
-            release.contains(&placeholder),
-            "packaging/release-notes.md uses {placeholder} and \
-             .github/workflows/release.yml never substitutes it — it would reach \
-             the releases page as literal braces"
+            filled.iter().any(|known| known == name),
+            "packaging/release-notes.md uses {{{{{name}}}}} and \
+             .github/workflows/release.yml substitutes only {filled:?} — it would \
+             reach the releases page as literal braces"
         );
         rest = &tail[end + 2..];
     }
