@@ -49,8 +49,8 @@ use forma_server::{render_page, PageConfig, PageOutput, RenderMode};
 
 use crate::render::{body_prefix, with_icon_links, EmbeddedPage, PERSONALITY_CSS};
 use crate::snapshot::{
-    StartBlockingRow, StartBoardRow, StartGapRow, StartOptionRow, StartOtherRow, StartPayload,
-    StartSlotRow, StartTextRow,
+    StartBlockingRow, StartBoardRow, StartGapRow, StartLayoutRow, StartOptionRow, StartOtherRow,
+    StartPayload, StartSlotRow, StartTextRow,
 };
 
 /// List slot names, binding-derived (compiler 0.2.0): a `createList` reading
@@ -63,13 +63,21 @@ const LIST_SLOT_SLOTS: &str = "list:slotRows:array";
 const LIST_SLOT_PERSONAS: &str = "list:personaOptions:array";
 const LIST_SLOT_GAPS: &str = "list:gapRows:array";
 const LIST_SLOT_BLOCKING: &str = "list:blockingRows:array";
+/// The layout menu appears TWICE — once on "Add a controller", once on "give
+/// slot N this layout" — so the second occurrence gets the `#2` suffix by
+/// document order, exactly like the mapper's `slotTabs`/`slotTabs#2` pair.
+/// Both receive the same array: it is one menu, drawn in two places.
+const LIST_SLOT_LAYOUTS: &str = "list:layoutOptions:array";
+const LIST_SLOT_LAYOUTS_2: &str = "list:layoutOptions#2:array";
+const LIST_SLOT_LAYOUT_ROWS: &str = "list:layoutRows:array";
+const LIST_SLOT_SLOT_OPTIONS: &str = "list:slotOptions:array";
 
 #[cfg(test)]
 const ISLAND_COMPONENT: &str = "StartIsland";
 
 /// How many `createShow` pairs this page has. Name-addressable since compiler
 /// 0.3.1, so this is a staleness tripwire rather than a mapping.
-const SHOW_COUNT: usize = 22;
+const SHOW_COUNT: usize = 23;
 
 /// Bare-named slots the island renders and the seam deliberately never fills.
 /// EMPTY, and that is the claim.
@@ -96,6 +104,7 @@ fn scalar_slots(payload: &StartPayload, flash: Option<&str>) -> serde_json::Valu
         "xinputLine": lines.xinput_line,
         "blockingLine": lines.blocking_line,
         "presetLine": lines.preset_line,
+        "mapperLine": lines.mapper_line,
         "readyLine": lines.ready_line,
         "playLine": lines.play_line,
         "guideLine": lines.guide_line,
@@ -215,8 +224,20 @@ fn text_row(row: &StartTextRow) -> SlotValue {
     SlotValue::object(vec![("text".to_owned(), SlotValue::Text(row.text.clone()))])
 }
 
-fn list_values(payload: &StartPayload) -> [(&'static str, SlotValue); 7] {
+fn layout_row(layout: &StartLayoutRow) -> SlotValue {
+    SlotValue::object(vec![
+        ("label".to_owned(), SlotValue::Text(layout.label.clone())),
+        ("panel".to_owned(), SlotValue::Text(layout.panel.clone())),
+        (
+            "players".to_owned(),
+            SlotValue::Text(layout.players.clone()),
+        ),
+    ])
+}
+
+fn list_values(payload: &StartPayload) -> [(&'static str, SlotValue); 11] {
     let rows = &payload.rows;
+    let layouts = || SlotValue::array(rows.layouts.iter().map(option_row).collect());
     [
         (
             LIST_SLOT_BOARDS,
@@ -246,6 +267,16 @@ fn list_values(payload: &StartPayload) -> [(&'static str, SlotValue); 7] {
             LIST_SLOT_BLOCKING,
             SlotValue::array(rows.blocking.iter().map(blocking_row).collect()),
         ),
+        (LIST_SLOT_LAYOUTS, layouts()),
+        (LIST_SLOT_LAYOUTS_2, layouts()),
+        (
+            LIST_SLOT_LAYOUT_ROWS,
+            SlotValue::array(rows.layout_details.iter().map(layout_row).collect()),
+        ),
+        (
+            LIST_SLOT_SLOT_OPTIONS,
+            SlotValue::array(rows.slot_numbers.iter().map(option_row).collect()),
+        ),
     ]
 }
 
@@ -272,6 +303,7 @@ fn show_values(payload: &StartPayload, flash: Option<&str>) -> [(&'static str, b
         ("show:canAdd", f.can_add),
         ("show:slotsFull", f.slots_full),
         ("show:hasGaps", f.has_gaps),
+        ("show:canLayout", f.can_layout),
         ("show:blockingAnswered", f.blocking_answered),
         ("show:ready", f.ready),
         ("show:notReady", f.not_ready),
@@ -440,11 +472,34 @@ mod tests {
         }
     }
 
+    /// "Add a controller" AS THE PAGE POSTS IT: with the served default
+    /// layout, which is what the form's first `<option>` carries.
     fn add(persona: &str) -> ksx_api::StageEdit {
         ksx_api::StageEdit::AddSlot {
             number: None,
             persona: persona.into(),
             preset: "Player 1".into(),
+            layout: Some("arcade-6button".into()),
+        }
+    }
+
+    /// The same click with the layout menu set to the blank one — a
+    /// controller that binds nothing, which is what EVERY controller used to
+    /// be.
+    fn add_blank(persona: &str) -> ksx_api::StageEdit {
+        ksx_api::StageEdit::AddSlot {
+            number: None,
+            persona: persona.into(),
+            preset: "Player 1".into(),
+            layout: None,
+        }
+    }
+
+    /// §3's answer, so a fixture can reach the state where Save and Play are
+    /// offered at all.
+    fn answer() -> ksx_api::StageEdit {
+        ksx_api::StageEdit::SetBlocking {
+            blocking: "bound-keys".into(),
         }
     }
 
@@ -777,17 +832,154 @@ mod tests {
         );
         assert!(out.html.contains("no pad is on the bus"), "{}", out.html);
         assert!(out.html.contains("Remove leaves no trace"), "{}", out.html);
-        // A pad with no bindings plugs and does nothing. Say it before a game
-        // does.
+        // It arrived with a LAYOUT, so the row says what it binds rather than
+        // promising a controller that does nothing.
+        assert!(out.html.contains("controls bound"), "{}", out.html);
         assert!(
+            out.html.contains(r#"action="/start/controller/remove""#),
+            "{}",
             out.html
-                .contains("nothing mapped yet — this pad would plug and do nothing"),
+        );
+    }
+
+    /// **A controller that binds nothing says so, on its own row, and does not
+    /// call itself ready.**
+    ///
+    /// FAILS against the shipped row, which said "ready — it will exist the
+    /// moment you press Play" for every staged slot including the ones with an
+    /// empty preset. That is `FIRST-RUN.md` §6's "a screen reports success
+    /// while nothing works", one line long — and it was the ordinary case,
+    /// because `AddSlot` staged an empty preset for every controller.
+    #[test]
+    fn a_controller_with_no_bindings_is_not_called_ready() {
+        let page = EmbeddedPage::load("/start").unwrap();
+        let out = render_start(
+            &page,
+            &payload(stage(&[choose(), add_blank("xbox360"), answer()])),
+            None,
+        );
+
+        assert!(
+            out.html.contains("not ready — nothing is bound to it"),
             "{}",
             out.html
         );
         assert!(
-            out.html.contains(r#"action="/start/controller/remove""#),
+            out.html
+                .contains("this pad would plug and do nothing, so Play refuses it by name"),
             "{}",
+            out.html
+        );
+        assert!(
+            !out.html.contains("ready — it will exist the moment"),
+            "a dead pad must not wear the ready sentence: {}",
+            out.html
+        );
+        // ...and neither button is offered, with ksx-core's own reason on the
+        // page instead.
+        assert!(
+            !out.html.contains(r#"action="/start/play""#),
+            "Play was offered for a pad that binds nothing: {}",
+            out.html
+        );
+        assert!(
+            !out.html.contains(r#"action="/start/save""#),
+            "Save was offered for a pad that binds nothing: {}",
+            out.html
+        );
+        assert!(
+            out.html.contains("would plug a pad that does"),
+            "{}",
+            out.html
+        );
+    }
+
+    /// **Moment 6 happens HERE: the layouts are served, offered, and land in
+    /// the stage.**
+    ///
+    /// FAILS against the shipped page, whose step 3 was a link to the mapper
+    /// and a paragraph admitting the consequence — "Mapping happens in the
+    /// mapper, and the mapper edits preset FILES. Save first". That sent a
+    /// first-run user out of a flow that had written nothing, told them to
+    /// write something they had not decided on, and then played the staged,
+    /// still-empty preset when they came back.
+    ///
+    /// It also fails against a page that spelled the layout list itself: every
+    /// id, every panel note and the recommended default are
+    /// `ksx_core::templates`', served through `StagedSetupView::layouts`.
+    #[test]
+    fn the_layouts_are_served_offered_and_land_in_the_stage() {
+        let page = EmbeddedPage::load("/start").unwrap();
+        let out = render_start(&page, &payload(stage(&[choose(), add("xbox360")])), None);
+
+        // The menu on "Add a controller" AND the one that re-dresses a staged
+        // slot — both from the served roster.
+        assert!(
+            out.html.contains(r#"action="/start/controller/layout""#),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains(r#"value="arcade-6button""#),
+            "{}",
+            out.html
+        );
+        assert!(out.html.contains(r#"value="keyboard-2p""#), "{}", out.html);
+        // The RECOMMENDED default is the first option, because that is what a
+        // select shows: a user who never opens the menu still gets a pad that
+        // does something.
+        let menu = out
+            .html
+            .find(r#"id="layout""#)
+            .expect("the layout menu on Add a controller");
+        let first = out.html[menu..]
+            .find(r#"<option value=""#)
+            .map(|at| &out.html[menu + at..menu + at + 40])
+            .unwrap_or_default();
+        assert!(
+            first.contains("arcade-6button"),
+            "the first layout option is not the served default: {first}"
+        );
+        // The panel note is ksx-core's, verbatim, so somebody can tell the
+        // layouts apart.
+        assert!(
+            out.html.contains("factory chart"),
+            "the panel note must be on the page: {}",
+            out.html
+        );
+        // The one that binds nothing is offered WITH what it costs.
+        assert!(out.html.contains("Binds nothing at all"), "{}", out.html);
+        assert!(
+            out.html.contains("Play will refuse it by name"),
+            "{}",
+            out.html
+        );
+        // ...and the mapper is still described as what it is — a FILE editor —
+        // rather than as step 3 of a flow that has saved nothing.
+        assert!(
+            out.html
+                .contains("no file is written and no mapper is opened"),
+            "{}",
+            out.html
+        );
+        assert!(
+            !out.html.contains("Save first: that writes one preset"),
+            "the page must no longer send a first-run user to the mapper to map: {}",
+            out.html
+        );
+        // The SEAM is stated where the link is. Mapping a button in the mapper
+        // does not change what Play does here, and a person cannot guess that
+        // — they would find it out by playing a pad that ignores the button
+        // they just mapped.
+        assert!(
+            out.html
+                .contains("Play on this page always starts exactly what is shown above"),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains("Open the mapper (edits saved files)"),
+            "the link must say what it opens: {}",
             out.html
         );
     }
@@ -888,7 +1080,11 @@ mod tests {
     fn saving_and_playing_are_two_buttons_and_appear_only_when_they_would_work() {
         let page = EmbeddedPage::load("/start").unwrap();
 
-        let ready = render_start(&page, &payload(stage(&[choose(), add("xbox360")])), None);
+        let ready = render_start(
+            &page,
+            &payload(stage(&[choose(), add("xbox360"), answer()])),
+            None,
+        );
         assert!(
             ready.html.contains(r#"action="/start/save""#),
             "{}",
@@ -931,6 +1127,64 @@ mod tests {
         );
         assert!(half.html.contains("controller"), "{}", half.html);
         assert!(half.html.contains("disabled"), "{}", half.html);
+    }
+
+    /// **§3 unanswered means Save and Play are not offered — and the page says
+    /// which question is missing.**
+    ///
+    /// FAILS against the shipped page. `ready` was `commit().is_ok()` and
+    /// `commit()` resolved an unanswered question through
+    /// `effective_blocking()`, so both buttons were live with the one question
+    /// in this flow still open — and pressing Save wrote
+    /// `block_keyboards = "whole"` from an answer nobody gave. On a returning
+    /// user's machine that overwrote the answer they had chosen last time.
+    ///
+    /// The other half is what must NOT happen instead: the fix is a refusal,
+    /// never a pre-selected option. This asserts both — no answer is marked,
+    /// and neither button is there.
+    #[test]
+    fn an_unanswered_question_disables_both_buttons_without_answering_it() {
+        let page = EmbeddedPage::load("/start").unwrap();
+        let out = render_start(&page, &payload(stage(&[choose(), add("xbox360")])), None);
+
+        assert!(
+            !out.html.contains(r#"action="/start/save""#),
+            "Save was offered with §3 unanswered — it would write Freeze: {}",
+            out.html
+        );
+        assert!(
+            !out.html.contains(r#"action="/start/play""#),
+            "Play was offered with §3 unanswered: {}",
+            out.html
+        );
+        assert!(out.html.contains("disabled"), "{}", out.html);
+        // The reason names the question, so the disabled button is not a
+        // mystery.
+        assert!(out.html.contains("split-or-freeze"), "{}", out.html);
+        // ...and the question is STILL not answered on the user's behalf.
+        assert!(out.html.contains("Not asked yet"), "{}", out.html);
+        assert!(
+            !blocking_card(&out.html).contains("pill-ok"),
+            "the fix must not be a pre-selected answer: {}",
+            out.html
+        );
+
+        // Answering it — with SPLIT, the non-default — is what opens both.
+        let answered = render_start(
+            &page,
+            &payload(stage(&[choose(), add("xbox360"), answer()])),
+            None,
+        );
+        assert!(
+            answered.html.contains(r#"action="/start/save""#),
+            "{}",
+            answered.html
+        );
+        assert!(
+            answered.html.contains(r#"action="/start/play""#),
+            "{}",
+            answered.html
+        );
     }
 
     /// **The three ways this page can be blind, and none of them draws an

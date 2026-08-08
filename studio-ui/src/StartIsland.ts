@@ -40,6 +40,7 @@ export interface StartLines {
   xinput_line: string;
   blocking_line: string;
   preset_line: string;
+  mapper_line: string;
   ready_line: string;
   play_line: string;
   guide_line: string;
@@ -64,6 +65,7 @@ export interface StartFlags {
   can_add: boolean;
   slots_full: boolean;
   has_gaps: boolean;
+  can_layout: boolean;
   blocking_answered: boolean;
   ready: boolean;
   not_ready: boolean;
@@ -117,6 +119,12 @@ export interface StartGapRow {
   instead: string;
 }
 
+export interface StartLayoutRow {
+  label: string;
+  panel: string;
+  players: string;
+}
+
 export interface StartBlockingRow {
   name: string;
   title: string;
@@ -137,6 +145,9 @@ export interface StartRows {
   personas: StartOptionRow[];
   gaps: StartGapRow[];
   blocking: StartBlockingRow[];
+  layouts: StartOptionRow[];
+  layout_details: StartLayoutRow[];
+  slot_numbers: StartOptionRow[];
 }
 
 /** The staged setup as ksx-api serves it. Only the fields this screen reads
@@ -180,6 +191,7 @@ const [controllerLine, setControllerLine] = createSignal("not collected");
 const [xinputLine, setXinputLine] = createSignal("not collected");
 const [blockingLine, setBlockingLine] = createSignal("not collected");
 const [presetLine, setPresetLine] = createSignal("not collected");
+const [mapperLine, setMapperLine] = createSignal("not collected");
 const [readyLine, setReadyLine] = createSignal("not collected");
 const [playLine, setPlayLine] = createSignal("not collected");
 const [guideLine, setGuideLine] = createSignal("not collected");
@@ -206,6 +218,7 @@ const [hasSlots, setHasSlots] = createSignal(false);
 const [canAdd, setCanAdd] = createSignal(false);
 const [slotsFull, setSlotsFull] = createSignal(false);
 const [hasGaps, setHasGaps] = createSignal(false);
+const [canLayout, setCanLayout] = createSignal(false);
 const [blockingAnswered, setBlockingAnswered] = createSignal(false);
 const [ready, setReady] = createSignal(false);
 const [notReady, setNotReady] = createSignal(false);
@@ -221,6 +234,9 @@ const [slotRows, setSlotRows] = createSignal<StartSlotRow[]>([]);
 const [personaOptions, setPersonaOptions] = createSignal<StartOptionRow[]>([]);
 const [gapRows, setGapRows] = createSignal<StartGapRow[]>([]);
 const [blockingRows, setBlockingRows] = createSignal<StartBlockingRow[]>([]);
+const [layoutOptions, setLayoutOptions] = createSignal<StartOptionRow[]>([]);
+const [layoutRows, setLayoutRows] = createSignal<StartLayoutRow[]>([]);
+const [slotOptions, setSlotOptions] = createSignal<StartOptionRow[]>([]);
 
 // ── Applying a payload ──────────────────────────────────────────────────────
 
@@ -240,6 +256,7 @@ export function applyStart(p: StartPayload): void {
   setXinputLine(l.xinput_line);
   setBlockingLine(l.blocking_line);
   setPresetLine(l.preset_line);
+  setMapperLine(l.mapper_line);
   setReadyLine(l.ready_line);
   setPlayLine(l.play_line);
   setGuideLine(l.guide_line);
@@ -268,6 +285,7 @@ export function applyStart(p: StartPayload): void {
   setCanAdd(f.can_add);
   setSlotsFull(f.slots_full);
   setHasGaps(f.has_gaps);
+  setCanLayout(f.can_layout);
   setBlockingAnswered(f.blocking_answered);
   setReady(f.ready);
   setNotReady(f.not_ready);
@@ -281,6 +299,9 @@ export function applyStart(p: StartPayload): void {
   setPersonaOptions(r.personas);
   setGapRows(r.gaps);
   setBlockingRows(r.blocking);
+  setLayoutOptions(r.layouts);
+  setLayoutRows(r.layout_details);
+  setSlotOptions(r.slot_numbers);
 }
 
 /** The studio server itself stopped answering /api/start. Say so and disable
@@ -651,6 +672,24 @@ export function StartIsland() {
                   ),
                 ),
               ),
+              // The LAYOUT it starts from. Served, default first — so a user
+              // who never opens this menu still gets a pad that does
+              // something, which is the difference between "ready" and a
+              // controller Play refuses.
+              h(
+                "label",
+                { class: "bindlabel", for: "layout" },
+                "starting from",
+                h(
+                  "select",
+                  { id: "layout", name: "layout" },
+                  createList(
+                    () => layoutOptions(),
+                    (o) => o.value + "|" + o.label,
+                    (o) => h("option", { value: o.value }, o.label),
+                  ),
+                ),
+              ),
               // The preset name is SERVED, because it becomes a file name.
               // Nothing on this page asks anybody to type one.
               h("input", { type: "hidden", name: "preset", value: () => nextPreset() }),
@@ -703,10 +742,73 @@ export function StartIsland() {
           () => presetsDown(),
           () => h("p", { class: "warn" }, () => presetsError()),
         ),
+        // GIVE A CONTROLLER A LAYOUT. Two selects and one submit, rather than
+        // a form per staged row: a createList inside a createList is not a
+        // shape this compiler emits, and the layout menu is the same menu for
+        // every row.
+        createShow(
+          () => canLayout(),
+          () =>
+            h(
+              "form",
+              { class: "pactrow", method: "post", action: "/start/controller/layout" },
+              h(
+                "label",
+                { class: "bindlabel", for: "layout-slot" },
+                "give",
+                h(
+                  "select",
+                  { id: "layout-slot", name: "number" },
+                  createList(
+                    () => slotOptions(),
+                    (o) => o.value + "|" + o.label,
+                    (o) => h("option", { value: o.value }, o.label),
+                  ),
+                ),
+              ),
+              h(
+                "label",
+                { class: "bindlabel", for: "layout-id" },
+                "the layout",
+                h(
+                  "select",
+                  { id: "layout-id", name: "layout" },
+                  createList(
+                    () => layoutOptions(),
+                    (o) => o.value + "|" + o.label,
+                    (o) => h("option", { value: o.value }, o.label),
+                  ),
+                ),
+              ),
+              h("button", { class: "btn", type: "submit" }, "Use this layout"),
+            ),
+        ),
+        h(
+          "details",
+          { class: "st-more" },
+          h("summary", null, "What each layout expects"),
+          h(
+            "ul",
+            { class: "plist dv-list" },
+            createList(
+              () => layoutRows(),
+              (l) => l.label + "|" + l.panel + "|" + l.players,
+              (l) =>
+                h(
+                  "li",
+                  { class: "dv-row" },
+                  h("span", { class: "dv-name" }, l.label),
+                  h("p", { class: "dv-note" }, l.panel),
+                  h("p", { class: "dv-line" }, l.players),
+                ),
+            ),
+          ),
+        ),
+        h("p", { class: "dv-note" }, () => mapperLine()),
         h(
           "p",
           { class: "pactrow" },
-          h("a", { class: "btn btn-ghost", href: "/map" }, "Open the mapper"),
+          h("a", { class: "btn btn-ghost", href: "/map" }, "Open the mapper (edits saved files)"),
         ),
       ),
       h(

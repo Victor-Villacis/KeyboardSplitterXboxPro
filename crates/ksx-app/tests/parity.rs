@@ -481,11 +481,19 @@ const ANCHORS: &[Anchors] = &[
         // here.
         cli: &["stage"],
         egui: &["Screen::FirstRun", "Ask::Stage"],
-        // The two acts §2 requires be separable, plus the page they live on.
-        // Naming both is deliberate: a `/start` that could only save, or only
+        // The two acts §2 requires be separable, plus the page they live on,
+        // plus the one that gives a staged controller its BINDINGS. Naming
+        // all four is deliberate: a `/start` that could only save, or only
         // play, would satisfy a one-anchor row while failing the requirement
-        // the row exists for.
-        studio: &["/start", "/start/save", "/start/play"],
+        // the row exists for — and a flow that could not map would satisfy
+        // both while playing a pad on which nothing works, which is what it
+        // did until `/start/controller/layout` existed.
+        studio: &[
+            "/start",
+            "/start/controller/layout",
+            "/start/save",
+            "/start/play",
+        ],
     },
     Anchors {
         capability: "Author presets / key mappings",

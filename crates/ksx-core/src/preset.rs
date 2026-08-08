@@ -357,6 +357,39 @@ impl Preset {
             .filter(|key| *key != Key::None)
     }
 
+    /// **How many bindings a key can actually reach** — the honest answer to
+    /// "does this pad do anything".
+    ///
+    /// Counted from the three places a keypress can produce pad output, each
+    /// filtered by the same rule [`Self::bound_keys`] uses: a [`Key::None`] row
+    /// is the inert placeholder spelling ("function present, unbound"), not
+    /// something anybody can press.
+    ///
+    /// This exists because `entries.len()` is the number that looks right and
+    /// is wrong: [`Self::builtin_empty`] lists **every** control with a
+    /// `Key::None` placeholder, so a preset that binds nothing has an entries
+    /// vector as long as a fully mapped one. A screen counting entries reports
+    /// a couple of dozen bindings for a pad that plugs and does nothing, which
+    /// is `docs/FIRST-RUN.md` §6's "a screen reports success while nothing
+    /// works" with a number attached.
+    pub fn live_bindings(&self) -> usize {
+        let entries = self.entries.iter().filter(|(key, _)| *key != Key::None);
+        let chords = self.chords.iter().filter(|chord| chord.key != Key::None);
+        let macros = self
+            .macros
+            .triggers
+            .iter()
+            .filter(|trigger| trigger.key != Key::None);
+        entries.count() + chords.count() + macros.count()
+    }
+
+    /// **Nothing on this preset drives the pad.** Derived from
+    /// [`Self::live_bindings`] rather than restated, so the two can never
+    /// disagree about a placeholder.
+    pub fn binds_nothing(&self) -> bool {
+        self.live_bindings() == 0
+    }
+
     /// The turbo row for `binding`, if it auto-fires.
     ///
     /// One row per endpoint by construction (the file is keyed by function), so
@@ -522,6 +555,53 @@ mod tests {
             .filter(|(_, b)| *b == binding)
             .map(|(k, _)| *k)
             .collect()
+    }
+
+    /// **A preset full of placeholders binds nothing, and the count says so.**
+    ///
+    /// Breaks against `entries.len()` as the answer, which is the number every
+    /// caller reaches for first: `builtin_empty()` has a row for every control
+    /// and not one key on it, so that version reports two dozen bindings for a
+    /// pad on which nothing works. `ksx_api::StagedSlotView::bindings` shipped
+    /// exactly that, and `StagedSetup::commit`'s no-bindings gate is built on
+    /// this predicate.
+    #[test]
+    fn a_placeholder_only_preset_binds_nothing_however_long_its_entry_list_is() {
+        let empty = Preset::builtin_empty();
+        assert!(
+            !empty.entries.is_empty(),
+            "the point of this fixture is a long entry list"
+        );
+        assert!(empty.binds_nothing());
+        assert_eq!(empty.live_bindings(), 0);
+
+        assert_eq!(Preset::builtin_default().live_bindings(), 26);
+        assert!(!Preset::builtin_default().binds_nothing());
+
+        // One live row among the placeholders is enough, and it is counted
+        // once — not once per placeholder beside it.
+        let mut one = Preset::builtin_empty();
+        one.entries.push((Key::G, Binding::Button(XButton::A)));
+        assert_eq!(one.live_bindings(), 1);
+        assert!(!one.binds_nothing());
+
+        // A chord and a macro trigger are keys somebody can press, so they
+        // count too — a preset whose only content is a chord is not dead.
+        let chorded = Preset {
+            name: "c".to_owned(),
+            entries: Vec::new(),
+            chords: vec![Chord {
+                key: Key::G,
+                binding: Binding::Button(XButton::B),
+                when: vec![Key::LeftShift],
+                unless: Vec::new(),
+            }],
+            macros: Default::default(),
+            turbo: Vec::new(),
+            protected: false,
+        };
+        assert_eq!(chorded.live_bindings(), 1);
+        assert!(!chorded.binds_nothing());
     }
 
     #[test]

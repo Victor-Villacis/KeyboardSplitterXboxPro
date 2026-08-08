@@ -980,15 +980,11 @@ impl ksx_api::MachineSource for LocalMachine {
         // no way to tell that apart from a machine with no templates. Two
         // lines, and the whole of task #14's `keyboard-2p` becomes reachable
         // from something other than a shell.
-        let templates = ksx_core::templates::TEMPLATES
-            .iter()
-            .map(|t| TemplateRow {
-                id: t.id.to_owned(),
-                label: t.summary.to_owned(),
-                detail: t.panel.to_owned(),
-                players: (1..=t.players).collect(),
-            })
-            .collect();
+        // ...composed by `TemplateRow::roster`, which the staged setup serves
+        // from too: one mapping from `Template` to a row, so "seed a new
+        // preset file" and "dress a staged controller" cannot describe the
+        // same panel differently on two screens.
+        let templates = TemplateRow::roster();
         Ok(PresetsView {
             config_root: root.presets_dir().display().to_string(),
             presets,

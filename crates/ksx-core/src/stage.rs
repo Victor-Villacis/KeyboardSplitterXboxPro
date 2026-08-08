@@ -42,6 +42,26 @@
 //!
 //! Refusals name what would make the choice legal. A refusal with no way
 //! forward is just an error message.
+//!
+//! # The two things [`StagedSetup::commit`] refuses that no operation can
+//!
+//! Every rule above is a fact about ONE edit, so an operation can check it.
+//! Two are facts about the setup as a WHOLE, and they are the two ways a
+//! screen could report success while nothing works:
+//!
+//! - **a controller that binds nothing** ([`StageRefusal::NoBindings`]) — the
+//!   pad plugs, the game sees a controller, every button is dead;
+//! - **an unanswered split-or-freeze question**
+//!   ([`StageRefusal::BlockingUnanswered`]) — resolving it to
+//!   [`Blocking::default`] would silently freeze a first-run user's keyboard,
+//!   and would overwrite a returning user's own answer with one they were
+//!   never shown.
+//!
+//! Both live in `commit` and nowhere else, which is what makes them
+//! unresurrectable: `commit` is the only door to a [`CommitSpec`], the save
+//! path and the play path are both built from one, and
+//! `ksx_api::StagedSetupView::ready` *is* `commit().is_ok()` — so the buttons
+//! are not offered, and the verbs refuse if something offers them anyway.
 
 use crate::blocking::Blocking;
 use crate::engine::ResolvedSlot;
@@ -177,6 +197,40 @@ pub enum StageRefusal {
     PresetNameClash { number: u8, other: u8, name: String },
     #[error("a preset needs a name — it is what the saved file is called, and what a [[slot]] refers to")]
     UnnamedPreset { number: u8 },
+    /// **A staged controller that binds nothing.**
+    ///
+    /// The pad plugs, Windows shows a controller, the game shows a controller,
+    /// and every button does nothing — which is indistinguishable from broken
+    /// hardware and is exactly `docs/FIRST-RUN.md` §6's "a screen reports
+    /// success while nothing works". Refused at [`StagedSetup::commit`], so it
+    /// is refused for BOTH exits (save and play) and shows up as
+    /// `StagedSetupView::not_ready` before either button is offered.
+    #[error(
+        "slot {number} would plug a pad that does nothing: its preset \"{preset}\" has no key \
+         bound to any control, so every button on it would be dead in a game — which looks \
+         exactly like broken hardware. Give it a layout to start from, or bind at least one \
+         control, then save or play. Nothing has been written, so fixing it costs nothing"
+    )]
+    NoBindings { number: u8, preset: String },
+    /// **Split-or-freeze has not been answered.**
+    ///
+    /// `docs/FIRST-RUN.md` §3 asks it once, and [`StagedSetup::blocking`] keeps
+    /// "not asked" apart from "chose the default" precisely so this can be
+    /// refused rather than silently resolved. A commit that fell back to
+    /// [`Blocking::default`] would write Freeze over the answer a returning
+    /// user had already given, from a question they were never shown.
+    #[error(
+        "split-or-freeze has not been answered yet, and it decides whether the keyboard you \
+         picked can still type while the pads are live. There is deliberately no default: an \
+         unanswered question resolved to \"{}\" would take a returning user's own answer away \
+         and would tell a first-run user their keyboard stopped typing for no reason they were \
+         shown. Answer it ({} | {} | {}), then save or play",
+        Blocking::Whole.as_str(),
+        Blocking::Whole.as_str(),
+        Blocking::BoundKeys.as_str(),
+        Blocking::Off.as_str()
+    )]
+    BlockingUnanswered,
     /// Committing (or planning) with no device chosen.
     #[error(
         "no keyboard has been chosen yet, so there is nothing for these {slots} slot(s) to \
@@ -206,6 +260,8 @@ impl StageRefusal {
             Self::BadAlias { .. } => "bad-alias",
             Self::PresetNameClash { .. } => "preset-name-clash",
             Self::UnnamedPreset { .. } => "unnamed-preset",
+            Self::NoBindings { .. } => "no-bindings",
+            Self::BlockingUnanswered => "blocking-unanswered",
             Self::NoDevice { .. } => "no-device",
             Self::NoSlots => "no-slots",
         }
@@ -226,10 +282,13 @@ pub struct CommitSpec {
     pub device: StagedDevice,
     /// Slot order. Every one names [`Self::device`] as its keyboard.
     pub slots: Vec<ResolvedSlot>,
-    /// How much of the keyboard a session takes away from Windows. Falls back
-    /// to [`Blocking::default`] when the user was never asked — which is what
-    /// an omitted `block_keyboards` key means on disk, so the fallback and the
-    /// file agree.
+    /// How much of the keyboard a session takes away from Windows.
+    ///
+    /// **Always the answer the user gave.** [`StagedSetup::commit`] refuses an
+    /// unanswered setup ([`StageRefusal::BlockingUnanswered`]), so there is no
+    /// path from "never asked" to a value here — which is what makes it safe
+    /// for `ksx-app`'s `stage::to_config` to assign it unconditionally over a
+    /// returning user's `block_keyboards`.
     pub blocking: Blocking,
 }
 
@@ -256,12 +315,6 @@ impl StagedSetup {
     /// asked. See the field docs for why those are not the same.
     pub fn blocking(&self) -> Option<Blocking> {
         self.blocking
-    }
-
-    /// What a session would actually do — the answer, or the default an
-    /// omitted `block_keyboards` key means.
-    pub fn effective_blocking(&self) -> Blocking {
-        self.blocking.unwrap_or_default()
     }
 
     /// Nothing staged at all. `true` for a fresh visit and after
@@ -433,6 +486,17 @@ impl StagedSetup {
         let mut slots = Vec::with_capacity(self.slots.len());
         for staged in &self.slots {
             check_pluggable(staged.persona)?;
+            // A pad with no bindings plugs and does nothing. Both exits are
+            // built from this value, so refusing here refuses SAVE and PLAY
+            // with one rule — and `StagedSetupView::ready` reads this same
+            // result, so the buttons are never offered for it in the first
+            // place.
+            if staged.preset.binds_nothing() {
+                return Err(StageRefusal::NoBindings {
+                    number: staged.number,
+                    preset: staged.preset.name.clone(),
+                });
+            }
             let spec = SlotSpec::new(
                 staged.number,
                 Some(keyboard.clone()),
@@ -459,10 +523,18 @@ impl StagedSetup {
                 after: xinput,
             });
         }
+        // LAST, because it is moment 6 and the others are moments 4 and 5: a
+        // user who has not yet added a controller should be told that, not
+        // asked about blocking. An unanswered question resolved to
+        // `Blocking::default()` here is the whole reason this refusal exists —
+        // see `StageRefusal::BlockingUnanswered`.
+        let Some(blocking) = self.blocking else {
+            return Err(StageRefusal::BlockingUnanswered);
+        };
         Ok(CommitSpec {
             device,
             slots,
-            blocking: self.effective_blocking(),
+            blocking,
         })
     }
 
@@ -730,30 +802,123 @@ mod tests {
         );
     }
 
-    /// "Not asked yet" and "the user chose the default" are different facts.
+    /// **"Not asked yet" and "the user chose Freeze" are different facts, and
+    /// the difference reaches all the way to the commit.**
     ///
-    /// Breaks against `blocking: Blocking` (no Option): that version cannot
-    /// tell a surface whether §3's one question has been put to the user, so
-    /// the screen renders Freeze pre-selected and the question is answered for
-    /// them — while `effective_blocking` still reports the same value, which is
-    /// why only the pair of accessors proves it.
+    /// Breaks against the shipped version, in which `commit()` read
+    /// `effective_blocking()` — `self.blocking.unwrap_or_default()`. That one
+    /// collapses the two into `Blocking::Whole` at the last step, so
+    /// `ready` (which IS `commit().is_ok()`) was true with the question
+    /// unanswered: Save was offered, and it wrote `block_keyboards = "whole"`
+    /// from a question the user had never been shown. All of §3's care —
+    /// `Option<Blocking>`, a screen that refuses to pre-select — leaked out
+    /// here.
+    ///
+    /// Also breaks against `blocking: Blocking` (no Option), which cannot tell
+    /// a surface whether §3's one question has been put to the user at all.
     #[test]
-    fn the_split_or_freeze_question_starts_unanswered() {
+    fn an_unanswered_split_or_freeze_question_is_refused_rather_than_defaulted() {
         let setup = staged();
         assert_eq!(setup.blocking(), None, "nobody has been asked");
-        assert_eq!(
-            setup.effective_blocking(),
-            Blocking::Whole,
-            "an omitted block_keyboards key means the whole device"
-        );
 
-        let split = setup.set_blocking(Blocking::BoundKeys);
-        assert_eq!(split.blocking(), Some(Blocking::BoundKeys));
-        assert_eq!(split.effective_blocking(), Blocking::BoundKeys);
+        let refused = setup.commit().unwrap_err();
+        assert_eq!(refused.code(), "blocking-unanswered");
+        let message = refused.to_string();
+        assert!(
+            message.contains("no default"),
+            "the refusal has to say the silence is deliberate: {message}"
+        );
+        assert!(message.contains("bound-keys"), "{message}");
+
+        // Answering it — with EITHER answer — is what makes the setup
+        // committable, and the answer is what the spec carries.
+        for answer in [Blocking::Whole, Blocking::BoundKeys, Blocking::Off] {
+            let spec = setup
+                .set_blocking(answer)
+                .commit()
+                .expect("an answered question commits");
+            assert_eq!(spec.blocking, answer);
+        }
+
         // Answering "freeze" is an ANSWER, not a return to silence.
-        let freeze = split.set_blocking(Blocking::Whole);
+        let freeze = setup
+            .set_blocking(Blocking::BoundKeys)
+            .set_blocking(Blocking::Whole);
         assert_eq!(freeze.blocking(), Some(Blocking::Whole));
         assert!(!freeze.is_empty());
+    }
+
+    /// **A staged controller that binds nothing is refused by BOTH exits.**
+    ///
+    /// Breaks against the shipped `commit()`, which never looked at the
+    /// bindings: `StageEdit::AddSlot` stages `entries: Vec::new()`, `ready`
+    /// was therefore true the instant a persona was picked, and Play plugged a
+    /// pad on which every button was dead — while the screen said "ready".
+    ///
+    /// The placeholder half is the one that would survive a naive fix:
+    /// `builtin_empty()` lists every control with a `Key::None` row, so an
+    /// `entries.is_empty()` check calls a preset that binds nothing "mapped".
+    #[test]
+    fn a_controller_that_binds_nothing_cannot_be_saved_or_played() {
+        let blank = Preset {
+            name: "Player 1".to_owned(),
+            entries: Vec::new(),
+            chords: Vec::new(),
+            macros: Default::default(),
+            turbo: Vec::new(),
+            protected: false,
+        };
+        let setup = StagedSetup::new()
+            .choose_device(device())
+            .unwrap()
+            .add_slot(1, Persona::Xbox360, blank)
+            .expect("staging it is free — it is the COMMIT that refuses")
+            .set_blocking(Blocking::Whole);
+
+        let refused = setup.commit().unwrap_err();
+        assert_eq!(refused.code(), "no-bindings");
+        let message = refused.to_string();
+        assert!(message.contains("slot 1"), "it names the slot: {message}");
+        assert!(message.contains("Player 1"), "{message}");
+        assert!(
+            message.contains("Nothing has been written"),
+            "a staged refusal says the fix is still free: {message}"
+        );
+
+        // The all-placeholder preset — every control present, nothing bound —
+        // is the same refusal, not a pass.
+        let placeholders = StagedSetup::new()
+            .choose_device(device())
+            .unwrap()
+            .add_slot(1, Persona::Xbox360, Preset::builtin_empty())
+            .unwrap()
+            .set_blocking(Blocking::Whole);
+        assert!(!placeholders.slot(1).unwrap().preset.entries.is_empty());
+        assert_eq!(placeholders.commit().unwrap_err().code(), "no-bindings");
+
+        // One live binding is enough — this is a floor, not a quality bar.
+        let mapped = placeholders
+            .set_bindings(1, preset("Player 1"))
+            .unwrap()
+            .commit()
+            .expect("one bound key is a pad that does something");
+        assert_eq!(mapped.slots.len(), 1);
+
+        // ...and a slot the user has not touched is named individually, so a
+        // four-player setup says WHICH pad is dead.
+        let one_dead = mapped_setup()
+            .add_slot(2, Persona::PlayStation, Preset::builtin_empty())
+            .unwrap()
+            .commit()
+            .unwrap_err();
+        assert_eq!(one_dead.code(), "no-bindings");
+        assert!(one_dead.to_string().contains("slot 2"), "{one_dead}");
+    }
+
+    /// A device, one mapped controller and an answered question — the
+    /// smallest setup that may be saved or played.
+    fn mapped_setup() -> StagedSetup {
+        staged().set_blocking(Blocking::Whole)
     }
 
     /// A device is staged as a SELECTOR — which board — and never as the raw
@@ -876,7 +1041,7 @@ mod tests {
 
         // Deliberate sharing — the SAME preset in both slots — is fine: that
         // is two players on one key map, which is an ordinary thing to want.
-        let shared = staged()
+        let shared = mapped_setup()
             .add_slot(2, Persona::PlayStation, preset("Player 1"))
             .unwrap()
             .commit()
@@ -974,6 +1139,11 @@ mod tests {
                 name: "P".into(),
             },
             StageRefusal::UnnamedPreset { number: 1 },
+            StageRefusal::NoBindings {
+                number: 1,
+                preset: "Player 1".into(),
+            },
+            StageRefusal::BlockingUnanswered,
             StageRefusal::NoDevice { slots: 1 },
             StageRefusal::NoSlots,
         ];

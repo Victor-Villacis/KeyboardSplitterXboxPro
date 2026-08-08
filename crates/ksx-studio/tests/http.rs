@@ -124,6 +124,15 @@ struct ScriptedControl {
     /// Every ControlSource call fails the way an absent daemon fails.
     no_daemon: bool,
     started_with: std::sync::Mutex<Option<Option<String>>>,
+    /// The staged setup, held the way the daemon holds it — a real
+    /// `ksx_core::StagedSetup` driven by real `StageEdit`s. A fake that stored
+    /// the posted strings would let the page pass while the domain refused,
+    /// which is the entire thing these routes are for.
+    staged: Mutex<ksx_core::stage::StagedSetup>,
+    /// Set when `stage_play` actually got as far as starting something. The
+    /// assertion that matters is that it is still `false` after a Play the
+    /// stage refuses.
+    played: AtomicBool,
     learning: AtomicBool,
     bound_with: std::sync::Mutex<Option<BindRequest>>,
     restored_with: std::sync::Mutex<Option<(String, String)>>,
@@ -138,6 +147,8 @@ impl ScriptedControl {
             refuse_start,
             no_daemon: false,
             started_with: std::sync::Mutex::new(None),
+            staged: Mutex::new(ksx_core::stage::StagedSetup::new()),
+            played: AtomicBool::new(false),
             learning: AtomicBool::new(false),
             bound_with: std::sync::Mutex::new(None),
             restored_with: std::sync::Mutex::new(None),
@@ -314,6 +325,66 @@ impl ControlSource for ScriptedControl {
             device: None,
             key: None,
             error: None,
+        }
+    }
+
+    // ── The staged setup, the way the daemon holds it ────────────────────
+
+    fn staged(&self) -> ksx_api::StagedSetupView {
+        if self.no_daemon {
+            return ksx_api::StagedSetupView::unreachable(NO_CHANNEL);
+        }
+        ksx_api::StagedSetupView::of(&self.staged.lock().unwrap())
+    }
+
+    fn stage_edit(&self, edit: &ksx_api::StageEdit) -> ksx_api::StageOutcome {
+        if self.no_daemon {
+            return ksx_api::StageOutcome::unavailable(NO_CHANNEL);
+        }
+        let mut setup = self.staged.lock().unwrap();
+        match edit.apply(&setup) {
+            Ok(next) => {
+                *setup = next;
+                ksx_api::StageOutcome::ok(&setup, "staged")
+            }
+            Err(refusal) => ksx_api::StageOutcome::refused(&setup, &refusal),
+        }
+    }
+
+    /// Save, gated by `commit()` exactly as the daemon gates it — the fake
+    /// must not report a write for a setup ksx-core refuses.
+    fn stage_commit(&self) -> ksx_api::StageOutcome {
+        let setup = self.staged.lock().unwrap();
+        match setup.commit() {
+            Ok(_) => {
+                let mut ok = ksx_api::StageOutcome::ok(&setup, "saved to config.toml");
+                ok.saved = Some(r"C:\cfg\config.toml".to_owned());
+                ok
+            }
+            Err(refusal) => ksx_api::StageOutcome::refused(
+                &setup,
+                &Refusal::from_wire(Some(refusal.code()), refusal.to_string()),
+            ),
+        }
+    }
+
+    /// Play, gated the same way — and it RECORDS whether it started anything,
+    /// so a test can assert that a refused Play started nothing rather than
+    /// only that the flash looked unhappy.
+    fn stage_play(&self) -> ksx_api::StageOutcome {
+        let setup = self.staged.lock().unwrap();
+        match setup.commit() {
+            Ok(_) => {
+                self.played.store(true, Ordering::SeqCst);
+                self.running.store(true, Ordering::SeqCst);
+                let mut ok = ksx_api::StageOutcome::ok(&setup, "the staged setup is playing");
+                ok.playing = true;
+                ok
+            }
+            Err(refusal) => ksx_api::StageOutcome::refused(
+                &setup,
+                &Refusal::from_wire(Some(refusal.code()), refusal.to_string()),
+            ),
         }
     }
 
@@ -778,6 +849,7 @@ impl ksx_api::MachineSource for ScriptedMachine {
                 label: "Two players sharing ONE keyboard: WASD vs the arrows".into(),
                 detail: "Two people on one ordinary keyboard, no encoder.".into(),
                 players: vec![1, 2],
+                blank: false,
             }],
         })
     }
@@ -1132,6 +1204,18 @@ fn start_server_with_machine(
         }
         fn assign_slot(&self, request: &ksx_api::SlotAssignRequest) -> ksx_api::SlotOutcome {
             self.0.assign_slot(request)
+        }
+        fn staged(&self) -> ksx_api::StagedSetupView {
+            self.0.staged()
+        }
+        fn stage_edit(&self, edit: &ksx_api::StageEdit) -> ksx_api::StageOutcome {
+            self.0.stage_edit(edit)
+        }
+        fn stage_commit(&self) -> ksx_api::StageOutcome {
+            self.0.stage_commit()
+        }
+        fn stage_play(&self) -> ksx_api::StageOutcome {
+            self.0.stage_play()
         }
     }
     struct SharedMachine(Arc<dyn ksx_api::MachineSource>);
@@ -3908,6 +3992,194 @@ fn the_check_routes_are_behind_the_guard() {
         assert!(
             response.starts_with("HTTP/1.1 421"),
             "{path} answered a rebound host: {response}"
+        );
+    }
+}
+
+// ── /start: the first run, walked over HTTP ────────────────────────────────
+
+/// **`docs/FIRST-RUN.md` §7 as far as HTTP can carry it**: the four moments a
+/// browser performs, in order, against the real router and the real staging
+/// domain — no terminal, no file editing, and nothing typed but a click.
+///
+/// This is the journey the shipped page could not complete honestly. It fails
+/// against the version at `179324e` in three separate places:
+///
+///  1. `/start/controller` staged an EMPTY preset, so the setup was `ready`
+///     the moment a persona was picked and `/start/play` started a pad on
+///     which every button was dead;
+///  2. the split-or-freeze question was never required, so both buttons were
+///     live with it unanswered and Save wrote `block_keyboards = "whole"`
+///     from an answer nobody gave;
+///  3. there was no way at all to give a staged controller bindings — step 3
+///     was a link to the mapper, which edits files this flow has not written.
+///
+/// The `played` flag is the load-bearing assertion: it proves a refused Play
+/// started NOTHING, rather than merely that the flash looked unhappy.
+#[test]
+fn the_first_run_journey_stages_maps_answers_and_only_then_plays() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(Arc::clone(&control));
+
+    // Moment 4 — a keyboard, posted as the SERVED selector. Nothing typed.
+    let response = post_form(
+        addr,
+        "/start/device",
+        "selector=usb%3Ad209%3A0430%3A00&alias=panel&label=Ultimarc+I-PAC+4",
+    );
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+
+    // Moment 5 + 6's menu half — a controller AND the layout it starts from,
+    // in one click, which is what the form posts.
+    let response = post_form(
+        addr,
+        "/start/controller",
+        "persona=xbox360&preset=Player+1&layout=arcade-6button",
+    );
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+
+    // The bindings are really in the stage — no file was written to get them.
+    let page = get(addr, "/start");
+    assert!(page.contains("controls bound"), "{page}");
+    assert!(
+        !page.contains("nothing mapped yet"),
+        "a controller staged from a layout binds something: {page}"
+    );
+
+    // ...and Play is NOT offered yet, because §3 is unanswered.
+    assert!(
+        !page.contains(r#"action="/start/play""#),
+        "Play was offered with the one question unanswered: {page}"
+    );
+    assert!(page.contains("split-or-freeze"), "{page}");
+    assert!(
+        page.contains("Not asked yet"),
+        "and it must still not be pre-answered: {page}"
+    );
+
+    // A hand-made POST to Play — the thing a disabled button cannot stop — is
+    // refused by the DOMAIN, and starts nothing.
+    let response = post_form(addr, "/start/play", "");
+    assert!(
+        response.contains("flash=error"),
+        "Play was accepted with §3 unanswered: {response}"
+    );
+    assert!(
+        response.contains("split-or-freeze"),
+        "the refusal must name the question: {response}"
+    );
+    assert!(
+        !control.played.load(Ordering::SeqCst),
+        "a refused Play started a session"
+    );
+    // Save is refused for the same reason, so it cannot write Freeze either.
+    let response = post_form(addr, "/start/save", "");
+    assert!(response.contains("flash=error"), "{response}");
+
+    // Moment 6's question, answered — with SPLIT, the answer a default would
+    // never have produced.
+    let response = post_form(addr, "/start/blocking", "blocking=bound-keys");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+
+    let page = get(addr, "/start");
+    assert!(page.contains(r#"action="/start/play""#), "{page}");
+    assert!(page.contains(r#"action="/start/save""#), "{page}");
+    assert!(page.contains("Answered: Split this keyboard."), "{page}");
+
+    // Moment 7.
+    let response = post_form(addr, "/start/play", "");
+    assert!(
+        !response.contains("flash=error"),
+        "a complete setup was refused: {response}"
+    );
+    assert!(control.played.load(Ordering::SeqCst), "{response}");
+}
+
+/// **A controller with no layout is staged, refused by name, and fixable
+/// without leaving the page.**
+///
+/// The blank layout is a real choice and it must stay reachable — but it is
+/// the one that cannot play, and every screen and every verb has to say so in
+/// the same words. Fails against any build where `/start/play` accepts a slot
+/// whose preset binds nothing.
+#[test]
+fn a_controller_with_no_bindings_is_refused_by_name_and_fixed_in_place() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(Arc::clone(&control));
+
+    post_form(
+        addr,
+        "/start/device",
+        "selector=usb%3Ad209%3A0430%3A00&alias=panel&label=I-PAC",
+    );
+    // The blank layout: every control listed, nothing bound.
+    post_form(
+        addr,
+        "/start/controller",
+        "persona=xbox360&preset=Player+1&layout=empty",
+    );
+    post_form(addr, "/start/blocking", "blocking=whole");
+
+    let page = get(addr, "/start");
+    assert!(
+        page.contains("not ready — nothing is bound to it"),
+        "{page}"
+    );
+    assert!(
+        !page.contains(r#"action="/start/play""#),
+        "Play was offered for a pad that binds nothing: {page}"
+    );
+
+    let response = post_form(addr, "/start/play", "");
+    assert!(response.contains("flash=error"), "{response}");
+    assert!(
+        response.contains("slot%201"),
+        "the refusal must name the slot: {response}"
+    );
+    assert!(!control.played.load(Ordering::SeqCst), "{response}");
+
+    // The fix is on the page — one POST, no file, no mapper, no shell.
+    let response = post_form(
+        addr,
+        "/start/controller/layout",
+        "number=1&layout=arcade-6button",
+    );
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    let page = get(addr, "/start");
+    assert!(page.contains("controls bound"), "{page}");
+    assert!(page.contains(r#"action="/start/play""#), "{page}");
+
+    let response = post_form(addr, "/start/play", "");
+    assert!(!response.contains("flash=error"), "{response}");
+    assert!(control.played.load(Ordering::SeqCst), "{response}");
+}
+
+/// Every mutating `/start` route is behind the guard: a rebound host must not
+/// be able to stage, save or start anything on this machine.
+#[test]
+fn the_start_routes_are_behind_the_guard() {
+    let addr = start_server(Arc::new(ScriptedControl::new(false)));
+    for path in [
+        "/start/device",
+        "/start/controller",
+        "/start/controller/layout",
+        "/start/controller/remove",
+        "/start/blocking",
+        "/start/discard",
+        "/start/save",
+        "/start/play",
+    ] {
+        let response = http(
+            addr,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 403") || response.starts_with("HTTP/1.1 421"),
+            "{path} accepted a cross-origin POST: {response}"
         );
     }
 }
