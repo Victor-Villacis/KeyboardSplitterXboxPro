@@ -14,9 +14,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # rust-toolchain.toml pins the exact compiler; `rustup show` installs it.
+      # NOT dtolnay/rust-toolchain: that action exports RUSTUP_TOOLCHAIN, which
+      # overrides the pin — and an overridden pin is how local 1.96 and CI 1.97
+      # both said "clippy clean" about different diagnostics on 2026-08-07.
+      - name: Toolchain (pinned by rust-toolchain.toml)
+        run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
       - name: Format
         # vendored vigem-client keeps upstream formatting; check only our crates.
@@ -81,7 +84,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Toolchain (pinned by rust-toolchain.toml)
+        run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
       # cabinet + studio is the shipping combination: the egui panel UI plus the
       # local web config server. The feature matrix above proves it compiles;

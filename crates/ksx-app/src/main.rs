@@ -1,5 +1,16 @@
 //! ksx — split keyboards (I-PAC arcade encoders) into virtual Xbox 360 controllers.
 
+// In the TEST harness build only, dead-code analysis loses `fn main` as a
+// liveness root (rustc 1.97 sharpened this), so everything reachable solely
+// through the runtime path — the `dyn MachineSource` chain Studio drives, the
+// onboard/profile-edit glue, every view-conversion helper no unit test calls
+// directly — reads as "never used" in that one target and nowhere else. CI
+// caught it under `--features studio` the first time local and CI ran the same
+// compiler version; the bin target in the very same clippy invocation checks
+// all of that code with `main` as a root and stays the authority, so this
+// silences a structural false positive, not a lint.
+#![cfg_attr(test, allow(dead_code))]
+
 mod autostart;
 #[cfg(feature = "cabinet")]
 mod cabinet;

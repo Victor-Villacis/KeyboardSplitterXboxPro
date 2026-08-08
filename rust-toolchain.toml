@@ -1,0 +1,12 @@
+# One compiler, everywhere, on purpose.
+#
+# On 2026-08-07 every local gate ran 1.96 while CI's `@stable` resolved to
+# 1.97, whose sharper dead-code analysis found 24 real diagnostics local runs
+# could not see — so "clippy clean" was true on both machines and meant
+# different things. A pinned toolchain makes the gate a single question.
+# Bumping this file IS the upgrade, in one reviewable commit, and CI installs
+# exactly this via `rustup show` (the dtolnay action would override the pin
+# through RUSTUP_TOOLCHAIN, which is why ci.yml no longer uses it).
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
