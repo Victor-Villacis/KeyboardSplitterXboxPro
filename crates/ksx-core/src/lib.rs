@@ -33,6 +33,9 @@
 //! - [`persona`] — [`Persona`]: which controller a slot presents itself as
 //! - [`blocking`] — [`Blocking`]: how much of a bound keyboard a session takes
 //!   away from Windows (whole device / bound keys only / nothing)
+//! - [`stage`] — [`StagedSetup`]: a setup the user is still deciding on, held
+//!   in memory and never written, so exploring costs nothing
+//!   (`docs/FIRST-RUN.md` §2)
 //! - [`engine`] — the [`Engine`]: precompiled dispatch, per-device key state, diffing
 //! - [`escape`] — [`EscapeDetector`], emergency-escape detection (policy lives upstream)
 
@@ -49,6 +52,7 @@ pub mod preset;
 pub mod selector;
 pub mod slot;
 pub mod socd;
+pub mod stage;
 pub mod templates;
 pub mod transport;
 pub mod vendors;
@@ -73,5 +77,6 @@ pub use preset::{Binding, Chord, Macros, Preset, TurboBinding};
 pub use selector::{DeviceFacts, DeviceRef, DeviceSelector, Match, Qualifier, SelectorParseError};
 pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS, MAX_XINPUT_SLOTS};
 pub use socd::{DirMechanism, OpposingPair, Pointing, Socd, UnknownSocd};
+pub use stage::{CommitSpec, StageRefusal, StagedDevice, StagedSetup, StagedSlot};
 pub use templates::{Template, TemplateError, MAX_TEMPLATE_PLAYERS, TEMPLATES};
 pub use transport::{Eligibility, Reach, Transport};
