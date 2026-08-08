@@ -152,6 +152,14 @@ surface does a human perform this task on*, and that is answered by the matrix.
 
 ## §3 The capability matrix
 
+> **This table is a test.** `crates/ksx-app/tests/parity.rs` parses it and
+> checks every cell against the tree — the clap command tree, Studio's routes,
+> the cabinet's screens and `Ask` variants. Editing a row means editing that
+> test's anchors too, and a word the guard has not been taught (the vocabulary
+> is below) fails it rather than passing unread. Adding a ROW with no anchors
+> also fails: an unbound row is checked by nothing, which is the state the whole
+> table was in before the guard existed.
+
 | Capability | CLI | egui (cabinet) | Studio (browser) |
 |---|---|---|---|
 | Author presets / key mappings | owns | — | **primary** |
