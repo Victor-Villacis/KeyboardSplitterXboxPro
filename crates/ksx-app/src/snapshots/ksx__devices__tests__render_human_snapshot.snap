@@ -7,4 +7,5 @@ keyboards (interception backend):
   slot 2  HID\VID_046D&PID_C31C&REV_6402&MI_00  "n/a"
 mice: 1 visible (unused — ksx never sets the mouse filter)
 usb enumeration unavailable
+bluetooth enumeration unavailable — any paired device is MISSING below, and its absence is not evidence that it is unpaired
 health: [OK]   2/10 keyboard slots in use (highest slot 2); no exhaustion detected

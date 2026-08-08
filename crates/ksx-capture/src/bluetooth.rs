@@ -84,6 +84,18 @@ pub struct BtCandidate {
     /// The only positive signal available without opening anything, and the one
     /// that decides whether Interception could capture it.
     pub is_keyboard: bool,
+    /// The instance path of the keyboard-class devnode this device produces —
+    /// **the id a `[[device]]` entry for it holds**, and the one a surface must
+    /// show.
+    ///
+    /// It is not always [`Self::id`]: depending on the stack the keyboard-class
+    /// node is either the `BTHENUM\` node itself or a `HID\` child of it. The
+    /// value here is the same one `ksx_platform::winusb::Candidate::ksx_device_id`
+    /// returns for the same device, so what `ksx device scan` PRINTS is what
+    /// `ksx device pick` WRITES (`docs/SURFACES.md` §1) — a picker offering the
+    /// service node while the writer commits the keyboard node would be two
+    /// answers to one question.
+    pub keyboard_id: Option<DeviceId>,
     /// **Can it deliver a keystroke right now?** See the module docs: PRESENT
     /// and TYPING are different questions for a paired device.
     pub can_type: bool,
@@ -120,38 +132,28 @@ impl BtCandidate {
 /// whole shape, including the paired-but-disconnected case, is exercised in CI
 /// against a synthetic tree with no radio anywhere near it.
 pub fn from_nodes(nodes: &[DeviceNode]) -> Vec<BtCandidate> {
-    // Every keyboard-class node on the machine, with the Bluetooth address it
-    // belongs to when it carries one. A Bluetooth HID keyboard's keyboard-class
-    // devnode is sometimes the `BTHENUM\` node itself and sometimes a `HID\`
-    // child of it, depending on the stack — both spellings put the same
-    // BD_ADDR in the instance path, so the address is what joins them rather
-    // than a parent walk that only works for one of the two shapes.
-    let keyboard_addresses: Vec<String> = nodes
-        .iter()
-        .filter(|n| n.is_keyboard_class())
-        .filter_map(bd_addr)
-        .collect();
-
+    // A Bluetooth HID keyboard's keyboard-class devnode is sometimes the
+    // `BTHENUM\` node itself and sometimes a `HID\` child of it, depending on
+    // the stack. Both spellings put the same BD_ADDR in the instance path, so
+    // the address is what joins them — a parent walk (`ParentIdPrefix`) only
+    // works for one of the two shapes, because a Bluetooth service node does
+    // not always write one.
     let mut out: Vec<BtCandidate> = Vec::new();
     for node in nodes.iter().filter(|n| is_bluetooth(n)) {
         let address = bd_addr(node);
-        let is_keyboard = node.is_keyboard_class()
-            || address
-                .as_deref()
-                .is_some_and(|addr| keyboard_addresses.iter().any(|k| k == addr));
+        // The keyboard-class devnode this device produces, if it has one.
+        let keyboard = nodes.iter().find(|k| {
+            k.is_keyboard_class()
+                && (k.instance_id.eq_ignore_ascii_case(&node.instance_id)
+                    || (address.is_some() && bd_addr(k) == address))
+        });
 
-        // The status of the node itself, and of the keyboard node that belongs
-        // to the same address when they are different devnodes: a live
-        // `BTHENUM` service node with a dead HID child still cannot type.
-        let mut trouble = node.trouble();
-        if trouble.is_none() {
-            if let Some(addr) = address.as_deref() {
-                trouble = nodes
-                    .iter()
-                    .filter(|n| n.is_keyboard_class() && bd_addr(n).as_deref() == Some(addr))
-                    .find_map(DeviceNode::trouble);
-            }
-        }
+        // The status of the node itself, and of the keyboard node when they are
+        // different devnodes: a live `BTHENUM` service node with a dead HID
+        // child still cannot type.
+        let trouble = node
+            .trouble()
+            .or_else(|| keyboard.and_then(|k| k.trouble()));
 
         out.push(BtCandidate {
             id: DeviceId::new(node.instance_id.to_uppercase()),
@@ -162,7 +164,8 @@ pub fn from_nodes(nodes: &[DeviceNode]) -> Vec<BtCandidate> {
             address,
             name: node.display_name(),
             service: node.service.clone(),
-            is_keyboard,
+            is_keyboard: keyboard.is_some(),
+            keyboard_id: keyboard.map(|k| DeviceId::new(k.instance_id.to_uppercase())),
             can_type: trouble.is_none(),
             trouble,
         });

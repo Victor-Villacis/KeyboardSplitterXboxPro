@@ -1238,6 +1238,17 @@ enum DeviceCommand {
         /// The name [[slot]] entries will use; defaults to the board's name
         #[arg(long)]
         alias: Option<String>,
+        /// Ask for one backend by name, and be told plainly if it cannot
+        /// apply
+        ///
+        /// Normally omitted: the binding decides, which is the rule above. Ask
+        /// for `winusb` explicitly and you get one of two different answers
+        /// instead of silence — "not yet, claim it first" on an unclaimed USB
+        /// board, or "never" on a Bluetooth device, because a claim binds a USB
+        /// interface through an INF hardware id and Bluetooth has none. That is
+        /// the transport, not a missing feature.
+        #[arg(long, value_parser = ["interception", "winusb"])]
+        backend: Option<String>,
         /// What was written, as JSON
         #[arg(long)]
         json: bool,
@@ -1775,8 +1786,25 @@ fn main() -> anyhow::Result<()> {
         },
         Command::Device { command } => match command {
             DeviceCommand::Scan { all, json } => device_scan::run(all, json),
-            DeviceCommand::Pick { query, alias, json } => {
-                device_edit::pick(device_edit::PickSpec { query, alias }, json)
+            DeviceCommand::Pick {
+                query,
+                alias,
+                backend,
+                json,
+            } => {
+                let backend = backend.as_deref().map(|b| match b {
+                    "winusb" => ksx_config::Backend::Winusb,
+                    // clap's `value_parser` already refused anything else.
+                    _ => ksx_config::Backend::Interception,
+                });
+                device_edit::pick(
+                    device_edit::PickSpec {
+                        query,
+                        alias,
+                        backend,
+                    },
+                    json,
+                )
             }
             DeviceCommand::Remove { alias, force, json } => {
                 device_edit::remove(device_edit::RemoveSpec { alias, force }, json)
@@ -2500,11 +2528,22 @@ mod tests {
             .expect("a query and a name");
         match cli.command {
             Command::Device {
-                command: DeviceCommand::Pick { query, alias, json },
+                command:
+                    DeviceCommand::Pick {
+                        query,
+                        alias,
+                        backend,
+                        json,
+                    },
             } => {
                 assert_eq!(query, "MI_00");
                 assert_eq!(alias.as_deref(), Some("panel"));
                 assert!(!json);
+                assert_eq!(
+                    backend, None,
+                    "no --backend means LET THE BINDING DECIDE, which is the rule; a default \
+                     of \"interception\" here would be a request nobody made"
+                );
             }
             _ => panic!("parsed to the wrong subcommand"),
         }
@@ -2512,6 +2551,36 @@ mod tests {
         // able to mean "whatever you think is best" — it writes config.
         assert!(Cli::try_parse_from(["ksx", "device", "pick"]).is_err());
         assert!(Cli::try_parse_from(["ksx", "device", "remove"]).is_err());
+    }
+
+    /// `--backend` takes the two backends that exist and nothing else. A typo
+    /// must be a parse error, not a silently ignored request — this flag's
+    /// whole purpose is to be TOLD which of the two "no" answers you hit.
+    #[test]
+    fn device_pick_backend_accepts_only_the_two_real_backends() {
+        let cli = Cli::try_parse_from(["ksx", "device", "pick", "MI_00", "--backend", "winusb"])
+            .expect("winusb is a backend");
+        match cli.command {
+            Command::Device {
+                command: DeviceCommand::Pick { backend, .. },
+            } => assert_eq!(backend.as_deref(), Some("winusb")),
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+        assert!(Cli::try_parse_from([
+            "ksx",
+            "device",
+            "pick",
+            "MI_00",
+            "--backend",
+            "interception"
+        ])
+        .is_ok());
+        assert!(
+            Cli::try_parse_from(["ksx", "device", "pick", "MI_00", "--backend", "bluetooth"])
+                .is_err(),
+            "bluetooth is a TRANSPORT, not a backend — the two are exactly what this task \
+             exists to keep apart"
+        );
     }
 
     #[test]

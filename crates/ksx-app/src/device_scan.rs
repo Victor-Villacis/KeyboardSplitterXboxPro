@@ -50,9 +50,9 @@ impl<'a> Board<'a> {
             .or_else(|| {
                 self.interfaces
                     .iter()
-                    .find(|r| r.state == "claimable" && r.boot_keyboard)
+                    .find(|r| capturable(r) && r.boot_keyboard)
             })
-            .or_else(|| self.interfaces.iter().find(|r| r.state == "claimable"))
+            .or_else(|| self.interfaces.iter().find(|r| capturable(r)))
             .copied()
     }
 
@@ -71,6 +71,18 @@ impl<'a> Board<'a> {
     pub fn alias(&self) -> Option<&'a str> {
         self.interfaces.iter().find_map(|r| r.alias.as_deref())
     }
+}
+
+/// Could ksx capture this devnode through SOME backend?
+///
+/// Reads the backend eligibility the enumerator already decided, never the
+/// state word. `state == "claimable"` means one specific thing — a USB
+/// interface on the keyboard stack that a claim could bind — and a Bluetooth
+/// keyboard is not that, while being perfectly capturable through Interception
+/// today. Matching on the state word here is what made a Bluetooth keyboard
+/// unpickable in a picker whose own row said it could be captured.
+fn capturable(row: &UsbRow) -> bool {
+    row.interception_eligible || row.winusb_eligible
 }
 
 /// Group a view's interfaces into physical boards, in first-seen order.
@@ -100,6 +112,24 @@ pub fn boards(view: &DevicesView) -> Vec<Board<'_>> {
 
 fn board_key(row: &UsbRow) -> &str {
     row.board.as_deref().unwrap_or(row.instance_id.as_str())
+}
+
+/// The transport word for a board's header line.
+///
+/// Read off the interface a pick would name, else the first devnode — the same
+/// rule `ksx_api::DeviceScanView::read` follows for the typed view, so the
+/// terminal and the browser cannot label one device two ways. `?` when the
+/// collector set none, which is a bug in the collector and must LOOK like one
+/// rather than silently reading as USB.
+fn transport_label(board: &Board<'_>) -> &'static str {
+    let row = board
+        .keyboard()
+        .or_else(|| board.interfaces.first().copied());
+    match row.map(|r| r.transport.as_str()) {
+        Some("usb") => "USB",
+        Some("bluetooth") => "Bluetooth",
+        _ => "?",
+    }
 }
 
 /// Best available name, in the order a human would prefer it.
@@ -156,9 +186,13 @@ pub fn render(view: &DevicesView, all: bool) -> String {
             .alias()
             .map(|a| format!("  (configured as \"{a}\")"))
             .unwrap_or_default();
+        // The transport, on the header line, because it is the fact that
+        // decides everything below it — and because a list that mixes USB and
+        // Bluetooth without saying which is which is a list you cannot act on.
         let _ = writeln!(
             out,
-            "  {}{alias}\n    {} interface(s)",
+            "  [{}] {}{alias}\n    {} interface(s)",
+            transport_label(board),
             board.name,
             board.interfaces.len()
         );
@@ -176,6 +210,30 @@ pub fn render(view: &DevicesView, all: bool) -> String {
             Some(kb) => {
                 let _ = writeln!(out, "    keyboard : {}", kb.instance_id);
                 let _ = writeln!(out, "    {}", kb.verdict);
+                // Which backends this device is eligible for — the line
+                // `ksx_core::Reach` composed. It is on EVERY row, not only the
+                // surprising ones: a rule stated only where it bites reads as a
+                // special case rather than as the rule.
+                let _ = writeln!(out, "    backends : {}", kb.backends);
+                // PRESENT is not TYPING. A paired Bluetooth keyboard with dead
+                // batteries sits in the device tree all day, and someone
+                // reading this list to find the spare keyboard a claim needs
+                // has to see the difference before they claim their panel.
+                //
+                // Not for a CLAIMED board, though: that one cannot type to
+                // Windows because somebody deliberately took it off the
+                // keyboard stack, the row above already says `claimed`, and the
+                // backends line already says why. Repeating it here as an
+                // alarm would put a warning on the one state that is working
+                // exactly as asked.
+                if kb.state != "claimed" && !kb.can_type && !kb.cannot_type_reason.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "               ^ {} — it is present and CANNOT type right now, so it \
+                         does not count as a spare keyboard",
+                        kb.cannot_type_reason
+                    );
+                }
                 // **The line §5 promised and nothing printed.** "A legacy entry
                 // that still resolves is never silently rewritten: `ksx device
                 // scan` prints the stronger selector it *would* write and leaves
@@ -287,7 +345,7 @@ pub fn view(
     // same reason.
     rows.sort_by_key(|b| (b.keyboard.is_none(), !b.looks_like_a_keyboard));
 
-    let configured = config
+    let configured: Vec<ksx_api::ConfiguredDevice> = config
         .devices
         .iter()
         .map(|entry| configured_row(entry, devices, connected, config, games, &found))
@@ -300,6 +358,7 @@ pub fn view(
     ksx_api::DeviceScanView::read(
         devices.generated_at.clone(),
         devices.usb_available,
+        devices.bluetooth_available,
         rows,
         configured,
         devices.notes.clone(),
@@ -326,13 +385,20 @@ fn board_row(board: &Board<'_>) -> ksx_api::BoardRow {
             .filter(|r| r.state == "claimed")
             .map(|r| release_command(&r.instance_id)),
         // Derived by `DeviceScanView::read` from the fields above — the
-        // partition, the elevated lead that must accompany the command, and
-        // the HID caveat. Setting any of them here would be the same decision
-        // taken twice.
+        // partition, the elevated lead that must accompany the command, the
+        // HID caveat, and the transport/backend cell it copies off the
+        // keyboard interface. Setting any of them here would be the same
+        // decision taken twice.
         pickable: false,
         command_lead: String::new(),
         command: String::new(),
         caveat: String::new(),
+        transport: String::new(),
+        interception_eligible: false,
+        winusb_eligible: false,
+        backends: String::new(),
+        can_type: false,
+        cannot_type_reason: String::new(),
     }
 }
 
@@ -370,14 +436,35 @@ fn configured_row(
         Match::One(facts) => Some(facts),
         Match::None | Match::Ambiguous(_) => None,
     };
-    let interface = hit.and_then(|facts| {
-        devices
-            .usb
-            .iter()
-            .find(|row| row.instance_id.eq_ignore_ascii_case(facts.id.as_str()))
-    });
+    let interface = hit
+        .and_then(|facts| {
+            devices
+                .usb
+                .iter()
+                .find(|row| row.instance_id.eq_ignore_ascii_case(facts.id.as_str()))
+        })
+        // A device with no USB interface — a Bluetooth keyboard — is named in
+        // config by its devnode path, because no `usb:` selector can describe
+        // one. `DeviceSelector::match_against` is USB-facts-shaped and answers
+        // `false` for those spellings by design, so the path is matched against
+        // the DEVICE LIST directly, byte-exact and case-insensitive: the same
+        // semantics `DeviceSelector::HardwareId` documents.
+        //
+        // Without this a configured Bluetooth keyboard read as "not connected
+        // right now" while it was connected and typing.
+        .or_else(|| {
+            let written = selector.to_string();
+            devices
+                .usb
+                .iter()
+                .find(|row| row.instance_id.eq_ignore_ascii_case(&written))
+        });
     let claimed = interface.is_some_and(|row| row.state == "claimed");
     let instance_id = interface.map(|row| row.instance_id.clone());
+    // The elevated commands are only ever shown for a device a claim could
+    // actually bind. Offering `ksx winusb claim` beside a Bluetooth entry would
+    // hand out a command that refuses every time it is run.
+    let winusb_reachable = interface.is_some_and(|row| row.winusb_eligible);
 
     ksx_api::ConfiguredDevice {
         alias: entry.alias.clone(),
@@ -399,10 +486,16 @@ fn configured_row(
         present: instance_id.is_some(),
         board: interface.and_then(|row| board_named(found, &row.instance_id)),
         instance_id: instance_id.clone(),
+        // Empty while the entry resolves to nothing: a transport is a fact
+        // about a device that is here, and guessing one from the id's spelling
+        // would be a claim about hardware nobody found.
+        transport: interface
+            .map(|row| row.transport.clone())
+            .unwrap_or_default(),
         claimed,
         claim_command: instance_id
             .as_deref()
-            .filter(|_| !claimed)
+            .filter(|_| !claimed && winusb_reachable)
             .map(claim_command),
         release_command: instance_id
             .as_deref()
@@ -492,9 +585,21 @@ mod tests {
     use super::*;
 
     fn row(id: &str, board: &str, state: &str, vendor: Option<&str>) -> UsbRow {
+        // Built through `ksx_core::Reach` rather than by hand, deliberately: a
+        // fixture that spelled its own eligibility could not disagree with the
+        // page even when the page was wrong, and the transport rule is the one
+        // thing these tests are here to hold.
+        let reach = ksx_core::Reach {
+            transport: ksx_core::Transport::Usb,
+            keyboard: state == "claimed" || state == "claimable",
+            claimed: state == "claimed",
+            can_type: state != "claimed",
+        };
+        let eligibility = reach.eligibility();
         UsbRow {
             instance_id: id.to_owned(),
             description: "USB Input Device".to_owned(),
+            transport: ksx_core::Transport::Usb.code().to_owned(),
             state: state.to_owned(),
             verdict: "on the keyboard stack; ksx could claim it".to_owned(),
             alias: None,
@@ -511,6 +616,72 @@ mod tests {
                 ksx_core::DeviceSelector::strongest_for(&facts, std::slice::from_ref(&facts))
                     .to_string()
             }),
+            interception_eligible: eligibility.interception,
+            winusb_eligible: eligibility.winusb,
+            backends: eligibility.line,
+            can_type: reach.can_type,
+            cannot_type_reason: String::new(),
+        }
+    }
+
+    /// Change a row's state **the way the collector would**.
+    ///
+    /// The state word and the backend eligibility are derived together from one
+    /// enumeration pass, so a fixture that moved one without the other would be
+    /// asserting against a row that cannot exist on any machine — and would
+    /// happily pass while the code under test was wrong about the pair.
+    fn restate(target: &mut UsbRow, state: &str) {
+        let rebuilt = row(
+            &target.instance_id,
+            target.board.as_deref().unwrap_or_default(),
+            state,
+            target.vendor.as_deref(),
+        );
+        target.state = rebuilt.state;
+        target.boot_keyboard = rebuilt.boot_keyboard;
+        target.interception_eligible = rebuilt.interception_eligible;
+        target.winusb_eligible = rebuilt.winusb_eligible;
+        target.backends = rebuilt.backends;
+        target.can_type = rebuilt.can_type;
+    }
+
+    /// A paired Bluetooth keyboard, in the shape the collector produces.
+    ///
+    /// `state` is the vocabulary word (`interception-only`), and every backend
+    /// field comes from `ksx_core::Reach` — the rule lives in one place and
+    /// this fixture reads it like the collector does.
+    fn bt_row(id: &str, name: &str, can_type: bool) -> UsbRow {
+        let reach = ksx_core::Reach {
+            transport: ksx_core::Transport::Bluetooth,
+            keyboard: true,
+            claimed: false,
+            can_type,
+        };
+        let eligibility = reach.eligibility();
+        UsbRow {
+            instance_id: id.to_owned(),
+            description: name.to_owned(),
+            transport: ksx_core::Transport::Bluetooth.code().to_owned(),
+            state: "interception-only".to_owned(),
+            verdict: "a Bluetooth keyboard on the Windows input stack — ksx can capture it \
+                      through Interception and split it into virtual pads"
+                .to_owned(),
+            alias: None,
+            selected: false,
+            ready: false,
+            boot_keyboard: true,
+            vendor: None,
+            board: Some(r"BTHENUM\001BDC0F1FE7".to_owned()),
+            selector: Some(id.to_owned()),
+            interception_eligible: eligibility.interception,
+            winusb_eligible: eligibility.winusb,
+            backends: eligibility.line,
+            can_type,
+            cannot_type_reason: if can_type {
+                String::new()
+            } else {
+                "not connected (paired but absent?)".to_owned()
+            },
         }
     }
 
@@ -549,8 +720,21 @@ mod tests {
                 ),
             ],
             usb_available: true,
+            bluetooth_available: true,
             notes: Vec::new(),
         }
+    }
+
+    /// The same cabinet with a paired Bluetooth keyboard on it — the machine
+    /// this whole task is about.
+    fn cabinet_with_bluetooth(can_type: bool) -> DevicesView {
+        let mut view = cabinet();
+        view.usb.push(bt_row(
+            r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002045E_PID&0800\7&3562C725&0&001BDC0F1FE7_C00000000",
+            "Bluetooth Keyboard",
+            can_type,
+        ));
+        view
     }
 
     #[test]
@@ -582,7 +766,7 @@ mod tests {
     fn unpickable_boards_are_hidden_by_default_and_counted() {
         let mut view = cabinet();
         // Turn the SpinTrak into something with no keyboard interface.
-        view.usb[3].state = "not-a-keyboard".into();
+        restate(&mut view.usb[3], "not-a-keyboard");
 
         let text = render(&view, false);
         assert!(text.contains("I-PAC"), "{text}");
@@ -636,6 +820,166 @@ mod tests {
         );
     }
 
+    // ── one list, two transports ──────────────────────────────────────────
+
+    /// **The list this task exists to produce.** A Bluetooth keyboard is in the
+    /// SAME grouped view as the USB boards, it is offered as pickable, and its
+    /// row states which backends it is eligible for.
+    ///
+    /// FAILS against the shipped scan in two independent ways: it enumerated
+    /// `nusb::list_devices()` so the row did not exist at all, and
+    /// `Board::keyboard` matched `state == "claimable"` so even a hand-placed
+    /// Bluetooth row would have been unpickable — a picker refusing to offer a
+    /// device whose own verdict said ksx could capture it.
+    #[test]
+    fn a_bluetooth_keyboard_is_in_the_same_list_and_is_pickable() {
+        let view = cabinet_with_bluetooth(true);
+        let boards = boards(&view);
+        let bt = boards
+            .iter()
+            .find(|b| b.name == "Bluetooth Keyboard")
+            .expect("the Bluetooth keyboard is one of the devices");
+        assert!(
+            bt.keyboard().is_some(),
+            "it is capturable through Interception, so it can be picked"
+        );
+
+        let text = render(&view, false);
+        assert!(text.contains("[Bluetooth] Bluetooth Keyboard"), "{text}");
+        assert!(
+            text.contains("[USB] Ultimarc I-PAC 4X"),
+            "and the USB half is labelled too — a transport column that only \
+             appears on the surprising row reads as a special case:\n{text}"
+        );
+    }
+
+    /// **The rule the list must teach, on the row.** Interception yes, WinUSB
+    /// never, and the "never" names the transport fact rather than a missing
+    /// feature.
+    ///
+    /// FAILS against any report that prints only the state word: `claimable` /
+    /// `interception-only` tells a user nothing about WHY, and "not supported"
+    /// invites waiting for a release that cannot come.
+    #[test]
+    fn the_bluetooth_row_states_both_backends_and_why_winusb_never_applies() {
+        let text = render(&cabinet_with_bluetooth(true), false);
+        let backends: Vec<&str> = text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("backends :"))
+            .collect();
+        assert_eq!(
+            backends.len(),
+            text.lines()
+                .filter(|l| l.trim_start().starts_with("keyboard :"))
+                .count(),
+            "EVERY row with a keyboard states its backends — a rule stated only \
+             where it bites reads as a special case:\n{text}"
+        );
+        assert!(backends.len() >= 2, "{text}");
+
+        let bt = backends
+            .iter()
+            .find(|l| l.contains("Bluetooth"))
+            .expect("the Bluetooth row has a backends line");
+        assert!(bt.contains("interception: yes"), "{bt}");
+        assert!(bt.contains("never"), "{bt}");
+        assert!(
+            bt.contains("no USB interface to bind"),
+            "the transport fact, not a vague refusal: {bt}"
+        );
+        assert!(
+            !bt.contains("not supported"),
+            "'not supported' invites waiting for a release that cannot come: {bt}"
+        );
+    }
+
+    /// **The trap, on the screen someone reads before claiming their panel.**
+    ///
+    /// A paired-but-disconnected Bluetooth keyboard is PRESENT, so it must stay
+    /// listed — hiding it would be its own lie — and the row must say it cannot
+    /// type. Someone who reads "2 keyboards" here, claims their panel, and then
+    /// finds the second one in a drawer with dead batteries is locked out of
+    /// their own machine.
+    ///
+    /// FAILS against a row that carries presence only.
+    #[test]
+    fn a_paired_but_disconnected_bluetooth_keyboard_is_listed_and_says_it_cannot_type() {
+        let text = render(&cabinet_with_bluetooth(false), false);
+        assert!(text.contains("Bluetooth Keyboard"), "still listed:\n{text}");
+        assert!(
+            text.contains("CANNOT type right now"),
+            "and it says so, in the words that stop someone counting it as a \
+             spare:\n{text}"
+        );
+        assert!(
+            text.contains("does not count as a spare keyboard"),
+            "{text}"
+        );
+
+        // A CONNECTED one must not carry the caveat, or the caveat means
+        // nothing when it appears.
+        let live = render(&cabinet_with_bluetooth(true), false);
+        assert!(!live.contains("CANNOT type right now"), "{live}");
+    }
+
+    /// A CLAIMED board cannot type to Windows either — that is what a claim
+    /// does — and it must NOT wear the same alarm. The row already says
+    /// `claimed` and the backends line already says why; repeating it as a
+    /// warning puts an alarm on the one state that is working exactly as asked.
+    ///
+    /// FAILS against gating the caveat on `!can_type` alone, which is the
+    /// obvious implementation and which decorated the reference cabinet's
+    /// working I-PAC with "does not count as a spare keyboard".
+    #[test]
+    fn a_claimed_board_is_not_warned_about_being_unable_to_type() {
+        let text = render(&cabinet(), false);
+        assert!(text.contains("[claimed]"), "fixture precondition:\n{text}");
+        assert!(
+            !text.contains("CANNOT type right now"),
+            "a deliberate claim is not a fault:\n{text}"
+        );
+        assert!(
+            !text.contains("does not count as a spare keyboard"),
+            "{text}"
+        );
+    }
+
+    /// The typed view every non-terminal surface reads carries the same facts,
+    /// on the board row — so Studio and the cabinet cannot tell a different
+    /// story from the terminal.
+    #[test]
+    fn the_typed_view_carries_the_transport_and_the_backends_per_board() {
+        let view = view(
+            &cabinet_with_bluetooth(true),
+            &connected(),
+            &ConfigFile::default(),
+            &GamesFile::default(),
+        );
+        let bt = view
+            .boards
+            .iter()
+            .find(|b| b.name == "Bluetooth Keyboard")
+            .expect("the Bluetooth keyboard reaches the typed view");
+        assert_eq!(bt.transport, "bluetooth");
+        assert!(bt.pickable);
+        assert!(bt.interception_eligible);
+        assert!(!bt.winusb_eligible);
+        assert!(bt.backends.contains("no USB interface to bind"), "{bt:?}");
+        // No elevated command: a claim on this device refuses every time, and
+        // a page that printed one would be handing out a dead command.
+        assert!(bt.claim_command.is_none());
+        assert!(bt.release_command.is_none());
+        assert_eq!(bt.command, "");
+
+        let ipac = view
+            .boards
+            .iter()
+            .find(|b| b.name == "Ultimarc I-PAC 4X")
+            .expect("the USB board is still there");
+        assert_eq!(ipac.transport, "usb");
+        assert!(ipac.winusb_eligible);
+    }
+
     /// A board no `usb:` selector can name gets **no** `id` line rather than a
     /// wrong one. Printing a guess here is worse than printing nothing: the
     /// whole value of the line is that it is what `pick` would commit.
@@ -644,7 +988,7 @@ mod tests {
         let mut view = cabinet();
         // The SpinTrak enumerates as a non-composite devnode with no `MI_`, so
         // there is no interface number to build a selector from.
-        view.usb[3].state = "claimable".into();
+        restate(&mut view.usb[3], "claimable");
         assert!(view.usb[3].selector.is_none(), "fixture precondition");
         let text = render(&view, true);
         assert!(text.contains("Ultimarc SpinTrak"), "{text}");
@@ -856,7 +1200,7 @@ mod tests {
         let mut cabinet = cabinet();
         for row in &mut cabinet.usb {
             if row.instance_id.contains("15A2") {
-                row.state = "not-a-keyboard".into();
+                restate(row, "not-a-keyboard");
             }
         }
         let view = view(
@@ -1058,7 +1402,7 @@ mod tests {
     fn a_machine_with_no_pickable_board_says_so_rather_than_printing_nothing() {
         let mut view = cabinet();
         for row in &mut view.usb {
-            row.state = "not-a-keyboard".into();
+            restate(row, "not-a-keyboard");
         }
         let text = render(&view, false);
         assert!(text.contains("No keyboard-capable boards found"), "{text}");

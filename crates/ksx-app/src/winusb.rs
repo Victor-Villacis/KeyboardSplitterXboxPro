@@ -83,6 +83,14 @@ pub fn render_status(survey: &Survey) -> String {
             ClaimState::Claimable => "CLAIMABLE — ksx could claim this",
             ClaimState::NotAKeyboard => "no keys   — not a keyboard interface; ksx leaves it alone",
             ClaimState::ForeignDriver => "foreign   — another vendor's driver owns it",
+            // Not "cannot be used". It is a keyboard, ksx captures it today
+            // through Interception, and only the CLAIM is impossible — for the
+            // transport, permanently. The verdict word has to carry that or
+            // this screen becomes the place people learn the wrong lesson.
+            ClaimState::InterceptionOnly => {
+                "no claim  — Bluetooth: no USB interface to bind, so WinUSB never applies; \
+                 Interception captures it as it is"
+            }
         };
         out.push_str(&format!(
             "  {}\n    driver     : {driver}\n    device     : {}\n    verdict    : {verdict}\n",
