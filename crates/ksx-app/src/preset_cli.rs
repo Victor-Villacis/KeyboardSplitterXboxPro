@@ -24,8 +24,10 @@
 //! (2) = refused (unknown template, no such player block, a preset of that
 //! name already exists without `--force`); nothing was written.
 
-use ksx_config::{ConfigRoot, PresetFile, Store};
+use ksx_config::{ConfigRoot, Store};
 use ksx_core::templates;
+
+use crate::preset_edit;
 
 /// Refused — nothing was written.
 pub const EXIT_REFUSED: i32 = 2;
@@ -160,6 +162,11 @@ fn list_presets(store: &Store, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The console driver. Every DECISION below — instantiate, refuse to clobber,
+/// back up, save — belongs to [`crate::preset_edit`]; this function is the
+/// flags, the printing and the exit code, and nothing else. Studio's Profiles
+/// page performs the same verb through the same two calls, which is the only
+/// way "the backup was taken" can be true of both.
 #[allow(clippy::too_many_arguments)]
 fn new(
     store: &Store,
@@ -170,37 +177,27 @@ fn new(
     dry_run: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    let preset = match templates::instantiate(from_template, name, player) {
-        Ok(preset) => preset,
-        Err(error) => refuse(
-            json,
-            match error {
-                templates::TemplateError::Unknown(_) => "unknown-template",
-                templates::TemplateError::NoSuchPlayer { .. } => "no-such-player",
-                templates::TemplateError::EmptyName => "bad-name",
-            },
-            &error.to_string(),
-            Some("`ksx preset list --templates` names the ones that ship."),
-        ),
+    let spec = preset_edit::NewPresetSpec {
+        name: name.to_owned(),
+        template: from_template.to_owned(),
+        player,
+        force,
     };
-
-    let file = PresetFile::from_core(&preset);
     let path = store.canonical_preset_path(name)?;
     let existing = store.load_preset(name)?.is_some();
-    if existing && !force {
-        refuse(
+    let plan = match preset_edit::plan_new(existing.then(|| path.clone()).as_deref(), &spec) {
+        Ok(plan) => plan,
+        Err(error) => refuse(
             json,
-            "preset-exists",
-            &format!(
-                "a preset called \"{name}\" already exists ({})",
-                path.display()
-            ),
-            Some("--force overwrites it (a timestamped backup is taken first)."),
-        );
-    }
+            error.code(),
+            &error.to_string(),
+            error.advice().as_deref(),
+        ),
+    };
+    let file = &plan.file;
 
     if dry_run {
-        let text = toml::to_string(&file)?;
+        let text = toml::to_string(file)?;
         if json {
             println!(
                 "{}",
@@ -227,13 +224,8 @@ fn new(
         return Ok(());
     }
 
-    // Only ever destructive with --force, and never without a copy first.
-    let backup = if existing {
-        store.backup(&store.preset_path(name)?)?
-    } else {
-        None
-    };
-    let written = store.save_preset(&file)?;
+    let outcome = preset_edit::apply_new(store, &plan)?;
+    let (written, backup) = (outcome.path.clone(), outcome.backup.clone());
 
     if json {
         println!(
@@ -252,11 +244,11 @@ fn new(
         if let Some(backup) = &backup {
             println!("backed up the old one to {}", backup.display());
         }
-        println!(
-            "wrote {} — {} controls from \"{from_template}\" (player {player})",
-            written.display(),
-            file.bindings.len()
-        );
+        // The outcome's own sentence, not a second copy of it. It also says
+        // "replaced" where this used to say "wrote" for both cases — the one
+        // word that distinguishes a new file from a clobbered one.
+        println!("{}", outcome.message());
+        println!("  {}", written.display());
         println!();
         println!("Point a slot at it in config.toml:");
         println!("  [[slot]]");

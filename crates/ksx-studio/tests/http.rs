@@ -365,7 +365,7 @@ impl ControlSource for ScriptedControl {
     }
 }
 
-/// The MACHINE provider, scripted: one reference cabinet, and the two writes
+/// The MACHINE provider, scripted: one reference cabinet, and every write
 /// RECORDED rather than performed.
 ///
 /// Recorded rather than performed for the reason the cross-site test below
@@ -388,6 +388,16 @@ struct ScriptedMachine {
     /// `refuse` and from an actually-empty cabinet, and the one the page
     /// shipped without a single test reaching it.
     blind: bool,
+    /// The last `profile_new` spec this provider was asked for, so a test can
+    /// prove the FORM's values reached the verb rather than a default.
+    created_profile: Mutex<Option<ksx_api::NewProfile>>,
+    created_preset: Mutex<Option<ksx_api::NewPreset>>,
+    /// Both machine READS behind /profiles refuse — the state a machine with
+    /// a syntax error in games.toml and a permission problem on the presets
+    /// folder is in. Distinct from "the machine is empty", which is what the
+    /// page used to render for it — and distinct from [`Self::refuse`], which
+    /// is the DEVICE scan refusing.
+    reads_refuse: bool,
 }
 
 const IPAC_KB: &str = r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000";
@@ -406,6 +416,14 @@ impl ScriptedMachine {
     fn blind() -> Self {
         Self {
             blind: true,
+            ..Self::default()
+        }
+    }
+
+    /// Both /profiles reads refuse (games.toml AND the presets folder).
+    fn reads_refusing() -> Self {
+        Self {
+            reads_refuse: true,
             ..Self::default()
         }
     }
@@ -563,6 +581,111 @@ impl ksx_api::MachineSource for ScriptedMachine {
             ),
         })
     }
+
+    /// The profile list is the reference cabinet's as of 2026-08-07, including
+    /// the one that is actually broken there: "MAME 4P" points at a mame.exe
+    /// that is not on the disk. The provider — not the page — is what decides
+    /// that, which is why the fixture states it as `state: "broken"` with the
+    /// path, exactly as `LocalMachine::profiles` composes it from
+    /// `ksx_games::preflight`.
+    fn profiles(&self) -> Result<ksx_api::ProfilesView, Refusal> {
+        if self.reads_refuse {
+            return Err(Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                "games.toml could not be read: expected `=` at line 4",
+                "run `ksx config export --what games`",
+            ));
+        }
+        Ok(ksx_api::ProfilesView {
+            generated_at: "test".into(),
+            config_root: "C:\\cfg".into(),
+            games_path: "C:\\cfg\\games.toml".into(),
+            profiles: vec![
+                ksx_api::ProfileDetail {
+                    title: "Street Fighter".into(),
+                    path: "C:\\sf.exe".into(),
+                    arguments: String::new(),
+                    slots: 2,
+                    presets: vec!["Arcade".into()],
+                    state: "ok".into(),
+                    verdict: "the program is there".into(),
+                    broken_path: None,
+                },
+                ksx_api::ProfileDetail {
+                    title: "MAME 4P".into(),
+                    path: "D:\\emu\\mame\\mame.exe".into(),
+                    arguments: String::new(),
+                    slots: 4,
+                    presets: vec!["Arcade".into()],
+                    state: "broken".into(),
+                    verdict: "game profile 'MAME 4P' points at 'D:\\emu\\mame\\mame.exe', \
+                              which does not exist"
+                        .into(),
+                    broken_path: Some("D:\\emu\\mame\\mame.exe".into()),
+                },
+            ],
+            notes: Vec::new(),
+        })
+    }
+
+    fn presets(&self) -> Result<ksx_api::PresetsView, Refusal> {
+        if self.reads_refuse {
+            return Err(Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                "the presets folder could not be read: access is denied",
+                "run `ksx doctor`",
+            ));
+        }
+        Ok(ksx_api::PresetsView {
+            config_root: "C:\\cfg\\presets".into(),
+            presets: vec![ksx_api::PresetRow {
+                name: "Arcade".into(),
+                bound: 25,
+                macros: 0,
+                protected: false,
+                source: "C:\\cfg\\presets\\Arcade.toml".into(),
+            }],
+            templates: vec![ksx_api::TemplateRow {
+                id: "keyboard-2p".into(),
+                label: "Two players sharing ONE keyboard: WASD vs the arrows".into(),
+                detail: "Two people on one ordinary keyboard, no encoder.".into(),
+                players: vec![1, 2],
+            }],
+        })
+    }
+
+    fn profile_new(&self, spec: &ksx_api::NewProfile) -> Result<String, Refusal> {
+        *self.created_profile.lock().unwrap() = Some(spec.clone());
+        if spec.title.trim().is_empty() {
+            return Err(Refusal::new(
+                ksx_api::codes::REFUSED,
+                "a profile needs a title — it is the name `ksx run --game` takes",
+            ));
+        }
+        Ok(format!(
+            "created profile \"{}\" — {} slot(s) on preset \"{}\" → {}",
+            spec.title, spec.slots, spec.preset, spec.path
+        ))
+    }
+
+    fn preset_new(&self, spec: &ksx_api::NewPreset) -> Result<String, Refusal> {
+        *self.created_preset.lock().unwrap() = Some(spec.clone());
+        // The refusal `LocalMachine` composes from
+        // `preset_edit::PresetError::Exists` + its `advice()`, verbatim in
+        // shape: a message that names the file it protected, and a remedy that
+        // is the ONLY way forward. "Arcade" is the preset `presets()` lists.
+        if spec.name == "Arcade" && !spec.force {
+            return Err(Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                "a preset called \"Arcade\" already exists (C:\\cfg\\presets\\Arcade.toml)",
+                "--force overwrites it (a timestamped backup is taken first).",
+            ));
+        }
+        Ok(format!(
+            "created preset \"{}\" — 30 controls from \"{}\" (player {})",
+            spec.name, spec.template, spec.player
+        ))
+    }
 }
 
 /// Bind port 0 to learn a free port, release it, and serve there. The tiny
@@ -630,6 +753,18 @@ fn start_server_with_machine(
             spec: &ksx_api::DeviceRemoveSpec,
         ) -> Result<ksx_api::DeviceRemoveView, Refusal> {
             self.0.device_remove(spec)
+        }
+        fn profiles(&self) -> Result<ksx_api::ProfilesView, Refusal> {
+            self.0.profiles()
+        }
+        fn presets(&self) -> Result<ksx_api::PresetsView, Refusal> {
+            self.0.presets()
+        }
+        fn profile_new(&self, spec: &ksx_api::NewProfile) -> Result<String, Refusal> {
+            self.0.profile_new(spec)
+        }
+        fn preset_new(&self, spec: &ksx_api::NewPreset) -> Result<String, Refusal> {
+            self.0.preset_new(spec)
         }
     }
     std::thread::spawn(move || {
@@ -1995,5 +2130,396 @@ fn every_page_links_to_the_device_picker() {
             body.contains(r#"href="/devices""#),
             "{route} has no link to the device picker: {body}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /profiles — the games.toml profiles and the presets (v15)
+// ---------------------------------------------------------------------------
+
+/// The page renders both machine reads, and a profile whose program is gone is
+/// broken ON THE PAGE with the path that is wrong — the whole reason this
+/// screen exists. That fact used to surface only when a session refused to
+/// start.
+#[test]
+fn the_profiles_page_shows_a_broken_profile_with_its_path() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    let response = get(addr, "/profiles");
+    let body = body_of(&response);
+
+    assert!(body.contains("Broken profiles"), "{body}");
+    assert!(body.contains("MAME 4P"), "{body}");
+    assert!(body.contains("D:\\emu\\mame\\mame.exe"), "{body}");
+    assert!(body.contains("which does not exist"), "{body}");
+    // The healthy one is listed too.
+    assert!(body.contains("Street Fighter"), "{body}");
+    // The presets and the in-box templates both arrived — the second is what
+    // `LocalMachine::presets` used to answer with an empty list.
+    assert!(body.contains("Arcade"), "{body}");
+    assert!(body.contains("keyboard-2p"), "{body}");
+}
+
+/// The JSON twin serves the same shape the page embeds — one struct, one
+/// serializer, like `/api/status` and `/api/map`.
+#[test]
+fn the_profiles_api_serves_the_pages_own_payload() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    let response = get(addr, "/api/profiles");
+    assert!(response.contains("no-store"), "{response}");
+
+    let value: serde_json::Value = serde_json::from_str(body_of(&response)).expect("json");
+    assert_eq!(
+        value.pointer("/profiles/profiles/1/state"),
+        Some(&serde_json::json!("broken"))
+    );
+    assert_eq!(
+        value.pointer("/profiles/profiles/1/broken_path"),
+        Some(&serde_json::json!("D:\\emu\\mame\\mame.exe"))
+    );
+    assert_eq!(
+        value.pointer("/presets/templates/0/id"),
+        Some(&serde_json::json!("keyboard-2p"))
+    );
+    // A poll is not an action.
+    assert_eq!(value.pointer("/flash"), Some(&serde_json::json!(null)));
+}
+
+/// Creating a profile: the form's own values reach the backend verb, and the
+/// outcome comes back as a flash on a 303 — never HTML from a POST.
+#[test]
+fn creating_a_profile_reaches_the_verb_and_flashes_the_outcome() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let machine = Arc::new(ScriptedMachine::default());
+    let addr = start_server_with_machine(control, machine.clone());
+
+    let response = post_form(
+        addr,
+        "/profiles/new",
+        "title=Tekken&path=C%3A%5Cgames%5Ctekken.exe&arguments=-windowed&slots=4&preset=Arcade",
+    );
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(response.contains("/profiles?flash="), "{response}");
+    assert!(response.contains("created%20profile"), "{response}");
+
+    let spec = machine
+        .created_profile
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("spec");
+    assert_eq!(spec.title, "Tekken");
+    assert_eq!(spec.path, "C:\\games\\tekken.exe");
+    assert_eq!(spec.arguments, "-windowed");
+    assert_eq!(spec.slots, 4);
+    assert_eq!(spec.preset, "Arcade");
+}
+
+/// A refusal flashes too, prefixed `error:` so the page's `show:flashError`
+/// pair picks the red side. Nothing fails silently.
+#[test]
+fn a_refused_profile_create_flashes_the_reason() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    let response = post_form(
+        addr,
+        "/profiles/new",
+        "title=&path=C%3A%5Cx.exe&slots=1&preset=Arcade",
+    );
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(response.contains("flash=error%3A"), "{response}");
+}
+
+/// A post with a field missing OR EMPTY still comes back as a 303 with a
+/// worded flash, NOT a 422.
+///
+/// The distinction is not pedantry. The island fetch-submits and reads its
+/// outcome out of the redirect's `?flash=` — a 422 carries no `Location`, so
+/// the page would show nothing whatsoever and the user would be left pressing
+/// a button that appears to do nothing. That is the failure mode this whole
+/// screen replaced; it must not come back through the extractor.
+///
+/// The EMPTY cases are the ones that matter, and the earlier version of this
+/// test did not have them: it covered only the absent key, which
+/// `#[serde(default)]` already handled, so it passed against the broken build.
+/// A browser sends `slots=` — present, empty — the instant a user clears a
+/// non-`required` `<input type="number">`, and serde_urlencoded answers
+/// "cannot parse integer from empty string" for an `Option<u8>`. The rows
+/// below fail against the `Option<u8>` version with a 422 and no `Location`;
+/// the `garbage` rows fail against any version that lets the extractor do the
+/// parsing at all.
+#[test]
+fn a_post_with_a_missing_or_empty_number_still_flashes_instead_of_422() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    for (path, body, why) in [
+        ("/profiles/new", "path=C%3A%5Cx.exe", "the key is absent"),
+        (
+            "/profiles/new",
+            "title=T&path=C%3A%5Cx.exe&slots=&preset=Arcade",
+            "the user cleared the slots box",
+        ),
+        (
+            "/profiles/new",
+            "title=T&path=C%3A%5Cx.exe&slots=lots&preset=Arcade",
+            "the slots box holds something that is not a number",
+        ),
+        ("/profiles/preset/new", "name=Couch", "the key is absent"),
+        (
+            "/profiles/preset/new",
+            "name=Couch&template=keyboard-2p&player=",
+            "the user cleared the player box",
+        ),
+        (
+            "/profiles/preset/new",
+            "name=Couch&template=keyboard-2p&player=two",
+            "the player box holds something that is not a number",
+        ),
+    ] {
+        let response = post_form(addr, path, body);
+        assert!(
+            response.starts_with("HTTP/1.1 303"),
+            "{path} must redirect with a flash when {why}, not reject the \
+             body — a 422 carries no Location and the island renders it as \
+             nothing at all: {response}"
+        );
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("location: /profiles"),
+            "{path} ({why}) must carry a Location the island can read a flash \
+             out of: {response}"
+        );
+        assert!(response.contains("flash="), "{path} ({why}): {response}");
+    }
+}
+
+/// A refusal arrives with its REMEDY, not just its message.
+///
+/// `flash_of` used to return `refusal.message` and drop `refusal.remedy`,
+/// justified by "the page has a place for the remedy already: the no-daemon
+/// banner". True of the control verbs it was written for; false of every
+/// machine verb this page added. `preset-exists` is the case that proves it —
+/// the message names the file it protected and the remedy names `--force`,
+/// which is the only path forward that exists anywhere on this screen, and the
+/// page has nowhere else that carries one.
+///
+/// Fails against the shipped version: the flash there stops at the filename.
+#[test]
+fn a_refusal_flashes_the_way_out_and_not_only_the_reason() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    let response = post_form(
+        addr,
+        "/profiles/preset/new",
+        "name=Arcade&template=keyboard-2p&player=1",
+    );
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(
+        response.contains("already%20exists"),
+        "the refusal must name what it protected: {response}"
+    );
+    assert!(
+        response.contains("--force"),
+        "…and the flag that means yes, which is the only way forward on this \
+         page: {response}"
+    );
+}
+
+/// A REFUSED read must not render as an assertion of absence.
+///
+/// This is the page's own stated purpose turned on itself, and it is this
+/// project's signature bug: a surface answering for a read it never completed
+/// (the session that reported success while the arcade panel was dead because
+/// a WinUSB board had silently fallen back to Interception).
+///
+/// Fails against the shipped version on the first two assertions: there,
+/// `collect_profiles` substituted `ProfilesView::default()` / `PresetsView::
+/// default()` on `Err`, so the page printed "no profiles in games.toml" and
+/// "No presets on disk … Make a preset from an in-box template below first" —
+/// the second of which points at a form whose `<select>` is empty for exactly
+/// the same reason, so the only route it offers cannot succeed.
+#[test]
+fn a_refused_read_is_not_rendered_as_an_empty_machine() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server_with_machine(control, Arc::new(ScriptedMachine::reads_refusing()));
+    let response = get(addr, "/profiles");
+    let body = body_of(&response);
+
+    assert!(
+        !body.contains("no profiles in games.toml"),
+        "a failed read must not be reported as an empty games.toml: {body}"
+    );
+    assert!(
+        !body.contains("Make a preset from an in-box template below"),
+        "a failed presets read must not send the user to a form fed by the \
+         same read: {body}"
+    );
+    assert!(
+        !body.contains(r#"action="/profiles/preset/new""#),
+        "…and that form must not be on the page at all: {body}"
+    );
+    // What it says instead: the failure, and both reasons, in words.
+    assert!(body.contains("could NOT be read"), "{body}");
+    assert!(body.contains("expected `=` at line 4"), "{body}");
+    assert!(body.contains("access is denied"), "{body}");
+    // Each read's remedy travels with it — this string replaces the list the
+    // user came for, so it is the one place that cannot be a dead end.
+    assert!(body.contains("ksx config export --what games"), "{body}");
+    assert!(body.contains("ksx doctor"), "{body}");
+
+    // The JSON twin says it in a machine-readable field, not by omission.
+    let value: serde_json::Value =
+        serde_json::from_str(body_of(&get(addr, "/api/profiles"))).expect("json");
+    assert_eq!(
+        value.pointer("/view/profiles_unreadable"),
+        Some(&serde_json::json!(true)),
+        "a poller must be able to tell a refused read from an empty one: \
+         {value}"
+    );
+    assert_eq!(
+        value.pointer("/view/presets_unreadable"),
+        Some(&serde_json::json!(true)),
+        "{value}"
+    );
+    assert_eq!(
+        value.pointer("/view/no_presets_yet"),
+        Some(&serde_json::json!(false)),
+        "'no presets yet' is a claim about the FOLDER; nothing was read: \
+         {value}"
+    );
+}
+
+/// Creating a preset from a template, through the same `preset_new` verb
+/// `ksx preset new` performs.
+#[test]
+fn creating_a_preset_from_a_template_reaches_the_verb() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let machine = Arc::new(ScriptedMachine::default());
+    let addr = start_server_with_machine(control, machine.clone());
+
+    let response = post_form(
+        addr,
+        "/profiles/preset/new",
+        "name=Couch&template=keyboard-2p&player=2",
+    );
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    let spec = machine
+        .created_preset
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("spec");
+    assert_eq!(spec.name, "Couch");
+    assert_eq!(spec.template, "keyboard-2p");
+    assert_eq!(spec.player, 2);
+    // Overwriting a 25-binding mapping is not something a web form may do by
+    // accident; `--force` stays the CLI's consent step.
+    assert!(!spec.force);
+}
+
+/// Switching profile is the SAME `ControlSource::start` the status page posts
+/// — one backend verb, no second "switch" path — and it comes back to
+/// /profiles so the user keeps their place.
+#[test]
+fn switching_profile_calls_start_and_returns_to_profiles() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let addr = start_server(control.clone());
+
+    let response = post_form(addr, "/profiles/switch", "profile=MAME+4P");
+    assert!(response.starts_with("HTTP/1.1 303"), "{response}");
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("location: /profiles?flash="),
+        "the redirect must come back HERE, not to / like the status page's \
+         twin of this verb: {response}"
+    );
+    assert_eq!(
+        control.started_with.lock().unwrap().clone(),
+        Some(Some("MAME 4P".to_owned())),
+        "the profile the row named must reach `start`"
+    );
+}
+
+/// The guard is a router-wide layer, so a route declared in the same chain is
+/// guarded by construction — but "by construction" is exactly the claim worth
+/// testing, once, per new mutating route.
+#[test]
+fn the_profiles_write_routes_refuse_a_cross_site_post() {
+    let control = Arc::new(ScriptedControl::new(false));
+    let machine = Arc::new(ScriptedMachine::default());
+    let addr = start_server_with_machine(control.clone(), machine.clone());
+
+    for (path, body) in [
+        (
+            "/profiles/new",
+            "title=Evil&path=C%3A%5Cevil.exe&slots=1&preset=Arcade",
+        ),
+        (
+            "/profiles/preset/new",
+            "name=Evil&template=keyboard-2p&player=1",
+        ),
+        ("/profiles/switch", "profile=MAME+4P"),
+    ] {
+        let response = http(
+            addr,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+                 Origin: http://evil.example\r\nConnection: close\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {len}\r\n\r\n{body}",
+                port = addr.port(),
+                len = body.len(),
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "{path} must refuse a cross-site POST: {response}"
+        );
+    }
+    // Not "it returned 403" — that no write happened.
+    assert!(machine.created_profile.lock().unwrap().is_none());
+    assert!(machine.created_preset.lock().unwrap().is_none());
+    assert!(control.started_with.lock().unwrap().is_none());
+}
+
+/// A rebound host cannot even READ the profile list. The same Host check
+/// covers every route; it is asserted on this one because a page that lists
+/// filesystem paths is worth naming explicitly.
+#[test]
+fn a_rebound_host_cannot_read_the_profiles() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    let response = http(
+        addr,
+        "GET /api/profiles HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 421"), "{response}");
+}
+
+/// Every page's nav must list every page, or a screen is unreachable. The nav
+/// is static markup INSIDE each island — not server-injected, not a shared
+/// component — so this is one edit per island, and exactly the kind that gets
+/// forgotten.
+#[test]
+fn every_page_links_to_every_other_page() {
+    let control = Arc::new(ScriptedControl::new(true));
+    let addr = start_server(control);
+    for route in ["/", "/map", "/devices", "/profiles"] {
+        let response = get(addr, route);
+        let body = body_of(&response);
+        for link in [
+            r#"href="/""#,
+            r#"href="/map""#,
+            r#"href="/devices""#,
+            r#"href="/profiles""#,
+        ] {
+            assert!(
+                body.contains(link),
+                "{route} does not link to {link} — the page is unreachable from it"
+            );
+        }
     }
 }

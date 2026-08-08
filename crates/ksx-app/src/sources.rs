@@ -22,7 +22,7 @@
 
 use ksx_api::{
     MacroSnapshot, MacroStepView, MacroView, MapperSlot, MapperSnapshot, PadRow, PresetRow,
-    PresetsView, ProfileRow, Refusal, StatusSnapshot, StatusSource,
+    PresetsView, ProfileRow, Refusal, StatusSnapshot, StatusSource, TemplateRow,
 };
 use ksx_platform::autostart;
 use ksx_platform::{BusDriverReport, InterceptionReport, ServiceState};
@@ -420,6 +420,98 @@ fn autostart_line() -> String {
     }
 }
 
+/// One `[[game]]` entry, preflighted into something a surface can branch on.
+///
+/// The verdicts are the honest three, and the middle one is the one worth
+/// keeping separate: `ksx_games::preflight` cannot check a `steam://` URL —
+/// only the shell resolves it — so a protocol profile is `launcher`, not `ok`.
+/// Reporting it green would be ksx claiming a check it did not make, and the
+/// user finding out at the same moment they used to find out about the missing
+/// .exe.
+fn profile_detail(entry: &ksx_config::GameEntry) -> ksx_api::ProfileDetail {
+    use ksx_games::{preflight, LaunchSpec, LaunchTarget, PreflightError};
+
+    let spec = LaunchSpec::from_entry(entry);
+    let protocol = matches!(spec.target, LaunchTarget::Protocol { .. });
+    let (state, verdict, broken_path) = match preflight(&spec) {
+        Ok(()) if protocol => (
+            "launcher",
+            match &spec.target {
+                LaunchTarget::Protocol { launcher, .. } => {
+                    format!("handed to {launcher}; ksx cannot verify it ahead of time")
+                }
+                // Unreachable: `protocol` IS this match arm.
+                LaunchTarget::Executable { .. } => "handed to the shell".to_owned(),
+            },
+            None,
+        ),
+        Ok(()) => ("ok", "the program is there".to_owned(), None),
+        // The refusal text is `ksx run`'s own — the same sentence, at the
+        // moment it is useful instead of the moment it is too late.
+        Err(err @ PreflightError::ExeMissing { .. }) => (
+            "broken",
+            err.to_string(),
+            Some(entry.path.trim().to_owned()),
+        ),
+        Err(err @ PreflightError::NotAFile { .. }) => (
+            "broken",
+            err.to_string(),
+            Some(entry.path.trim().to_owned()),
+        ),
+        Err(err @ PreflightError::NoPath { .. }) => ("broken", err.to_string(), None),
+    };
+
+    let mut presets: Vec<String> = Vec::new();
+    for slot in &entry.slots {
+        if !presets.contains(&slot.preset) {
+            presets.push(slot.preset.clone());
+        }
+    }
+
+    ksx_api::ProfileDetail {
+        title: entry.title.clone(),
+        path: entry.path.clone(),
+        arguments: entry.arguments.clone(),
+        slots: entry.slots.len(),
+        presets,
+        state: state.to_owned(),
+        verdict,
+        broken_path,
+    }
+}
+
+/// A store error as the refusal a surface flashes.
+fn refuse_config(what: &str, err: ksx_config::ConfigError) -> Refusal {
+    Refusal::with_remedy(
+        ksx_api::codes::REFUSED,
+        format!("{what}: {err}"),
+        "run `ksx doctor`",
+    )
+}
+
+/// A profile-write refusal, keeping the planner's stable code and its advice.
+///
+/// The code is the planner's, not a fresh one invented here — that is the
+/// whole point of `ProfileError::code()` existing, and it is what lets a JSON
+/// caller and a web form agree on why they were refused.
+fn profile_refusal(err: crate::profile_edit::ProfileError) -> Refusal {
+    let advice = err.advice();
+    let refusal = Refusal::new(ksx_api::codes::REFUSED, err.to_string());
+    if advice.is_empty() {
+        refusal
+    } else {
+        refusal.remedy(advice)
+    }
+}
+
+fn preset_refusal(err: crate::preset_edit::PresetError) -> Refusal {
+    let refusal = Refusal::new(ksx_api::codes::REFUSED, err.to_string());
+    match err.advice() {
+        Some(advice) => refusal.remedy(advice),
+        None => refusal,
+    }
+}
+
 fn load_profiles() -> (Vec<ProfileRow>, String) {
     let root = match ksx_config::ConfigRoot::discover() {
         Ok(root) => root,
@@ -620,11 +712,148 @@ impl ksx_api::MachineSource for LocalMachine {
                 }
             })
             .collect();
+        // The in-box layouts, from the one registry that holds them
+        // (`ksx_core::templates::TEMPLATES` — the same slice
+        // `ksx preset list --templates` prints). This field was
+        // `Vec::new()` until 2026-08-07: the typed surface promised "the
+        // templates a new one can be seeded from" and answered with nothing,
+        // so a surface offering "start from a template" had an empty menu and
+        // no way to tell that apart from a machine with no templates. Two
+        // lines, and the whole of task #14's `keyboard-2p` becomes reachable
+        // from something other than a shell.
+        let templates = ksx_core::templates::TEMPLATES
+            .iter()
+            .map(|t| TemplateRow {
+                id: t.id.to_owned(),
+                label: t.summary.to_owned(),
+                detail: t.panel.to_owned(),
+                players: (1..=t.players).collect(),
+            })
+            .collect();
         Ok(PresetsView {
             config_root: root.presets_dir().display().to_string(),
             presets,
-            templates: Vec::new(),
+            templates,
         })
+    }
+
+    /// games.toml, **preflighted**.
+    ///
+    /// The one thing this does that no existing read did: it runs
+    /// [`ksx_games::preflight`] per row, which is the identical check
+    /// `ksx run --game` makes at launch. Same function, same refusal type,
+    /// moved to the moment a person is looking at the list rather than the
+    /// moment they wanted to play — which is the entire difference between
+    /// "MAME 4P is broken, that path is gone" and a cabinet that does nothing
+    /// when the button is pressed.
+    ///
+    /// A protocol URL (`steam://…`) reports `launcher`, never `ok`: preflight
+    /// passes it by construction because only the shell can resolve it, and
+    /// calling that "ok" would claim a check ksx did not make.
+    fn profiles(&self) -> Result<ksx_api::ProfilesView, Refusal> {
+        let root = ksx_config::ConfigRoot::discover().map_err(|err| {
+            Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                format!("the config root could not be found: {err}"),
+                "run `ksx doctor`",
+            )
+        })?;
+        let store = ksx_config::Store::new(root.clone());
+        let mut notes = Vec::new();
+        let games = match store.load_games() {
+            Ok(loaded) => {
+                notes.extend(loaded.warnings.iter().map(ToString::to_string));
+                loaded.value
+            }
+            Err(err) => {
+                return Err(Refusal::with_remedy(
+                    ksx_api::codes::REFUSED,
+                    format!("games.toml could not be read: {err}"),
+                    "run `ksx config export --what games`",
+                ))
+            }
+        };
+        let profiles = games.games.iter().map(profile_detail).collect();
+        Ok(ksx_api::ProfilesView {
+            generated_at: now_utc(),
+            config_root: root.dir().display().to_string(),
+            games_path: root.games_path().display().to_string(),
+            profiles,
+            notes,
+        })
+    }
+
+    /// Append a `[[game]]` — plan, then apply, then report.
+    ///
+    /// The preset list is read here rather than trusted from the caller: a
+    /// form posts a string, and "the preset exists" is a fact about this disk
+    /// at this instant, not about the page that was drawn two minutes ago.
+    fn profile_new(&self, spec: &ksx_api::NewProfile) -> Result<String, Refusal> {
+        let root = ksx_config::ConfigRoot::discover().map_err(|err| {
+            Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                format!("the config root could not be found: {err}"),
+                "run `ksx doctor`",
+            )
+        })?;
+        let store = ksx_config::Store::new(root);
+        let games = store
+            .load_games()
+            .map_err(|err| refuse_config("games.toml could not be read", err))?
+            .value;
+        let presets: Vec<String> = store
+            .load_presets()
+            .map_err(|err| refuse_config("the presets folder could not be read", err))?
+            .value
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        let plan = crate::profile_edit::plan_new(
+            &games,
+            &presets,
+            &crate::profile_edit::NewProfileSpec {
+                title: spec.title.clone(),
+                path: spec.path.clone(),
+                arguments: spec.arguments.clone(),
+                slots: spec.slots,
+                preset: spec.preset.clone(),
+            },
+        )
+        .map_err(profile_refusal)?;
+        let outcome = crate::profile_edit::apply_new(&store, &plan).map_err(profile_refusal)?;
+        Ok(outcome.message())
+    }
+
+    /// Instantiate an in-box template into a preset file — the same two calls
+    /// `ksx preset new` makes, through the same writer.
+    fn preset_new(&self, spec: &ksx_api::NewPreset) -> Result<String, Refusal> {
+        let root = ksx_config::ConfigRoot::discover().map_err(|err| {
+            Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                format!("the config root could not be found: {err}"),
+                "run `ksx doctor`",
+            )
+        })?;
+        let store = ksx_config::Store::new(root);
+        let path = store
+            .canonical_preset_path(&spec.name)
+            .map_err(|err| refuse_config("that preset name cannot be a file name", err))?;
+        let existing = store
+            .load_preset(&spec.name)
+            .map_err(|err| refuse_config("the presets folder could not be read", err))?
+            .is_some();
+        let plan = crate::preset_edit::plan_new(
+            existing.then_some(path).as_deref(),
+            &crate::preset_edit::NewPresetSpec {
+                name: spec.name.clone(),
+                template: spec.template.clone(),
+                player: spec.player,
+                force: spec.force,
+            },
+        )
+        .map_err(preset_refusal)?;
+        let outcome = crate::preset_edit::apply_new(&store, &plan).map_err(preset_refusal)?;
+        Ok(outcome.message())
     }
 
     /// Reuses the tray's own launcher, deliberately.

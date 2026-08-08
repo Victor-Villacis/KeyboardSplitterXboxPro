@@ -418,6 +418,7 @@ export function DevicesIsland() {
           { class: "navlink on", href: "/devices", "aria-current": "page" },
           "Devices",
         ),
+        h("a", { class: "navlink", href: "/profiles" }, "Profiles"),
       ),
       createShow(
         () => pillRunning(),

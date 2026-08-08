@@ -3799,6 +3799,23 @@ a.strow:hover {
   header.top {
     padding: var(--sp-2) var(--sp-4);
     gap: var(--sp-2);
+    /* The rail grew a third screen (Profiles) and will grow more. Measured at
+       360px: brand + two links + the state pill already came to ~434px against
+       360 of viewport, so the bar was one nav item away from scrolling the
+       whole PAGE sideways — and the item that fell off the end would have been
+       the state pill, the one thing on the header that says anything. Wrap the
+       pill to its own line instead. */
+    flex-wrap: wrap;
+  }
+
+  /* Same treatment, and the same reason, as `.slotstrip .tabs` below: the top
+     nav is NAVIGATION, so on a phone it scrolls sideways on its own line
+     rather than clipping the last screen out of reach. This is what keeps a
+     fourth and fifth page cheap — they cost a link, not a layout. */
+  .topnav {
+    flex: 1 1 100%;
+    max-width: 100%;
+    overflow-x: auto;
   }
 
   .studio > main {
@@ -3880,6 +3897,26 @@ a.strow:hover {
     flex-basis: 100%;
     margin-left: 0;
     text-align: left;
+  }
+
+  /* Same rule, same reason, for `.plist li` — which the profiles page is the
+     first to give THREE children (meta column + state pill + a Switch form).
+     `.pmeta{min-width:0}` and `.pdetail{overflow-wrap:anywhere}` stop the
+     page scrolling sideways, but at 360px they do it by squeezing the meta
+     column to ~160px while it carries four stacked lines including a full
+     Windows path. Wrapping puts the pill and the button on their own line and
+     gives the text the width. */
+  .plist li {
+    flex-wrap: wrap;
+  }
+
+  /* …and the button that lands on that second line is a row's only action.
+     `--ctl-h-sm` is 28px, and `(pointer: coarse)` lifts it only to 36 — still
+     under the 44px iOS / 48px Android floor, on the one control a phone user
+     has to hit. Width comes free from the wrap above. */
+  .plist .btn-row {
+    min-height: 2.75rem;
+    padding-inline: var(--sp-5);
   }
 
   .toasts {

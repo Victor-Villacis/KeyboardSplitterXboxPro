@@ -86,6 +86,51 @@ finished either** — it is untested against a real caller, and its shape is a
 guess. That is the surface-parity guard on the task list (#26), and until it
 exists this paragraph is the only thing checking.
 
+### §1a Rendered COPY is logic too, and one page proves it
+
+A Studio island seeds its signals from the server's paint and then rewrites the
+same signals from a 2 s poll. It is very easy to let the island compose its own
+sentences from the polled data, and every one of them is then a second
+implementation of a backend rule in another language.
+
+The Profiles page shipped that way and review found the drift immediately: the
+slot-count input's ceiling was `createSignal("16")` in `ProfilesIsland.ts`, its
+setter was never called, and no payload field could reach it. `MAX_SLOTS` has
+already been raised once (task #17). The next raise would have had the server
+render `max="32"` and hydration write `16` straight back over it — a *legal*
+input silently refused, for the same reason `main.rs`'s `slot_arg` module
+exists. The summary lines, the pill mapping and the row text were duplicated the
+same way; they had not drifted yet.
+
+The shape that fixes it: **one serialized derived block**. `ProfilesDerived`
+(`crates/ksx-studio/src/snapshot.rs`) holds every displayed string, every count,
+both numeric ceilings and every `show:` boolean, computed once from the provider
+data; `render_profiles.rs` injects it into the FMIR slots and `applyProfiles`
+assigns it to signals. Neither composes anything. A new page copies this, not
+the two-halves version.
+
+### §1b A refused READ is not an empty result
+
+"I could not read this" and "there is nothing here" are different sentences, and
+a user acts on them differently: one says *go fix your config*, the other says
+*go make your first profile*. A surface that renders the second when the first
+is true has reported success over a read that did not happen — which is the
+failure mode this project keeps hitting (the session that read as healthy while
+the arcade panel was dead, because a WinUSB board had fallen back to
+Interception).
+
+The rule: **an `Err` from a provider gets a typed field on the payload, never a
+`Default::default()` view.** Substituting a default is what turns a refusal into
+a count of zero, and a count of zero into a confident wrong sentence. See
+`ProfilesPayload::profiles_error` / `presets_error`, and note the second-order
+bug the Profiles page had: a defaulted `PresetsView` set `noPresetsYet`, whose
+copy points at a template form fed by *the same read that just failed* — a
+closed loop with a wrong sentence on it.
+
+A page that gets this right needs a test that fails when the two are conflated;
+asserting the failure state renders is not enough, because that passes while the
+absence sentence renders too.
+
 ## §2 Build order
 
 1. **Backend verb** — typed spec, pure plan, tested against synthetic fixtures.
@@ -292,6 +337,17 @@ crossing is a design smell worth a second look.
   field.
 - **Device pick UI** — Studio, following the existing CLI verb (§3). Also the
   egui: §3 row 3 no longer claims a view exists there.
+- **`ksx games new` — the CLI half of profile creation, owed.** Studio's
+  `/profiles` page creates a games.toml profile through
+  `MachineSource::profile_new` over a pure plan in `ksx-app`'s `profile_edit`
+  — but there is no CLI verb for it, so §2's build order ran 1 → 3 with 2
+  skipped. That is backwards and it shows: `profile_edit` is gated
+  `#[cfg(any(feature = "studio", feature = "cabinet"))]` because Studio is its
+  only caller, which is a backend module whose existence depends on a UI
+  feature flag. `plan_new` / `apply_new` are pure and already carry the
+  refusals; the CLI verb is a thin driver over them, and it removes the gate.
+  Until then §3's "Edit config, profiles | CLI owns" row is aspirational for
+  the CREATE half.
 - **Cabinet slot list scrolling** — egui, operating surface, still broken above
   four slots. The body *is* inside a `ScrollArea`; what is missing is any
   scroll-to-focus call, so the joystick can move the cursor to a row that is
