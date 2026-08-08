@@ -75,3 +75,23 @@
 *.png   binary
 *.rgba  binary
 
+
+###############################################################################
+# Generated UI bundles — crates/ksx-studio/assets/ (output of studio-ui/build.mjs)
+#
+# `-text` means: never translate line endings, in either direction. These files
+# are BUILD OUTPUT whose names are content hashes, and the workflow that keeps
+# them honest is "rebuild and confirm `git status` is clean". Under `* text=auto`
+# that check can never pass on Windows: the build writes LF, git smudges the
+# checkout to CRLF, and every rebuild reports nine modified files whose content
+# is identical. A real change is then indistinguishable from the noise.
+#
+# It has already cost more than a confusing `git status`. A builder agent that
+# wrote LF into the otherwise-CRLF `studio.css` changed the SOURCE's bytes, so
+# the hash in the emitted filename was one no clean checkout could reproduce —
+# master carried an asset name that only existed on one machine.
+#
+# Not `binary`: these are readable JS/JSON and a diff of them is occasionally
+# worth having. `-text` alone stops the translation without hiding the content.
+###############################################################################
+crates/ksx-studio/assets/** -text
