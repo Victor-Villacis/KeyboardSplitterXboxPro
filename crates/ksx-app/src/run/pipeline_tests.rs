@@ -468,6 +468,220 @@ fn run_session_with(
     }
 }
 
+/// **`ksx play`, end to end, against the oracle the scripted path uses.**
+///
+/// The same 392-event cabinet recording, the same plan, the same supervisor and
+/// the same assertion — but the events come out of `ReplayBackend` reading the
+/// corpus file, which is what `ksx play` actually runs. That is the claim the
+/// verb makes: a recording drives the identical pipeline a human does. Anything
+/// the play path does differently to the pad states — a dropped device, a
+/// mis-parsed key name, a remap that quietly changed which slot moved — shows up
+/// here as a divergence from the pure engine.
+///
+/// Three things it pins beyond the pad states:
+/// - the schedule really is the recorded `t_ms` values, in order (virtual clock,
+///   no sleeps);
+/// - a finished recording ends the session as `ReplayFinished`, exit 0 — not as
+///   a capture thread dying (exit 3), which is what happens if the replay
+///   backend simply returns;
+/// - `resolve_recording` accepts the real corpus, desk keyboard and all.
+///
+/// What it cannot cover is `Silenced` wrapping a real board — there is no board
+/// here. That has its own test in `ksx_capture::replay`.
+#[test]
+fn ksx_play_replays_the_corpus_into_the_same_pads_the_scripted_path_produces() {
+    use ksx_capture::{Recording, ReplayBackend, VirtualClock};
+
+    let path = repo_root().join("crates/ksx-capture/tests/corpus/ipac-session-001.jsonl");
+    let text = std::fs::read_to_string(&path).expect("corpus present");
+    let recording = Recording::parse(&text).expect("the corpus is a playable recording");
+    let events = load_corpus();
+    assert_eq!(
+        recording.len(),
+        events.len(),
+        "the play parser and the oracle's parser must read the same file the same way"
+    );
+
+    let plan = cabinet_plan();
+    // `ksx play` with no `--as`: the corpus was recorded on this cabinet, so the
+    // ids it holds are the ones the plan drives. The desk keyboard it also
+    // caught drives nothing and is ignored, exactly as in a live session.
+    let play =
+        crate::play::resolve_recording("ipac-session-001.jsonl", recording, &[], &plan, &[], &[])
+            .expect("the corpus drives this cabinet's slots");
+    assert_eq!(play.driving.len(), 1, "one panel drives every slot");
+    assert_eq!(play.driving[0].slots, vec![1, 2, 3, 4]);
+    assert_eq!(play.ignored.len(), 1, "and the desk keyboard is ignored");
+
+    let clock = VirtualClock::new();
+    let stamps: Vec<u64> = play.recording.events().iter().map(|e| e.t_ms).collect();
+    let backend = ReplayBackend::new(play.recording).with_clock(Box::new(clock.clone()));
+    let progress = backend.progress();
+
+    let log = PadLog::default();
+    let trace: Trace = Arc::new(Mutex::new(Vec::new()));
+    let mut options = RunOptions {
+        clock: Clock::monotonic_nanos(),
+        trace: Some(trace.clone()),
+        plug_deadline: Duration::from_secs(10),
+        // The verb's own hook: the capture thread deliberately stays alive when
+        // the recording runs out, so this is what turns "finished" into a stop.
+        hook: Box::new(crate::play::ReplayHook::new(
+            progress.clone(),
+            Box::new(super::supervisor::NoHook),
+        )),
+        ..RunOptions::default()
+    };
+    let wiring = Wiring {
+        capture: Box::new(backend),
+        pads: Box::new(RecordingBackend::new(log.clone())),
+    };
+    let mut out: Vec<u8> = Vec::new();
+    let outcome = supervise(&plan, wiring, &mut options, &mut out).expect("supervisor ran");
+
+    assert_eq!(
+        outcome.stop,
+        StopReason::ReplayFinished,
+        "a recording that ran out is its own clean stop, not a capture failure"
+    );
+    assert_eq!(outcome.exit_code(), 0);
+    assert_eq!(
+        outcome.events,
+        events.len() as u64,
+        "every recorded event reached the engine"
+    );
+    assert_eq!(
+        progress.passes(),
+        1,
+        "one pass, because --loop was not given"
+    );
+
+    // The schedule is the file's, event for event.
+    assert_eq!(
+        clock.waits(),
+        stamps,
+        "the replay must wait for each recorded stamp, in order"
+    );
+
+    let session = Session {
+        outcome,
+        trace: trace.lock().expect("trace poisoned").clone(),
+        pads: log.events(),
+        timeline: log.timeline(),
+        output: String::from_utf8(out).expect("utf-8 output"),
+        resent: Vec::new(),
+    };
+    assert_eq!(session.outcome.pads.len(), 4, "all four panels got a pad");
+    let expected = assert_pads_match_the_pure_engine(&session, &events);
+    for slot in 1..=4u8 {
+        assert!(
+            expected.iter().any(|(s, _)| *s == slot),
+            "slot {slot} saw no pad updates; the replay lost a player"
+        );
+    }
+    // Teardown ORDER is a property of `supervise` and is pinned by the scripted
+    // path above, which observes the capture backend's control messages in the
+    // same timeline. What a replay adds is that it leaves nothing behind: every
+    // pad it plugged is unplugged again when the recording ends by itself.
+    for pad in &session.outcome.pads {
+        assert!(
+            session.pads.contains(&PadEvent::Unplug(pad.handle)),
+            "slot {} was never unplugged after the recording finished",
+            pad.slot
+        );
+    }
+}
+
+/// **The replay oracle, applied to a live session's pad log.**
+///
+/// Every pad update this session made must be one a bare [`Engine`] would have
+/// produced from the same events, in the same order. Shared by the two paths
+/// that can put the recorded cabinet session in front of the pipeline — a
+/// scripted capture backend and `ksx play`'s real one — so "the same oracle,
+/// two sources" is a fact about this function rather than about two copies of
+/// it staying in step.
+///
+/// Returns the pure engine's `(slot, state)` sequence, which is what a caller
+/// wants for anything else it needs to say about the session.
+fn assert_pads_match_the_pure_engine(
+    session: &Session,
+    events: &[CorpusEvent],
+) -> Vec<(u8, PadState)> {
+    let handle_of: BTreeMap<u8, u32> = session
+        .outcome
+        .pads
+        .iter()
+        .map(|p| (p.slot, p.handle))
+        .collect();
+    let mut engine = Engine::new(cabinet_slots());
+    let by_slot: Vec<(u8, PadState)> = events
+        .iter()
+        .enumerate()
+        .flat_map(|(i, e)| {
+            engine
+                .handle(&KeyEvent {
+                    device: e.device.clone(),
+                    key: e.key,
+                    down: e.down,
+                    t: i as u64,
+                })
+                .into_iter()
+                .map(|d| (d.slot, d.state))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let expected: Vec<(u32, PadState)> = by_slot
+        .iter()
+        .map(|(slot, state)| (handle_of[slot], *state))
+        .collect();
+
+    let mut actual = session.pads.iter().filter_map(|e| match e {
+        PadEvent::Update(handle, state) => Some((*handle, *state)),
+        _ => None,
+    });
+    // The output thread also writes one neutral state per pad at teardown, so
+    // compare the session's transitions as a prefix.
+    let observed: Vec<(u32, PadState)> = actual.by_ref().take(expected.len()).collect();
+    if session.outcome.deltas_coalesced == 0 {
+        assert_eq!(
+            observed, expected,
+            "the live pipeline diverged from the pure engine"
+        );
+        return by_slot;
+    }
+    // Coalescing is level-triggered and therefore ALLOWED to drop intermediate
+    // states — that is the M4 fix that stops a stalled output thread from
+    // blocking the engine. Under parallel CI load it does fire here (observed
+    // 305 of 311 once, agreeing for the first 301 and then simply shorter), so
+    // demanding exact equality makes this test a load-sensitive flake rather
+    // than a correctness check.
+    //
+    // What must still hold is the property coalescing actually promises: every
+    // state that survived is one the pure engine produced, in order, and each
+    // pad ends where an un-squashed run would have left it. The stronger
+    // equality above still runs whenever nothing was coalesced, which is the
+    // ordinary case.
+    let mut it = expected.iter();
+    assert!(
+        observed.iter().all(|o| it.any(|e| e == o)),
+        "coalescing dropped intermediate states, but what survived is not an \
+         in-order subsequence of what the pure engine produced"
+    );
+    let final_of = |seq: &[(u32, PadState)]| -> BTreeMap<u32, PadState> {
+        let mut last = BTreeMap::new();
+        for (handle, state) in seq {
+            last.insert(*handle, *state);
+        }
+        last
+    };
+    assert_eq!(
+        final_of(&observed),
+        final_of(&expected),
+        "a coalesced burst left a pad in a different state than an un-squashed one"
+    );
+    by_slot
+}
+
 fn index_of(trace: &[Step], step: Step) -> usize {
     trace
         .iter()
@@ -519,81 +733,14 @@ fn recorded_cabinet_session_drives_all_four_pads_through_the_real_pipeline() {
     // The pipeline's pad updates must equal, transition for transition, what a
     // bare Engine produces from the same events — the replay oracle, but end to
     // end through three threads and two channels.
-    let handle_of: BTreeMap<u8, u32> = session
-        .outcome
-        .pads
-        .iter()
-        .map(|p| (p.slot, p.handle))
-        .collect();
-    let mut engine = Engine::new(cabinet_slots());
-    let expected: Vec<(u32, PadState)> = events
-        .iter()
-        .enumerate()
-        .flat_map(|(i, e)| {
-            engine
-                .handle(&KeyEvent {
-                    device: e.device.clone(),
-                    key: e.key,
-                    down: e.down,
-                    t: i as u64,
-                })
-                .into_iter()
-                .map(|d| (handle_of[&d.slot], d.state))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    let mut actual = session.pads.iter().filter_map(|e| match e {
-        PadEvent::Update(handle, state) => Some((*handle, *state)),
-        _ => None,
-    });
-    // The output thread also writes one neutral state per pad at teardown, so
-    // compare the session's transitions as a prefix.
-    let observed: Vec<(u32, PadState)> = actual.by_ref().take(expected.len()).collect();
-    if session.outcome.deltas_coalesced == 0 {
-        assert_eq!(
-            observed, expected,
-            "the live pipeline diverged from the pure engine"
-        );
-    } else {
-        // Coalescing is level-triggered and therefore ALLOWED to drop
-        // intermediate states — that is the M4 fix that stops a stalled output
-        // thread from blocking the engine. Under parallel CI load it does fire
-        // here (observed 305 of 311 once, agreeing for the first 301 and then
-        // simply shorter), so demanding exact equality makes this test a
-        // load-sensitive flake rather than a correctness check.
-        //
-        // What must still hold is the property coalescing actually promises:
-        // every state that survived is one the pure engine produced, in order,
-        // and each pad ends where an un-squashed run would have left it. The
-        // stronger equality above still runs whenever nothing was coalesced,
-        // which is the ordinary case.
-        let mut it = expected.iter();
-        assert!(
-            observed.iter().all(|o| it.any(|e| e == o)),
-            "coalescing dropped intermediate states, but what survived is not an \
-             in-order subsequence of what the pure engine produced"
-        );
-        let final_of = |seq: &[(u32, PadState)]| -> BTreeMap<u32, PadState> {
-            let mut last = BTreeMap::new();
-            for (handle, state) in seq {
-                last.insert(*handle, *state);
-            }
-            last
-        };
-        assert_eq!(
-            final_of(&observed),
-            final_of(&expected),
-            "a coalesced burst left a pad in a different state than an un-squashed one"
-        );
-    }
+    let expected = assert_pads_match_the_pure_engine(&session, &events);
     assert!(expected.len() > 100, "expected a busy session");
 
     // Every player panel drove its own pad: the one-keyboard→many-slots fan-out
     // this project exists for.
     for slot in 1..=4u8 {
         assert!(
-            expected.iter().any(|(h, _)| *h == handle_of[&slot]),
+            expected.iter().any(|(s, _)| *s == slot),
             "slot {slot} saw no pad updates; fan-out is broken"
         );
     }

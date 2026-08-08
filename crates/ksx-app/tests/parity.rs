@@ -531,6 +531,18 @@ const ANCHORS: &[Anchors] = &[
         studio: &["/pads/spawn", "/pads/prune"],
     },
     Anchors {
+        capability: "Record / replay a session",
+        // One capability, both halves: `ksx monitor --record` writes the
+        // timeline and `ksx play` drives the pipeline from it. `monitor` is
+        // named by the button-check row as well, which is correct — a verb can
+        // be part of two capabilities, and this one genuinely is.
+        cli: &["monitor", "play"],
+        // The names an attract-mode button would take (§3b). Neither exists,
+        // which is what makes the egui cell's "planned" honest.
+        egui: &["Screen::Replay", "Ask::Play"],
+        studio: &["/play", "/recordings"],
+    },
+    Anchors {
         capability: "Start / stop / switch profile",
         cli: &["run", "session start", "session stop", "session reload"],
         egui: &["Screen::Session", "Ask::Start", "Ask::Stop"],

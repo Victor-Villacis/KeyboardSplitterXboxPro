@@ -170,6 +170,7 @@ surface does a human perform this task on*, and that is answered by the matrix.
 | Is it working: pads, drivers | owns | **primary** | view |
 | Spawn test pads / prune the bus | owns | — | **primary** (§3a) |
 | Start / stop / switch profile | owns | **primary** | convenience |
+| Record / replay a session | owns | planned (§3b) | planned (§3b) |
 
 "owns" = the verb lives here. "primary" = where a human does it. "view" =
 renders backend state, takes no decisions. **"planned" = nothing is there** —
@@ -273,6 +274,26 @@ What is unchanged: the dry-run-first consent shape is the backend's, not the
 surface's. `pads_prune(confirm)` is `--yes`, spelled the same way and refusing
 the same things, and a POST that did not come from the confirm screen gets the
 dry run.
+
+### §3b Record / replay, and why both other cells say `planned`
+
+`ksx monitor --record` writes a session; `ksx play` plays one back into the
+real pipeline. Together they are one capability, and today the CLI owns all of
+it.
+
+Both other cells are `planned` rather than `never`, and the distinction is the
+one §3 draws: nothing is there *yet*, and there is no reason in principle for
+that. An attract-mode loop is a **cabinet** feature — it belongs on the egui,
+started from the panel with no keyboard in reach, which is precisely what §4
+says that surface is for. Recording a session and picking one to replay is a
+list and a button, which is what §5 says Studio is good at. Neither is written,
+so neither is claimed.
+
+What is genuinely CLI-shaped, and would stay here even after both faces exist,
+is the *argument surface*: `--as`, `--speed`, `--game`. Those are the flags of
+someone debugging a mapping against a recording, which is a keyboard-and-shell
+activity by nature. A cabinet needs one button that says "play the demo" and a
+browser needs a list of recordings — neither needs the flags.
 
 ## §4 The egui is an appliance panel, not a worse browser
 

@@ -40,6 +40,7 @@ mod monitor;
 #[cfg(any(feature = "studio", feature = "cabinet"))]
 mod onboard;
 mod pads;
+mod play;
 mod preset_cli;
 mod preset_edit;
 // Gated exactly like `sources` below, and for the same `-D warnings` reason:
@@ -328,6 +329,74 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         record: Option<std::path::PathBuf>,
         /// JSONL on stdout: warning lines, event lines, one final {"summary":...}
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replay a recorded session: the file drives the pads, live and for real
+    ///
+    /// Plays back what `ksx monitor --record` wrote. The recording becomes the
+    /// session's input device — same plan, same presets, same personas, same
+    /// pads, same teardown — so what you watch is what the player at the panel
+    /// produced, down to the timing. Beyond the fun it is a full-stack
+    /// regression test that needs no hardware, and an attract-mode loop for a
+    /// cabinet.
+    ///
+    /// LIVE INPUT IS SUPPRESSED WHILE IT PLAYS. The boards the recording drives
+    /// are captured exactly as `ksx run` captures them, so their keystrokes do
+    /// not reach Windows, and their events are discarded rather than mixed into
+    /// the recorded timeline — otherwise you fight the recording inside the
+    /// game, which sees both. The emergency escapes still work, because the
+    /// real board is still being watched: LeftCtrl x5 frees the keyboards,
+    /// Ctrl+Alt+Del stops the session.
+    ///
+    /// DEVICE IDS. A recording names devices by the id they had WHEN IT WAS
+    /// RECORDED, which after a replug — or on another machine — can name
+    /// nothing at all. --as points a recorded device at a configured one, by
+    /// alias or by selector: `--as ipac`, or `--as "<recorded id>=ipac"` when
+    /// the recording names more than one device. A recording where NOTHING
+    /// drives a slot is refused before a pad is plugged, naming what it holds,
+    /// what this session drives, and the flag to type. A recorded device that
+    /// drives no slot is played and ignored — exactly what an unassigned
+    /// keyboard does in a live session.
+    ///
+    /// --loop restarts at the end (releasing anything the recording left held
+    /// first), --speed multiplies the recorded pace, and --game applies a
+    /// games.toml profile's slot layout and starts its program the way
+    /// `ksx run --game` does.
+    ///
+    /// Exit codes: 0 = the recording finished, the game exited, or a clean
+    /// stop; 1 = error; 2 = refused to start (unreadable or invalid recording,
+    /// a --as target that resolves to nothing, a recording that drives no slot,
+    /// an invalid config, a missing driver) — nothing was plugged and no
+    /// keyboard filter was set; 3 = started, then torn down by a runtime
+    /// failure.
+    Play {
+        /// The recording to play, as `ksx monitor --record` wrote it
+        #[arg(value_name = "FILE")]
+        file: std::path::PathBuf,
+        /// Point a recorded device at a configured one: TARGET, or
+        /// "RECORDED_ID=TARGET". Repeatable.
+        #[arg(long = "as", value_name = "[FROM=]TARGET")]
+        remap: Vec<String>,
+        /// Multiply the recorded pace (1.0 = exactly as recorded)
+        #[arg(long, default_value_t = 1.0, value_name = "N")]
+        speed: f64,
+        /// Restart at the end — the cabinet's attract mode
+        #[arg(long = "loop")]
+        looping: bool,
+        /// Take the slot layout and block flags from this games.toml profile
+        #[arg(long, value_name = "TITLE")]
+        game: Option<String>,
+        /// Apply the --game profile's slots and flags without starting the game
+        #[arg(long, requires = "game")]
+        no_launch: bool,
+        /// Resolve the recording against the plan and print it; touch no driver
+        #[arg(long)]
+        dry_run: bool,
+        /// Print a rolling capture-to-submit latency summary every 5 s
+        #[arg(long)]
+        latency: bool,
+        /// JSON on stdout: the resolution with --dry-run, else the final summary
         #[arg(long)]
         json: bool,
     },
@@ -1555,6 +1624,27 @@ fn main() -> anyhow::Result<()> {
             record,
             json,
         } => monitor::run(for_secs, record, json),
+        Command::Play {
+            file,
+            remap,
+            speed,
+            looping,
+            game,
+            no_launch,
+            dry_run,
+            latency,
+            json,
+        } => play::run(play::Options {
+            file,
+            remap,
+            speed,
+            looping,
+            game,
+            no_launch,
+            dry_run,
+            latency,
+            json,
+        }),
         Command::Pads {
             count,
             persona,
@@ -2251,6 +2341,105 @@ mod tests {
         assert!(help.contains("passthrough-only"), "{help}");
         assert!(help.contains("re-sent to the OS"), "{help}");
         assert!(help.contains("2 = Interception driver"), "{help}");
+    }
+
+    #[test]
+    fn play_takes_a_file_and_defaults_to_one_pass_at_real_time() {
+        let cli = Cli::try_parse_from(["ksx", "play", "session.jsonl"]).unwrap();
+        match cli.command {
+            Command::Play {
+                file,
+                remap,
+                speed,
+                looping,
+                game,
+                dry_run,
+                ..
+            } => {
+                assert_eq!(file, std::path::PathBuf::from("session.jsonl"));
+                assert!(remap.is_empty());
+                assert_eq!(speed, 1.0, "playback is real time unless asked otherwise");
+                assert!(!looping, "an attract loop is opt-in: a cabinet must not");
+                assert_eq!(game, None);
+                assert!(!dry_run);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+    }
+
+    /// `--as` is repeatable, and a spec that carries a `port=` qualifier — which
+    /// contains an `=` of its own — must arrive whole.
+    #[test]
+    fn play_remaps_are_repeatable_and_arrive_verbatim() {
+        let cli = Cli::try_parse_from([
+            "ksx",
+            "play",
+            "session.jsonl",
+            "--as",
+            "ipac",
+            "--as",
+            r"HID\VID_D209&PID_0430&REV_0056&MI_00=usb:d209:0430:00:port=7&25EEA38C&0&0000",
+            "--speed",
+            "2.5",
+            "--loop",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Play {
+                remap,
+                speed,
+                looping,
+                ..
+            } => {
+                assert_eq!(remap.len(), 2);
+                assert_eq!(remap[0], "ipac");
+                assert!(
+                    remap[1].ends_with("port=7&25EEA38C&0&0000"),
+                    "{:?}",
+                    remap[1]
+                );
+                assert_eq!(speed, 2.5);
+                assert!(looping);
+            }
+            _ => panic!("parsed to the wrong subcommand"),
+        }
+    }
+
+    /// **The `--help` has to say that playback suppresses live input**, because
+    /// the alternative — finding out by mashing the panel and watching the game
+    /// receive both — is the whole reason the behaviour exists.
+    #[test]
+    fn play_help_says_live_input_is_suppressed_and_how_to_remap() {
+        let mut cmd = Cli::command();
+        let play = cmd.find_subcommand_mut("play").unwrap();
+        let help = play.render_long_help().to_string();
+        assert!(help.contains("LIVE INPUT IS SUPPRESSED"), "{help}");
+        assert!(
+            help.contains("do not reach Windows"),
+            "say what suppressed MEANS: {help}"
+        );
+        assert!(
+            help.contains("discarded rather than mixed"),
+            "and that live events do not join the timeline: {help}"
+        );
+        assert!(
+            help.contains("LeftCtrl x5"),
+            "the escape hatch still works and must be named: {help}"
+        );
+        assert!(
+            help.contains("WHEN IT WAS RECORDED") && help.contains("--as"),
+            "the device-id problem and its flag: {help}"
+        );
+        assert!(help.contains("2 = refused to start"), "{help}");
+    }
+
+    #[test]
+    fn play_no_launch_needs_a_game() {
+        assert!(Cli::try_parse_from(["ksx", "play", "s.jsonl", "--no-launch"]).is_err());
+        assert!(
+            Cli::try_parse_from(["ksx", "play", "s.jsonl", "--game", "MAME", "--no-launch"])
+                .is_ok()
+        );
     }
 
     #[test]

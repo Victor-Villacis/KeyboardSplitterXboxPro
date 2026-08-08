@@ -543,6 +543,17 @@ impl ReplayBackend {
         self
     }
 
+    /// Publish progress into an existing handle.
+    ///
+    /// For the caller that has to hold the handle *before* it can build the
+    /// backend — `ksx play` wires its session hook from this, and the backend
+    /// itself is only constructed later, inside the closure that runs once the
+    /// pads are up (`crate::run::live_session`).
+    pub fn with_progress(mut self, progress: ReplayProgress) -> Self {
+        self.progress = progress;
+        self
+    }
+
     /// Live progress. Grab it before `run`.
     pub fn progress(&self) -> ReplayProgress {
         self.progress.clone()
