@@ -104,6 +104,7 @@ fn scalar_slots(payload: &StartPayload, flash: Option<&str>) -> serde_json::Valu
         "xinputLine": lines.xinput_line,
         "blockingLine": lines.blocking_line,
         "presetLine": lines.preset_line,
+        "mapperLine": lines.mapper_line,
         "readyLine": lines.ready_line,
         "playLine": lines.play_line,
         "guideLine": lines.guide_line,
@@ -964,6 +965,21 @@ mod tests {
         assert!(
             !out.html.contains("Save first: that writes one preset"),
             "the page must no longer send a first-run user to the mapper to map: {}",
+            out.html
+        );
+        // The SEAM is stated where the link is. Mapping a button in the mapper
+        // does not change what Play does here, and a person cannot guess that
+        // — they would find it out by playing a pad that ignores the button
+        // they just mapped.
+        assert!(
+            out.html
+                .contains("Play on this page always starts exactly what is shown above"),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains("Open the mapper (edits saved files)"),
+            "the link must say what it opens: {}",
             out.html
         );
     }

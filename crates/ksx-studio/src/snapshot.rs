@@ -1161,6 +1161,10 @@ pub struct StartLines {
     /// What the mapper edits and where the staged preset stands relative to
     /// the presets on disk.
     pub preset_line: String,
+    /// **What the mapper is, beside the link to it.** The one sentence that
+    /// keeps "I mapped it in the mapper" from meaning "Play here will use
+    /// that" — see [`MAPPER_LINE`].
+    pub mapper_line: String,
     /// Ready to save or play, or ksx-core's own reason it is not.
     pub ready_line: String,
     /// What pressing Play actually does — moment 7's first sentence.
@@ -1236,6 +1240,7 @@ impl StartLines {
                     .to_owned(),
             },
             preset_line: preset_line(p),
+            mapper_line: MAPPER_LINE.to_owned(),
             ready_line: match (&staged.not_ready, staged.reachable) {
                 (_, false) => "Nothing can be saved or played until a daemon answers.".to_owned(),
                 (Some(why), true) => why.clone(),
@@ -1251,6 +1256,26 @@ impl StartLines {
         }
     }
 }
+
+/// **What the mapper is, said beside the link to it.**
+///
+/// The mapper is a preset-FILE editor, and this page's setup is not files.
+/// Those two facts have one consequence a person cannot guess and would find
+/// out the worst possible way: mapping a button over there does not change what
+/// Play does over here. The page used to imply the opposite — "Save first: that
+/// writes one preset per controller and puts the slot in the list the mapper
+/// reads" — which reads as an instruction to go and map, and then Play started
+/// the staged bindings anyway.
+///
+/// Stated rather than engineered away because the honest engineering answer is
+/// the mapper editing the staged slot directly, and that is not built yet. A
+/// sentence that names the seam is the difference between a limitation and a
+/// trap.
+const MAPPER_LINE: &str =
+    "The mapper edits preset FILES, and this setup is not files yet. Give a controller a layout \
+     above to map it here; use the mapper to change individual buttons AFTER you save — an edit \
+     there changes what a saved session plays, while Play on this page always starts exactly what \
+     is shown above.";
 
 /// **What Play does**, stated before the button rather than after it.
 ///

@@ -40,6 +40,7 @@ export interface StartLines {
   xinput_line: string;
   blocking_line: string;
   preset_line: string;
+  mapper_line: string;
   ready_line: string;
   play_line: string;
   guide_line: string;
@@ -190,6 +191,7 @@ const [controllerLine, setControllerLine] = createSignal("not collected");
 const [xinputLine, setXinputLine] = createSignal("not collected");
 const [blockingLine, setBlockingLine] = createSignal("not collected");
 const [presetLine, setPresetLine] = createSignal("not collected");
+const [mapperLine, setMapperLine] = createSignal("not collected");
 const [readyLine, setReadyLine] = createSignal("not collected");
 const [playLine, setPlayLine] = createSignal("not collected");
 const [guideLine, setGuideLine] = createSignal("not collected");
@@ -254,6 +256,7 @@ export function applyStart(p: StartPayload): void {
   setXinputLine(l.xinput_line);
   setBlockingLine(l.blocking_line);
   setPresetLine(l.preset_line);
+  setMapperLine(l.mapper_line);
   setReadyLine(l.ready_line);
   setPlayLine(l.play_line);
   setGuideLine(l.guide_line);
@@ -801,10 +804,11 @@ export function StartIsland() {
             ),
           ),
         ),
+        h("p", { class: "dv-note" }, () => mapperLine()),
         h(
           "p",
           { class: "pactrow" },
-          h("a", { class: "btn btn-ghost", href: "/map" }, "Open the mapper"),
+          h("a", { class: "btn btn-ghost", href: "/map" }, "Open the mapper (edits saved files)"),
         ),
       ),
       h(
