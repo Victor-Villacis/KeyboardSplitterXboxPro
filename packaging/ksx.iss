@@ -64,6 +64,10 @@
 #define AppURL         "https://github.com/Victor-Villacis/KeyboardSplitterXboxPro"
 #define AppExe         "ksx.exe"
 #define RepoRoot       ".."
+; The Start-menu subfolder every surface that is NOT the product lives in.
+; Spelled once because it appears on five entries and a typo makes a sixth
+; folder rather than an error. See the [Icons] section for why it exists.
+#define AdvancedGroup  "ksx (advanced)"
 
 [Setup]
 ; Never change AppId: it is what makes an install an UPGRADE rather than a
@@ -104,8 +108,24 @@ UninstallDisplayName={#AppName} {#AppVersion}
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "addtopath";   Description: "Add ksx to PATH (so `ksx` works from any terminal)"; GroupDescription: "Integration"
+; CHECKED, deliberately — docs/FIRST-RUN.md §4 bullet 1. It used to carry
+; `Flags: unchecked`, and the audit's finding was concrete: this installer's
+; only other hand-off is the "run it now" checkbox at the end, so a user who
+; declined that one was left with nothing on screen and a Start menu to hunt
+; through. An icon on the desktop is what "installed" looks like to the person
+; FIRST-RUN.md is written about.
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+; UNCHECKED, equally deliberately — §4 bullet 4. PATH buys exactly one thing:
+; typing `ksx` in a terminal. FIRST-RUN.md's premise is that the customer never
+; opens one (and docs/SURFACES.md §3 keeps the CLI a development surface), so
+; the default must not be "edit a machine-wide environment variable to buy the
+; installing user nothing".
+;
+; ASCII ONLY in this Description, and in every Comment below. This file has no
+; UTF-8 BOM, so ISCC reads it in the system code page: a byte above 127 in a
+; string the USER sees becomes mojibake in a shortcut tooltip or a wizard
+; checkbox. Comments are discarded by the compiler and may keep their dashes.
+Name: "addtopath";   Description: "Add ksx to PATH (for the `ksx` command in a terminal; not needed to use ksx)"; GroupDescription: "Integration"; Flags: unchecked
 
 [Files]
 Source: "{#RepoRoot}\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
@@ -119,29 +139,71 @@ Source: "{#RepoRoot}\LICENSE-APACHE";   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\docs\*.md";        DestDir: "{app}\docs"; Flags: ignoreversion
 
 [Icons]
-; No IconFilename= on any of these: the target IS ksx.exe, and ksx.exe carries
-; the icon group as resource 1 (crates\ksx-app\build.rs). A separate
-; IconFilename pointing at a copied .ico would be a second thing to keep in
-; step, and the first one to go stale.
+; ---------------------------------------------------------------------------
+; ONE entry at the top level, and it is the product (docs/FIRST-RUN.md §4
+; bullet 3).
+; ---------------------------------------------------------------------------
+;
+; This section used to put FIVE names in front of a new user: "ksx", "ksx
+; daemon (tray only)", "ksx Studio (serve only)", "ksx cabinet" and "ksx setup
+; wizard". Four of those are surfaces and development verbs. Nothing on screen
+; told a first-time user which one was the application, and three of them —
+; a tray icon with no window, a server with no client, a 10-foot panel meant to
+; be driven by an arcade stick — LOOK BROKEN when opened with a mouse on a
+; desktop. A menu that cannot be ranked teaches nothing and mis-teaches
+; plenty.
+;
+; The four are NOT deleted; deleting them would take the tray-only daemon (the
+; right thing on a cabinet or over RDP) and the serve-only Studio (the
+; documented recovery path, docs/M9-DECISION.md §4 item 7) away from the only
+; people who need them. They move one level down, into a folder named
+; "ksx (advanced)". A folder is a question a user answers before reading its
+; contents: someone who opens it has already decided they want something other
+; than "ksx", which is precisely the population those entries serve. And since
+; FIRST-RUN.md's premise is that the customer never types `ksx <verb>`, a
+; Start-menu folder is also the only place these stay reachable at all without
+; a shell.
+;
+; No IconFilename= on any entry whose target IS ksx.exe: the exe carries the
+; icon group as resource 1 (crates\ksx-app\build.rs), so the shortcut inherits
+; it. A separate IconFilename pointing at a copied .ico would be a second thing
+; to keep in step, and the first one to go stale. The one exception is the
+; doctor entry, whose target is the command processor — see it below.
 ;
 ; THE PLAIN "ksx" ENTRY RUNS `open`, NOT `daemon` (docs/M9-DECISION.md §4
 ; item 1). It used to run the daemon, which put a tray icon on screen and
 ; nothing else: the entry a person double-clicks appeared to do nothing, and
 ; the way to actually see ksx was to type a URL. `open` starts the daemon if
 ; one is not running, waits for it and for Studio, and then shows a window.
+Name: "{group}\{#AppName}";       Filename: "{app}\{#AppExe}"; Parameters: "open"; Comment: "Open ksx"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "open"; Comment: "Open ksx"; Tasks: desktopicon
+
+; --- ksx (advanced) --------------------------------------------------------
+; Everything below is a surface or a dev verb, and every one of them is the
+; right answer to SOME question — just never to "I just installed this, what
+; do I click?".
 ;
-; The old behaviour keeps an entry of its own rather than being deleted:
-; starting the tray daemon WITHOUT opening a window is what you want on a
-; cabinet, over RDP, or when Studio is not the point.
-Name: "{group}\{#AppName}";                    Filename: "{app}\{#AppExe}"; Parameters: "open"; Comment: "Open ksx"
-Name: "{group}\{#AppName} daemon (tray only)"; Filename: "{app}\{#AppExe}"; Parameters: "daemon"; Comment: "Start the ksx tray daemon without opening a window"
 ; `open`, `studio` and `cabinet` exist only in a build carrying those features
-; — see the build line in the header. This entry SERVES Studio and opens
-; nothing; the window is what "ksx" above is for.
-Name: "{group}\{#AppName} Studio (serve only)"; Filename: "{app}\{#AppExe}"; Parameters: "studio"; Comment: "Serve ksx Studio on 127.0.0.1:4460 for another device to open"
-Name: "{group}\{#AppName} cabinet";      Filename: "{app}\{#AppExe}"; Parameters: "cabinet"; Comment: "The 10-foot cabinet panel"
-Name: "{group}\{#AppName} setup wizard"; Filename: "{app}\{#AppExe}"; Parameters: "setup"; Comment: "First-run setup"
-Name: "{autodesktop}\{#AppName}";        Filename: "{app}\{#AppExe}"; Parameters: "open"; Tasks: desktopicon
+; — see the build line in the header.
+;
+; The tray-only daemon is the plain entry's OLD behaviour, kept because
+; starting the tray without opening a window is what you want on a cabinet,
+; over RDP, or when Studio is not the point.
+Name: "{group}\{#AdvancedGroup}\daemon (tray only)"; Filename: "{app}\{#AppExe}"; Parameters: "daemon"; Comment: "Start the ksx tray daemon without opening a window"
+; This entry SERVES Studio and opens nothing; the window is what "ksx" is for.
+Name: "{group}\{#AdvancedGroup}\Studio (serve only)"; Filename: "{app}\{#AppExe}"; Parameters: "studio"; Comment: "Serve ksx Studio on 127.0.0.1:4460 for another device to open"
+Name: "{group}\{#AdvancedGroup}\cabinet panel"; Filename: "{app}\{#AppExe}"; Parameters: "cabinet"; Comment: "The 10-foot cabinet panel, driven by the arcade panel rather than a mouse"
+Name: "{group}\{#AdvancedGroup}\setup wizard"; Filename: "{app}\{#AppExe}"; Parameters: "setup"; Comment: "The console setup wizard"
+; `ksx doctor` stays one click away — it is just not the hand-off any more
+; (§4 bullet 2, and the [Run] section below).
+;
+; Through the command processor and not straight at ksx.exe, because ksx.exe is
+; a CONSOLE subsystem binary (crates\ksx-app\src\console.rs, deliberately): a
+; shortcut that ran `doctor` directly would print its driver tables into a
+; console that closes the instant the process exits, which shows the one user
+; who came here for those tables nothing at all. `/k` keeps the window. That
+; target is cmd.exe, so this is the one entry that must name an icon.
+Name: "{group}\{#AdvancedGroup}\driver check (ksx doctor)"; Filename: "{cmd}"; Parameters: "/k ""{app}\{#AppExe}"" doctor"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExe}"; IconIndex: 0; Comment: "Check drivers and hardware, in a window that stays open"
 
 [Registry]
 ; PATH, machine-wide, appended — `uninsdeletevalue` on a shared key would be
@@ -151,7 +213,31 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
     Tasks: addtopath; Check: NeedsAddPath(ExpandConstant('{app}'))
 
 [Run]
-Filename: "{app}\{#AppExe}"; Parameters: "doctor"; Description: "Check drivers and hardware now (ksx doctor)"; Flags: postinstall nowait skipifsilent
+; The hand-off is THE PRODUCT (docs/FIRST-RUN.md §4 bullet 2). This line used
+; to run `ksx doctor`: a person who ticked "run this now" — the one moment the
+; installer has their consent to show them what they just bought — got a
+; console full of driver tables. That is a developer's answer to a question
+; they did not ask, and it is the last screen of the install, so it is also
+; their first impression of ksx.
+;
+; `open` is the same verb both icons run. It starts the daemon if one is not
+; running, waits for it and for Studio, then puts a window on screen
+; (crates\ksx-app\src\studio_launch.rs) — moment 3 of FIRST-RUN.md §1.
+; `nowait` because that wait is seconds long and the wizard must not hold its
+; Finish button hostage for it; `open` exits by design once the window is up.
+;
+; `runasoriginaluser` matters more than it looks. Setup is elevated
+; (PrivilegesRequired=admin, for Program Files and the driver bundle), and
+; without this flag the whole chain — `ksx open`, the daemon it starts, and the
+; browser window that daemon's Studio ends up in — inherits that token. ksx is
+; built to run WITHOUT one: `ksx autostart` registers its logon task as
+; InteractiveToken/LeastPrivilege, "never elevated"
+; (crates\ksx-app\src\autostart.rs), so an elevated first daemon would make
+; moment 3 behave differently from every boot after it. It would also put the
+; Chromium profile ksx owns under the ELEVATING account's %LOCALAPPDATA%, which
+; on a machine where a standard user typed an admin's credentials is not the
+; profile the user gets tomorrow.
+Filename: "{app}\{#AppExe}"; Parameters: "open"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: postinstall nowait skipifsilent runasoriginaluser
 
 [UninstallRun]
 ; Leave nothing behind that keeps starting: the scheduled task outlives an

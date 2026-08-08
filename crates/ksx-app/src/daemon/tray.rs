@@ -28,9 +28,10 @@
 //! # Testing
 //!
 //! There is nothing here to unit-test — it is a message pump around six Win32
-//! calls. Everything with a decision in it (which menu items are enabled, what
-//! the tooltip says, what each command does) lives in the parent module and is
-//! tested there. This file's correctness is established by running it.
+//! calls. Everything with a decision in it (which item leads and is therefore
+//! drawn in bold, which items are enabled, what the tooltip says, what each
+//! command does) lives in the parent module and is tested there. This file's
+//! correctness is established by running it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -45,11 +46,11 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, KillTimer, LoadIconW,
-    LoadImageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, TrackPopupMenu,
-    TranslateMessage, HICON, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MFS_DISABLED,
-    MFS_ENABLED, MF_BYPOSITION, MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN,
-    TPM_RIGHTALIGN, WM_APP, WM_COMMAND, WM_DESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
-    WS_OVERLAPPED,
+    LoadImageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetMenuDefaultItem, SetTimer,
+    TrackPopupMenu, TranslateMessage, HICON, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR,
+    LR_SHARED, MFS_DISABLED, MFS_ENABLED, MF_BYPOSITION, MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON,
+    TPM_BOTTOMALIGN, TPM_RIGHTALIGN, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP,
+    WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use super::{DaemonCommand, DaemonState, SharedState};
@@ -321,7 +322,19 @@ unsafe extern "system" fn wnd_proc(
     match msg {
         WM_KSX_TRAY => {
             // The low word of lParam is the mouse message.
-            if (lparam as u32) & 0xFFFF == WM_RBUTTONUP {
+            //
+            // BOTH buttons open the menu, and the left one is the reason this
+            // is not just `WM_RBUTTONUP`. A right-click-only tray icon is
+            // correct Win32 and wrong for the person in docs/FIRST-RUN.md §1
+            // moment 3, who has never used this program: they left-click the
+            // new icon, nothing happens, and the app the installer just
+            // handed them looks dead. Opening the menu — rather than firing
+            // the first item outright, which is the other convention — keeps
+            // one property that matters more than the convention does: a
+            // click on this icon can still only ever SHOW something. Nothing
+            // is claimed, plugged or written by looking (FIRST-RUN.md §6).
+            let button = (lparam as u32) & 0xFFFF;
+            if button == WM_RBUTTONUP || button == WM_LBUTTONUP {
                 show_menu(hwnd);
             }
             0
@@ -386,6 +399,20 @@ fn show_menu(hwnd: HWND) {
         // (AppendMenuW copies the string).
         unsafe { AppendMenuW(menu, flags, MENU_BASE + index, text.as_ptr()) };
     }
+
+    // The first item is the menu's DEFAULT item, which Windows draws in bold.
+    //
+    // Index 0 and not a search for a particular command: WHICH action leads is
+    // `DaemonState::menu`'s decision, made in the parent module where it is
+    // tested (`the_trays_first_item_is_the_one_that_opens_ksx` pins it to
+    // "Open ksx"). This file only renders that decision, which is the same
+    // division of labour as the enabled flag above.
+    //
+    // `1` is by-position — the by-command form would need the id arithmetic
+    // above repeated here, for no gain.
+    // SAFETY: `menu` is live and has just been populated; a menu with no items
+    // makes this a documented no-op rather than a fault.
+    unsafe { SetMenuDefaultItem(menu, 0, 1) };
 
     // SAFETY: `point` is written by GetCursorPos before it is read.
     let mut point = POINT { x: 0, y: 0 };
