@@ -1528,6 +1528,7 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
                 slot: 1,
                 preset: "IPAC P1".into(),
                 profile: None,
+                persona: None,
                 reload: false,
             }),
             Request::LearnKey,

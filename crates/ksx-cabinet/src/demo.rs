@@ -267,6 +267,7 @@ mod tests {
             slot: 1,
             preset: "IPAC P2".into(),
             profile: None,
+            persona: None,
             reload: true,
         });
         assert!(!assigned.ok);

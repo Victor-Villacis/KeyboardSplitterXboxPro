@@ -403,12 +403,41 @@ crossing is a design smell worth a second look.
 
 ## §10 What this settles for open work
 
-- **Slot persona menu** — authoring, so Studio primary, egui view. Backend verb
-  first: `SlotAssignRequest` carries slot, preset, profile and reload — **no
-  persona** — so no surface can re-persona a slot until the wire type changes.
-  A serde test pins that field set, so the day persona arrives on the wire the
-  surface decision gets re-taken deliberately instead of by whoever adds the
-  field.
+- **Slot persona menu** — **settled and built, 2026-08-08 (task #8).** The
+  decision stands as it was written: authoring, so Studio primary, egui view.
+
+  The wire type changed, which is what this entry was waiting for.
+  `SlotAssignRequest` now carries `persona` as an **optional string**, and both
+  halves of that are load-bearing. *Optional*, because `Persona::default()` is
+  `xbox360`: a defaulted field would have read every pre-2026-08-08 request as
+  "make this slot an Xbox 360 pad" and silently un-PlayStation-ed slots 5–8 the
+  first time somebody re-pointed a preset. *A string*, because ksx-core carries
+  no serde and the alias table lives in one `FromStr` — a surface must never
+  hold a copy of it to fill this field. The serde test that pinned the old
+  field set still pins the new one; it was renamed and re-argued, not deleted.
+
+  What each surface got, and why:
+
+  - **Backend** (`ksx-app/src/slots.rs`) applies it, and refuses two things in
+    words: a persona this build cannot plug (`Persona::can_plug`, which reads
+    the backend's `is_implemented` and never a driver probe) and a fifth XInput
+    slot — counted **after** the write would land, over the whole destination
+    file, so the refusal is about the config that would exist rather than about
+    the one field being touched.
+  - **CLI** — `ksx slot assign --slot N --persona P`, lenient parsing through
+    the same `FromStr`. Preset and persona are independently optional: either,
+    both, or the preset alone.
+  - **Studio** — the picker sits on `/setup`'s "Wire a slot" form, beside the
+    slot and preset selects that already POST `slot-assign`. **Not `/profiles`,
+    which has no slot rows**: a second slot editor on a second page would be
+    two front doors onto one verb, which is the drift §1 forbids. The option
+    list is `SetupView::personas`, served by the backend with a `can_plug` flag
+    and a `why_not` sentence per entry; nothing about personas is spelled in
+    TypeScript.
+  - **egui** — renders the persona in the Presets screen's slot rows. No
+    picker: §4's rule is that anything needing text entry or a menu of five
+    belongs elsewhere, and re-personaing is a between-sessions authoring act,
+    not something done standing at the cabinet mid-evening.
 - **Device pick UI** — Studio, following the existing CLI verb (§3). Also the
   egui: §3 row 3 no longer claims a view exists there. `/setup`'s first step
   links to `/devices` rather than growing a second picker.

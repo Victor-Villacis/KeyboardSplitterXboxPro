@@ -188,6 +188,15 @@ pub struct SlotOutcome {
     pub preset: Option<String>,
     /// What the slot pointed at before; `None` when the slot was created.
     pub previous_preset: Option<String>,
+    /// The persona the slot presents itself as NOW — canonical spelling,
+    /// whether or not this request asked for a change.
+    #[serde(default)]
+    pub persona: Option<String>,
+    /// What it was before, and `None` when this request left the persona
+    /// alone. The pair, not just the new half — same rule as
+    /// [`Self::previous_preset`].
+    #[serde(default)]
+    pub previous_persona: Option<String>,
     /// The games.toml profile this landed in, or `None` for `config.toml`.
     pub profile: Option<String>,
     /// The slot was ADDED to that file rather than repointed.
@@ -305,6 +314,8 @@ impl From<crate::wire::SlotAssignResponse> for SlotOutcome {
             slot: response.slot,
             preset: response.preset,
             previous_preset: response.previous_preset,
+            persona: response.persona,
+            previous_persona: response.previous_persona,
             profile: response.profile,
             created: response.created,
             unchanged: response.unchanged,

@@ -218,6 +218,15 @@ fn perform(
                 slot: *slot,
                 preset: preset.clone(),
                 profile: profile.clone(),
+                // **Absent, and it stays absent.** docs/SURFACES.md §10 puts
+                // the persona MENU on Studio and leaves the egui a view: this
+                // screen picks a preset, and a `None` here is the wire's way
+                // of saying "I was not asked about the persona", which leaves
+                // whatever the slot already presents itself as untouched. An
+                // egui that filled this in would re-persona a slot from the
+                // one surface that cannot show the five options or their
+                // consequences.
+                persona: None,
                 // The bounce, asked for explicitly, because the modal that got
                 // us here said the pads would replug.
                 reload: true,
