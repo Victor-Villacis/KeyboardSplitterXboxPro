@@ -394,11 +394,13 @@ fn board_row(board: &Board<'_>) -> ksx_api::BoardRow {
         command: String::new(),
         caveat: String::new(),
         transport: String::new(),
+        transport_label: String::new(),
         interception_eligible: false,
         winusb_eligible: false,
         backends: String::new(),
         can_type: false,
         cannot_type_reason: String::new(),
+        cannot_type_line: String::new(),
     }
 }
 
