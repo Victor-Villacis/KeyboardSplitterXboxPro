@@ -155,6 +155,27 @@ pub trait MachineSource: Send + Sync {
         Err(Refusal::not_here("the driver report", "run `ksx doctor`"))
     }
 
+    /// **Can a virtual controller be created right now?** — the one slice of
+    /// [`Self::doctor`] a first run has to know before it offers to Play.
+    ///
+    /// Its own method, and not a field on [`DoctorView`], for two reasons that
+    /// both matter at the poll rate `/start` runs at: the full report walks the
+    /// Interception class filters, probes HIDMaestro, reads the CI policy and
+    /// takes a process snapshot, none of which this question needs; and
+    /// [`DoctorView`] is prose plus advice rows, while a page deciding what to
+    /// say before a button needs something it can branch on.
+    ///
+    /// Read-only, exactly like the rest of this trait's reads: it queries the
+    /// registry and the service manager and installs nothing. `SURFACES.md` §3
+    /// keeps installing off the browser surface entirely, and this method is
+    /// what lets a page obey that rule while still telling the truth.
+    fn pad_bus(&self) -> Result<PadBusView, Refusal> {
+        Err(Refusal::not_here(
+            "the controller-driver state",
+            "run `ksx doctor`",
+        ))
+    }
+
     /// `ksx winusb status` — read-only; nothing is opened or claimed.
     fn winusb(&self) -> Result<WinusbView, Refusal> {
         Err(Refusal::not_here(
@@ -1584,6 +1605,208 @@ pub struct AdviceRow {
 }
 
 // ---------------------------------------------------------------------------
+// The pad bus, as the one question a first run has to ask about it
+// ---------------------------------------------------------------------------
+
+/// Stable [`PadBusView::code`] values — `ksx doctor`'s own ViGEmBus advice
+/// codes, spelled once so a match arm cannot drift from the producer.
+///
+/// They are `ksx_platform::advice`'s, not a second vocabulary: the whole point
+/// of this view is that `/start` and `ksx doctor` reach the same verdict from
+/// the same function. `HEALTHY` is the one addition, because "doctor said
+/// nothing" needs a name on the wire.
+pub mod pad_bus_codes {
+    /// Doctor has nothing to say: registered, file present, service running.
+    pub const HEALTHY: &str = "";
+    /// No `ViGEmBus` service key at all.
+    pub const MISSING: &str = "vigembus-missing";
+    /// Service key registered, `ViGEmBus.sys` gone — a broken install.
+    pub const FILE_MISSING: &str = "vigembus-file-missing";
+    /// Installed, service not running. Usually a machine that has not rebooted.
+    pub const NOT_RUNNING: &str = "vigembus-not-running";
+    /// Installed, and Windows would not say what the service is doing.
+    pub const STATE_UNKNOWN: &str = "vigembus-state-unknown";
+    /// The read itself failed. **Not** a state of the driver (`SURFACES.md`
+    /// §1b) — a state of our knowledge.
+    pub const UNREADABLE: &str = "vigembus-unreadable";
+}
+
+/// **Can ksx create a virtual controller on this machine right now?**
+///
+/// One fact, because it is the one fact a first run cannot discover for
+/// itself: every persona ksx can plug goes out through ViGEmBus, so a machine
+/// without that driver stages perfectly, saves perfectly, and then plugs
+/// nothing. `docs/FIRST-RUN.md` §6 forbids exactly that shape — "a screen
+/// reports success while nothing works" — which is why this is stated *before*
+/// the button rather than diagnosed after it.
+///
+/// **Three states, not two.** `blocked` and `unknown` are separate fields and
+/// never both set: "the driver is not installed" and "I could not find out" are
+/// different sentences, and a user acts on them differently (`SURFACES.md`
+/// §1b). The default value of this type is the `unknown` one, so a payload
+/// nobody filled in cannot read as a healthy bus.
+///
+/// **The verdict is not re-derived here.** [`Self::code`] is a `ksx doctor`
+/// advice code, produced by `ksx_platform::advice::vigembus_advice` — the same
+/// function `ksx doctor` prints from. What this type adds is the *wording* for
+/// somebody who has never opened a terminal, which is the audience `FIRST-RUN`
+/// is written about and not the audience `ksx doctor` is written for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadBusView {
+    /// The driver state was read at all. `false` means every judgement below
+    /// is "unknown", never "absent".
+    pub readable: bool,
+    /// One of [`pad_bus_codes`].
+    pub code: String,
+    /// **Known** to be unable to plug a pad.
+    pub blocked: bool,
+    /// Could not be determined — the read failed, the service state was
+    /// unreadable, or this build does not recognise the code it got back.
+    pub unknown: bool,
+    /// The driver file's version, when one could be read.
+    pub version: Option<String>,
+    /// What is true, in a first-run user's words.
+    pub line: String,
+    /// What to do about it, **no-terminal route first**. Empty when there is
+    /// nothing to do. `FIRST-RUN.md` §6: "the only way out of a mistake is a
+    /// shell command" is on the list of things that must never happen, so the
+    /// shell command is named second and never alone.
+    pub remedy: String,
+}
+
+/// The honest zero value: nothing has been read, so nothing is known.
+///
+/// Hand-written rather than derived because a derived `Default` would be
+/// `readable: false` with an empty `line` and `unknown: false` — a view that
+/// claims nothing is wrong while having looked at nothing, which is the exact
+/// failure this type exists to prevent.
+impl Default for PadBusView {
+    fn default() -> Self {
+        Self::unreadable("the controller-driver state has not been read")
+    }
+}
+
+impl PadBusView {
+    /// The read failed or never happened.
+    pub fn unreadable(reason: impl std::fmt::Display) -> Self {
+        Self {
+            readable: false,
+            code: pad_bus_codes::UNREADABLE.to_owned(),
+            blocked: false,
+            unknown: true,
+            version: None,
+            line: format!(
+                "Whether the ViGEmBus controller driver is installed could not be determined \
+                 ({reason}). That is not the same as it being missing — nothing here knows \
+                 either way."
+            ),
+            remedy: NO_BUS_READ_REMEDY.to_owned(),
+        }
+    }
+
+    /// Build the view from `ksx doctor`'s verdict.
+    ///
+    /// `code` is the first advice code `vigembus_advice` returned, or
+    /// [`pad_bus_codes::HEALTHY`] when it returned none. An unrecognised code
+    /// lands in [`Self::unknown`] with the code quoted: a producer that grew a
+    /// state this build has never heard of has said something, and rendering
+    /// that as "all fine" would be inventing an answer.
+    pub fn from_doctor(code: &str, version: Option<String>) -> Self {
+        let base = Self {
+            readable: true,
+            code: code.to_owned(),
+            blocked: false,
+            unknown: false,
+            version: version.clone(),
+            line: String::new(),
+            remedy: String::new(),
+        };
+        match code {
+            pad_bus_codes::HEALTHY => Self {
+                line: format!(
+                    "The ViGEmBus controller driver{} is installed and running, so ksx can \
+                     create virtual controllers on this machine.",
+                    match &version {
+                        Some(v) => format!(" (v{v})"),
+                        None => String::new(),
+                    }
+                ),
+                ..base
+            },
+            pad_bus_codes::MISSING => Self {
+                blocked: true,
+                line: "The ViGEmBus controller driver is NOT installed. It is the driver that \
+                       makes a virtual controller exist, so until it is there ksx can stage and \
+                       save a setup but cannot plug a single pad — and no game will see one."
+                    .to_owned(),
+                remedy: INSTALL_BUS_REMEDY.to_owned(),
+                ..base
+            },
+            pad_bus_codes::FILE_MISSING => Self {
+                blocked: true,
+                line: "The ViGEmBus controller driver is registered with Windows but its driver \
+                       file is gone — a broken install. ksx cannot plug a pad through it."
+                    .to_owned(),
+                remedy: INSTALL_BUS_REMEDY.to_owned(),
+                ..base
+            },
+            pad_bus_codes::NOT_RUNNING => Self {
+                blocked: true,
+                line: "The ViGEmBus controller driver is installed but its service is not \
+                       running, so nothing can be plugged through it yet. A machine that has \
+                       just installed the driver and not restarted looks exactly like this."
+                    .to_owned(),
+                remedy: "Restart Windows. If it is still stopped afterwards, run the ksx \
+                         installer again and leave \"Install the ViGEmBus controller driver\" \
+                         ticked."
+                    .to_owned(),
+                ..base
+            },
+            pad_bus_codes::STATE_UNKNOWN => Self {
+                unknown: true,
+                line: "The ViGEmBus controller driver is installed, but Windows would not say \
+                       whether its service is running — so whether a pad can be plugged is not \
+                       known from here."
+                    .to_owned(),
+                remedy: NO_BUS_READ_REMEDY.to_owned(),
+                ..base
+            },
+            other => Self {
+                unknown: true,
+                line: format!(
+                    "The controller driver reported a state this build does not recognise \
+                     (\"{other}\"), so whether a pad can be plugged is not known from here."
+                ),
+                remedy: NO_BUS_READ_REMEDY.to_owned(),
+                ..base
+            },
+        }
+    }
+
+    /// Nothing is wrong and nothing needs saying before the button.
+    pub fn silent(&self) -> bool {
+        !self.blocked && !self.unknown
+    }
+}
+
+/// The remedy for every state where the bus is known to be unusable.
+///
+/// The installer comes first and the command second, on purpose: the installer
+/// is elevated already, it is the one moment the user has consented to an
+/// administrator token, and it is a route that needs no terminal. The command
+/// is named anyway because someone who has one should not have to guess it.
+pub const INSTALL_BUS_REMEDY: &str =
+    "Run the ksx installer again and leave \"Install the ViGEmBus controller driver\" ticked — \
+     the driver is bundled with ksx and nothing is downloaded. From a terminal opened as \
+     administrator, `ksx install-drivers --yes` does the same thing.";
+
+/// The remedy when the answer itself is unknown. It cannot promise a fix,
+/// because it does not know there is anything to fix.
+pub const NO_BUS_READ_REMEDY: &str =
+    "Nothing needs doing in advance. If Play starts and no controller appears in your game, the \
+     Start menu's \"ksx (advanced) > driver check\" prints what this machine really has.";
+
+// ---------------------------------------------------------------------------
 // First run, and the config in/out that has no path in it
 // ---------------------------------------------------------------------------
 
@@ -2452,5 +2675,72 @@ mod tests {
         let wire = serde_json::to_string(&SetupView::default()).unwrap();
         let back: SetupView = serde_json::from_str(&wire).unwrap();
         assert_eq!(back.max_slots, ksx_core::MAX_SLOTS);
+    }
+
+    /// **A default `PadBusView` must never read as a healthy bus.**
+    ///
+    /// Fails against a `#[derive(Default)]` on that struct — which is the
+    /// obvious thing to write and was the first thing written here. The
+    /// derived value is `blocked: false, unknown: false, line: ""`, so
+    /// `silent()` is true and a page renders nothing: a payload nobody filled
+    /// in would look exactly like a machine with a working driver, on the one
+    /// screen whose whole job is to say otherwise before the button.
+    #[test]
+    fn an_uncollected_pad_bus_is_unknown_and_not_silent() {
+        let view = PadBusView::default();
+        assert!(!view.readable);
+        assert!(view.unknown, "an unread bus is unknown, never fine");
+        assert!(!view.blocked, "unknown is not the same as blocked");
+        assert!(!view.silent(), "a page must have something to say here");
+        assert_eq!(view.code, pad_bus_codes::UNREADABLE);
+        assert!(!view.line.trim().is_empty());
+    }
+
+    /// The three states stay three, and only one of them licenses silence.
+    #[test]
+    fn every_doctor_code_lands_in_exactly_one_state() {
+        for (code, blocked, unknown) in [
+            (pad_bus_codes::HEALTHY, false, false),
+            (pad_bus_codes::MISSING, true, false),
+            (pad_bus_codes::FILE_MISSING, true, false),
+            (pad_bus_codes::NOT_RUNNING, true, false),
+            (pad_bus_codes::STATE_UNKNOWN, false, true),
+            // A code from a future ksx-platform. Unknown, never silent.
+            ("vigembus-something-new", false, true),
+        ] {
+            let view = PadBusView::from_doctor(code, None);
+            assert_eq!(view.blocked, blocked, "blocked for {code:?}");
+            assert_eq!(view.unknown, unknown, "unknown for {code:?}");
+            assert!(
+                !(view.blocked && view.unknown),
+                "{code:?} claims both at once"
+            );
+            assert!(view.readable, "{code:?} came from a read that answered");
+            assert!(!view.line.trim().is_empty(), "{code:?} says nothing");
+            assert_eq!(
+                view.silent(),
+                code == pad_bus_codes::HEALTHY,
+                "only a healthy bus is silent ({code:?})"
+            );
+            // Anything that is not silent owes the user a next step, and
+            // FIRST-RUN.md §6 forbids that step being a shell command ALONE.
+            if !view.silent() {
+                assert!(!view.remedy.trim().is_empty(), "{code:?} has no remedy");
+                assert!(
+                    view.remedy.contains("installer") || view.remedy.contains("Start menu"),
+                    "{code:?}'s remedy needs a route with no terminal in it: {}",
+                    view.remedy
+                );
+            }
+        }
+    }
+
+    /// The version is evidence, so it is printed only when it was read.
+    #[test]
+    fn a_healthy_bus_names_its_version_only_when_there_is_one() {
+        let known = PadBusView::from_doctor(pad_bus_codes::HEALTHY, Some("1.22.0.0".into()));
+        assert!(known.line.contains("v1.22.0.0"), "{}", known.line);
+        let unknown = PadBusView::from_doctor(pad_bus_codes::HEALTHY, None);
+        assert!(!unknown.line.contains("(v"), "{}", unknown.line);
     }
 }

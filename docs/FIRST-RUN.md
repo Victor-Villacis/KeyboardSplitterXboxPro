@@ -81,6 +81,21 @@ Two things must be said on that screen, not buried:
 
 ## §4 What the installer must do (moment 2)
 
+- **Install the bundled controller driver, having asked.** Without ViGEmBus
+  there is no bus for a virtual pad to appear on, so every one of the moments
+  below can be performed perfectly and moment 7 still plugs nothing. Setup is
+  the **only** point in the product where an administrator token exists and
+  the user has already consented to it (`ksx install-drivers` needs one and ksx
+  never self-elevates), so it is the only place this can happen without a
+  terminal — and §7 makes "without a terminal" the test. It is a `[Tasks]`
+  checkbox, ticked by default, whose label names the driver and says what it is
+  for; `docs/DRIVERS.md` is right that installing a kernel driver silently
+  throws away the consent, and a checkbox nobody can read is silence with extra
+  steps. What it runs is `ksx install-drivers --yes`, not the bundled `.exe`,
+  because that verb owns the hash pin, the signature pin and the sealed handle.
+  A failure here **never** fails the install: a machine with no ViGEmBus still
+  wants the ksx that configures and maps, so the wizard says what happened,
+  names the way back, and carries on.
 - **Desktop icon by default.** Not `Flags: unchecked`. The audit's finding: a
   user who declines the launch prompt has to go hunting through a Start menu.
 - **Offer to launch ksx**, not to run a diagnostic. `ksx doctor` is a developer
@@ -108,6 +123,13 @@ Clean, because it genuinely is: no config, no daemon session, no pads.
   column carry this already.
 - **Nothing on this screen may claim, plug, or write.** Looking is never a
   commitment — the same rule `ksx device scan` already follows against `pick`.
+- **Say it if Play cannot work.** A machine with no ViGEmBus can walk every
+  moment above and plug nothing at the end, so whether a pad can be created is
+  read (`MachineSource::pad_bus`) and stated before the Play button. Three
+  states, not two: cannot, could-not-tell, and fine — and the remedy is a
+  sentence naming the installer, never a button, because §3 of
+  `docs/SURFACES.md` marks driver installation `never` for this surface and
+  that has not changed.
 
 ## §6 What must never happen
 

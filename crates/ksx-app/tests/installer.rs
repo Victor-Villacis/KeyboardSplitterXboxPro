@@ -268,6 +268,167 @@ fn the_start_menu_offers_one_thing_and_keeps_the_rest_one_level_down() {
     );
 }
 
+/// **Moment 7 has a driver under it, and the wizard asks.**
+///
+/// Fails against every version before this one, where the `[Tasks]` section had
+/// two entries and neither was the driver. The bundled ViGEmBus setup shipped
+/// to `{app}\drivers` and was never executed, so on a machine that has never
+/// had ViGEmBus a first-run user reached Play, pressed it, and nothing plugged
+/// — and the documented fix was `ksx install-drivers` from an elevated shell,
+/// which `docs/FIRST-RUN.md` §7 rules out as an answer.
+///
+/// It fails in the other direction too. Installing a kernel driver without
+/// asking is what `docs/DRIVERS.md` refuses, so this asserts a checkbox exists
+/// AND that its label says what it does: "install drivers" is a phrase a
+/// first-time user cannot rank, and a checkbox nobody understands is not
+/// consent.
+#[test]
+fn the_bundled_driver_is_offered_checked_and_the_label_says_what_it_is() {
+    let text = script();
+    let tasks = section(&text, "[Tasks]");
+    let task = tasks
+        .iter()
+        .find(|line| field(line.as_str(), "Name").as_deref() == Some("vigembus"))
+        .unwrap_or_else(|| {
+            panic!("no `vigembus` task: nothing in this installer installs the driver: {tasks:?}")
+        });
+
+    assert!(
+        !field(task, "Flags")
+            .unwrap_or_default()
+            .contains("unchecked"),
+        "the driver box is ticked by default — the whole point is that a first run does \
+         not have to know it needs one: {task}"
+    );
+
+    let description = field(task, "Description").expect("the task must carry a Description");
+    assert!(
+        description.contains("ViGEmBus"),
+        "the label names the driver, so somebody who already has one can recognise it: \
+         {description}"
+    );
+    assert!(
+        description.to_ascii_lowercase().contains("controller"),
+        "and says what it is FOR, in a word a first-run user has (`controller`), not one \
+         only we have: {description}"
+    );
+}
+
+/// **The install goes through the verb that verifies it.**
+///
+/// `drivers\ViGEmBus_1.22.0_x64_x86_arm64.exe` is sitting in `{app}` and a
+/// one-line `[Run]` entry could execute it. That version would pass every other
+/// test in this file and would throw away `docs/DRIVERS.md`'s entire
+/// guarantee: the protected-directory search, the sealed handle, the SHA-256
+/// and the Authenticode chain all live in `ksx install-drivers`, and none of
+/// them becomes optional because Inno is doing the running.
+///
+/// So this asserts the bundled file name appears only as a payload to COPY,
+/// never as something to execute, and that the driver step names the verb.
+#[test]
+fn nothing_executes_the_bundled_setup_directly() {
+    let text = script();
+    let bundle = ksx_platform::installer::INSTALLER_FILE_NAME;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with(';') || line.starts_with("//") || !line.contains(bundle) {
+            continue;
+        }
+        assert!(
+            line.starts_with("Source:"),
+            "{bundle} may only be COPIED by this installer. Running it directly skips \
+             every check `ksx install-drivers` makes on it (docs/DRIVERS.md): {line}"
+        );
+    }
+
+    let code = section(&text, "[Code]").join("\n");
+    assert!(
+        code.contains("install-drivers --yes"),
+        "the driver step must run `ksx install-drivers --yes` — one code path owns the \
+         hash pin, the signature pin and the sealed handle"
+    );
+}
+
+/// **A driver that will not install must not fail the install.**
+///
+/// ksx without ViGEmBus still runs, still configures, still maps and still
+/// saves; it just cannot plug a pad. Rolling the whole install back over that
+/// would take away the nine tenths that work to punish the one tenth that did
+/// not — and would leave the user with no ksx *and* no driver.
+///
+/// Fails against the obvious "fix" for a failed driver step: `Abort`,
+/// `ExitSetupMsgBox` or a `RaiseException` in the driver path, any of which
+/// turns a recoverable outcome into a rolled-back install.
+///
+/// It also pins the other half of the obligation — that a failure SAYS so and
+/// names a way back — because a step that fails silently is the same bug as a
+/// step that fails loudly and takes everything with it.
+#[test]
+fn a_failed_driver_install_reports_and_continues() {
+    let text = script();
+    let code = section(&text, "[Code]").join("\n");
+
+    for wrecker in ["Abort", "ExitSetupMsgBox", "RaiseException"] {
+        assert!(
+            !code.contains(wrecker),
+            "`{wrecker}` in [Code] would let a failed driver install take the whole \
+             install with it. A machine with no ViGEmBus still wants ksx."
+        );
+    }
+
+    // An EXCEPTION out of `CurStepChanged` rolls the install back just as
+    // effectively as an `Abort`, and it is the failure mode ISCC cannot catch:
+    // a constant that does not expand compiles perfectly and throws at run
+    // time, on a shipped setup.exe, on somebody else's machine.
+    assert!(
+        code.contains("try") && code.contains("except"),
+        "the driver step must be wrapped in try..except — CI proves this file \
+         COMPILES and proves nothing about what it does when run"
+    );
+
+    // The retry the user can actually perform comes first: they are looking at
+    // the installer that offers it. `FIRST-RUN.md` §6 puts "the only way out of
+    // a mistake is a shell command" on the list of things that must never
+    // happen, so the command is named as well, never instead.
+    assert!(
+        code.contains("run this installer again"),
+        "a failure must name the no-terminal retry — this installer, with the box ticked"
+    );
+    assert!(
+        code.contains("ksx install-drivers --yes"),
+        "...and the command, for somebody who has a terminal open anyway"
+    );
+}
+
+/// **Every byte the user can see is ASCII.**
+///
+/// `ksx.iss` has no UTF-8 BOM, so ISCC reads it in the system code page: one
+/// byte above 127 in a wizard checkbox, a shortcut tooltip or a message box
+/// becomes mojibake on somebody else's machine, and it renders correctly on
+/// the machine that wrote it. This is the one class of mistake in this file
+/// that cannot be caught by looking at it, and the number of user-visible
+/// strings just tripled.
+///
+/// Comment lines are exempt and stay exempt — ISCC discards them, and this
+/// repository's prose uses en dashes and section marks everywhere.
+#[test]
+fn no_user_visible_string_carries_a_byte_above_127() {
+    for (number, line) in script().lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(';') || trimmed.starts_with("//") {
+            continue;
+        }
+        assert!(
+            line.is_ascii(),
+            "line {} has a byte above 127 outside a comment. ksx.iss has no BOM, so ISCC \
+             reads it in the system code page and this reaches a user as mojibake — keep \
+             it ASCII, or put the sentence in a comment: {line}",
+            number + 1
+        );
+    }
+}
+
 /// **The `CLAUDE.md` landmine, as an assertion.** No Pascal `{ }` comment in
 /// `[Code]`.
 ///

@@ -255,6 +255,13 @@ ksx install-drivers --yes           # execute (needs an elevated terminal)
 ksx install-drivers --repair --yes  # run setup again over an existing install
 ```
 
+**The setup wizard runs this for you**, from a checkbox ticked by default — it
+is elevated already, which is the one thing this command needs and the one
+thing ksx will never obtain for itself. The commands above are the same code
+path, for a machine set up some other way or a driver that has since gone
+missing. With ViGEmBus installed and healthy the plan is `already-installed`
+and nothing runs.
+
 Two independent pins must both hold before anything runs: the installer's
 **SHA-256** and its **Authenticode signer**, both recorded in
 [`docs/DRIVERS.md`](docs/DRIVERS.md). The file is opened **once** with writers

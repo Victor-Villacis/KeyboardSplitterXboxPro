@@ -94,6 +94,23 @@ fn summarize_hidmaestro(report: &DriverReport, out: &mut Vec<Advice>) {
     });
 }
 
+/// **`ksx doctor`'s ViGEmBus judgement, on its own.**
+///
+/// The same function [`summarize`] calls, exposed because more than one caller
+/// now needs to know whether a pad can be plugged and every one of them must
+/// reach that answer the same way. `/start` asks it before it offers Play, and
+/// `ksx doctor` prints it: two surfaces, one verdict, one set of codes.
+///
+/// Empty means healthy — a service key, `ViGEmBus.sys` on disk, and a running
+/// service. It never means "could not tell": that state is
+/// `vigembus-state-unknown`, which is a warning like the others precisely
+/// because a caller must not be able to mistake it for silence.
+pub fn vigembus_advice(v: &BusDriverReport) -> Vec<Advice> {
+    let mut out = Vec::new();
+    summarize_vigembus(v, &mut out);
+    out
+}
+
 fn summarize_vigembus(v: &BusDriverReport, out: &mut Vec<Advice>) {
     if !v.installed {
         out.push(Advice {
