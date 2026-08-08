@@ -216,7 +216,7 @@ fn perform(
         } => {
             let outcome = control.assign_slot(&SlotAssignRequest {
                 slot: *slot,
-                preset: preset.clone(),
+                preset: Some(preset.clone()),
                 profile: profile.clone(),
                 // **Absent, and it stays absent.** docs/SURFACES.md §10 puts
                 // the persona MENU on Studio and leaves the egui a view: this

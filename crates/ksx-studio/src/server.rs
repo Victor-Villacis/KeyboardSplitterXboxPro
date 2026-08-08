@@ -1553,7 +1553,7 @@ async fn setup_form_slot(
     };
     let request = ksx_api::SlotAssignRequest {
         slot,
-        preset,
+        preset: Some(preset),
         profile: form
             .profile
             .as_deref()

@@ -742,10 +742,33 @@ fn handle_slot_assign(
             })
         }
     };
+    // The persona NAME becomes a persona HERE, in the daemon, through
+    // `ksx_core`'s one lenient `FromStr` — the parser `ksx pads --persona` and
+    // every config file already go through, aliases and all. Not in
+    // `SlotAssignRequest::from_json`: ksx-api would then need a persona
+    // vocabulary of its own, which is the second copy of the alias table the
+    // wire field's doc comment refuses. An unknown name is refused in
+    // `UnknownPersona`'s own words, which list every valid one.
+    let persona = match assign
+        .persona
+        .as_deref()
+        .map(str::parse::<ksx_core::Persona>)
+    {
+        None => None,
+        Some(Ok(persona)) => Some(persona),
+        Some(Err(unknown)) => {
+            return serde_json::json!({
+                "ok": false,
+                "code": "unknown-persona",
+                "error": unknown.to_string(),
+            })
+        }
+    };
     let applied = match (deps.slot_assign)(&crate::slots::SlotSpec {
         slot: assign.slot,
         preset: assign.preset.clone(),
         profile: assign.profile.clone(),
+        persona,
     }) {
         Ok(applied) => applied,
         Err(err) => {
@@ -764,6 +787,11 @@ fn handle_slot_assign(
         "slot": applied.slot,
         "preset": applied.preset,
         "previous_preset": applied.previous,
+        // Canonical spelling, from `Persona::as_str` — so a surface that
+        // echoes this straight back into the next request cannot introduce a
+        // second spelling of one persona.
+        "persona": applied.persona.as_str(),
+        "previous_persona": applied.previous_persona.map(|p| p.as_str()),
         "profile": applied.profile,
         "created": applied.created,
         "unchanged": applied.unchanged,
@@ -1526,7 +1554,7 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
             }),
             Request::SlotAssign(ksx_api::SlotAssignRequest {
                 slot: 1,
-                preset: "IPAC P1".into(),
+                preset: Some("IPAC P1".into()),
                 profile: None,
                 persona: None,
                 reload: false,
@@ -1710,7 +1738,7 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
     fn no_slot_assign() -> SlotAssignFn {
         Box::new(|spec| {
             Err(crate::slots::SlotError::UnknownPreset {
-                preset: spec.preset.clone(),
+                preset: spec.preset.clone().unwrap_or_default(),
                 available: Vec::new(),
             })
         })

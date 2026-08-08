@@ -168,21 +168,38 @@ impl ControlSource for ScriptedControl {
         if self.no_daemon {
             return ksx_api::SlotOutcome::failed(NO_CHANNEL, "ksx daemon");
         }
-        if request.preset != "IPAC P1" {
+        // `None` is "keep the preset it has" (the persona-only write), which
+        // this cabinet's slot 1 answers with the one preset it owns. Only a
+        // NAMED preset that is not on disk is a refusal.
+        let preset = request.preset.clone().unwrap_or_else(|| "IPAC P1".into());
+        if preset != "IPAC P1" {
             return ksx_api::SlotOutcome {
                 ok: false,
-                error: Some(format!("no preset named \"{}\" on disk", request.preset)),
+                error: Some(format!("no preset named \"{preset}\" on disk")),
                 code: Some(ksx_api::codes::UNKNOWN_PRESET.into()),
                 ..ksx_api::SlotOutcome::default()
             };
         }
+        // The persona the request asked for, canonicalized the way the real
+        // daemon canonicalizes it — a fake that echoed the alias back would
+        // let a surface that re-sends what it was shown ship a second
+        // spelling.
+        let persona = request
+            .persona
+            .as_deref()
+            .and_then(|name| name.parse::<ksx_core::Persona>().ok())
+            .unwrap_or_default();
         // Faithful to `bounce_after_slot_write` (ksx-app/src/daemon/pipe.rs):
         // the pads replug only when a session was RUNNING, and the daemon's own
         // sentence says which of the two happened. A fake that reported
         // `restarted` off the request rather than off the session is exactly
         // what let "The pads replugged." ship as an unconditional suffix.
         let running = self.running.load(Ordering::SeqCst);
-        let mut message = format!("slot {} now uses \"{}\"", request.slot, request.preset);
+        let mut message = format!(
+            "slot {} now uses \"{preset}\" as a {} pad",
+            request.slot,
+            persona.label()
+        );
         let (restarted, reloaded) = if !running {
             message.push_str(" — nothing is running, so the next start reads it");
             (false, true)
@@ -197,7 +214,8 @@ impl ControlSource for ScriptedControl {
             ok: true,
             message: Some(message),
             slot: Some(request.slot),
-            preset: Some(request.preset.clone()),
+            preset: Some(preset),
+            persona: Some(persona.as_str().to_owned()),
             profile: request.profile.clone(),
             restarted,
             reloaded,

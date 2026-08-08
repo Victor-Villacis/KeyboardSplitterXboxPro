@@ -458,7 +458,15 @@ pub struct SlotAssignRequest {
     /// 1..=`ksx_core::MAX_SLOTS`.
     pub slot: u8,
     /// The preset's `name` (its file's `name` field), e.g. `"IPAC P1"`.
-    pub preset: String,
+    ///
+    /// ABSENT means "the preset this slot already uses", which is what makes a
+    /// persona-only write possible — `ksx slot assign --slot 5 --persona
+    /// playstation` must not oblige anyone to re-type a name they are not
+    /// changing, and a surface that filled it in from its last read would
+    /// write back a preset the file may have moved on from. A request with
+    /// neither a preset nor a persona is refused: it asks for nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
     /// A games.toml profile title. ABSENT means config.toml's `[[slot]]` list —
     /// the same either/or `ksx setup` asks about, spelled the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -514,22 +522,25 @@ impl SlotAssignRequest {
                 format!("slot {slot} is not a slot number (1..={max})"),
             ));
         };
-        let Some(preset) = field(request, "preset") else {
+        let preset = field(request, "preset");
+        let persona = field(request, "persona");
+        if preset.is_none() && persona.is_none() {
             return Err(bad_request(
-                r#"slot-assign needs a "preset" (the preset this slot should use)"#,
+                r#"slot-assign needs a "preset" (which preset this slot uses), a "persona" (which controller it presents itself as), or both — with neither there is nothing to change"#,
             ));
-        };
+        }
         Ok(Self {
             slot,
             preset,
             profile: field(request, "profile"),
-            // Verbatim. `field` drops a blank, which is what an empty
-            // `<select>` submission looks like, and a blank must read as "not
-            // asked about" rather than as a persona named "". The NAME is not
-            // validated here: this reader has no persona vocabulary, and
-            // inventing one would be the second copy of the alias table this
-            // field's doc comment exists to prevent.
-            persona: field(request, "persona"),
+            // Both verbatim, both already read above. `field` drops a blank,
+            // which is what an empty `<select>` submission looks like, and a
+            // blank must read as "not asked about" rather than as a persona
+            // named "". The persona NAME is not validated here: this reader
+            // has no persona vocabulary, and inventing one would be the second
+            // copy of the alias table that field's doc comment exists to
+            // prevent.
+            persona,
             reload: flag(request, "reload"),
         })
     }
@@ -1370,7 +1381,7 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 3, allow_sh
     fn slot_assign_carries_slot_preset_profile_persona_and_reload() {
         let full = SlotAssignRequest {
             slot: 1,
-            preset: "P1".into(),
+            preset: Some("P1".into()),
             profile: Some("MAME 4P".into()),
             persona: Some("playstation".into()),
             reload: true,
@@ -1389,15 +1400,24 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 3, allow_sh
             "the config-writing wire's field set — see docs/SURFACES.md §10"
         );
 
-        // ...and the three optional halves stay optional, so the minimal
-        // request a CLI or a form sends is still slot + preset and nothing else.
-        let minimal = SlotAssignRequest {
-            slot: 1,
-            preset: "P1".into(),
-            ..Default::default()
-        };
-        let json = serde_json::to_value(&minimal).unwrap();
-        assert_eq!(json.as_object().unwrap().len(), 2, "{json}");
+        // ...and every optional half stays optional, so a request carries
+        // exactly what it asks for and nothing else. A preset re-point is two
+        // keys; a persona-only change is two keys; neither mentions the other.
+        for asked in [
+            SlotAssignRequest {
+                slot: 1,
+                preset: Some("P1".into()),
+                ..Default::default()
+            },
+            SlotAssignRequest {
+                slot: 1,
+                persona: Some("playstation".into()),
+                ..Default::default()
+            },
+        ] {
+            let json = serde_json::to_value(&asked).unwrap();
+            assert_eq!(json.as_object().unwrap().len(), 2, "{json}");
+        }
     }
 
     /// **Every slot-assign document ever written still parses, and still means
@@ -1424,7 +1444,7 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 3, allow_sh
         let parsed = SlotAssignRequest::from_json(&old).expect("an old document still parses");
         assert_eq!(parsed.persona, None, "absent must not mean xbox360");
         assert_eq!(parsed.slot, 3);
-        assert_eq!(parsed.preset, "IPAC P3");
+        assert_eq!(parsed.preset.as_deref(), Some("IPAC P3"));
 
         // The same in the typed direction: a request that asks for no persona
         // change puts no persona key on the wire at all, so a daemon older

@@ -1370,9 +1370,25 @@ enum SlotCommand {
             help = slot_arg::ASSIGN_SLOT.as_str(),
         )]
         slot: u8,
-        /// Preset name — `ksx preset list` names them (case-insensitive)
-        #[arg(long, value_name = "NAME")]
-        preset: String,
+        /// Preset name — `ksx preset list` names them (case-insensitive).
+        /// Omit it to keep the preset the slot already uses (with --persona)
+        #[arg(long, value_name = "NAME", required_unless_present = "persona")]
+        preset: Option<String>,
+        /// Which controller this slot presents itself as: xbox360,
+        /// playstation, dualsense, switchpro, xboxseries
+        ///
+        /// Aliases are accepted (ds4, ps4, "Xbox 360", xsx). Omit it to leave
+        /// the slot's persona exactly as it is — this never defaults to
+        /// xbox360, because that would quietly un-PlayStation a slot every
+        /// time its preset changed.
+        ///
+        /// Windows exposes 4 XInput slots: xbox360 and xboxseries each take
+        /// one, so a fifth of those is refused. playstation is plain HID and
+        /// takes none, which is how players 5+ exist at all. dualsense,
+        /// switchpro and xboxseries need HIDMaestro (M8) and are refused by
+        /// this build with the reason attached.
+        #[arg(long, value_name = "NAME", value_parser = parse_persona)]
+        persona: Option<ksx_core::Persona>,
         /// Write into this games.toml profile instead of config.toml
         #[arg(long, value_name = "TITLE")]
         profile: Option<String>,
@@ -1466,6 +1482,7 @@ fn main() -> anyhow::Result<()> {
             SlotCommand::Assign {
                 slot,
                 preset,
+                persona,
                 profile,
                 reload,
                 json,
@@ -1473,6 +1490,7 @@ fn main() -> anyhow::Result<()> {
                 action: slot_cli::Action::Assign {
                     slot,
                     preset,
+                    persona,
                     profile,
                     reload,
                 },
@@ -3238,6 +3256,7 @@ mod tests {
                 SlotCommand::Assign {
                     slot,
                     preset,
+                    persona,
                     profile,
                     reload,
                     json,
@@ -3247,7 +3266,12 @@ mod tests {
             panic!("an assign");
         };
         assert_eq!(slot, 3);
-        assert_eq!(preset, "IPAC P3");
+        assert_eq!(preset.as_deref(), Some("IPAC P3"));
+        assert_eq!(
+            persona, None,
+            "no --persona means the slot keeps the one it has; it must NOT \
+             parse as the xbox360 default"
+        );
         assert_eq!(profile, None, "config.toml unless a profile is named");
         assert!(!reload, "nothing is disturbed unless asked");
         assert!(!json);
