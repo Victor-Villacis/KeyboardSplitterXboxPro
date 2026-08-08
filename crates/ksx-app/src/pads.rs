@@ -1,6 +1,11 @@
 //! `ksx pads` — plug N virtual pads, show each pad's XInput identity, run a
 //! visible test pattern, then unplug cleanly.
 //!
+//! [`ceiling_warning`] runs BEFORE the first plug: an XInput persona past
+//! Windows' four slots plugs pads no game can read, and this used to happen in
+//! silence. It warns and proceeds — the convention this command keeps — on
+//! stderr in both modes, so `--json` still puts exactly one object on stdout.
+//!
 //! Exit code [`EXIT_DRIVER_MISSING`] (2) = ViGEmBus is not installed, and
 //! [`EXIT_REFUSED`] (also 2) = `--persona` names something this build cannot
 //! create. Same code, different `--json` `code` — because only the first one
@@ -114,6 +119,109 @@ pub fn error_json(code: &str, message: &str) -> serde_json::Value {
     serde_json::json!({ "error": { "code": code, "message": message } })
 }
 
+/// The persona this build can plug that costs no XInput slot — the remedy
+/// [`ceiling_warning`] points at.
+///
+/// Derived from the roster, never spelled, for the same reason
+/// [`surface::spawn_offer`] derives its own option list: a build that cannot
+/// plug that persona must not be told to use it. `None` means this build has
+/// no HID persona at all, and the warning then names the cost without offering
+/// a command that would fail.
+pub fn hid_persona() -> Option<ksx_core::Persona> {
+    ksx_core::Persona::ALL
+        .iter()
+        .copied()
+        .find(|p| p.can_plug() && !p.is_xinput())
+}
+
+/// What `ksx pads --count N --persona P` will hand a GAME, said before the
+/// first pad is plugged. `None` when there is nothing to say.
+///
+/// A WARNING, not a refusal — the convention this command already keeps
+/// (`--prune` refuses only what would take a pad out of a player's hands).
+/// `ksx pads` is the test command: plugging four dead pads on purpose to see
+/// what Windows does with them is a legitimate thing to ask for, and the
+/// config layer is where the same ceiling REFUSES
+/// (`ksx_config::Issue::TooManyXinputSlots`). What was missing was anyone
+/// saying it out loud beforehand: eight pads plugged, the pattern ran on all
+/// eight, and four of them were invisible to every game with nothing on screen
+/// admitting it.
+///
+/// **What decides it**: Windows hands out exactly [`MAX_XINPUT_SLOTS`] XInput
+/// slots, and an XInput persona needs one to be read at all. Whether THIS pad
+/// gets one depends on how many are already taken when it plugs — read here
+/// from XInput itself (real pads and other processes' pads count, which is why
+/// the ViGEm child list cannot answer it) and phrased as a ceiling, because
+/// another process can take a slot between this reading and the plug.
+///
+/// A HID persona does not enter that arithmetic at all, which is the fix.
+pub fn ceiling_warning(
+    count: u8,
+    persona: ksx_core::Persona,
+    xinput_in_use: Option<u8>,
+) -> Option<String> {
+    use ksx_core::MAX_XINPUT_SLOTS;
+
+    if !persona.is_xinput() {
+        // A HID pad takes no XInput slot, so this answer does not depend on
+        // the reading — and a warning here would be crying wolf.
+        return None;
+    }
+    // "…and the extras still plug": true in both definite arms, and the whole
+    // reason this needs saying — a dead pad is indistinguishable from a live
+    // one until a game fails to see it.
+    let unread = "Those pads plug and run the pattern all the same; nothing reads them.";
+    let mut text = match (xinput_in_use, surface::xinput_free(xinput_in_use)) {
+        (Some(_), Some(free)) if count <= free => return None,
+        (Some(in_use), Some(free)) => format!(
+            "warning: {} of these {count} {persona} pad(s) will be invisible to every game. \
+             Windows exposes exactly {MAX_XINPUT_SLOTS} XInput slots and no virtual bus can \
+             create a fifth; {in_use} of them {} in use right now — by any pad on this machine, \
+             real or virtual — so at most {free} of these will be readable. {unread}\n",
+            count - free,
+            if in_use == 1 { "is" } else { "are" },
+        ),
+        // A reading that failed is not a reading of zero — but it still leaves
+        // one thing knowable: no machine has fewer than none in use, so
+        // anything past the ceiling is invisible whatever the true occupancy
+        // turns out to be. That is a floor, and it is said as one.
+        _ if count > MAX_XINPUT_SLOTS => format!(
+            "warning: at least {} of these {count} {persona} pad(s) will be invisible to every \
+             game. Windows exposes exactly {MAX_XINPUT_SLOTS} XInput slots and no virtual bus \
+             can create a fifth. ksx could not read how many are already in use, so the real \
+             number can only be higher — that is a reading that failed, not an empty machine. \
+             {unread}\n",
+            count - MAX_XINPUT_SLOTS,
+        ),
+        _ => format!(
+            "warning: ksx could not read how many of Windows' {MAX_XINPUT_SLOTS} XInput slots \
+             are in use, so it cannot say how many of these {count} {persona} pad(s) a game will \
+             see — that is a reading that failed, not an empty machine.\n"
+        ),
+    };
+    if let Some(hid) = hid_persona() {
+        // The fix that WORKS, measured rather than reasoned: ViGEm's DS4
+        // targets are plain HID, so they never enter the XInput arithmetic —
+        // not capped at four, and no second driver to install.
+        text.push_str(&format!(
+            "  The fix is a HID persona, which never enters that arithmetic: `ksx pads --count \
+             {count} --persona {hid}` plugs {count} pads a game can read (HID/DirectInput — \
+             MAME, RetroArch, SDL, \
+             Steam Input) and takes none of the {MAX_XINPUT_SLOTS} XInput slots. Measured \
+             2026-08-04 (docs/research/m6.5-ds4-findings.md): six {hid} targets enumerated \
+             alongside four {persona} pads, with the XInput count unmoved.\n"
+        ));
+        text.push_str(&format!(
+            "  On a real panel that is the mixed shape the same measurement ran: slots \
+             1..={MAX_XINPUT_SLOTS} `persona = \"{persona}\"`, slots {}+ `persona = \"{hid}\"`, \
+             in config.toml.\n",
+            MAX_XINPUT_SLOTS + 1,
+        ));
+    }
+    text.push_str("  Plugging anyway — this is a warning, not a refusal.\n");
+    Some(text)
+}
+
 #[cfg(windows)]
 pub fn run(
     count: u8,
@@ -138,6 +246,19 @@ pub fn run(
             eprintln!("error: {err}");
         }
         std::process::exit(EXIT_REFUSED);
+    }
+
+    // BEFORE the bus is opened, so the sentence arrives while the answer is
+    // still "don't", not as a post-mortem over eight pads that are already
+    // animating. After the persona refusal above, because a persona this build
+    // cannot create has no XInput arithmetic to warn about.
+    //
+    // stderr in BOTH modes: `--json` promises exactly one object on stdout,
+    // and a warning that broke that promise would be a worse bug than the one
+    // it is reporting. A machine reader loses nothing — the response already
+    // carries `user_index: null` on every pad the slots ran out for.
+    if let Some(warning) = ceiling_warning(count, persona, ksx_platform::xinput::slots_in_use()) {
+        eprint!("{warning}");
     }
 
     let vigem = match VigemBackend::connect() {
@@ -553,12 +674,15 @@ pub fn prune(_yes: bool, _json: bool) -> anyhow::Result<()> {
 ///   [`spawn_offer`] stops offering counts that would not fit.
 ///
 /// What it deliberately does NOT do is refuse a count above the XInput
-/// ceiling. `ksx pads --count 8 --persona xbox360` plugs eight pads today and
-/// four of them are invisible to every game (open task #16); changing that is
-/// that task's job. What this adds is the sentence saying so, attached to the
-/// option that would cause it, so a surface can warn BEFORE the click without
-/// knowing why four is the number — and NAMING the persona it applies to,
-/// because the same click costs nothing on a HID pad.
+/// ceiling. `ksx pads --count 8 --persona xbox360` plugs eight pads and four
+/// of them are invisible to every game; that stayed a WARNING when task #16
+/// landed — plugging dead pads on purpose to see what Windows does with them
+/// is a legitimate thing to ask a test command for, and the config layer is
+/// where the same ceiling refuses. What this adds is the sentence saying so,
+/// attached to the option that would cause it, so a surface can warn BEFORE
+/// the click without knowing why four is the number — and NAMING the persona
+/// it applies to, because the same click costs nothing on a HID pad. The
+/// console's half of that same sentence is [`super::ceiling_warning`].
 #[cfg_attr(not(any(feature = "studio", feature = "cabinet")), allow(dead_code))]
 pub mod surface {
     use ksx_core::{Persona, MAX_SLOTS, MAX_XINPUT_SLOTS};
@@ -755,7 +879,9 @@ pub mod surface {
     }
 
     /// The XInput ceiling, stated for THIS machine right now — the sentence
-    /// task #16 exists because nothing said.
+    /// task #16 existed because nothing said. (The console says it too now,
+    /// from [`super::ceiling_warning`]; this is the page's spelling of the
+    /// same fact.)
     ///
     /// `xinput_in_use` comes from XInput itself, not from the ViGEm bus's
     /// child list, and the difference is the whole point. The bus can only
@@ -1026,8 +1152,10 @@ pub mod surface {
             );
         }
 
-        /// Task #16, as the page sees it: over the ceiling is a WARNING, not a
-        /// refusal. Changing that is #16's job; saying it is this module's.
+        /// Task #16, as the page sees it: over the ceiling is a WARNING, not
+        /// a refusal — and that is how #16 landed on the console too, so the
+        /// two faces still describe one click the same way
+        /// (`the_cli_warning_and_the_surface_plan_agree_on_the_number`).
         #[test]
         fn eight_xbox_pads_are_allowed_and_four_of_them_are_named_unreadable() {
             let plan = plan_spawn(8, Persona::Xbox360, 30, false, IDLE.0, IDLE.1);
@@ -1762,6 +1890,175 @@ mod tests {
         ];
         let v = pads_json(&fixture_driver(), &rows);
         insta::assert_snapshot!(serde_json::to_string_pretty(&v).unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // The ceiling warning `ksx pads` prints before it plugs anything (task #16)
+    // -----------------------------------------------------------------------
+
+    use ksx_core::{Persona, MAX_XINPUT_SLOTS};
+
+    /// **Eight xbox360 pads, four of them dead, and nothing said so.**
+    ///
+    /// Fails against the version this replaced, where `run` printed nothing
+    /// before the plug loop: `ksx pads --count 8 --persona xbox360` plugged
+    /// eight pads, animated all eight, and four were invisible to every game
+    /// with no line anywhere admitting it. The number has to be NAMED, and it
+    /// has to arrive before the plug — a post-mortem over eight animating pads
+    /// is not a warning.
+    #[test]
+    fn eight_xinput_pads_on_an_idle_machine_name_the_four_no_game_will_see() {
+        let warning = ceiling_warning(8, Persona::Xbox360, Some(0))
+            .expect("eight XInput pads past a four-slot ceiling must warn");
+        assert!(warning.starts_with("warning:"), "{warning}");
+        assert!(
+            warning.contains(&format!("{} of these 8", 8 - MAX_XINPUT_SLOTS)),
+            "the count of invisible pads must be named: {warning}"
+        );
+        assert!(warning.contains("invisible to every game"), "{warning}");
+        assert!(
+            warning.contains(&MAX_XINPUT_SLOTS.to_string()),
+            "the ceiling itself must be named: {warning}"
+        );
+        // Warn and PROCEED — this command's convention, and the one thing a
+        // reader must not have to guess after a paragraph of bad news.
+        assert!(warning.contains("warning, not a refusal"), "{warning}");
+    }
+
+    /// The remedy is the measured one, and it is a command that works.
+    ///
+    /// Fails against a warning that only stated the problem: "4 of these will
+    /// be invisible" with no way forward is the shape of message that gets
+    /// read once and ignored after. The persona named is derived from the
+    /// roster, so a build that cannot plug it cannot be told to use it.
+    #[test]
+    fn the_warning_hands_over_the_fix_that_was_actually_measured() {
+        let hid = hid_persona().expect("this build plugs a HID persona");
+        assert!(!hid.is_xinput(), "the fix must not take an XInput slot");
+        assert!(hid.can_plug(), "a remedy this build cannot run is not one");
+
+        let warning = ceiling_warning(8, Persona::Xbox360, Some(0)).unwrap();
+        assert!(
+            warning.contains(&format!("ksx pads --count 8 --persona {hid}")),
+            "the fix must be a command, with the count they asked for: {warning}"
+        );
+        assert!(
+            warning.contains("m6.5-ds4-findings.md"),
+            "a claim about six HID pads is measured, not reasoned — cite it: {warning}"
+        );
+        assert!(warning.contains("XInput count unmoved"), "{warning}");
+        // …and the shape that measurement actually ran, for a real panel.
+        assert!(
+            warning.contains(&format!("slots {}+", MAX_XINPUT_SLOTS + 1)),
+            "{warning}"
+        );
+    }
+
+    /// A HID persona never triggers it, at any count. Fails against a
+    /// persona-blind warning keyed on `count > MAX_XINPUT_SLOTS` alone, which
+    /// would tell someone plugging eight PlayStation pads that four of them
+    /// are invisible — contradicting `--help`, the persona's own doc, and
+    /// `surface::plan_spawn`, which reports no warning for that same spawn.
+    #[test]
+    fn a_hid_persona_is_never_warned_about_however_many_are_asked_for() {
+        for count in [1u8, MAX_XINPUT_SLOTS, MAX_XINPUT_SLOTS + 1, 16] {
+            for in_use in [Some(0), Some(MAX_XINPUT_SLOTS), None] {
+                assert_eq!(
+                    ceiling_warning(count, Persona::PlayStation, in_use),
+                    None,
+                    "count {count}, in use {in_use:?}"
+                );
+            }
+        }
+    }
+
+    /// A count that fits is silent. Crying wolf on every `ksx pads` is how a
+    /// warning stops being read.
+    #[test]
+    fn a_count_that_fits_the_free_slots_says_nothing() {
+        for count in 1..=MAX_XINPUT_SLOTS {
+            assert_eq!(ceiling_warning(count, Persona::Xbox360, Some(0)), None);
+        }
+        // …and "fits" is measured against what is FREE, not against the
+        // ceiling: two slots already taken makes three pads two too many.
+        assert_eq!(ceiling_warning(2, Persona::Xbox360, Some(2)), None);
+        let warning = ceiling_warning(3, Persona::Xbox360, Some(2)).unwrap();
+        assert!(warning.contains("1 of these 3"), "{warning}");
+        assert!(warning.contains("2 of them are in use"), "{warning}");
+        assert!(
+            warning.contains("at most 2 of these will be readable"),
+            "a slot count is a ceiling, not a promise: {warning}"
+        );
+    }
+
+    /// **A reading that failed is not a reading of zero** — the rule
+    /// `surface::xinput_free` exists for, applied to the CLI's own sentence.
+    ///
+    /// Fails against a warning that folded `None` into `0`: it would have
+    /// announced "0 of them are in use right now" on a machine it never
+    /// looked at, and stayed silent about four pads on a machine whose four
+    /// slots were already full.
+    #[test]
+    fn an_unread_ceiling_is_said_and_never_assumed_to_be_empty() {
+        // Past the ceiling, one thing stays knowable whatever the occupancy:
+        // no machine has fewer than none in use, so the excess is a FLOOR.
+        let over = ceiling_warning(8, Persona::Xbox360, None).unwrap();
+        assert!(
+            over.contains(&format!("at least {}", 8 - MAX_XINPUT_SLOTS)),
+            "{over}"
+        );
+        assert!(over.contains("could not read"), "{over}");
+        assert!(
+            !over.contains("0 of them"),
+            "an unread ceiling must not report an empty machine: {over}"
+        );
+
+        // Under the ceiling nothing is knowable at all, and silence would be
+        // the claim that everything is fine — on four real pads it is not.
+        let under = ceiling_warning(MAX_XINPUT_SLOTS, Persona::Xbox360, None)
+            .expect("an unread ceiling must be said, not assumed");
+        assert!(under.contains("could not read"), "{under}");
+        assert!(
+            !under.contains("invisible to every game"),
+            "ksx did not look; it cannot claim any pad is dead: {under}"
+        );
+    }
+
+    /// A full ceiling: every pad asked for is invisible, and the sentence
+    /// still has to be arithmetic rather than a special case.
+    #[test]
+    fn a_full_ceiling_makes_every_requested_pad_unreadable() {
+        let warning = ceiling_warning(2, Persona::Xbox360, Some(MAX_XINPUT_SLOTS)).unwrap();
+        assert!(warning.contains("2 of these 2"), "{warning}");
+        assert!(
+            warning.contains("at most 0 of these will be readable"),
+            "{warning}"
+        );
+    }
+
+    /// The CLI warning and the surface plan describe the SAME click with the
+    /// same number. Two faces of one backend cannot disagree about how many
+    /// pads a game will see (docs/SURFACES.md §1).
+    #[test]
+    fn the_cli_warning_and_the_surface_plan_agree_on_the_number() {
+        for (count, in_use) in [(8u8, 0u8), (5, 1), (6, 3), (4, 4)] {
+            let surface::SpawnPlan::Plug { unreadable, .. } =
+                surface::plan_spawn(count, Persona::Xbox360, 30, false, Some(in_use), 0)
+            else {
+                panic!("expected a plug for {count}/{in_use}");
+            };
+            let unreadable = unreadable.expect("a read ceiling gives a number");
+            let warning = ceiling_warning(count, Persona::Xbox360, Some(in_use));
+            if unreadable == 0 {
+                assert_eq!(warning, None, "{count} pads, {in_use} in use");
+                continue;
+            }
+            let warning = warning.expect("the plan says some are unreadable; the CLI must too");
+            assert!(
+                warning.contains(&format!("{unreadable} of these {count}")),
+                "{count} pads, {in_use} in use: {warning}"
+            );
+        }
     }
 
     #[test]

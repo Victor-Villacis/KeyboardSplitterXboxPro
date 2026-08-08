@@ -1061,8 +1061,10 @@ pub struct PadsView {
     /// **The ceiling, said out loud for this machine right now.** The reason
     /// this is a backend string and not a page's `if`: `ksx pads --count 8
     /// --persona xbox360` plugs eight pads and four of them are invisible to
-    /// every game (open task #16), and a surface must be able to say that
-    /// BEFORE the button is pressed without knowing why four is the number.
+    /// every game, and a surface must be able to say that BEFORE the button is
+    /// pressed without knowing why four is the number. (The console says the
+    /// same thing before its own plug, from the same constant — `ksx-app`'s
+    /// `pads::ceiling_warning`.)
     pub xinput_line: String,
     /// Does THIS process hold an administrator token? `None` = unanswerable.
     /// A prune restarts a bus device, which needs one; a page shows this

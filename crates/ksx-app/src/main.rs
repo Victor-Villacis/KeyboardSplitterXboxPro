@@ -78,7 +78,7 @@ use clap::{Parser, Subcommand};
 mod slot_arg {
     use std::sync::LazyLock;
 
-    use ksx_core::MAX_SLOTS;
+    use ksx_core::{MAX_SLOTS, MAX_XINPUT_SLOTS};
 
     /// The accepted range, in the `i64` clap's ranged integer parsers speak.
     pub fn range() -> std::ops::RangeInclusive<i64> {
@@ -91,11 +91,22 @@ mod slot_arg {
         format!("Slot to set up first; later players continue from it (1..={MAX_SLOTS})")
     });
 
+    /// The XInput half of this line was three literals — "4 slots", "pads 5
+    /// and up", "playstation" — beside a derived `MAX_SLOTS`. All of it is
+    /// derived now, for the same reason the range is: `--help` must not be
+    /// able to disagree with the warning `ksx pads` prints from that same
+    /// constant and that same roster, and a build with no HID persona must not
+    /// advise one.
     pub static PADS_COUNT: LazyLock<String> = LazyLock::new(|| {
-        format!(
-            "Pads to plug (1..={MAX_SLOTS}; XInput has 4 slots, so pads 5 and up need \
-             --persona playstation)"
-        )
+        let mut help = format!("Pads to plug (1..={MAX_SLOTS}");
+        if let Some(hid) = crate::pads::hid_persona() {
+            help.push_str(&format!(
+                "; XInput has {MAX_XINPUT_SLOTS} slots, so pads {} and up need --persona {hid}",
+                MAX_XINPUT_SLOTS + 1,
+            ));
+        }
+        help.push(')');
+        help
     });
 
     pub static ASSIGN_SLOT: LazyLock<String> =
@@ -1926,12 +1937,44 @@ mod tests {
             .unwrap()
             .render_long_help()
             .to_string();
-        for (label, help) in [("setup", setup), ("pads", pads), ("slot assign", assign)] {
+        for (label, help) in [
+            ("setup", setup),
+            ("pads", pads.clone()),
+            ("slot assign", assign),
+        ] {
             assert!(
                 help.contains(&bound),
                 "{label} --help never says {bound}:\n{help}"
             );
         }
+
+        // **The XInput ceiling in `pads --help` is derived too — a TRIPWIRE,
+        // and honestly labelled as one.**
+        //
+        // It does NOT fail against the literals it replaced ("XInput has 4
+        // slots, so pads 5 and up need --persona playstation"), because those
+        // literals are correct today: MAX_XINPUT_SLOTS is 4 and PlayStation is
+        // pluggable. Saying otherwise would be the kind of claim rule 8 bans.
+        // What it does is bite the moment either stops being true — the same
+        // job the MAX_SLOTS assertion above does, and the same job it failed
+        // to do when the bound was frozen at eight. The `expect` below is the
+        // sharper half: gate the HID persona off (as `can_plug` already does
+        // for three others) and a `--help` that still advises it fails here.
+        let xinput = ksx_core::MAX_XINPUT_SLOTS;
+        assert!(
+            pads.contains(&format!("XInput has {xinput} slots")),
+            "pads --help must derive the ceiling:\n{pads}"
+        );
+        assert!(
+            pads.contains(&format!("pads {} and up", xinput + 1)),
+            "…and the first slot past it:\n{pads}"
+        );
+        // …and the persona it advises is one this build can actually plug.
+        let hid = pads::hid_persona().expect("this build plugs a HID persona");
+        assert!(
+            pads.contains(&format!("--persona {hid}")),
+            "pads --help must name a persona this build can plug:\n{pads}"
+        );
     }
 
     #[test]
