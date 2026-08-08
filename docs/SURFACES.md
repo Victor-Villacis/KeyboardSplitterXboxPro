@@ -83,8 +83,17 @@ The backend read was built for a screen nobody wrote, and is compiled behind
 So the failure mode is symmetric, and the rule needs both halves: a surface must
 not own a capability the backend lacks, **and a backend verb with no face is not
 finished either** — it is untested against a real caller, and its shape is a
-guess. That is the surface-parity guard on the task list (#26), and until it
-exists this paragraph is the only thing checking.
+guess.
+
+That was the surface-parity guard on the task list (#26), and it now exists:
+`crates/ksx-app/tests/parity.rs` walks the clap command tree, reads Studio's
+routes out of `Router::new()` and the cabinet's screens and `Ask` variants out
+of its source, and asks of every cell in §3 whether the tree agrees. A verb no
+row names and no exemption covers fails it. So does a cell claiming a face that
+is not there — and so does the opposite, which is what it found on the day it
+was written: two cells still saying `planned` about pages that had shipped.
+What it cannot check is a capability nobody wrote a row for, which is the
+remaining reason to keep §3 current by hand.
 
 ### §1a Rendered COPY is logic too, and one page proves it
 
@@ -146,8 +155,8 @@ surface does a human perform this task on*, and that is answered by the matrix.
 | Capability | CLI | egui (cabinet) | Studio (browser) |
 |---|---|---|---|
 | Author presets / key mappings | owns | — | **primary** |
-| Edit config, profiles | owns | slot→preset only | planned primary |
-| Device pick / remove | owns | planned (#22) | planned (#22) |
+| Edit config, profiles | owns | slot→preset only | **primary** |
+| Device pick / remove | owns | planned | **primary** |
 | WinUSB claim / release | owns | planned | never (needs elevation) |
 | "Press a button, see it light" | input only (`ksx monitor`) | **primary** | planned (§8) |
 | Is it working: pads, drivers | owns | **primary** | view |
@@ -170,12 +179,12 @@ Four cells were corrected, each against the code:
   decision caused. That is a targeting decision taken in a surface; it is the
   strongest live counter-example to §1 in the tree, and it stays until the
   destination rule moves behind the verb.
-- **Edit config — Studio.** Was "**primary**". No Studio route writes
-  `config.toml` or `games.toml`; the only config-adjacent route re-reads. Every
-  `/map/*` write goes to a preset file. `AppState` holds no `MachineSource`, and
-  `ControlSource` has exactly one config-writing verb (`slot-assign`) which
-  Studio never calls. It is the right destination, so it stays in the table —
-  as a plan.
+- **Edit config — Studio.** *Superseded 2026-08-08; see below.* Was
+  "**primary**". At the audit no Studio route wrote `config.toml` or
+  `games.toml`; the only config-adjacent route re-read. Every `/map/*` write
+  went to a preset file. `AppState` held no `MachineSource`, and `ControlSource`
+  had exactly one config-writing verb (`slot-assign`) which Studio never called.
+  It was the right destination, so it stayed in the table — as a plan.
 - **Device pick / remove, WinUSB claim / release — egui.** Both were "view".
   The cabinet has five screens and none of them is devices; the only device
   string anywhere on that surface is a truncated board name inside the
@@ -189,6 +198,21 @@ Four cells were corrected, each against the code:
   live-input channel in Studio at any screen size — no feed on `AppState`, no
   frame type, nothing — and the cross-reference pointed at the wrong section
   (mobile is §8; §6 is launching).
+
+Two more were corrected on 2026-08-08, and this time by the guard rather than
+by a person reading the table — both in the direction that is cheaper to make
+and harder to notice, a face that SHIPPED while the cell still said `planned`:
+
+- **Edit config — Studio.** Was "planned primary". `/setup` and `/profiles`
+  have since shipped and the plan is the surface: `/setup/import` rewrites the
+  whole config root, `/setup/slot` posts the same `ControlSource::assign_slot`
+  that `ksx slot assign` performs, and `/profiles/new` writes a games.toml
+  profile through `MachineSource::profile_new`. **primary**, which is where the
+  bullet above already said it belonged.
+- **Device pick / remove — Studio.** Was "planned (#22)"; #22 shipped
+  `/devices`, `/devices/pick` and `/devices/remove`. The egui half stays planned
+  and drops the issue number, because #22 was never about the cabinet — its five
+  screens are still ButtonCheck, Status, Session, Profiles, Presets.
 
 ### §3a Why the pad verbs get a Studio face and WinUSB claim does not
 
