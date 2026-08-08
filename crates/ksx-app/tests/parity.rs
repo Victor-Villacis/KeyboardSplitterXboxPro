@@ -543,6 +543,13 @@ const ANCHORS: &[Anchors] = &[
 /// The reason is a field rather than a comment so that it reaches the failure
 /// message and so that an entry cannot land without one. "Nobody got round to
 /// it" is not on this list — that is the thing the guard is for.
+///
+/// The test for membership is *what makes the other surfaces the wrong place*,
+/// and it is a narrower test than "feels like plumbing". `ksx doctor` looks like
+/// an exemption and is not one: `StatusSnapshot` carries `vigem`,
+/// `interception`, `pads` and `autostart`, the egui's Status screen renders
+/// them and so does `/api/status`, which is precisely §3's "Is it working:
+/// pads, drivers" row. It is claimed there, not excused here.
 struct Exempt {
     verb: &'static str,
     /// The cargo feature that has to be on for this verb to exist at all.
@@ -561,9 +568,11 @@ const EXEMPT: &[Exempt] = &[
     Exempt {
         verb: "daemon",
         gate: None,
-        why: "Not a capability — the process the capabilities run inside. Its face is the \
-              tray icon it installs. A button that starts the thing serving the button is \
-              a bootstrap problem, not a surface gap.",
+        why: "Not a capability — the process the capabilities run inside, and its face is \
+              the tray icon it installs. Whether it is up is already on both other \
+              surfaces (`StatusSnapshot::daemon_running`). What is not is STARTING it, \
+              and a button that starts the thing serving the button is a bootstrap \
+              problem, not a surface gap.",
     },
     Exempt {
         verb: "install-drivers",
@@ -575,8 +584,10 @@ const EXEMPT: &[Exempt] = &[
     Exempt {
         verb: "autostart",
         gate: None,
-        why: "Writes a per-user Task Scheduler task once, when a cabinet is commissioned. \
-              A machine-lifecycle step, not something anyone performs while ksx runs.",
+        why: "Its STATE is already on both other surfaces (`StatusSnapshot::autostart`); \
+              what is CLI-only is the write, which registers a per-user Task Scheduler \
+              task once, when a cabinet is commissioned. A machine-lifecycle step, not \
+              something anyone performs while ksx runs.",
     },
     Exempt {
         verb: "studio",
