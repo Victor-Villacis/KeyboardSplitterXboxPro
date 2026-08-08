@@ -137,6 +137,7 @@ pub(crate) struct BrandAssets;
 /// the template, and the tests below fail the moment upstream grows a real
 /// hook or changes the markup — which is the point at which this should go
 /// away.
+///
 const ICON_LINKS: &str = concat!(
     r#"<link rel="icon" href="/favicon.svg" type="image/svg+xml">"#,
     r#"<link rel="icon" href="/favicon.ico" type="image/x-icon">"#,
@@ -156,28 +157,53 @@ pub(crate) fn with_icon_links(mut out: PageOutput) -> PageOutput {
     out
 }
 
-/// The oracle both page modules' tests use: every icon link is present, and
-/// every one of them is INSIDE `<head>`.
+/// The oracle every page module's tests use: the head carries the icon links
+/// this crate splices AND the viewport meta it does not — each inside
+/// `<head>`, the viewport exactly once.
 ///
-/// The inside-`<head>` half is the half that earns its keep. The links are
-/// spliced in after forma-server has rendered, so an upstream template change
-/// that moved or renamed `</head>` would drop three `<link>` elements into
-/// the body — where they do nothing whatsoever, and where the page looks
-/// completely normal.
+/// The inside-`<head>` half is the half that earns its keep for the icons:
+/// they are spliced in after forma-server has rendered, so an upstream
+/// template change that moved or renamed `</head>` would drop three `<link>`
+/// elements into the body — where they do nothing whatsoever, and where the
+/// page looks completely normal.
+///
+/// # Why an oracle in this crate asserts a tag this crate never writes
+///
+/// The viewport meta comes from `forma-server`'s own template
+/// (`template.rs`, both 0.1.4 and 0.2.0), and it was believed absent for a
+/// day: three separate greps — two reviewers' and the integrator's — searched
+/// `ksx-studio/src` and `studio-ui/src`, found nothing, and a task was filed
+/// to "add the one line that fixes phones". All three measured the SOURCE of
+/// a page whose head is assembled by a dependency; nobody read the OUTPUT.
+/// The duplicate splice that task produced was caught by this very
+/// exactly-once assertion, one commit old.
+///
+/// So it is pinned here, in the output, for both directions: if upstream ever
+/// drops the tag, phones break silently and this is the only tripwire; if
+/// anyone "adds" it again, two viewport metas is a browser picking one by a
+/// rule nobody reads. Either failure names this comment.
 #[cfg(test)]
-pub(crate) fn assert_icon_links_in_head(route: &str, html: &str) {
+pub(crate) fn assert_complete_head(route: &str, html: &str) {
     let head_end = html
         .find("</head>")
         .unwrap_or_else(|| panic!("{route}: rendered page has no </head>"));
-    for link in [
+    let viewport = r#"<meta name="viewport" content="width=device-width, initial-scale=1">"#;
+    assert_eq!(
+        html.matches(viewport).count(),
+        1,
+        "{route}: forma-server's template emits the viewport meta exactly once; \
+         see assert_complete_head's docs before touching this"
+    );
+    for extra in [
+        viewport,
         r#"<link rel="icon" href="/favicon.svg" type="image/svg+xml">"#,
         r#"<link rel="icon" href="/favicon.ico" type="image/x-icon">"#,
         r#"<link rel="apple-touch-icon" href="/apple-touch-icon.png">"#,
     ] {
         let at = html
-            .find(link)
-            .unwrap_or_else(|| panic!("{route}: missing icon link {link}"));
-        assert!(at < head_end, "{route}: {link} landed outside <head>");
+            .find(extra)
+            .unwrap_or_else(|| panic!("{route}: missing head element {extra}"));
+        assert!(at < head_end, "{route}: {extra} landed outside <head>");
     }
 }
 
@@ -1268,14 +1294,14 @@ mod tests {
     /// The status page declares all three icons, inside `<head>`. The mapper
     /// runs the same oracle from its own module.
     #[test]
-    fn icon_links_are_in_the_status_head() {
+    fn the_status_head_is_complete() {
         let out = render_status(
             &EmbeddedPage::load("/").unwrap(),
             &sample(),
             &idle_session(),
             None,
         );
-        assert_icon_links_in_head("/", &out.html);
+        assert_complete_head("/", &out.html);
     }
 
     #[test]

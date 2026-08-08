@@ -297,7 +297,7 @@ pub(crate) fn render_pads(page: &EmbeddedPage, payload: &PadsPayload) -> PageOut
 mod tests {
     use super::*;
     use crate::control::SessionView;
-    use crate::render::assert_icon_links_in_head;
+    use crate::render::assert_complete_head;
 
     /// The rendered document with the `__ksx-payload` data block removed.
     ///
@@ -526,7 +526,7 @@ mod tests {
         assert!(out.html.contains("ksx.exe (pid 4242)"));
         assert!(out.html.contains("ROOT\\SYSTEM\\0002"));
         assert!(out.html.contains("2026-08-07 12:00:00 UTC"));
-        assert_icon_links_in_head("/pads", &out.html);
+        assert_complete_head("/pads", &out.html);
         assert!(
             out.html.contains(
                 r#"<noscript><meta http-equiv="refresh" content="5; url=/pads"></noscript>"#

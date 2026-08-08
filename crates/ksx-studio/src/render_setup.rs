@@ -337,7 +337,7 @@ pub(crate) fn render_setup(
 mod tests {
     use super::*;
     use crate::control::{LearnView, SessionView};
-    use crate::render::{assert_icon_links_in_head, assert_island_slot_contract, payload_json};
+    use crate::render::{assert_complete_head, assert_island_slot_contract, payload_json};
     use crate::snapshot::SetupSnapshot;
     use ksx_api::{setup_states, setup_steps, SetupDeviceRow, SetupSlotRow, SetupStep, SetupView};
 
@@ -1081,9 +1081,9 @@ mod tests {
     }
 
     #[test]
-    fn icon_links_are_in_the_setup_head() {
+    fn the_setup_head_is_complete() {
         let out = render_setup(&EmbeddedPage::load("/setup").unwrap(), &configured(), None);
-        assert_icon_links_in_head("/setup", &out.html);
+        assert_complete_head("/setup", &out.html);
     }
 
     /// `SetupPayload::default()` is the DEFAULTED payload, which is a refused

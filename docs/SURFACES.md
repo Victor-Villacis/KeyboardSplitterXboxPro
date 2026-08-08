@@ -349,15 +349,25 @@ one phone use case that beats every other surface:
 phone in your hand shows which key fired.** That is ButtonCheck on a phone, and
 it is better than walking round to the monitor for every wire.
 
-Two corrections to how that reads, both of which change what the work *is*:
+Two corrections to how that reads — the first of which was itself wrong, and
+is kept because *how* it was wrong is this repo's most instructive audit
+failure to date:
 
-**"Responsive-only" currently means "not responsive at all."** There is no
-`<meta name="viewport">` anywhere in `studio-ui/` or `ksx-studio/assets`, so a
-phone lays the page out at a 980px virtual viewport and scales it down —
-CSS breakpoints never fire, and no amount of media-query work will make them.
-The viewport tag is the first line of this section's work, not a detail of it
-(task #28). It is one line in the page head, and it belongs to whoever is next
-in `render.rs`.
+**The viewport tag was never missing.** An earlier revision of this section
+said "responsive-only currently means not responsive at all: there is no
+`<meta name="viewport">` anywhere in `studio-ui/` or `ksx-studio/assets`", a
+task was filed to add the one line, and the line was added — producing a
+DUPLICATE, because `forma-server`'s own template (`template.rs`, 0.1.4 and
+0.2.0 alike) has emitted the tag on every page this crate ever rendered.
+Three separate greps reached the same false conclusion the same way: they
+searched the page's *source*, and the head of these pages is assembled by a
+dependency, so the truth was only ever in the *output*. The claim is now
+pinned where the truth lives — `render.rs::assert_complete_head` reads the
+rendered HTML and asserts the tag is present, in `<head>`, exactly once —
+and the lesson generalises: **an audit of a claim about output must read the
+output.** Breakpoints and media queries therefore already fire on phones;
+what they fire *against* is layouts nobody has tuned, which is the actual
+work (task #24).
 
 **ButtonCheck is not on Studio to be made responsive.** There is no live-input
 channel in `ksx-studio` at all — no feed on `AppState`, no frame type, no
@@ -365,10 +375,10 @@ handler. The strongest argument in this section therefore rests on a capability
 that exists only in the egui, and the first step is a backend-to-surface wiring
 job, not a CSS pass. §2's build order already says which comes first.
 
-Order follows that: viewport tag, then the live feed, then a responsive pass on
-`/` and status, `/map` last. Mapping asks you to press the key it is capturing,
-which a phone cannot do for a desk keyboard — so it is the least valuable page
-on the smallest screen.
+Order follows that: the live feed, then a responsive pass on `/` and status,
+`/map` last. Mapping asks you to press the key it is capturing, which a phone
+cannot do for a desk keyboard — so it is the least valuable page on the
+smallest screen.
 
 ## §9 User flows worth writing down
 

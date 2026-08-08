@@ -515,7 +515,7 @@ pub(crate) fn render_devices(
 mod tests {
     use super::*;
     use crate::control::SessionView;
-    use crate::render::assert_icon_links_in_head;
+    use crate::render::assert_complete_head;
     use ksx_api::{DeviceScanView, UsbRow};
 
     const PANEL: &str = r"USB\VID_D209&PID_0430&MI_00\7&25EEA38C&0&0000";
@@ -774,7 +774,7 @@ mod tests {
             "{}",
             out.html
         );
-        assert_icon_links_in_head("/devices", &out.html);
+        assert_complete_head("/devices", &out.html);
     }
 
     /// **Every list ITEM field the seam fills is bound, and every one the

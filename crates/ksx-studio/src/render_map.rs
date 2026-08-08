@@ -3456,9 +3456,9 @@ mod tests {
     /// through the shared oracle in `render.rs`, so the two pages cannot
     /// declare different icons.
     #[test]
-    fn icon_links_are_in_the_mapper_head() {
+    fn the_mapper_head_is_complete() {
         let out = render_map(&page(), &sample(), None);
-        crate::render::assert_icon_links_in_head("/map", &out.html);
+        crate::render::assert_complete_head("/map", &out.html);
     }
 
     /// The big one: real bindings from the payload land as key tags in the

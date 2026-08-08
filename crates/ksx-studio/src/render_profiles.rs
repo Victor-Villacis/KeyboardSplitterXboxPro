@@ -754,9 +754,9 @@ mod tests {
     }
 
     #[test]
-    fn icon_links_are_in_the_profiles_head() {
+    fn the_profiles_head_is_complete() {
         let out = render_profiles(&page(), &sample(), None);
-        crate::render::assert_icon_links_in_head("/profiles", &out.html);
+        crate::render::assert_complete_head("/profiles", &out.html);
     }
 
     /// A read that refused renders as a NOTE beside an empty list, never as an
