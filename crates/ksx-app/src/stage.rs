@@ -547,6 +547,63 @@ mod tests {
         assert_eq!(after.slots[2].preset, "Player 4");
     }
 
+    /// **A returning user's split-or-freeze answer is never overwritten by a
+    /// question nobody was asked.**
+    ///
+    /// `to_config` assigns `settings.block_keyboards` unconditionally, which is
+    /// correct — a save writes what the screen showed — and was a data-loss bug
+    /// for exactly as long as `commit()` could produce a `blocking` nobody had
+    /// chosen. It read `effective_blocking()` (`unwrap_or_default()` == Whole),
+    /// so a returning user who had chosen SPLIT, staged a second controller and
+    /// pressed Save got their keyboard frozen: the desk keyboard that was still
+    /// typing yesterday stops typing today, and nothing on screen ever asked.
+    ///
+    /// The fix is upstream and structural — `commit()` refuses an unanswered
+    /// question — so this test asserts the property through the same door a
+    /// surface uses: there is no reachable path from "not asked" to a written
+    /// value.
+    #[test]
+    fn an_unanswered_question_cannot_write_over_the_answer_already_on_disk() {
+        let root = TempRoot::new("blocking");
+        let store = root.store();
+
+        // Yesterday: this cabinet is SPLIT, so the keyboard still types.
+        let mut base = ConfigFile::default();
+        base.settings.block_keyboards = Blocking::BoundKeys;
+        store.save_config(&base).unwrap();
+
+        // Today: a device, a mapped controller, and §3 never asked.
+        let unasked = StagedSetup::new()
+            .choose_device(device())
+            .unwrap()
+            .add_slot(1, Persona::Xbox360, preset("Player 1", Key::A, XButton::A))
+            .unwrap();
+        assert_eq!(unasked.blocking(), None);
+        let refused = unasked.commit().unwrap_err();
+        assert_eq!(
+            refused.code(),
+            "blocking-unanswered",
+            "there must be no CommitSpec for an unasked question — that is the only \
+             thing standing between it and `to_config`"
+        );
+        assert_eq!(
+            store.load_config().unwrap().value.settings.block_keyboards,
+            Blocking::BoundKeys,
+            "the answer on disk is untouched"
+        );
+
+        // And when they DO answer, the answer is what lands — including the
+        // one that happens to equal the default, which must be written because
+        // it was chosen and not because it was assumed.
+        let spec = unasked.set_blocking(Blocking::Whole).commit().unwrap();
+        assert_eq!(spec.blocking, Blocking::Whole);
+        apply(&store, &spec).unwrap();
+        assert_eq!(
+            store.load_config().unwrap().value.settings.block_keyboards,
+            Blocking::Whole
+        );
+    }
+
     /// **A preset the save would replace is copied first.**
     ///
     /// Breaks against the shipped `apply`, which called `Store::save_preset`
