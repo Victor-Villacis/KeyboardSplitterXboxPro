@@ -389,22 +389,34 @@ impl DaemonState {
 
     /// Menu item labels + whether each is enabled right now.
     ///
-    /// **"Open cabinet UI" is first**, and that is the point of the M9 pass:
-    /// the tray's primary action is now the surface you can drive from the
-    /// machine, with Studio — the authoring surface, which needs a keyboard —
-    /// second. Start/Stop/Reload keep their place below both, because the
-    /// people who use those from the tray are already at a desk.
+    /// **"Open ksx" is first, and the tray draws it in bold.** The first item
+    /// is this menu's primary action (`tray::show_menu` passes index 0 to
+    /// `SetMenuDefaultItem`), so what sits there is not a matter of taste: the
+    /// tray is what a person sees at moment 3 of docs/FIRST-RUN.md §1, seconds
+    /// after an installer that offered them exactly one thing — the app. The
+    /// item that delivers that has to be the one their eye lands on.
     ///
-    /// The second item says **"Open ksx"**, not "Open Studio", because that is
-    /// what it now is: `crate::studio_launch` puts Studio in a chrome-less
-    /// window of its own, with its own taskbar button, and the name of the
-    /// application a person opened is "ksx" (docs/M9-DECISION.md §4). It runs
-    /// the same code `ksx open` runs.
+    /// It says "Open ksx", not "Open Studio", because that is what it is:
+    /// `crate::studio_launch` puts Studio in a chrome-less window of its own,
+    /// with its own taskbar button, and the name of the application a person
+    /// opened is "ksx" (docs/M9-DECISION.md §4 item 1). It runs the same code
+    /// `ksx open` runs.
+    ///
+    /// **"Open cabinet UI" is second**, and it is not demoted — it is aimed.
+    /// M9 put it first on the reasoning that it is the surface you can drive
+    /// *from the machine*; that is still true, and still why it is above
+    /// Start/Stop. But it is a 10-foot panel navigated by an arcade panel, and
+    /// a first-run user at a desk with a mouse who opens it first meets a
+    /// screen built for someone else. The person who wants it knows they want
+    /// it. The person at moment 3 does not.
+    ///
+    /// Start/Stop/Reload keep their place below both, because the people who
+    /// use those from the tray are already at a desk.
     pub fn menu(&self) -> Vec<(DaemonCommand, &'static str, bool)> {
         let running = matches!(self.run, RunState::Running { .. } | RunState::Starting);
         vec![
-            (DaemonCommand::OpenCabinet, "Open cabinet UI", true),
             (DaemonCommand::OpenStudio, "Open ksx", true),
+            (DaemonCommand::OpenCabinet, "Open cabinet UI", true),
             (
                 DaemonCommand::Start { game: None },
                 "Start emulation",
@@ -2350,8 +2362,9 @@ mod tests {
 
     #[test]
     fn the_menu_disables_what_cannot_be_done_right_now() {
-        // The two surfaces lead the menu (see the test below) and are always
-        // available; the session verbs sit behind them.
+        // The two surfaces lead the menu — "Open ksx" then "Open cabinet UI"
+        // (see the test below) — and are always available; the session verbs
+        // sit behind them.
         let start = 2;
         let stopped = DaemonState::default().menu();
         assert_eq!(
@@ -2573,23 +2586,33 @@ mod tests {
         }
     }
 
-    /// **The tray's primary action is the cabinet panel.** The M9 pass moved
-    /// it there deliberately: the first item is the surface you can drive from
-    /// the machine, and Studio — which needs a keyboard — is second.
+    /// **The tray's primary action is opening ksx.**
+    ///
+    /// Fails against the M9 order this replaced, which put
+    /// `OpenCabinet`/"Open cabinet UI" at index 0. That order was defensible
+    /// on its own terms and wrong in the flow: `tray::show_menu` makes index 0
+    /// the menu's DEFAULT item — the bold one — so a user two seconds out of
+    /// the installer, which offered them the app and nothing else
+    /// (docs/FIRST-RUN.md §4), was pointed at a 10-foot panel meant to be
+    /// driven by an arcade stick. Assert the whole pair, in order: getting
+    /// index 0 right by deleting index 1 would be a different bug.
     #[test]
-    fn the_trays_first_two_items_are_the_two_surfaces_in_order() {
+    fn the_trays_first_item_is_the_one_that_opens_ksx() {
         let menu = DaemonState::default().menu();
-        assert_eq!(menu[0].0, DaemonCommand::OpenCabinet);
-        assert_eq!(menu[0].1, "Open cabinet UI");
-        assert!(menu[0].2, "always available — it is how you look at ksx");
-        assert_eq!(menu[1].0, DaemonCommand::OpenStudio);
+        assert_eq!(menu[0].0, DaemonCommand::OpenStudio);
         // "Open ksx", not "Open Studio": the item opens an application window
         // with its own taskbar button, and the application a person opened is
         // called ksx (docs/M9-DECISION.md §4 item 1 — "tray → Open ksx"). It
         // is the same code path `ksx open` runs.
-        assert_eq!(menu[1].1, "Open ksx");
+        assert_eq!(menu[0].1, "Open ksx");
+        assert!(menu[0].2, "always available — it is how you look at ksx");
+        assert_eq!(menu[1].0, DaemonCommand::OpenCabinet);
+        assert_eq!(menu[1].1, "Open cabinet UI");
+        assert!(menu[1].2, "the cabinet is second, not conditional");
         // ...and Quit is still last, and still the tray's alone. Closing a
-        // window must never do what this item does.
+        // window must never do what this item does — and, since the default
+        // item is index 0, a bold "Quit" is a click away from ending a session
+        // by accident. Both are guarded by asserting the two ends.
         assert_eq!(
             menu.last().map(|item| item.0.clone()),
             Some(DaemonCommand::Quit)
