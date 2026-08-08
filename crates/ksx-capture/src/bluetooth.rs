@@ -43,8 +43,16 @@
 use ksx_core::{DeviceId, Reach, Transport};
 use ksx_platform::winusb::DeviceNode;
 
-/// The `BTHENUM` enumerator prefix — a paired Bluetooth device's service nodes.
-pub const BTHENUM: &str = "BTHENUM";
+/// The address parser and the enumerator name live beside the device tree in
+/// `ksx-platform`, not here.
+///
+/// Two consumers need the same answer, and a second copy would be a second
+/// answer: `ksx_platform::winusb::Survey` groups a Bluetooth keyboard's service
+/// nodes by address to decide what a claim would cost, and this module groups
+/// the device list by the same address. If those two ever disagreed, the list
+/// and the refusal would be describing different devices — the failure mode
+/// this crate's `regkey`/`vendors` consolidations already paid for twice.
+pub use ksx_platform::winusb::{bd_addr, BTHENUM};
 
 /// One Bluetooth device node, as seen without opening anything.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,51 +192,6 @@ pub fn candidates() -> std::io::Result<Vec<BtCandidate>> {
 /// Is this node a Bluetooth device's service node?
 fn is_bluetooth(node: &DeviceNode) -> bool {
     node.enumerator.eq_ignore_ascii_case(BTHENUM)
-}
-
-/// The Bluetooth device address inside an instance path, uppercased.
-///
-/// Two spellings appear on this machine and both are handled:
-///
-/// ```text
-/// BTHENUM\{00001124-…}_VID&0002045E_PID&0800\7&2A0B8CBA&0&001BDC0F1FE7_C00000000
-///                                                        ^^^^^^^^^^^^
-/// BTHENUM\Dev_001BDC0F1FE7\7&2A0B8CBA&0&BluetoothDevice_001BDC0F1FE7
-///             ^^^^^^^^^^^^
-/// ```
-///
-/// `None` rather than a partial match when nothing in the path is twelve hex
-/// digits: a wrong address would merge two different devices into one row,
-/// which is exactly the ambiguity the USB side's `ParentIdPrefix` join exists
-/// to avoid. Grouping alone is the honest fallback.
-pub fn bd_addr(node: &DeviceNode) -> Option<String> {
-    let key = node.device_key.to_uppercase();
-    if let Some(rest) = key.strip_prefix("DEV_") {
-        let addr: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
-        if is_bd_addr(&addr) {
-            return Some(addr);
-        }
-    }
-    // Otherwise the address is the last `&`-separated segment of the instance,
-    // up to the `_` that starts the per-service suffix.
-    let instance = node.instance.to_uppercase();
-    let tail = instance.rsplit('&').next()?;
-    let candidate = tail.split('_').find(|part| is_bd_addr(part))?;
-    Some(candidate.to_owned())
-}
-
-/// Twelve hex digits, and not the all-zero address.
-///
-/// The zero address is not a device. Measured on this machine: the LOCAL
-/// radio's own service nodes — `Bluetooth Peripheral Device`, `Virtual
-/// Bluetooth HID Device`, `Standard Serial over Bluetooth link (COM4)` — all
-/// spell `…&0&000000000000_0000000n`. Accepting it would file three unrelated
-/// pseudo-devices under one row named after whichever enumerated first, which
-/// is the SpinTrak-labelled-as-an-I-PAC failure in a different costume.
-fn is_bd_addr(text: &str) -> bool {
-    text.len() == 12
-        && text.chars().all(|c| c.is_ascii_hexdigit())
-        && text.chars().any(|c| c != '0')
 }
 
 #[cfg(test)]
