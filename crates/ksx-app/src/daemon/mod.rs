@@ -114,7 +114,13 @@ pub enum DaemonCommand {
     /// **Closing that window does not quit the daemon.** Quit stays here, on
     /// the tray.
     OpenCabinet,
-    /// Open ksx Studio in a browser, starting one if nothing is listening.
+    /// **Open ksx** — Studio in a chrome-less application window, starting a
+    /// Studio if nothing is listening (`crate::studio_launch`).
+    ///
+    /// The variant keeps the name of the surface it opens; the menu item is
+    /// labelled "Open ksx" because from the tray this IS ksx — the same thing
+    /// `ksx open` does, through the same code, so the item and the verb cannot
+    /// drift into two behaviours (docs/M9-DECISION.md §4 item 1).
     OpenStudio,
     /// Print the current state (headless mode's `status`).
     Status,
@@ -356,11 +362,17 @@ impl DaemonState {
     /// machine, with Studio — the authoring surface, which needs a keyboard —
     /// second. Start/Stop/Reload keep their place below both, because the
     /// people who use those from the tray are already at a desk.
+    ///
+    /// The second item says **"Open ksx"**, not "Open Studio", because that is
+    /// what it now is: `crate::studio_launch` puts Studio in a chrome-less
+    /// window of its own, with its own taskbar button, and the name of the
+    /// application a person opened is "ksx" (docs/M9-DECISION.md §4). It runs
+    /// the same code `ksx open` runs.
     pub fn menu(&self) -> Vec<(DaemonCommand, &'static str, bool)> {
         let running = matches!(self.run, RunState::Running { .. } | RunState::Starting);
         vec![
             (DaemonCommand::OpenCabinet, "Open cabinet UI", true),
-            (DaemonCommand::OpenStudio, "Open Studio", true),
+            (DaemonCommand::OpenStudio, "Open ksx", true),
             (
                 DaemonCommand::Start { game: None },
                 "Start emulation",
@@ -2435,7 +2447,11 @@ mod tests {
         assert_eq!(menu[0].1, "Open cabinet UI");
         assert!(menu[0].2, "always available — it is how you look at ksx");
         assert_eq!(menu[1].0, DaemonCommand::OpenStudio);
-        assert_eq!(menu[1].1, "Open Studio");
+        // "Open ksx", not "Open Studio": the item opens an application window
+        // with its own taskbar button, and the application a person opened is
+        // called ksx (docs/M9-DECISION.md §4 item 1 — "tray → Open ksx"). It
+        // is the same code path `ksx open` runs.
+        assert_eq!(menu[1].1, "Open ksx");
         // ...and Quit is still last, and still the tray's alone. Closing a
         // window must never do what this item does.
         assert_eq!(

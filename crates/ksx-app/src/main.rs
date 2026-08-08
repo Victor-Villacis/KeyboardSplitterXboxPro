@@ -920,6 +920,29 @@ enum Command {
         #[command(subcommand)]
         command: DeviceCommand,
     },
+    /// Open ksx: start the daemon if needed, then show Studio in its own window
+    ///
+    /// The friendly double-click, and what the Start-menu "ksx" entry runs.
+    /// It makes the machine ready before it shows you anything: probe the
+    /// daemon's control pipe and start `ksx daemon` if nothing answers, probe
+    /// Studio's port and start `ksx studio` if nothing answers, WAIT for each,
+    /// and only then open the window. Clicking a ksx shortcut must never be
+    /// able to produce ERR_CONNECTION_REFUSED (docs/M9-DECISION.md §4).
+    ///
+    /// The window is a chrome-less application window — no address bar, no
+    /// tabs, its own taskbar button — hosted by Microsoft Edge or Google
+    /// Chrome, whichever the App Paths registry names first, running in a
+    /// browser profile ksx owns under %LOCALAPPDATA%\ksx. With neither
+    /// installed it opens your default browser instead and says so.
+    ///
+    /// A daemon that will not start is a warning, not a failure: Studio's
+    /// read side needs no daemon, so the window still opens read-only behind
+    /// its "No daemon" banner — the recovery path for a wedged daemon.
+    ///
+    /// Exit codes: 0 = a window was opened, 1 = it could not be (Studio never
+    /// answered, or no browser could be started).
+    #[cfg(feature = "studio")]
+    Open,
     /// Serve the ksx Studio page on 127.0.0.1: cabinet status + session control
     ///
     /// One auto-refreshing page. The SESSION panel talks to a running `ksx
@@ -1563,6 +1586,8 @@ fn main() -> anyhow::Result<()> {
             dry_run,
             json,
         }),
+        #[cfg(feature = "studio")]
+        Command::Open => studio_launch::run(),
         #[cfg(feature = "studio")]
         Command::Studio { port } => studio::run(port),
         #[cfg(feature = "cabinet")]

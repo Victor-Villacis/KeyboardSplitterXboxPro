@@ -2,11 +2,11 @@
 //! best-effort: every failure is `None` (doctor must report on broken machines).
 
 use windows::core::PCWSTR;
-pub use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY, KEY_READ, RRF_RT_REG_DWORD,
     RRF_RT_REG_MULTI_SZ, RRF_RT_REG_QWORD, RRF_RT_REG_SZ,
 };
+pub use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 
 use crate::parse::parse_multi_sz;
 
