@@ -50,6 +50,7 @@ pub mod selector;
 pub mod slot;
 pub mod socd;
 pub mod templates;
+pub mod transport;
 pub mod vendors;
 
 pub use blocking::{Blocking, UnknownBlocking};
@@ -73,3 +74,4 @@ pub use selector::{DeviceFacts, DeviceRef, DeviceSelector, Match, Qualifier, Sel
 pub use slot::{InvalidSlotNumber, InvalidationReason, SlotSpec, MAX_SLOTS, MAX_XINPUT_SLOTS};
 pub use socd::{DirMechanism, OpposingPair, Pointing, Socd, UnknownSocd};
 pub use templates::{Template, TemplateError, MAX_TEMPLATE_PLAYERS, TEMPLATES};
+pub use transport::{Eligibility, Reach, Transport};
