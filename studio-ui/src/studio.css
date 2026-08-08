@@ -4485,3 +4485,134 @@ a.strow:hover {
     gap: var(--sp-1);
   }
 }
+
+/* ═══ §7 SCREEN — /check, the BUTTON CHECK ════════════════════════════════
+ *
+ * docs/MAPPER-UX.md Build C. This screen has exactly one job — press a panel
+ * key, watch every virtual control it drives light on every slot at once — and
+ * its whole layout follows from where it is read: a phone, held one-handed,
+ * behind a cabinet, while the other hand is on the panel.
+ *
+ * Hence: no absolute positioning, no controller geometry, one flowing grid of
+ * generous chips that reflows from four columns to one without a media query.
+ * `auto-fill` + `minmax` is doing the responsive work here — the responsive
+ * pass is a separate branch and this screen must not need it, nor fight it. */
+
+.check .keystrip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  min-height: 2.75rem;
+  align-items: center;
+}
+
+/* The one thing you are looking at from arm's length: which key just fired.
+ * Mono and BOLD is the keycap vocabulary the mapper's legend already uses, so
+ * a key on this screen looks like the same object as a key on that one. */
+.check .keyhit {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-md);
+  background: var(--accent-dim);
+}
+
+.check .keyname {
+  font-family: var(--mono);
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-bold);
+  letter-spacing: var(--track-mono);
+  color: var(--text-primary);
+}
+
+/* Which BOARD it came from. `--cool` because that is this design system's
+ * identity colour — a device name is an identity, not a state. */
+.check .keyfrom {
+  font-size: var(--fs-micro);
+  color: var(--cool);
+}
+
+.check .chipgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
+  gap: var(--sp-2);
+}
+
+/* 44px is the touch floor. A chip is not a button — nothing here is clickable
+ * yet — but it is read and pointed at by somebody holding a screwdriver, and
+ * sizing it below that would make the grid unreadable long before it made it
+ * untappable. */
+.check .chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 2.75rem;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+  transition: background-color 90ms linear, border-color 90ms linear;
+}
+
+.check .chipslot {
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--cool);
+}
+
+.check .chipname {
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  color: var(--text-primary);
+}
+
+.check .chipkeys {
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+/* HELD, and FLASHED-and-already-released, are the same colour on purpose:
+ * they answer one question ("did this control fire?") and the difference
+ * between them is a fact about timing, not about wiring. What separates them
+ * is duration — a hold stays lit while the button is down, a flash is 140 ms —
+ * and that reads correctly without needing a second colour to decode. */
+.check .chip.down,
+.check .chip.flash {
+  background: var(--accent-dim-2);
+  border-color: var(--accent);
+}
+
+.check .chip.down .chipname,
+.check .chip.flash .chipname {
+  color: var(--accent-strong);
+}
+
+/* A flash is a 140 ms class, so its fade has to be a transition ON THE WAY
+ * OUT, not an animation: an animation would restart mid-flight every time the
+ * same chip fired again, which is exactly what a turbo button does. */
+@media (prefers-reduced-motion: reduce) {
+  .check .chip {
+    transition: none;
+  }
+}
+
+/* Loss and off-panel keys are REPORTED, in the warning colour, above the grid.
+ * Hiding either is the failure this whole stream is built to avoid. */
+.check .warnline {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--warn-line);
+  border-radius: var(--r-md);
+  background: var(--warn-dim);
+  color: var(--warn);
+  font-size: var(--fs-sm);
+}
+
+.check .feedcard .dvalue {
+  font-size: var(--fs-lg);
+}

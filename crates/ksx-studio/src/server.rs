@@ -37,17 +37,19 @@ use serde::Deserialize;
 use crate::control::{BindOutcome, BindRequest, ControlSource, SessionView};
 use crate::error::StudioError;
 use crate::render::{render_status, Assets, BrandAssets, EmbeddedPage};
+use crate::render_check::render_check;
 use crate::render_devices::render_devices;
 use crate::render_map::render_map;
 use crate::render_setup::render_setup;
 use crate::snapshot::{
-    DevicesPayload, MapPayload, PadsPayload, ProfilesPayload, SetupPayload, SetupSnapshot,
-    StatusPayload, StatusSnapshot, StatusSource,
+    CheckPayload, DevicesPayload, MapPayload, PadsPayload, ProfilesPayload, SetupPayload,
+    SetupSnapshot, StatusPayload, StatusSnapshot, StatusSource,
 };
 
 struct AppState {
     page: EmbeddedPage,
     map_page: EmbeddedPage,
+    check_page: EmbeddedPage,
     pads_page: EmbeddedPage,
     devices_page: EmbeddedPage,
     profiles_page: EmbeddedPage,
@@ -103,6 +105,7 @@ pub fn serve(
     }
     let page = EmbeddedPage::load("/")?;
     let mapper = EmbeddedPage::load("/map")?;
+    let check = EmbeddedPage::load("/check")?;
     let pads = EmbeddedPage::load("/pads")?;
     let devices = EmbeddedPage::load("/devices")?;
     let profiles = EmbeddedPage::load("/profiles")?;
@@ -110,6 +113,7 @@ pub fn serve(
     let state = Arc::new(AppState {
         page,
         map_page: mapper,
+        check_page: check,
         pads_page: pads,
         devices_page: devices,
         profiles_page: profiles,
@@ -194,6 +198,14 @@ pub fn serve(
             // `MachineSource` verb each, and the arming step is a GET
             // (`/pads?confirm=1`) because showing someone what a destructive
             // button will remove must not itself be a POST.
+            // BUILD C — the button check, one click from the mapper. Two
+            // routes and no verbs: the page is a READ of the slot roster, and
+            // the lighting-up arrives on /api/live beside it rather than
+            // through either of these. Nothing here writes, so nothing here
+            // needs the guard's mutating arm — the Host check still covers it,
+            // which is what stops a rebound origin watching the panel.
+            .route("/check", get(check_page))
+            .route("/api/check", get(api_check))
             // ── THE LIVE FEED ─────────────────────────────────────────────
             // One route, and it is the keystone the button check stands on:
             // the daemon's input fan-out as Server-Sent Events. Read-only and
@@ -1763,6 +1775,67 @@ async fn pads_page(State(state): State<Arc<AppState>>, Query(query): Query<PadsQ
 /// the confirm panel could reappear after the user had walked away from it.
 async fn api_pads(State(state): State<Arc<AppState>>) -> Response {
     let payload = collect_pads(&state, false).await;
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        axum::Json(payload),
+    )
+        .into_response()
+}
+
+/// One fresh [`CheckPayload`]: the slot roster and the session, on a blocking
+/// worker like every other collector read.
+///
+/// Deliberately the SAME `StatusSource::mapper()` the mapper page calls. The
+/// button check's control roster is a preset's binding table — there is no
+/// second read of it and no second shape for it, so a preset edit made on
+/// /map is on /check at the next roster poll with nothing to keep in step.
+async fn collect_check(state: &Arc<AppState>) -> CheckPayload {
+    let check_state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        crate::render_check::payload(check_state.source.mapper(), check_state.control.session())
+    })
+    .await
+    .unwrap_or_else(|_| {
+        crate::render_check::payload(
+            ksx_api::MapperSnapshot::unavailable("reading the slots panicked"),
+            SessionView::unreachable("reading the slots panicked"),
+        )
+    })
+}
+
+/// `GET /check` — BUILD C, the button check (docs/MAPPER-UX.md).
+///
+/// The document is the binding table, read from disk; the lighting-up is
+/// `/api/live` beside it. Both halves are needed and only one of them is here
+/// — see `crate::render_check` for why that split IS the page.
+async fn check_page(State(state): State<Arc<AppState>>) -> Response {
+    let payload = collect_check(&state).await;
+    let out = render_check(&state.check_page, &payload);
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_str(&out.csp)
+                    .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'")),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        out.html,
+    )
+        .into_response()
+}
+
+/// The roster poller's endpoint — the same [`CheckPayload`] the /check page
+/// embeds as island props (parity unit-tested in render_check.rs).
+///
+/// Polled every few SECONDS, not at display rate: this is the structure, and
+/// the structure only changes when somebody edits a preset.
+async fn api_check(State(state): State<Arc<AppState>>) -> Response {
+    let payload = collect_check(&state).await;
     (
         [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
         axum::Json(payload),
