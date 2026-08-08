@@ -293,11 +293,18 @@ profile. Anything requiring text entry belongs elsewhere.
 
 Studio binds `127.0.0.1` and refuses anything else — `ksx-studio/src/error.rs`
 returns `NonLoopbackBind` rather than serving a LAN address. Its **pages** are
-`/` (status), `/map` (the mapper), `/pads` (the ViGEm bus and its two verbs),
-`/devices` (the picker), `/profiles` (profiles & presets) and `/setup` (the
-configuration).
+`/` (status), `/map` (the mapper), `/check` (the button check), `/pads` (the
+ViGEm bus and its two verbs), `/devices` (the picker), `/profiles` (profiles &
+presets) and `/setup` (the configuration).
 
-Six pages, dozens of routes: the rest are the `/api/*` reads, the mutating
+`/check` is the one page that performs no verb at all, and the one fed by a
+channel that is not the control pipe: `GET /api/live` is Server-Sent Events
+over the daemon's own outbound-only feed pipe, which is what lets a press on
+the panel light a control in a browser at display rate. It is still a VIEW —
+it writes nothing, and it decides nothing, because its whole control roster is
+`MapperSlot::bindings`' key set arriving from the backend (§1).
+
+Seven pages, dozens of routes: the rest are the `/api/*` reads, the mutating
 form endpoints, the service worker, the asset handler and three icons. The
 distinction is not pedantry — it is the whole reason the CSRF guard is one
 layer over the router rather than a check per handler, because "the mapper

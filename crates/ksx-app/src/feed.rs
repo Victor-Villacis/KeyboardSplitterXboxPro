@@ -13,8 +13,9 @@
 //!                                            │
 //!                     ┌──────────────────────┼───────────────────────┐
 //!                     ▼                      ▼                       ▼
-//!             cabinet button check     Studio live socket        E8 light bus
-//!             (LiveSubscription)          (later)                  (later)
+//!             cabinet button check     Studio (SSE, via the      E8 light bus
+//!             (LiveSubscription)       live pipe — daemon/          (later)
+//!                                      live_pipe.rs)
 //! ```
 //!
 //! # The three properties, and how each one is structural rather than promised

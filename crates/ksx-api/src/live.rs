@@ -3,7 +3,7 @@
 //! This module is the *shape* of the stream. The sink that fills it lives in
 //! `ksx-app` (`crate::feed`), because it owns the pipeline; the shape lives
 //! here so that every consumer names one set of types — the cabinet's button
-//! check today, Studio's live socket and E8's feedback bus next
+//! check and Studio's `/check` today, E8's feedback bus next
 //! (docs/ENHANCEMENTS.md E8: "the feedback consumer is a BUS, not a lamp
 //! driver"; docs/MAPPER-UX.md Build C: "same socket feeds the E8 light bus and
 //! the 3D viewer later — one stream, three consumers").
@@ -38,8 +38,10 @@ use serde::{Deserialize, Serialize};
 /// One coalesced picture of the running pipeline, as of the instant a consumer
 /// asked for it.
 ///
-/// Serializable so that Studio's future live socket carries exactly this and
-/// not a fourth description of the same facts.
+/// Serializable because Studio's live feed carries exactly this and not a
+/// fourth description of the same facts: the daemon writes it onto
+/// [`LIVE_PIPE_NAME`] inside a [`LiveEnvelope`], Studio re-emits it verbatim as
+/// an SSE `frame` event, and the browser parses this struct.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveFrame {
     /// A session is running and this frame describes it. `false` means the
