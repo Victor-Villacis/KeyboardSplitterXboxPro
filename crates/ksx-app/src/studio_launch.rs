@@ -121,10 +121,12 @@ pub enum Window {
 ///
 /// **Local, not roaming, and not the config root.** ksx's configuration lives
 /// in `%APPDATA%\ksx` because it is small, hand-editable TOML a user might
-/// legitimately sync between machines. A Chromium profile is neither: it is
-/// hundreds of megabytes of cache, cookies and a code cache keyed to one
-/// installation, and putting it beside `config.toml` would roam all of that
-/// and bury the four files a human is meant to edit.
+/// legitimately sync between machines. A Chromium profile is neither: **63 MB
+/// after one open**, measured here on 2026-08-08 by running exactly the argv
+/// below, and it is cache and a code cache keyed to one installation — so it
+/// grows, and none of it means anything on another machine. Beside
+/// `config.toml` it would roam all of that and bury the handful of files a
+/// human is meant to edit.
 pub fn profile_dir(local_appdata: &Path) -> PathBuf {
     local_appdata.join("ksx").join("browser-profile")
 }

@@ -1110,12 +1110,14 @@ impl ksx_api::MachineSource for LocalMachine {
     /// Reuses the tray's own launcher, deliberately.
     ///
     /// `crate::studio_launch::open` already carries the property that makes
-    /// this honest — probe, start if needed, WAIT for the port, only then hand
-    /// the URL to the shell — and a second launch path would be a second place
-    /// for that ordering to be got wrong. It returns immediately and does the
-    /// waiting on its own thread, which is also what the cabinet needs: this is
-    /// called from the worker thread, but eight seconds of port-polling is not
-    /// something to hold even a worker on.
+    /// this honest — probe, start if needed, WAIT for the port, and only then
+    /// open anything — and a second launch path would be a second place for
+    /// that ordering to be got wrong. Since M9 it opens a chrome-less
+    /// application window rather than a browser tab, and the cabinet gets that
+    /// for free precisely because it did not grow a launcher of its own. It
+    /// returns immediately and does the waiting on its own thread, which is
+    /// also what the cabinet needs: this is called from the worker thread, but
+    /// eight seconds of port-polling is not something to hold even a worker on.
     #[cfg(feature = "studio")]
     fn open_studio(&self) -> Result<String, Refusal> {
         // `open` narrates to a writer for the tray's console. This caller has
