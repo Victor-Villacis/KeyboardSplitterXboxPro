@@ -901,11 +901,11 @@ fn the_guard_is_still_bound_to_the_documents_and_the_tree_it_reads() {
     // Nothing is lost by narrowing it. A `owns` cell whose verb was renamed or
     // deleted still fails, one test up, in
     // `every_cell_claiming_a_shipped_face_has_one` — with a better message.
+    let bound = anchors();
     let shipped_cli: BTreeSet<&str> = matrix()
         .iter()
         .filter(|row| classify(&row.cli) == Claim::Shipped)
-        .filter_map(|row| anchored.contains(&row.capability).then(|| row))
-        .filter_map(|row| ANCHORS.iter().find(|a| key(a.capability) == row.capability))
+        .filter_map(|row| bound.get(&row.capability))
         .flat_map(|a| a.cli.iter().copied())
         .collect();
     for verb in &shipped_cli {
