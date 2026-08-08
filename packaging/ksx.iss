@@ -8,10 +8,11 @@
 ; The output lands in packaging\out\ksx-<version>-setup.exe.
 ;
 ; The feature flags are not optional for a SHIPPED build: the Start-menu
-; entries below run `ksx studio` and `ksx cabinet`, and both subcommands only
-; exist when their feature is on (docs/ENHANCEMENTS.md E7 rule A — the default
-; build links neither UI, which is the right default for a headless cabinet
-; and the wrong one for an installer aimed at a desktop).
+; entries below run `ksx open`, `ksx studio` and `ksx cabinet`, and those
+; subcommands only exist when their feature is on (docs/ENHANCEMENTS.md E7
+; rule A — the default build links neither UI, which is the right default for
+; a headless cabinet and the wrong one for an installer aimed at a desktop).
+; `open` is gated with `studio` because it is Studio it opens.
 ;
 ; ---------------------------------------------------------------------------
 ; What this installer does and does not do
@@ -122,13 +123,25 @@ Source: "{#RepoRoot}\docs\*.md";        DestDir: "{app}\docs"; Flags: ignorevers
 ; the icon group as resource 1 (crates\ksx-app\build.rs). A separate
 ; IconFilename pointing at a copied .ico would be a second thing to keep in
 ; step, and the first one to go stale.
-Name: "{group}\{#AppName}";              Filename: "{app}\{#AppExe}"; Parameters: "daemon"; Comment: "Start the ksx tray daemon"
-; `studio` and `cabinet` exist only in a build carrying those features — see
-; the build line in the header.
-Name: "{group}\{#AppName} Studio";       Filename: "{app}\{#AppExe}"; Parameters: "studio"; Comment: "Open ksx Studio in a browser"
+;
+; THE PLAIN "ksx" ENTRY RUNS `open`, NOT `daemon` (docs/M9-DECISION.md §4
+; item 1). It used to run the daemon, which put a tray icon on screen and
+; nothing else: the entry a person double-clicks appeared to do nothing, and
+; the way to actually see ksx was to type a URL. `open` starts the daemon if
+; one is not running, waits for it and for Studio, and then shows a window.
+;
+; The old behaviour keeps an entry of its own rather than being deleted:
+; starting the tray daemon WITHOUT opening a window is what you want on a
+; cabinet, over RDP, or when Studio is not the point.
+Name: "{group}\{#AppName}";                    Filename: "{app}\{#AppExe}"; Parameters: "open"; Comment: "Open ksx"
+Name: "{group}\{#AppName} daemon (tray only)"; Filename: "{app}\{#AppExe}"; Parameters: "daemon"; Comment: "Start the ksx tray daemon without opening a window"
+; `open`, `studio` and `cabinet` exist only in a build carrying those features
+; — see the build line in the header. This entry SERVES Studio and opens
+; nothing; the window is what "ksx" above is for.
+Name: "{group}\{#AppName} Studio (serve only)"; Filename: "{app}\{#AppExe}"; Parameters: "studio"; Comment: "Serve ksx Studio on 127.0.0.1:4460 for another device to open"
 Name: "{group}\{#AppName} cabinet";      Filename: "{app}\{#AppExe}"; Parameters: "cabinet"; Comment: "The 10-foot cabinet panel"
 Name: "{group}\{#AppName} setup wizard"; Filename: "{app}\{#AppExe}"; Parameters: "setup"; Comment: "First-run setup"
-Name: "{autodesktop}\{#AppName}";        Filename: "{app}\{#AppExe}"; Parameters: "daemon"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppName}";        Filename: "{app}\{#AppExe}"; Parameters: "open"; Tasks: desktopicon
 
 [Registry]
 ; PATH, machine-wide, appended — `uninsdeletevalue` on a shared key would be

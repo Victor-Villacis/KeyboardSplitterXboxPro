@@ -3,9 +3,10 @@
 
 use windows::core::PCWSTR;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_DWORD,
+    RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY, KEY_READ, RRF_RT_REG_DWORD,
     RRF_RT_REG_MULTI_SZ, RRF_RT_REG_QWORD, RRF_RT_REG_SZ,
 };
+pub use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 
 use crate::parse::parse_multi_sz;
 
@@ -35,7 +36,21 @@ pub fn key_exists(subkey: &str) -> bool {
 
 /// REG_SZ / REG_EXPAND_SZ (auto-expanded by RegGetValueW) under HKLM.
 pub fn read_string(subkey: &str, value: &str) -> Option<String> {
-    let raw = read_raw(subkey, value, RRF_RT_REG_SZ.0)?;
+    read_string_under(HKEY_LOCAL_MACHINE, subkey, value)
+}
+
+/// The same read under an explicit root.
+///
+/// Everything else in this module asks HKLM, because driver state is machine
+/// state. `App Paths` is the exception: an application installed by a user who
+/// is not an administrator registers itself under HKCU and appears nowhere in
+/// HKLM (`crate::app_paths`), so a HKLM-only reader would report a browser
+/// that is sitting on the machine as absent.
+///
+/// An empty `value` reads the key's **default** value, which is where
+/// `App Paths` keeps the executable's full path.
+pub fn read_string_under(root: HKEY, subkey: &str, value: &str) -> Option<String> {
+    let raw = read_raw_under(root, subkey, value, RRF_RT_REG_SZ.0)?;
     let units: Vec<u16> = raw
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -64,6 +79,10 @@ pub fn read_u64(subkey: &str, value: &str) -> Option<u64> {
 }
 
 fn read_raw(subkey: &str, value: &str, rrf_type: u32) -> Option<Vec<u8>> {
+    read_raw_under(HKEY_LOCAL_MACHINE, subkey, value, rrf_type)
+}
+
+fn read_raw_under(root: HKEY, subkey: &str, value: &str, rrf_type: u32) -> Option<Vec<u8>> {
     use windows::Win32::System::Registry::REG_ROUTINE_FLAGS;
     let sub = wide(subkey);
     let val = wide(value);
@@ -71,7 +90,7 @@ fn read_raw(subkey: &str, value: &str, rrf_type: u32) -> Option<Vec<u8>> {
     let mut len: u32 = 0;
     let err = unsafe {
         RegGetValueW(
-            HKEY_LOCAL_MACHINE,
+            root,
             PCWSTR(sub.as_ptr()),
             PCWSTR(val.as_ptr()),
             flags,
@@ -86,7 +105,7 @@ fn read_raw(subkey: &str, value: &str, rrf_type: u32) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; len as usize];
     let err = unsafe {
         RegGetValueW(
-            HKEY_LOCAL_MACHINE,
+            root,
             PCWSTR(sub.as_ptr()),
             PCWSTR(val.as_ptr()),
             flags,
