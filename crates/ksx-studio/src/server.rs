@@ -31,8 +31,10 @@ use crate::error::StudioError;
 use crate::render::{render_status, Assets, BrandAssets, EmbeddedPage};
 use crate::render_devices::render_devices;
 use crate::render_map::render_map;
+use crate::render_setup::render_setup;
 use crate::snapshot::{
-    DevicesPayload, MapPayload, ProfilesPayload, StatusPayload, StatusSnapshot, StatusSource,
+    DevicesPayload, MapPayload, ProfilesPayload, SetupPayload, SetupSnapshot, StatusPayload,
+    StatusSnapshot, StatusSource,
 };
 
 struct AppState {
@@ -40,12 +42,14 @@ struct AppState {
     map_page: EmbeddedPage,
     devices_page: EmbeddedPage,
     profiles_page: EmbeddedPage,
+    setup_page: EmbeddedPage,
     source: Box<dyn StatusSource>,
     control: Box<dyn ControlSource>,
     /// The MACHINE reads and writes that are not a `DaemonCommand`: the
     /// device enumeration and the two `[[device]]` writes behind `/devices`,
-    /// the preflighted profile list, the preset list with its templates, and
-    /// the two creates behind `/profiles`. A THIRD provider rather than more
+    /// the preflighted profile list, the preset list with its templates, the
+    /// two creates behind `/profiles`, and the config in and out plus the
+    /// first-run state behind `/setup`. A THIRD provider rather than more
     /// methods on the other two, because that is the split `ksx-api` already
     /// draws — status is what the box looks like, control is what the daemon
     /// can be told, and this is what is on the machine itself (the USB tree
@@ -76,11 +80,13 @@ pub fn serve(
     let mapper = EmbeddedPage::load("/map")?;
     let devices = EmbeddedPage::load("/devices")?;
     let profiles = EmbeddedPage::load("/profiles")?;
+    let setup = EmbeddedPage::load("/setup")?;
     let state = Arc::new(AppState {
         page,
         map_page: mapper,
         devices_page: devices,
         profiles_page: profiles,
+        setup_page: setup,
         source,
         control,
         machine,
@@ -180,6 +186,41 @@ pub fn serve(
             .route("/profiles/new", post(profiles_form_new))
             .route("/profiles/switch", post(profiles_form_switch))
             .route("/profiles/preset/new", post(profiles_form_preset_new))
+            // ── /setup — the CONFIG FIRST, and the first run ───────────────
+            // Two verbs a person sees (Export, Import) and three steps, each
+            // one backend verb. No route here takes a filesystem path, in or
+            // out: the export IS the bytes and the import IS the document, so
+            // nothing on this page ever asks anyone to name a file.
+            .route("/setup", get(setup_screen))
+            .route("/api/setup", get(api_setup))
+            // A GET on purpose: it writes nothing, and `guard.rs` decides what
+            // to police by METHOD — a read wearing a POST would be a lie the
+            // guard then has to work around. The Host check still covers it.
+            .route("/setup/export.json", get(setup_export))
+            // DRY RUN unless the form's "write it" box is ticked
+            // (`ksx_api::ImportRequest::apply`), which is the CLI's consent
+            // shape and not a web-only ceremony.
+            //
+            // The one route with its own body limit. axum's default is 2 MB,
+            // and a whole cabinet — config, every games.toml profile and every
+            // preset in one interop document — can exceed it; the cost of the
+            // default was a bare 413 with no way back to the page. 8 MB is
+            // roomy for a configuration and still a bound, and the handler
+            // turns the rejection into a flashed sentence either way.
+            .route(
+                "/setup/import",
+                post(setup_form_import)
+                    .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+            )
+            // Step 2: one `ControlSource::assign_slot` — the same pipe verb
+            // `ksx slot assign` performs. It BOUNCES the pads, which the page
+            // says before the click, not after it.
+            .route("/setup/slot", post(setup_form_slot))
+            // Step 3: the daemon's own learner, the two verbs the mapper
+            // already uses. The page renders `learn_poll` per request, so this
+            // step works with scripting switched off.
+            .route("/setup/prove", post(setup_form_prove))
+            .route("/setup/prove/cancel", post(setup_form_prove_cancel))
             // Canon helper: correct no-cache + Service-Worker-Allowed
             // headers for free (replaced a hand-rolled handler).
             .route("/sw.js", get(forma_server::sw::serve_sw::<Assets>))
@@ -1057,6 +1098,60 @@ async fn collect_devices(state: &Arc<AppState>) -> DevicesPayload {
     })
 }
 
+// ── /setup: the config first, and the first run ────────────────────────────
+//
+// Two verbs a user sees. EXPORT hands back a file; IMPORT takes a document.
+// Neither takes a path — `ksx_api::MachineSource::{config_export,
+// config_import}` are in-memory on purpose, so no screen has to put a
+// filesystem in front of someone who asked for their configuration.
+//
+// Three steps, each ONE backend verb, and each independently resumable: none of
+// them is a wizard step, so there is no half-written state to come back to.
+// Step 1 belongs to `/devices` and is a link. Steps 2 and 3 are the POSTs
+// below.
+
+/// One fresh setup payload. The machine read hits the config store and the two
+/// control calls hit the daemon pipe — blocking work, kept off the async
+/// workers exactly like [`collect`].
+async fn collect_setup(state: &Arc<AppState>) -> SetupPayload {
+    let setup_state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let setup = match setup_state.machine.setup_state() {
+            Ok(view) => SetupSnapshot::ready(view),
+            // A refusal is a FACT to render, not a blank page: "this build has
+            // no machine provider" and "this machine has nothing configured"
+            // want opposite advice.
+            Err(refusal) => SetupSnapshot::unavailable(&refusal.message),
+        };
+        SetupPayload {
+            setup,
+            session: setup_state.control.session(),
+            // Step 3's whole read. Doing it here rather than in client code is
+            // what makes "press a button and watch it land" work with
+            // scripting off — the <noscript> refresh repaints the key.
+            learn: setup_state.control.learn_poll(),
+            flash: None,
+            ..SetupPayload::default()
+        }
+        // The page's sentences and its show booleans, composed from the three
+        // reads above (snapshot.rs). Composed HERE means the poller's JSON and
+        // the server paint carry the identical words — the client derives
+        // none of them.
+        .composed()
+    })
+    .await
+    .unwrap_or_else(|_| {
+        SetupPayload {
+            setup: SetupSnapshot::unavailable("the setup collection panicked"),
+            session: SessionView::unreachable("the setup collection panicked"),
+            learn: crate::control::LearnView::unavailable("the setup collection panicked"),
+            flash: None,
+            ..SetupPayload::default()
+        }
+        .composed()
+    })
+}
+
 async fn devices_page(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DevicesQuery>,
@@ -1087,11 +1182,47 @@ async fn devices_page(
         .into_response()
 }
 
+async fn setup_screen(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PageQuery>,
+) -> Response {
+    let payload = collect_setup(&state).await;
+    let flash = query.flash.as_deref().filter(|f| !f.trim().is_empty());
+    let out = render_setup(&state.setup_page, &payload, flash);
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_str(&out.csp)
+                    .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'")),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        out.html,
+    )
+        .into_response()
+}
+
 /// The poller's endpoint: the SAME [`DevicesPayload`] shape the page embeds
 /// (parity unit-tested in render_devices.rs). `flash` is always null — a poll
 /// is not an action.
 async fn api_devices(State(state): State<Arc<AppState>>) -> Response {
     let payload = collect_devices(&state).await;
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        axum::Json(payload),
+    )
+        .into_response()
+}
+
+/// The setup poller's endpoint — the same [`SetupPayload`] the page embeds
+/// (parity pinned in render_setup.rs).
+async fn api_setup(State(state): State<Arc<AppState>>) -> Response {
+    let payload = collect_setup(&state).await;
     (
         [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
         axum::Json(payload),
@@ -1186,6 +1317,286 @@ async fn devices_form_remove(
     .await
     .unwrap_or_else(|_| Err("the device removal panicked".to_owned()));
     devices_redirect(outcome)
+}
+
+/// 303 back to /setup with the outcome as the flash. Errors flash too — this
+/// page must never fail silently, and its no-JS path has nowhere else to look.
+fn setup_redirect(outcome: Result<String, String>) -> Response {
+    let flash = match outcome {
+        Ok(message) => message,
+        Err(error) => format!("error: {error}"),
+    };
+    Redirect::to(&format!("/setup?flash={}", urlencode(&flash))).into_response()
+}
+
+/// Comma-separated form words → the `what` list the api verbs take. Empty means
+/// "whatever the document carries" / "the whole root", which is what both verbs
+/// already document.
+fn what_words(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    /// `config,games,presets` — absent means the whole root.
+    what: Option<String>,
+}
+
+/// GET /setup/export.json — the configuration as a download.
+///
+/// A GET because it writes nothing (see the route comment). The response is the
+/// document itself with a `Content-Disposition`, which is what makes an
+/// ordinary `<a download>` work with scripting switched off — no blob, no
+/// clipboard, no path to type.
+async fn setup_export(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ExportQuery>,
+) -> Response {
+    let what = what_words(query.what.as_deref());
+    let outcome = tokio::task::spawn_blocking(move || {
+        state
+            .machine
+            .config_export(&ksx_api::ExportRequest { what })
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(ksx_api::Refusal::new(
+            ksx_api::codes::REFUSED,
+            "the export panicked",
+        ))
+    });
+
+    let export = match outcome {
+        Ok(export) => export,
+        // Back to the page with the reason, rather than a bare error body: the
+        // user clicked a link on a page, so the page is where the answer goes.
+        Err(refusal) => return setup_redirect(Err(refusal.message)),
+    };
+
+    let disposition = format!("attachment; filename=\"{}\"", export.filename);
+    let mut response = export.document.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disposition)
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+/// Every field optional on purpose. A missing one is a REFUSAL WITH A SENTENCE
+/// (303 + `?flash=error: …`), not axum's 422 — this page's whole feedback
+/// channel with scripting off is the flash, and a bare status page would
+/// dead-end the user with nothing to read.
+#[derive(Deserialize)]
+struct ImportForm {
+    #[serde(default)]
+    document: Option<String>,
+    #[serde(default)]
+    what: Option<String>,
+    /// The "write it" box. Present at all = ticked (HTML omits an unchecked box
+    /// entirely), so an absent field is a DRY RUN — which is the consent shape
+    /// `ksx config import` has always had, arriving here for free.
+    #[serde(default)]
+    apply: Option<String>,
+    #[serde(default)]
+    force: Option<String>,
+}
+
+/// POST /setup/import — one `MachineSource::config_import`.
+///
+/// The report is structured; the flash is one line (`urlencode` caps at 300
+/// characters). What the line carries is chosen rather than truncated: a
+/// refusal names the FIRST fault and how many more there are, because the
+/// commonest way an import fails is a document that will not validate, and
+/// telling the owner of this page to go and run a CLI to read a list the page
+/// is already holding is the dead end this screen exists to remove.
+///
+/// The extractor is a `Result` on purpose. Every refusal on this route is a
+/// flashed sentence — that is the whole feedback channel with scripting off —
+/// so an over-large paste or a wrong content type has to arrive as one too,
+/// rather than as axum's bare 413/415 with no way back to the page.
+async fn setup_form_import(
+    State(state): State<Arc<AppState>>,
+    form: Result<Form<ImportForm>, axum::extract::rejection::FormRejection>,
+) -> Response {
+    let Ok(Form(form)) = form else {
+        return setup_redirect(Err(
+            "that document could not be read — it may be larger than this page accepts \
+             (8 MB). Import it with `ksx config import <file>` instead"
+                .to_owned(),
+        ));
+    };
+    let request = ksx_api::ImportRequest {
+        document: form.document.unwrap_or_default(),
+        what: what_words(form.what.as_deref()),
+        apply: form.apply.is_some(),
+        force: form.force.is_some(),
+    };
+    if request.document.trim().is_empty() {
+        return setup_redirect(Err(
+            "nothing to import — paste a configuration into the box first".to_owned(),
+        ));
+    }
+    let outcome = tokio::task::spawn_blocking(move || state.machine.config_import(&request))
+        .await
+        .unwrap_or_else(|_| {
+            Err(ksx_api::Refusal::new(
+                ksx_api::codes::REFUSED,
+                "the import panicked",
+            ))
+        });
+    setup_redirect(match outcome {
+        Ok(report) if report.ok => Ok(import_flash(&report)),
+        Ok(report) => Err(import_flash(&report)),
+        Err(refusal) => Err(refusal.message),
+    })
+}
+
+/// One [`ksx_api::ImportReport`] as the sentence this page flashes.
+///
+/// The backend composes the fact and names no control (`onboard::import`); each
+/// surface adds its own. Here that is two things the report cannot know: the
+/// label on THIS page's consent box, and the first of the faults it is holding.
+fn import_flash(report: &ksx_api::ImportReport) -> String {
+    let mut line = report.summary.clone();
+    if let Some(first) = report.faults.first() {
+        line.push_str(&format!(" First: {first}"));
+        let rest = report.faults.len() - 1;
+        if rest > 0 {
+            line.push_str(&format!(" (+{rest} more)"));
+        }
+    } else if report.ok && !report.applied {
+        // A clean dry run. The backend said what it WOULD do and that nothing
+        // was written; "write it" is the name of the box on this page and
+        // nowhere else.
+        line.push_str(" Tick \"write it\" and import again to apply.");
+    }
+    line
+}
+
+#[derive(Deserialize)]
+struct SetupSlotForm {
+    /// Optional so a malformed post is a flashed refusal rather than a 422 —
+    /// same rule as [`ImportForm`].
+    #[serde(default)]
+    slot: Option<u8>,
+    #[serde(default)]
+    preset: Option<String>,
+    /// The `<select>`'s "(this cabinet's config)" sentinel is the empty string:
+    /// no profile, so `config.toml`'s `[[slot]]` list.
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+/// POST /setup/slot — step 2, one `ControlSource::assign_slot` (pipe
+/// `slot-assign`, the same verb `ksx slot assign` performs).
+///
+/// `reload` is asked for, and unlike every other reload on this protocol it is
+/// a BOUNCE: the pads replug. The page says so above the button, because after
+/// the click is too late to be told.
+async fn setup_form_slot(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<SetupSlotForm>,
+) -> Response {
+    let preset = form.preset.unwrap_or_default().trim().to_owned();
+    if preset.is_empty() {
+        return setup_redirect(Err(
+            "no preset picked — a slot has to point at one".to_owned()
+        ));
+    }
+    let Some(slot) = form.slot else {
+        return setup_redirect(Err(
+            "no slot picked — choose which player this preset is for".to_owned(),
+        ));
+    };
+    let request = ksx_api::SlotAssignRequest {
+        slot,
+        preset,
+        profile: form
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned),
+        reload: true,
+    };
+    let outcome = tokio::task::spawn_blocking(move || state.control.assign_slot(&request))
+        .await
+        .unwrap_or_else(|_| {
+            crate::control::SlotOutcome::failed(
+                "the control call panicked",
+                "run `ksx slot assign --slot N --preset NAME`",
+            )
+        });
+    setup_redirect(slot_flash(outcome))
+}
+
+/// One [`crate::control::SlotOutcome`] as the sentence this page flashes.
+///
+/// **The canonical formatters, not a second reconstruction.**
+/// [`ksx_api::SlotOutcome::headline`] is the designated one-line renderer and
+/// is what the cabinet (`ksx-cabinet/src/app.rs`) and the daemon
+/// (`ksx-app/src/daemon/pipe.rs`) print; `refusal()` is the matching one for
+/// the error arm, and it carries the CODE and the remedy that a hand-built
+/// `unwrap_or` throws away.
+///
+/// This used to rebuild the sentence from flags — `message` then `if restarted
+/// { push(" The pads replugged.") }` — which is the exact re-derivation
+/// `control.rs::a_slot_outcome_prints_what_the_daemon_said_rather_than_re_deriving_it`
+/// forbids by name. It went wrong three ways: it double-named the bounce when
+/// the daemon's own sentence already named it, it lost slot/preset/`unchanged`
+/// when there was no sentence, and it had no way to say "nothing was running,
+/// so nothing had to restart" — which is the state this page's own wire form is
+/// offered in, because it turns on `reachable`, not `running`.
+fn slot_flash(outcome: crate::control::SlotOutcome) -> Result<String, String> {
+    match outcome.refusal() {
+        Some(refusal) => Err(refusal.message),
+        None => Ok(outcome.headline()),
+    }
+}
+
+/// POST /setup/prove — step 3, `ControlSource::learn_start` (pipe `learn-key`).
+///
+/// The daemon's own learner, unchanged: the mapper's "press a key" dialog is
+/// the same two verbs. Nothing new is listening to a keyboard here.
+async fn setup_form_prove(State(state): State<Arc<AppState>>) -> Response {
+    let outcome = tokio::task::spawn_blocking(move || state.control.learn_start())
+        .await
+        .unwrap_or_else(|_| crate::control::LearnView::unavailable("the control call panicked"));
+    setup_redirect(learn_flash(
+        outcome,
+        "Listening — press a button on the panel.",
+    ))
+}
+
+/// POST /setup/prove/cancel — `ControlSource::learn_cancel`.
+async fn setup_form_prove_cancel(State(state): State<Arc<AppState>>) -> Response {
+    let outcome = tokio::task::spawn_blocking(move || state.control.learn_cancel())
+        .await
+        .unwrap_or_else(|_| crate::control::LearnView::unavailable("the control call panicked"));
+    setup_redirect(learn_flash(outcome, "Stopped listening."))
+}
+
+fn learn_flash(view: crate::control::LearnView, done: &str) -> Result<String, String> {
+    match view.refusal() {
+        Some(refusal) => Err(refusal.message),
+        None => Ok(done.to_owned()),
+    }
 }
 
 #[derive(Deserialize)]

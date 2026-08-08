@@ -207,15 +207,24 @@ profile. Anything requiring text entry belongs elsewhere.
 ## §5 Studio is the workbench
 
 Studio binds `127.0.0.1` and refuses anything else — `ksx-studio/src/error.rs`
-returns `NonLoopbackBind` rather than serving a LAN address. It currently has
-two **pages**, `/` and `/map`.
+returns `NonLoopbackBind` rather than serving a LAN address. Its **pages** are
+`/` (status), `/map` (the mapper), `/devices` (the picker), `/profiles`
+(profiles & presets) and `/setup` (the configuration).
 
-Two pages, twenty-seven routes: the rest are `/api/status`, fourteen mutating
-`/api/*` and `/map/*` endpoints, the service worker, the asset handler and three
-icons. The distinction is not pedantry — it is the whole reason the CSRF guard
-is one layer over the router rather than a check per handler, because "the
-mapper alone grew eight form endpoints in three milestones" and the failure mode
+Five pages, dozens of routes: the rest are the `/api/*` reads, the mutating
+form endpoints, the service worker, the asset handler and three icons. The
+distinction is not pedantry — it is the whole reason the CSRF guard is one
+layer over the router rather than a check per handler, because "the mapper
+alone grew eight form endpoints in three milestones" and the failure mode
 being prevented is forgetting one.
+
+`/setup` is where the config itself lives, and it has exactly **two verbs**:
+Export downloads the whole root as one JSON document, Import pastes one back
+(dry run unless the write box is ticked — `ksx config import`'s consent shape,
+unchanged). Neither takes a path: `MachineSource::config_export|config_import`
+are in-memory on purpose, because a person who asked a page for their
+configuration should not be handed a directory to go and find. A config root
+appears on that page once, in small print, for a bug report to quote.
 
 `/map` is good enough to stop treating as supplemental tooling. Authoring a
 25-binding preset is a pointer-and-keyboard task and the browser is simply
@@ -317,7 +326,13 @@ on the smallest screen.
 Four journeys carry nearly all the product's surface area:
 
 1. **First-time setup** — no config: find the board, name it, claim it, wire a
-   slot, prove a button lights.
+   slot, prove a button lights. **Studio's `/setup`** (§5): the checklist is
+   decided in the backend (`ksx-app::onboard::plan_steps`, pure) and rendered,
+   never re-derived per surface; each step is one backend verb, and the board
+   step LINKS to the devices screen instead of duplicating it. Every step is
+   resumable because none of them is a wizard step: each reads the config as it
+   stands and writes one complete thing, so an abandoned run leaves a valid
+   config rather than a half-written one.
 2. **Change a mapping** — running cabinet, one binding is wrong.
 3. **"It doesn't work"** — the diagnostic path, which must terminate in a cause
    and not a shrug.
@@ -336,7 +351,8 @@ crossing is a design smell worth a second look.
   surface decision gets re-taken deliberately instead of by whoever adds the
   field.
 - **Device pick UI** — Studio, following the existing CLI verb (§3). Also the
-  egui: §3 row 3 no longer claims a view exists there.
+  egui: §3 row 3 no longer claims a view exists there. `/setup`'s first step
+  links to `/devices` rather than growing a second picker.
 - **`ksx games new` — the CLI half of profile creation, owed.** Studio's
   `/profiles` page creates a games.toml profile through
   `MachineSource::profile_new` over a pure plan in `ksx-app`'s `profile_edit`

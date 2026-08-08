@@ -196,6 +196,54 @@ pub trait MachineSource: Send + Sync {
         ))
     }
 
+    /// The first-run state: what the config root already holds, and which of
+    /// the onboarding steps is next.
+    ///
+    /// The STEPS are part of the answer on purpose. "Which step comes next" is
+    /// a decision about configuration, and docs/SURFACES.md §1 puts decisions
+    /// in the backend — a surface that worked it out from the rows would be a
+    /// second, silently diverging copy of the rule the moment a fifth step
+    /// exists.
+    fn setup_state(&self) -> Result<SetupView, Refusal> {
+        Err(Refusal::not_here(
+            "reading the first-run state",
+            "run `ksx setup`",
+        ))
+    }
+
+    /// `ksx config export` — the config root as ONE interop JSON document,
+    /// **in memory**.
+    ///
+    /// Deliberately not a path. The CLI's export writes to stdout or to a file
+    /// because that is what a shell can consume; a surface that offers the user
+    /// a DOWNLOAD needs the bytes, and giving it a path instead would put the
+    /// filesystem back in front of a person who asked for a file (which is the
+    /// whole reason `/setup` exists). Same `ksx_config::interop` machinery
+    /// underneath either way — there is no second serializer.
+    fn config_export(&self, _request: &ExportRequest) -> Result<ConfigExport, Refusal> {
+        Err(Refusal::not_here(
+            "exporting the configuration",
+            "run `ksx config export`",
+        ))
+    }
+
+    /// `ksx config import` — a document in, **dry run unless
+    /// [`ImportRequest::apply`]**.
+    ///
+    /// The consent shape is load-bearing and is the CLI's, unchanged
+    /// (`ksx-app/src/config_io.rs`): a first call reports exactly which files
+    /// it would create and which it would overwrite, every overwrite leaves a
+    /// timestamped `.bak`, and validation faults refuse the write unless
+    /// [`ImportRequest::force`] says otherwise. A surface may not skip the dry
+    /// run — replacing a cabinet's whole configuration is not a thing to do on
+    /// one click.
+    fn config_import(&self, _request: &ImportRequest) -> Result<ImportReport, Refusal> {
+        Err(Refusal::not_here(
+            "importing a configuration",
+            "run `ksx config import`",
+        ))
+    }
+
     /// Get ksx Studio on screen — start it if nothing is listening, wait for
     /// the port to answer, then hand the URL to the shell.
     ///
@@ -966,6 +1014,233 @@ pub struct AdviceRow {
     pub remedy: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// First run, and the config in/out that has no path in it
+// ---------------------------------------------------------------------------
+
+/// Stable [`SetupStep::id`] values, in the order a first run performs them.
+///
+/// Named constants because a surface routes on them (the board step is a link
+/// to the devices screen, the prove step is a button that starts the learner),
+/// and a typo in a match arm would silently render a step nobody can act on.
+pub mod setup_steps {
+    /// Find the board and give it a name — one `[[device]]` entry.
+    pub const BOARD: &str = "board";
+    /// Point a slot at a preset — one `[[slot]]`, or one `[[game.slot]]`.
+    pub const SLOT: &str = "slot";
+    /// Press a button and watch ksx name it.
+    pub const PROVE: &str = "prove";
+}
+
+/// Stable [`SetupStep::state`] values.
+pub mod setup_states {
+    /// Already true of this machine — nothing to do.
+    pub const DONE: &str = "done";
+    /// The next thing to do.
+    pub const NOW: &str = "now";
+    /// Real, but an earlier step has to happen first.
+    pub const LATER: &str = "later";
+}
+
+/// The first run, as a surface reads it: what is already configured, and what
+/// the next step is.
+///
+/// The `now` step is the backend's decision and every implementation owes the
+/// same invariant — exactly one step is next, always. It is held where a real
+/// implementation can be driven against it: `ksx-app`'s
+/// `onboard::exactly_one_step_is_next_for_every_state_of_the_machine`, which
+/// runs `plan_steps` over every combination of the three counts. A hand-built
+/// `SetupView` asserted against here would only test the `vec!` literal beside
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupView {
+    pub generated_at: String,
+    /// **Support detail, never an interface.** A person setting a cabinet up
+    /// does not operate on a directory — they import, export, and follow the
+    /// steps. This is here so a bug report can quote it, and it belongs in
+    /// small print.
+    pub config_root: String,
+    /// A `config.toml` (or `config.json`) is really on disk. `false` is the
+    /// first-run state, and it is not an error.
+    pub config_exists: bool,
+    /// `[[device]]` entries — the boards this cabinet has been told about.
+    pub devices: Vec<SetupDeviceRow>,
+    /// Every wired slot, from `config.toml` and from every games.toml profile.
+    pub slots: Vec<SetupSlotRow>,
+    /// Preset names on disk.
+    pub presets: Vec<String>,
+    /// games.toml profile titles.
+    pub profiles: Vec<String>,
+    /// The onboarding checklist, ordered, with exactly one step in
+    /// [`setup_states::NOW`] while anything is left to do.
+    pub steps: Vec<SetupStep>,
+    /// Anything the read has to say out loud (a games.toml that would not
+    /// parse) — rendered, never swallowed.
+    pub notes: Vec<String>,
+    /// **The highest slot number this build accepts** — `ksx_core::MAX_SLOTS`,
+    /// carried so a surface can offer the slots the daemon would actually take.
+    ///
+    /// Here rather than in the view code for the reason docs/SURFACES.md §1
+    /// gives: "which slots exist" is a decision about configuration, and a
+    /// surface that answers it from a constant of its own is a second copy of
+    /// the rule. Task #17 lifted this number from an arbitrary 8 and had to
+    /// chase three frozen `1..=8` literals to do it; a menu built from this
+    /// field cannot become the fourth.
+    #[serde(default = "default_max_slots")]
+    pub max_slots: u8,
+}
+
+/// The ceiling a document that predates the field gets — the real one, never
+/// zero. A missing field means "an older ksx wrote this", not "no slots".
+fn default_max_slots() -> u8 {
+    ksx_core::MAX_SLOTS
+}
+
+impl Default for SetupView {
+    /// Hand-written for one field: `max_slots` defaults to the ceiling this
+    /// build really has. A derived `Default` would hand every caller a zero,
+    /// and a zero renders as a slot menu with nothing in it.
+    fn default() -> Self {
+        Self {
+            generated_at: String::new(),
+            config_root: String::new(),
+            config_exists: false,
+            devices: Vec::new(),
+            slots: Vec::new(),
+            presets: Vec::new(),
+            profiles: Vec::new(),
+            steps: Vec::new(),
+            notes: Vec::new(),
+            max_slots: default_max_slots(),
+        }
+    }
+}
+
+/// One `[[device]]` entry, as the setup page shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupDeviceRow {
+    /// The name the user gave it — what slots refer to.
+    pub alias: String,
+    /// The selector it resolves through. Long and machine-shaped: small print.
+    pub id: String,
+    /// `interception` | `winusb`.
+    pub backend: String,
+}
+
+/// One wired slot.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupSlotRow {
+    pub number: u8,
+    /// The `[[device]]` alias (or the raw selector, in a games.toml profile),
+    /// or `(any)` when the slot takes whatever is plugged in.
+    pub device: String,
+    pub preset: String,
+    pub persona: String,
+    /// `config.toml`, or the games.toml profile title this slot lives in.
+    pub source: String,
+}
+
+/// One step of the first run.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupStep {
+    /// One of [`setup_steps`] — what a surface routes on.
+    pub id: String,
+    pub title: String,
+    /// What is true about this step RIGHT NOW, in one sentence.
+    pub detail: String,
+    /// One of [`setup_states`].
+    pub state: String,
+}
+
+/// What to export. Empty `what` is the whole root.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportRequest {
+    /// `config` | `games` | `presets`; empty = all three.
+    #[serde(default)]
+    pub what: Vec<String>,
+}
+
+/// One exported document, held in memory rather than written anywhere.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigExport {
+    /// A suggested name for whatever the surface does with the bytes.
+    pub filename: String,
+    /// The document — interop JSON (TOML stays canonical on disk).
+    pub document: String,
+    pub bytes: usize,
+    /// Which parts it carries: `config`, `games`, `presets`.
+    pub parts: Vec<String>,
+    /// How many presets travelled with it.
+    pub presets: usize,
+    /// Anything the read had to say (unknown keys in a file, a shadowed
+    /// `.json`) — said out loud, never swallowed.
+    pub warnings: Vec<String>,
+}
+
+/// One import attempt. `apply` false — the default — is a DRY RUN.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportRequest {
+    /// The document itself. A bare (un-enveloped) document needs `what` to
+    /// name what it is, exactly as the CLI does — importing the wrong file
+    /// over the wrong file is the failure this verb exists to prevent.
+    pub document: String,
+    #[serde(default)]
+    pub what: Vec<String>,
+    /// **Write.** Absent or false reports what would happen and changes
+    /// nothing.
+    #[serde(default)]
+    pub apply: bool,
+    /// Write even though validation found faults (advisories never block).
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// What an import did, or would do.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportReport {
+    /// The verb ended the way it was asked to. A DRY RUN with a clean plan is
+    /// `true`; a write refused by validation faults and a write that stopped
+    /// half way are both `false`.
+    ///
+    /// A separate field from [`applied`](Self::applied) so no surface has to
+    /// re-derive "did this go wrong" from two other booleans and get it
+    /// subtly different from the next surface.
+    pub ok: bool,
+    /// Files were really written. `false` is a dry-run report — or a refusal.
+    pub applied: bool,
+    /// ONE sentence, short enough to survive a redirect's `?flash=` — the
+    /// no-JavaScript path has nowhere else to put it.
+    pub summary: String,
+    /// The write that stopped a half-finished import. The paths in
+    /// [`written`](Self::written) ARE on disk; the rest are not.
+    pub error: Option<String>,
+    pub parts: Vec<String>,
+    /// Every file the import touches, whether or not it was applied.
+    pub writes: Vec<ImportWrite>,
+    /// Validation faults in the configuration this import would produce.
+    /// Non-empty and `force` unset means nothing was written.
+    pub faults: Vec<String>,
+    /// Validation advisories — never blocking, always shown.
+    pub advisories: Vec<String>,
+    pub warnings: Vec<String>,
+    /// Paths really written (empty on a dry run).
+    pub written: Vec<String>,
+    /// The `.bak-YYYYMMDD-HHMMSS` copies taken first — the road home.
+    pub backups: Vec<String>,
+}
+
+/// One file an import touches.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportWrite {
+    /// `config` | `games` | `presets`.
+    pub part: String,
+    pub path: String,
+    /// `create` | `overwrite`.
+    pub action: String,
+    /// `toml` | `json` — the format the file KEEPS, not the document's.
+    pub format: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,6 +1286,19 @@ mod tests {
             (
                 "ksx winusb release",
                 Nothing.winusb_release("ID").unwrap_err(),
+            ),
+            ("ksx setup", Nothing.setup_state().unwrap_err()),
+            (
+                "ksx config export",
+                Nothing
+                    .config_export(&ExportRequest::default())
+                    .unwrap_err(),
+            ),
+            (
+                "ksx config import",
+                Nothing
+                    .config_import(&ImportRequest::default())
+                    .unwrap_err(),
             ),
         ];
         for (command, refusal) in checks {
@@ -1266,5 +1554,56 @@ mod tests {
         let view = scan(true, vec![lying]);
         assert!(!view.boards[0].pickable);
         assert_eq!(view.pickable_boards, 0);
+    }
+
+    /// The import consent shape, as a TYPE rather than as a review note: an
+    /// [`ImportRequest`] a surface builds — or deserializes from a form that
+    /// simply omitted the box — writes nothing at all. `apply` has to be said.
+    #[test]
+    fn an_import_request_is_a_dry_run_until_someone_says_so() {
+        assert!(!ImportRequest::default().apply);
+        assert!(!ImportRequest::default().force);
+        let off_the_wire: ImportRequest =
+            serde_json::from_str(r#"{"document":"{}"}"#).expect("minimal request");
+        assert!(
+            !off_the_wire.apply && !off_the_wire.force,
+            "a document with no consent fields must not write: {off_the_wire:?}"
+        );
+    }
+
+    /// The slot ceiling a surface renders is THIS build's, never zero and never
+    /// a number the view code picked.
+    ///
+    /// Two ways it can go wrong and both are covered: a derived `Default`
+    /// (`max_slots: 0`, a slot menu with nothing in it) and a plain
+    /// `#[serde(default)]` on the field, which turns a document written by an
+    /// older ksx into the same zero. Either regression fails here; both were
+    /// live in the version that hardcoded the menu at eight.
+    ///
+    /// (The old test in this slot built a `SetupView` with one `now` step and
+    /// then asserted it had one `now` step — it tested the `vec!` literal three
+    /// lines above it. The invariant it claimed to hold is really held in
+    /// ksx-app, against `plan_steps`; see [`SetupView`].)
+    #[test]
+    fn the_slot_ceiling_a_surface_renders_is_this_builds_max_slots() {
+        assert_eq!(SetupView::default().max_slots, ksx_core::MAX_SLOTS);
+        assert!(ksx_core::MAX_SLOTS > 0);
+
+        // A document from a ksx that predates the field.
+        let older: SetupView = serde_json::from_str(
+            r#"{"generated_at":"","config_root":"","config_exists":false,
+                 "devices":[],"slots":[],"presets":[],"profiles":[],"steps":[],"notes":[]}"#,
+        )
+        .expect("an older document must still deserialize");
+        assert_eq!(
+            older.max_slots,
+            ksx_core::MAX_SLOTS,
+            "a missing ceiling means 'an older ksx wrote this', not 'no slots'"
+        );
+
+        // …and it survives the round trip a surface actually makes.
+        let wire = serde_json::to_string(&SetupView::default()).unwrap();
+        let back: SetupView = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.max_slots, ksx_core::MAX_SLOTS);
     }
 }

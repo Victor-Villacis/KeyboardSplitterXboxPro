@@ -419,6 +419,7 @@ export function DevicesIsland() {
           "Devices",
         ),
         h("a", { class: "navlink", href: "/profiles" }, "Profiles"),
+        h("a", { class: "navlink", href: "/setup" }, "Setup"),
       ),
       createShow(
         () => pillRunning(),
