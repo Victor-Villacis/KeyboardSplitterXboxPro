@@ -592,6 +592,25 @@ const KEYBOARD_2P: &[Row] = &[
         button(XButton::Back),
         [Key::Tab, Key::Numpad0, Key::None, Key::None],
     ),
+    // GUIDE, and it is not decoration. `docs/FIRST-RUN.md` moment 7 ends with
+    // "Guide opens Game Bar so they can launch a game without leaving it" —
+    // which is how someone whose keyboard has just become a controller starts
+    // the game at all. A layout that binds every other button and not this one
+    // strands them: the pad works, and there is no way to reach a game with it.
+    //
+    // `keyboard-wasd` already bound it (`LeftWindows`) and this layout did not,
+    // which is the inconsistency rather than the choice — every persona exposes
+    // Guide, so a desktop layout omitting it is an oversight.
+    //
+    // P1 keeps `LeftWindows`, matching `keyboard-wasd` so the two desktop
+    // layouts agree. P2 gets `NumpadAsterisk`: it is inside the numpad half
+    // this layout already gives them, so pressing it does not mean reaching
+    // across the other player's hands — the same rule the Start/Back comment
+    // above states.
+    row(
+        button(XButton::Guide),
+        [Key::LeftWindows, Key::NumpadAsterisk, Key::None, Key::None],
+    ),
 ];
 
 /// Every in-box template, in the order `ksx preset list --templates` prints

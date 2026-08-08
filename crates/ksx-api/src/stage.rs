@@ -533,18 +533,55 @@ pub fn preset_name_for_slot(number: u8) -> String {
     format!("Player {number}")
 }
 
-/// The layout id "Add a controller" offers first: the first roster entry that
-/// actually binds something.
+/// The layout id "Add a controller" offers first.
 ///
-/// Read off the roster rather than spelled, so a build whose first template
-/// changed cannot end up offering a blank one by default — which would put a
-/// first-run user one click from a pad that does nothing.
+/// # Why this is a NAME and not "the first roster entry"
+///
+/// It used to be `roster().find(|l| !l.blank)`, which is declaration order
+/// wearing a rule's clothing: it returned `arcade-6button` because that
+/// `Template` happens to be written first in `ksx_core::templates`. So the
+/// person `docs/FIRST-RUN.md` is about — at a desk, on the keyboard they
+/// already own — was offered an I-PAC six-button *cabinet* chart, keyed to
+/// arrows plus `LeftControl/LeftAlt/Space/Z/X` and `1`/`5` for start and coin.
+///
+/// Two things fell out of that, and the second is why this is a defect rather
+/// than a preference:
+///
+/// 1. It is the wrong chart for the machine. An arcade template describes a
+///    panel wired to an encoder's factory chart, and a laptop is not one.
+/// 2. **It silently broke FIRST-RUN.md moment 7.** No arcade template binds
+///    `Guide` — a real panel has no spare button for it — so the promise that
+///    "Guide opens Game Bar so they can launch a game without leaving it"
+///    could not happen on the default path, and a user whose keyboard had just
+///    become a controller had no way to reach a game with it.
+///
+/// # Why `keyboard-2p` and not `keyboard-wasd`
+///
+/// `keyboard-wasd` binds Guide and was the obvious pick, and it is wrong: it is
+/// `players: 1`. Staging a second controller takes the layout's SECOND player
+/// block, and a one-player layout has none — so slot 2 fell back to another
+/// chart and the two collided on `D`. A test already guarded that ("two players
+/// on one panel must not share a key") and caught it.
+///
+/// `keyboard-2p` is the two-player desktop layout, so slot 2 is a real second
+/// half rather than a fallback — and it now binds Guide too (`LeftWindows` /
+/// `NumpadAsterisk`), which it should have from the start: every persona
+/// exposes Guide, so a desktop layout omitting it was an oversight rather than
+/// a decision.
+///
+/// An arcade owner still picks their chart in one click. They came here knowing
+/// they have a cabinet, which is exactly the knowledge a first-run desktop user
+/// does not have.
+const DEFAULT_LAYOUT: &str = "keyboard-2p";
+
 fn default_layout() -> String {
-    TemplateRow::roster()
-        .into_iter()
-        .find(|layout| !layout.blank)
-        .map(|layout| layout.id)
-        .unwrap_or_default()
+    debug_assert!(
+        TemplateRow::roster()
+            .iter()
+            .any(|layout| layout.id == DEFAULT_LAYOUT && !layout.blank),
+        "DEFAULT_LAYOUT must name a roster entry that binds something"
+    );
+    DEFAULT_LAYOUT.to_owned()
 }
 
 /// One in-box layout as a real preset, or the refusal that names what to send.
@@ -1053,11 +1090,20 @@ mod tests {
         // Slot 2 takes the layout's SECOND player block, so a two-player panel
         // gives two players different keys without anybody being asked what a
         // "player block" is.
+        //
+        // BOTH slots take `view.default_layout`, and that is the point: this
+        // asserted non-collision across a hardcoded `"arcade-6button"` and
+        // whatever the default happened to be, which passed only while those
+        // two were the same string. When the default moved it failed — not
+        // because the property broke, but because two DIFFERENT charts share
+        // keys by construction and always did. The invariant worth holding is
+        // the one the comment above describes: one layout, two players, no
+        // overlap.
         let two = StageEdit::AddSlot {
             number: None,
             persona: "playstation".into(),
             preset: "Player 2".into(),
-            layout: Some("arcade-6button".into()),
+            layout: Some(view.default_layout.clone()),
         }
         .apply(&setup)
         .unwrap();
@@ -1248,5 +1294,43 @@ mod tests {
         // The tag is the field a surface switches on.
         let text = serde_json::to_string(&StageEdit::Discard).unwrap();
         assert_eq!(text, r#"{"edit":"discard"}"#);
+    }
+    /// **FIRST-RUN.md moment 7, and the reason `DEFAULT_LAYOUT` is a name.**
+    ///
+    /// Moment 7 promises "Guide opens Game Bar so they can launch a game
+    /// without leaving it". A first-run user never chooses a layout — they take
+    /// the offered one — so if that layout does not bind Guide, the promise is
+    /// one the flow cannot keep and nothing anywhere says so.
+    ///
+    /// Fails against the previous `roster().find(|l| !l.blank)`: that returned
+    /// `arcade-6button`, which binds Start and Back and no Guide, because a
+    /// real arcade panel has no spare button for one.
+    #[test]
+    fn the_offered_layout_binds_guide_because_moment_7_promises_it() {
+        let offered = default_layout();
+        let preset = instantiate(&offered, "Player 1", 1, None)
+            .expect("the offered layout must instantiate");
+        assert!(
+            preset
+                .entries
+                .iter()
+                .any(|entry| format!("{:?}", entry).contains("Guide")),
+            "the layout offered to a first-run user ({offered}) binds no Guide, so              FIRST-RUN.md moment 7 cannot happen on the default path"
+        );
+    }
+
+    /// The offered layout must also actually bind something — the property the
+    /// old roster scan was protecting, kept now that the id is spelled.
+    #[test]
+    fn the_offered_layout_is_never_a_blank_one() {
+        let offered = default_layout();
+        let row = TemplateRow::roster()
+            .into_iter()
+            .find(|layout| layout.id == offered)
+            .expect("DEFAULT_LAYOUT must name a real roster entry");
+        assert!(
+            !row.blank,
+            "{offered} is blank: one click from a pad that does nothing"
+        );
     }
 }
