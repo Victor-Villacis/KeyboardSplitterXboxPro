@@ -801,8 +801,16 @@ fn play_live(request: PlayRequest) -> anyhow::Result<()> {
         json,
     } = request;
 
-    if !json {
-        print!("{}", render_human(&play, &file, speed, looping));
+    // What is about to drive what, before anything is plugged. In `--json` mode
+    // this goes to stderr rather than being dropped — stdout owes that mode
+    // exactly one object, but a remap that silently changed which board the
+    // recording drives is not a thing to keep to ourselves. Same split the
+    // escape banner uses.
+    let report = render_human(&play, &file, speed, looping);
+    if json {
+        eprint!("{report}");
+    } else {
+        print!("{report}");
     }
 
     let progress = ReplayProgress::default();
