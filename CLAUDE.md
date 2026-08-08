@@ -120,6 +120,11 @@ cheap and local — it is Node, not rustc.)
   build if a cited section stops existing. Renumbering breaks all of them.
 - **`.iss` files**: never write a Pascal `{ }` comment containing `{app}` —
   Inno ends the comment at the first `}`. Use `//`. This broke the installer.
+- **The version is spelled twice** — `Cargo.toml`'s `[workspace.package]` and
+  `packaging/ksx.iss`'s `#define AppVersion` — and a release tag must equal
+  both. Bump them in the same commit; `crates/ksx-app/tests/installer.rs` fails
+  if they drift, and the release refuses to build rather than guessing
+  (`docs/RELEASING.md`).
 - **Windows/CRLF**: `include_str!` reads files as checked out. A test comparing
   against `\n` passes locally and fails on every fresh clone. CI was red 57 runs
   over this.
@@ -143,6 +148,7 @@ offline — the regression oracle for the whole input path).
 | how is a device identified, and why not by path? | `docs/DEVICE-IDENTITY.md` |
 | what can each control surface do? | `docs/CONTROL-SURFACE.md` |
 | the milestone map and exit criteria | `docs/ARCHITECTURE.md` |
+| how a customer gets a build (tag → releases page) | `docs/RELEASING.md` |
 | supervised cabinet runbooks (the hardware gates) | `docs/GATES.md` |
 | the panel is dead / a claim went wrong | `docs/RECOVERY.md` |
 | keys, chords, turbo, SOCD, macros | `docs/INPUT-TRANSFORMS.md` |

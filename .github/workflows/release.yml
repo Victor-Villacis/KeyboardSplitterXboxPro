@@ -1,0 +1,156 @@
+name: Release
+
+# ---------------------------------------------------------------------------
+# THE TRIGGER IS A PUSHED TAG. THE PATTERN IS `v*`.
+# ---------------------------------------------------------------------------
+#
+#     git tag v0.1.0 && git push origin v0.1.0
+#
+# and that is the entire release. There is no GitHub Release to create by hand
+# first: creating one in the web UI works only *because* it creates a tag, so
+# the UI step is optional polish, never a requirement. `docs/RELEASING.md` is
+# the runbook; this comment is the contract.
+#
+# `v*` matches every ksx repo the owner already releases this way, which is the
+# reason it is `v*` and not something cleverer. The version part is not free
+# text: build-installer.yml refuses to build unless `packaging/ksx.iss` and
+# `Cargo.toml` already carry exactly that version, and refuses a tag that is not
+# `v<major>.<minor>.<patch>`.
+#
+# Two gotchas, both learned on another repo and both cheap to hit:
+#
+#   * `on: push: tags` runs the workflow file AS IT EXISTS AT THE TAGGED COMMIT.
+#     A release.yml that only exists on a branch will not run. Tag master after
+#     merging.
+#   * A tag pushed by GITHUB_TOKEN from inside Actions does NOT trigger
+#     workflows. A tag you push from your machine does. That is the intended
+#     path here anyway.
+#
+# What a customer gets out of this: docs/FIRST-RUN.md §1 moment 1 — "a .exe from
+# the releases page. One file." The installer is that file. `ksx.exe` rides
+# along for people who want the bare program, and is not what the page leads
+# with.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Read by default; the one job that writes says so itself.
+permissions:
+  contents: read
+
+jobs:
+  # The whole gate, not a subset: fmt, clippy, the four feature combinations,
+  # the test suite, then the release build and the installer. `ci.yml` is
+  # `workflow_call`-able for exactly this, so a release cannot ship a binary
+  # that skipped a check a branch push would have run.
+  #
+  # It is also where the tag is checked against the tree — threaded down to
+  # build-installer.yml's "Version agreement" step, which runs before the build
+  # so a mistyped tag costs seconds instead of ten minutes.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+
+  publish:
+    needs: ci
+    runs-on: windows-latest
+    permissions:
+      # `gh release create` writes to this repository, and nothing else here
+      # does. The built-in GITHUB_TOKEN, no PAT, no third-party action, no
+      # secret to rotate.
+      contents: write
+      # Naming any permission zeroes the rest, and this job downloads the
+      # artifacts the build produced. Same-run downloads are not documented to
+      # need this; a permission that grants nothing beyond reading this run is
+      # cheaper than discovering the answer on a pushed tag.
+      actions: read
+    steps:
+      # For packaging/release-notes.md. The release body's prose lives in the
+      # repository, reviewable and diffable, rather than inside a YAML string.
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ksx-windows-installer
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: ksx-windows-x86_64
+          path: dist
+
+      # The hash in the release body is the one the build computed. This step
+      # does not compute a second one to publish — it re-hashes what came back
+      # out of the artifact store and refuses to publish if the two disagree, so
+      # the number on the page is provably the number of the attached file.
+      - name: Verify the assets are the files that were built
+        shell: pwsh
+        env:
+          SETUP_NAME: ${{ needs.ci.outputs.setup_name }}
+          SETUP_SHA256: ${{ needs.ci.outputs.setup_sha256 }}
+        run: |
+          if (-not $env:SETUP_NAME) { throw 'the build job reported no installer name' }
+          if (-not $env:SETUP_SHA256) { throw 'the build job reported no installer hash' }
+          $setup = Join-Path 'dist' $env:SETUP_NAME
+          if (-not (Test-Path $setup)) { throw "$setup is not in the downloaded artifacts" }
+          if (-not (Test-Path 'dist/ksx.exe')) { throw 'dist/ksx.exe is not in the downloaded artifacts' }
+          $h = (Get-FileHash $setup -Algorithm SHA256).Hash
+          if ($h -ne $env:SETUP_SHA256) {
+            throw "the downloaded installer hashes $h but was built as $($env:SETUP_SHA256) - NOT publishing"
+          }
+          Write-Host "verified $($env:SETUP_NAME)  SHA256 $h"
+
+      # Placeholders in, prose out. Every `{{NAME}}` in the template must be
+      # substituted here; `crates/ksx-app/tests/installer.rs` fails if the
+      # template grows one this step does not know about, because a literal
+      # `{{SIZE}}` on the releases page is the kind of thing nobody notices
+      # until a customer screenshots it.
+      - name: Compose the release notes
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+          SETUP_NAME: ${{ needs.ci.outputs.setup_name }}
+          SETUP_SHA256: ${{ needs.ci.outputs.setup_sha256 }}
+        run: |
+          $notes = Get-Content 'packaging/release-notes.md' -Raw
+          # The note at the top of the template is addressed to whoever edits
+          # it. Markdown would hide it, but "hidden" is not "absent": it is
+          # still the raw body `gh release view` prints and the text a plain
+          # reader sees. Drop it.
+          $notes = $notes -replace '(?s)^\s*<!--.*?-->\s*', ''
+          $notes = $notes.Replace('{{VERSION}}', ($env:TAG -replace '^v', ''))
+          $notes = $notes.Replace('{{TAG}}', $env:TAG)
+          $notes = $notes.Replace('{{SETUP_NAME}}', $env:SETUP_NAME)
+          $notes = $notes.Replace('{{SETUP_SHA256}}', $env:SETUP_SHA256)
+          $notes = $notes.Replace('{{COMMIT}}', $env:GITHUB_SHA)
+          if ($notes -match '\{\{([A-Z_]+)\}\}') {
+            throw "packaging/release-notes.md still holds an unsubstituted placeholder: {{$($Matches[1])}}"
+          }
+          Set-Content -Path 'notes.md' -Value $notes -Encoding utf8
+          Write-Host $notes
+
+      - name: Publish
+        shell: pwsh
+        env:
+          # The repository's own token. `gh` reads GH_TOKEN from the
+          # environment; nothing is stored and nothing expires.
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          SETUP_NAME: ${{ needs.ci.outputs.setup_name }}
+        run: |
+          # THE ASSETS. The installer first, because it is the file
+          # docs/FIRST-RUN.md §1 moment 1 means; ksx.exe second, for people who
+          # want the bare program and no Start-menu entry.
+          $assets = @("dist/$($env:SETUP_NAME)", 'dist/ksx.exe')
+          $version = $env:TAG -replace '^v', ''
+          $cmd = @(
+            'release', 'create', $env:TAG,
+            '--title', "ksx $version",
+            '--notes-file', 'notes.md',
+            '--verify-tag',
+            '--latest'
+          ) + $assets
+          gh @cmd
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed with $LASTEXITCODE" }

@@ -1,0 +1,226 @@
+name: Build installer
+
+# The shippable `ksx.exe` and the `setup.exe` a customer downloads, defined once
+# and called from two places:
+#
+#   ci.yml       every branch — an installer that stopped building is found the
+#                day it breaks, not the day someone tries to ship;
+#   release.yml  a `v*` tag — these same two files become the release assets.
+#
+# A reusable workflow rather than a copy, because "what CI proves" and "what a
+# customer downloads" must be the same build. If you need a third caller, add a
+# caller — not a second copy of these steps.
+#
+# ---------------------------------------------------------------------------
+# Why the shippable binary is built HERE and not on a developer machine
+# ---------------------------------------------------------------------------
+#
+# On 2026-08-07 the primary dev box (i9-14900K) began crashing rustc during
+# `cargo build --release`: three runs on a byte-identical command line died
+# three different ways (0xc0000409 twice in different crates, then 0xc0000005),
+# with 28GB of 64GB free — so not OOM. A deterministic compiler that fails
+# non-deterministically is hardware corrupting compute, and the release profile
+# (opt-level=3 + thin LTO + codegen-units=1) is the heaviest sustained load in
+# the build, which is why it surfaces there first.
+#
+# The danger is NOT the crash. A crash is loud and safe. The danger is the run
+# that *succeeds* on marginal hardware and emits a silently miscompiled binary
+# — which then goes onto an arcade cabinet and misbehaves with no error anywhere
+# to explain it. A clean runner removes that class of risk entirely.
+#
+# Keep this even after the CPU is replaced: it also means anyone can get a
+# working ksx.exe without a Rust toolchain.
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: >
+          The tag being released, e.g. `v0.1.0`, when this build is about to
+          become a GitHub Release. Empty for an ordinary CI build. When set, the
+          build FAILS unless the tree already carries that exact version — see
+          the "Version agreement" step.
+        type: string
+        default: ''
+    outputs:
+      setup_name:
+        description: The installer's filename, e.g. `ksx-0.1.0-setup.exe`.
+        value: ${{ jobs.build.outputs.setup_name }}
+      setup_sha256:
+        description: SHA-256 of the installer, as built.
+        value: ${{ jobs.build.outputs.setup_sha256 }}
+      exe_sha256:
+        description: SHA-256 of the bare ksx.exe, as built.
+        value: ${{ jobs.build.outputs.exe_sha256 }}
+
+# A called workflow does NOT inherit the caller's workflow-level env, so this is
+# repeated here rather than relied upon from ci.yml.
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      setup_name: ${{ steps.installer.outputs.name }}
+      setup_sha256: ${{ steps.installer.outputs.sha256 }}
+      exe_sha256: ${{ steps.exe.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # ---------------------------------------------------------------------
+      # The tag and the tree must already agree. WE FAIL; WE DO NOT DERIVE.
+      # ---------------------------------------------------------------------
+      #
+      # The alternative was to overwrite `#define AppVersion` from the tag at
+      # build time. Rejected, for three reasons:
+      #
+      # 1. That version is not just a filename. It is `VersionInfoVersion`, the
+      #    "ksx 0.1.0" row in Apps & Features, and the uninstaller's display
+      #    name — i.e. what the INSTALLED program says about itself, forever.
+      # 2. A derived version cannot be rebuilt. `packaging\ksx.iss`'s own header
+      #    tells you to run `iscc packaging\ksx.iss`; if CI patched the version
+      #    in, that command would emit a different file than the one on the
+      #    releases page, and nobody could reproduce or diff a shipped artifact.
+      # 3. The tag is not the only other copy. `Cargo.toml`'s
+      #    `[workspace.package] version` stamps `ksx --version`. Deriving the
+      #    .iss from the tag would leave that one free to drift, which MOVES the
+      #    disagreement rather than removing it.
+      #
+      # So one rule covers all three: the tag says what the tree already says.
+      # The cost of being wrong is one deleted tag and one more commit. The cost
+      # of the silent version is a user holding a setup.exe whose About box
+      # disagrees with the page they downloaded it from.
+      #
+      # `crates/ksx-app/tests/installer.rs` pins .iss == Cargo.toml on every
+      # test run, so the only thing left to check here is the tag — and it is
+      # checked BEFORE the 10-minute build, so a mistyped tag costs seconds.
+      - name: Version agreement (tag vs packaging/ksx.iss vs Cargo.toml)
+        if: inputs.release_tag != ''
+        shell: pwsh
+        # Through the environment, not `${{ }}` string interpolation: a tag name
+        # is attacker-controllable in principle and would otherwise be pasted
+        # into a PowerShell script.
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $want = $tag -replace '^v', ''
+          # Inno Setup's VersionInfoVersion is a numeric Windows version
+          # resource: `0.2.0-rc1` is not expressible, so a tag carrying a
+          # suffix could never agree with the .iss. Say that here, in one
+          # second, rather than as an ISCC error ten minutes in.
+          if ($want -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+            $bad = "tag '$tag' is not a numeric version tag (expected v<major>.<minor>.<patch>). " +
+                   "ksx has no prerelease channel: Inno Setup's VersionInfoVersion cannot hold a suffix."
+            throw $bad
+          }
+
+          $iss = Get-Content 'packaging/ksx.iss' -Raw
+          if ($iss -notmatch '(?m)^#define\s+AppVersion\s+"([^"]+)"') {
+            throw 'packaging/ksx.iss has no `#define AppVersion "..."` line.'
+          }
+          $issVersion = $Matches[1]
+
+          $cargo = Get-Content 'Cargo.toml' -Raw
+          if ($cargo -notmatch '(?s)\[workspace\.package\][^\[]*?version\s*=\s*"([^"]+)"') {
+            throw 'Cargo.toml has no [workspace.package] version.'
+          }
+          $cargoVersion = $Matches[1]
+
+          Write-Host "tag           $tag  (version $want)"
+          Write-Host "ksx.iss       $issVersion"
+          Write-Host "Cargo.toml    $cargoVersion"
+          if ($issVersion -ne $want -or $cargoVersion -ne $want) {
+            $lines = @(
+              "the tag and the tree disagree about the version."
+              "  tag $tag says          $want"
+              "  packaging/ksx.iss says $issVersion   (#define AppVersion)"
+              "  Cargo.toml says        $cargoVersion   ([workspace.package] version)"
+              ''
+              "Nothing has been built. Fix the tree, delete the tag, tag again:"
+              "  git tag -d $tag && git push origin :refs/tags/$tag"
+            )
+            throw ($lines -join "`n")
+          }
+
+      # rust-toolchain.toml pins the exact compiler; `rustup show` installs it.
+      # NOT dtolnay/rust-toolchain: that action exports RUSTUP_TOOLCHAIN, which
+      # overrides the pin.
+      - name: Toolchain (pinned by rust-toolchain.toml)
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+
+      # cabinet + studio is the shipping combination: the egui panel UI plus the
+      # local web config server. CI's feature matrix proves it compiles; this
+      # builds it optimized.
+      - name: Build release
+        run: cargo build --release --features cabinet,studio
+
+      # Print the hash in the log so a downloaded artifact can be verified
+      # against the run that produced it — and hand it up as a job output, so
+      # the release body can carry the same number rather than a second one.
+      - name: Hash
+        id: exe
+        shell: pwsh
+        run: |
+          $exe = 'target/release/ksx.exe'
+          $h = (Get-FileHash $exe -Algorithm SHA256).Hash
+          $mb = [math]::Round((Get-Item $exe).Length / 1MB, 2)
+          Write-Host "ksx.exe  $mb MB"
+          Write-Host "SHA256   $h"
+          "sha256=$h" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "### ksx.exe`n`n- size: $mb MB`n- SHA256: ``$h```n- commit: ``$env:GITHUB_SHA``" |
+            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ksx-windows-x86_64
+          path: target/release/ksx.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      # A bare ksx.exe is not something a person can use. `packaging/ksx.iss`
+      # describes the whole install — the Start-menu entry, the desktop icon,
+      # PATH as an opt-in, the bundled ViGEmBus driver folder, an uninstaller.
+      #
+      # Inno Setup ships preinstalled on windows-latest, so this needs no new
+      # dependency. ISCC is not on PATH, hence the explicit path.
+      - name: Build installer
+        id: installer
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw "Inno Setup not found at $iscc" }
+          & $iscc /Qp 'packaging\ksx.iss'
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+          # OutputDir=out in ksx.iss, and it is relative to the .iss file.
+          $setup = Get-ChildItem packaging\out\*setup.exe | Select-Object -First 1
+          if (-not $setup) { throw 'ISCC reported success but produced no setup.exe' }
+          # The second half of the version agreement, and the half that checks
+          # the ARTIFACT rather than the source: OutputBaseFilename is
+          # `{#AppName}-{#AppVersion}-setup`, so this is the tag's version
+          # appearing in the name of the file a customer will download.
+          if ($env:RELEASE_TAG) {
+            $expected = 'ksx-' + ($env:RELEASE_TAG -replace '^v', '') + '-setup.exe'
+            if ($setup.Name -ne $expected) {
+              throw "the installer is named $($setup.Name), but tag $env:RELEASE_TAG expects $expected"
+            }
+          }
+          $h = (Get-FileHash $setup -Algorithm SHA256).Hash
+          $mb = [math]::Round($setup.Length / 1MB, 2)
+          Write-Host "$($setup.Name)  $mb MB"
+          Write-Host "SHA256   $h"
+          "name=$($setup.Name)" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "sha256=$h" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "### $($setup.Name)`n`n- size: $mb MB`n- SHA256: ``$h```n" |
+            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ksx-windows-installer
+          path: packaging/out/*setup.exe
+          if-no-files-found: error
+          retention-days: 30
