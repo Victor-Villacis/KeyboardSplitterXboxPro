@@ -319,10 +319,27 @@ pub struct DevicesView {
     /// Was the Interception driver available at all? `false` is the EXPECTED
     /// end state after M6, not a failure.
     pub interception_available: bool,
-    /// HID-class USB interfaces, claimable or not.
+    /// **Every input devnode, on every transport ksx models** — HID-class USB
+    /// interfaces and Bluetooth device nodes in one list.
+    ///
+    /// The field keeps its wire name because it has always been the device
+    /// list; what changed is that it is no longer only USB. [`UsbRow::transport`]
+    /// says which, and nothing downstream may infer a transport from anything
+    /// else. Before the Bluetooth pass existed this list came from
+    /// `nusb::list_devices()` alone, so a Bluetooth keyboard simply did not
+    /// appear — the user was told, in effect, that their keyboard did not exist.
     pub usb: Vec<UsbRow>,
     /// Was USB enumeration possible?
     pub usb_available: bool,
+    /// Was Bluetooth enumeration possible?
+    ///
+    /// A separate flag from [`Self::usb_available`] because they are separate
+    /// reads and either can fail alone. Collapsing them would let a failed
+    /// Bluetooth walk hide behind a successful USB one and print a list that
+    /// silently omits half the machine — "I could not read this" and "there is
+    /// nothing here" are different sentences.
+    #[serde(default)]
+    pub bluetooth_available: bool,
     /// Anything the report has to say out loud (both backends missing, an
     /// enumeration that failed) — rendered, never swallowed.
     pub notes: Vec<String>,
@@ -344,12 +361,25 @@ pub struct KeyboardRow {
     pub detail: String,
 }
 
-/// One USB interface `ksx winusb status` reasons about.
+/// One devnode in the unified device list — a USB interface or a Bluetooth
+/// device node.
+///
+/// Named `UsbRow` from when this list was USB-only. [`Self::transport`] is the
+/// field that says what a row actually is, and every consumer reads it rather
+/// than assuming: a Bluetooth row is not a defective USB row, it is a device on
+/// a different transport with a different, permanent answer about backends.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsbRow {
     /// The instance id, uppercased — the string a `[[device]] id` holds.
     pub instance_id: String,
     pub description: String,
+    /// `usb` | `bluetooth` — [`ksx_core::Transport::code`].
+    ///
+    /// The one field that must never be inferred from another. A row's
+    /// enumerator prefix, its vendor id and its description are all things a
+    /// surface could squint at; the collector already knows, so it says.
+    #[serde(default)]
+    pub transport: String,
     /// `claimed` | `claimable` | `not-a-keyboard` | `foreign-driver`.
     pub state: String,
     /// The one sentence that says what that means for ksx.
@@ -413,6 +443,36 @@ pub struct UsbRow {
     /// `None` only when no `usb:` selector could name the interface at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<String>,
+    /// **Which backends can reach this row**, as `ksx_core::Reach::eligibility`
+    /// decided — never as a surface guessed.
+    ///
+    /// The rule is not derivable from anything else on this row, which is
+    /// exactly why it is carried: a Bluetooth keyboard is Interception-eligible
+    /// (it is a keyboard on the Windows input stack, so splitting it into
+    /// virtual pads works today) and can NEVER be WinUSB-claimed (WinUSB binds
+    /// a USB interface through an INF hardware id and there is no USB interface
+    /// here). Someone reading `state == "claimable"` alone would get both
+    /// halves wrong.
+    #[serde(default)]
+    pub interception_eligible: bool,
+    #[serde(default)]
+    pub winusb_eligible: bool,
+    /// The one line a row shows about backends — composed in `ksx-core`, so the
+    /// CLI report, Studio's Rust seam and Studio's TypeScript island cannot
+    /// word it three ways. Never empty for a collected row.
+    #[serde(default)]
+    pub backends: String,
+    /// **Can this device deliver a keystroke right now?**
+    ///
+    /// Not the same question as "is it present". A paired-but-disconnected
+    /// Bluetooth keyboard is present all day and cannot type a character; a
+    /// claimed USB interface is present and deliberately off the keyboard
+    /// stack. Both are listed, and both say so.
+    #[serde(default)]
+    pub can_type: bool,
+    /// Why not, when not. Empty when it can.
+    #[serde(default)]
+    pub cannot_type_reason: String,
 }
 
 /// `ksx device scan`, presentation-shaped: one row per PHYSICAL board, plus
@@ -440,11 +500,17 @@ pub struct UsbRow {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceScanView {
     pub generated_at: String,
-    /// Was USB enumeration possible? `false` means [`Self::boards`] is empty
-    /// because nothing could be READ, not because nothing is plugged in.
+    /// Was USB enumeration possible? `false` means [`Self::boards`] is missing
+    /// its USB half because nothing could be READ, not because nothing is
+    /// plugged in.
     pub usb_available: bool,
-    /// Every board, in enumeration order (stable on one machine), probable
-    /// keyboards first.
+    /// The same question for the Bluetooth pass, tracked separately because it
+    /// is a separate read and either can fail alone.
+    #[serde(default)]
+    pub bluetooth_available: bool,
+    /// Every device, in enumeration order (stable on one machine), probable
+    /// keyboards first — **both transports in one list**, which is the whole
+    /// point of this shape. [`BoardRow::transport`] says which each is.
     pub boards: Vec<BoardRow>,
     /// Every `[[device]]` entry in `config.toml`, resolved against the live
     /// enumeration.
@@ -511,6 +577,7 @@ impl DeviceScanView {
     pub fn read(
         generated_at: String,
         usb_available: bool,
+        bluetooth_available: bool,
         mut boards: Vec<BoardRow>,
         mut configured: Vec<ConfiguredDevice>,
         notes: Vec<String>,
@@ -528,6 +595,30 @@ impl DeviceScanView {
             );
             board.command_lead = lead;
             board.command = command;
+            // The board's transport and backend eligibility are the KEYBOARD
+            // interface's, because that is the devnode a pick would name. A
+            // board with no keyboard falls back to its first interface, so a
+            // "no backend" row still says which transport it is on — half the
+            // reason a Bluetooth speaker shows up in a keyboard list at all is
+            // to answer "why is my device not here".
+            let source = board
+                .keyboard
+                .as_deref()
+                .and_then(|kb| {
+                    board
+                        .interfaces
+                        .iter()
+                        .find(|i| i.instance_id.eq_ignore_ascii_case(kb))
+                })
+                .or_else(|| board.interfaces.first());
+            if let Some(row) = source {
+                board.transport = row.transport.clone();
+                board.interception_eligible = row.interception_eligible;
+                board.winusb_eligible = row.winusb_eligible;
+                board.backends = row.backends.clone();
+                board.can_type = row.can_type;
+                board.cannot_type_reason = row.cannot_type_reason.clone();
+            }
         }
         for device in &mut configured {
             let (line, level) = device_health(device);
@@ -544,17 +635,24 @@ impl DeviceScanView {
         let other_boards = boards.len() - pickable_boards;
         Self {
             configured_summary: configured_summary_line(configured.len()),
-            boards_summary: boards_summary_line(pickable_boards, usb_available),
+            boards_summary: boards_summary_line(
+                pickable_boards,
+                usb_available,
+                bluetooth_available,
+            ),
             other_summary: other_summary_line(other_boards),
-            // The two conclusions, drawn once. `usb_available` gates the first
-            // for the reason its own doc gives; the second is unconditional
-            // here because reaching `read` at all means the config WAS read.
-            no_pickable_board_found: usb_available && pickable_boards == 0,
+            // The two conclusions, drawn once. BOTH enumerations gate the
+            // first: a machine whose Bluetooth walk failed has not been fully
+            // read, so "no keyboard-capable board found" would be an assertion
+            // about half a machine. The second is unconditional here because
+            // reaching `read` at all means the config WAS read.
+            no_pickable_board_found: usb_available && bluetooth_available && pickable_boards == 0,
             no_configured_device: configured.is_empty(),
             pickable_boards,
             other_boards,
             generated_at,
             usb_available,
+            bluetooth_available,
             boards,
             configured,
             notes,
@@ -570,6 +668,7 @@ impl DeviceScanView {
         Self {
             generated_at: String::new(),
             usb_available: false,
+            bluetooth_available: false,
             boards: Vec::new(),
             configured: Vec::new(),
             notes: Vec::new(),
@@ -592,6 +691,23 @@ impl DeviceScanView {
 pub const UNREAD_BOARDS_LINE: &str =
     "USB enumeration failed — this list is empty because nothing could be READ, not because \
      nothing is plugged in";
+
+/// The same sentence for the Bluetooth half, and the reason the two halves are
+/// tracked apart.
+///
+/// A machine whose USB walk worked and whose Bluetooth walk failed has a list
+/// that is *right about USB and silent about Bluetooth*, which reads exactly
+/// like a machine with no Bluetooth devices. Saying which half is missing is
+/// the difference between "your keyboard is not paired" and "ksx could not
+/// look".
+pub const UNREAD_BLUETOOTH_LINE: &str =
+    "Bluetooth enumeration failed — any Bluetooth device is MISSING from this list, and its \
+     absence here is not evidence that it is unpaired";
+
+/// The USB half failed and the Bluetooth half answered.
+pub const UNREAD_USB_LINE: &str =
+    "USB enumeration failed — any USB board is MISSING from this list, and its absence here is \
+     not evidence that it is unplugged";
 
 /// The same distinction for the configured list. A refusal reaches this page
 /// before `config.toml` is opened, so "no [[device]] entries" would be a claim
@@ -648,14 +764,33 @@ fn configured_summary_line(count: usize) -> String {
     }
 }
 
-fn boards_summary_line(count: usize, usb_available: bool) -> String {
-    if !usb_available {
-        return UNREAD_BOARDS_LINE.to_owned();
+/// The line above the pickable list, and the one place an empty list is NOT
+/// the same sentence as an empty machine.
+///
+/// Two transports means two ways to be half-blind, and a partial read must not
+/// read as a complete one. When one pass failed the count is still printed —
+/// it is true of the half that answered — and the missing half is named beside
+/// it, because "no Bluetooth device here" and "ksx could not look at Bluetooth"
+/// send a user to two different places.
+fn boards_summary_line(count: usize, usb_available: bool, bluetooth_available: bool) -> String {
+    match (usb_available, bluetooth_available) {
+        (false, false) => return UNREAD_BOARDS_LINE.to_owned(),
+        (true, false) => return format!("{} — {UNREAD_BLUETOOTH_LINE}", found_line(count)),
+        (false, true) => return format!("{} — {UNREAD_USB_LINE}", found_line(count)),
+        (true, true) => {}
     }
     match count {
         0 => NO_BOARDS_LINE.to_owned(),
         1 => "1 keyboard-capable board:".to_owned(),
         n => format!("{n} keyboard-capable boards:"),
+    }
+}
+
+/// What a partial read may still assert: the count of what it DID see.
+fn found_line(count: usize) -> String {
+    match count {
+        1 => "1 keyboard-capable device found so far".to_owned(),
+        n => format!("{n} keyboard-capable devices found so far"),
     }
 }
 
@@ -693,6 +828,21 @@ fn device_health(device: &ConfiguredDevice) -> (String, &'static str) {
     }
     if device.backend != "winusb" {
         return ("on the Windows keyboard stack".to_owned(), "idle");
+    }
+    // `backend = "winusb"` on a device that is not on the USB transport is not
+    // a claim someone forgot to perform. It is a claim that can never be
+    // performed, so the advice "run `ksx winusb claim`" — correct for every
+    // other unclaimed entry — would send this user to a command that refuses
+    // forever. The entry has to be changed, not the machine.
+    if device.transport == ksx_core::Transport::Bluetooth.code() {
+        return (
+            format!(
+                "backend is winusb and this device is on Bluetooth — {}. Change the entry to \
+                 backend = \"interception\", which CAN capture it.",
+                ksx_core::transport::WINUSB_NEEDS_A_USB_INTERFACE
+            ),
+            "warn",
+        );
     }
     if device.used_by.is_empty() {
         (
@@ -763,6 +913,29 @@ pub struct BoardRow {
     /// empty when [`Self::looks_like_a_keyboard`]. See [`CAVEAT_NOT_A_KEYBOARD`].
     #[serde(default)]
     pub caveat: String,
+    /// `usb` | `bluetooth` — this device's transport, taken from the interface
+    /// a pick would name (its keyboard, else its first devnode).
+    ///
+    /// Filled by [`DeviceScanView::read`]. The transport column exists because
+    /// the answer to "which backends can I use" is decided by it and by nothing
+    /// else on the row.
+    #[serde(default)]
+    pub transport: String,
+    /// Which backends can reach this device — see [`UsbRow::interception_eligible`].
+    /// Filled by [`DeviceScanView::read`].
+    #[serde(default)]
+    pub interception_eligible: bool,
+    #[serde(default)]
+    pub winusb_eligible: bool,
+    /// The composed backend line. Filled by [`DeviceScanView::read`].
+    #[serde(default)]
+    pub backends: String,
+    /// Can it deliver a keystroke right now? Filled by [`DeviceScanView::read`].
+    #[serde(default)]
+    pub can_type: bool,
+    /// Why not, when not. Filled by [`DeviceScanView::read`].
+    #[serde(default)]
+    pub cannot_type_reason: String,
 }
 
 /// One `[[device]]` entry, resolved against the machine as it is right now.
@@ -798,6 +971,16 @@ pub struct ConfiguredDevice {
     pub board: Option<String>,
     /// The interface it resolved to, when it is present.
     pub instance_id: Option<String>,
+    /// `usb` | `bluetooth` for the device this entry resolved to; empty while
+    /// it resolves to nothing.
+    ///
+    /// Carried because the entry's `backend` can be *permanently* wrong rather
+    /// than merely not-yet-right: `backend = "winusb"` on a Bluetooth device is
+    /// not a claim someone forgot to perform, it is a claim that can never be
+    /// performed. [`device_health`] tells those two apart, and it needs this to
+    /// do it.
+    #[serde(default)]
+    pub transport: String,
     /// Is that interface bound to `winusb.sys`?
     pub claimed: bool,
     pub claim_command: Option<String>,
@@ -1636,14 +1819,20 @@ mod tests {
         }
     }
 
-    fn scan(usb_available: bool, boards: Vec<BoardRow>) -> DeviceScanView {
+    /// Both enumerations answered — the ordinary machine.
+    fn scan(available: bool, boards: Vec<BoardRow>) -> DeviceScanView {
         DeviceScanView::read(
             "t".to_owned(),
-            usb_available,
+            available,
+            available,
             boards,
             Vec::new(),
             Vec::new(),
         )
+    }
+
+    fn configured(devices: Vec<ConfiguredDevice>) -> DeviceScanView {
+        DeviceScanView::read("t".to_owned(), true, true, Vec::new(), devices, Vec::new())
     }
 
     fn keyboard_board() -> BoardRow {
@@ -1681,6 +1870,166 @@ mod tests {
 
         // The two states must not be spelled the same way anywhere.
         assert_ne!(blind.boards_summary, empty.boards_summary);
+    }
+
+    /// **Half a read is not a whole one.** USB answered and Bluetooth did not:
+    /// the count of what WAS found is still true and still printed, but the
+    /// page may not conclude "nothing here" and must name the missing half.
+    ///
+    /// FAILS against the single `usb_available` flag this view shipped with:
+    /// with Bluetooth enumeration dead and USB fine, `no_pickable_board_found`
+    /// was `true` on a machine whose Bluetooth keyboard was sitting right there
+    /// — the same class of confident wrong answer the USB flag was added to
+    /// stop, one transport later.
+    #[test]
+    fn one_failed_transport_never_licenses_the_empty_machine_sentence() {
+        let usb_only = DeviceScanView::read(
+            "t".to_owned(),
+            true,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(
+            !usb_only.no_pickable_board_found,
+            "the Bluetooth half was never read, so the machine was not read"
+        );
+        assert_ne!(usb_only.boards_summary, NO_BOARDS_LINE);
+        assert!(
+            usb_only
+                .boards_summary
+                .contains("Bluetooth enumeration failed"),
+            "the missing half must be named: {}",
+            usb_only.boards_summary
+        );
+        assert!(
+            usb_only.boards_summary.contains("not evidence"),
+            "absence from a list nobody could read is not evidence: {}",
+            usb_only.boards_summary
+        );
+
+        let bt_only = DeviceScanView::read(
+            "t".to_owned(),
+            false,
+            true,
+            vec![keyboard_board()],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(!bt_only.no_pickable_board_found);
+        assert!(
+            bt_only.boards_summary.contains("USB enumeration failed"),
+            "{}",
+            bt_only.boards_summary
+        );
+        assert!(
+            bt_only.boards_summary.contains("1 keyboard-capable device"),
+            "what WAS found is still true and still printed: {}",
+            bt_only.boards_summary
+        );
+        // The three failure shapes must not be spelled the same way.
+        assert_ne!(usb_only.boards_summary, bt_only.boards_summary);
+        assert_ne!(usb_only.boards_summary, UNREAD_BOARDS_LINE);
+    }
+
+    /// **The permanent case, told apart from the not-yet case.**
+    ///
+    /// `backend = "winusb"` on an unclaimed USB board is a claim someone has
+    /// not performed yet, and the advice is to perform it. The same line on a
+    /// Bluetooth device is a claim that can NEVER be performed, and repeating
+    /// "run `ksx winusb claim`" would send that user to a command that refuses
+    /// forever.
+    ///
+    /// FAILS against the shipped `device_health`, which had one sentence for
+    /// both and no idea what transport the entry resolved to.
+    #[test]
+    fn a_winusb_entry_on_bluetooth_is_told_no_claim_can_ever_fix_it() {
+        let bt = configured(vec![ConfiguredDevice {
+            transport: "bluetooth".to_owned(),
+            ..loose_winusb_entry(vec!["slot 1 (keyboard)".to_owned()])
+        }]);
+        let line = &bt.configured[0].health_line;
+        assert!(line.contains("Bluetooth"), "{line}");
+        assert!(
+            line.contains("no USB interface to bind"),
+            "the transport fact, not a vague 'unsupported': {line}"
+        );
+        assert!(
+            line.contains("interception"),
+            "and the backend that CAN capture it: {line}"
+        );
+        assert!(
+            !line.contains("ksx winusb claim"),
+            "never advise a command that refuses forever: {line}"
+        );
+        assert_eq!(bt.configured[0].health_level, "warn");
+
+        // The USB entry beside it keeps the recoverable wording.
+        let usb = configured(vec![ConfiguredDevice {
+            transport: "usb".to_owned(),
+            ..loose_winusb_entry(vec!["slot 1 (keyboard)".to_owned()])
+        }]);
+        assert!(usb.configured[0].health_line.contains("refuses to start"));
+        assert_ne!(usb.configured[0].health_line, *line);
+    }
+
+    /// A board's transport and backend eligibility come from the interface a
+    /// pick would NAME — its keyboard — not from whichever devnode enumerated
+    /// first. On an I-PAC that is the difference between describing MI_00 and
+    /// describing the vendor collection on MI_02.
+    #[test]
+    fn a_boards_transport_is_the_one_its_keyboard_interface_is_on() {
+        let vendor_iface = UsbRow {
+            instance_id: "USB\\VID_D209&PID_0430&MI_02\\X".to_owned(),
+            transport: "usb".to_owned(),
+            backends: "wrong row".to_owned(),
+            ..UsbRow::default()
+        };
+        let keyboard_iface = UsbRow {
+            instance_id: "USB\\VID_D209&PID_0430&MI_00\\X".to_owned(),
+            transport: "usb".to_owned(),
+            interception_eligible: true,
+            winusb_eligible: true,
+            backends: "the keyboard's line".to_owned(),
+            can_type: true,
+            ..UsbRow::default()
+        };
+        let view = scan(
+            true,
+            vec![BoardRow {
+                // Deliberately NOT first in the list.
+                interfaces: vec![vendor_iface, keyboard_iface],
+                ..keyboard_board()
+            }],
+        );
+        assert_eq!(view.boards[0].backends, "the keyboard's line");
+        assert!(view.boards[0].winusb_eligible);
+        assert!(view.boards[0].can_type);
+    }
+
+    /// A device with no keyboard interface still gets a transport, because
+    /// half the reason it is listed at all is to answer "why is my device not
+    /// in the picker" — and for a Bluetooth device the answer is a permanent
+    /// one a user needs to read.
+    #[test]
+    fn a_device_with_no_keyboard_still_reports_its_transport() {
+        let view = scan(
+            true,
+            vec![BoardRow {
+                name: "ULT TOWER 9".to_owned(),
+                keyboard: None,
+                interfaces: vec![UsbRow {
+                    transport: "bluetooth".to_owned(),
+                    backends: "Bluetooth · no backend".to_owned(),
+                    ..UsbRow::default()
+                }],
+                ..BoardRow::default()
+            }],
+        );
+        assert!(!view.boards[0].pickable);
+        assert_eq!(view.boards[0].transport, "bluetooth");
+        assert!(!view.boards[0].backends.is_empty());
     }
 
     /// The same distinction for the configured list, which is read from a file
@@ -1752,13 +2101,7 @@ mod tests {
     /// — and the user was being sent to debug a working session.
     #[test]
     fn an_unreferenced_winusb_entry_is_not_told_the_session_refuses() {
-        let orphan = DeviceScanView::read(
-            "t".to_owned(),
-            true,
-            Vec::new(),
-            vec![loose_winusb_entry(Vec::new())],
-            Vec::new(),
-        );
+        let orphan = configured(vec![loose_winusb_entry(Vec::new())]);
         let line = &orphan.configured[0].health_line;
         assert!(
             !line.contains("refuses to start"),
@@ -1772,13 +2115,9 @@ mod tests {
 
         // The same entry WITH a slot naming it is the real fault, and it must
         // still be called one — otherwise this fix is just silence.
-        let named = DeviceScanView::read(
-            "t".to_owned(),
-            true,
-            Vec::new(),
-            vec![loose_winusb_entry(vec!["slot 1 (keyboard)".to_owned()])],
-            Vec::new(),
-        );
+        let named = configured(vec![loose_winusb_entry(vec![
+            "slot 1 (keyboard)".to_owned()
+        ])]);
         let line = &named.configured[0].health_line;
         assert!(line.contains("refuses to start"), "{line}");
         assert_eq!(named.configured[0].health_level, "warn");
@@ -1789,19 +2128,13 @@ mod tests {
     /// plugged in is the same class of confident wrong answer.
     #[test]
     fn an_absent_board_gets_no_claim_verdict() {
-        let view = DeviceScanView::read(
-            "t".to_owned(),
-            true,
-            Vec::new(),
-            vec![ConfiguredDevice {
-                alias: "panel".to_owned(),
-                backend: "winusb".to_owned(),
-                present: false,
-                used_by: vec!["slot 1 (keyboard)".to_owned()],
-                ..ConfiguredDevice::default()
-            }],
-            Vec::new(),
-        );
+        let view = configured(vec![ConfiguredDevice {
+            alias: "panel".to_owned(),
+            backend: "winusb".to_owned(),
+            present: false,
+            used_by: vec!["slot 1 (keyboard)".to_owned()],
+            ..ConfiguredDevice::default()
+        }]);
         assert_eq!(view.configured[0].health_line, "");
         assert_eq!(view.configured[0].health_level, "none");
     }
