@@ -1910,7 +1910,10 @@ mod tests {
     #[test]
     fn the_slot_ceiling_a_surface_renders_is_this_builds_max_slots() {
         assert_eq!(SetupView::default().max_slots, ksx_core::MAX_SLOTS);
-        assert!(ksx_core::MAX_SLOTS > 0);
+        // Compile-time, because a runtime assert on a constant is vacuous
+        // (clippy agrees): if this build's ceiling were zero, every menu
+        // derived from it is meaningless before any test runs.
+        const _: () = assert!(ksx_core::MAX_SLOTS > 0);
 
         // A document from a ksx that predates the field.
         let older: SetupView = serde_json::from_str(
