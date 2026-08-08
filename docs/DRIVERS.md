@@ -16,6 +16,9 @@ Deep dives: [`research/virtual-gamepad-2026.md`](research/virtual-gamepad-2026.m
   `CN=Nefarius Software Solutions e.U., L=Wels, C=AT`; SHA-256
   `89220A7865076B342892F98865F3499FB7C4CFD673159E89D352C360FD014C6A`). Never download
   at runtime (the old endpoints are rotting).
+- **Installed by the ksx installer, from a checkbox** — see "Who runs it, and
+  when" below. `ksx install-drivers` is still the verb; the setup wizard is now
+  one of the two places it is run from.
 - Plan B: HIDMaestro (MIT, user-mode UMDF2; would mean a hand-written Rust client for
   its documented shared-memory protocol — verify its WGI double-input bug first).
   Plan C: libvirtualhid (LizardByte; revisit when Sunshine's PR merges and XInput slot
@@ -147,6 +150,47 @@ The verified file is opened once with `FILE_SHARE_READ` (writers and deleters
 denied), hashed and signature-checked through that handle, and the handle is held
 across `CreateProcess`, which targets the path `GetFinalPathNameByHandleW`
 reports for it. The bytes that were checked are the bytes that run.
+
+### Who runs it, and when
+
+Two places, one verb.
+
+| where | how | consent |
+|---|---|---|
+| The setup wizard (`packaging/ksx.iss`) | a `[Tasks]` checkbox, **ticked by default**, running `ksx install-drivers --yes` at `ssPostInstall` | the checkbox, plus the UAC prompt setup already raised |
+| A terminal | `ksx install-drivers --yes`, elevated | `--yes`, plus the elevated prompt the user opened |
+
+The wizard was added because the alternative was a lie by omission. The
+installer shipped this file to `{app}\drivers` and never ran it, so a machine
+that had never had ViGEmBus produced a ksx that installed cleanly, staged a
+setup, saved it, and plugged nothing — and the only fix was a shell command, on
+a product whose acceptance test (`docs/FIRST-RUN.md` §7) is *no terminal*.
+`ksx install-drivers` needs an administrator token and ksx never self-elevates,
+so setup — already elevated, already consented to — is the one moment where
+that token exists.
+
+**Nothing about the checks was relaxed to do it.** The wizard runs the *verb*,
+not the bundled `.exe`: the protected-directory search, the sealed handle, the
+SHA-256 and the Authenticode policy above all still decide, and a bundle that
+fails any of them is refused from the wizard exactly as from a shell. Running
+the `.exe` directly would have been one line of Pascal and would have deleted
+every guarantee on this page; `crates/ksx-app/tests/installer.rs` asserts the
+file name appears only on a `Source:` line.
+
+**And it is not silent.** `docs/DRIVERS.md`'s original objection — "an installer
+that silently installed a kernel driver would throw away both pins and the
+consent" — was right about the consent and is answered rather than overruled:
+the box says which driver and what it is for, clearing it is honoured, and a
+user who clears it is told on the last page how to get the driver later. A
+failure never fails the install, because a machine with no ViGEmBus still wants
+the ksx that configures and maps; the wizard says what happened, names the
+retry, and continues.
+
+Because the plan is idempotent, both a re-install and an upgrade cost one
+process start and change nothing: a healthy ViGEmBus yields `already-installed`,
+which runs nothing. The one machine the wizard does act on beyond a first
+install is a **broken** one — a registered service whose `ViGEmBus.sys` is gone,
+which is what `ksx doctor` already tells people to fix this way.
 
 ## Capture: Interception now → WinUSB later
 
