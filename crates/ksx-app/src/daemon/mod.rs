@@ -127,6 +127,19 @@ pub enum DaemonCommand {
     /// `ksx open` does, through the same code, so the item and the verb cannot
     /// drift into two behaviours (docs/M9-DECISION.md §4 item 1).
     OpenStudio,
+    /// **Play a STAGED setup, with nothing written** (`docs/FIRST-RUN.md` §2,
+    /// moment 7).
+    ///
+    /// Carries the whole [`ksx_core::CommitSpec`] rather than a flag, because
+    /// there is no file for the factory to go and read: the setup exists only
+    /// in [`DaemonState::staged`], and this is how it reaches the session.
+    ///
+    /// Otherwise this IS [`Self::Start`] — same panel mute, same start, same
+    /// reap — which is the property that matters: playing an unsaved setup must
+    /// not be a second session path with its own bugs. The override lasts until
+    /// the next [`Self::Reload`] or [`Self::Start`], both of which go back to
+    /// what is on disk.
+    PlayStaged(Box<ksx_core::CommitSpec>),
     /// Print the current state (headless mode's `status`).
     Status,
     /// Stop everything and exit the process.
@@ -320,6 +333,20 @@ pub struct DaemonState {
     /// The verdict of the last binding-apply. Never cleared: a caller
     /// identifies its own answer by generation, not by presence.
     pub apply: Option<ApplyReport>,
+    /// **The setup a visitor is still deciding on** (`docs/FIRST-RUN.md` §2).
+    ///
+    /// It lives here — in the daemon, for the length of a visit — for the
+    /// reason §2 gives: a persona choice must not be a file write, and the
+    /// backend owns state (`SURFACES.md` §1) so every surface sees the same
+    /// half-made setup rather than each holding its own draft. It is never
+    /// serialized into `config.toml` from here: `crate::stage::apply` is the
+    /// one explicit act that does that, and only when the user asks.
+    ///
+    /// A fresh `StagedSetup` for a fresh daemon: this is deliberately NOT
+    /// seeded from what is on disk. Staging is what a user is *proposing*, and
+    /// pre-filling it would make "Start over" mean "back to the config file"
+    /// rather than "back to nothing".
+    pub staged: ksx_core::StagedSetup,
 }
 
 impl DaemonState {
@@ -481,6 +508,19 @@ pub trait SessionFactory: Send {
     fn resolve_plan(&self) -> anyhow::Result<crate::run::plan::RunPlan> {
         anyhow::bail!("this session factory cannot re-resolve a plan")
     }
+
+    /// Point every FUTURE session at a **staged** setup instead of at the
+    /// config on disk (`None` = back to disk).
+    ///
+    /// Returns whether this factory can do it. Defaulted to `false` rather than
+    /// to a silent no-op, and the control loop refuses on `false`: a factory
+    /// that quietly ignored the override would start the session that IS on
+    /// disk while the screen said it was playing the one that is not — which is
+    /// this project's signature bug (a surface reporting success while
+    /// something else is running) in a new place.
+    fn set_staged(&mut self, _spec: Option<ksx_core::CommitSpec>) -> bool {
+        false
+    }
 }
 
 /// The keystroke behaviour of a WinUSB-claimed panel between sessions.
@@ -630,6 +670,11 @@ pub fn control_loop_with(
                     let _ = writeln!(out, "already running");
                     continue;
                 }
+                // Start means THE CONFIG ON DISK. Clearing any staged override
+                // here is what keeps that true: a tray Start after somebody
+                // played an unsaved setup must run what is saved, not the draft
+                // they walked away from.
+                factory.set_staged(None);
                 // A per-start profile override must not outlive a start that
                 // never started: a typo'd `--game` would otherwise repoint
                 // every later tray Start at the broken title.
@@ -655,6 +700,39 @@ pub fn control_loop_with(
                     set_game(&state, factory.game());
                 }
             }
+            // **Play a staged setup.** Deliberately the same five steps
+            // `Start` takes — arm, mute, start, and hand the panel back if
+            // nothing started — because a second start path would be a second
+            // set of ways to leave a dead panel behind. The ONE difference is
+            // where the plan comes from: `set_staged` points the factory at a
+            // setup that exists only in memory.
+            Ok(DaemonCommand::PlayStaged(spec)) => {
+                if session.is_some() {
+                    let _ = writeln!(out, "already running");
+                    continue;
+                }
+                if !factory.set_staged(Some(*spec)) {
+                    // Never silent: a factory that cannot run a staged setup
+                    // would otherwise start whatever is on disk while the
+                    // screen said it was playing the unsaved one.
+                    let _ = writeln!(
+                        out,
+                        "[FAIL] this daemon cannot start an unsaved setup — save it first, or \
+                         start it with `ksx run`"
+                    );
+                    continue;
+                }
+                panel.arm_escapes();
+                panel.set_emulating(true);
+                session = start(factory, &state, out);
+                if session.is_none() {
+                    panel.set_emulating(false);
+                    // The override does not outlive a start that never
+                    // started: a later tray Start must mean the config on
+                    // disk, not a staged setup nobody could run.
+                    factory.set_staged(None);
+                }
+            }
             Ok(DaemonCommand::Stop) => match session.take() {
                 Some(live) => {
                     let _ = writeln!(out, "stopping…");
@@ -668,6 +746,10 @@ pub fn control_loop_with(
             },
             Ok(DaemonCommand::Reload) => {
                 let _ = writeln!(out, "reloading configuration…");
+                // "Reload config" means the FILE. A staged override left in
+                // place here would make the tray's most literal verb re-start
+                // something that is not in any config at all.
+                factory.set_staged(None);
                 restart(&mut session, factory, &state, panel, out);
             }
             // The mapper's save path. Cheap when it can be, honest when it
@@ -1133,6 +1215,9 @@ pub fn run(
         no_launch,
         panel: claimed.clone(),
         feed: feed.clone(),
+        // A fresh daemon plays what is configured. A staged setup only ever
+        // gets here through the pipe's `stage-play`.
+        staged: None,
     };
 
     let (tx, rx) = crossbeam_channel::unbounded::<DaemonCommand>();
@@ -1174,7 +1259,13 @@ pub fn run(
                 // `slot-assign`: which preset a slot uses. The one write here
                 // that is not a preset edit, and the one whose `reload` is a
                 // BOUNCE rather than a hot swap.
-                slot_assign: pipe::slot_assign_fn(map_root),
+                slot_assign: pipe::slot_assign_fn(map_root.clone()),
+                // `stage-commit`: the ONE act that turns the staged setup into
+                // files. Everything else about staging — choosing a device,
+                // adding and deleting controllers, changing personas — is
+                // memory, which is what makes exploring free
+                // (docs/FIRST-RUN.md §2).
+                stage_commit: pipe::stage_commit_fn(map_root),
                 learn: learn::LearnService::with_rawinput(),
             },
         );
@@ -2026,6 +2117,7 @@ mod tests {
             }),
             live: None,
             apply: None,
+            staged: Default::default(),
         };
         let tip = state.tooltip();
         assert!(tip.contains("running, 4 pad(s)"), "{tip}");
@@ -2041,6 +2133,7 @@ mod tests {
             last: None,
             live: None,
             apply: None,
+            staged: Default::default(),
         };
         assert!(long.tooltip().encode_utf16().count() <= 127);
         assert!(long.tooltip().ends_with('…'));
@@ -2066,6 +2159,7 @@ mod tests {
                 ..LiveHealth::default()
             }),
             apply: None,
+            staged: Default::default(),
         };
         let tip = state.tooltip();
         assert!(tip.contains("running, 4 pad(s)"), "{tip}");
@@ -2117,6 +2211,7 @@ mod tests {
             }),
             live: Some(LiveHealth::default()),
             apply: None,
+            staged: Default::default(),
         };
         assert!(state.tooltip().contains("REBOOT REQUIRED"), "{state:?}");
     }
@@ -2137,6 +2232,7 @@ mod tests {
                 ..LiveHealth::default()
             }),
             apply: None,
+            staged: Default::default(),
         };
         let tip = state.tooltip();
         assert!(tip.contains("watchdog TRIPPED"), "{tip}");
@@ -2157,6 +2253,7 @@ mod tests {
             }),
             game: None,
             apply: None,
+            staged: Default::default(),
         };
         assert!(!state.tooltip().contains("[!]"), "{}", state.tooltip());
     }
@@ -2465,6 +2562,11 @@ mod tests {
                     // over the pipe only (there is nothing for a human to
                     // click that means "apply bindings and nothing else").
                     DaemonCommand::ApplyBindings => "reload",
+                    // Not a menu item either, and it never will be: playing an
+                    // UNSAVED setup only means something to a surface that is
+                    // holding one, and the tray holds nothing. It reaches the
+                    // control loop over the pipe (`stage-play`).
+                    DaemonCommand::PlayStaged(_) => "start",
                 }),
                 "{command:?} is in the tray menu but not reachable headlessly"
             );

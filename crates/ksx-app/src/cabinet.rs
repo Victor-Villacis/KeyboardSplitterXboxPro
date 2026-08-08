@@ -129,6 +129,25 @@ fn daemon_sink(
             }),
             // The one write the cabinet DOES have: which preset a slot uses.
             slot_assign: crate::daemon::pipe::slot_assign_fn(root),
+            // **The cabinet cannot SAVE a staged setup**, and that is this
+            // table's rule again rather than a gap. `docs/FIRST-RUN.md` is a
+            // desk flow: choosing a keyboard from a list of real devices and
+            // naming a preset are keyboard-and-mouse acts, and a cabinet has
+            // neither — the arcade panel IS the input. Reading and editing the
+            // staged setup stay available (they are memory, and a 10-foot
+            // screen can legitimately show what is staged); turning it into
+            // files is refused here in words naming the surface that can.
+            //
+            // The refusal is a real ConfigError rather than a silent success,
+            // so a screen that ever grew a Save button would fail loudly on
+            // the first press instead of appearing to work.
+            stage_commit: Box::new(|_spec| {
+                Err(ksx_config::ConfigError::UnknownDeviceAlias(
+                    "the cabinet cannot save a setup — open ksx (Studio) on a desk, or run \
+                     `ksx setup`"
+                        .to_owned(),
+                ))
+            }),
             // Learning a key is AUTHORING — it exists to fill in a binding —
             // so it is refused here like the other four. The first pass wired
             // the real `with_rawinput()` learner with a comment saying learn

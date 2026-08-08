@@ -185,6 +185,27 @@ pub fn plan(spec: &CommitSpec) -> Result<RunPlan, PlanError> {
     Ok(plan)
 }
 
+/// [`plan`], plus **the one resolution pass** — what a live staged session
+/// actually starts on.
+///
+/// A staged setup names a board by [`ksx_core::DeviceSelector`]
+/// (`usb:d209:0430:00`), and a capture backend needs a devnode. That
+/// translation is `crate::run::resolve`, run once at session start, and this
+/// calls the SAME `plan::resolve_devices` that `plan::resolve_as` calls — not a
+/// copy — so a staged session and a saved one resolve "which board is this"
+/// identically. A second answer to that question is the one this project has
+/// already been wrong about (`docs/DEVICE-IDENTITY.md` §8).
+///
+/// Kept apart from [`plan`] because the split is the point: [`plan`] touches no
+/// hardware and is what a *preview* calls, and enumeration belongs on the
+/// starting side of the line `FIRST-RUN.md` §5 draws.
+pub fn resolve(spec: &CommitSpec) -> Result<RunPlan, PlanError> {
+    let config = to_config(&ConfigFile::default(), spec);
+    let mut plan = plan(spec)?;
+    crate::run::plan::resolve_devices(&mut plan, &config.devices)?;
+    Ok(plan)
+}
+
 /// **Save.** Write the staged setup: presets first, then one config write
 /// behind one timestamped backup.
 ///

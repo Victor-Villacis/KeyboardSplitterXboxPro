@@ -93,6 +93,18 @@ pub type SlotAssignFn = Box<
         + Send,
 >;
 
+/// The `stage-commit` verb's writer — [`crate::stage::apply`], same injection
+/// rule as [`MapFn`].
+///
+/// It is a `Fn` over the whole [`ksx_core::CommitSpec`] rather than a config
+/// root, so the protocol tests exercise every refusal above it with no disk at
+/// all — and so the ONE act that turns a staged setup into files is visible in
+/// this list beside the other writers, instead of hidden inside a handler.
+pub type StageCommitFn = Box<
+    dyn Fn(&ksx_core::CommitSpec) -> Result<crate::stage::Committed, ksx_config::ConfigError>
+        + Send,
+>;
+
 /// Everything a pipe request can reach. One struct so the transport, the
 /// tests and future verbs share a single wiring point.
 pub struct PipeDeps {
@@ -108,6 +120,9 @@ pub struct PipeDeps {
     /// The one verb here that is not a preset write: which preset a slot uses
     /// (`slot-assign`, docs/CONTROL-SURFACE.md honest gaps 1 and 5).
     pub slot_assign: SlotAssignFn,
+    /// The ONE act that turns the staged setup into files (`stage-commit`).
+    /// Everything else about staging is memory (docs/FIRST-RUN.md §2).
+    pub stage_commit: StageCommitFn,
     pub learn: super::learn::LearnService,
 }
 
@@ -194,6 +209,12 @@ pub fn backups_fn(root: ksx_config::ConfigRoot) -> BackupsFn {
 /// A slot assignment is one deliberate act.
 pub fn slot_assign_fn(root: ksx_config::ConfigRoot) -> SlotAssignFn {
     Box::new(move |spec| crate::slots::assign(&ksx_config::Store::new(root.clone()), spec))
+}
+
+/// The real [`StageCommitFn`]: [`crate::stage::apply`] against `root`'s store —
+/// presets first, then one config write behind one timestamped backup.
+pub fn stage_commit_fn(root: ksx_config::ConfigRoot) -> StageCommitFn {
+    Box::new(move |spec| crate::stage::apply(&ksx_config::Store::new(root.clone()), spec))
 }
 
 /// games.toml rows for the status response. Unreadable configuration reports
@@ -356,7 +377,7 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
     };
     let Some(verb) = request.get("verb").and_then(|v| v.as_str()) else {
         return err_msg(
-            r#"request has no "verb" (status | start | stop | reload | map | map-macro | map-restore | map-clear-all | map-backups | slot-assign | learn-key | learn-poll | learn-cancel)"#,
+            r#"request has no "verb" (status | start | stop | reload | map | map-macro | map-restore | map-clear-all | map-backups | slot-assign | stage | stage-edit | stage-commit | stage-play | learn-key | learn-poll | learn-cancel)"#,
         );
     };
     match verb {
@@ -399,6 +420,13 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
         "map-clear-all" => handle_map_clear_all(&request, deps, settle),
         "map-backups" => handle_map_backups(&request, deps),
         "slot-assign" => handle_slot_assign(&request, deps, settle),
+        // The staged setup (docs/FIRST-RUN.md §2). `stage` and `stage-edit`
+        // touch one value in the daemon's own state and NOTHING else — no
+        // file, no driver, no session — which is what makes exploring free.
+        "stage" => stage_view(&deps.state),
+        "stage-edit" => handle_stage_edit(&request, deps),
+        "stage-commit" => handle_stage_commit(deps),
+        "stage-play" => handle_stage_play(deps, settle),
         // Learn needs an IDLE daemon, and this refusal is deliberate — it was
         // re-examined in full on 2026-08-05 and kept.
         //
@@ -449,8 +477,8 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
         "learn-cancel" => deps.learn.cancel(),
         other => err_msg(format!(
             "unknown verb '{other}' (status | start | stop | reload | map | map-macro | \
-             map-restore | map-clear-all | map-backups | slot-assign | learn-key | \
-             learn-poll | learn-cancel)"
+             map-restore | map-clear-all | map-backups | slot-assign | stage | stage-edit | \
+             stage-commit | stage-play | learn-key | learn-poll | learn-cancel)"
         )),
     }
 }
@@ -809,6 +837,228 @@ fn handle_slot_assign(
         // reads as "nothing was running".
         "reloaded": bounce.reconciled,
     })
+}
+
+// ---------------------------------------------------------------------------
+// The staged setup — docs/FIRST-RUN.md §2
+// ---------------------------------------------------------------------------
+
+/// One [`ksx_api::StageOutcome`] as the JSON line the pipe carries.
+///
+/// Serialized from the api type rather than hand-built, unlike the older verbs
+/// on this module: the outcome already IS the wire shape (it is what a surface
+/// deserializes), so writing the object out by hand here would be a second
+/// description of it — and the client would deserialize whichever one drifted.
+fn stage_json(outcome: &ksx_api::StageOutcome) -> serde_json::Value {
+    serde_json::to_value(outcome)
+        .unwrap_or_else(|err| err_msg(format!("the staged setup could not be described: {err}")))
+}
+
+/// The staged setup as it stands. **A read: it changes nothing.**
+fn stage_view(state: &SharedState) -> serde_json::Value {
+    let Ok(s) = state.lock() else {
+        // A poisoned lock is a failed READ, and a failed read is not an
+        // absence (docs/SURFACES.md §1b). Rendering an empty setup here would
+        // tell a user they had staged nothing.
+        return stage_json(&ksx_api::StageOutcome::unavailable(
+            "the daemon's state lock is poisoned, so the staged setup could not be read — \
+             this is not the same as having staged nothing",
+        ));
+    };
+    let mut outcome = ksx_api::StageOutcome::ok(&s.staged, "the staged setup");
+    // A pure read reports no verb having happened.
+    outcome.message = None;
+    stage_json(&outcome)
+}
+
+/// `{"verb":"stage-edit","edit":"add-slot","persona":"playstation",…}` — one
+/// edit to the staged setup.
+///
+/// **Nothing here writes.** The edit is validated by `ksx_api::StageEdit::apply`
+/// (which is `ksx_core`'s own operations behind a string parser), and the new
+/// value replaces the old one in the daemon's state — or, on a refusal, does
+/// not, and the answer carries the setup the caller still has.
+fn handle_stage_edit(request: &serde_json::Value, deps: &PipeDeps) -> serde_json::Value {
+    // The whole request object IS the edit: the `verb` field is ignored by
+    // serde's tag (`edit`), so a surface sends one flat object.
+    let edit: ksx_api::StageEdit = match serde_json::from_value(request.clone()) {
+        Ok(edit) => edit,
+        Err(err) => {
+            return serde_json::json!({
+                "ok": false,
+                "code": ksx_api::codes::BAD_REQUEST,
+                "error": format!(
+                    "stage-edit needs an \"edit\" naming one of choose-device | add-slot | \
+                     set-persona | set-bindings | remove-slot | set-blocking | discard: {err}"
+                ),
+            })
+        }
+    };
+    let Ok(mut s) = deps.state.lock() else {
+        return stage_json(&ksx_api::StageOutcome::unavailable(
+            "the daemon's state lock is poisoned, so the staged setup could not be edited",
+        ));
+    };
+    match edit.apply(&s.staged) {
+        Ok(next) => {
+            s.staged = next;
+            stage_json(&ksx_api::StageOutcome::ok(&s.staged, describe(&edit)))
+        }
+        // The setup is handed back UNCHANGED, which is the whole promise: a
+        // user told "no" is still looking at a true screen.
+        Err(refusal) => stage_json(&ksx_api::StageOutcome::refused(&s.staged, &refusal)),
+    }
+}
+
+/// The one line a successful edit prints. Composed here, once, so the browser
+/// and the cabinet describe the same act identically.
+fn describe(edit: &ksx_api::StageEdit) -> String {
+    match edit {
+        ksx_api::StageEdit::ChooseDevice { label, .. } => {
+            format!("using \"{label}\" — nothing has been claimed or written")
+        }
+        ksx_api::StageEdit::AddSlot { .. } => {
+            "controller staged — nothing is plugged until you play".to_owned()
+        }
+        ksx_api::StageEdit::SetPersona { number, .. } => {
+            format!("slot {number} changed — free, because nothing was written")
+        }
+        ksx_api::StageEdit::SetBindings { number, .. } => format!("slot {number}'s bindings"),
+        ksx_api::StageEdit::RemoveSlot { number } => {
+            format!("slot {number} removed — no file, no backup, no trace")
+        }
+        ksx_api::StageEdit::SetBlocking { .. } => {
+            "answered — and LeftCtrl five times always stops emulation, in either mode".to_owned()
+        }
+        ksx_api::StageEdit::Discard => "started over".to_owned(),
+    }
+}
+
+/// `{"verb":"stage-commit"}` — **save** the staged setup.
+///
+/// The only verb on this module that turns staging into files. It does not
+/// start anything and does not claim anything: `docs/FIRST-RUN.md` §2's
+/// "saving and playing are separate acts", and `SURFACES.md` §3's rule that
+/// claiming is always explicit and separately confirmed.
+fn handle_stage_commit(deps: &PipeDeps) -> serde_json::Value {
+    let Ok(s) = deps.state.lock() else {
+        return stage_json(&ksx_api::StageOutcome::unavailable(
+            "the daemon's state lock is poisoned, so the staged setup could not be saved",
+        ));
+    };
+    // `commit()` is where ksx-core refuses an incomplete setup, in the same
+    // words `StagedSetupView::not_ready` already showed on screen — so pressing
+    // Save cannot produce a surprise the page had not already stated.
+    let spec = match s.staged.commit() {
+        Ok(spec) => spec,
+        Err(refusal) => {
+            return stage_json(&ksx_api::StageOutcome::refused(
+                &s.staged,
+                &ksx_api::Refusal::from_wire(Some(refusal.code()), refusal.to_string()),
+            ))
+        }
+    };
+    match (deps.stage_commit)(&spec) {
+        Ok(written) => {
+            let mut outcome = ksx_api::StageOutcome::ok(&s.staged, written.message());
+            outcome.saved = Some(written.config.display().to_string());
+            outcome.backup = written.backup.map(|path| path.display().to_string());
+            stage_json(&outcome)
+        }
+        Err(err) => stage_json(&ksx_api::StageOutcome::refused(
+            &s.staged,
+            &ksx_api::Refusal::new(ksx_api::codes::REFUSED, err.to_string()),
+        )),
+    }
+}
+
+/// `{"verb":"stage-play"}` — **play the staged setup with nothing written.**
+///
+/// The plan is built in memory (`crate::stage::plan`) and handed to the control
+/// loop as [`DaemonCommand::PlayStaged`], which takes the ordinary start path.
+/// No config file is read and none is written, which is what makes
+/// `FIRST-RUN.md` §2's "the user may leave without saving and lose only what
+/// they typed" true.
+fn handle_stage_play(deps: &PipeDeps, settle: Duration) -> serde_json::Value {
+    let (spec, staged) = {
+        let Ok(s) = deps.state.lock() else {
+            return stage_json(&ksx_api::StageOutcome::unavailable(
+                "the daemon's state lock is poisoned, so the staged setup could not be started",
+            ));
+        };
+        match s.staged.commit() {
+            Ok(spec) => (spec, s.staged.clone()),
+            Err(refusal) => {
+                return stage_json(&ksx_api::StageOutcome::refused(
+                    &s.staged,
+                    &ksx_api::Refusal::from_wire(Some(refusal.code()), refusal.to_string()),
+                ))
+            }
+        }
+    };
+
+    // Build the plan HERE, before anything is enqueued: a setup that cannot
+    // plan must be refused with the planner's own sentence — which names the
+    // slot and the preset — rather than as a session that starts and dies with
+    // the reason only in the daemon's log.
+    //
+    // `plan`, not `resolve`: this is the pure half, so a refusal costs no USB
+    // enumeration. The factory runs the resolution pass on the same spec when
+    // the session actually starts.
+    if let Err(err) = crate::stage::plan(&spec) {
+        return stage_json(&ksx_api::StageOutcome::refused(
+            &staged,
+            &ksx_api::Refusal::new(ksx_api::codes::REFUSED, err.to_string()),
+        ));
+    }
+
+    let baseline = snapshot(&deps.state).run;
+    if matches!(baseline, RunState::Running { .. } | RunState::Starting) {
+        return stage_json(&ksx_api::StageOutcome::refused(
+            &staged,
+            &ksx_api::Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                "a session is already running, so the staged setup was not started",
+                "stop it first (`ksx session stop`), then play again",
+            ),
+        ));
+    }
+    if deps
+        .tx
+        .send(DaemonCommand::PlayStaged(Box::new(spec)))
+        .is_err()
+    {
+        return stage_json(&ksx_api::StageOutcome::refused(
+            &staged,
+            &ksx_api::Refusal::new(ksx_api::codes::REFUSED, "the daemon is shutting down"),
+        ));
+    }
+    let started = await_start(&deps.state, &baseline, settle);
+    let mut outcome = if started["ok"] == serde_json::Value::Bool(true) {
+        let mut ok = ksx_api::StageOutcome::ok(
+            &staged,
+            started["message"]
+                .as_str()
+                .unwrap_or("the staged setup is playing"),
+        );
+        ok.playing = true;
+        ok
+    } else {
+        ksx_api::StageOutcome::refused(
+            &staged,
+            &ksx_api::Refusal::new(
+                ksx_api::codes::REFUSED,
+                started["error"]
+                    .as_str()
+                    .unwrap_or("the staged setup did not start"),
+            ),
+        )
+    };
+    // NEVER a path. Playing writes nothing, and reporting one would be a claim
+    // about the disk this verb did not make.
+    outcome.saved = None;
+    outcome.backup = None;
+    stage_json(&outcome)
 }
 
 /// What [`bounce_after_slot_write`] did.
@@ -1766,6 +2016,16 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
         })
     }
 
+    /// A `stage-commit` writer that always refuses, so a test that reaches it
+    /// says so loudly instead of touching a real config root.
+    fn no_stage_commit() -> StageCommitFn {
+        Box::new(|_spec| {
+            Err(ksx_config::ConfigError::UnknownDeviceAlias(
+                "this test daemon has no config root".to_owned(),
+            ))
+        })
+    }
+
     fn deps(tx: Sender<DaemonCommand>, state: SharedState, profiles: ProfilesFn) -> PipeDeps {
         PipeDeps {
             tx,
@@ -1782,6 +2042,11 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
             }),
             backups: no_backups(),
             slot_assign: no_slot_assign(),
+            // Records the spec it was handed and writes nothing, so every
+            // staging refusal above it is exercised with no disk at all — and
+            // so a test can assert that a REFUSED commit never reached the
+            // writer, which "no file appeared" cannot prove.
+            stage_commit: no_stage_commit(),
             learn: idle_learn(),
         }
     }
@@ -1829,6 +2094,261 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
         assert_eq!(v["game"], "Street Fighter");
         assert_eq!(v["profiles"][1]["title"], "Metal Slug");
         assert!(v["tooltip"].as_str().unwrap().contains("running, 4 pad(s)"));
+    }
+
+    // -- the staged setup (docs/FIRST-RUN.md §2) ----------------------------
+
+    /// Stage a device and a controller over the pipe, in the shape a surface
+    /// sends.
+    fn stage_up(deps: &PipeDeps) {
+        let chosen = handle_request(
+            r#"{"verb":"stage-edit","edit":"choose-device","selector":"usb:d209:0430:00",
+                "alias":"panel","label":"Ultimarc I-PAC 4"}"#,
+            deps,
+            FAST,
+        );
+        assert_eq!(chosen["ok"], true, "{chosen}");
+        let added = handle_request(
+            r#"{"verb":"stage-edit","edit":"add-slot","persona":"playstation","preset":"Player 1"}"#,
+            deps,
+            FAST,
+        );
+        assert_eq!(added["ok"], true, "{added}");
+    }
+
+    /// **The whole point of §2, over the wire: staging writes nothing and
+    /// starts nothing.**
+    ///
+    /// Breaks against a daemon that answered a persona choice by calling
+    /// `slot-assign` (which is what the pre-staging design did): the writer
+    /// would be reached, and this fixture's writer refuses in a sentence naming
+    /// the test daemon's missing config root, so the outcome would not be `ok`.
+    /// It also breaks against any handler that enqueued a command — nothing
+    /// about choosing a controller may reach the control loop.
+    #[test]
+    fn staging_holds_the_setup_in_the_daemon_and_touches_nothing_else() {
+        let state = shared(RunState::Stopped);
+        let (tx, rx) = unbounded();
+        let deps = deps(tx, state.clone(), no_profiles());
+        stage_up(&deps);
+
+        // It is HELD: a second, independent request sees it.
+        let view = handle_request(r#"{"verb":"stage"}"#, &deps, FAST);
+        assert_eq!(view["ok"], true, "{view}");
+        assert_eq!(view["setup"]["device"]["label"], "Ultimarc I-PAC 4");
+        assert_eq!(view["setup"]["device"]["selector"], "usb:d209:0430:00");
+        assert_eq!(view["setup"]["slots"][0]["number"], 1);
+        assert_eq!(view["setup"]["slots"][0]["persona"], "playstation");
+        assert_eq!(view["setup"]["ready"], true);
+        // The ceilings and the roster are SERVED, so no surface has to know
+        // them (docs/CLAUDE.md's one rule).
+        assert_eq!(view["setup"]["max_slots"], ksx_core::MAX_SLOTS);
+        assert_eq!(
+            view["setup"]["max_xinput_slots"],
+            ksx_core::MAX_XINPUT_SLOTS
+        );
+        assert_eq!(
+            view["setup"]["personas"].as_array().unwrap().len(),
+            ksx_core::Persona::ALL.len()
+        );
+        // §3 has not been asked, and that is not the same as "whole".
+        assert_eq!(view["setup"]["blocking"], serde_json::Value::Null);
+
+        // Nothing was enqueued and no session state moved.
+        assert!(rx.try_recv().is_err(), "staging enqueues nothing");
+        assert_eq!(state.lock().unwrap().run, RunState::Stopped);
+    }
+
+    /// A refused edit leaves the held setup exactly as it was, and says why in
+    /// ksx-core's own words.
+    ///
+    /// Breaks against a handler that stored the edit before validating it (or
+    /// that validated against a clone and stored anyway): the fifth Xbox slot
+    /// would be in the daemon's state, and the next `stage` read would show a
+    /// slot the user was just told they could not have.
+    #[test]
+    fn a_refused_edit_leaves_the_held_setup_untouched() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let deps = deps(tx, state.clone(), no_profiles());
+        handle_request(
+            r#"{"verb":"stage-edit","edit":"choose-device","selector":"usb:d209:0430:00",
+                "alias":"panel","label":"I-PAC"}"#,
+            &deps,
+            FAST,
+        );
+        for n in 1..=4 {
+            let added = handle_request(
+                &format!(
+                    r#"{{"verb":"stage-edit","edit":"add-slot","number":{n},
+                        "persona":"xbox360","preset":"P{n}"}}"#
+                ),
+                &deps,
+                FAST,
+            );
+            assert_eq!(added["ok"], true, "{added}");
+        }
+        let refused = handle_request(
+            r#"{"verb":"stage-edit","edit":"add-slot","number":5,"persona":"xbox360","preset":"P5"}"#,
+            &deps,
+            FAST,
+        );
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["code"], "too-many-xinput-slots");
+        assert!(
+            refused["error"].as_str().unwrap().contains("is_xinput()"),
+            "{refused}"
+        );
+        // The answer carries the setup the caller STILL HAS — four slots.
+        assert_eq!(refused["setup"]["slots"].as_array().unwrap().len(), 4);
+        assert_eq!(refused["setup"]["xinput_used"], 4);
+        // ...and so does the daemon.
+        assert_eq!(state.lock().unwrap().staged.slots().len(), 4);
+
+        // A word this build cannot parse is a DIFFERENT failure, and carries a
+        // different code.
+        let typo = handle_request(
+            r#"{"verb":"stage-edit","edit":"add-slot","persona":"gamecube","preset":"P5"}"#,
+            &deps,
+            FAST,
+        );
+        assert_eq!(typo["code"], ksx_api::codes::BAD_REQUEST, "{typo}");
+    }
+
+    /// Removing a staged controller is free and complete, and "Start over"
+    /// always works.
+    #[test]
+    fn removing_and_discarding_leave_no_trace() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let deps = deps(tx, state.clone(), no_profiles());
+        stage_up(&deps);
+
+        let removed = handle_request(
+            r#"{"verb":"stage-edit","edit":"remove-slot","number":1}"#,
+            &deps,
+            FAST,
+        );
+        assert_eq!(removed["ok"], true, "{removed}");
+        assert!(
+            removed["message"].as_str().unwrap().contains("no trace"),
+            "{removed}"
+        );
+        assert!(removed["setup"]["slots"].as_array().unwrap().is_empty());
+        // The device survives: deleting a controller is not starting over.
+        assert_eq!(removed["setup"]["device"]["alias"], "panel");
+
+        let over = handle_request(r#"{"verb":"stage-edit","edit":"discard"}"#, &deps, FAST);
+        assert_eq!(over["ok"], true, "{over}");
+        assert_eq!(over["setup"]["empty"], true);
+        assert!(state.lock().unwrap().staged.is_empty());
+    }
+
+    /// Saving an incomplete setup is refused **before the writer is reached**,
+    /// in the same sentence the view was already showing as `not_ready`.
+    ///
+    /// Breaks against a handler that called the writer first and let it fail:
+    /// this fixture's writer refuses with "this test daemon has no config
+    /// root", which is a true sentence about the wrong thing — and on a real
+    /// machine that ordering writes a `[[device]]` for a setup with no
+    /// controller in it.
+    #[test]
+    fn saving_an_incomplete_setup_never_reaches_the_writer() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let deps = deps(tx, state.clone(), no_profiles());
+
+        // No device, no controller.
+        let empty = handle_request(r#"{"verb":"stage-commit"}"#, &deps, FAST);
+        assert_eq!(empty["ok"], false, "{empty}");
+        assert_eq!(empty["code"], "no-device");
+        assert_eq!(empty["saved"], serde_json::Value::Null);
+
+        // A device but no controller — and the refusal is the sentence the
+        // view was already carrying, so Save cannot surprise anyone.
+        handle_request(
+            r#"{"verb":"stage-edit","edit":"choose-device","selector":"usb:d209:0430:00",
+                "alias":"panel","label":"I-PAC"}"#,
+            &deps,
+            FAST,
+        );
+        let view = handle_request(r#"{"verb":"stage"}"#, &deps, FAST);
+        assert_eq!(view["setup"]["ready"], false);
+        let refused = handle_request(r#"{"verb":"stage-commit"}"#, &deps, FAST);
+        assert_eq!(refused["code"], "no-slots");
+        assert_eq!(
+            refused["error"], view["setup"]["not_ready"],
+            "Save must refuse in the words the screen was already showing"
+        );
+    }
+
+    /// **Play without saving**: the staged setup reaches the control loop as
+    /// `PlayStaged`, carrying the whole spec, and the answer claims no file.
+    ///
+    /// Breaks against two shortcuts. A `stage-play` that saved first and then
+    /// sent an ordinary `Start` would enqueue the wrong command AND leave a
+    /// config the user never asked for — §2's "the user may leave without
+    /// saving and lose only what they typed" would be false. And a
+    /// `PlayStaged` that carried only a flag would reach a control loop with
+    /// nowhere to read the setup from, because it is not on disk.
+    #[test]
+    fn playing_a_staged_setup_carries_the_whole_spec_and_writes_nothing() {
+        let state = shared(RunState::Stopped);
+        let (tx, rx) = unbounded();
+        let deps = deps(tx, state.clone(), no_profiles());
+        stage_up(&deps);
+
+        let worker = std::thread::spawn({
+            let state = state.clone();
+            move || {
+                let command = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                state.lock().unwrap().run = RunState::Running { slots: 1 };
+                command
+            }
+        });
+        let played = handle_request(r#"{"verb":"stage-play"}"#, &deps, Duration::from_secs(2));
+        assert_eq!(played["ok"], true, "{played}");
+        assert_eq!(played["playing"], true);
+        // NEVER a path: playing writes nothing, and saying otherwise would be a
+        // claim about the disk this verb did not make.
+        assert_eq!(played["saved"], serde_json::Value::Null);
+        assert_eq!(played["backup"], serde_json::Value::Null);
+        // ...and the staged setup is still staged, so a user can go on editing.
+        assert_eq!(played["setup"]["slots"][0]["persona"], "playstation");
+
+        let DaemonCommand::PlayStaged(spec) = worker.join().unwrap() else {
+            panic!("stage-play must enqueue PlayStaged, not Start");
+        };
+        assert_eq!(spec.slots.len(), 1);
+        assert_eq!(spec.slots[0].spec.persona, ksx_core::Persona::PlayStation);
+        assert_eq!(
+            spec.slots[0].spec.keyboard.as_ref().map(|k| k.as_str()),
+            Some("usb:d209:0430:00"),
+            "the staged slot names the staged board, by selector"
+        );
+    }
+
+    /// Playing an incomplete setup is refused before anything is enqueued, and
+    /// so is playing while a session is already running.
+    #[test]
+    fn playing_refuses_before_enqueuing_anything() {
+        let state = shared(RunState::Stopped);
+        let (tx, rx) = unbounded();
+        let deps = deps(tx, state.clone(), no_profiles());
+        let refused = handle_request(r#"{"verb":"stage-play"}"#, &deps, FAST);
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["code"], "no-device");
+        assert!(rx.try_recv().is_err(), "nothing may be enqueued");
+
+        stage_up(&deps);
+        state.lock().unwrap().run = RunState::Running { slots: 4 };
+        let busy = handle_request(r#"{"verb":"stage-play"}"#, &deps, FAST);
+        assert_eq!(busy["ok"], false, "{busy}");
+        assert!(
+            busy["error"].as_str().unwrap().contains("already running"),
+            "{busy}"
+        );
+        assert!(rx.try_recv().is_err(), "nothing may be enqueued");
     }
 
     #[test]

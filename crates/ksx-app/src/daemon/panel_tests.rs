@@ -900,6 +900,7 @@ fn the_control_loops_keyboard_is_the_daemons_own_claim() {
         no_launch: true,
         panel: Some(Arc::clone(&rig.panel)),
         feed: crate::feed::LiveSink::default(),
+        staged: None,
     };
     let mut keyboard = factory.panel_keyboard();
 
@@ -928,6 +929,7 @@ fn the_control_loops_keyboard_is_the_daemons_own_claim() {
         no_launch: true,
         panel: None,
         feed: crate::feed::LiveSink::default(),
+        staged: None,
     };
     none.panel_keyboard().set_emulating(true);
 }

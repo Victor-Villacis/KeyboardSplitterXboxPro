@@ -30,6 +30,15 @@ pub struct LiveFactory {
     /// while nobody is subscribed, which is every session on a cabinet with no
     /// window open.
     pub feed: crate::feed::LiveSink,
+    /// **Play without saving** (`docs/FIRST-RUN.md` §2): when this is set,
+    /// every session is built from the STAGED setup instead of from the config
+    /// on disk, and no file is read or written to do it.
+    ///
+    /// `Option` rather than a second factory because the two must be the same
+    /// session path: same claim, same supervisor, same panel handling, same
+    /// reap. Only the plan's origin differs, which is exactly one branch in
+    /// [`SessionFactory::resolve_plan`].
+    pub staged: Option<ksx_core::CommitSpec>,
 }
 
 impl LiveFactory {
@@ -92,8 +101,22 @@ impl SessionFactory for LiveFactory {
     /// comparison and every preset edit reports "slot N's input device changed"
     /// and bounces a live session mid-game (`docs/DEVICE-IDENTITY.md` §8).
     fn resolve_plan(&self) -> anyhow::Result<crate::run::plan::RunPlan> {
+        // The staged setup wins while one is set, and it is the ONLY branch
+        // that differs: `crate::stage::resolve` runs the same
+        // `plan::resolve_devices` pass `resolve_as` runs, so "which board is
+        // this" is answered once for both.
+        if let Some(spec) = &self.staged {
+            return crate::stage::resolve(spec).map_err(|err| anyhow::anyhow!("{err}"));
+        }
         crate::run::plan::resolve_as(&self.root, self.game.as_deref(), "ksx daemon")
             .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
+    /// This factory CAN run a staged setup, so it takes the override and says
+    /// so.
+    fn set_staged(&mut self, spec: Option<ksx_core::CommitSpec>) -> bool {
+        self.staged = spec;
+        true
     }
 
     fn config_dir(&self) -> PathBuf {
