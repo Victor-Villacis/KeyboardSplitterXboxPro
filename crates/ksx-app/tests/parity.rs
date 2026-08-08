@@ -473,6 +473,21 @@ struct Anchors {
 
 const ANCHORS: &[Anchors] = &[
     Anchors {
+        capability: "First run: stage a setup, save or play",
+        // `planned` — and it is the reason the bookkeeping test below stopped
+        // demanding that every CLI anchor resolve. `ksx stage` does not exist;
+        // saying so IS the claim, exactly as `Screen::Mapper` below says the
+        // cabinet has no mapper. §3c records why the build order ran backwards
+        // here.
+        cli: &["stage"],
+        egui: &["Screen::FirstRun", "Ask::Stage"],
+        // The two acts §2 requires be separable, plus the page they live on.
+        // Naming both is deliberate: a `/start` that could only save, or only
+        // play, would satisfy a one-anchor row while failing the requirement
+        // the row exists for.
+        studio: &["/start", "/start/save", "/start/play"],
+    },
+    Anchors {
         capability: "Author presets / key mappings",
         cli: &[
             "setup",
@@ -612,7 +627,33 @@ const EXEMPT: &[Exempt] = &[
         why: "Same, and §6 already fixed the direction: the egui opens Studio, never the \
               reverse — a browser would need a registered ksx:// protocol to do it.",
     },
+    Exempt {
+        verb: "open",
+        gate: Some("studio"),
+        why: "It IS the product's front door — start the daemon if needed, then show Studio \
+              in its own window — so it is the same class as `studio` and `cabinet`: a verb \
+              that launches a surface cannot have a face on the surface it launches. It is \
+              what the installer's shortcut and the Start menu entry both run, which is \
+              precisely the point at which no other surface exists yet.",
+    },
 ];
+
+/// **The guard's own blind spot, stated so it is not rediscovered.**
+///
+/// `EXEMPT` gates and the two feature-gated verbs above are only visible when
+/// the test binary was built with that feature on, and CI's test step is
+/// `cargo test --workspace` with default features — where `studio` and
+/// `cabinet` are off (`CLAUDE.md`: "the default build compiles neither"). So
+/// `ksx open`, `ksx studio` and `ksx cabinet` are checked by this file only
+/// when somebody runs it with the feature enabled. `ksx open` sat unaccounted
+/// for exactly that reason until 2026-08-08 and CI stayed green throughout.
+///
+/// The fix is a feature-enabled test job, not a change here; it is written down
+/// rather than done because widening the CI matrix is its own change with its
+/// own runtime cost, and a note that names the hole is better than a guard that
+/// quietly checks less than it claims.
+#[cfg(test)]
+const _FEATURE_GATED_VERBS_ARE_ONLY_CHECKED_WITH_THE_FEATURE_ON: () = ();
 
 fn gate_is_on(feature: &str) -> bool {
     match feature {
@@ -850,12 +891,29 @@ fn the_guard_is_still_bound_to_the_documents_and_the_tree_it_reads() {
 
     let verbs = cli_verbs();
     let claimed: BTreeSet<&str> = ANCHORS.iter().flat_map(|a| a.cli.iter().copied()).collect();
-    for verb in &claimed {
+    // Only where the ROW SAYS THE VERB IS THERE. A `planned` CLI cell anchored
+    // on a name that does not resolve is not a stale anchor — it is the claim
+    // (§3c). The egui and Studio columns have always worked this way:
+    // `Screen::Mapper` and `/buttons` name nothing, which is exactly what makes
+    // their cells honest, and the CLI column was the odd one out until the
+    // first row with a genuinely planned CLI half arrived.
+    //
+    // Nothing is lost by narrowing it. A `owns` cell whose verb was renamed or
+    // deleted still fails, one test up, in
+    // `every_cell_claiming_a_shipped_face_has_one` — with a better message.
+    let shipped_cli: BTreeSet<&str> = matrix()
+        .iter()
+        .filter(|row| classify(&row.cli) == Claim::Shipped)
+        .filter_map(|row| anchored.contains(&row.capability).then(|| row))
+        .filter_map(|row| ANCHORS.iter().find(|a| key(a.capability) == row.capability))
+        .flat_map(|a| a.cli.iter().copied())
+        .collect();
+    for verb in &shipped_cli {
         if !verbs.contains(*verb) {
             problems.push(format!(
-                "tests/parity.rs anchors a capability on `ksx {verb}`, which is not in the \
-                 clap tree. Either the verb was renamed and the anchor is stale, or it was \
-                 deleted and §3 still promises it."
+                "tests/parity.rs anchors a capability on `ksx {verb}`, whose §3 cell says the \
+                 CLI OWNS it, and it is not in the clap tree. Either the verb was renamed and \
+                 the anchor is stale, or it was deleted and §3 still promises it."
             ));
         }
     }
