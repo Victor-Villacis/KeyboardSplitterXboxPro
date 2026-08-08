@@ -147,102 +147,69 @@ fn scalar_slots(payload: &SetupPayload, flash: Option<&str>) -> serde_json::Valu
 }
 
 /// The list array payloads, keyed by their (unique) slot names.
+///
+/// VERBATIM from [`crate::snapshot::SetupRows`] — this seam formats nothing.
+/// The row sentences ("Slot 3 — IPAC P1", "interception · usb:…") and the
+/// slot-menu ceiling used to be composed here and AGAIN in `SetupIsland.ts`,
+/// which is docs/SURFACES.md §1 drift with a runtime cost: the two copies
+/// could disagree between the SSR paint and the first poll. Now both read the
+/// rows `SetupPayload::composed` filled, so they cannot.
 fn list_values(payload: &SetupPayload) -> [(&'static str, SlotValue); 7] {
-    let view = &payload.setup.view;
+    let rows = &payload.rows;
 
     let steps = SlotValue::array(
-        view.steps
+        rows.steps
             .iter()
-            .enumerate()
-            .map(|(i, step)| {
+            .map(|step| {
                 SlotValue::object(vec![
-                    ("badge".to_owned(), SlotValue::Text(format!("{}", i + 1))),
+                    ("badge".to_owned(), SlotValue::Text(step.badge.clone())),
                     ("title".to_owned(), SlotValue::Text(step.title.clone())),
                     ("detail".to_owned(), SlotValue::Text(step.detail.clone())),
-                    // Presentation, from the backend's decision — this seam
-                    // never decides which step is next.
-                    (
-                        "cls".to_owned(),
-                        SlotValue::Text(format!("step {}", step.state)),
-                    ),
+                    ("cls".to_owned(), SlotValue::Text(step.cls.clone())),
                 ])
             })
             .collect(),
     );
 
-    // 1..=the ceiling THE BACKEND serves (`ksx_core::MAX_SLOTS`, carried on
-    // `SetupView::max_slots`). This page used to hold its own `SLOT_CHOICES =
-    // 8` — in Rust and again in TypeScript — which silently hid slots 9-16
-    // that `ksx slot assign` accepts and that this page's own inventory lists.
     let slot_options = SlotValue::array(
-        (1..=view.max_slots)
-            .map(|n| {
+        rows.slot_options
+            .iter()
+            .map(|option| {
                 SlotValue::object(vec![
-                    ("value".to_owned(), SlotValue::Text(n.to_string())),
-                    ("label".to_owned(), SlotValue::Text(format!("Slot {n}"))),
+                    ("value".to_owned(), SlotValue::Text(option.value.clone())),
+                    ("label".to_owned(), SlotValue::Text(option.label.clone())),
                 ])
             })
             .collect(),
     );
 
-    let presets = SlotValue::array(
-        view.presets
-            .iter()
-            .map(|name| SlotValue::object(vec![("text".to_owned(), SlotValue::Text(name.clone()))]))
-            .collect(),
-    );
+    let text_rows = |rows: &[crate::snapshot::SetupTextRowView]| {
+        SlotValue::array(
+            rows.iter()
+                .map(|row| {
+                    SlotValue::object(vec![("text".to_owned(), SlotValue::Text(row.text.clone()))])
+                })
+                .collect(),
+        )
+    };
+    let presets = text_rows(&rows.preset_options);
+    let profiles = text_rows(&rows.profile_options);
+    let notes = text_rows(&rows.notes);
 
-    let profiles = SlotValue::array(
-        view.profiles
-            .iter()
-            .map(|title| {
-                SlotValue::object(vec![("text".to_owned(), SlotValue::Text(title.clone()))])
-            })
-            .collect(),
-    );
-
-    let devices = SlotValue::array(
-        view.devices
-            .iter()
-            .map(|device| {
-                SlotValue::object(vec![
-                    ("title".to_owned(), SlotValue::Text(device.alias.clone())),
-                    (
-                        "detail".to_owned(),
-                        SlotValue::Text(format!("{} · {}", device.backend, device.id)),
-                    ),
-                ])
-            })
-            .collect(),
-    );
-
-    let slots = SlotValue::array(
-        view.slots
-            .iter()
-            .map(|slot| {
-                SlotValue::object(vec![
-                    (
-                        "title".to_owned(),
-                        SlotValue::Text(format!("Slot {} — {}", slot.number, slot.preset)),
-                    ),
-                    (
-                        "detail".to_owned(),
-                        SlotValue::Text(format!(
-                            "{} · {} · {}",
-                            slot.device, slot.persona, slot.source
-                        )),
-                    ),
-                ])
-            })
-            .collect(),
-    );
-
-    let notes = SlotValue::array(
-        view.notes
-            .iter()
-            .map(|note| SlotValue::object(vec![("text".to_owned(), SlotValue::Text(note.clone()))]))
-            .collect(),
-    );
+    let pair_rows = |rows: &[crate::snapshot::SetupPairRowView]| {
+        SlotValue::array(
+            rows.iter()
+                .map(|row| {
+                    SlotValue::object(vec![
+                        ("title".to_owned(), SlotValue::Text(row.title.clone())),
+                        ("detail".to_owned(), SlotValue::Text(row.detail.clone())),
+                    ])
+                })
+                .collect(),
+        )
+    };
+    let devices = pair_rows(&rows.devices);
+    let slots = pair_rows(&rows.slots);
 
     [
         (LIST_SLOT_STEPS, steps),

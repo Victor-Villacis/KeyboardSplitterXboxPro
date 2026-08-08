@@ -843,6 +843,119 @@ impl SetupFlags {
     }
 }
 
+/// One checklist step as the row the page draws.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupStepRowView {
+    /// "1", "2", "3" — the position, as the badge text.
+    pub badge: String,
+    pub title: String,
+    pub detail: String,
+    /// `step done` | `step now` | `step later` — presentation of the BACKEND's
+    /// state word, composed here so neither language re-derives it.
+    pub cls: String,
+}
+
+/// A title-over-detail row (the inventory's boards and slots).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupPairRowView {
+    pub title: String,
+    pub detail: String,
+}
+
+/// One `<option>`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupOptionRowView {
+    pub value: String,
+    pub label: String,
+}
+
+/// One plain-text row (presets, profiles, notes).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupTextRowView {
+    pub text: String,
+}
+
+/// **Every list row `/setup` draws, composed once, in Rust** — the same
+/// docs/SURFACES.md §1 rule [`SetupLines`] and [`SetupFlags`] already follow,
+/// applied to the row and label formatters.
+///
+/// These used to live twice: `render_setup.rs::list_values` composed
+/// "Slot 3 — IPAC P1" for the SSR paint and `SetupIsland.ts` composed it
+/// again for the two-second poll. Two copies of a SENTENCE drift silently
+/// (the Profiles page's `ProfilesDerived` header tells the longer version of
+/// this story); now both seams read these rows verbatim and format nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupRows {
+    pub steps: Vec<SetupStepRowView>,
+    pub devices: Vec<SetupPairRowView>,
+    pub slots: Vec<SetupPairRowView>,
+    /// `1..=SetupView::max_slots` — the ceiling the backend serves, never a
+    /// literal in either language.
+    pub slot_options: Vec<SetupOptionRowView>,
+    pub preset_options: Vec<SetupTextRowView>,
+    pub profile_options: Vec<SetupTextRowView>,
+    pub notes: Vec<SetupTextRowView>,
+}
+
+impl SetupRows {
+    /// Compose every row for one read. The only implementation.
+    pub fn of(setup: &SetupSnapshot) -> Self {
+        let view = &setup.view;
+        Self {
+            steps: view
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(i, step)| SetupStepRowView {
+                    badge: (i + 1).to_string(),
+                    title: step.title.clone(),
+                    detail: step.detail.clone(),
+                    cls: format!("step {}", step.state),
+                })
+                .collect(),
+            devices: view
+                .devices
+                .iter()
+                .map(|device| SetupPairRowView {
+                    title: device.alias.clone(),
+                    detail: format!("{} · {}", device.backend, device.id),
+                })
+                .collect(),
+            slots: view
+                .slots
+                .iter()
+                .map(|slot| SetupPairRowView {
+                    title: format!("Slot {} — {}", slot.number, slot.preset),
+                    detail: format!("{} · {} · {}", slot.device, slot.persona, slot.source),
+                })
+                .collect(),
+            slot_options: (1..=view.max_slots)
+                .map(|n| SetupOptionRowView {
+                    value: n.to_string(),
+                    label: format!("Slot {n}"),
+                })
+                .collect(),
+            preset_options: view
+                .presets
+                .iter()
+                .map(|name| SetupTextRowView { text: name.clone() })
+                .collect(),
+            profile_options: view
+                .profiles
+                .iter()
+                .map(|title| SetupTextRowView {
+                    text: title.clone(),
+                })
+                .collect(),
+            notes: view
+                .notes
+                .iter()
+                .map(|note| SetupTextRowView { text: note.clone() })
+                .collect(),
+        }
+    }
+}
+
 /// What `GET /api/setup` serves AND what the setup island's props carry — the
 /// same one-struct-one-serializer rule as [`StatusPayload`], parity pinned in
 /// `render_setup.rs`.
@@ -865,11 +978,15 @@ pub struct SetupPayload {
     /// rule.
     #[serde(default)]
     pub flags: SetupFlags,
+    /// The page's list rows, composed from [`Self::setup`]. Same rule again —
+    /// see [`SetupRows`].
+    #[serde(default)]
+    pub rows: SetupRows,
 }
 
 impl SetupPayload {
-    /// Recompose [`lines`](Self::lines) and [`flags`](Self::flags) from this
-    /// payload's own facts.
+    /// Recompose [`lines`](Self::lines), [`flags`](Self::flags) and
+    /// [`rows`](Self::rows) from this payload's own facts.
     ///
     /// Called on the way OUT — by the render seam and by `/api/setup` — rather
     /// than at construction, so a payload assembled field by field (every test
@@ -879,6 +996,7 @@ impl SetupPayload {
     pub fn composed(mut self) -> Self {
         self.lines = SetupLines::of(&self.setup, &self.session, &self.learn);
         self.flags = SetupFlags::of(&self.setup, &self.session, &self.learn);
+        self.rows = SetupRows::of(&self.setup);
         self
     }
 }
@@ -1244,5 +1362,60 @@ mod tests {
         // Every field of both derived halves really moved.
         assert_ne!(payload.lines, refused.lines);
         assert_ne!(payload.flags, refused.flags);
+    }
+
+    /// The ROW sentences are composed here and nowhere else. This pins the
+    /// exact strings both seams (render_setup.rs's SSR injection and
+    /// SetupIsland.ts's poll) now read verbatim — the formatters they used to
+    /// each own are gone, so this is the only place a row wording can change.
+    #[test]
+    fn the_setup_rows_are_composed_once_from_the_view() {
+        let view = ksx_api::SetupView {
+            devices: vec![ksx_api::SetupDeviceRow {
+                alias: "P1 board".to_owned(),
+                id: "usb:d209:0430:00".to_owned(),
+                backend: "interception".to_owned(),
+            }],
+            slots: vec![ksx_api::SetupSlotRow {
+                number: 3,
+                device: "P1 board".to_owned(),
+                preset: "IPAC P1".to_owned(),
+                persona: "Xbox 360 pad".to_owned(),
+                source: "config.toml".to_owned(),
+            }],
+            presets: vec!["IPAC P1".to_owned()],
+            profiles: vec!["Street Fighter".to_owned()],
+            steps: vec![ksx_api::SetupStep {
+                id: ksx_api::setup_steps::SLOT.to_owned(),
+                title: "Wire a slot".to_owned(),
+                detail: "One slot is wired.".to_owned(),
+                state: ksx_api::setup_states::NOW.to_owned(),
+            }],
+            notes: vec!["a note".to_owned()],
+            ..ksx_api::SetupView::default()
+        };
+        let rows = SetupRows::of(&SetupSnapshot::ready(view));
+
+        assert_eq!(rows.steps[0].badge, "1");
+        assert_eq!(rows.steps[0].cls, "step now");
+        assert_eq!(rows.devices[0].title, "P1 board");
+        assert_eq!(rows.devices[0].detail, "interception · usb:d209:0430:00");
+        assert_eq!(rows.slots[0].title, "Slot 3 — IPAC P1");
+        assert_eq!(
+            rows.slots[0].detail,
+            "P1 board · Xbox 360 pad · config.toml"
+        );
+        assert_eq!(rows.preset_options[0].text, "IPAC P1");
+        assert_eq!(rows.profile_options[0].text, "Street Fighter");
+        assert_eq!(rows.notes[0].text, "a note");
+
+        // The menu is 1..=the ceiling the BACKEND serves — never a literal in
+        // a view layer (the shipped page held `SLOT_CHOICES = 8` in two
+        // languages while `ksx_core::MAX_SLOTS` was 16).
+        assert_eq!(rows.slot_options.len(), usize::from(ksx_core::MAX_SLOTS));
+        assert_eq!(rows.slot_options[0].value, "1");
+        assert_eq!(rows.slot_options[0].label, "Slot 1");
+        let last = rows.slot_options.last().unwrap();
+        assert_eq!(last.value, ksx_core::MAX_SLOTS.to_string());
     }
 }

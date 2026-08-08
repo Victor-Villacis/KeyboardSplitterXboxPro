@@ -153,6 +153,8 @@ export interface SetupPayload {
   lines: SetupLines;
   /** Derived, server-side. See [[SetupFlags]]. */
   flags: SetupFlags;
+  /** Derived, server-side. See [[SetupRows]]. */
+  rows: SetupRows;
 }
 
 interface StepRow {
@@ -175,6 +177,21 @@ interface OptionRow {
 
 interface TextRow {
   text: string;
+}
+
+/** Every list row this page draws, composed once in `snapshot.rs`
+ *  (`SetupRows`) and assigned VERBATIM below. The row sentences and the
+ *  slot-menu ceiling used to be formatted here and again in
+ *  `render_setup.rs::list_values` — two languages, one sentence, silent
+ *  drift. This page formats nothing. */
+export interface SetupRows {
+  steps: StepRow[];
+  devices: RowPair[];
+  slots: RowPair[];
+  slot_options: OptionRow[];
+  preset_options: TextRow[];
+  profile_options: TextRow[];
+  notes: TextRow[];
 }
 
 // ── The live state store (module-level: one island, page lifetime) ─────────
@@ -286,37 +303,18 @@ export function applySetup(p: SetupPayload): void {
   setNoSlots(f.no_slots);
   setHasNotes(f.has_notes);
 
-  setStepRows(
-    view.steps.map((step, i) => ({
-      badge: String(i + 1),
-      title: step.title,
-      detail: step.detail,
-      cls: `step ${step.state}`,
-    })),
-  );
-  setDeviceRows(
-    view.devices.map((device) => ({
-      title: device.alias,
-      detail: `${device.backend} · ${device.id}`,
-    })),
-  );
-  setSlotRows(
-    view.slots.map((slot) => ({
-      title: `Slot ${slot.number} — ${slot.preset}`,
-      detail: `${slot.device} · ${slot.persona} · ${slot.source}`,
-    })),
-  );
-  // 1..=the ceiling the BACKEND serves. This used to be a `SLOT_CHOICES = 8`
-  // const here and another one in render_setup.rs, which hid slots 9-16 that
-  // `ksx slot assign` accepts and that the inventory above would list.
-  const choices: OptionRow[] = [];
-  for (let n = 1; n <= view.max_slots; n++) {
-    choices.push({ value: String(n), label: `Slot ${n}` });
-  }
-  setSlotOptions(choices);
-  setPresetOptions(view.presets.map((name) => ({ text: name })));
-  setProfileOptions(view.profiles.map((title) => ({ text: title })));
-  setNoteRows(view.notes.map((text) => ({ text })));
+  // VERBATIM from `snapshot.rs::SetupRows` — no sentence and no ceiling is
+  // composed on this side of the wire. (The slot menu once held its own
+  // `SLOT_CHOICES = 8` here while `ksx_core::MAX_SLOTS` was 16, and the row
+  // labels were formatted here and again in render_setup.rs; both are now
+  // one Rust implementation that the SSR paint and this poll both read.)
+  setStepRows(p.rows.steps);
+  setDeviceRows(p.rows.devices);
+  setSlotRows(p.rows.slots);
+  setSlotOptions(p.rows.slot_options);
+  setPresetOptions(p.rows.preset_options);
+  setProfileOptions(p.rows.profile_options);
+  setNoteRows(p.rows.notes);
 }
 
 /** The studio server itself stopped answering /api/setup.
