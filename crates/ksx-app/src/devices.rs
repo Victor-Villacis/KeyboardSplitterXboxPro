@@ -406,6 +406,18 @@ impl DevicesReport {
                         || entry.selector().matches(&r.candidate.facts())
                 })
             })
+            // An entry that names a BLUETOOTH device is not unmatched — it
+            // matched, and the fault is the backend it asks for. Without this
+            // the same entry is reported twice with contradictory advice:
+            // "no such interface is present" (plug it in or re-pick) beside
+            // "it is a Bluetooth device" (edit the entry). The first is simply
+            // wrong, and it is the one a user would act on first.
+            .filter(|entry| {
+                !self
+                    .bluetooth
+                    .iter()
+                    .any(|r| r.config_id().as_str().eq_ignore_ascii_case(entry.raw()))
+            })
             .collect()
     }
 }
@@ -1155,6 +1167,8 @@ mod tests {
     const MOUSE: &str = "HID\\VID_046D&PID_C077&REV_7200";
     const IPAC_USB: &str = "USB\\VID_D209&PID_0430&MI_00\\7&1A2B3C4D&0&0000";
     const IPAC_USB_B: &str = "USB\\VID_D209&PID_0430&MI_00\\7&5E6F7A8B&0&0000";
+    /// A paired Bluetooth keyboard — the shape measured on this machine.
+    const BT_KEYBOARD: &str = r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002045E_PID&0800\7&3562C725&0&001BDC0F1FE7_C00000000";
 
     fn keyboard(id: &str, slot: u8, friendly: Option<&str>) -> DeviceInfo {
         DeviceInfo {
@@ -1516,6 +1530,73 @@ mod tests {
 
     /// The M6 exit state: Interception uninstalled, everything on WinUSB. The
     /// command must still work — it is how you check the machine survived.
+    /// A paired Bluetooth keyboard, in the shape `bt_candidates` produces.
+    fn bt_row(configured: &ConfiguredDevices, can_type: bool) -> BtRow {
+        let id = DeviceId::new(BT_KEYBOARD.to_owned());
+        let candidate = ksx_capture::BtCandidate {
+            id: id.clone(),
+            device: r"BTHENUM\001BDC0F1FE7".to_owned(),
+            address: Some("001BDC0F1FE7".to_owned()),
+            name: "Bluetooth Keyboard".to_owned(),
+            service: Some("kbdhid".to_owned()),
+            is_keyboard: true,
+            keyboard_id: Some(id.clone()),
+            can_type,
+            trouble: (!can_type).then_some("not connected (paired but absent?)"),
+        };
+        BtRow {
+            alias: configured.alias_for(&id).map(str::to_owned),
+            selected_winusb: configured.backend_for(&id) == Backend::Winusb,
+            candidate,
+        }
+    }
+
+    /// **One fault, one message.** An entry that names a Bluetooth device and
+    /// asks for `winusb` matched a real device; what is wrong is the backend.
+    /// Reporting it ALSO as "no such interface is present" would give a user
+    /// two contradictory instructions — plug it in / re-pick, versus edit the
+    /// entry — and the wrong one comes first.
+    ///
+    /// Breaks against `unmatched_winusb_config` as written, which searched the
+    /// USB rows alone and therefore called every Bluetooth entry unmatched.
+    #[test]
+    fn a_winusb_entry_on_bluetooth_is_reported_once_as_the_backend_fault() {
+        let cfg = config(&[(BT_KEYBOARD, "desk", Backend::Winusb)]);
+        let report = DevicesReport::build(
+            Vec::new(),
+            true,
+            Vec::new(),
+            true,
+            vec![bt_row(&cfg, true)],
+            true,
+            cfg,
+        );
+
+        assert_eq!(
+            report.winusb_on_bluetooth().len(),
+            1,
+            "the fault is that winusb can never reach this transport"
+        );
+        assert!(
+            report.unmatched_winusb_config().is_empty(),
+            "…and it is NOT also 'no such interface is present': the interface \
+             is present, and telling someone to plug it in sends them to fix a \
+             machine that is fine"
+        );
+
+        let text = render_human(&report);
+        assert_eq!(
+            text.matches("[WARN]").count(),
+            1,
+            "one fault, one warning:\n{text}"
+        );
+        assert!(text.contains("no USB interface to bind"), "{text}");
+        assert!(
+            !text.contains("no USB interface has that instance path"),
+            "the unmatched wording must not appear beside it:\n{text}"
+        );
+    }
+
     /// **A backend and a transport are different kinds of thing, and `--json`
     /// says so with its shape.**
     ///
