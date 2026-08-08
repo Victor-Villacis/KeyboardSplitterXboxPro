@@ -98,6 +98,7 @@
 mod control;
 mod error;
 mod guard;
+mod live;
 mod render;
 mod render_devices;
 mod render_map;

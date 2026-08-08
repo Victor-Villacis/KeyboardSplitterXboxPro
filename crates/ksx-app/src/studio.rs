@@ -53,6 +53,17 @@ pub fn run(port: u16) -> anyhow::Result<()> {
         // an unreachable daemon answers "no session" there, so /pads never
         // goes dark with the pipe dead.)
         Box::new(LocalMachine),
+        // The FOURTH provider: the LIVE INPUT FEED, over the daemon's second
+        // pipe (`ksx_api::LIVE_PIPE_NAME`). Not on `ControlSource`, and this
+        // is the reason — the other three are questions with an answer, served
+        // over a channel that is one line out, one line in, per connection. A
+        // stream held open on that channel would hold the daemon's single pipe
+        // thread for as long as a browser tab lived, and nothing else would
+        // ever be answered again (`ksx_api::LiveSource`).
+        //
+        // With no daemon running this refuses in words, per open, and the page
+        // says so — it never hangs and never renders a dead grid.
+        std::sync::Arc::new(ksx_api::PipeLiveSource::new()),
     )?;
     Ok(())
 }

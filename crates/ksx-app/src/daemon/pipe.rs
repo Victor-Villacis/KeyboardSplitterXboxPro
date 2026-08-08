@@ -1092,7 +1092,15 @@ pub mod server {
 
     /// One pipe instance. Closes on drop; [`Instance::finish`] is the
     /// graceful path (flush → disconnect) for a served connection.
-    struct Instance(HANDLE);
+    ///
+    /// `pub(crate)` because the LIVE feed's channel
+    /// (`crate::daemon::live_pipe`) is a second named pipe with different
+    /// *semantics* — outbound-only, thread per connection, many lines per
+    /// connection — but identical Win32 *mechanics*. One copy of these unsafe
+    /// blocks, two protocols on top of it: a second hand-rolled
+    /// `CreateNamedPipeW` is how two pipes come to disagree about the
+    /// security descriptor.
+    pub(crate) struct Instance(HANDLE);
 
     // SAFETY: a pipe HANDLE is a kernel object reference, valid on any thread
     // of the owning process; only the raw-pointer typedef blocks the auto
@@ -1112,7 +1120,21 @@ pub mod server {
         /// must fail here, not silently split the client stream with the
         /// first.
         fn create(wide_name: &[u16], first: bool) -> Result<Self, u32> {
-            let mut open_mode = PIPE_ACCESS_DUPLEX;
+            Self::create_with(wide_name, first, PIPE_ACCESS_DUPLEX)
+        }
+
+        /// [`Instance::create`] with the access mode named.
+        ///
+        /// The control pipe is `PIPE_ACCESS_DUPLEX` — it answers questions.
+        /// The live feed's pipe is `PIPE_ACCESS_OUTBOUND`, so a client cannot
+        /// write to it at all: one-directionality enforced by the object
+        /// manager rather than by everyone remembering.
+        pub(crate) fn create_with(
+            wide_name: &[u16],
+            first: bool,
+            access: u32,
+        ) -> Result<Self, u32> {
+            let mut open_mode = access;
             if first {
                 open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
             }
@@ -1140,7 +1162,7 @@ pub mod server {
 
         /// Block until a client connects. A client that raced ahead of us
         /// (ERROR_PIPE_CONNECTED) is already connected — success.
-        fn connect(&self) -> bool {
+        pub(crate) fn connect(&self) -> bool {
             // SAFETY: `self.0` is a live pipe handle; a null OVERLAPPED means
             // synchronous, which is this server's whole design.
             let ok = unsafe { ConnectNamedPipe(self.0, std::ptr::null_mut()) };
@@ -1179,7 +1201,7 @@ pub mod server {
             String::from_utf8(buf).ok()
         }
 
-        fn write_all(&self, mut bytes: &[u8]) -> bool {
+        pub(crate) fn write_all(&self, mut bytes: &[u8]) -> bool {
             while !bytes.is_empty() {
                 let mut written: u32 = 0;
                 // SAFETY: `bytes` outlives the call and its length is passed;
@@ -1203,7 +1225,7 @@ pub mod server {
 
         /// Flush + disconnect, so the client reads the full response before
         /// the handle goes away. Drop then closes it.
-        fn finish(self) {
+        pub(crate) fn finish(self) {
             // SAFETY: live handle; flush-then-disconnect is the documented
             // graceful server-side teardown for byte pipes.
             unsafe {

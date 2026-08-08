@@ -71,7 +71,15 @@ axum = "0.8"
 forma-ir = "0.2.0"
 forma-server = "0.2.0"
 rust-embed = "8"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
+# `sync` is NOT incidental: the live feed's SSE bridge is a `spawn_blocking`
+# thread handing frames to an async stream over a bounded `mpsc`, and that
+# channel is the one place the browser's backpressure meets the daemon's.
+# Naming the feature here rather than relying on another crate enabling it is
+# the difference between "it compiles today" and "it compiles".
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
+# The bare `Stream` trait, for that bridge's response body. axum already pulls
+# it in; ksx-studio names it so it can implement it.
+futures-core = "0.3"
 # cabinet (the 10-foot OPERATE surface) — reaches ksx-app ONLY through the
 # optional `cabinet` feature, exactly like `studio`. The default build must link
 # NEITHER ui (provable with `cargo tree -p ksx-app`).

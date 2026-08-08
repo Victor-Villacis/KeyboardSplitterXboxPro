@@ -66,6 +66,20 @@ struct AppState {
     /// the config store, the bus device), readable while the pipe is dead,
     /// exactly as the read-only mapper is.
     machine: Box<dyn ksx_api::MachineSource>,
+    /// The FOURTH provider: the live input feed
+    /// (`ksx_api::LiveSource` over the `ksx-live` named pipe).
+    ///
+    /// Not a method on any of the other three, because it is not their shape.
+    /// Status is a point-in-time snapshot, control is one verb per call and
+    /// machine is what is on this box — all three are *questions with an
+    /// answer*. This is a subscription that outlives any answer, on its own
+    /// channel, for a reason [`ksx_api::LiveSource`] spells out: the control
+    /// pipe serves connections one at a time, so a stream on it would take the
+    /// daemon's whole control surface down with the tab.
+    ///
+    /// `Arc`, not `Box`, because every SSE connection hands a handle to its own
+    /// blocking bridge thread.
+    live: Arc<dyn ksx_api::LiveSource>,
 }
 
 /// Serve the page until the process is killed (Ctrl+C included — no
@@ -82,6 +96,7 @@ pub fn serve(
     source: Box<dyn StatusSource>,
     control: Box<dyn ControlSource>,
     machine: Box<dyn ksx_api::MachineSource>,
+    live: Arc<dyn ksx_api::LiveSource>,
 ) -> Result<(), StudioError> {
     if !bind.ip().is_loopback() {
         return Err(StudioError::NonLoopbackBind { bind });
@@ -102,6 +117,7 @@ pub fn serve(
         source,
         control,
         machine,
+        live,
     });
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -178,6 +194,14 @@ pub fn serve(
             // `MachineSource` verb each, and the arming step is a GET
             // (`/pads?confirm=1`) because showing someone what a destructive
             // button will remove must not itself be a POST.
+            // ── THE LIVE FEED ─────────────────────────────────────────────
+            // One route, and it is the keystone the button check stands on:
+            // the daemon's input fan-out as Server-Sent Events. Read-only and
+            // one-directional by construction — the browser has nothing to say
+            // back, and everything it might want to say is already a verb on a
+            // route above. `crate::live` carries why SSE and not a WebSocket,
+            // and how a stalled tab is made to cost the pipeline nothing.
+            .route("/api/live", get(api_live))
             .route("/pads", get(pads_page))
             .route("/api/pads", get(api_pads))
             .route("/pads/spawn", post(pads_form_spawn))
@@ -1746,6 +1770,18 @@ async fn api_pads(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
+/// `GET /api/live` — the daemon's input fan-out, as Server-Sent Events.
+///
+/// The one endpoint on this server that is a SUBSCRIPTION rather than an
+/// answer. It never touches the other three providers: it hands the request's
+/// own bridge thread a handle to [`AppState::live`] and gets out of the way.
+/// `crate::live` holds the design — why SSE, why the channel is one slot deep
+/// and blocking, and why "no daemon" is a 200 with a refusal event rather than
+/// a status code.
+async fn api_live(State(state): State<Arc<AppState>>) -> Response {
+    crate::live::stream(Arc::clone(&state.live))
+}
+
 /// 303 back to /pads, carrying the outcome as the flash. Errors flash exactly
 /// like successes — a page with no JavaScript must never fail silently.
 fn pads_redirect(outcome: Result<String, String>) -> Response {
@@ -2352,6 +2388,7 @@ mod tests {
                 Box::new(NullSource),
                 Box::new(NullControl),
                 Box::new(NullMachine),
+                Arc::new(ksx_api::NoLiveSource::new("no live feed in this test")),
             )
             .unwrap_err();
             assert!(

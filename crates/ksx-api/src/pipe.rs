@@ -84,12 +84,29 @@ const RETRY_PAUSE: Duration = Duration::from_millis(50);
 const NOT_FOUND_TRIES: u32 = 3;
 
 fn open(pipe_path: &str) -> Result<std::fs::File, TransportError> {
+    open_with(pipe_path, true, true)
+}
+
+/// [`open`] with the access mode named.
+///
+/// The live feed's channel ([`crate::LIVE_PIPE_NAME`]) is created
+/// **outbound-only** by the daemon, so a duplex open of it fails with
+/// ACCESS_DENIED — a read-only open is not an optimisation there, it is the
+/// only one the kernel will grant. Sharing the retry policy rather than
+/// copying it keeps one answer to "is a daemon there?": the same
+/// `NOT_FOUND_TRIES` looks, the same busy budget, the same
+/// [`TransportError::NotRunning`] verdict on both channels.
+pub(crate) fn open_with(
+    pipe_path: &str,
+    read: bool,
+    write: bool,
+) -> Result<std::fs::File, TransportError> {
     let deadline = Instant::now() + CONNECT_BUDGET;
     let mut not_found = 0;
     loop {
         match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
+            .read(read)
+            .write(write)
             .open(pipe_path)
         {
             Ok(file) => return Ok(file),

@@ -1133,6 +1133,13 @@ fn start_server_with_machine(
             Box::new(FixedStatus),
             Box::new(SharedControl(control)),
             Box::new(SharedMachine(machine)),
+            // These tests never open the feed; a source that refuses in words
+            // is the honest stand-in, and `/api/live` under it is a real state
+            // of the endpoint (no daemon) worth being able to assert against.
+            std::sync::Arc::new(
+                ksx_api::NoLiveSource::new("no live feed in this test")
+                    .with_remedy("start the daemon"),
+            ),
         );
     });
     // Wait until it accepts.
@@ -3602,4 +3609,78 @@ fn the_pads_api_serves_the_payload_and_never_arms_it() {
     assert_eq!(value["flash"], serde_json::json!(null));
     assert_eq!(value["pads"]["prune"]["kind"], serde_json::json!("restart"));
     assert_eq!(value["pads"]["pads"].as_array().unwrap().len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// /api/live — the live input feed, as Server-Sent Events.
+// ---------------------------------------------------------------------------
+
+/// **No daemon is an ANSWER, over real HTTP, and the browser keeps trying.**
+///
+/// The three things a browser needs from this endpoint when the feed is not
+/// there, all in one response: a 200 (an `EventSource` treats any other status
+/// as fatal and stops retrying — so a page opened before the daemon started
+/// would stay dead until somebody reloaded it by hand), a `text/event-stream`
+/// content type, and the refusal itself as an event it can put on screen.
+///
+/// Catches the shape that returned 503 with a JSON body: perfectly readable in
+/// curl, and a permanently dead feed in a browser.
+#[test]
+fn the_live_feed_answers_without_a_daemon_and_keeps_the_browser_retrying() {
+    let addr = start_server(Arc::new(ScriptedControl::new(false)));
+    let response = get(addr, "/api/live");
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "{response}"
+    );
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "a buffered live feed is worse than none: {response}"
+    );
+
+    let body = body_of(&response);
+    assert!(
+        body.contains("event: unavailable"),
+        "the refusal travels as an event: {body}"
+    );
+    assert!(
+        body.contains("retry: "),
+        "the SERVER sets the reconnect interval, not each browser: {body}"
+    );
+
+    let data = body
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("a data line");
+    let refusal: Refusal = serde_json::from_str(data).expect("the refusal is JSON");
+    assert!(!refusal.message.trim().is_empty(), "{refusal:?}");
+    assert!(
+        refusal.remedy.is_some(),
+        "a refusal owes a way out: {refusal:?}"
+    );
+}
+
+/// The feed is a READ, and reads are not what `guard.rs` polices — but the Host
+/// check covers every route, and a live stream is the one route somebody would
+/// be most tempted to exempt "because it is only a stream".
+///
+/// A rebound host reaching this endpoint would be a page on another origin
+/// watching what is typed on this cabinet's panel.
+#[test]
+fn the_live_feed_is_behind_the_guard_like_every_other_route() {
+    let addr = start_server(Arc::new(ScriptedControl::new(false)));
+    let response = http(
+        addr,
+        "GET /api/live HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 421"),
+        "a rebound host must not be able to watch the panel: {response}"
+    );
 }

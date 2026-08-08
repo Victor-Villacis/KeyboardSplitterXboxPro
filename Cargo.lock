@@ -1790,6 +1790,7 @@ dependencies = [
  "axum",
  "forma-ir",
  "forma-server",
+ "futures-core",
  "ksx-api",
  "ksx-config",
  "ksx-core",
