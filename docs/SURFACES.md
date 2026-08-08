@@ -239,6 +239,19 @@ four `stage*` pipe verbs, and Studio's `/start` performing all of them. What
 does not: any way to stage a setup from a terminal. The four verbs are on the
 control pipe, so the CLI half is a driver over `ControlSource`, not new logic.
 
+**Moment 6 is half here, and the half that is missing is named.** A staged
+controller gets its bindings from a SERVED in-box layout
+(`StageEdit::SetLayout` → `StagedSetup::set_bindings`, offered at
+`/start/controller/layout`), which is why `commit()` can require a slot to bind
+something before it will save or play one. What is *not* built is per-key
+editing of a staged slot: the mapper is a preset-FILE editor, so mapping a
+button there does not change what `/start`'s Play starts. The page says so
+beside the link (`snapshot.rs`'s `MAPPER_LINE`) rather than leaving it to be
+discovered. The finished shape is `/map` able to open a staged slot and hand
+back — one target field on the mapper's existing writes, not a second mapper:
+`docs/MAPPER-UX.md` describes ~23k lines of finished UX and duplicating it is
+the worst outcome available.
+
 **This row is also why the guard's bookkeeping changed.** It used to require
 every CLI anchor to exist in the clap tree, whatever its cell said — which is
 right for a cell claiming `owns` and wrong for one saying `planned`, where a
