@@ -123,6 +123,13 @@ Clean, because it genuinely is: no config, no daemon session, no pads.
   column carry this already.
 - **Nothing on this screen may claim, plug, or write.** Looking is never a
   commitment — the same rule `ksx device scan` already follows against `pick`.
+- **Say it if Play cannot work.** A machine with no ViGEmBus can walk every
+  moment above and plug nothing at the end, so whether a pad can be created is
+  read (`MachineSource::pad_bus`) and stated before the Play button. Three
+  states, not two: cannot, could-not-tell, and fine — and the remedy is a
+  sentence naming the installer, never a button, because §3 of
+  `docs/SURFACES.md` marks driver installation `never` for this surface and
+  that has not changed.
 
 ## §6 What must never happen
 

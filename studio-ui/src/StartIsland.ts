@@ -41,6 +41,8 @@ export interface StartLines {
   blocking_line: string;
   preset_line: string;
   mapper_line: string;
+  bus_heading: string;
+  bus_cls: string;
   ready_line: string;
   play_line: string;
   guide_line: string;
@@ -56,6 +58,7 @@ export interface StartFlags {
   stage_down: boolean;
   scan_down: boolean;
   presets_down: boolean;
+  bus_warn: boolean;
   has_device: boolean;
   has_boards: boolean;
   no_boards: boolean;
@@ -170,11 +173,20 @@ export interface SessionView {
   profile: string | null;
 }
 
+/** `ksx_api::PadBusView` — can ksx create a virtual controller right now.
+ *  Only the two sentences are read here; `blocked` vs `unknown` was already
+ *  decided in Rust and arrives as `flags.bus_warn` plus `lines.bus_cls`. */
+export interface PadBusView {
+  line: string;
+  remedy: string;
+}
+
 /** What GET /api/start serves and what the island props carry — one shape
  *  (`StartPayload` in snapshot.rs; parity unit-tested in render_start.rs). */
 export interface StartPayload {
   staged: StagedSetupView;
   session: SessionView;
+  pad_bus: PadBusView;
   flash: string | null;
   lines: StartLines;
   flags: StartFlags;
@@ -192,6 +204,10 @@ const [xinputLine, setXinputLine] = createSignal("not collected");
 const [blockingLine, setBlockingLine] = createSignal("not collected");
 const [presetLine, setPresetLine] = createSignal("not collected");
 const [mapperLine, setMapperLine] = createSignal("not collected");
+const [busHeading, setBusHeading] = createSignal("not collected");
+const [busCls, setBusCls] = createSignal("card alarm");
+const [busLine, setBusLine] = createSignal("not collected");
+const [busRemedy, setBusRemedy] = createSignal("");
 const [readyLine, setReadyLine] = createSignal("not collected");
 const [playLine, setPlayLine] = createSignal("not collected");
 const [guideLine, setGuideLine] = createSignal("not collected");
@@ -209,6 +225,7 @@ const [pillDown, setPillDown] = createSignal(false);
 const [stageDown, setStageDown] = createSignal(false);
 const [scanDown, setScanDown] = createSignal(false);
 const [presetsDown, setPresetsDown] = createSignal(false);
+const [busWarn, setBusWarn] = createSignal(false);
 const [hasDevice, setHasDevice] = createSignal(false);
 const [hasBoards, setHasBoards] = createSignal(false);
 const [noBoards, setNoBoards] = createSignal(false);
@@ -257,6 +274,14 @@ export function applyStart(p: StartPayload): void {
   setBlockingLine(l.blocking_line);
   setPresetLine(l.preset_line);
   setMapperLine(l.mapper_line);
+  // The driver banner: heading and severity class from the page's own lines,
+  // the two sentences straight off `ksx_api::PadBusView`. Nothing here decides
+  // whether the bus is broken or merely unread — that is `flags.bus_warn`
+  // plus the class, both settled in Rust.
+  setBusHeading(l.bus_heading);
+  setBusCls(l.bus_cls);
+  setBusLine(p.pad_bus.line);
+  setBusRemedy(p.pad_bus.remedy);
   setReadyLine(l.ready_line);
   setPlayLine(l.play_line);
   setGuideLine(l.guide_line);
@@ -276,6 +301,7 @@ export function applyStart(p: StartPayload): void {
   setStageDown(f.stage_down);
   setScanDown(f.scan_down);
   setPresetsDown(f.presets_down);
+  setBusWarn(f.bus_warn);
   setHasDevice(f.has_device);
   setHasBoards(f.has_boards);
   setNoBoards(f.no_boards);
@@ -862,6 +888,34 @@ export function StartIsland() {
         // ksx-api's own sentences, arriving on the payload.
         h("p", { class: "dv-warn" }, () => escapeLine()),
         h("p", { class: "dv-note" }, () => scopeLine()),
+      ),
+      // ── The driver, said BEFORE the button that needs it ─────────────────
+      //
+      // Every persona ksx can plug goes out through ViGEmBus, so a machine
+      // without it stages perfectly, saves perfectly and then plugs nothing.
+      // That is FIRST-RUN.md §6's first forbidden shape — a screen reporting
+      // success while nothing works — and the only place to prevent it is
+      // above the button.
+      //
+      // ONE createShow, deliberately: `bus_warn` is true both for a bus known
+      // not to work and for one nothing could be learned about, and the two
+      // are told apart by the heading and the class, which are decided in
+      // Rust. A second createShow would need a second copy of these three
+      // slots, and the seam fills only the first slot of a given name.
+      //
+      // Reading this changes nothing. `/start` never installs a driver
+      // (SURFACES.md §3 marks that column `never`); the remedy is a sentence
+      // naming the installer, not a button that runs one.
+      createShow(
+        () => busWarn(),
+        () =>
+          h(
+            "section",
+            { class: () => busCls() },
+            h("h2", null, () => busHeading()),
+            h("p", { class: "alarmlead" }, () => busLine()),
+            h("p", { class: "alarmlead" }, () => busRemedy()),
+          ),
       ),
       // ── STEP 4 (moment 7): PLAY ─────────────────────────────────────────
       h(

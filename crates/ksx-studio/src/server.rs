@@ -1421,16 +1421,17 @@ async fn devices_form_remove(
 
 // ── /start: the first run (docs/FIRST-RUN.md moments 4–7) ──────────────────
 
-/// One fresh first-run payload: the staged setup, the device enumeration and
-/// the presets on disk.
+/// One fresh first-run payload: the staged setup, the device enumeration, the
+/// presets on disk and whether a pad can be plugged at all.
 ///
-/// Three reads with three failure modes, kept apart all the way to the page —
+/// Four reads with four failure modes, kept apart all the way to the page —
 /// `SURFACES.md` §1b. A dead daemon must not read as "you have staged
 /// nothing", a refused enumeration must not read as "you have no keyboards",
-/// and an unreadable presets folder must not read as "nothing would be
-/// replaced". Each degrades to the honest value its own type provides
+/// an unreadable presets folder must not read as "nothing would be replaced",
+/// and a driver check that did not answer must not read as a working bus. Each
+/// degrades to the honest value its own type provides
 /// (`StagedSetupView::unreachable`, `DeviceScanView::default`, a non-empty
-/// `presets_error`) and never to `Default::default()`.
+/// `presets_error`, `PadBusView::unreadable`) and never to `Default::default()`.
 ///
 /// Never cached, and that is `FIRST-RUN.md` §5's visible-rescan requirement
 /// met by construction: a user who plugs a keyboard in while this page is open
@@ -1448,10 +1449,18 @@ async fn collect_start(state: &Arc<AppState>) -> StartPayload {
             Ok(view) => (view.presets, String::new()),
             Err(refusal) => (Vec::new(), flash_of(refusal)),
         };
+        // A refusal becomes the UNREADABLE view, never the default one — and
+        // `PadBusView`'s default is itself unreadable, so neither path can
+        // paint a healthy bus onto a machine nobody looked at.
+        let pad_bus = start_state
+            .machine
+            .pad_bus()
+            .unwrap_or_else(|refusal| ksx_api::PadBusView::unreadable(flash_of(refusal)));
         StartPayload {
             staged,
             scan,
             session,
+            pad_bus,
             unavailable,
             presets,
             presets_error,
@@ -1466,6 +1475,7 @@ async fn collect_start(state: &Arc<AppState>) -> StartPayload {
             staged: ksx_api::StagedSetupView::unreachable("the first-run collection panicked"),
             scan: ksx_api::DeviceScanView::default(),
             session: SessionView::unreachable("the first-run collection panicked"),
+            pad_bus: ksx_api::PadBusView::unreadable("the first-run collection panicked"),
             unavailable: "the device scan panicked — nothing below is a reading of this machine"
                 .to_owned(),
             presets_error: "the preset read panicked".to_owned(),

@@ -77,7 +77,7 @@ const ISLAND_COMPONENT: &str = "StartIsland";
 
 /// How many `createShow` pairs this page has. Name-addressable since compiler
 /// 0.3.1, so this is a staleness tripwire rather than a mapping.
-const SHOW_COUNT: usize = 23;
+const SHOW_COUNT: usize = 24;
 
 /// Bare-named slots the island renders and the seam deliberately never fills.
 /// EMPTY, and that is the claim.
@@ -105,6 +105,15 @@ fn scalar_slots(payload: &StartPayload, flash: Option<&str>) -> serde_json::Valu
         "blockingLine": lines.blocking_line,
         "presetLine": lines.preset_line,
         "mapperLine": lines.mapper_line,
+        // The driver banner. The heading and the class are this page's
+        // (`StartLines`); the two sentences are `ksx_api::PadBusView`'s, taken
+        // verbatim off the view for the same reason `escapeLine` below is
+        // taken off the staged view — they are composed beside the type that
+        // decided them, and a page that paraphrased would be re-judging.
+        "busHeading": lines.bus_heading,
+        "busCls": lines.bus_cls,
+        "busLine": payload.pad_bus.line,
+        "busRemedy": payload.pad_bus.remedy,
         "readyLine": lines.ready_line,
         "playLine": lines.play_line,
         "guideLine": lines.guide_line,
@@ -294,6 +303,7 @@ fn show_values(payload: &StartPayload, flash: Option<&str>) -> [(&'static str, b
         ("show:stageDown", f.stage_down),
         ("show:scanDown", f.scan_down),
         ("show:presetsDown", f.presets_down),
+        ("show:busWarn", f.bus_warn),
         ("show:hasDevice", f.has_device),
         ("show:hasBoards", f.has_boards),
         ("show:noBoards", f.no_boards),
@@ -513,6 +523,15 @@ mod tests {
                 line: "idle — daemon reachable".into(),
                 profile: None,
             },
+            // A machine whose driver is fine. Stated rather than defaulted:
+            // `PadBusView::default()` is the UNREADABLE view (deliberately —
+            // see its Default impl), so every fixture here would otherwise be
+            // rendering the "could not be checked" banner, and the tests that
+            // care about that banner would prove nothing.
+            pad_bus: ksx_api::PadBusView::from_doctor(
+                ksx_api::pad_bus_codes::HEALTHY,
+                Some("1.22.0.0".into()),
+            ),
             ..StartPayload::default()
         }
         .composed()
@@ -1301,6 +1320,109 @@ mod tests {
         assert_ne!(down.html, refused.html);
         assert_ne!(refused.html, empty.html);
         assert_ne!(empty.html, blind.html);
+    }
+
+    /// **A machine that cannot plug a pad says so before the Play button.**
+    ///
+    /// Fails against every version of this page before the driver read
+    /// existed. On those, a PC that had never had ViGEmBus rendered a
+    /// completely clean `/start`: four steps, a green "Ready. Save writes it,
+    /// Play starts it", and a Play button that plugged nothing. That is
+    /// `FIRST-RUN.md` §6's first forbidden shape — a screen reporting success
+    /// while nothing works — and the fix was a shell command, which §7
+    /// forbids as an answer.
+    ///
+    /// Three states are asserted because the page has to tell them apart:
+    /// a bus that is known bad, a bus nothing could be learned about, and a
+    /// healthy one that must stay quiet. Collapsing the middle into either
+    /// neighbour is `SURFACES.md` §1b.
+    #[test]
+    fn a_bus_that_cannot_plug_is_stated_before_the_play_button() {
+        let page = EmbeddedPage::load("/start").unwrap();
+        let staged = payload(stage(&[choose(), add("xbox360")]));
+
+        // (1) NO VIGEMBUS. The setup is otherwise perfect and ready — which is
+        // exactly the machine this test exists for.
+        let missing = render_start(
+            &page,
+            &StartPayload {
+                pad_bus: ksx_api::PadBusView::from_doctor(ksx_api::pad_bus_codes::MISSING, None),
+                ..staged.clone()
+            }
+            .composed(),
+            None,
+        );
+        assert!(
+            missing.html.contains("Play cannot plug a controller"),
+            "a ready setup on a machine with no bus said nothing: {}",
+            missing.html
+        );
+        assert!(
+            missing.html.contains("is NOT installed"),
+            "{}",
+            missing.html
+        );
+        // The way out, and it is one a person who has never opened a terminal
+        // can take (FIRST-RUN.md §6).
+        assert!(
+            missing.html.contains("Run the ksx installer again"),
+            "the remedy must name a route with no terminal in it: {}",
+            missing.html
+        );
+        // ...and reading it changed nothing: SURFACES.md §3 marks driver
+        // installation `never` for this surface, so the remedy is a sentence
+        // and not a button.
+        assert!(
+            !missing.html.contains(r#"action="/start/install-drivers""#),
+            "this page may say a driver is missing and must never install one: {}",
+            missing.html
+        );
+
+        // (2) THE READ FAILED. Different heading, different colour, and it must
+        // never borrow (1)'s claim about the machine.
+        let unread = render_start(
+            &page,
+            &StartPayload {
+                pad_bus: ksx_api::PadBusView::unreadable("the driver read is not available here"),
+                ..staged.clone()
+            }
+            .composed(),
+            None,
+        );
+        assert!(
+            unread.html.contains("could not be checked"),
+            "{}",
+            unread.html
+        );
+        assert!(
+            !unread.html.contains("Play cannot plug a controller"),
+            "a failed read asserted the machine's state: {}",
+            unread.html
+        );
+        assert!(
+            unread.html.contains("card alarm warn"),
+            "unknown is the amber banner, not the red one: {}",
+            unread.html
+        );
+
+        // (3) A HEALTHY BUS SAYS NOTHING — including in the payload block,
+        // which is served verbatim to the island and to `/api/start`. A page
+        // that warned here would teach users to ignore the banner in the two
+        // cases that matter.
+        let healthy = render_start(&page, &staged, None);
+        assert!(
+            !healthy.html.contains("Play cannot plug a controller"),
+            "{}",
+            healthy.html
+        );
+        assert!(
+            !healthy.html.contains("could not be checked"),
+            "a healthy machine carried the unknown-read heading in its payload: {}",
+            healthy.html
+        );
+
+        assert_ne!(missing.html, unread.html);
+        assert_ne!(unread.html, healthy.html);
     }
 
     /// **Saving over an existing preset is said BEFORE the click.**

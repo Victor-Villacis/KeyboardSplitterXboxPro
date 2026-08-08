@@ -614,7 +614,14 @@ const EXEMPT: &[Exempt] = &[
         gate: None,
         why: "Needs an administrator token and ksx never self-elevates, so this sits on \
               the same line §3a draws for WinUSB claim: a page could only ever print the \
-              command. §3 marks that column `never` for a reason.",
+              command. §3 marks that column `never` for a reason. What changed is WHO \
+              runs it: the setup wizard does, from a ticked-by-default checkbox, because \
+              setup is the one place an admin token already exists and has already been \
+              consented to (packaging/ksx.iss, docs/DRIVERS.md \"Who runs it, and when\"). \
+              That is still not a surface — it happens once, before any surface exists. \
+              What the surfaces carry is the STATE: `MachineSource::pad_bus` is read by \
+              /start and said before the Play button, which is the row §3 already gives \
+              them (\"Is it working: pads, drivers\").",
     },
     Exempt {
         verb: "autostart",

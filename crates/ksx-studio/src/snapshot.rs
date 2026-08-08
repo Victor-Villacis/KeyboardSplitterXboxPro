@@ -1068,12 +1068,13 @@ impl SetupPayload {
 /// the same one-struct-one-serializer rule as [`StatusPayload`], parity pinned
 /// in `render_start.rs`.
 ///
-/// **Four reads, four failure modes, four fields.** They are kept apart for the
+/// **Five reads, five failure modes, five fields.** They are kept apart for the
 /// reason `docs/SURFACES.md` §1b gives: a daemon that is down and a machine
 /// with no boards are opposite advice, and collapsing either into an empty
 /// value is how a page ends up saying "you have staged nothing" when the truth
 /// is "nothing answered". [`Self::staged`] carries its own `reachable` +
-/// `error`; the other two carry theirs beside them.
+/// `error`; [`Self::pad_bus`] carries its own `readable`; the other two carry
+/// theirs beside them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartPayload {
     /// The staged setup, from `ControlSource::staged` — the DAEMON's memory,
@@ -1083,6 +1084,20 @@ pub struct StartPayload {
     /// read `/devices` renders.
     pub scan: ksx_api::DeviceScanView,
     pub session: crate::control::SessionView,
+    /// **Whether a pad can be plugged at all**, from `MachineSource::pad_bus`.
+    ///
+    /// The one machine fact this page cannot get from the daemon or from the
+    /// device list, and the one that decides whether moment 7 can happen: with
+    /// no ViGEmBus every step above works perfectly and Play plugs nothing.
+    /// Read-only — `docs/SURFACES.md` §3 marks driver installation `never` for
+    /// the browser, and this is how a page obeys that rule and still tells the
+    /// truth before the button.
+    ///
+    /// It carries its own `readable`, so a refused read becomes
+    /// `PadBusView::unreadable(...)` rather than a default that would render
+    /// as a healthy bus.
+    #[serde(default)]
+    pub pad_bus: ksx_api::PadBusView,
     /// Empty when the scan answered. Otherwise the refusal, verbatim.
     #[serde(default)]
     pub unavailable: String,
@@ -1167,6 +1182,18 @@ pub struct StartLines {
     pub mapper_line: String,
     /// Ready to save or play, or ksx-core's own reason it is not.
     pub ready_line: String,
+    /// The driver banner's heading. What the SENTENCES say is
+    /// `ksx_api::PadBusView`'s and arrives composed; what this page decides is
+    /// how to introduce it — "cannot" and "could not be checked" are two
+    /// different headings and a page that used one for both would be asserting
+    /// the machine's state from a read that failed.
+    pub bus_heading: String,
+    /// The banner's class: red for a bus that is known not to work, amber for
+    /// one nothing could be learned about. Served rather than derived in
+    /// TypeScript for the reason every other `_cls` on this page is
+    /// (`StartBoardRow::caveat_cls`): the severity is a judgement, and
+    /// judgements are the backend's.
+    pub bus_cls: String,
     /// What pressing Play actually does — moment 7's first sentence.
     pub play_line: String,
     /// Moment 7's one fact about the pad itself.
@@ -1241,6 +1268,8 @@ impl StartLines {
             },
             preset_line: preset_line(p),
             mapper_line: MAPPER_LINE.to_owned(),
+            bus_heading: bus_heading(&p.pad_bus).to_owned(),
+            bus_cls: bus_cls(&p.pad_bus).to_owned(),
             ready_line: match (&staged.not_ready, staged.reachable) {
                 (_, false) => "Nothing can be saved or played until a daemon answers.".to_owned(),
                 (Some(why), true) => why.clone(),
@@ -1299,6 +1328,38 @@ const PLAY_LINE: &str =
 const GUIDE_LINE: &str =
     "Whatever you map to GUIDE opens the Xbox Game Bar, so you can start a game without going \
      back to a keyboard. It is an ordinary button on every persona — map it like any other.";
+
+/// The driver banner's heading, and the only place this page words the
+/// difference between the two reasons it appears.
+///
+/// A `blocked` bus is a statement about the machine and reads like one. An
+/// `unknown` one is a statement about this page's own read — `SURFACES.md` §1b
+/// — and must never borrow the first heading, because "ksx cannot plug a
+/// controller" is a claim nothing here is entitled to make.
+///
+/// A healthy bus gets the EMPTY string, not the nearest of the two. The banner
+/// is hidden either way (`StartFlags::bus_warn`), but the payload block is
+/// served verbatim to the island and to `/api/start`, so a heading left lying
+/// in it would be a sentence about a machine that is fine, saying it is not.
+fn bus_heading(bus: &ksx_api::PadBusView) -> &'static str {
+    match (bus.blocked, bus.unknown) {
+        (true, _) => "Play cannot plug a controller on this machine yet",
+        (_, true) => "The controller driver could not be checked",
+        _ => "",
+    }
+}
+
+/// Red for a bus that is known not to work, amber for one nothing is known
+/// about, and nothing at all for a healthy one — same rule as
+/// [`bus_heading`]. Both banners are `.card.alarm`; `.alarm.warn` is the amber
+/// variant (`studio.css` §4.9).
+fn bus_cls(bus: &ksx_api::PadBusView) -> &'static str {
+    match (bus.blocked, bus.unknown) {
+        (true, _) => "card alarm",
+        (_, true) => "card alarm warn",
+        _ => "",
+    }
+}
 
 fn controller_line(staged: &ksx_api::StagedSetupView) -> String {
     match staged.slots.len() {
@@ -1368,6 +1429,13 @@ pub struct StartFlags {
     pub scan_down: bool,
     /// The preset read refused.
     pub presets_down: bool,
+    /// **The pad bus needs saying before the Play button.** True when ksx is
+    /// known to be unable to plug a pad, and true when that could not be
+    /// determined — the two look different (`bus_cls`, `bus_heading`) but both
+    /// are things a user is entitled to read before pressing a button that
+    /// depends on them. False only for a bus `ksx doctor` has nothing to say
+    /// about.
+    pub bus_warn: bool,
     /// A keyboard is staged.
     pub has_device: bool,
     /// Boards that can be picked.
@@ -1421,6 +1489,12 @@ impl StartFlags {
             stage_down: !staged.reachable,
             scan_down: !scan_read,
             presets_down: !p.presets_error.trim().is_empty(),
+            // `!silent()`, not `blocked`. A read that failed is the case this
+            // page has historically got wrong in the other direction — and
+            // "unknown" is the one state where saying nothing is indefensible,
+            // because the page would be resolving the doubt in the machine's
+            // favour on the user's behalf.
+            bus_warn: !p.pad_bus.silent(),
             has_device: staged.device.is_some(),
             has_boards: scan_read && p.scan.pickable_boards > 0,
             // `no_pickable_board_found` and nothing else. `boards.is_empty()`

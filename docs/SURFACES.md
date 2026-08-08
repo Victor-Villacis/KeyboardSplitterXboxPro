@@ -313,6 +313,24 @@ surface's. `pads_prune(confirm)` is `--yes`, spelled the same way and refusing
 the same things, and a POST that did not come from the confirm screen gets the
 dry run.
 
+**A surface that cannot DO a thing still owes you the state of it.** `/start`
+cannot install ViGEmBus and never will — that is this section's whole argument
+and the `never` in §3's WinUSB row applies to it identically. What it can do,
+and until 2026-08-08 did not, is say that Play will plug nothing before the
+user presses Play. Every persona ksx can create goes out through that bus, so a
+machine without it stages perfectly, saves perfectly, and produces a controller
+no game ever sees: `FIRST-RUN.md` §6's first forbidden shape, reached by a page
+that was carefully obeying a rule about what it must not do.
+
+The read is `MachineSource::pad_bus` — one registry read, one service query and
+`ksx doctor`'s own ViGEmBus verdict, reached through the function doctor calls
+so the two can never disagree. Its view keeps `blocked` and `unknown` apart for
+§1b's reason, and its `Default` is the unknown one, so a payload nobody filled
+in cannot render as a working bus. **The remedy is a sentence, not a button**:
+it names the ksx installer, whose ticked-by-default driver checkbox is where
+that install actually happens (`docs/DRIVERS.md`), and the elevated command
+second. Reading the page still installs nothing.
+
 ### §3b Record / replay, and why both other cells say `planned`
 
 `ksx monitor --record` writes a session; `ksx play` plays one back into the
