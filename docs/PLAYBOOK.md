@@ -11,7 +11,7 @@ adopt/reject rationale.
 1. **Contracts first** when multiple agents will build in parallel: one agent (or
    the lead) defines shared types/trait signatures; implementers build against them.
 2. **Parallel implementation** with strict crate ownership — one agent per crate,
-   never two writers in one file. `ksx-app` wiring is its own sequential step.
+   never two writers in one file. `ksx-backend` wiring is its own sequential step.
 3. **Adversarial review, Bun ratio** (M3 onward — driver-touching code can brick
    keyboards): every implementation gets **2 independent adversarial reviewers**
    with distinct lenses — (a) correctness-vs-legacy (diff against the C# ground

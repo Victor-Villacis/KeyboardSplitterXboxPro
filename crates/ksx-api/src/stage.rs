@@ -227,7 +227,7 @@ pub struct StagedSetupView {
     /// free slot.
     ///
     /// **Served, because it becomes a FILE NAME.** A save writes one preset per
-    /// staged slot (`ksx-app`'s `stage::apply`), so this string is the name of
+    /// staged slot (`ksx-backend`'s `stage::apply`), so this string is the name of
     /// something that lands on disk — and a surface that invented it would be
     /// deciding, in TypeScript, what a first-run user's files are called. The
     /// first-run user is the whole audience here and `FIRST-RUN.md` §1 gives

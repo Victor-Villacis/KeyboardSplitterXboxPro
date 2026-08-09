@@ -20,7 +20,7 @@
 //!
 //! # The checklist is rendered, not computed
 //!
-//! `stepRows` comes straight off `ksx_api::SetupView::steps`, which ksx-app's
+//! `stepRows` comes straight off `ksx_api::SetupView::steps`, which ksx-backend's
 //! `onboard::plan_steps` decides — pure, and unit-tested there against every
 //! combination of three counts. docs/SURFACES.md §1: a surface may not hold
 //! logic another surface would need, and "which step is next" is exactly that

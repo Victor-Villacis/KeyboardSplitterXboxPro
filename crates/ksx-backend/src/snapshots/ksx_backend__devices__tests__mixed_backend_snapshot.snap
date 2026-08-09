@@ -1,5 +1,5 @@
 ---
-source: crates/ksx-app/src/devices.rs
+source: crates/ksx-backend/src/devices.rs
 expression: render_human(&report)
 ---
 keyboards (interception backend):

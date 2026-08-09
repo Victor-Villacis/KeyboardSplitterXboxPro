@@ -23,7 +23,7 @@ the code it was checked against.
 ## §1 The backend owns state; every surface is a view
 
 Already the architecture, stated here so it stops being implicit. From
-`crates/ksx-app/src/device_edit.rs`:
+`crates/ksx-backend/src/device_edit.rs`:
 
 > One writer, like every other write. A typed spec in, a pure plan out, a
 > timestamped backup taken before the write, and the store's atomic save doing
@@ -75,7 +75,7 @@ while the cabinet UI had a devices screen, so the screen could not list a board.
 **What actually happened:** the cabinet has never had a devices screen —
 `ksx-cabinet/src/nav.rs` has always been exactly ButtonCheck, Status, Session,
 Profiles, Presets, and `git log -S` finds no deleted one. `devices()` *is*
-implemented now (`ksx-app/src/sources.rs`), and has **zero callers**: the only
+implemented now (`ksx-backend/src/sources.rs`), and has **zero callers**: the only
 `.devices()` calls in the tree are capture backends and the trait's own test.
 The backend read was built for a screen nobody wrote, and is compiled behind
 `#[cfg(all(windows, feature = "cabinet"))]` for a consumer that never asks.
@@ -531,7 +531,7 @@ Four journeys carry nearly all the product's surface area:
 
    **Studio's `/setup`** (§5) is the same territory for someone who already has
    a configuration: the checklist is
-   decided in the backend (`ksx-app::onboard::plan_steps`, pure) and rendered,
+   decided in the backend (`ksx-backend::onboard::plan_steps`, pure) and rendered,
    never re-derived per surface; each step is one backend verb, and the board
    step LINKS to the devices screen instead of duplicating it. Every step is
    resumable because none of them is a wizard step: each reads the config as it
@@ -563,7 +563,7 @@ crossing is a design smell worth a second look.
 
   What each surface got, and why:
 
-  - **Backend** (`ksx-app/src/slots.rs`) applies it, and refuses two things in
+  - **Backend** (`ksx-backend/src/slots.rs`) applies it, and refuses two things in
     words: a persona this build cannot plug (`Persona::can_plug`, which reads
     the backend's `is_implemented` and never a driver probe) and a fifth XInput
     slot — counted **after** the write would land, over the whole destination
@@ -588,7 +588,7 @@ crossing is a design smell worth a second look.
   links to `/devices` rather than growing a second picker.
 - **`ksx games new` — the CLI half of profile creation, owed.** Studio's
   `/profiles` page creates a games.toml profile through
-  `MachineSource::profile_new` over a pure plan in `ksx-app`'s `profile_edit`
+  `MachineSource::profile_new` over a pure plan in `ksx-backend`'s `profile_edit`
   — but there is no CLI verb for it, so §2's build order ran 1 → 3 with 2
   skipped. That is backwards and it shows: `profile_edit` is gated
   `#[cfg(any(feature = "studio", feature = "cabinet"))]` because Studio is its

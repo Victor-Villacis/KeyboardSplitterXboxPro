@@ -1,5 +1,5 @@
 ---
-source: crates/ksx-app/src/monitor.rs
+source: crates/ksx-backend/src/monitor.rs
 expression: "String::from_utf8(out).unwrap()"
 ---
 monitoring 2 keyboard(s) — passthrough only, no keys are blocked

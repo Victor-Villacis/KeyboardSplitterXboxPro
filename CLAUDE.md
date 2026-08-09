@@ -5,7 +5,7 @@ Read this before touching anything. It is the map, not the reasoning: it says
 this file points at the right one instead of repeating it.
 
 ksx splits one keyboard (an arcade encoder — an I-PAC) into up to 16 virtual
-gamepads on Windows 11. Rust, workspace of 13 crates + one vendored dep.
+gamepads on Windows 11. Rust, workspace of 14 crates + one vendored dep.
 
 ## The one rule everything else follows
 
@@ -30,23 +30,42 @@ performs it on**. There is no "egui first or web first" question.
 | ViGEm pad output, persona routing | `crates/ksx-output` |
 | Windows plumbing: USB enumeration, WinUSB claim/release | `crates/ksx-platform` |
 | the wire contract between backend and every surface | `crates/ksx-api` |
-| CLI verbs, daemon, tray, session supervisor, writers | `crates/ksx-app` |
+| **every verb's body** — daemon, tray, session supervisor, writers | `crates/ksx-backend` |
+| the `ksx` binary: clap definitions and verb dispatch, and nothing else | `crates/ksx-app` |
 | the browser UI (Rust render seams + routes) | `crates/ksx-studio` |
 | the browser UI's TypeScript islands | `studio-ui/src` |
 | the 10-foot cabinet panel (egui) | `crates/ksx-cabinet` |
 
-`crates/ksx-app/src/` is the biggest surface area. Orient by verb: `main.rs`
-registers every CLI command; `device_edit.rs` / `device_scan.rs` are the device
-picker's write and read halves; `run/` is the session supervisor (`plan.rs`
-builds a plan, `resolve.rs` turns config spellings into live devnodes);
-`daemon/` is the resident tray process and its control pipe; `sources.rs` is
-where surfaces get their data.
+**The last two rows are the pair that catches people.** `crates/ksx-app` is one
+file — `main.rs`, 3,873 lines of clap `#[derive]` and one `match` — and it is
+the only crate in the workspace that knows clap exists. If you are adding a
+flag, it goes there. If you are adding *behaviour*, it does not: the body lives
+in `ksx-backend` and `main.rs` gains one arm calling it. That boundary is
+`docs/SURFACES.md` §1 ("the backend owns state; every surface is a view") made
+into a compiler error instead of a review comment; before the split the two were
+the same 50,665-line crate and the rule was on the honour system.
+
+`crates/ksx-backend/src/` is the biggest surface area. Orient by verb:
+`device_edit.rs` / `device_scan.rs` are the device picker's write and read
+halves; `run/` is the session supervisor (`plan.rs` builds a plan, `resolve.rs`
+turns config spellings into live devnodes); `daemon/` is the resident tray
+process and its control pipe; `sources.rs` is where surfaces get their data.
+
+`crates/ksx-app/tests/` did NOT follow the code, on purpose. Each of the five
+tests the *binary* rather than a verb: `parity.rs` walks the built exe's clap
+tree, `no_interception_dll.rs` parses that exe's PE import table, `installer.rs`
+reads `packaging/ksx.iss` against the shipped version, `docs.rs` walks the whole
+repo's Markdown, and `replay.rs` drives `ksx-core` from a recorded session with
+no ksx-app or ksx-backend code in it at all.
 
 ## Adding things — the shapes to copy
 
-**A CLI verb**: a typed spec in, a pure plan out, a timestamped backup before
-any write, the store's atomic save doing the I/O. Copy `device_edit.rs` — its
-module docs state the pattern. Refusals carry a stable `code()` and an
+**A CLI verb**: two files. The body goes in `ksx-backend/src/<verb>.rs` and is a
+typed spec in, a pure plan out, a timestamped backup before any write, the
+store's atomic save doing the I/O — copy `ksx-backend/src/device_edit.rs`, its
+module docs state the pattern. Then `ksx-app/src/main.rs` gets the clap
+definition and one `match` arm calling it, plus its module in the
+`use ksx_backend::{…}` list at the top. Refusals carry a stable `code()` and an
 `advice()` that names a command that actually exists.
 
 **A Studio page**: routes go in the ONE `Router::new()` chain in
@@ -139,9 +158,16 @@ version it catches. A test that re-encodes the implementation is worse than
 none — several have been deleted for this. Hardware-touching tests live behind
 the `cab-tests` feature and never run in CI.
 
-`crates/ksx-app/tests/` holds the cross-cutting ones: `docs.rs` (doc citations
-stay true), `replay.rs` (a real 392-event cabinet recording drives the engine
-offline — the regression oracle for the whole input path).
+Unit tests live beside the code, so most of them are in `ksx-backend`.
+`crates/ksx-app/tests/` holds the cross-cutting ones, which test the shipped
+binary rather than a verb: `docs.rs` (doc citations stay true), `replay.rs` (a
+real 392-event cabinet recording drives the engine offline — the regression
+oracle for the whole input path).
+
+**insta snapshot files are keyed by `module_path!()`, which starts with the
+crate name.** A snapshot that moves crates has to be renamed with it
+(`ksx__x.snap` → `ksx_backend__x.snap`) or the test fails looking for a file
+that is sitting right there.
 
 ## Which doc to open
 

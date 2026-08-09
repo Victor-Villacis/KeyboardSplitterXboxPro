@@ -61,7 +61,7 @@
 //! writer parks in `WriteFile` → **the daemon's subscription queue fills and
 //! the sink drops, counting into that subscriber's `dropped`** — which is
 //! reported to this same consumer in the next frame that gets through
-//! (`ksx-app/src/daemon/live_pipe.rs`). Every buffer in the chain is bounded,
+//! (`ksx-backend/src/daemon/live_pipe.rs`). Every buffer in the chain is bounded,
 //! nothing anywhere waits on the capture thread, and the number the page shows
 //! is the number that is true.
 //!

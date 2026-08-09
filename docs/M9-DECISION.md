@@ -34,8 +34,8 @@ Then Studio was built. Measured today:
 | | |
 |---|---|
 | Wall clock | 25 commits, **2026-08-04 22:09 → 2026-08-06 12:58 (~39 hours)** |
-| Production lines | **23,257** — `ksx-studio/src` 8,929 (`render_map.rs` alone 5,809), `ksx-app/src/studio.rs` 1,310, `studio-ui/src` 12,773 (`MapIsland.ts` 5,599, `studio.css` 3,853, `map.ts` 2,155), `build.mjs` 245 |
-| Tests | **139** — 102 Rust `#[test]` in `ksx-studio` + 7 in `ksx-app/src/studio.rs` + 30 browser tests in `studio-ui/pwtest` (+1,249 lines of `tests/http.rs`) |
+| Production lines | **23,257** — `ksx-studio/src` 8,929 (`render_map.rs` alone 5,809), `ksx-backend/src/studio.rs` 1,310, `studio-ui/src` 12,773 (`MapIsland.ts` 5,599, `studio.css` 3,853, `map.ts` 2,155), `build.mjs` 245 |
+| Tests | **139** — 102 Rust `#[test]` in `ksx-studio` + 7 in `ksx-backend/src/studio.rs` + 30 browser tests in `studio-ui/pwtest` (+1,249 lines of `tests/http.rs`) |
 | Surface | 27 routes, every one 1:1 onto one of the pipe's 12 verbs through one writer |
 | Features with no egui equivalent | 37-column diagonal piano roll, vendored controller art with measured hit-test extents, first-class diagonals across three mechanisms, multi-select + multi-bind, toasts + undo, no-JS form twins, a documented design system (DESIGN-SYSTEM.md) |
 
@@ -274,7 +274,7 @@ and what makes C's Studio-only world safe to live in.
 
 **It is also already 80% written, in the wrong crate.** `ksx-studio` contains
 `StatusSource` (`snapshot.rs`) and `ControlSource` (`control.rs`) with their view
-types, and `ksx-app/src/studio.rs` contains the two real implementations
+types, and `ksx-backend/src/studio.rs` contains the two real implementations
 (`CollectorSource` over the config store and platform collectors,
 `PipeControlSource` over `\\.\pipe\ksx-daemon`). M10a is mostly a **move plus two
 additions**, not a design exercise.
@@ -290,7 +290,7 @@ accident.
 **Two traits, kept separate — the split is load-bearing:**
 
 ```rust
-/// Read side. Satisfiable with NO daemon running: ksx-app's collectors read
+/// Read side. Satisfiable with NO daemon running: ksx-backend's collectors read
 /// the config store and the platform directly. This is why `ksx studio`
 /// renders a read-only mapper behind the "No daemon" banner instead of an
 /// error page, and merging it into the write trait would delete that.

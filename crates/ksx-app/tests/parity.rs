@@ -27,7 +27,7 @@
 //! | egui | `Screen::ALL` + every `Ask` variant | `ksx-cabinet/src/{nav,app}.rs`, by source text |
 //! | Studio | every `.route()` inside `Router::new()` | `ksx-studio/src/server.rs`, by source text |
 //!
-//! The two source-text readers work the way `ksx-app/src/run/plan.rs`'s
+//! The two source-text readers work the way `ksx-backend/src/run/plan.rs`'s
 //! source-guard test does, and for the same reason: the fact being checked is a
 //! *structural* one that no value reachable at runtime reports. In Studio's case
 //! the structure is load-bearing twice over — the scan stops at the guard layer

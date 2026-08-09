@@ -237,7 +237,7 @@ Name: "{group}\{#AdvancedGroup}\setup wizard"; Filename: "{app}\{#AppExe}"; Para
 ; (§4 bullet 2, and the [Run] section below).
 ;
 ; Through the command processor and not straight at ksx.exe, because ksx.exe is
-; a CONSOLE subsystem binary (crates\ksx-app\src\console.rs, deliberately): a
+; a CONSOLE subsystem binary (crates\ksx-backend\src\console.rs, deliberately): a
 ; shortcut that ran `doctor` directly would print its driver tables into a
 ; console that closes the instant the process exits, which shows the one user
 ; who came here for those tables nothing at all. `/k` keeps the window. That
@@ -261,7 +261,7 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
 ;
 ; `open` is the same verb both icons run. It starts the daemon if one is not
 ; running, waits for it and for Studio, then puts a window on screen
-; (crates\ksx-app\src\studio_launch.rs) — moment 3 of FIRST-RUN.md §1.
+; (crates\ksx-backend\src\studio_launch.rs) — moment 3 of FIRST-RUN.md §1.
 ; `nowait` because that wait is seconds long and the wizard must not hold its
 ; Finish button hostage for it; `open` exits by design once the window is up.
 ;
@@ -271,7 +271,7 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
 ; browser window that daemon's Studio ends up in — inherits that token. ksx is
 ; built to run WITHOUT one: `ksx autostart` registers its logon task as
 ; InteractiveToken/LeastPrivilege, "never elevated"
-; (crates\ksx-app\src\autostart.rs), so an elevated first daemon would make
+; (crates\ksx-backend\src\autostart.rs), so an elevated first daemon would make
 ; moment 3 behave differently from every boot after it. It would also put the
 ; Chromium profile ksx owns under the ELEVATING account's %LOCALAPPDATA%, which
 ; on a machine where a standard user typed an admin's credentials is not the
@@ -408,7 +408,7 @@ begin
     exit;
   end
   // The exit codes are `ksx install-drivers`'s documented contract
-  // (crates\ksx-app\src\install.rs): 2 = refused before anything ran,
+  // (crates\ksx-backend\src\install.rs): 2 = refused before anything ran,
   // 3 = the ViGEmBus setup itself ran and failed, 1 = unexpected.
   else if ResultCode = 2 then
   begin

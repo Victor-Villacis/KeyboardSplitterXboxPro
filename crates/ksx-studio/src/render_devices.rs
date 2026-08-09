@@ -12,7 +12,7 @@
 //!
 //! Nothing here reads hardware, resolves a device id, or judges whether a
 //! board can be picked. All of that is [`ksx_api::DeviceScanView`], composed by
-//! `ksx-app`'s `device_scan::view` from the same enumeration `ksx device scan`
+//! `ksx-backend`'s `device_scan::view` from the same enumeration `ksx device scan`
 //! prints — `docs/SURFACES.md` §1: a capability is a typed spec and a pure plan
 //! in the backend, and surfaces render the result. What this file does is turn
 //! that view into the exact strings the island draws, and it does that because
@@ -562,7 +562,7 @@ mod tests {
     const AUX: &str = r"USB\VID_D209&PID_0430&MI_01\7&25EEA38C&0&0001";
     const FAN: &str = r"USB\VID_1E71&PID_300E&MI_01\7&8FBF878&0&0001";
 
-    /// A Bluetooth keyboard, in the shape `ksx-app`'s collector produces.
+    /// A Bluetooth keyboard, in the shape `ksx-backend`'s collector produces.
     const BT_KEYBOARD: &str = r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002045E_PID&0800\7&3562C725&0&001BDC0F1FE7_C00000000";
 
     /// Backend eligibility from `ksx_core::Reach`, never spelled by hand: a
@@ -698,7 +698,7 @@ mod tests {
                 transport: "usb".into(),
                 survives_replug: false,
                 means: "this exact USB socket".into(),
-                port_pinned_warning: Some(ksx_app_port_pinned_warning_stand_in().to_owned()),
+                port_pinned_warning: Some(ksx_backend_port_pinned_warning_stand_in().to_owned()),
                 present: true,
                 board: Some("Ultimarc I-PAC 4X".into()),
                 instance_id: Some(PANEL.to_owned()),
@@ -712,12 +712,12 @@ mod tests {
         )
     }
 
-    /// ksx-studio does not depend on ksx-app, so the paragraph cannot be
+    /// ksx-studio does not depend on ksx-backend, so the paragraph cannot be
     /// imported. It is reproduced with the two halves the tests assert on and
-    /// nothing else, and `ksx-app`'s own
+    /// nothing else, and `ksx-backend`'s own
     /// `the_port_pinned_warning_says_both_halves` pins the real constant — so
     /// the two cannot silently diverge on the parts that matter.
-    fn ksx_app_port_pinned_warning_stand_in() -> &'static str {
+    fn ksx_backend_port_pinned_warning_stand_in() -> &'static str {
         "PORT-PINNED — nothing weaker than the Windows instance path separates this board from \
          its twin, so this entry matches only while Windows keeps reporting that exact path. \
          Moving the board to another USB socket is the usual way that changes, and the entry then \
@@ -1184,7 +1184,7 @@ mod tests {
     ///
     /// A transport check, not a wording check: the fixture supplies the
     /// paragraph and this proves the seam carries it whole, so a `portWarn`
-    /// that got dropped or truncated fails here. `ksx-app`'s
+    /// that got dropped or truncated fails here. `ksx-backend`'s
     /// `the_port_pinned_warning_says_both_halves_and_promises_neither_too_hard`
     /// is what pins the WORDS.
     #[test]

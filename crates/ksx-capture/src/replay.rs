@@ -12,7 +12,7 @@
 //! # One format, and it already exists
 //!
 //! The corpus is the JSONL `ksx monitor --record` writes (documented in
-//! `ksx-app/src/monitor.rs`), one object per line:
+//! `ksx-backend/src/monitor.rs`), one object per line:
 //!
 //! ```json
 //! {"t_ms": 1042, "device": "HID\\VID_D209&PID_0430&REV_0056&MI_00", "key": "A", "down": true}
@@ -76,7 +76,7 @@ pub struct RecordedEvent {
     pub t_ms: u64,
     /// The device id **as it was at record time** — which after a replug, or on
     /// another machine, may name nothing at all. Resolving that is the caller's
-    /// job (`ksx-app`'s `play::resolve`), not this type's.
+    /// job (`ksx-backend`'s `play::resolve`), not this type's.
     pub device: DeviceId,
     pub key: Key,
     pub down: bool,

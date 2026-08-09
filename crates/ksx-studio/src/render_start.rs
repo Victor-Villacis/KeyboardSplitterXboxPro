@@ -1436,7 +1436,7 @@ mod tests {
 
     /// **Saving over an existing preset is said BEFORE the click.**
     ///
-    /// `ksx-app`'s `stage::apply` keeps a timestamped copy, and its flash says
+    /// `ksx-backend`'s `stage::apply` keeps a timestamped copy, and its flash says
     /// so afterwards. This is the half that arrives in time to change the
     /// decision.
     #[test]

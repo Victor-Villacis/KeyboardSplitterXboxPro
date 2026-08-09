@@ -493,7 +493,7 @@ fn list_values(snap: &StatusSnapshot) -> [(&'static str, SlotValue); 5] {
 }
 
 /// Badge derivations from the presentation-shaped snapshot lines. The
-/// snapshot contract deliberately ships composed sentences (ksx-app owns
+/// snapshot contract deliberately ships composed sentences (ksx-backend owns
 /// the wording); these prefixes are the stable part of that wording and the
 /// unit tests pin them. Anything unrecognized degrades to the WARN side —
 /// a pill must never say OK about a line it does not understand.

@@ -1,5 +1,5 @@
 ---
-source: crates/ksx-app/src/pads.rs
+source: crates/ksx-backend/src/pads.rs
 assertion_line: 388
 expression: "serde_json::to_string_pretty(&v).unwrap()"
 ---

@@ -1,7 +1,7 @@
 //! **The live fan-out: what a surface sees of a running pipeline.**
 //!
 //! This module is the *shape* of the stream. The sink that fills it lives in
-//! `ksx-app` (`crate::feed`), because it owns the pipeline; the shape lives
+//! `ksx-backend` (`crate::feed`), because it owns the pipeline; the shape lives
 //! here so that every consumer names one set of types — the cabinet's button
 //! check and Studio's `/check` today, E8's feedback bus next
 //! (docs/ENHANCEMENTS.md E8: "the feedback consumer is a BUS, not a lamp

@@ -1,24 +1,23 @@
 //! ksx — split keyboards (I-PAC arcade encoders) into virtual Xbox 360 controllers.
 
-// In the TEST harness build only, dead-code analysis loses `fn main` as a
-// liveness root (rustc 1.97 sharpened this), so everything reachable solely
-// through the runtime path — the `dyn MachineSource` chain Studio drives, the
-// onboard/profile-edit glue, every view-conversion helper no unit test calls
-// directly — reads as "never used" in that one target and nowhere else. CI
-// caught it under `--features studio` the first time local and CI ran the same
-// compiler version; the bin target in the very same clippy invocation checks
-// all of that code with `main` as a root and stays the authority, so this
-// silences a structural false positive, not a lint.
-#![cfg_attr(test, allow(dead_code))]
+// This file used to carry `#![cfg_attr(test, allow(dead_code))]`. In the test
+// harness build, dead-code analysis loses `fn main` as a liveness root (rustc
+// 1.97 sharpened this), so everything reachable only through the runtime path —
+// the `dyn MachineSource` chain Studio drives, the onboard/profile-edit glue,
+// every view-conversion helper no unit test calls — read as "never used" in
+// that one target and nowhere else. All of that code is `ksx-backend`'s now,
+// where `pub mod` makes it a liveness root in its own right, so the allow is
+// gone rather than inherited: nothing left in this crate is reachable except
+// through `main` or a test, and if that changes the lint should say so.
 
 // Every verb this file dispatches to. These were `mod` declarations until the
 // split; the bodies are `ksx-backend`'s now and this crate is the CLI and
 // nothing else — argument definitions, the `match` below, and the exit codes.
 // If you are adding logic rather than a flag, it does not go in this file.
 use ksx_backend::{
-    autostart, config_io, daemon, device_edit, device_scan, devices, doctor, install, logging,
-    macro_cli, macro_trace, map, mapping, monitor, pads, play, preset_cli, run, session, setup,
-    slot_cli, winusb,
+    autostart, config_io, daemon, device_edit, device_scan, devices, doctor, import_legacy,
+    install, logging, macro_cli, macro_trace, map, mapping, monitor, pads, play, preset_cli, run,
+    session, setup, slot_cli, winusb,
 };
 // `console` is here rather than above because `ksx cabinet` is its only caller
 // in this file: the daemon detaches its own console from inside the backend.
@@ -1626,7 +1625,7 @@ fn main() -> anyhow::Result<()> {
             from,
             dry_run,
             json,
-        } => import_legacy(from, dry_run, json),
+        } => import_legacy::run(from, dry_run, json),
         Command::Doctor { latency, json } => {
             if latency {
                 doctor::run_latency(json)
@@ -1895,80 +1894,6 @@ fn main() -> anyhow::Result<()> {
             }),
         },
     }
-}
-
-/// Exit code 3 = import completed but produced warnings (0 = clean, 1 = error).
-const EXIT_IMPORT_WARNINGS: i32 = 3;
-
-fn import_legacy(
-    from: Option<std::path::PathBuf>,
-    dry_run: bool,
-    json: bool,
-) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    use ksx_legacy_import::json_escape;
-
-    let dir = from.unwrap_or_else(ksx_legacy_import::default_legacy_dir);
-    let import = ksx_legacy_import::import_dir(&dir)
-        .with_context(|| format!("importing legacy XML from '{}'", dir.display()))?;
-
-    if dry_run {
-        let files = import.rendered_files()?;
-        if json {
-            let rendered: Vec<String> = files
-                .iter()
-                .map(|f| {
-                    format!(
-                        "{{\"path\":\"{}\",\"content\":\"{}\"}}",
-                        json_escape(&f.path),
-                        json_escape(&f.content)
-                    )
-                })
-                .collect();
-            println!(
-                "{{\"dry_run\":true,\"legacy_dir\":\"{}\",\"report\":{},\"files\":[{}]}}",
-                json_escape(&dir.display().to_string()),
-                import.report.to_json(),
-                rendered.join(",")
-            );
-        } else {
-            for file in &files {
-                println!("==== {} ====", file.path);
-                println!("{}", file.content);
-            }
-            // Report on stderr so stdout stays pipeable TOML.
-            eprintln!("{}", import.report);
-        }
-    } else {
-        let root = ksx_legacy_import::default_config_root()
-            .context("cannot resolve the ksx config root (%APPDATA% is not set)")?;
-        let written = import
-            .write_outputs(&root)
-            .with_context(|| format!("writing TOML into '{}'", root.display()))?;
-        if json {
-            let paths: Vec<String> = written
-                .iter()
-                .map(|p| format!("\"{}\"", json_escape(&p.display().to_string())))
-                .collect();
-            println!(
-                "{{\"dry_run\":false,\"legacy_dir\":\"{}\",\"config_root\":\"{}\",\"report\":{},\"written\":[{}]}}",
-                json_escape(&dir.display().to_string()),
-                json_escape(&root.display().to_string()),
-                import.report.to_json(),
-                paths.join(",")
-            );
-        } else {
-            println!("{}", import.report);
-            for path in &written {
-                println!("wrote {}", path.display());
-            }
-        }
-    }
-
-    if !import.report.warnings.is_empty() {
-        std::process::exit(EXIT_IMPORT_WARNINGS);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

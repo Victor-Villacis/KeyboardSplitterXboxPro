@@ -70,7 +70,7 @@ pub struct DeviceEntry {
     /// Interception hardware id, an ACPI path the setup wizard wrote, and now
     /// `usb:d209:0430:00` — the replug-proof form `ksx device pick` writes.
     /// What each one *means* is decided once, at session start
-    /// (`ksx-app::run::resolve`), against a fresh enumeration; nothing
+    /// (`ksx-backend::run::resolve`), against a fresh enumeration; nothing
     /// byte-compares this against hardware any more.
     ///
     /// The raw string is what goes back to disk — see [`crate::device_serde`]
@@ -142,7 +142,7 @@ impl ConfigFile {
     ///
     /// Deliberately still the *written* spelling and not a concrete devnode:
     /// what a selector names is decided once, at session start, against a fresh
-    /// enumeration (`ksx-app::run::resolve`). Resolving here would mean the
+    /// enumeration (`ksx-backend::run::resolve`). Resolving here would mean the
     /// config layer enumerating hardware, and would put resolution downstream
     /// of the hot-swap comparison that decides whether a config edit has to
     /// bounce a live session (`docs/DEVICE-IDENTITY.md` §8).

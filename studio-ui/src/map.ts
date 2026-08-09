@@ -506,7 +506,7 @@ async function bindOnce(
         key,
         force,
         // A binding-only edit is hot-swapped into a running session: the pads
-        // stay plugged (crates/ksx-app/src/daemon/mod.rs `apply_bindings`).
+        // stay plugged (crates/ksx-backend/src/daemon/mod.rs `apply_bindings`).
         reload: true,
       }),
     });

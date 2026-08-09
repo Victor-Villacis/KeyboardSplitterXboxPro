@@ -52,6 +52,7 @@ pub mod device_scan;
 pub mod devices;
 pub mod doctor;
 pub mod feed;
+pub mod import_legacy;
 pub mod install;
 pub mod logging;
 pub mod macro_cli;

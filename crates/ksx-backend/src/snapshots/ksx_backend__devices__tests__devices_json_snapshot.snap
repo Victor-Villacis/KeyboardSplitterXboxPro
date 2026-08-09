@@ -1,5 +1,5 @@
 ---
-source: crates/ksx-app/src/devices.rs
+source: crates/ksx-backend/src/devices.rs
 expression: "serde_json::to_string_pretty(&devices_json(&report)).unwrap()"
 ---
 {

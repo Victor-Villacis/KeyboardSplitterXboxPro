@@ -2,10 +2,10 @@
 
 > Status: design, mostly built. `ksx-core::DeviceSelector` implements the
 > matching rule below and is fully tested. §9 items 1–4 are built: `[[device]]
-> id` is a `DeviceRef` (raw + parsed); `ksx-app/src/run/resolve.rs` resolves it
+> id` is a `DeviceRef` (raw + parsed); `ksx-backend/src/run/resolve.rs` resolves it
 > once per session inside `plan::resolve_as`; and `ksx device scan` / `ksx
 > device pick` / `ksx device remove` ship as CLI verbs
-> (`ksx-app/src/device_scan.rs`, `ksx-app/src/device_edit.rs`, wired in
+> (`ksx-backend/src/device_scan.rs`, `ksx-backend/src/device_edit.rs`, wired in
 > `ksx-app/src/main.rs`). `remove` is a fifth verb this document never
 > specified — it is listed in §9 now. Only item 5, press-to-identify, is absent.
 >
@@ -66,7 +66,7 @@ exact board, in that exact socket, had no working starting point.
 
 All three paths that taught it now teach the picker instead. The setup wizard
 writes what Raw Input reported, so nobody types anything
-(`ksx-app/src/setup.rs`); `QUICKSTART.md` and `MIGRATION-WINUSB.md` show the
+(`ksx-backend/src/setup.rs`); `QUICKSTART.md` and `MIGRATION-WINUSB.md` show the
 `usb:` selector and the verb that produces it. `crates/ksx-app/tests/docs.rs`
 holds them to it: a `[[device]]` block containing a literal devnode path has to
 name `ksx device pick` on the same page.
@@ -293,7 +293,7 @@ The rule the codebase already documents, restated because it is easy to erode:
 by construction: every public function returns a string type and none returns a
 `bool`, so there is nothing for a branch to ask. `ksx-capture` and `ksx-platform`
 re-export `ULTIMARC_VID` from it rather than each declaring their own, and
-`ksx-app/src/devices.rs` holds no copy at all. The SpinTrak-is-not-an-I-PAC
+`ksx-backend/src/devices.rs` holds no copy at all. The SpinTrak-is-not-an-I-PAC
 regression this section was written after is a test in that module.
 
 The one refusal string that gave I-PAC-specific advice to every user regardless
@@ -375,7 +375,7 @@ The gap, smallest-first. Items 1–4 are **built**; only item 5 is not:
    `persona_serde` / `socd_serde`, so old files round-trip byte-identically.
    A value with no `\` and no known prefix is now a load error rather than a
    literal that silently matches nothing.
-2. ~~**One resolution pass.**~~ Built, in `ksx-app/src/run/resolve.rs`, called
+2. ~~**One resolution pass.**~~ Built, in `ksx-backend/src/run/resolve.rs`, called
    from `plan::resolve_as` — the one call `ksx run`, `ksx daemon`, autostart
    and the tray's "Reload config" share, which is what keeps it upstream of the
    hot-swap comparison in §8. `Match::One` proceeds; `Match::Ambiguous` refuses
@@ -393,7 +393,7 @@ The gap, smallest-first. Items 1–4 are **built**; only item 5 is not:
    `[WARN]` notes, and refuses (`ResolveError::Missing`) only when no slot
    survives, because *then* a "successful" start is a dead panel with no error
    anywhere. `run/resolve.rs`'s own module header carries the same correction.
-3. ~~**`ksx device scan`.**~~ Built (`ksx-app/src/device_scan.rs`): a read-only,
+3. ~~**`ksx device scan`.**~~ Built (`ksx-backend/src/device_scan.rs`): a read-only,
    daemon-free report — boards grouped, friendly names, which interface is
    claimable, and the selector each would get. Two of the six things this item
    asked for are **still missing**, and both are real: grouping is by composite

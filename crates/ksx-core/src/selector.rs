@@ -71,7 +71,7 @@
 //!
 //! [`DeviceRef`] is the pair a `[[device]] id` holds: the selector, and the
 //! text it was written as. Both, because `parse` canonicalises — see that
-//! type's docs. `ksx-app::run::resolve` turns each one into a concrete devnode
+//! type's docs. `ksx-backend::run::resolve` turns each one into a concrete devnode
 //! exactly once, at session start.
 
 use core::fmt;

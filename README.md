@@ -382,7 +382,8 @@ crates/ksx-capture        CaptureBackend: interception / winusb / rawinput-ident
 crates/ksx-output         VirtualPadBackend: ViGEmBus
 crates/ksx-platform       driver health, install, autostart, WinUSB rebind, SendInput
 crates/ksx-games          game launch + exit detection (launcher hand-off)
-crates/ksx-app            the `ksx` binary
+crates/ksx-app            the `ksx` binary: clap definitions and verb dispatch, nothing else
+crates/ksx-backend        every verb's body — the daemon, the run supervisor, the writers
 crates/ksx-studio         ksx Studio, the optional localhost UI (feature `studio`)
 crates/vigem-client       vendored CasualX/vigem-client (MIT)
 assets/brand/             the ksx mark: two master SVGs + every generated raster

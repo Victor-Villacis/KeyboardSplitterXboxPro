@@ -116,7 +116,7 @@ impl Handles {
 
 /// A source of per-device key events that can also suppress them from the OS.
 ///
-/// Object-safe and `Send`: `ksx-app` holds a `Box<dyn CaptureBackend>` chosen at
+/// Object-safe and `Send`: `ksx-backend` holds a `Box<dyn CaptureBackend>` chosen at
 /// startup (interception / mock / winusb in M6).
 pub trait CaptureBackend: Send {
     /// Enumerate devices this backend can currently see. Cold path; may allocate

@@ -37,7 +37,7 @@ fn load_corpus() -> Vec<Event> {
         .filter(|l| !l.trim().is_empty())
         .map(|line| {
             // Deliberately hand-parsed: the corpus format is a stable contract
-            // (documented in ksx-app/src/monitor.rs), not a serde type.
+            // (documented in ksx-backend/src/monitor.rs), not a serde type.
             let field = |name: &str| -> String {
                 let key = format!("\"{name}\":");
                 let rest = &line[line.find(&key).expect("field") + key.len()..];

@@ -14,7 +14,7 @@
 //!
 //! M6 broke that assumption. The daemon claims its WinUSB panel **once**, for
 //! its whole lifetime, so the health state behind it now outlives every session
-//! that borrows it ([`crate::backend::Handles`], `ksx-app`'s `daemon::panel`).
+//! that borrows it ([`crate::backend::Handles`], `ksx-backend`'s `daemon::panel`).
 //! A reader that treats these latches as "what happened to me" therefore reads
 //! somebody else's history: one watchdog trip in the first game would end every
 //! later game before it translated a keystroke, blaming a stall that was already

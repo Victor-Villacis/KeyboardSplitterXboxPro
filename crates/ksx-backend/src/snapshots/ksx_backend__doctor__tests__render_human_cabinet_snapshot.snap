@@ -1,5 +1,5 @@
 ---
-source: crates/ksx-app/src/doctor.rs
+source: crates/ksx-backend/src/doctor.rs
 expression: "render_human(&report, &advice)"
 ---
 ksx doctor — driver health
