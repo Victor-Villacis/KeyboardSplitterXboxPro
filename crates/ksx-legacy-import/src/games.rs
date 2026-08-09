@@ -1,6 +1,8 @@
 //! `splitter_games.xml` -> [`ksx_config::GamesFile`].
 //!
-//! Legacy schema (`legacy/KeyboardSplitter/Models/{GameData,Game,SlotData}.cs`):
+//! Legacy schema (`KeyboardSplitter/Models/{GameData,Game,SlotData}.cs` — a
+//! path in the C# app, see the crate's Provenance section and
+//! `docs/LEGACY-UPSTREAM.md`):
 //! `<Games>` -> `<Game Title Notes Path Arguments BlockKeyboards BlockMice>` →
 //! `<Slot Number GamepadUserIndex Keyboard Mouse Preset/>`. Device values are
 //! hardware-id strings; they are carried into the TOML **verbatim** (legacy

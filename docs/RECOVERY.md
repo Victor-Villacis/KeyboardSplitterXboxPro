@@ -35,7 +35,11 @@ If keyboards are dead at boot:
    Set-ItemProperty $m UpperFilters @('mouclass')  # remove 'mouse' if present
    ```
 3. Reboot. Keyboards work; Interception is gone; use ksx's WinUSB backend (M6+) or
-   the legacy `legacy/InterceptionUninstall/` tool to clean up properly.
+   the legacy `InterceptionUninstall/` tool to clean up properly. That tool is not
+   in this repo — it is a VS2013 C# project you would have to check out and build
+   (`git show legacy-csharp-final:InterceptionUninstall/`, or upstream; see
+   `docs/LEGACY-UPSTREAM.md`). The registry edit above is the version that needs
+   no build.
 
 ## 2. WinUSB claim: the panel stopped typing
 

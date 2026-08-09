@@ -154,6 +154,7 @@ offline — the regression oracle for the whole input path).
 | keys, chords, turbo, SOCD, macros | `docs/INPUT-TRANSFORMS.md` |
 | Studio's visual language | `docs/DESIGN-SYSTEM.md` |
 | why there is no native config UI | `docs/M9-DECISION.md` |
+| a comment cites a `.cs` file — where is it? | `docs/LEGACY-UPSTREAM.md` |
 | the enhancement/idea ledger | `docs/ENHANCEMENTS.md` |
 
 ## Working style here

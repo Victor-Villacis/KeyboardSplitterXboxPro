@@ -5,8 +5,10 @@ present as keyboards — into up to **4 virtual Xbox 360 controllers** on Window
 
 This is a ground-up **Rust** rebuild of djlastnight's
 [KeyboardSplitterXbox](https://github.com/djlastnight/KeyboardSplitterXbox)
-(2016, C#/.NET 4.0, unmaintained). The original lives on in [`legacy/`](legacy/) as the
-behavior reference; the Rust workspace at the repo root is the project now.
+(2016, C#/.NET 4.0, unmaintained). The Rust workspace at the repo root is the
+project now; the original stays the behavior reference, read from upstream (or
+from this repo's `legacy-csharp-final` tag) rather than vendored — see
+[`docs/LEGACY-UPSTREAM.md`](docs/LEGACY-UPSTREAM.md).
 
 ## Download
 
@@ -388,7 +390,6 @@ crates/vigem-client       vendored CasualX/vigem-client (MIT)
 assets/brand/             the ksx mark: two master SVGs + every generated raster
 tools/icongen/            regenerates them (own cargo workspace — see assets/brand/README.md)
 packaging/                Inno Setup script
-legacy/                   original C# solution (frozen, reference only)
 examples/                 frontend wrapper scripts
 docs/                     architecture, integration, driver story, recovery, migration, research
 ```

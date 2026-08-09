@@ -1,5 +1,6 @@
-//! Bindings and presets, including the two built-ins ported from
-//! `legacy/KeyboardSplitter/Presets/Preset.cs`.
+//! Bindings and presets, including the two built-ins ported from legacy
+//! `KeyboardSplitter/Presets/Preset.cs` — a path in djlastnight's
+//! KeyboardSplitterXbox, which `docs/LEGACY-UPSTREAM.md` locates.
 
 use crate::key::Key;
 use crate::macros::{Macro, MacroTrigger, MIN_STEP_MS, TURBO_MAX_HZ};

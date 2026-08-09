@@ -3,11 +3,14 @@
 //! Two schemas are accepted transparently, distinguished per element by their
 //! attribute spelling (XML attribute names are case-sensitive):
 //!
-//! - **v2** (current, `legacy/SplitterCore/Preset/*.cs`): lowercase attributes
+//! (Both schemas are read off the C# itself; the crate's Provenance section and
+//! `docs/LEGACY-UPSTREAM.md` say where the `.cs` paths below resolve.)
+//!
+//! - **v2** (current, `SplitterCore/Preset/*.cs`): lowercase attributes
 //!   with numeric ids -- `<preset name>`, `<button id="4096">`,
 //!   `<axis id="1" value="-32768">`, `<dpad direction="1">`,
 //!   `<custom function="2">`.
-//! - **v1** (`legacy/KeyboardSplitter/Presets/PresetUpgrader.cs`): capitalized
+//! - **v1** (`KeyboardSplitter/Presets/PresetUpgrader.cs`): capitalized
 //!   attributes with enum *names* -- `<preset Name>`, `<button ID="A">`,
 //!   `<axis ID="X" Position="Min">`, `<dpad ID="Up">` (also accepted as
 //!   `<pov>`), `<custom ID="Button_A">`. The legacy upgrader's blunt
@@ -389,7 +392,7 @@ fn parse_custom(attrs: &[(String, String)]) -> Result<Binding, String> {
 }
 
 /// Expand a flat `XboxCustomFunction` id into a plain [`Binding`]
-/// (`legacy/VirtualXbox/Enums/XboxCustomFunction.cs`, bit-exact). Axis custom
+/// (legacy `VirtualXbox/Enums/XboxCustomFunction.cs`, bit-exact). Axis custom
 /// functions always drive full-scale Min/Max (`CustomFunctionHelper.cs`).
 fn expand_custom(function: u32) -> Option<Binding> {
     if function <= 0x8 {

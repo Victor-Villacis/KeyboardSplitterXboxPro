@@ -1,9 +1,12 @@
 //! XInput-shaped pad state and the legacy `VirtualXbox` ID tables.
 //!
-//! The numeric ids are contractual: legacy preset XML stores them
-//! (`legacy/VirtualXbox/Enums/*.cs`), and [`PadState`] is kept in XInput wire
-//! shape (== `vigem_client::XGamepad`) so no output backend needs a translation
-//! layer.
+//! The numeric ids are contractual: legacy preset XML on disk stores them, so
+//! they are reproduced bit-for-bit from legacy `VirtualXbox/Enums/*.cs`.
+//! [`PadState`] is kept in XInput wire shape (== `vigem_client::XGamepad`) so
+//! no output backend needs a translation layer.
+//!
+//! Every `.cs` path cited here is a path in djlastnight's KeyboardSplitterXbox,
+//! the C# app ksx replaced; `docs/LEGACY-UPSTREAM.md` says where to read it.
 
 use bitflags::bitflags;
 
@@ -259,7 +262,7 @@ mod tests {
 
     #[test]
     fn button_bits_match_legacy_xbox_button() {
-        // Bit-for-bit against legacy/VirtualXbox/Enums/XboxButton.cs.
+        // Bit-for-bit against legacy VirtualXbox/Enums/XboxButton.cs.
         assert_eq!(XButton::Start.legacy_id(), 0x0010);
         assert_eq!(XButton::Back.legacy_id(), 0x0020);
         assert_eq!(XButton::LeftThumb.legacy_id(), 0x0040);
@@ -363,7 +366,7 @@ mod tests {
 
     #[test]
     fn dpad_ids_match_legacy_and_wire_bits() {
-        // Verified against legacy/VirtualXbox/Enums/XboxDpadDirection.cs:
+        // Verified against legacy VirtualXbox/Enums/XboxDpadDirection.cs:
         // Off=0 (not a binding), Up=1, Down=2, Left=4, Right=8.
         assert_eq!(DpadDirection::Up.legacy_id(), 1);
         assert_eq!(DpadDirection::Down.legacy_id(), 2);

@@ -117,7 +117,8 @@ fn original_bak_corpus_imports_with_zero_warnings() {
 fn v1_schema_upgrades_transparently() {
     // v1 markers: <preset Name>, named ID attributes, Position names, <pov>,
     // pre-rename trigger names, named custom functions
-    // (legacy/KeyboardSplitter/Presets/PresetUpgrader.cs).
+    // (legacy `KeyboardSplitter/Presets/PresetUpgrader.cs`, a path in
+    // djlastnight/KeyboardSplitterXbox — docs/LEGACY-UPSTREAM.md).
     let v1 = r#"<?xml version="1.0" encoding="utf-16"?>
 <preset_data>
   <preset Name="v1 preset">
