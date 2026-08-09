@@ -11,68 +11,21 @@
 // silences a structural false positive, not a lint.
 #![cfg_attr(test, allow(dead_code))]
 
-// The backend, one `use` per verb module. These were `mod` declarations in
-// this file until the split; they are re-exported at the crate root rather
-// than named `ksx_backend::` at each call site so that the modules still here
-// keep resolving `crate::console` — which is what makes each slice of the move
-// a rename plus this list, and nothing else.
-#[cfg(windows)]
-use ksx_backend::ctrl_c;
-use ksx_backend::{console, logging, macro_cli, map, mapping, setup, slot_cli, slots};
-
-mod autostart;
+// Every verb this file dispatches to. These were `mod` declarations until the
+// split; the bodies are `ksx-backend`'s now and this crate is the CLI and
+// nothing else — argument definitions, the `match` below, and the exit codes.
+// If you are adding logic rather than a flag, it does not go in this file.
+use ksx_backend::{
+    autostart, config_io, daemon, device_edit, device_scan, devices, doctor, install, logging,
+    macro_cli, macro_trace, map, mapping, monitor, pads, play, preset_cli, run, session, setup,
+    slot_cli, winusb,
+};
+// `console` is here rather than above because `ksx cabinet` is its only caller
+// in this file: the daemon detaches its own console from inside the backend.
 #[cfg(feature = "cabinet")]
-mod cabinet;
-#[cfg(windows)]
-mod capture;
-// Still here, and this is the reason: `onboard` shares config_io's INTERNALS
-// — `gather`, `plan_writes`, `examine`, `Fault` and the rest of its
-// `pub(crate)` surface — so the two are one unit as far as the move is
-// concerned. Splitting them across a crate boundary would mean promoting that
-// whole surface to `pub` and demoting it again when `onboard` follows, which
-// is churn in exchange for nothing. They move together.
-mod config_io;
-mod daemon;
-mod device_edit;
-mod device_scan;
-mod devices;
-mod doctor;
-mod feed;
-mod install;
-mod macro_trace;
-mod monitor;
-// The first-run state and the path-free config in/out, for the surfaces that
-// have a screen. Gated with `sources` for the same reason: the CLI reaches this
-// machinery through `config_io` directly, so a default build would carry it as
-// dead code — which `-D warnings` refuses.
-#[cfg(any(feature = "studio", feature = "cabinet"))]
-mod onboard;
-mod pads;
-mod play;
-mod preset_cli;
-mod preset_edit;
-// Gated exactly like `sources` below, and for the same `-D warnings` reason:
-// this is the write half of games.toml and Studio's Profiles page is its only
-// caller today, so a default build would carry it as dead code. The gate comes
-// off the day a `ksx games new` CLI verb exists — which is where it belongs
-// per docs/SURFACES.md §2, and which is the one thing this change-set did not
-// also do.
-#[cfg(any(feature = "studio", feature = "cabinet"))]
-mod profile_edit;
-mod run;
-mod session;
-#[cfg(any(feature = "studio", feature = "cabinet"))]
-mod sources;
-// The staged setup's two exits — save it, or play it without saving
-// (docs/FIRST-RUN.md §2). Not feature-gated: `ksx_core::StagedSetup` lives in
-// the daemon for the length of a visit, so every build that can run a daemon
-// needs the paths that turn one into a config write or a run plan.
-mod stage;
+use ksx_backend::{cabinet, console};
 #[cfg(feature = "studio")]
-mod studio;
-#[cfg(feature = "studio")]
-mod studio_launch;
-mod winusb;
+use ksx_backend::{studio, studio_launch};
 
 use clap::{Parser, Subcommand};
 
@@ -2828,7 +2781,9 @@ mod tests {
 
     /// Plain `ksx daemon` must detach; `--console` and `--headless` must not.
     /// This is the flag-to-policy wiring — the policy itself is tested in
-    /// `crate::console`.
+    /// `ksx_backend::console`, which is also why the calls below spell that
+    /// path out: the `use` at the top of this file is behind `cabinet`,
+    /// because outside a test `ksx cabinet` is this crate's only caller.
     #[test]
     fn daemon_console_flags_parse_and_select_the_right_policy() {
         let cli = Cli::try_parse_from(["ksx", "daemon"]).unwrap();
@@ -2841,7 +2796,7 @@ mod tests {
         assert!(!headless);
         assert!(!console);
         assert!(
-            console::mode(headless, console).detaches(),
+            ksx_backend::console::mode(headless, console).detaches(),
             "a bare `ksx daemon` must release its console: a stray terminal window on a \
              cabinet is one click away from killing emulation"
         );
@@ -2859,7 +2814,7 @@ mod tests {
                 panic!("parsed to the wrong subcommand");
             };
             assert!(
-                !console::mode(headless, console).detaches(),
+                !ksx_backend::console::mode(headless, console).detaches(),
                 "{args:?} must keep the console"
             );
         }

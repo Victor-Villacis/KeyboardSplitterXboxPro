@@ -37,13 +37,60 @@
 //! `daemon/` is the resident tray process and its control pipe; `sources.rs`
 //! is where surfaces get their data.
 
+pub mod autostart;
+#[cfg(feature = "cabinet")]
+pub mod cabinet;
+#[cfg(windows)]
+pub mod capture;
+pub mod config_io;
 pub mod console;
 #[cfg(windows)]
 pub mod ctrl_c;
+pub mod daemon;
+pub mod device_edit;
+pub mod device_scan;
+pub mod devices;
+pub mod doctor;
+pub mod feed;
+pub mod install;
 pub mod logging;
 pub mod macro_cli;
+pub mod macro_trace;
 pub mod map;
 pub mod mapping;
+pub mod monitor;
+// The first-run state and the path-free config in/out, for the surfaces that
+// have a screen. Gated with `sources` because that is the only caller: the CLI
+// reaches this machinery through `config_io` directly.
+#[cfg(any(feature = "studio", feature = "cabinet"))]
+pub mod onboard;
+pub mod pads;
+pub mod play;
+pub mod preset_cli;
+pub mod preset_edit;
+// Gated exactly like `sources` below: this is the write half of games.toml and
+// Studio's Profiles page is its only caller today. The gate comes off the day a
+// `ksx games new` CLI verb exists — which is where it belongs per
+// docs/SURFACES.md §2.
+#[cfg(any(feature = "studio", feature = "cabinet"))]
+pub mod profile_edit;
+pub mod run;
+pub mod session;
 pub mod setup;
 pub mod slot_cli;
 pub mod slots;
+// Gated because it reaches `cabinet` and `studio_launch`, which are themselves
+// behind those features — so this is not a tidiness gate, it is what the module
+// can actually name.
+#[cfg(any(feature = "studio", feature = "cabinet"))]
+pub mod sources;
+// The staged setup's two exits — save it, or play it without saving
+// (docs/FIRST-RUN.md §2). Not feature-gated: `ksx_core::StagedSetup` lives in
+// the daemon for the length of a visit, so every build that can run a daemon
+// needs the paths that turn one into a config write or a run plan.
+pub mod stage;
+#[cfg(feature = "studio")]
+pub mod studio;
+#[cfg(feature = "studio")]
+pub mod studio_launch;
+pub mod winusb;
