@@ -35,11 +35,11 @@ are *not* relative to anything in this repo, and the `legacy/` prefix some of
 them used to carry has been removed precisely so that one convention holds
 everywhere.
 
-That the redirect is honest was checked, not assumed: every one of the 311 C#
-files deleted from `legacy/` was compared by git blob SHA against the upstream
-tree at that commit, and every one matched. The single file under `legacy/` that
-was *ours* rather than upstream's was `legacy/LEGACY.md` — this document, moved
-here rather than lost.
+That the redirect is honest was checked, not assumed: all 311 deleted files (174
+of them `.cs`, the rest projects, images and binaries) were compared by git blob
+SHA against the upstream tree at that commit, and every one matched. The single
+file under `legacy/` that was *ours* rather than upstream's was
+`legacy/LEGACY.md` — this document, moved here rather than lost.
 
 ## The files worth opening
 
