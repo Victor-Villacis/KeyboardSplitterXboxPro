@@ -72,19 +72,29 @@ jobs:
       # breakages reached master that way (87701cd, 4200214, 4135a7b's dead
       # LearnService::refusing), each caught by a local gate CI did not run.
       # Compile every combination the release build can ship.
-      - name: Feature matrix (clippy, all four combinations)
+      #
+      # BOTH crates, and that second one is not symmetry for its own sake.
+      # `ksx-app` forwards these features to `ksx-backend`, so `-p ksx-app`
+      # does enable the backend's gated code — but `--all-targets` only builds
+      # ksx-app's OWN test targets, and the unit tests that sit behind those
+      # gates now live in ksx-backend beside the code they test. Gating only
+      # the CLI would reopen exactly the gap this step exists to close, one
+      # crate lower down.
+      - name: Feature matrix (clippy, both crates, all four combinations)
         shell: pwsh
         run: |
-          foreach ($f in @('', 'studio', 'cabinet', 'studio,cabinet')) {
-            $label = if ($f) { $f } else { '<default>' }
-            Write-Host "::group::features: $label"
-            if ($f) {
-              cargo clippy -p ksx-app --all-targets --features $f -- -D warnings
-            } else {
-              cargo clippy -p ksx-app --all-targets -- -D warnings
+          foreach ($p in @('ksx-app', 'ksx-backend')) {
+            foreach ($f in @('', 'studio', 'cabinet', 'studio,cabinet')) {
+              $label = if ($f) { $f } else { '<default>' }
+              Write-Host "::group::$p features: $label"
+              if ($f) {
+                cargo clippy -p $p --all-targets --features $f -- -D warnings
+              } else {
+                cargo clippy -p $p --all-targets -- -D warnings
+              }
+              if ($LASTEXITCODE -ne 0) { throw "$p feature combination '$label' failed" }
+              Write-Host '::endgroup::'
             }
-            if ($LASTEXITCODE -ne 0) { throw "feature combination '$label' failed" }
-            Write-Host '::endgroup::'
           }
       - name: Check vendored vigem-client compiles
         run: cargo check -p vigem-client --all-features

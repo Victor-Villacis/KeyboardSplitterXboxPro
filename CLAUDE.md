@@ -79,17 +79,20 @@ you ever gate by hand:
 ```
 cargo fmt --check                       # on the crates you touched
 cargo clippy --workspace --exclude vigem-client --all-targets -- -D warnings
-cargo clippy -p ksx-app --all-targets -- -D warnings                       # no features
-cargo clippy -p ksx-app --all-targets --features studio -- -D warnings
-cargo clippy -p ksx-app --all-targets --features cabinet -- -D warnings
-cargo clippy -p ksx-app --all-targets --features studio,cabinet -- -D warnings
+# then, for BOTH ksx-app and ksx-backend, all four combinations:
+cargo clippy -p <crate> --all-targets -- -D warnings                       # no features
+cargo clippy -p <crate> --all-targets --features studio -- -D warnings
+cargo clippy -p <crate> --all-targets --features cabinet -- -D warnings
+cargo clippy -p <crate> --all-targets --features studio,cabinet -- -D warnings
 cargo test --workspace --exclude vigem-client
 ```
 
 The four feature combinations are not paranoia: `studio` and `cabinet` are
 independent opt-ins, so the default build compiles neither, and **five separate
 breakages have reached master through that gap**. `--features studio` alone has
-caught dead code twice.
+caught dead code twice. Both crates, because `ksx-app` merely *forwards* those
+features to `ksx-backend`: `-p ksx-app --all-targets` compiles the backend's
+gated code but not the backend's tests, which is where most of it is tested.
 
 Touched `studio-ui/`? Also `cd studio-ui && node build.mjs`, commit the
 regenerated assets, and confirm a fresh rebuild is byte-identical. (That one is

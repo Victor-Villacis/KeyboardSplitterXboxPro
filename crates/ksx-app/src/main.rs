@@ -11,15 +11,27 @@
 // silences a structural false positive, not a lint.
 #![cfg_attr(test, allow(dead_code))]
 
+// The backend, one `use` per verb module. These were `mod` declarations in
+// this file until the split; they are re-exported at the crate root rather
+// than named `ksx_backend::` at each call site so that the modules still here
+// keep resolving `crate::console` — which is what makes each slice of the move
+// a rename plus this list, and nothing else.
+#[cfg(windows)]
+use ksx_backend::ctrl_c;
+use ksx_backend::{console, logging, setup};
+
 mod autostart;
 #[cfg(feature = "cabinet")]
 mod cabinet;
 #[cfg(windows)]
 mod capture;
+// Still here, and this is the reason: `onboard` shares config_io's INTERNALS
+// — `gather`, `plan_writes`, `examine`, `Fault` and the rest of its
+// `pub(crate)` surface — so the two are one unit as far as the move is
+// concerned. Splitting them across a crate boundary would mean promoting that
+// whole surface to `pub` and demoting it again when `onboard` follows, which
+// is churn in exchange for nothing. They move together.
 mod config_io;
-mod console;
-#[cfg(windows)]
-mod ctrl_c;
 mod daemon;
 mod device_edit;
 mod device_scan;
@@ -27,7 +39,6 @@ mod devices;
 mod doctor;
 mod feed;
 mod install;
-mod logging;
 mod macro_cli;
 mod macro_trace;
 mod map;
@@ -53,7 +64,6 @@ mod preset_edit;
 mod profile_edit;
 mod run;
 mod session;
-mod setup;
 mod slot_cli;
 mod slots;
 #[cfg(any(feature = "studio", feature = "cabinet"))]

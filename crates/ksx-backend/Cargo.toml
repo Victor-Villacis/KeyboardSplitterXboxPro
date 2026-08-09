@@ -1,33 +1,13 @@
 [package]
-name = "ksx-app"
-description = "ksx — split keyboards (I-PAC arcade encoders) into virtual Xbox 360 controllers."
+name = "ksx-backend"
+description = "ksx — the backend: every verb's typed spec, pure plan and I/O, with no CLI attached."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "ksx"
-path = "src/main.rs"
-
-# The Win32 resource stamp — icon group + VERSIONINFO. See build.rs for what
-# it does and why a failure there is a warning rather than an error.
-[target.'cfg(windows)'.build-dependencies]
-# Named directly rather than through [workspace.dependencies]: it is a
-# BUILD-time dependency of exactly one crate, it never appears in any ksx
-# binary, and hoisting it would put a resource compiler in the same list as
-# the engine's runtime deps. `winresource` is the maintained fork of the
-# unmaintained `winres`.
-winresource = "0.1"
-
 [dependencies]
-# The backend — every verb's typed spec, pure plan and I/O. This crate is the
-# CLI and nothing else: `main.rs` parses arguments and dispatches into
-# ksx-backend, which is what makes docs/SURFACES.md §1 ("the backend owns
-# state; every surface is a view") a crate boundary rather than an honour
-# system. The `studio` and `cabinet` features below forward to it.
-ksx-backend.workspace = true
 ksx-core.workspace = true
 ksx-config.workspace = true
 # The typed control API (docs/M9-DECISION.md §6): the daemon READS the control
@@ -54,7 +34,6 @@ anyhow.workspace = true
 # `capture::SetupError` is matched on for a stable --json error code, so it is a
 # typed enum rather than an anyhow::Error.
 thiserror.workspace = true
-clap.workspace = true
 crossbeam-channel.workspace = true
 # The live fan-out sink's subscriber list (`crate::feed`): the publisher reads
 # an arc-swapped snapshot instead of taking a lock, which is the same shape —
@@ -109,15 +88,15 @@ windows-sys = { workspace = true, features = [
 
 [features]
 # `ksx studio` — the optional localhost web status page (docs/ENHANCEMENTS.md E7).
-# It forwards to ksx-backend as well as enabling the dependency here, because
-# the split is still in flight: `studio.rs` and `studio_launch.rs` have not
-# moved yet. The `dep:` half comes off with them.
-studio = ["dep:ksx-studio", "ksx-backend/studio"]
+# ksx-app forwards its own `studio` feature to this one; the two are the same
+# opt-in spelled at two layers, which is why CI's four-combination matrix now
+# runs against BOTH crates (`.github/workflows/ci.yml`) — `-p ksx-app` alone
+# would enable this code but never compile the tests that live beside it.
+studio = ["dep:ksx-studio"]
 # `ksx cabinet` + the daemon's in-process window (docs/M9-DECISION.md, the
 # cabinet/Studio split). Independent of `studio`: a cabinet with no browser
 # builds this and not that.
-cabinet = ["dep:ksx-cabinet", "ksx-backend/cabinet"]
+cabinet = ["dep:ksx-cabinet"]
 
 [dev-dependencies]
 insta.workspace = true
-

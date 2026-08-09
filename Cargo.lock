@@ -1642,6 +1642,7 @@ dependencies = [
  "hdrhistogram",
  "insta",
  "ksx-api",
+ "ksx-backend",
  "ksx-cabinet",
  "ksx-capture",
  "ksx-config",
@@ -1659,6 +1660,34 @@ dependencies = [
  "tracing-subscriber",
  "windows-sys 0.60.2",
  "winresource",
+]
+
+[[package]]
+name = "ksx-backend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "crossbeam-channel",
+ "hdrhistogram",
+ "insta",
+ "ksx-api",
+ "ksx-cabinet",
+ "ksx-capture",
+ "ksx-config",
+ "ksx-core",
+ "ksx-games",
+ "ksx-legacy-import",
+ "ksx-output",
+ "ksx-platform",
+ "ksx-studio",
+ "serde_json",
+ "thiserror 2.0.19",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
