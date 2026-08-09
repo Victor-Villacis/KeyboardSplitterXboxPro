@@ -1,6 +1,7 @@
 //! `splitter_settings.xml` -> [`ksx_config::Settings`].
 //!
-//! Legacy schema (`legacy/KeyboardSplitter/GlobalSettings.cs`, root
+//! Legacy schema (`KeyboardSplitter/GlobalSettings.cs` — a path in the C# app,
+//! see the crate's Provenance section and `docs/LEGACY-UPSTREAM.md`; root
 //! `<SplitterSettings>`): `MouseMoveDeadZone` (0..=12),
 //! `StartingVirtualControllerUserIndex` (1..=4), plus two UI-only toggles —
 //! `DisplayEmulationInformation` and `SuggestInputDevicesForNewSlots` -- that

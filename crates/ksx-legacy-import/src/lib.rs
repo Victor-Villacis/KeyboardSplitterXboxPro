@@ -1,13 +1,24 @@
 //! ksx-legacy-import -- reads the legacy app's UTF-16 XML and emits ksx TOML.
 //!
 //! Import fidelity is bit-exact against the legacy ID tables
-//! (`legacy/VirtualXbox/Enums/*.cs`): XboxButton 0x0010..0x8000, triggers
+//! (`VirtualXbox/Enums/*.cs`): XboxButton 0x0010..0x8000, triggers
 //! 0x10000/0x20000, axes 1/2/4/8 with signed 16-bit values, dpad flags, and the
 //! flat XboxCustomFunction space (expanded into plain [`ksx_core::Binding`]s).
 //! Also honors the v1-schema upgrader semantics (`LeftTrigger`→`Left`,
 //! `<pov>`→dpad, named enum attributes) from
-//! `legacy/KeyboardSplitter/Presets/PresetUpgrader.cs` -- applied transparently
-//! when v1 markers are detected.
+//! `KeyboardSplitter/Presets/PresetUpgrader.cs` -- applied transparently when
+//! v1 markers are detected.
+//!
+//! # Provenance
+//!
+//! Every `.cs` path cited in this crate is a path in **djlastnight's
+//! KeyboardSplitterXbox**, the C# app ksx replaced —
+//! <https://github.com/djlastnight/KeyboardSplitterXbox> at commit `863dc2d`,
+//! which is also this repo's `legacy-csharp-final` tag, so
+//! `git show legacy-csharp-final:<path>` resolves any of them offline. That
+//! source is the *only* answer to why the XML parses the way it does, so a
+//! citation here is load-bearing rather than decorative; `docs/LEGACY-UPSTREAM.md`
+//! has the full story.
 //!
 //! Unmappable entries never abort an import: they produce precise
 //! [`Warning`]s (file, preset, entry, reason) and are skipped.

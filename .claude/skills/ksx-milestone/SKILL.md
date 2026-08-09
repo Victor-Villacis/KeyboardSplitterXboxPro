@@ -23,9 +23,11 @@ comes as the skill argument or from conversation.
 
 Run implementation as a Workflow: contracts (if new shared types are needed) →
 parallel implementers with strict crate ownership → **2 adversarial reviewers**
-with distinct lenses (correctness-vs-legacy reading `legacy/` C# directly;
-crash/hang/recovery safety) — this ratio is mandatory for driver-touching
-milestones. Reviewers fix mechanical issues, report semantic ones.
+with distinct lenses (correctness-vs-legacy reading the C# directly — it is not
+vendored, use `git show legacy-csharp-final:<path>`, see
+`docs/LEGACY-UPSTREAM.md`; crash/hang/recovery safety) — this ratio is mandatory
+for driver-touching milestones. Reviewers fix mechanical issues, report semantic
+ones.
 
 Every agent prompt must include: repo path, required reading list, the crate(s)
 it owns, the gate commands, "no git commits", and the CLI rules (stable exit

@@ -277,7 +277,8 @@ software. Costs per-key remapping and caps at 2 pads/board — escape hatch, not
 | kanata-interception | crates.io dep | LGPL-3.0 (dynamic driver API binding) |
 | `winusb.sys` (M6 capture) | in-box, `%SystemRoot%\System32\drivers` | Microsoft, ships with Windows — nothing to redistribute, nothing to license |
 | ksx-generated WinUSB INF | written to `%APPDATA%\ksx\winusb` on claim | MIT OR Apache-2.0 (it is ksx output); the catalog signing it is the user's |
-| Legacy C# app | `legacy/` | upstream repo shipped no license; kept as reference, not distributed |
+| Legacy C# app | not vendored — upstream + tag `legacy-csharp-final` (`docs/LEGACY-UPSTREAM.md`) | upstream repo shipped no license; read as reference, never distributed |
 
-Nothing from `legacy/` (embedded `devcon.exe`, ScpVBus, prebuilt DLLs) is ever carried
-into release artifacts.
+Nothing from the legacy C# tree (embedded `devcon.exe`, ScpVBus, prebuilt DLLs) is ever
+carried into release artifacts. Its no-license status is the reason it is cited rather
+than copied: there are no terms under which any of it could be redistributed.

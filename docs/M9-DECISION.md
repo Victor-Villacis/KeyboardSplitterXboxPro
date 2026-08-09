@@ -153,9 +153,9 @@ frameless window with no address bar and no tabs, its own taskbar button, its ow
 alt-tab entry, and no inherited extensions or session. What remains missing is
 identity work ksx needs *under every option*: today the tray calls
 `LoadIconW(ptr::null_mut(), IDI_APPLICATION)` — **the generic Windows default
-icon** — there is no Start Menu entry, no Add/Remove Programs presence, no owned
-`.ico` outside `legacy/`, and `ksx studio` does not open a browser at all; the
-user is expected to type a URL.
+icon** — there is no Start Menu entry, no Add/Remove Programs presence, no ksx
+`.ico` anywhere (the only three in the tree are the legacy C# app's), and `ksx
+studio` does not open a browser at all; the user is expected to type a URL.
 
 That last one is the whole decision in miniature. The thing that makes ksx feel
 like a web page is not HTML — it is that you launch it by typing a URL, and that

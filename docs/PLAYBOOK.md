@@ -15,7 +15,8 @@ adopt/reject rationale.
 3. **Adversarial review, Bun ratio** (M3 onward — driver-touching code can brick
    keyboards): every implementation gets **2 independent adversarial reviewers**
    with distinct lenses — (a) correctness-vs-legacy (diff against the C# ground
-   truth in `legacy/`), (b) crash/hang/recovery safety (what happens on kill,
+   truth: `git show legacy-csharp-final:<path>`, see `docs/LEGACY-UPSTREAM.md`),
+   (b) crash/hang/recovery safety (what happens on kill,
    hang, unplug, driver absence). Their only job: find why the code does not work.
    Mechanical fixes they may apply; semantic divergences they report.
 4. **The gate** (all must be green before commit):
