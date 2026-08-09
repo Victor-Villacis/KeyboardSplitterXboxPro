@@ -173,6 +173,7 @@ that is sitting right there.
 
 | question | doc |
 |---|---|
+| taking the project over / broad orientation | `docs/HANDOFF.md` |
 | which surface does this belong on? | `docs/SURFACES.md` |
 | how is a device identified, and why not by path? | `docs/DEVICE-IDENTITY.md` |
 | what can each control surface do? | `docs/CONTROL-SURFACE.md` |

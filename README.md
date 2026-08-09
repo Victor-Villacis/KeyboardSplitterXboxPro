@@ -26,6 +26,10 @@ developer machine — [`docs/RELEASING.md`](docs/RELEASING.md). The bare `ksx.ex
 is attached beside the installer for people who want no installer; it is not the
 file to start with.
 
+**Taking this over?** [`docs/HANDOFF.md`](docs/HANDOFF.md) is the orientation:
+what ksx is, how the crates fit together, what is finished, what is not, and
+the half-dozen beliefs about this codebase that turned out to be false.
+
 **New here?** [`docs/QUICKSTART.md`](docs/QUICKSTART.md) goes from a fresh
 machine to four working players: drivers, which capture mode to pick, and then
 either `ksx preset new --from-template arcade-6button` (a standard panel needs

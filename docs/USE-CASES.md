@@ -14,9 +14,9 @@ non-negotiables are listed at the bottom.
 | T1 | One multi-player encoder (I-PAC2/4) → 2–4 pads by key subsets | arcade cabinets (**the primary case**) | ✅ proven on hardware (M4) |
 | T2 | N distinct keyboards → one pad each | couch co-op, two people one PC — *the legacy app's headline case* | ⚠️ supported by design, **never tested**; needs a second physical keyboard bound to a slot |
 | T3 | Mixed: encoder + regular keyboard(s) | cabinet with a control station | ⚠️ same as T2 |
-| T4 | **Two identical devices** (2× I-PAC2, or two of the same cheap USB keyboard) | very common for 4-player builds and co-op | ❌ **blocked on Interception** — ksx refuses to start (see below); ✅ **structurally solved by the M6 WinUSB claim**, whose identity is the per-port USB instance path |
+| T4 | **Two identical devices** (2× I-PAC2, or two of the same cheap USB keyboard) | very common for 4-player builds and co-op | ⚠️ **never silently confused, still not usable together.** `DeviceSelector`'s port rung tells twins apart in config and `Match::Ambiguous` refuses rather than guessing (`docs/DEVICE-IDENTITY.md` §2). But an INF binds by hardware id, which both boards share, so `winusb.rs` refuses `SharedHardwareId` for BOTH while both are plugged — claiming one would claim every one. Telling them apart *during a claim* needs per-device installation, which ksx does not do. Untested: nobody here owns a second board |
 | T5 | One keyboard → one pad | single-player remapper, accessibility | ✅ works (degenerate case of T1) |
-| T6 | More than 4 pads | 6-player cabinets | ❌ XInput caps at 4; needs HID personas (ENHANCEMENTS E4) |
+| T6 | More than 4 pads | 6-player cabinets | ✅ **solved, and measured** — not by HID personas as this row used to predict, but by ViGEm's OTHER target: `research/m6.5-ds4-findings.md` plugged six DS4 targets alongside four X360 pads and the XInput count did not move. `Persona::playstation` takes no XInput slot, which is how players 5+ exist. `MAX_SLOTS` is 16; `ksx pads` warns before plugging XInput pads a game cannot see |
 | T7 | Laptop internal keyboard as a player | portable setups | ⚠️ untested; Interception filters the class stack so it should work |
 
 ## The blocker worth fixing: T4, identical devices

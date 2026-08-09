@@ -48,10 +48,24 @@ Rules that keep us honest (each maps to a legacy defect — see risk review §1/
 | M1 | ✅ done | ksx-core + ksx-config + importer | `ksx import-legacy` converts the real cab XML with zero warnings; proptests green |
 | M2 | ✅ done | ViGEm output | 4 pads in joy.cpl, LED order right, kill → pads vanish |
 | M3 | ✅ done | Interception capture | attribution + blocking verified; taskkill recovery <1 s ×5; LCtrl×5 in fullscreen |
-| M4 | 🔨 code done, cabinet gate pending | End-to-end parity (`ksx run`) | 4-player real-game session via `ksx run`; p99 < 1 ms |
-| M5 | 🔨 code done, cabinet gate pending | Game launching, autostart, tray daemon, install-drivers, frontend integration | cold boot → daemon → frontend → game → clean exit |
-| M6 | 🔨 code done, cabinet gate pending | WinUSB claim: capture backend, rebind tooling, recovery path, keystroke re-injection | same session with Interception **uninstalled**; frontend navigable with emulation stopped; 2-week soak |
-| M7 | – | UI (decision deferred; egui/eframe leading) | preset edit without hand-editing TOML |
+| M4 | 🔨 code done, cabinet gate pending | End-to-end parity (`ksx run`) | 4-player real-game session via `ksx run`; p99 < 1 ms — **GATE 3 phase 1** |
+| M5 | 🔨 code done, one phase pending | Game launching, autostart, tray daemon, install-drivers, frontend integration | cold boot → daemon → frontend → game → clean exit. GATE 1 passed 2026-08-05 except Phase C (the frontend wrap) — **GATE 3 phase 2** |
+| M6 | 🔨 code done, cabinet gate pending | WinUSB claim: capture backend, rebind tooling, recovery path, keystroke re-injection | same session with Interception **uninstalled**, then a 2-week soak — **GATE 3 phase 3**. The claim itself has run daily on the cabinet since 2026-08-06; what is unproven is the session with the old driver gone |
+| M6.5 | ✅ done | DS4 spike: a second ViGEm target type | measured in `research/m6.5-ds4-findings.md` — six DS4 targets enumerated alongside four X360 with the XInput count unmoved, which is how players 5+ exist |
+| M7 | ✅ done | UI: preset editing without a text editor | met by Studio's mapper (`/map`), not by the egui the original entry assumed. `docs/MAPPER-UX.md` Build A shipped; Build B (the wizard) and Build C (button-check) are tracked there |
+| M8 | 🔨 client done, blocked on the driver | HIDMaestro personas: DualSense, Switch Pro, Xbox Series | `crates/ksx-hidmaestro` is a complete protocol client, honestly gated: `Persona::can_plug()` is false for all three and every surface reads it. Finishing needs the shared section's byte layout transcribed from HIDMaestro's own MIT sources — see `docs/ENHANCEMENTS.md` E1 |
+| M9 | ✅ done, **re-decided** | "ksx is a real Windows application" | Was an egui config UI; cancelled 2026-08-06 because Studio had already shipped the mapper E7 wanted a native UI for (`docs/M9-DECISION.md`). Delivered instead: an owned icon, an installer, a tray "Open ksx", and `ksx open` — daemon up, wait for the port, then a chrome-less window |
+| M10a | ✅ done | `ksx-api`: the typed, transport-free contract every surface consumes | `crates/ksx-api`. Studio and the cabinet depend on it and **not** on the backend crate, which is what makes `SURFACES.md` §1 checkable |
+| M10b | 🔨 continuing | Studio as the UI | six pages: `/`, `/start`, `/map`, `/devices`, `/pads`, `/profiles`, `/setup`, `/check` |
+
+### What "cabinet gate pending" means, and where it is written down
+
+M4, M5 and M6 are **code-complete and unproven**, and that distinction is the
+whole reason this column exists: every one of them has a claim only hardware can
+settle. All three are collected into one supervised evening in
+[`GATES.md`](GATES.md)'s **GATE 3** — the p99 measurement, the frontend wrap, and
+then Interception's removal followed by a 14-day soak. Until that runs, treating
+them as done would be the exact failure `docs/FIRST-RUN.md` §6 is about.
 
 ### M4 supervisor (`crates/ksx-backend/src/run/`)
 
