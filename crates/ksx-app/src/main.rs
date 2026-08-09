@@ -18,7 +18,7 @@
 // a rename plus this list, and nothing else.
 #[cfg(windows)]
 use ksx_backend::ctrl_c;
-use ksx_backend::{console, logging, setup};
+use ksx_backend::{console, logging, macro_cli, map, mapping, setup, slot_cli, slots};
 
 mod autostart;
 #[cfg(feature = "cabinet")]
@@ -39,10 +39,7 @@ mod devices;
 mod doctor;
 mod feed;
 mod install;
-mod macro_cli;
 mod macro_trace;
-mod map;
-mod mapping;
 mod monitor;
 // The first-run state and the path-free config in/out, for the surfaces that
 // have a screen. Gated with `sources` for the same reason: the CLI reaches this
@@ -64,8 +61,6 @@ mod preset_edit;
 mod profile_edit;
 mod run;
 mod session;
-mod slot_cli;
-mod slots;
 #[cfg(any(feature = "studio", feature = "cabinet"))]
 mod sources;
 // The staged setup's two exits — save it, or play it without saving

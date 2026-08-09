@@ -41,4 +41,9 @@ pub mod console;
 #[cfg(windows)]
 pub mod ctrl_c;
 pub mod logging;
+pub mod macro_cli;
+pub mod map;
+pub mod mapping;
 pub mod setup;
+pub mod slot_cli;
+pub mod slots;
