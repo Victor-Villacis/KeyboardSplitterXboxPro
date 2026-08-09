@@ -976,7 +976,13 @@ fn a_wedged_output_thread_cannot_prevent_un_capturing() {
             self.inner.user_index(handle)
         }
         fn update(&mut self, handle: PadHandle, state: &PadState) -> Result<(), OutputError> {
-            let deadline = Instant::now() + Duration::from_secs(20);
+            // Strictly SHORTER than the supervisor backstop below. If the
+            // release never arrives, the wedge must be what gives up first, so
+            // the failure names the thing under test; a backstop that fires
+            // first reports "the session stopped for another reason" and hides
+            // it. These two were inverted (20s here, 15s there) and that is
+            // exactly what happened — see the backstop's comment.
+            let deadline = Instant::now() + Duration::from_secs(30);
             while !self.released.load(Ordering::SeqCst) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(2));
             }
@@ -1024,8 +1030,19 @@ fn a_wedged_output_thread_cannot_prevent_un_capturing() {
         })
     });
     let trace: Trace = Arc::new(Mutex::new(Vec::new()));
-    // Backstop so a regression fails instead of hanging forever.
-    let hard_deadline = Instant::now() + Duration::from_secs(15);
+    // Backstop so a regression fails instead of hanging forever — and nothing
+    // else. It is deliberately far longer than any legitimate run of this test,
+    // because it competes with the behaviour under test: this stops the session
+    // with a DIFFERENT StopReason, so whenever it wins the race the
+    // `EmergencyStop` assertion below fails for a reason that has nothing to do
+    // with un-capturing.
+    //
+    // It was 15s, which is under a second's slack on this workload — 1400
+    // strokes through a bounded channel while the output thread is wedged, plus
+    // thread scheduling. It passed on master and failed on the v0.1.0 tag run
+    // at THE SAME COMMIT, then blocked the release. A loaded runner is not a
+    // regression, so the number has to be one no honest run can reach.
+    let hard_deadline = Instant::now() + Duration::from_secs(120);
     let mut options = RunOptions {
         clock: Clock::monotonic_nanos(),
         trace: Some(trace.clone()),
