@@ -53,7 +53,7 @@ Rules that keep us honest (each maps to a legacy defect — see risk review §1/
 | M6 | 🔨 code done, cabinet gate pending | WinUSB claim: capture backend, rebind tooling, recovery path, keystroke re-injection | same session with Interception **uninstalled**; frontend navigable with emulation stopped; 2-week soak |
 | M7 | – | UI (decision deferred; egui/eframe leading) | preset edit without hand-editing TOML |
 
-### M4 supervisor (`crates/ksx-app/src/run/`)
+### M4 supervisor (`crates/ksx-backend/src/run/`)
 
 `ksx run` is the pipeline above, wired up. Two orderings are contractual and
 asserted in CI (`src/run/pipeline_tests.rs`, mock backends, no drivers):
@@ -73,7 +73,7 @@ device set from its idle path; a bound device that disappears releases its keys
 `InvalidationReason`, and the session keeps running. Config hot-reload is **not**
 in M4.
 
-### M5 (`crates/ksx-games`, `crates/ksx-app/src/{daemon,autostart,install}.rs`)
+### M5 (`crates/ksx-games`, `crates/ksx-backend/src/{daemon,autostart,install}.rs`)
 
 Everything M5 adds hangs off the M4 pipeline without changing it. The pipeline's
 two contractual orderings are unchanged and still asserted the same way.
@@ -143,7 +143,7 @@ contract is that ksx is stopped on every exit path — and whose safety net is t
 killing ksx is always safe, because blocking is released on process death with no
 cleanup.
 
-### M6 (`crates/ksx-platform/src/{winusb,inject}.rs`, `crates/ksx-app/src/winusb.rs`, `crates/ksx-app/src/daemon/typethrough.rs`)
+### M6 (`crates/ksx-platform/src/{winusb,inject}.rs`, `crates/ksx-backend/src/winusb.rs`, `crates/ksx-backend/src/daemon/typethrough.rs`)
 
 M6 replaces the capture *mechanism* without touching the pipeline above it. The
 `CaptureBackend` contract is unchanged; a WinUSB backend satisfies it the same
@@ -410,7 +410,7 @@ already bound to `winusb.sys` — ksx never performs the rebind itself.
 
 Backend choice is per device (`[[device]] backend = "winusb"`), resolved in the
 pure planner (`RunPlan::winusb`, `needs_interception`) and built in one place
-(`ksx-app/src/capture.rs`) so `ksx run` and the daemon cannot drift. WinUSB
+(`ksx-backend/src/capture.rs`) so `ksx run` and the daemon cannot drift. WinUSB
 interfaces are claimed **before** the Interception context is created, so a claim
 failure happens while every keyboard on the machine is still completely normal.
 When no bound device needs Interception, no Interception context is created at

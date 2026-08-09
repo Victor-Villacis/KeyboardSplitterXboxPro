@@ -39,7 +39,7 @@
 //!
 //! # It is NOT in the default build
 //!
-//! `ksx-app`'s `cabinet` feature is the only thing that names this crate, and
+//! `ksx-backend`'s `cabinet` feature is the only thing that names this crate, and
 //! `cargo tree` proves it — the same rule, and the same proof, as `studio`
 //! (docs/ENHANCEMENTS.md E7 rule A).
 

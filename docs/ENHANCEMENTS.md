@@ -360,7 +360,7 @@ out to pluggable sinks behind a small trait:
   backpressure the engine (same rule as everything else near the pipeline).
 
 Status: **unblocked**, still post-M7 in sequence. The Studio live socket it
-was to be designed alongside SHIPPED on 2026-08-08 (`ksx-app/src/daemon/
+was to be designed alongside SHIPPED on 2026-08-08 (`ksx-backend/src/daemon/
 live_pipe.rs` + `ksx-studio/src/live.rs`), so the sink trait now has a
 concrete second consumer to be shaped against rather than a hypothetical one —
 and `PadFeedback` is already a field of every frame both of them read.

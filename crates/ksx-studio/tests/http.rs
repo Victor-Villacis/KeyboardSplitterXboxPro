@@ -82,7 +82,7 @@ impl StatusSource for FixedStatus {
     }
 
     /// The preset's `[macros]` tables, in the file's own shape — what
-    /// ksx-app's collector reads off disk (`ms` and `frames` kept apart, the
+    /// ksx-backend's collector reads off disk (`ms` and `frames` kept apart, the
     /// `macro.<name>` rows resolved into `triggers`).
     fn macros(&self, preset: &str) -> MacroSnapshot {
         MacroSnapshot::read(
@@ -200,7 +200,7 @@ impl ControlSource for ScriptedControl {
             .as_deref()
             .and_then(|name| name.parse::<ksx_core::Persona>().ok())
             .unwrap_or_default();
-        // Faithful to `bounce_after_slot_write` (ksx-app/src/daemon/pipe.rs):
+        // Faithful to `bounce_after_slot_write` (ksx-backend/src/daemon/pipe.rs):
         // the pads replug only when a session was RUNNING, and the daemon's own
         // sentence says which of the two happened. A fake that reported
         // `restarted` off the request rather than off the session is exactly
@@ -889,7 +889,7 @@ impl ksx_api::MachineSource for ScriptedMachine {
 
     // ── The M10 verbs behind /setup: the config in and out, and the first-run
     //    state. Synthetic, and deliberately just enough to prove the ROUTES —
-    //    what the real provider does to a config root is `ksx-app`'s to test
+    //    what the real provider does to a config root is `ksx-backend`'s to test
     //    (`onboard.rs` + `config_io.rs`), and testing it twice would only pin
     //    the fake.
 
@@ -956,7 +956,7 @@ impl ksx_api::MachineSource for ScriptedMachine {
 
     /// The consent shape, faithfully: no `apply`, no write.
     ///
-    /// The summaries mirror `ksx-app::onboard`'s after the review: the backend
+    /// The summaries mirror `ksx-backend::onboard`'s after the review: the backend
     /// states the FACT and names no control, because the same sentence is read
     /// by the cabinet egui, which has no checkbox called "write it". Naming
     /// this page's box is `server.rs::import_flash`'s job and is asserted as

@@ -1,7 +1,7 @@
 //! The READ side: everything a surface can show with **no daemon running**.
 //!
 //! Kept apart from [`crate::ControlSource`] on purpose, and the split is
-//! load-bearing (docs/M9-DECISION.md §6): ksx-app's collectors read the config
+//! load-bearing (docs/M9-DECISION.md §6): ksx-backend's collectors read the config
 //! store and the platform directly, which is why `ksx studio` renders a
 //! read-only mapper behind the "No daemon" banner instead of an error page.
 //! Merging the two traits would delete that path — a surface that needed a
@@ -16,14 +16,14 @@
 use serde::{Deserialize, Serialize};
 
 /// Supplies a fresh [`StatusSnapshot`] per request. Implementations live with
-/// the caller (ksx-app builds one from the existing collectors); this crate
+/// the caller (ksx-backend builds one from the existing collectors); this crate
 /// never gathers machine state itself.
 pub trait StatusSource: Send + Sync {
     fn snapshot(&self) -> StatusSnapshot;
 
     /// The mapper page's data: slots with their presets and bindings. The
     /// default is an honest "no data" so existing sources keep compiling;
-    /// ksx-app overrides it with the config-store reader.
+    /// ksx-backend overrides it with the config-store reader.
     fn mapper(&self) -> MapperSnapshot {
         MapperSnapshot::unavailable("this status source supplies no mapper data")
     }
@@ -32,7 +32,7 @@ pub trait StatusSource: Send + Sync {
     /// (docs/INPUT-TRANSFORMS.md §1c).
     ///
     /// A separate method rather than a field on [`MapperSlot`] for one
-    /// deliberate reason: [`MapperSlot`] is built by the CALLER (ksx-app's
+    /// deliberate reason: [`MapperSlot`] is built by the CALLER (ksx-backend's
     /// `collect_mapper`), so a new required field would be a compile break in
     /// a crate this seam is not allowed to reach into. A defaulted trait
     /// method is the same shape [`StatusSource::mapper`] itself used to grow

@@ -13,6 +13,7 @@ default-members = [
     "crates/ksx-hidmaestro",
     "crates/ksx-platform",
     "crates/ksx-games",
+    "crates/ksx-backend",
     "crates/ksx-app",
     "crates/ksx-studio",
     "crates/ksx-cabinet",
@@ -37,6 +38,7 @@ ksx-output = { path = "crates/ksx-output" }
 ksx-hidmaestro = { path = "crates/ksx-hidmaestro" }
 ksx-platform = { path = "crates/ksx-platform" }
 ksx-games = { path = "crates/ksx-games" }
+ksx-backend = { path = "crates/ksx-backend" }
 ksx-studio = { path = "crates/ksx-studio" }
 ksx-cabinet = { path = "crates/ksx-cabinet" }
 vigem-client = { path = "crates/vigem-client", features = ["unstable_xtarget_notification", "unstable_ds4"] }

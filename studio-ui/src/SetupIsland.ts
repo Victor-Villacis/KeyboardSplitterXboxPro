@@ -19,7 +19,7 @@ import { h, createSignal, createList, createShow } from "@getforma/core";
 // # The first run is a checklist the BACKEND decides
 //
 // `stepRows` is rendered, never computed here: `ksx_api::MachineSource::
-// setup_state` returns the steps with their state already chosen (ksx-app's
+// setup_state` returns the steps with their state already chosen (ksx-backend's
 // `onboard::plan_steps`, pure and unit-tested), because "which step is next" is
 // a decision about configuration and docs/SURFACES.md §1 puts decisions in the
 // backend. The three ACTIONS below the list are authored, not derived — a list

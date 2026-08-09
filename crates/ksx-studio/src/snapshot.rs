@@ -3,7 +3,7 @@
 //!
 //! `StatusSource` and its snapshots moved to `ksx-api` for the reason
 //! docs/M9-DECISION.md §6 gives: the read side must be satisfiable with NO
-//! daemon running (ksx-app's collectors read the config store and the platform
+//! daemon running (ksx-backend's collectors read the config store and the platform
 //! directly), and it is consumed by surfaces that do not link this crate. What
 //! remains below is the part that genuinely belongs to a web page: the
 //! envelope the islands protocol serializes into the document and the poller

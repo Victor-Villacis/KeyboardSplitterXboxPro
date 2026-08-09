@@ -17,7 +17,7 @@
 //! so, per call, with the line to type.
 //!
 //! The reads (devices, presets, autostart, doctor, WinUSB status) are
-//! daemon-free and safe from anywhere, so ksx-app can implement them the day a
+//! daemon-free and safe from anywhere, so ksx-backend can implement them the day a
 //! surface consumes them — the shapes below are what it would fill in. The
 //! mutating and elevated ones are a different question and not merely
 //! unimplemented: a pad test COMPETES for the four XInput slots, and `winusb
@@ -46,7 +46,7 @@ pub trait MachineSource: Send + Sync {
     /// grouped into the physical boards a person picks from, with the
     /// `[[device]]` entries that are configured against them.
     ///
-    /// It exists beside `devices` for the reason `crates/ksx-app/src/
+    /// It exists beside `devices` for the reason `crates/ksx-backend/src/
     /// device_scan.rs` opens with: one interface per row is the right shape
     /// for diagnosing a backend and the wrong shape for CHOOSING. On the
     /// reference cabinet `ksx devices` prints 29 interfaces, three of which are
@@ -296,7 +296,7 @@ pub trait MachineSource: Send + Sync {
     /// [`ImportRequest::apply`]**.
     ///
     /// The consent shape is load-bearing and is the CLI's, unchanged
-    /// (`ksx-app/src/config_io.rs`): a first call reports exactly which files
+    /// (`ksx-backend/src/config_io.rs`): a first call reports exactly which files
     /// it would create and which it would overwrite, every overwrite leaves a
     /// timestamped `.bak`, and validation faults refuse the write unless
     /// [`ImportRequest::force`] says otherwise. A surface may not skip the dry
@@ -924,7 +924,7 @@ fn device_health(device: &ConfiguredDevice) -> (String, &'static str) {
 }
 
 /// One physical board: every interface that shares a composite parent
-/// (`crates/ksx-app/src/device_scan.rs` `Board`).
+/// (`crates/ksx-backend/src/device_scan.rs` `Board`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardRow {
     /// The vendor table's name, else the device's own product string, else the
@@ -1393,7 +1393,7 @@ pub struct PadsView {
     /// --persona xbox360` plugs eight pads and four of them are invisible to
     /// every game, and a surface must be able to say that BEFORE the button is
     /// pressed without knowing why four is the number. (The console says the
-    /// same thing before its own plug, from the same constant — `ksx-app`'s
+    /// same thing before its own plug, from the same constant — `ksx-backend`'s
     /// `pads::ceiling_warning`.)
     pub xinput_line: String,
     /// Does THIS process hold an administrator token? `None` = unanswerable.
@@ -1839,7 +1839,7 @@ pub mod setup_states {
 ///
 /// The `now` step is the backend's decision and every implementation owes the
 /// same invariant — exactly one step is next, always. It is held where a real
-/// implementation can be driven against it: `ksx-app`'s
+/// implementation can be driven against it: `ksx-backend`'s
 /// `onboard::exactly_one_step_is_next_for_every_state_of_the_machine`, which
 /// runs `plan_steps` over every combination of the three counts. A hand-built
 /// `SetupView` asserted against here would only test the `vec!` literal beside
@@ -2650,7 +2650,7 @@ mod tests {
     /// (The old test in this slot built a `SetupView` with one `now` step and
     /// then asserted it had one `now` step — it tested the `vec!` literal three
     /// lines above it. The invariant it claimed to hold is really held in
-    /// ksx-app, against `plan_steps`; see [`SetupView`].)
+    /// ksx-backend, against `plan_steps`; see [`SetupView`].)
     #[test]
     fn the_slot_ceiling_a_surface_renders_is_this_builds_max_slots() {
         assert_eq!(SetupView::default().max_slots, ksx_core::MAX_SLOTS);

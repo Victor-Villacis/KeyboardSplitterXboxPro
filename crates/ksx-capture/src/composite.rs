@@ -56,7 +56,7 @@ impl CompositeBackend {
     /// Passing children built with different handles is a programming error the
     /// constructor cannot detect (the handles are opaque), so the intended
     /// construction is: make one `Handles`, hand a clone to every
-    /// `*_with(handles)` constructor, then pass the same one here. `ksx-app`'s
+    /// `*_with(handles)` constructor, then pass the same one here. `ksx-backend`'s
     /// wiring does exactly that.
     pub fn new(children: Vec<Box<dyn CaptureBackend>>, handles: Handles) -> Self {
         Self { children, handles }

@@ -3,7 +3,7 @@
 //!
 //! # Why not a tray crate
 //!
-//! `ksx-app` already links `windows-sys`, and the whole API surface needed here
+//! `ksx-backend` already links `windows-sys`, and the whole API surface needed here
 //! is five functions and one message loop. A crate for this would add a
 //! dependency tree (and, in most cases, an event-loop framework) to a project
 //! whose entire premise is that the input path must be boring and auditable.

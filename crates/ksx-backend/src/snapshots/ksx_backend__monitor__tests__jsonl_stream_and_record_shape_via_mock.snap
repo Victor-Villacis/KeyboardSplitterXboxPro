@@ -1,5 +1,5 @@
 ---
-source: crates/ksx-app/src/monitor.rs
+source: crates/ksx-backend/src/monitor.rs
 expression: stdout
 ---
 {"device":"HID\\VID_D209&PID_0430&REV_0056&MI_00","down":true,"key":"A","t_ms":10}

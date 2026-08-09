@@ -33,7 +33,7 @@
 //! switched off.
 //!
 //! Session state and the three POST routes go through [`ControlSource`] —
-//! ksx-app implements it over the daemon's `\\.\pipe\ksx-daemon` control
+//! ksx-backend implements it over the daemon's `\\.\pipe\ksx-daemon` control
 //! channel, so every button maps to the same `DaemonCommand` the tray
 //! enqueues (docs/CONTROL-SURFACE.md: no GUI-only code paths). When no
 //! daemon answers the pipe, the controls render visibly disabled with the
@@ -78,7 +78,7 @@
 //! - This crate depends on **exactly one other ksx crate: `ksx-api`**, the
 //!   typed control API every ksx front end consumes (docs/M9-DECISION.md §6).
 //!   Data arrives through its [`StatusSource`] and [`ControlSource`] traits;
-//!   ksx-app supplies the implementations (collectors and pipe client
+//!   ksx-backend supplies the implementations (collectors and pipe client
 //!   respectively). Nothing here can touch capture, output, or a live session
 //!   — a control implementation is a client of the daemon's pipe, never a
 //!   second control loop. `ksx-api` links no axum, no forma and no tokio, so

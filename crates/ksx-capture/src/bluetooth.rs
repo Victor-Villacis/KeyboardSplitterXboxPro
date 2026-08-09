@@ -202,7 +202,7 @@ mod tests {
     use super::*;
     use ksx_platform::winusb::{NodeStatus, CM_PROB_DEVICE_NOT_CONNECTED, KEYBOARD_CLASS_GUID};
 
-    /// The measured shape on this machine (`crates/ksx-app/src/winusb.rs`'s
+    /// The measured shape on this machine (`crates/ksx-backend/src/winusb.rs`'s
     /// `status_does_not_count_a_keyboard_that_cannot_type` uses the same path).
     const BT_KEYBOARD: &str = r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002045E_PID&0800\7&2A0B8CBA&0&001BDC0F1FE7_C00000000";
     const BT_AUDIO: &str = r"BTHENUM\Dev_B84DEEAA1122\7&2A0B8CBA&0&BluetoothDevice_B84DEEAA1122";

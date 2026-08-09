@@ -24,7 +24,7 @@
 //! - **what is staged is what plays** — [`StagedSetup::commit`] produces ONE
 //!   [`CommitSpec`], and the save path and the play path are both built from
 //!   that one value. There is no second translation in which a saved file could
-//!   mean something different from what the screen showed. `ksx-app`'s
+//!   mean something different from what the screen showed. `ksx-backend`'s
 //!   `crate::stage` pins that with a test.
 //!
 //! # Validation is reused, never restated

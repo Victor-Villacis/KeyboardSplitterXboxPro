@@ -582,7 +582,7 @@ impl SlotAssignRequest {
 /// Deserialization is deliberately TOLERANT (every field defaults) and
 /// serialization deliberately FAITHFUL (nothing is skipped): a daemon older
 /// than this binary is missing fields rather than lying, and the drift test in
-/// ksx-app re-serializes a real daemon answer through these types and checks
+/// ksx-backend re-serializes a real daemon answer through these types and checks
 /// that nothing the daemon said was dropped on the way in.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Response {
@@ -1383,7 +1383,7 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 3, allow_sh
         assert!(missing.message.contains(&bound), "{}", missing.message);
 
         // Past `u8` entirely — the only slot value this reader itself rejects;
-        // 1..=MAX_SLOTS proper is checked where the config is (ksx-app).
+        // 1..=MAX_SLOTS proper is checked where the config is (ksx-backend).
         let huge = SlotAssignRequest::from_json(&serde_json::json!({"slot": 999, "preset": "P"}))
             .expect_err("999 is not a slot");
         assert_eq!(huge.code, codes::BAD_SLOT);
@@ -1391,7 +1391,7 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 3, allow_sh
 
         // A slot past the old eight-player ceiling is an ordinary request to
         // this reader, whose only slot rule is "fits in u8" — pinned so nobody
-        // adds a second, literal ceiling on the wire beside ksx-app's.
+        // adds a second, literal ceiling on the wire beside ksx-backend's.
         let ninth = SlotAssignRequest::from_json(&serde_json::json!({"slot": 9, "preset": "P"}))
             .expect("slot 9 is a slot");
         assert_eq!(ninth.slot, 9);

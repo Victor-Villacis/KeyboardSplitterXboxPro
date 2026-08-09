@@ -48,8 +48,11 @@ pub mod plan;
 pub mod resolve;
 pub mod supervisor;
 
-/// End-to-end pipeline tests. `ksx-app` is a bin-only crate, so integration
-/// tests that need its internals live here rather than in `tests/`.
+/// End-to-end pipeline tests. They reach this module's internals — the
+/// `Wiring` seam and the fake backends behind it — so they live inside the
+/// crate rather than in `tests/`, which sees only the public surface.
+/// (Before the ksx-app split they had no choice: a bin crate has no
+/// integration-test target at all.)
 #[cfg(test)]
 mod pipeline_tests;
 

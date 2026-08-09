@@ -1636,8 +1636,22 @@ name = "ksx-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arc-swap",
  "clap",
+ "ksx-backend",
+ "ksx-capture",
+ "ksx-config",
+ "ksx-core",
+ "ksx-legacy-import",
+ "ksx-platform",
+ "winresource",
+]
+
+[[package]]
+name = "ksx-backend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
  "crossbeam-channel",
  "hdrhistogram",
  "insta",
@@ -1658,7 +1672,6 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "windows-sys 0.60.2",
- "winresource",
 ]
 
 [[package]]

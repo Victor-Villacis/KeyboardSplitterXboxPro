@@ -740,7 +740,7 @@ impl eframe::App for App {
 }
 
 /// The subscription and the worker's `Sender` go here, and with them the
-/// pipeline's cost (`ksx-app`'s `crate::feed`). Logged because "did the closed
+/// pipeline's cost (`ksx-backend`'s `crate::feed`). Logged because "did the closed
 /// window actually stop paying" is otherwise only answerable by inspection.
 impl Drop for App {
     fn drop(&mut self) {

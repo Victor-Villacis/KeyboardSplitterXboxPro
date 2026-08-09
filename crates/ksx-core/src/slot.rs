@@ -47,7 +47,7 @@ pub const MAX_XINPUT_SLOTS: u8 = 4;
 pub struct InvalidSlotNumber(pub u8);
 
 /// Desired configuration of one slot — pure data. The runtime slot (pad
-/// handle, XInput user index, live invalidation) is orchestrated in ksx-app.
+/// handle, XInput user index, live invalidation) is orchestrated in ksx-backend.
 ///
 /// Slot number ≠ XInput user index: the user index is discovered from ViGEm's
 /// notification callback after plug-in, never derived from this number.

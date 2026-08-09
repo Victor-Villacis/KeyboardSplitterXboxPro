@@ -39,7 +39,7 @@
 //! - `down` (bool): true = press, false = release.
 //!
 //! The field *set* is stable; field order within a line is not guaranteed.
-//! Serialization lives here in ksx-app (the capture crate stays serde-free).
+//! Serialization lives here in ksx-backend (the capture crate stays serde-free).
 //!
 //! Exit codes: 0 = clean stop (Ctrl+C or `--for-secs` elapsed), 1 = error,
 //! [`crate::devices::EXIT_DRIVER_MISSING`] (2) = Interception unavailable.

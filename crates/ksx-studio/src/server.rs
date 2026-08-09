@@ -1017,7 +1017,7 @@ async fn map_form_bind(
             key: key.clone(),
             force,
             // A binding-only edit is hot-swapped into a running session — the
-            // pads stay plugged in (ksx-app `apply_bindings`).
+            // pads stay plugged in (ksx-backend `apply_bindings`).
             reload: true,
         };
         bind_flash(&function, key.as_deref(), control.bind(&request))
@@ -1719,7 +1719,7 @@ async fn start_form_save(State(state): State<Arc<AppState>>) -> Response {
 /// and not a flag on it: a combined button would make the two indistinguishable
 /// at the moment a user is deciding whether to commit to anything at all. The
 /// plan is built in the daemon from the staged value with no file read
-/// (`ksx-app`'s `stage::plan`), so a session that starts here means exactly
+/// (`ksx-backend`'s `stage::plan`), so a session that starts here means exactly
 /// what the screen showed.
 async fn start_form_play(State(state): State<Arc<AppState>>) -> Response {
     let outcome = tokio::task::spawn_blocking(move || {
@@ -1983,7 +1983,7 @@ async fn setup_form_slot(
 /// **The canonical formatters, not a second reconstruction.**
 /// [`ksx_api::SlotOutcome::headline`] is the designated one-line renderer and
 /// is what the cabinet (`ksx-cabinet/src/app.rs`) and the daemon
-/// (`ksx-app/src/daemon/pipe.rs`) print; `refusal()` is the matching one for
+/// (`ksx-backend/src/daemon/pipe.rs`) print; `refusal()` is the matching one for
 /// the error arm, and it carries the CODE and the remedy that a hand-built
 /// `unwrap_or` throws away.
 ///

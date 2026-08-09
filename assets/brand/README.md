@@ -94,7 +94,7 @@ length).
 | surface | wiring |
 |---|---|
 | `ksx.exe` icon + version tab | `crates/ksx-app/build.rs` (winresource → `rc.exe`) |
-| tray notification icon | `crates/ksx-app/src/daemon/tray.rs::load_tray_icon` |
+| tray notification icon | `crates/ksx-backend/src/daemon/tray.rs::load_tray_icon` |
 | Studio favicon / SVG icon / apple-touch | `crates/ksx-studio/src/render.rs` (`BrandAssets`, `ICON_LINKS`) + `server.rs` root routes |
 | egui cabinet window | `crates/ksx-cabinet/src/lib.rs::launch` |
 | installer + uninstaller | `packaging/ksx.iss` |

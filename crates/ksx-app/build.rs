@@ -19,8 +19,8 @@
 //!
 //! - Explorer shows the icon group with the **numerically lowest** id, so 1
 //!   is what makes this the file's face;
-//! - `daemon::tray` loads that same id out of its own module
-//!   (`daemon/tray.rs`, `ICON_RESOURCE_ID`). The two constants are the
+//! - `ksx_backend::daemon::tray` loads that same id out of its own module
+//!   (`ksx-backend/src/daemon/tray.rs`, `ICON_RESOURCE_ID`). The two are the
 //!   handshake; they are documented in terms of each other on both sides.
 //!
 //! # VERSIONINFO

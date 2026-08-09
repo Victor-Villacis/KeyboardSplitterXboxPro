@@ -394,7 +394,7 @@ impl KeyInjector for RecordingInjector {
 /// A [`KeyInjector`] that accepts every stroke and does nothing with it.
 ///
 /// This is not a test double. It is what the **daemon's** claimed panel is
-/// built with (`ksx_app::daemon::panel`): the daemon holds one claim for its
+/// built with (`ksx_backend::daemon::panel`): the daemon holds one claim for its
 /// whole lifetime and one [`Typethrough`] behind it, and that `Typethrough` is
 /// the single injector for the panel. Handing the capture backend a real
 /// injector as well would give the panel two independent held-key sets, and a

@@ -22,93 +22,48 @@ path = "src/main.rs"
 winresource = "0.1"
 
 [dependencies]
+# The backend — every verb's typed spec, pure plan and I/O. This crate is the
+# CLI and nothing else: `main.rs` parses arguments and dispatches into
+# ksx-backend, which is what makes docs/SURFACES.md §1 ("the backend owns
+# state; every surface is a view") a crate boundary rather than an honour
+# system. The `studio` and `cabinet` features below forward to it.
+#
+# THIS LIST IS SHORT ON PURPOSE. It was fourteen crates deep — capture, output,
+# platform, games, api, the two UIs, tokio-adjacent everything — because the
+# verbs lived here. They do not any more, and a dependency added back here is
+# the first sign that logic is leaking into the argument parser. What is left
+# is what a clap definition genuinely needs.
+ksx-backend.workspace = true
+# `MAX_SLOTS` and `MAX_XINPUT_SLOTS`, for the slot flags' ranges and their help
+# text, and `Persona` for `--persona`'s value parser. A clap range frozen at a
+# literal IS the effective ceiling no matter what the constant says — that is
+# the bug `slot_arg` exists for.
 ksx-core.workspace = true
+# `Backend` and `JsonStyle` for two value parsers, and `ConfigRoot::discover`
+# for the log sink's root.
 ksx-config.workspace = true
-# The typed control API (docs/M9-DECISION.md §6): the daemon READS the control
-# protocol through the same types Studio, `ksx session` and any future shell
-# WRITE it with, so the two descriptions of a message cannot drift. Not
-# optional and not web-adjacent — ksx-api links serde and ksx-config, nothing
-# that can open a socket, so E7 rule A (no tokio/axum/forma in the default
-# build) is unaffected.
-ksx-api.workspace = true
-ksx-legacy-import.workspace = true
-ksx-capture.workspace = true
-ksx-output.workspace = true
+# `autostart::TaskMode`, the target of `--mode`'s `From` impl.
 ksx-platform.workspace = true
-ksx-games.workspace = true
-# E7 rule: the web supplement is compile-time optional. The DEFAULT build
-# links no axum, no tokio, no forma — provable with
-# `cargo tree -p ksx-app | grep -ciE "axum|tokio|forma"` == 0.
-ksx-studio = { workspace = true, optional = true }
-# E7 rule again, for the second UI: the 10-foot cabinet surface links egui and
-# eframe, and the DEFAULT build links neither it nor Studio — provable with
-# `cargo tree -p ksx-app`, both ways.
-ksx-cabinet = { workspace = true, optional = true }
 anyhow.workspace = true
-# `capture::SetupError` is matched on for a stable --json error code, so it is a
-# typed enum rather than an anyhow::Error.
-thiserror.workspace = true
 clap.workspace = true
-crossbeam-channel.workspace = true
-# The live fan-out sink's subscriber list (`crate::feed`): the publisher reads
-# an arc-swapped snapshot instead of taking a lock, which is the same shape —
-# and the same reason — as ksx-capture's hot decision table.
-arc-swap.workspace = true
-# Capture→submit latency histogram for `ksx run` (p50/p99/max). A permanent
-# debug feature per docs/ARCHITECTURE.md rule 5, not a one-off measurement.
-hdrhistogram.workspace = true
-serde_json.workspace = true
-# mapping.rs::restore parses `<preset>.toml.session-bak` files (the mapper's
-# "undo this session" safety net) before rewriting through the store.
-toml.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-tracing-appender.workspace = true
-
-# SetConsoleCtrlHandler for `ksx pads`/`ksx run` (no ctrlc crate — one API, one
-# AtomicBool), QPC for the latency clock, Beep for the escape-toggle audio cue.
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = [
-    "Win32_Foundation",
-    # timeBeginPeriod/timeEndPeriod: the engine thread raises the system timer
-    # resolution to 1 ms only WHILE a macro is playing back (a 33 ms step on a
-    # ~15.6 ms default timer is mushy), and restores it the moment the last
-    # deadline clears. See supervisor::TimerResolution.
-    "Win32_Media",
-    # FreeConsole/SetStdHandle + CreateFileW("NUL"): `ksx daemon` releases its
-    # console once the tray icon exists, and points the standard handles at the
-    # null device so later writes are a silent no-op instead of an I/O error.
-    "Win32_Storage_FileSystem",
-    "Win32_System_Console",
-    "Win32_System_Diagnostics_Debug",
-    "Win32_System_Performance",
-    # The daemon's control channel: CreateNamedPipeW/ConnectNamedPipe for the
-    # \\.\pipe\ksx-daemon server (plain threads, no async runtime — E7 rule A).
-    # Security/IO carry the SECURITY_ATTRIBUTES/OVERLAPPED types those
-    # signatures reference; both are passed as null.
-    "Win32_Security",
-    "Win32_System_IO",
-    "Win32_System_Pipes",
-    # The tray (`daemon/tray.rs`). These three were reaching this crate
-    # TRANSITIVELY — Shell and WindowsAndMessaging from ksx-platform and
-    # ksx-capture, LibraryLoader from ksx-capture — which meant a window
-    # class, a notification icon and a message pump compiled here only for as
-    # long as some other crate happened to want the same modules. windows-sys
-    # features are additive, so declaring what this crate's own `use` lines
-    # name costs nothing and removes the coupling.
-    "Win32_System_LibraryLoader",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-] }
 
 [features]
 # `ksx studio` — the optional localhost web status page (docs/ENHANCEMENTS.md E7).
-studio = ["dep:ksx-studio"]
+# A pure forward: the verb body is `ksx-backend`'s and this crate names neither
+# ksx-studio nor axum. One opt-in, spelled at the layer that ships it — which is
+# also why CI runs its four-combination matrix against BOTH crates.
+studio = ["ksx-backend/studio"]
 # `ksx cabinet` + the daemon's in-process window (docs/M9-DECISION.md, the
 # cabinet/Studio split). Independent of `studio`: a cabinet with no browser
 # builds this and not that.
-cabinet = ["dep:ksx-cabinet"]
+cabinet = ["ksx-backend/cabinet"]
 
 [dev-dependencies]
-insta.workspace = true
+# The five integration tests are about the BINARY, not about a verb, so their
+# dependencies are the ones needed to inspect it: `installer.rs` reads the
+# packaged version through ksx-platform, `no_interception_dll.rs` parses the
+# built exe's import table, `parity.rs` walks its clap tree, and `replay.rs`
+# drives ksx-core from a recorded session with no ksx-app code in it at all.
+ksx-capture.workspace = true
+ksx-legacy-import.workspace = true
 
