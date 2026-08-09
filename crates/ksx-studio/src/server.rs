@@ -245,7 +245,10 @@ pub fn serve(
             .route("/profiles", get(profiles_page))
             .route("/api/profiles", get(api_profiles))
             .route("/profiles/new", post(profiles_form_new))
+            .route("/profiles/update", post(profiles_form_update))
+            .route("/profiles/delete", post(profiles_form_delete))
             .route("/profiles/switch", post(profiles_form_switch))
+            .route("/profiles/stop", post(profiles_form_stop))
             .route("/profiles/preset/new", post(profiles_form_preset_new))
             // ── /setup — the CONFIG FIRST, and the first run ───────────────
             // Two verbs a person sees (Export, Import) and three steps, each
@@ -309,6 +312,10 @@ pub fn serve(
             .route("/api/start", get(api_start))
             .route("/start/device", post(start_form_device))
             .route("/start/controller", post(start_form_controller))
+            .route(
+                "/start/controller/persona",
+                post(start_form_controller_persona),
+            )
             // Moment 6 IN THE STAGE: dress a staged controller in one of
             // ksx's in-box layouts. One `stage-edit`, so it reaches nothing
             // outside the daemon's memory — the bindings a first-run user
@@ -453,25 +460,63 @@ async fn collect_map(
     state: &Arc<AppState>,
     selected: Option<u8>,
     macro_selected: Option<String>,
+    target: &'static str,
 ) -> MapPayload {
     let map_state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
-        let mapper = map_state.source.mapper();
         let session = map_state.control.session();
         let learn = map_state.control.learn_poll();
+        let staged = (target == "stage").then(|| map_state.control.staged());
+        let mapper = staged.as_ref().map_or_else(
+            || map_state.source.mapper(),
+            ksx_api::staged_mapper_snapshot,
+        );
+        if target == "stage"
+            && selected.is_some_and(|number| !mapper.slots.iter().any(|slot| slot.number == number))
+        {
+            let number = selected.unwrap_or(0);
+            let reason = format!(
+                "staged controller {number} no longer exists — return to Setup and choose a controller"
+            );
+            return MapPayload {
+                target: target.to_owned(),
+                mapper: crate::snapshot::MapperSnapshot::unavailable(&reason),
+                session,
+                learn,
+                selected: number,
+                macros: crate::snapshot::MacroSnapshot::unavailable(&reason),
+                macro_selected: macro_selected.unwrap_or_default(),
+            };
+        }
         let selected = selected
             .filter(|n| mapper.slots.iter().any(|s| s.number == *n))
             .or_else(|| mapper.slots.first().map(|s| s.number))
             .unwrap_or(0);
         // v11: the macro editor reads ONE preset — the selected slot's, since
         // that is the pad whose controls are the grid's columns.
-        let macros = match mapper.slots.iter().find(|s| s.number == selected) {
-            Some(slot) => map_state.source.macros(&slot.preset),
-            None => crate::snapshot::MacroSnapshot::unavailable(
-                "no slot is selected, so there is no preset to read macros from",
-            ),
+        let macros = if let Some(staged) = staged.as_ref() {
+            staged
+                .slots
+                .iter()
+                .find(|slot| slot.number == selected)
+                .map_or_else(
+                    || {
+                        crate::snapshot::MacroSnapshot::unavailable(
+                            "no staged controller is selected, so there are no controls to edit",
+                        )
+                    },
+                    ksx_api::staged_macro_snapshot,
+                )
+        } else {
+            match mapper.slots.iter().find(|s| s.number == selected) {
+                Some(slot) => map_state.source.macros(&slot.preset),
+                None => crate::snapshot::MacroSnapshot::unavailable(
+                    "no slot is selected, so there is no preset to read macros from",
+                ),
+            }
         };
         MapPayload {
+            target: target.to_owned(),
             mapper,
             session,
             learn,
@@ -482,6 +527,7 @@ async fn collect_map(
     })
     .await
     .unwrap_or_else(|_| MapPayload {
+        target: target.to_owned(),
         mapper: crate::snapshot::MapperSnapshot::unavailable("mapper collection panicked"),
         session: SessionView::unreachable("mapper collection panicked"),
         learn: crate::control::LearnView::unavailable("mapper collection panicked"),
@@ -494,6 +540,10 @@ async fn collect_map(
 #[derive(Deserialize)]
 struct MapQuery {
     slot: Option<u8>,
+    /// `stage` aims the existing mapper at first-run's in-memory setup. Every
+    /// other spelling is deliberately the saved mapper; URLs cannot invent a
+    /// third write destination.
+    target: Option<String>,
     /// v11: which `[macros.<name>]` table the macro editor paints. The tabs
     /// are anchors, so this is how a page with no JavaScript walks a preset's
     /// macros — exactly like `slot=` walks its slots.
@@ -504,10 +554,32 @@ struct MapQuery {
     flash: Option<String>,
 }
 
+fn map_target(value: Option<&str>) -> &'static str {
+    if value == Some("stage") {
+        "stage"
+    } else {
+        "saved"
+    }
+}
+
 async fn map_page(State(state): State<Arc<AppState>>, Query(query): Query<MapQuery>) -> Response {
-    let payload = collect_map(&state, query.slot, query.macro_name.clone()).await;
-    let flash = query.flash.as_deref().filter(|f| !f.trim().is_empty());
-    let out = render_map(&state.map_page, &payload, flash);
+    let target = map_target(query.target.as_deref());
+    let payload = collect_map(&state, query.slot, query.macro_name.clone(), target).await;
+    let flash = query
+        .flash
+        .as_deref()
+        .filter(|f| !f.trim().is_empty())
+        .map(|flash| {
+            consumer_map_detail(
+                flash,
+                if flash.starts_with("error") {
+                    "error: That change could not be completed. Nothing changed."
+                } else {
+                    "The change was completed."
+                },
+            )
+        });
+    let out = render_map(&state.map_page, &payload, flash.as_deref());
     (
         [
             (
@@ -529,7 +601,8 @@ async fn map_page(State(state): State<Arc<AppState>>, Query(query): Query<MapQue
 /// The mapper poller's endpoint — the same [`MapPayload`] shape the /map page
 /// embeds as island props (parity unit-tested in render_map.rs).
 async fn api_map(State(state): State<Arc<AppState>>, Query(query): Query<MapQuery>) -> Response {
-    let payload = collect_map(&state, query.slot, query.macro_name.clone()).await;
+    let target = map_target(query.target.as_deref());
+    let payload = collect_map(&state, query.slot, query.macro_name.clone(), target).await;
     (
         [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
         axum::Json(payload),
@@ -570,11 +643,147 @@ async fn api_learn_cancel(State(state): State<Arc<AppState>>) -> Response {
     control_json(state, |control| control.learn_cancel()).await
 }
 
+struct TargetBind<'a> {
+    target: Option<&'a str>,
+    slot: Option<u8>,
+    preset: &'a str,
+    function: &'a str,
+    keys: &'a [String],
+    force: bool,
+    reload: bool,
+    turbo_hz: Option<u32>,
+}
+
+/// Presentation boundary for Controls. Backend diagnostics remain available
+/// to logs and typed codes; the primary workflow never reflects command lines,
+/// storage addresses, or internal nouns into a flash/toast.
+fn consumer_map_detail(raw: &str, fallback: &str) -> String {
+    // Provider text is diagnostic input, not customer copy. The Map surface
+    // gets structured conflicts/chords through their typed fields and uses an
+    // action-specific authored fallback for every scalar outcome. An
+    // allow-by-absence blacklist would inevitably leak a novel HID address,
+    // registry key, parser detail or storage path.
+    let _ = raw;
+    fallback.to_owned()
+}
+
+fn consumerize_bind(mut outcome: BindOutcome) -> BindOutcome {
+    if !outcome.ok {
+        outcome.error = Some(consumer_map_detail(
+            outcome.error.as_deref().unwrap_or(""),
+            "That control could not be changed. Nothing changed.",
+        ));
+    }
+    outcome
+}
+
+fn consumerize_macro(mut outcome: crate::control::MacroOutcome) -> crate::control::MacroOutcome {
+    if !outcome.ok {
+        outcome.error = Some(consumer_map_detail(
+            outcome.error.as_deref().unwrap_or(""),
+            "The macro could not be changed. Nothing changed.",
+        ));
+    }
+    outcome.problems = outcome
+        .problems
+        .into_iter()
+        .map(|problem| consumer_map_detail(&problem, "One step or setting is not valid."))
+        .collect();
+    outcome.warnings = outcome
+        .warnings
+        .into_iter()
+        .map(|warning| {
+            consumer_map_detail(&warning, "One very short step may be missed by the game.")
+        })
+        .collect();
+    outcome
+}
+
+fn bind_for_target(control: &dyn ControlSource, bind: TargetBind<'_>) -> BindOutcome {
+    if map_target(bind.target) != "stage" {
+        return control.bind_keys(
+            bind.preset,
+            bind.function,
+            bind.keys,
+            bind.force,
+            bind.reload,
+            bind.turbo_hz,
+        );
+    }
+
+    let Some(number) = bind.slot else {
+        return BindOutcome {
+            ok: false,
+            error: Some("a staged binding write needs an exact controller slot".to_owned()),
+            code: Some(ksx_api::codes::BAD_SLOT.to_owned()),
+            ..BindOutcome::default()
+        };
+    };
+    control.stage_bind(&ksx_api::StagedBindRequest {
+        number,
+        preset: bind.preset.to_owned(),
+        function: bind.function.to_owned(),
+        keys: bind.keys.to_vec(),
+        force: bind.force,
+        turbo_hz: bind.turbo_hz,
+    })
+}
+
+fn macro_for_target(
+    control: &dyn ControlSource,
+    target: Option<&str>,
+    slot: Option<u8>,
+    write: &crate::control::MacroWrite,
+) -> crate::control::MacroOutcome {
+    if map_target(target) != "stage" {
+        return control.save_macro(write);
+    }
+
+    let Some(number) = slot else {
+        return crate::control::MacroOutcome {
+            ok: false,
+            error: Some("a staged macro write needs an exact controller slot".to_owned()),
+            code: Some(ksx_api::codes::BAD_SLOT.to_owned()),
+            ..crate::control::MacroOutcome::default()
+        };
+    };
+    control.stage_macro(&ksx_api::StagedMacroRequest {
+        number,
+        write: write.clone(),
+    })
+}
+
+#[derive(Deserialize)]
+struct TargetedBindRequest {
+    #[serde(flatten)]
+    request: BindRequest,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    slot: Option<u8>,
+}
+
 async fn api_bind(
     State(state): State<Arc<AppState>>,
-    axum::Json(request): axum::Json<BindRequest>,
+    axum::Json(request): axum::Json<TargetedBindRequest>,
 ) -> Response {
-    control_json(state, move |control| control.bind(&request)).await
+    control_json(state, move |control| {
+        let keys = request.request.key.iter().cloned().collect::<Vec<_>>();
+        consumerize_bind(bind_for_target(
+            control,
+            TargetBind {
+                target: request.target.as_deref(),
+                slot: request.slot,
+                preset: &request.request.preset,
+                function: &request.request.function,
+                keys: &keys,
+                force: request.request.force,
+                reload: request.request.reload,
+                turbo_hz: None,
+            },
+        ))
+    })
+    .await
 }
 
 /// POST /api/bind/keys — the JSON twin of `/map/add` + `/map/key/remove`.
@@ -599,6 +808,10 @@ struct BindKeysRequest {
     /// off — `0` clears it, `n` sets it.
     #[serde(default)]
     turbo_hz: Option<u32>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    slot: Option<u8>,
 }
 
 async fn api_bind_keys(
@@ -606,14 +819,19 @@ async fn api_bind_keys(
     axum::Json(request): axum::Json<BindKeysRequest>,
 ) -> Response {
     control_json(state, move |control| {
-        control.bind_keys(
-            &request.preset,
-            &request.function,
-            &request.keys,
-            request.force,
-            request.reload,
-            request.turbo_hz,
-        )
+        consumerize_bind(bind_for_target(
+            control,
+            TargetBind {
+                target: request.target.as_deref(),
+                slot: request.slot,
+                preset: &request.preset,
+                function: &request.function,
+                keys: &request.keys,
+                force: request.force,
+                reload: request.reload,
+                turbo_hz: request.turbo_hz,
+            },
+        ))
     })
     .await
 }
@@ -632,20 +850,40 @@ async fn api_bind_keys(
 /// mapper's existing "Restore backup from …" (`latest-backup`) undoes.
 async fn api_macro_save(
     State(state): State<Arc<AppState>>,
-    axum::Json(request): axum::Json<crate::control::MacroWrite>,
+    axum::Json(request): axum::Json<TargetedMacroWrite>,
 ) -> Response {
-    let request = crate::control::MacroWrite {
+    let write = crate::control::MacroWrite {
         reload: true,
-        ..request
+        ..request.write
     };
-    control_json(state, move |control| control.save_macro(&request)).await
+    control_json(state, move |control| {
+        consumerize_macro(macro_for_target(
+            control,
+            request.target.as_deref(),
+            request.slot,
+            &write,
+        ))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct TargetedMacroWrite {
+    #[serde(flatten)]
+    write: crate::control::MacroWrite,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    slot: Option<u8>,
 }
 
 #[derive(Deserialize)]
 struct RestoreRequest {
     preset: String,
-    /// One of [`crate::control::RESTORE_MODES`] — validated here so a typo is
-    /// a 200-with-error the page can flash, not a daemon round-trip.
+    #[serde(default)]
+    target: Option<String>,
+    /// Parsed as a typed [`crate::control::RestoreMode`] here so a typo is a
+    /// 200-with-error the page can flash, not a daemon round-trip.
     mode: String,
 }
 
@@ -658,24 +896,39 @@ async fn api_preset_restore(
     State(state): State<Arc<AppState>>,
     axum::Json(request): axum::Json<RestoreRequest>,
 ) -> Response {
+    if map_target(request.target.as_deref()) == "stage" {
+        return (
+            [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "error": "This unsaved setup has no recovery copy yet. Save it first, or keep editing it in memory."
+            })),
+        )
+            .into_response();
+    }
     let Some(mode) = crate::control::RestoreMode::parse(&request.mode) else {
         return (
             [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
             axum::Json(serde_json::json!({
                 "ok": false,
-                "error": format!(
-                    "unknown restore mode \"{}\" ({})",
-                    request.mode,
-                    crate::control::RESTORE_MODES.join(" | ")
-                ),
+                "error": "Choose one of the recovery options shown on the page.",
             })),
         )
             .into_response();
     };
     control_json(state, move |control| {
         match control.restore(&request.preset, mode) {
-            Ok(message) => serde_json::json!({ "ok": true, "message": message }),
-            Err(refusal) => serde_json::json!({ "ok": false, "error": refusal.message }),
+            Ok(message) => serde_json::json!({
+                "ok": true,
+                "message": consumer_map_detail(&message, "Your controller layout was restored.")
+            }),
+            Err(refusal) => serde_json::json!({
+                "ok": false,
+                "error": consumer_map_detail(
+                    &refusal.message,
+                    "That recovery copy could not be applied. Nothing changed."
+                )
+            }),
         }
     })
     .await
@@ -684,6 +937,8 @@ async fn api_preset_restore(
 #[derive(Deserialize)]
 struct PresetRequest {
     preset: String,
+    #[serde(default)]
+    target: Option<String>,
 }
 
 /// POST /api/preset/clear-all — unbind every function of one preset. One pipe
@@ -693,10 +948,32 @@ async fn api_preset_clear_all(
     State(state): State<Arc<AppState>>,
     axum::Json(request): axum::Json<PresetRequest>,
 ) -> Response {
+    if map_target(request.target.as_deref()) == "stage" {
+        return (
+            [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "error": "Clear all is available after this setup is saved."
+            })),
+        )
+            .into_response();
+    }
     control_json(state, move |control| {
         match control.clear_all(&request.preset) {
-            Ok(message) => serde_json::json!({ "ok": true, "message": message }),
-            Err(refusal) => serde_json::json!({ "ok": false, "error": refusal.message }),
+            Ok(message) => serde_json::json!({
+                "ok": true,
+                "message": consumer_map_detail(
+                    &message,
+                    "All controls were cleared. Use Undo this session to recover them."
+                )
+            }),
+            Err(refusal) => serde_json::json!({
+                "ok": false,
+                "error": consumer_map_detail(
+                    &refusal.message,
+                    "The controller layout could not be cleared. Nothing changed."
+                )
+            }),
         }
     })
     .await
@@ -711,8 +988,17 @@ struct SessionRequest {
 /// POST /api/session/stop — "Pause emulation & map".
 async fn api_session_stop(State(state): State<Arc<AppState>>) -> Response {
     control_json(state, |control| match control.stop() {
-        Ok(message) => serde_json::json!({ "ok": true, "message": message }),
-        Err(refusal) => serde_json::json!({ "ok": false, "error": refusal.message }),
+        Ok(message) => serde_json::json!({
+            "ok": true,
+            "message": consumer_map_detail(&message, "Play is paused. You can edit controls now.")
+        }),
+        Err(refusal) => serde_json::json!({
+            "ok": false,
+            "error": consumer_map_detail(
+                &refusal.message,
+                "Play could not be paused. Nothing changed."
+            )
+        }),
     })
     .await
 }
@@ -731,8 +1017,17 @@ async fn api_session_start(
         .map(str::to_owned);
     control_json(state, move |control| {
         match control.start(profile.as_deref()) {
-            Ok(message) => serde_json::json!({ "ok": true, "message": message }),
-            Err(refusal) => serde_json::json!({ "ok": false, "error": refusal.message }),
+            Ok(message) => serde_json::json!({
+                "ok": true,
+                "message": consumer_map_detail(&message, "Play resumed.")
+            }),
+            Err(refusal) => serde_json::json!({
+                "ok": false,
+                "error": consumer_map_detail(
+                    &refusal.message,
+                    "Play could not resume. Open Home and press Play when you are ready."
+                )
+            }),
         }
     })
     .await
@@ -753,11 +1048,15 @@ async fn api_session_start(
 #[derive(Deserialize)]
 struct MapSlotForm {
     slot: Option<u8>,
+    #[serde(default)]
+    target: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct MapBindForm {
     slot: Option<u8>,
+    #[serde(default)]
+    target: Option<String>,
     function: String,
     /// The `<select name="key">` value. The empty placeholder means "nothing
     /// picked" — an honest refusal, never a silent clear (that is what the
@@ -778,17 +1077,28 @@ struct MapBindForm {
 #[derive(Deserialize)]
 struct MapRestoreForm {
     slot: Option<u8>,
+    #[serde(default)]
+    target: Option<String>,
     mode: String,
 }
 
 /// 303 back to the mapper, carrying the outcome as the flash. Errors are
 /// flashed exactly like successes — the no-JS page must never fail silently.
-fn map_redirect(slot: u8, outcome: Result<String, String>) -> Response {
+fn map_redirect(target: Option<&str>, slot: u8, outcome: Result<String, String>) -> Response {
     let flash = match outcome {
         Ok(message) => message,
         Err(error) => format!("error: {error}"),
     };
-    Redirect::to(&format!("/map?slot={slot}&flash={}", urlencode(&flash))).into_response()
+    let target = if map_target(target) == "stage" {
+        "target=stage&"
+    } else {
+        ""
+    };
+    Redirect::to(&format!(
+        "/map?{target}slot={slot}&flash={}",
+        urlencode(&flash)
+    ))
+    .into_response()
 }
 
 /// Run one slot-scoped verb for the slot a form named. Blocking work (a
@@ -799,33 +1109,69 @@ fn map_redirect(slot: u8, outcome: Result<String, String>) -> Response {
 /// same config read that resolves the preset already carries the bindings the
 /// edit has to be computed against, so nothing reads the file twice and no
 /// form has to be trusted with a key list it made up.
-async fn map_act_slot<F>(state: Arc<AppState>, slot: Option<u8>, verb: F) -> Response
+async fn map_act_slot<F>(
+    state: Arc<AppState>,
+    target: Option<String>,
+    slot: Option<u8>,
+    verb: F,
+) -> Response
 where
     F: FnOnce(&dyn ControlSource, &crate::snapshot::MapperSlot) -> Result<String, String>
         + Send
         + 'static,
 {
+    let redirect_target = target.clone();
     let (number, outcome) = tokio::task::spawn_blocking(move || {
-        let mapper = state.source.mapper();
-        let chosen = slot
-            .and_then(|n| mapper.slots.iter().find(|s| s.number == n))
-            .or_else(|| mapper.slots.first());
+        let mapper = if map_target(target.as_deref()) == "stage" {
+            ksx_api::staged_mapper_snapshot(&state.control.staged())
+        } else {
+            state.source.mapper()
+        };
+        let staged = map_target(target.as_deref()) == "stage";
+        let chosen = if staged {
+            slot.and_then(|n| mapper.slots.iter().find(|s| s.number == n))
+        } else {
+            slot.and_then(|n| mapper.slots.iter().find(|s| s.number == n))
+                .or_else(|| mapper.slots.first())
+        };
         match chosen {
             Some(slot) => (slot.number, verb(state.control.as_ref(), slot)),
-            None => (0, Err(format!("nothing to map — {}", mapper.source))),
+            None if staged => {
+                let number = slot.unwrap_or(0);
+                let reason = if slot.is_some() {
+                    format!("Player {number} is no longer in this unsaved setup. Nothing changed.")
+                } else {
+                    "Choose a player before changing controls. Nothing changed.".to_owned()
+                };
+                (number, Err(reason))
+            }
+            None => (
+                0,
+                Err(if mapper.generated_at == "(unavailable)" {
+                    mapper.source
+                } else {
+                    "No controller is ready to edit. Add one in Setup, then return to Controls."
+                        .to_owned()
+                }),
+            ),
         }
     })
     .await
     .unwrap_or_else(|_| (0, Err("the control call panicked".to_owned())));
-    map_redirect(number, outcome)
+    map_redirect(redirect_target.as_deref(), number, outcome)
 }
 
 /// [`map_act_slot`] for the verbs that need nothing but the preset name.
-async fn map_act<F>(state: Arc<AppState>, slot: Option<u8>, verb: F) -> Response
+async fn map_act<F>(
+    state: Arc<AppState>,
+    target: Option<String>,
+    slot: Option<u8>,
+    verb: F,
+) -> Response
 where
     F: FnOnce(&dyn ControlSource, &str) -> Result<String, String> + Send + 'static,
 {
-    map_act_slot(state, slot, move |control, slot| {
+    map_act_slot(state, target, slot, move |control, slot| {
         verb(control, &slot.preset)
     })
     .await
@@ -864,19 +1210,31 @@ fn bind_refusal(function: &str, key: Option<&str>, outcome: BindOutcome) -> Stri
         let who: Vec<String> = outcome
             .conflicts
             .iter()
-            .map(|c| c.describe(named))
+            .map(|conflict| {
+                let control = conflict.function.strip_prefix("macro.").map_or_else(
+                    || conflict.function.clone(),
+                    |name| format!("the \"{name}\" macro"),
+                );
+                match conflict.slot {
+                    Some(player) => {
+                        format!("{named} already controls {control} for Player {player}")
+                    }
+                    None => format!("{named} already controls {control} for another player"),
+                }
+            })
             .collect();
         return format!(
-            "{function} was not changed: {} — tick \"let this key drive another slot's \
+            "{function} was not changed: {} — tick \"let this key drive another player's \
              control too\" in the Bind by name panel and submit again",
             who.join("; ")
         );
     }
     format!(
         "{function} was not changed: {}",
-        outcome
-            .error
-            .unwrap_or_else(|| "the daemon refused the write".to_owned())
+        consumer_map_detail(
+            outcome.error.as_deref().unwrap_or(""),
+            "That control could not be changed. Nothing changed."
+        )
     )
 }
 
@@ -935,11 +1293,15 @@ async fn map_form_add(
 ) -> Response {
     let function = form.function.trim().to_owned();
     let force = form.force.is_some();
+    let target = form.target.clone();
     let key = match picked_key(&form, &function, "Add") {
         Ok(key) => key,
-        Err(refusal) => return map_redirect(form.slot.unwrap_or(0), Err(refusal)),
+        Err(refusal) => {
+            return map_redirect(target.as_deref(), form.slot.unwrap_or(0), Err(refusal))
+        }
     };
-    map_act_slot(state, form.slot, move |control, slot| {
+    let write_target = target.clone();
+    map_act_slot(state, target, form.slot, move |control, slot| {
         let current = slot.bindings.get(&function).cloned().unwrap_or_default();
         let next = crate::control::with_key(&current, &key);
         if next.len() == current.len() {
@@ -948,7 +1310,19 @@ async fn map_form_add(
                 current.join(" · ")
             ));
         }
-        let outcome = control.bind_keys(&slot.preset, &function, &next, force, true, None);
+        let outcome = bind_for_target(
+            control,
+            TargetBind {
+                target: write_target.as_deref(),
+                slot: Some(slot.number),
+                preset: &slot.preset,
+                function: &function,
+                keys: &next,
+                force,
+                reload: true,
+                turbo_hz: None,
+            },
+        );
         keys_flash(&function, Some(&key), &next, outcome)
     })
     .await
@@ -962,11 +1336,15 @@ async fn map_form_remove_key(
     Form(form): Form<MapBindForm>,
 ) -> Response {
     let function = form.function.trim().to_owned();
+    let target = form.target.clone();
     let key = match picked_key(&form, &function, "Remove key") {
         Ok(key) => key,
-        Err(refusal) => return map_redirect(form.slot.unwrap_or(0), Err(refusal)),
+        Err(refusal) => {
+            return map_redirect(target.as_deref(), form.slot.unwrap_or(0), Err(refusal))
+        }
     };
-    map_act_slot(state, form.slot, move |control, slot| {
+    let write_target = target.clone();
+    map_act_slot(state, target, form.slot, move |control, slot| {
         let current = slot.bindings.get(&function).cloned().unwrap_or_default();
         let next = crate::control::without_key(&current, &key);
         if next.len() == current.len() {
@@ -979,7 +1357,19 @@ async fn map_form_remove_key(
                 }
             ));
         }
-        let outcome = control.bind_keys(&slot.preset, &function, &next, false, true, None);
+        let outcome = bind_for_target(
+            control,
+            TargetBind {
+                target: write_target.as_deref(),
+                slot: Some(slot.number),
+                preset: &slot.preset,
+                function: &function,
+                keys: &next,
+                force: false,
+                reload: true,
+                turbo_hz: None,
+            },
+        );
         // The removed key is named in the sentence, because "A is now S" on
         // its own does not say what just left.
         keys_flash(&function, Some(&key), &next, outcome)
@@ -1001,8 +1391,10 @@ async fn map_form_bind(
         .filter(|k| !k.is_empty())
         .map(str::to_owned);
     let force = form.force.is_some();
+    let target = form.target.clone();
     if key.is_none() {
         return map_redirect(
+            target.as_deref(),
             form.slot.unwrap_or(0),
             Err(format!(
                 "no key picked for {function} — choose one from the list (\"Clear\" is how \
@@ -1010,17 +1402,23 @@ async fn map_form_bind(
             )),
         );
     }
-    map_act(state, form.slot, move |control, preset| {
-        let request = BindRequest {
-            preset: preset.to_owned(),
-            function: function.clone(),
-            key: key.clone(),
-            force,
-            // A binding-only edit is hot-swapped into a running session — the
-            // pads stay plugged in (ksx-backend `apply_bindings`).
-            reload: true,
-        };
-        bind_flash(&function, key.as_deref(), control.bind(&request))
+    let write_target = target.clone();
+    map_act_slot(state, target, form.slot, move |control, slot| {
+        let keys = key.iter().cloned().collect::<Vec<_>>();
+        let outcome = bind_for_target(
+            control,
+            TargetBind {
+                target: write_target.as_deref(),
+                slot: Some(slot.number),
+                preset: &slot.preset,
+                function: &function,
+                keys: &keys,
+                force,
+                reload: true,
+                turbo_hz: None,
+            },
+        );
+        bind_flash(&function, key.as_deref(), outcome)
     })
     .await
 }
@@ -1032,15 +1430,23 @@ async fn map_form_clear(
     Form(form): Form<MapBindForm>,
 ) -> Response {
     let function = form.function.trim().to_owned();
-    map_act(state, form.slot, move |control, preset| {
-        let request = BindRequest {
-            preset: preset.to_owned(),
-            function: function.clone(),
-            key: None,
-            force: false,
-            reload: true,
-        };
-        bind_flash(&function, None, control.bind(&request))
+    let target = form.target.clone();
+    let write_target = target.clone();
+    map_act_slot(state, target, form.slot, move |control, slot| {
+        let outcome = bind_for_target(
+            control,
+            TargetBind {
+                target: write_target.as_deref(),
+                slot: Some(slot.number),
+                preset: &slot.preset,
+                function: &function,
+                keys: &[],
+                force: false,
+                reload: true,
+                turbo_hz: None,
+            },
+        );
+        bind_flash(&function, None, outcome)
     })
     .await
 }
@@ -1059,11 +1465,13 @@ async fn map_form_turbo(
     Form(form): Form<MapBindForm>,
 ) -> Response {
     let function = form.function.trim().to_owned();
+    let target = form.target.clone();
     let raw = form.turbo_hz.as_deref().map(str::trim).unwrap_or("");
     let hz = match raw.parse::<u32>() {
         Ok(hz) => hz,
         Err(_) => {
             return map_redirect(
+                target.as_deref(),
                 form.slot.unwrap_or(0),
                 Err(format!(
                     "no turbo rate given for {function} — type a number of presses a second                      into the box (0 turns auto-fire off)"
@@ -1071,21 +1479,34 @@ async fn map_form_turbo(
             )
         }
     };
-    map_act_slot(state, form.slot, move |control, slot| {
+    let write_target = target.clone();
+    map_act_slot(state, target, form.slot, move |control, slot| {
         let current = slot.bindings.get(&function).cloned().unwrap_or_default();
         if current.is_empty() && hz > 0 {
             return Err(format!(
                 "{function} has no keys, so there is nothing to auto-fire — bind a key first"
             ));
         }
-        let outcome = control.bind_keys(&slot.preset, &function, &current, false, true, Some(hz));
+        let outcome = bind_for_target(
+            control,
+            TargetBind {
+                target: write_target.as_deref(),
+                slot: Some(slot.number),
+                preset: &slot.preset,
+                function: &function,
+                keys: &current,
+                force: false,
+                reload: true,
+                turbo_hz: Some(hz),
+            },
+        );
         if !outcome.ok {
             return Err(bind_refusal(&function, None, outcome));
         }
         Ok(match (hz, outcome.turbo_effective_hz) {
             (0, _) => format!("{function} no longer auto-fires."),
             (asked, Some(effective)) if effective != asked => format!(
-                "{function} auto-fires at about {effective} Hz — {asked} Hz was asked for, but                  a press AND a release must each survive a 60 Hz poll."
+                "{function} auto-fires about {effective} times a second. The requested {asked} is too fast for reliable press-and-release input."
             ),
             (asked, _) => format!("{function} auto-fires at {asked} Hz."),
         })
@@ -1100,17 +1521,30 @@ async fn map_form_restore(
     Form(form): Form<MapRestoreForm>,
 ) -> Response {
     let mode = form.mode.trim().to_owned();
+    if map_target(form.target.as_deref()) == "stage" {
+        return map_redirect(
+            form.target.as_deref(),
+            form.slot.unwrap_or(0),
+            Err("This unsaved setup has no recovery copy yet. Save it first, or keep editing it in memory.".to_owned()),
+        );
+    }
     let Some(mode) = crate::control::RestoreMode::parse(&mode) else {
         return map_redirect(
+            form.target.as_deref(),
             form.slot.unwrap_or(0),
-            Err(format!(
-                "unknown restore mode \"{mode}\" ({})",
-                crate::control::RESTORE_MODES.join(" | ")
-            )),
+            Err("Choose one of the recovery options shown on the page.".to_owned()),
         );
     };
-    map_act(state, form.slot, move |control, preset| {
-        control.restore(preset, mode).map_err(flash_of)
+    map_act(state, form.target, form.slot, move |control, preset| {
+        control
+            .restore(preset, mode)
+            .map(|message| consumer_map_detail(&message, "Your controller layout was restored."))
+            .map_err(|refusal| {
+                consumer_map_detail(
+                    &flash_of(refusal),
+                    "That recovery copy could not be applied. Nothing changed.",
+                )
+            })
     })
     .await
 }
@@ -1120,8 +1554,28 @@ async fn map_form_clear_all(
     State(state): State<Arc<AppState>>,
     Form(form): Form<MapSlotForm>,
 ) -> Response {
-    map_act(state, form.slot, move |control, preset| {
-        control.clear_all(preset).map_err(flash_of)
+    if map_target(form.target.as_deref()) == "stage" {
+        return map_redirect(
+            form.target.as_deref(),
+            form.slot.unwrap_or(0),
+            Err("Use the individual controls while this setup is unsaved; Clear all is available after Save.".to_owned()),
+        );
+    }
+    map_act(state, form.target, form.slot, move |control, preset| {
+        control
+            .clear_all(preset)
+            .map(|message| {
+                consumer_map_detail(
+                    &message,
+                    "All controls were cleared. Use Undo this session to recover them.",
+                )
+            })
+            .map_err(|refusal| {
+                consumer_map_detail(
+                    &flash_of(refusal),
+                    "The controller layout could not be cleared. Nothing changed.",
+                )
+            })
     })
     .await
 }
@@ -1136,10 +1590,11 @@ async fn map_form_session_stop(
     Form(form): Form<MapSlotForm>,
 ) -> Response {
     let slot = form.slot.unwrap_or(0);
+    let target = form.target;
     let outcome = tokio::task::spawn_blocking(move || state.control.stop().map_err(flash_of))
         .await
         .unwrap_or_else(|_| Err("the control call panicked".to_owned()));
-    map_redirect(slot, outcome)
+    map_redirect(target.as_deref(), slot, outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -1490,11 +1945,7 @@ async fn start_page(
     Query(query): Query<PageQuery>,
 ) -> Response {
     let mut payload = collect_start(&state).await;
-    let flash = query
-        .flash
-        .as_deref()
-        .filter(|f| !f.trim().is_empty())
-        .map(str::to_owned);
+    let flash = start_flash_from_query(query.flash.as_deref());
     payload.flash = flash.clone();
     let out = render_start(&state.start_page, &payload, flash.as_deref());
     (
@@ -1559,6 +2010,12 @@ struct StartLayoutForm {
 }
 
 #[derive(Deserialize)]
+struct StartPersonaForm {
+    number: u8,
+    persona: String,
+}
+
+#[derive(Deserialize)]
 struct StartSlotForm {
     number: u8,
 }
@@ -1568,18 +2025,107 @@ struct StartBlockingForm {
     blocking: String,
 }
 
-/// 303 back to the first-run page, carrying the outcome as the flash.
-///
-/// Refusals flash exactly like successes and carry ksx-core's own sentence:
-/// this flow is four decisions deep and a click that silently did nothing is
-/// how somebody ends up pressing Play on a setup they think has two controllers
-/// in it.
-fn start_redirect(outcome: Result<String, String>) -> Response {
-    let flash = match outcome {
-        Ok(message) => message,
-        Err(error) => format!("error: {error}"),
-    };
-    Redirect::to(&format!("/start?flash={}", urlencode(&flash))).into_response()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartAction {
+    Edit,
+    Discard,
+    Save,
+    Play,
+}
+
+const START_EDIT_OK: &str = "Setup updated. Nothing has been saved or started.";
+const START_DISCARD_OK: &str = "Setup cleared. Nothing was saved or started.";
+const START_SAVE_OK: &str = "Setup saved for later. Play has not started.";
+const START_PLAY_OK: &str = "Play started. Use Stop to return the keyboard to normal.";
+const START_EDIT_ERROR: &str =
+    "error: Setup could not be updated. Reopen ksx and try again; nothing was changed.";
+const START_DISCARD_ERROR: &str =
+    "error: Setup could not be cleared. Reopen ksx and try again; nothing was changed.";
+const START_SAVE_NOT_READY: &str =
+    "error: This setup is not ready to save. Complete the highlighted steps, then try again.";
+const START_SAVE_ERROR: &str =
+    "error: Setup could not be saved. Reopen ksx and try again; nothing was changed.";
+const START_PLAY_NOT_READY: &str =
+    "error: This setup is not ready to play. Complete the highlighted steps, then try again.";
+const START_PLAY_ACTIVE: &str =
+    "error: The active game could not be replaced. Open Home, stop Play, then try again.";
+const START_PLAY_ERROR: &str =
+    "error: Play could not start. Reopen ksx and try again; nothing was saved.";
+const START_UNKNOWN_FLASH_ERROR: &str =
+    "error: Setup could not finish that request. Reopen ksx and try again.";
+
+const START_FLASH_ALLOWLIST: [&str; 12] = [
+    START_EDIT_OK,
+    START_DISCARD_OK,
+    START_SAVE_OK,
+    START_PLAY_OK,
+    START_EDIT_ERROR,
+    START_DISCARD_ERROR,
+    START_SAVE_NOT_READY,
+    START_SAVE_ERROR,
+    START_PLAY_NOT_READY,
+    START_PLAY_ACTIVE,
+    START_PLAY_ERROR,
+    START_UNKNOWN_FLASH_ERROR,
+];
+
+/// A query string is user-controlled even when our own POST produced it. Only
+/// presentation copy this module can emit is allowed back onto `/start`; a
+/// hand-written raw error becomes a generic remedy rather than customer text.
+fn start_flash_from_query(flash: Option<&str>) -> Option<String> {
+    let flash = flash?.trim();
+    if flash.is_empty() {
+        return None;
+    }
+    Some(
+        START_FLASH_ALLOWLIST
+            .into_iter()
+            .find(|safe| *safe == flash)
+            .unwrap_or(START_UNKNOWN_FLASH_ERROR)
+            .to_owned(),
+    )
+}
+
+/// Translate provider outcomes at the Studio presentation boundary. The raw
+/// sentence may contain commands, channel names, paths, or internal nouns; it
+/// is used only to select a safe, useful state and is never reflected.
+fn start_action_flash(action: StartAction, outcome: &Result<String, String>) -> &'static str {
+    match outcome {
+        Ok(_) => match action {
+            StartAction::Edit => START_EDIT_OK,
+            StartAction::Discard => START_DISCARD_OK,
+            StartAction::Save => START_SAVE_OK,
+            StartAction::Play => START_PLAY_OK,
+        },
+        Err(error) => {
+            let lower = error.to_ascii_lowercase();
+            let not_ready = lower.contains("not ready")
+                || lower.contains("split-or-freeze")
+                || lower.contains("no controls")
+                || lower.contains("no device")
+                || lower.contains("slot ");
+            match action {
+                StartAction::Edit => START_EDIT_ERROR,
+                StartAction::Discard => START_DISCARD_ERROR,
+                StartAction::Save if not_ready => START_SAVE_NOT_READY,
+                StartAction::Save => START_SAVE_ERROR,
+                StartAction::Play
+                    if lower.contains("already running")
+                        || (lower.contains("session") && lower.contains("running")) =>
+                {
+                    START_PLAY_ACTIVE
+                }
+                StartAction::Play if not_ready => START_PLAY_NOT_READY,
+                StartAction::Play => START_PLAY_ERROR,
+            }
+        }
+    }
+}
+
+/// 303 back to the first-run page with customer-facing action feedback.
+fn start_redirect(action: StartAction, outcome: Result<String, String>) -> Response {
+    let flash = start_action_flash(action, &outcome);
+    Redirect::to(&format!("/start?flash={}", urlencode(flash))).into_response()
 }
 
 /// Run one staging edit off the async workers (the pipe client blocks) and
@@ -1589,7 +2135,11 @@ fn start_redirect(outcome: Result<String, String>) -> Response {
 /// file, no driver, no session. That is `FIRST-RUN.md` §2, and it is why this
 /// helper has no confirm step, no backup and no dry run: there is nothing to
 /// undo, because there is nothing to have done.
-async fn stage_edit(state: Arc<AppState>, edit: ksx_api::StageEdit) -> Response {
+async fn stage_edit(
+    state: Arc<AppState>,
+    edit: ksx_api::StageEdit,
+    action: StartAction,
+) -> Response {
     let outcome = tokio::task::spawn_blocking(move || {
         let outcome = state.control.stage_edit(&edit);
         if outcome.ok {
@@ -1600,7 +2150,7 @@ async fn stage_edit(state: Arc<AppState>, edit: ksx_api::StageEdit) -> Response 
     })
     .await
     .unwrap_or_else(|_| Err("the staging edit panicked".to_owned()));
-    start_redirect(outcome)
+    start_redirect(action, outcome)
 }
 
 /// POST /start/device — moment 4. Replaces any earlier choice, freely.
@@ -1615,6 +2165,7 @@ async fn start_form_device(
             alias: form.alias,
             label: form.label,
         },
+        StartAction::Edit,
     )
     .await
 }
@@ -1633,6 +2184,24 @@ async fn start_form_controller(
             preset: form.preset,
             layout: form.layout,
         },
+        StartAction::Edit,
+    )
+    .await
+}
+
+/// POST /start/controller/persona — change a staged controller freely. This
+/// is still an in-memory StageEdit: no pad is replugged and no file is written.
+async fn start_form_controller_persona(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<StartPersonaForm>,
+) -> Response {
+    stage_edit(
+        state,
+        ksx_api::StageEdit::SetPersona {
+            number: form.number,
+            persona: form.persona,
+        },
+        StartAction::Edit,
     )
     .await
 }
@@ -1655,6 +2224,7 @@ async fn start_form_layout(
             layout: form.layout,
             player: None,
         },
+        StartAction::Edit,
     )
     .await
 }
@@ -1669,6 +2239,7 @@ async fn start_form_remove(
         ksx_api::StageEdit::RemoveSlot {
             number: form.number,
         },
+        StartAction::Edit,
     )
     .await
 }
@@ -1683,13 +2254,14 @@ async fn start_form_blocking(
         ksx_api::StageEdit::SetBlocking {
             blocking: form.blocking,
         },
+        StartAction::Edit,
     )
     .await
 }
 
 /// POST /start/discard — "Start over". §2 requires that it always works.
 async fn start_form_discard(State(state): State<Arc<AppState>>) -> Response {
-    stage_edit(state, ksx_api::StageEdit::Discard).await
+    stage_edit(state, ksx_api::StageEdit::Discard, StartAction::Discard).await
 }
 
 /// POST /start/save — moment 7, half one. **One config write.**
@@ -1709,7 +2281,7 @@ async fn start_form_save(State(state): State<Arc<AppState>>) -> Response {
     })
     .await
     .unwrap_or_else(|_| Err("the save panicked".to_owned()));
-    start_redirect(outcome)
+    start_redirect(StartAction::Save, outcome)
 }
 
 /// POST /start/play — moment 7, half two. **Starts a session and writes
@@ -1732,7 +2304,7 @@ async fn start_form_play(State(state): State<Arc<AppState>>) -> Response {
     })
     .await
     .unwrap_or_else(|_| Err("the staged start panicked".to_owned()));
-    start_redirect(outcome)
+    start_redirect(StartAction::Play, outcome)
 }
 
 /// 303 back to /setup with the outcome as the flash. Errors flash too — this
@@ -2231,7 +2803,10 @@ where
 {
     let outcome = tokio::task::spawn_blocking(move || verb(state.machine.as_ref()))
         .await
-        .unwrap_or_else(|_| Err("the machine call panicked".to_owned()));
+        .unwrap_or_else(|_| {
+            Err("That change could not be completed. Nothing was changed. Reopen ksx and try again."
+                .to_owned())
+        });
     pads_redirect(outcome)
 }
 
@@ -2351,30 +2926,29 @@ async fn collect_profiles(state: &Arc<AppState>) -> ProfilesPayload {
         let mut profiles_error = None;
         let mut presets_error = None;
         let profiles = match read_state.machine.profiles() {
-            Ok(view) => {
-                notes.extend(view.notes.iter().cloned());
+            Ok(mut view) => {
+                if !view.notes.is_empty() {
+                    notes.push(
+                        "Some saved-game details need attention. Reopen ksx after correcting them."
+                            .to_owned(),
+                    );
+                    view.notes = notes.clone();
+                }
                 view
             }
-            Err(refusal) => {
-                notes.push(refusal.message.clone());
-                if let Some(remedy) = &refusal.remedy {
-                    notes.push(remedy.clone());
-                }
-                // The same message+remedy join a refused ACTION flashes: this
-                // string replaces the list the user came for, so dropping the
-                // way out would leave the one card with nowhere to send them.
-                profiles_error = Some(flash_of(refusal));
+            Err(_) => {
+                let message = "Saved Games could not be read. Reopen ksx and try again.";
+                notes.push(message.to_owned());
+                profiles_error = Some(message.to_owned());
                 ksx_api::ProfilesView::default()
             }
         };
         let presets = match read_state.machine.presets() {
             Ok(view) => view,
-            Err(refusal) => {
-                notes.push(refusal.message.clone());
-                if let Some(remedy) = &refusal.remedy {
-                    notes.push(remedy.clone());
-                }
-                presets_error = Some(flash_of(refusal));
+            Err(_) => {
+                let message = "Controller layouts could not be read. Reopen ksx and try again.";
+                notes.push(message.to_owned());
+                presets_error = Some(message.to_owned());
                 ksx_api::PresetsView::default()
             }
         };
@@ -2404,10 +2978,14 @@ async fn collect_profiles(state: &Arc<AppState>) -> ProfilesPayload {
         // A panicked read is a FAILED read, not an empty machine — the same
         // distinction, arriving by a different door.
         ProfilesPayload {
-            session: SessionView::unreachable("profile collection panicked"),
-            profiles_error: Some("profile collection panicked".to_owned()),
-            presets_error: Some("profile collection panicked".to_owned()),
-            notes: vec!["profile collection panicked".to_owned()],
+            session: SessionView::unreachable("Play is temporarily unavailable."),
+            profiles_error: Some(
+                "Saved Games could not be read. Reopen ksx and try again.".to_owned(),
+            ),
+            presets_error: Some(
+                "Controller layouts could not be read. Reopen ksx and try again.".to_owned(),
+            ),
+            notes: vec!["Saved Games is temporarily unavailable.".to_owned()],
             ..ProfilesPayload::default()
         }
         .derived()
@@ -2419,7 +2997,7 @@ async fn profiles_page(
     Query(query): Query<PageQuery>,
 ) -> Response {
     let payload = collect_profiles(&state).await;
-    let flash = query.flash.as_deref().filter(|f| !f.trim().is_empty());
+    let flash = crate::render_profiles::profiles_flash_from_query(query.flash.as_deref());
     let out = crate::render_profiles::render_profiles(&state.profiles_page, &payload, flash);
     (
         [
@@ -2450,26 +3028,27 @@ async fn api_profiles(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-/// 303 back to /profiles, carrying the outcome as the flash. Errors flash
-/// exactly like successes — the no-JS page must never fail silently.
-fn profiles_redirect(outcome: Result<String, String>) -> Response {
-    let flash = match outcome {
-        Ok(message) => message,
-        Err(error) => format!("error: {error}"),
-    };
-    Redirect::to(&format!("/profiles?flash={}", urlencode(&flash))).into_response()
+/// 303 back to /profiles with copy owned by the presentation seam. Neither a
+/// provider sentence nor a form value is ever reflected into the redirect.
+fn profiles_redirect(action: crate::render_profiles::ProfilesAction, succeeded: bool) -> Response {
+    let flash = crate::render_profiles::profiles_action_flash(action, succeeded);
+    Redirect::to(&format!("/profiles?flash={}", urlencode(flash))).into_response()
 }
 
 /// Run one [`ksx_api::MachineSource`] verb off the async workers, then 303
 /// back to /profiles. The [`act`] of this page.
-async fn machine_act<F>(state: Arc<AppState>, verb: F) -> Response
+async fn machine_act<F>(
+    state: Arc<AppState>,
+    action: crate::render_profiles::ProfilesAction,
+    verb: F,
+) -> Response
 where
-    F: FnOnce(&dyn ksx_api::MachineSource) -> Result<String, String> + Send + 'static,
+    F: FnOnce(&dyn ksx_api::MachineSource) -> Result<String, ksx_api::Refusal> + Send + 'static,
 {
-    let outcome = tokio::task::spawn_blocking(move || verb(state.machine.as_ref()))
+    let succeeded = tokio::task::spawn_blocking(move || verb(state.machine.as_ref()).is_ok())
         .await
-        .unwrap_or_else(|_| Err("the machine call panicked".to_owned()));
-    profiles_redirect(outcome)
+        .unwrap_or(false);
+    profiles_redirect(action, succeeded)
 }
 
 /// Every field defaults, deliberately — including the two that are required —
@@ -2510,8 +3089,8 @@ struct NewProfileForm {
 /// One numeric form field, parsed HERE instead of by the extractor.
 ///
 /// `Ok(None)` means "the user left it blank" — the caller decides whether that
-/// is a default or a refusal. `Err` is the sentence to flash: a 303 with words
-/// on it, never a 422 the page cannot read.
+/// is a default or a refusal. `Err` selects the action's fixed refusal copy: a
+/// 303 with words on it, never a 422 the page cannot read.
 fn number_field(raw: &str, field: &str) -> Result<Option<u8>, String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -2535,21 +3114,111 @@ async fn profiles_form_new(
 ) -> Response {
     // Blank stays 0, which the planner refuses by name ("a profile hands out
     // 1..=MAX_SLOTS slots") — this layer does not pick a player count.
-    let slots = match number_field(&form.slots, "slots") {
+    let slots = match number_field(&form.slots, "players") {
         Ok(value) => value.unwrap_or(0),
-        Err(message) => return profiles_redirect(Err(message)),
+        Err(_) => {
+            return profiles_redirect(crate::render_profiles::ProfilesAction::CreateGame, false)
+        }
     };
-    machine_act(state, move |machine| {
-        machine
-            .profile_new(&ksx_api::NewProfile {
+    machine_act(
+        state,
+        crate::render_profiles::ProfilesAction::CreateGame,
+        move |machine| {
+            machine.profile_new(&ksx_api::NewProfile {
                 title: form.title,
                 path: form.path,
                 arguments: form.arguments,
                 slots,
                 preset: form.preset,
             })
-            .map_err(flash_of)
-    })
+        },
+    )
+    .await
+}
+
+/// Defaulted, string-typed form fields keep every refusal on the page instead
+/// of turning an empty number input into an extractor-level 422.
+#[derive(Deserialize)]
+struct UpdateProfileForm {
+    #[serde(default)]
+    original_title: String,
+    #[serde(default)]
+    revision: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    arguments: String,
+    #[serde(default)]
+    slots: String,
+    #[serde(default)]
+    preset: String,
+    #[serde(default)]
+    rebase_devices: bool,
+}
+
+/// POST /profiles/update — replace one exact profile while keeping its
+/// existing device assignments unless the form explicitly asks to refresh
+/// them from the current Setup controllers.
+async fn profiles_form_update(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<UpdateProfileForm>,
+) -> Response {
+    let slots = match number_field(&form.slots, "players") {
+        Ok(value) => value.unwrap_or(0),
+        Err(_) => {
+            return profiles_redirect(crate::render_profiles::ProfilesAction::UpdateGame, false)
+        }
+    };
+    machine_act(
+        state,
+        crate::render_profiles::ProfilesAction::UpdateGame,
+        move |machine| {
+            machine.profile_update(&ksx_api::UpdateProfile {
+                original_title: form.original_title,
+                revision: form.revision,
+                title: form.title,
+                path: form.path,
+                arguments: form.arguments,
+                slots,
+                preset: form.preset,
+                rebase_devices: form.rebase_devices,
+            })
+        },
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct DeleteProfileForm {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    revision: String,
+    #[serde(default)]
+    confirm_delete: String,
+}
+
+/// POST /profiles/delete — remove only the named game profile. Presets and
+/// the controller setup are independent resources and are never cascaded.
+async fn profiles_form_delete(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<DeleteProfileForm>,
+) -> Response {
+    if form.confirm_delete != "yes" {
+        return profiles_redirect(crate::render_profiles::ProfilesAction::DeleteGame, false);
+    }
+    machine_act(
+        state,
+        crate::render_profiles::ProfilesAction::DeleteGame,
+        move |machine| {
+            machine.profile_delete(&ksx_api::DeleteProfile {
+                title: form.title,
+                revision: form.revision,
+            })
+        },
+    )
     .await
 }
 
@@ -2566,33 +3235,34 @@ struct NewPresetForm {
 
 /// POST /profiles/preset/new — `ksx preset new`, through the same writer.
 ///
-/// No `force` field, deliberately: overwriting a preset is destructive and the
-/// consent shape for it is the CLI's `--force`. A web form that could clobber
-/// a 25-binding mapping because a name collided is not a form this page wants.
-/// That makes the refusal load-bearing — it is the ONLY thing standing between
-/// "that name is taken" and a user with nowhere to go — which is why
-/// [`flash_of`] carries `Refusal::remedy`, and why the Presets card no longer
-/// claims that only the built-ins are protected.
+/// No `force` field, deliberately: a web form must not overwrite a complete
+/// controller layout merely because its name collided. The action-specific
+/// refusal tells the customer to choose another name without reflecting the
+/// provider's internal message or remedy.
 async fn profiles_form_preset_new(
     State(state): State<Arc<AppState>>,
     Form(form): Form<NewPresetForm>,
 ) -> Response {
     // Blank means player 1 — every template has a first block, and the field
     // is labelled as the multi-player exception rather than a required answer.
-    let player = match number_field(&form.player, "the player block") {
+    let player = match number_field(&form.player, "the player choice") {
         Ok(value) => value.unwrap_or(1),
-        Err(message) => return profiles_redirect(Err(message)),
+        Err(_) => {
+            return profiles_redirect(crate::render_profiles::ProfilesAction::CreateLayout, false)
+        }
     };
-    machine_act(state, move |machine| {
-        machine
-            .preset_new(&ksx_api::NewPreset {
+    machine_act(
+        state,
+        crate::render_profiles::ProfilesAction::CreateLayout,
+        move |machine| {
+            machine.preset_new(&ksx_api::NewPreset {
                 name: form.name,
                 template: form.template,
                 player,
                 force: false,
             })
-            .map_err(flash_of)
-    })
+        },
+    )
     .await
 }
 
@@ -2612,12 +3282,20 @@ async fn profiles_form_switch(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(str::to_owned);
-    let outcome = tokio::task::spawn_blocking(move || {
-        state.control.start(profile.as_deref()).map_err(flash_of)
-    })
-    .await
-    .unwrap_or_else(|_| Err("the control call panicked".to_owned()));
-    profiles_redirect(outcome)
+    let succeeded =
+        tokio::task::spawn_blocking(move || state.control.start(profile.as_deref()).is_ok())
+            .await
+            .unwrap_or(false);
+    profiles_redirect(crate::render_profiles::ProfilesAction::Play, succeeded)
+}
+
+/// Stop the active Play session and return to Saved Games so a cabinet is not
+/// stranded on a read-only running state.
+async fn profiles_form_stop(State(state): State<Arc<AppState>>) -> Response {
+    let succeeded = tokio::task::spawn_blocking(move || state.control.stop().is_ok())
+        .await
+        .unwrap_or(false);
+    profiles_redirect(crate::render_profiles::ProfilesAction::Stop, succeeded)
 }
 
 /// One [`ksx_api::Refusal`] as the sentence a page flashes — message AND
@@ -2841,5 +3519,73 @@ mod tests {
         assert_eq!(urlencode("a&b=c?d#e"), "a%26b%3Dc%3Fd%23e");
         assert_eq!(urlencode("naïve"), "na%C3%AFve");
         assert_eq!(urlencode(&"x".repeat(1000)).len(), 300, "capped");
+    }
+
+    #[test]
+    fn start_action_feedback_never_reflects_provider_or_query_text() {
+        let raw = r#"daemon pipe refused --preset C:\Users\Victor\.ksx\claim.toml"#;
+        let edit = Err(raw.to_owned());
+        assert_eq!(
+            start_action_flash(StartAction::Edit, &edit),
+            START_EDIT_ERROR
+        );
+        let play = Err("a session is already running in the daemon".to_owned());
+        assert_eq!(
+            start_action_flash(StartAction::Play, &play),
+            START_PLAY_ACTIVE
+        );
+        let incomplete = Err("slot 1 has no controls mapped".to_owned());
+        assert_eq!(
+            start_action_flash(StartAction::Play, &incomplete),
+            START_PLAY_NOT_READY
+        );
+
+        assert_eq!(
+            start_flash_from_query(Some(raw)).as_deref(),
+            Some(START_UNKNOWN_FLASH_ERROR)
+        );
+        assert_eq!(
+            start_flash_from_query(Some(START_SAVE_OK)).as_deref(),
+            Some(START_SAVE_OK)
+        );
+
+        for safe in START_FLASH_ALLOWLIST {
+            let lower = safe.to_ascii_lowercase();
+            for forbidden in ["daemon", "pipe", "--", r"c:\", "preset", "claim"] {
+                assert!(
+                    !lower.contains(forbidden),
+                    "customer action feedback exposed {forbidden:?}: {safe}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn start_redirect_location_contains_only_presented_copy() {
+        let raw = r#"daemon pipe at C:\Users\Victor\.ksx refused `ksx daemon`"#;
+        let response = start_redirect(StartAction::Play, Err(raw.to_owned()));
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("start redirect location");
+        assert!(location.starts_with("/start?flash=error"), "{location}");
+        for leaked in ["daemon", "pipe", "Victor", "preset", "claim"] {
+            assert!(!location.contains(leaked), "{leaked} leaked: {location}");
+        }
+    }
+
+    #[test]
+    fn map_feedback_never_reflects_unmodeled_provider_text() {
+        let fallback = "That change could not be completed. Nothing changed.";
+        for hostile in [
+            r"C:\Users\Victor\secret",
+            r"HID\VID_D209&PID_0430",
+            r"HKLM\SYSTEM\CurrentControlSet",
+            "expected a sequence at line 4 column 9",
+            r#"{"verb":"map","key":"A"}"#,
+        ] {
+            assert_eq!(consumer_map_detail(hostile, fallback), fallback);
+        }
     }
 }

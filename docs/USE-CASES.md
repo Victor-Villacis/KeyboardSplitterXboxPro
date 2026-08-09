@@ -11,7 +11,7 @@ non-negotiables are listed at the bottom.
 
 | # | Topology | Who | Status |
 |---|---|---|---|
-| T1 | One multi-player encoder (I-PAC2/4) → 2–4 pads by key subsets | arcade cabinets (**the primary case**) | ✅ proven on hardware (M4) |
+| T1 | One multi-player encoder (I-PAC2/4) → 2–4 pads by key subsets | arcade cabinets (**the primary case**) | ✅ supported and exercised on hardware; the release-grade four-player latency/game run remains Gate 3 phase 1 |
 | T2 | N distinct keyboards → one pad each | couch co-op, two people one PC — *the legacy app's headline case* | ⚠️ supported by design, **never tested**; needs a second physical keyboard bound to a slot |
 | T3 | Mixed: encoder + regular keyboard(s) | cabinet with a control station | ⚠️ same as T2 |
 | T4 | **Two identical devices** (2× I-PAC2, or two of the same cheap USB keyboard) | very common for 4-player builds and co-op | ⚠️ **never silently confused, still not usable together.** `DeviceSelector`'s port rung tells twins apart in config and `Match::Ambiguous` refuses rather than guessing (`docs/DEVICE-IDENTITY.md` §2). But an INF binds by hardware id, which both boards share, so `winusb.rs` refuses `SharedHardwareId` for BOTH while both are plugged — claiming one would claim every one. Telling them apart *during a claim* needs per-device installation, which ksx does not do. Untested: nobody here owns a second board |
@@ -36,60 +36,49 @@ Three ways out, cheapest first:
    the config stores hwid + learned slot. Cost: slot numbers drift across
    replug/resume (documented as R2), so ksx must detect drift and ask again
    rather than silently mis-routing. **Highest value per unit of work.**
-2. **WinUSB claim (M6).** Identity becomes the USB device path — structurally
-   unique per port, no collisions, no drift. Solves T4 as a side effect of the
-   work already planned for the 2026 driver deadline. `ksx winusb status` already
-   reports each interface's instance path and refuses an ambiguous target rather
-   than guessing between two identical boards.
+2. **Per-device WinUSB installation.** The runtime identity is already the
+   unique USB instance path, but the current INF binds by shared hardware id.
+   ksx therefore refuses `SharedHardwareId` while twins are connected: claiming
+   one with today's installer would claim both. T4 needs an installation method
+   scoped to one device instance, not merely the existing runtime selector.
 3. **RawInput correlation for identity only.** `crates/ksx-capture/src/rawinput.rs`
    already reports the per-device instance path; use it during setup to map
    physical panel → device, never for blocking (the blocking variant of this hack
    is rejected by design).
 
-Recommendation: (1) now as a setup-time feature, (2) as the durable answer.
+Recommendation: keep the refusal, test (1) only with explicit drift detection,
+and research a per-device installation path for (2). Until then, two different
+encoder models are the honest supported workaround.
 
-## Adoption gaps (a new user's first ten minutes)
+## A new user's first ten minutes
 
-The cabinet's config came from importing 10-year-old XML. Someone starting fresh
-has none of that:
+The old path assumed an imported configuration and exposed the developer CLI.
+The current product path is shipped in Studio:
 
-- ~~**`ksx setup` wizard**~~ → **SHIPPED (M7)**: `ksx setup` identifies the panel
-  by PRESS through the RawInput observer ("hold a key on the panel for player
-  N" — never a numbered list, which is the only answer that works when two
-  encoders share a hardware id), then walks position-named prompts
-  (`SOUTH`, not `A`), auto-advances, refuses an already-taken key inline, audits
-  for completeness (it warns when the panel can reach neither START nor BACK —
-  the cabinet's exit keys), and commits TRANSACTIONALLY: nothing is written
-  until the review screen is confirmed, and wiring the slot into `config.toml`
-  (or a `--profile` games entry) is asked, never assumed. It offers the next
-  player when a slot is done, so P1→P4 is one run. The state machine is pure
-  and unit-tested; the interactive loop only prints and reads.
-  **Deliberate deviation from ES**: skipping is "press nothing" with a visible
-  countdown rather than hold-to-skip — the Raw Input observer re-baselines held
-  keys, so a hold is invisible without taxing every press with an autorepeat
-  probe. Two silent prompts end the run, which makes bailing out cheaper than
-  ES's ~40 s of holding.
-- ~~**Preset templates**~~ → **SHIPPED (M7)**, in `ksx-core/src/templates.rs`
-  beside the built-ins: `arcade-6button` (I-PAC2/MAME six-button fighting panel,
-  P1–P2 key blocks), `arcade-4way` (MAME's four-player chart, P1–P4),
-  `keyboard-wasd` (one ordinary keyboard — give each player their own and
-  nothing collides), `keyboard-2p` (T1 without an encoder: ONE desk keyboard
-  split into two disjoint key blocks, P1 on WASD and P2 on the arrows plus the
-  numpad, for a two-player Steam game with no arcade hardware in the house),
-  plus `default`/`empty` as named seeds. `ksx preset list
-  --templates` / `ksx preset new <NAME> --from-template <ID> [--player N]`.
-  Every direction binds the hat AND the left stick, because some games read only
-  one; that is fan-out, not duplication.
-- **`ksx install-drivers` should also offer Interception**, not just ViGEmBus — a
-  fresh machine has neither. (License note in `docs/DRIVERS.md`: Interception is
-  LGPL/non-commercial; bundling its installer is fine, commercial use is not.)
-- ~~**Quickstart**~~ → **SHIPPED (M7)**: [`QUICKSTART.md`](QUICKSTART.md) — a
-  fresh machine to four working players, written for someone who has never seen
-  the legacy app: drivers, the capture-mode decision spelled out as a table,
-  templates for the fast path and the wizard for the sure one, slot wiring, and
-  the "fix one binding" flow that means you never re-run the wizard.
-- **`ksx map` verbs** (ENHANCEMENTS E5) so a preset can be edited without TOML —
-  and so an AI assistant can configure a cabinet conversationally.
+- The installer creates one console-free customer launcher and optionally runs
+  it as the original, unelevated Windows user. It opens `/start`, not Status.
+- An empty configuration starts an idle background service with no capture,
+  virtual controllers, or session. Setup can therefore hold a fresh in-memory
+  draft instead of deadlocking on the absence of a saved controller.
+- Setup lists ordinary keyboards first and unusual HID-capable devices in a
+  separate optional disclosure. Device choice, controller type, layout, and
+  split/freeze answer remain drafts until Save or Play.
+- `/map?target=stage` reuses the complete visual mapper for bindings, multiple
+  keys, auto-fire, and macros. Staged writes are exact-slot, atomic operations;
+  a refusal leaves the draft unchanged.
+- Save and Play are separate. Play can use the draft without writing it; Save
+  does not start a session.
+- Saved Games supports create, switch, edit, optional device rebase, and delete
+  in Studio. Created games inherit the matching saved Setup device choices and
+  are immediately plannable.
+- [`QUICKSTART.md`](QUICKSTART.md) now documents this customer journey with no
+  terminal or file editing. Developer commands remain documented in README.
+
+What remains is physical proof, not a missing customer workflow: Gate 4 must run
+the exact installer on a clean standard-user machine, and T2/T4 still need the
+second physical keyboards/encoders the current lab does not own. Interception is
+not bundled because of its licence; ViGEmBus remains the default installer
+checkbox.
 
 ## Notes on breadth we already have for free
 
@@ -114,29 +103,12 @@ has none of that:
 5. **Crash-only**: process death always returns the keyboards.
 6. **Config stays plain TOML** and hand-editable; wizards write it, never replace it.
 
-## Suggested sequencing
+## Current sequencing
 
-Fold into the roadmap after M5, without delaying the M6 deadline work:
-
-- **M6** (unchanged, deadline-driven): WinUSB backend — also solves T4 durably.
-  Design question raised by generality: with the encoder claimed by WinUSB it is
-  no longer a keyboard, so **frontend navigation needs ksx to inject keystrokes**
-  when not emulating. Design that in, or the cabinet loses menu control.
-  → **Answered and implemented** (`docs/ARCHITECTURE.md` §M6): the daemon owns
-  the claim for its whole lifetime, not per-session, and re-injects the panel's
-  keystrokes with `SendInput` (`ksx_platform::inject::Typethrough`) whenever
-  emulation is stopped. Muting/unmuting is ordered against session start/stop and
-  asserted in CI. The honest residual: **if ksx is not running, a claimed panel
-  does nothing**, and injected keys never reach the secure desktop — mitigated by
-  autostart, a mandatory second keyboard (`ksx winusb claim` refuses the last
-  one), and `ksx winusb release`.
-- **M7 "general availability"**: `ksx setup` wizard, preset templates,
-  Interception in `install-drivers`, quickstart docs, `ksx map` verbs, and a
-  tested T2/T4 path. This is what turns "Victor's cabinet software" into
-  "the thing people install instead of the abandoned app".
-  → **Landed so far**: `ksx map` and its whole verb family; `ksx setup`;
-  `ksx preset list --templates` / `ksx preset new --from-template`;
-  [`QUICKSTART.md`](QUICKSTART.md).
-  → **Still open**: offering Interception inside `ksx install-drivers` (licence
-  note above), and T2/T4 tested on real hardware — the wizard makes T2 *easy*
-  (each keyboard identifies itself by press) but easy is not tested.
+1. Run Gate 4 with the exact CI-built installer and record its SHA/version.
+2. Complete Gate 3's real four-player latency/game run, frontend wrap, driver
+   removal, and 14-day soak.
+3. Test T2 with two distinct physical keyboards and T4 with two identical
+   devices. Do not turn an unowned-hardware claim into a checkmark.
+4. Add code signing before calling the installer frictionless; unsigned
+   SmartScreen remains a release risk even when the binary is correct.

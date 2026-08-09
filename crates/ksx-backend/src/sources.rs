@@ -62,9 +62,9 @@ impl StatusSource for CollectorSource {
     fn macros(&self, preset: &str) -> MacroSnapshot {
         let root = match ksx_config::ConfigRoot::discover() {
             Ok(root) => root,
-            Err(err) => {
-                return MacroSnapshot::unavailable(&format!("config root not found: {err}"))
-            }
+            Err(_) => return MacroSnapshot::unavailable(
+                "Controller layouts are temporarily unavailable. Close and reopen ksx, then try again.",
+            ),
         };
         collect_macros(&ksx_config::Store::new(root), preset)
     }
@@ -83,17 +83,15 @@ impl StatusSource for CollectorSource {
 fn collect_macros(store: &ksx_config::Store, preset_name: &str) -> MacroSnapshot {
     let loaded = match store.load_presets() {
         Ok(loaded) => loaded,
-        Err(err) => return MacroSnapshot::unavailable(&format!("presets unreadable: {err}")),
+        Err(_) => {
+            return MacroSnapshot::unavailable(
+                "Controller layouts could not be read. Close and reopen ksx, then try again.",
+            )
+        }
     };
-    let known: Vec<String> = loaded.value.iter().map(|p| p.name.clone()).collect();
     let Some(file) = loaded.value.into_iter().find(|p| p.name == preset_name) else {
         return MacroSnapshot::unavailable(&format!(
-            "no preset called \"{preset_name}\" is on disk (presets found: {})",
-            if known.is_empty() {
-                "none".to_owned()
-            } else {
-                known.join(", ")
-            }
+            "The controller layout \"{preset_name}\" is no longer available. Return to Setup and choose a layout before editing macros."
         ));
     };
     let macros = file
@@ -138,7 +136,9 @@ fn collect_macros(store: &ksx_config::Store, preset_name: &str) -> MacroSnapshot
 fn collect_mapper() -> MapperSnapshot {
     let root = match ksx_config::ConfigRoot::discover() {
         Ok(root) => root,
-        Err(err) => return MapperSnapshot::unavailable(&format!("config root not found: {err}")),
+        Err(_) => return MapperSnapshot::unavailable(
+            "Controller layouts are temporarily unavailable. Close and reopen ksx, then try again.",
+        ),
     };
     let config_root = root.dir().display().to_string();
     let store = ksx_config::Store::new(root);
@@ -166,7 +166,7 @@ fn collect_mapper() -> MapperSnapshot {
                 .collect();
             (rows, "config.toml [[slot]] entries".to_owned(), None)
         }
-        _ => match store.load_games() {
+        Ok(_) => match store.load_games() {
             Ok(loaded) => match loaded.value.games.first() {
                 Some(game) => {
                     let rows = game
@@ -199,39 +199,62 @@ fn collect_mapper() -> MapperSnapshot {
                     }
                 }
             },
-            Err(err) => {
-                return MapperSnapshot::unavailable(&format!("games.toml unreadable: {err}"))
+            Err(_) => {
+                return MapperSnapshot::unavailable(
+                    "Saved games could not be read. Close and reopen ksx, then try again.",
+                )
             }
         },
+        Err(_) => {
+            return MapperSnapshot::unavailable(
+                "The saved setup could not be read. Close and reopen ksx, then try again.",
+            )
+        }
     };
 
-    let slots = rows
-        .into_iter()
-        .map(|(number, keyboard, preset_name, persona, macros)| {
-            let bindings = preset_bindings(&store, &preset_name);
-            let turbo = preset_turbo(&store, &preset_name);
-            // The newest restore point, read from disk rather than from the
-            // daemon: the label is still true (and still worth showing) when
-            // nothing answers the pipe.
-            let backup = crate::mapping::list_backups(&store, &preset_name)
-                .ok()
-                .and_then(|backups| backups.first().map(|b| b.label()));
-            MapperSlot {
-                number,
-                persona: persona.as_str().to_owned(),
-                persona_label: persona.label().to_owned(),
-                preset: preset_name,
-                keyboard,
-                bindings,
-                backup,
-                turbo,
-                // The tournament switch, straight off the slot entry: "my
-                // macros do nothing" has two causes, and this is the one you
-                // cannot see by reading the preset.
-                macros_off: !macros.is_on(),
+    let mut slots = Vec::new();
+    for (number, keyboard, preset_name, persona, macros) in rows {
+        let layout = match preset_layout(&store, &preset_name) {
+            Ok(layout) => layout,
+            Err(problem) => {
+                let reason = match problem {
+                    LayoutProblem::Missing => format!(
+                        "Player {number}'s controller layout \"{preset_name}\" is missing. Choose another layout in Setup before editing controls."
+                    ),
+                    LayoutProblem::Unreadable => format!(
+                        "Player {number}'s controller layout \"{preset_name}\" could not be read. Nothing can be changed until it is repaired or replaced in Setup."
+                    ),
+                    LayoutProblem::Invalid => format!(
+                        "Player {number}'s controller layout \"{preset_name}\" is not valid. Repair it or choose another layout in Setup before editing controls."
+                    ),
+                };
+                return MapperSnapshot::unavailable(&reason);
             }
-        })
-        .collect();
+        };
+        // The newest restore point, read from disk rather than from the
+        // daemon: the label is still true (and still worth showing) when
+        // nothing answers the pipe.
+        let backup = crate::mapping::list_backups(&store, &preset_name)
+            .ok()
+            .and_then(|backups| backups.first().map(|b| b.label()));
+        let session_backup = crate::mapping::session_backup_path(&store, &preset_name)
+            .is_ok_and(|path| path.is_file());
+        slots.push(MapperSlot {
+            number,
+            persona: persona.as_str().to_owned(),
+            persona_label: persona.label().to_owned(),
+            preset: preset_name,
+            keyboard,
+            bindings: layout.bindings,
+            backup,
+            session_backup,
+            turbo: layout.turbo,
+            // The tournament switch, straight off the slot entry: "my
+            // macros do nothing" has two causes, and this is the one you
+            // cannot see by reading the preset.
+            macros_off: !macros.is_on(),
+        });
+    }
 
     MapperSnapshot {
         generated_at: now_utc(),
@@ -242,21 +265,33 @@ fn collect_mapper() -> MapperSnapshot {
     }
 }
 
-/// Canonical function name → bound key names. Inert `"None"` placeholders
-/// become EMPTY lists (the page's honest "unbound" tag); an unreadable or
-/// missing preset yields no entries at all — its zones all render unbound,
-/// and a `map` attempt will name the real problem.
-fn preset_bindings(
+#[derive(Debug)]
+struct LayoutView {
+    bindings: std::collections::BTreeMap<String, Vec<String>>,
+    turbo: std::collections::BTreeMap<String, u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutProblem {
+    Missing,
+    Unreadable,
+    Invalid,
+}
+
+/// Read one controller layout as one fact. A valid layout may have no
+/// bindings; a missing, unreadable or invalid layout is a different state and
+/// must never be painted as a healthy page full of “unbound” controls.
+fn preset_layout(
     store: &ksx_config::Store,
     preset_name: &str,
-) -> std::collections::BTreeMap<String, Vec<String>> {
+) -> Result<LayoutView, LayoutProblem> {
     let mut bindings = std::collections::BTreeMap::new();
-    let Ok(Some(loaded)) = store.load_preset(preset_name) else {
-        return bindings;
+    let loaded = match store.load_preset(preset_name) {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => return Err(LayoutProblem::Missing),
+        Err(_) => return Err(LayoutProblem::Unreadable),
     };
-    let Ok(core) = loaded.value.to_core() else {
-        return bindings;
-    };
+    let core = loaded.value.to_core().map_err(|_| LayoutProblem::Invalid)?;
     for (key, binding) in &core.entries {
         let function = ksx_config::function_name(binding);
         let keys: &mut Vec<String> = bindings.entry(function).or_default();
@@ -264,28 +299,14 @@ fn preset_bindings(
             keys.push(key.name().to_owned());
         }
     }
-    bindings
-}
-
-/// Canonical function name → its AUTO-FIRE rate, as authored
-/// (docs/INPUT-TRANSFORMS.md §3). Read from the same file and the same core
-/// model the bindings come from, so the legend's rate and the legend's keys
-/// can never disagree.
-fn preset_turbo(
-    store: &ksx_config::Store,
-    preset_name: &str,
-) -> std::collections::BTreeMap<String, u32> {
     let mut rates = std::collections::BTreeMap::new();
-    let Ok(Some(loaded)) = store.load_preset(preset_name) else {
-        return rates;
-    };
-    let Ok(core) = loaded.value.to_core() else {
-        return rates;
-    };
     for t in &core.turbo {
         rates.insert(ksx_config::function_name(&t.binding), t.hz);
     }
-    rates
+    Ok(LayoutView {
+        bindings,
+        turbo: rates,
+    })
 }
 
 fn collect_snapshot() -> StatusSnapshot {
@@ -446,19 +467,21 @@ fn profile_detail(entry: &ksx_config::GameEntry) -> ksx_api::ProfileDetail {
             None,
         ),
         Ok(()) => ("ok", "the program is there".to_owned(), None),
-        // The refusal text is `ksx run`'s own — the same sentence, at the
-        // moment it is useful instead of the moment it is too late.
-        Err(err @ PreflightError::ExeMissing { .. }) => (
+        Err(PreflightError::ExeMissing { .. }) => (
             "broken",
-            err.to_string(),
+            "The selected program cannot be found on this computer.".to_owned(),
             Some(entry.path.trim().to_owned()),
         ),
-        Err(err @ PreflightError::NotAFile { .. }) => (
+        Err(PreflightError::NotAFile { .. }) => (
             "broken",
-            err.to_string(),
+            "The selected program is a folder, not a program.".to_owned(),
             Some(entry.path.trim().to_owned()),
         ),
-        Err(err @ PreflightError::NoPath { .. }) => ("broken", err.to_string(), None),
+        Err(PreflightError::NoPath { .. }) => (
+            "broken",
+            "No program or game link is saved.".to_owned(),
+            None,
+        ),
     };
 
     let mut presets: Vec<String> = Vec::new();
@@ -469,6 +492,7 @@ fn profile_detail(entry: &ksx_config::GameEntry) -> ksx_api::ProfileDetail {
     }
 
     ksx_api::ProfileDetail {
+        revision: crate::profile_edit::profile_revision(entry),
         title: entry.title.clone(),
         path: entry.path.clone(),
         arguments: entry.arguments.clone(),
@@ -481,11 +505,11 @@ fn profile_detail(entry: &ksx_config::GameEntry) -> ksx_api::ProfileDetail {
 }
 
 /// A store error as the refusal a surface flashes.
-fn refuse_config(what: &str, err: ksx_config::ConfigError) -> Refusal {
+fn refuse_config(what: &str, _err: ksx_config::ConfigError) -> Refusal {
     Refusal::with_remedy(
         ksx_api::codes::REFUSED,
-        format!("{what}: {err}"),
-        "run `ksx doctor`",
+        what,
+        "reopen ksx and try again; if it still fails, make sure ksx can access its saved data",
     )
 }
 
@@ -504,11 +528,48 @@ fn profile_refusal(err: crate::profile_edit::ProfileError) -> Refusal {
     }
 }
 
+/// Names a Saved Games form may offer. Merely loading a file is not enough:
+/// the runtime consumes `PresetFile::to_core`, so selection must use that same
+/// semantic boundary or a successful Save can produce an immediate Play
+/// refusal.
+fn valid_layout_names(layouts: &[ksx_config::PresetFile]) -> Vec<String> {
+    layouts
+        .iter()
+        .filter(|layout| layout.to_core().is_ok())
+        .map(|layout| layout.name.clone())
+        .collect()
+}
+
 fn preset_refusal(err: crate::preset_edit::PresetError) -> Refusal {
-    let refusal = Refusal::new(ksx_api::codes::REFUSED, err.to_string());
-    match err.advice() {
-        Some(advice) => refusal.remedy(advice),
-        None => refusal,
+    use crate::preset_edit::PresetError;
+    use ksx_core::templates::TemplateError;
+
+    match err {
+        PresetError::Exists { name, .. } => Refusal::with_remedy(
+            ksx_api::codes::REFUSED,
+            format!("a controller layout called \"{name}\" already exists"),
+            "choose a different name; Saved Games never overwrites a controller layout",
+        ),
+        PresetError::Template(TemplateError::EmptyName) => Refusal::with_remedy(
+            ksx_api::codes::REFUSED,
+            "a controller layout needs a name",
+            "give the new controller layout a short name you will recognize",
+        ),
+        PresetError::Template(TemplateError::Unknown(_)) => Refusal::with_remedy(
+            ksx_api::codes::REFUSED,
+            "that starter layout is not available",
+            "refresh Saved Games and choose a starter layout again",
+        ),
+        PresetError::Template(TemplateError::NoSuchPlayer { .. }) => Refusal::with_remedy(
+            ksx_api::codes::REFUSED,
+            "that starter layout does not include the selected player",
+            "choose one of the player numbers shown for that starter layout",
+        ),
+        PresetError::Config(_) => Refusal::with_remedy(
+            ksx_api::codes::REFUSED,
+            "the controller layout could not be saved",
+            "reopen ksx and try again",
+        ),
     }
 }
 
@@ -963,26 +1024,26 @@ impl ksx_api::MachineSource for LocalMachine {
     }
 
     fn presets(&self) -> Result<PresetsView, Refusal> {
-        let root = ksx_config::ConfigRoot::discover().map_err(|err| {
+        let root = ksx_config::ConfigRoot::discover().map_err(|_| {
             Refusal::with_remedy(
                 ksx_api::codes::REFUSED,
-                format!("the config root could not be found: {err}"),
-                "run `ksx doctor`",
+                "Controller layouts could not be opened",
+                "reopen ksx and try again",
             )
         })?;
         let store = ksx_config::Store::new(root.clone());
-        let loaded = store.load_presets().map_err(|err| {
+        let loaded = store.load_presets().map_err(|_| {
             Refusal::with_remedy(
                 ksx_api::codes::REFUSED,
-                format!("the presets folder could not be read: {err}"),
-                "run `ksx preset list`",
+                "Controller layouts could not be read",
+                "reopen ksx and try again",
             )
         })?;
         let presets = loaded
             .value
             .iter()
             .map(|file| {
-                let core = file.to_core().ok();
+                let core = file.to_core();
                 PresetRow {
                     name: file.name.clone(),
                     bound: core.as_ref().map_or(0, |preset| preset.entries.len()),
@@ -994,6 +1055,10 @@ impl ksx_api::MachineSource for LocalMachine {
                         file.name.to_ascii_lowercase().as_str(),
                         "default" | "empty"
                     ),
+                    usable: core.is_ok(),
+                    problem: core.is_err().then(|| {
+                        "This controller layout needs attention before it can be used.".to_owned()
+                    }),
                     source: store
                         .preset_path(&file.name)
                         .map(|path| path.display().to_string())
@@ -1036,25 +1101,30 @@ impl ksx_api::MachineSource for LocalMachine {
     /// passes it by construction because only the shell can resolve it, and
     /// calling that "ok" would claim a check ksx did not make.
     fn profiles(&self) -> Result<ksx_api::ProfilesView, Refusal> {
-        let root = ksx_config::ConfigRoot::discover().map_err(|err| {
+        let root = ksx_config::ConfigRoot::discover().map_err(|_| {
             Refusal::with_remedy(
                 ksx_api::codes::REFUSED,
-                format!("the config root could not be found: {err}"),
-                "run `ksx doctor`",
+                "Saved Games could not be opened",
+                "reopen ksx and try again",
             )
         })?;
         let store = ksx_config::Store::new(root.clone());
         let mut notes = Vec::new();
         let games = match store.load_games() {
             Ok(loaded) => {
-                notes.extend(loaded.warnings.iter().map(ToString::to_string));
+                if !loaded.warnings.is_empty() {
+                    notes.push(
+                        "Some saved-game details need attention. Reopen ksx after correcting them."
+                            .to_owned(),
+                    );
+                }
                 loaded.value
             }
-            Err(err) => {
+            Err(_) => {
                 return Err(Refusal::with_remedy(
                     ksx_api::codes::REFUSED,
-                    format!("games.toml could not be read: {err}"),
-                    "run `ksx config export --what games`",
+                    "Saved Games could not be read",
+                    "reopen ksx and try again; your saved games have not been replaced",
                 ))
             }
         };
@@ -1074,26 +1144,29 @@ impl ksx_api::MachineSource for LocalMachine {
     /// form posts a string, and "the preset exists" is a fact about this disk
     /// at this instant, not about the page that was drawn two minutes ago.
     fn profile_new(&self, spec: &ksx_api::NewProfile) -> Result<String, Refusal> {
-        let root = ksx_config::ConfigRoot::discover().map_err(|err| {
+        let root = ksx_config::ConfigRoot::discover().map_err(|_| {
             Refusal::with_remedy(
                 ksx_api::codes::REFUSED,
-                format!("the config root could not be found: {err}"),
-                "run `ksx doctor`",
+                "Saved Games could not be opened",
+                "reopen ksx and try again",
             )
         })?;
         let store = ksx_config::Store::new(root);
+        let config = store
+            .load_config()
+            .map_err(|err| refuse_config("Controller Setup could not be read", err))?
+            .value;
         let games = store
             .load_games()
-            .map_err(|err| refuse_config("games.toml could not be read", err))?
+            .map_err(|err| refuse_config("Saved Games could not be read", err))?
             .value;
-        let presets: Vec<String> = store
+        let loaded_layouts = store
             .load_presets()
-            .map_err(|err| refuse_config("the presets folder could not be read", err))?
-            .value
-            .iter()
-            .map(|p| p.name.clone())
-            .collect();
+            .map_err(|err| refuse_config("Controller layouts could not be read", err))?
+            .value;
+        let presets = valid_layout_names(&loaded_layouts);
         let plan = crate::profile_edit::plan_new(
+            &config,
             &games,
             &presets,
             &crate::profile_edit::NewProfileSpec {
@@ -1109,23 +1182,90 @@ impl ksx_api::MachineSource for LocalMachine {
         Ok(outcome.message())
     }
 
+    fn profile_update(&self, spec: &ksx_api::UpdateProfile) -> Result<String, Refusal> {
+        let root = ksx_config::ConfigRoot::discover().map_err(|_| {
+            Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                "Saved Games could not be opened",
+                "reopen ksx and try again",
+            )
+        })?;
+        let store = ksx_config::Store::new(root);
+        let config = store
+            .load_config()
+            .map_err(|err| refuse_config("Controller Setup could not be read", err))?
+            .value;
+        let games = store
+            .load_games()
+            .map_err(|err| refuse_config("Saved Games could not be read", err))?
+            .value;
+        let loaded_layouts = store
+            .load_presets()
+            .map_err(|err| refuse_config("Controller layouts could not be read", err))?
+            .value;
+        let presets = valid_layout_names(&loaded_layouts);
+        let plan = crate::profile_edit::plan_update(
+            &config,
+            &games,
+            &presets,
+            &crate::profile_edit::UpdateProfileSpec {
+                original_title: spec.original_title.clone(),
+                revision: spec.revision.clone(),
+                title: spec.title.clone(),
+                path: spec.path.clone(),
+                arguments: spec.arguments.clone(),
+                slots: spec.slots,
+                preset: spec.preset.clone(),
+                rebase_devices: spec.rebase_devices,
+            },
+        )
+        .map_err(profile_refusal)?;
+        let outcome = crate::profile_edit::apply_update(&store, &plan).map_err(profile_refusal)?;
+        Ok(outcome.message())
+    }
+
+    fn profile_delete(&self, spec: &ksx_api::DeleteProfile) -> Result<String, Refusal> {
+        let root = ksx_config::ConfigRoot::discover().map_err(|_| {
+            Refusal::with_remedy(
+                ksx_api::codes::REFUSED,
+                "Saved Games could not be opened",
+                "reopen ksx and try again",
+            )
+        })?;
+        let store = ksx_config::Store::new(root);
+        let games = store
+            .load_games()
+            .map_err(|err| refuse_config("Saved Games could not be read", err))?
+            .value;
+        let plan = crate::profile_edit::plan_delete(
+            &games,
+            &crate::profile_edit::DeleteProfileSpec {
+                title: spec.title.clone(),
+                revision: spec.revision.clone(),
+            },
+        )
+        .map_err(profile_refusal)?;
+        let outcome = crate::profile_edit::apply_delete(&store, &plan).map_err(profile_refusal)?;
+        Ok(outcome.message())
+    }
+
     /// Instantiate an in-box template into a preset file — the same two calls
     /// `ksx preset new` makes, through the same writer.
     fn preset_new(&self, spec: &ksx_api::NewPreset) -> Result<String, Refusal> {
-        let root = ksx_config::ConfigRoot::discover().map_err(|err| {
+        let root = ksx_config::ConfigRoot::discover().map_err(|_| {
             Refusal::with_remedy(
                 ksx_api::codes::REFUSED,
-                format!("the config root could not be found: {err}"),
-                "run `ksx doctor`",
+                "Controller layouts could not be opened",
+                "reopen ksx and try again",
             )
         })?;
         let store = ksx_config::Store::new(root);
         let path = store
             .canonical_preset_path(&spec.name)
-            .map_err(|err| refuse_config("that preset name cannot be a file name", err))?;
+            .map_err(|err| refuse_config("that controller-layout name cannot be used", err))?;
         let existing = store
             .load_preset(&spec.name)
-            .map_err(|err| refuse_config("the presets folder could not be read", err))?
+            .map_err(|err| refuse_config("Controller layouts could not be read", err))?
             .is_some();
         let plan = crate::preset_edit::plan_new(
             existing.then_some(path).as_deref(),
@@ -1137,8 +1277,8 @@ impl ksx_api::MachineSource for LocalMachine {
             },
         )
         .map_err(preset_refusal)?;
-        let outcome = crate::preset_edit::apply_new(&store, &plan).map_err(preset_refusal)?;
-        Ok(outcome.message())
+        crate::preset_edit::apply_new(&store, &plan).map_err(preset_refusal)?;
+        Ok(format!("created controller layout \"{}\"", plan.file.name))
     }
 
     /// Reuses the tray's own launcher, deliberately.
@@ -1310,6 +1450,108 @@ mod tests {
         assert_eq!(client.sink().path(), crate::daemon::pipe::PIPE_NAME);
     }
 
+    /// A controller with zero bindings is a valid (if unfinished) layout. A
+    /// missing, unreadable or semantically invalid layout is not: collapsing
+    /// any of those into the same empty map paints every control as healthily
+    /// unbound and lets the page invite writes against data it never read.
+    #[test]
+    fn mapper_layout_reads_keep_empty_distinct_from_missing_unreadable_and_invalid() {
+        let dir = std::env::temp_dir().join(format!(
+            "ksx-mapper-layout-state-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ksx_config::Store::new(ksx_config::ConfigRoot::at(&dir));
+
+        let empty: ksx_config::PresetFile =
+            toml::from_str("name = \"Empty\"\n[bindings]\n").unwrap();
+        store.save_preset(&empty).unwrap();
+        let read = preset_layout(&store, "Empty").expect("a valid empty layout was read");
+        assert!(read.bindings.is_empty());
+        assert!(read.turbo.is_empty());
+
+        assert_eq!(
+            preset_layout(&store, "Missing").unwrap_err(),
+            LayoutProblem::Missing
+        );
+
+        let invalid: ksx_config::PresetFile =
+            toml::from_str("name = \"Invalid\"\n[bindings]\nwarp = \"S\"\n").unwrap();
+        store.save_preset(&invalid).unwrap();
+        assert_eq!(
+            preset_layout(&store, "Invalid").unwrap_err(),
+            LayoutProblem::Invalid
+        );
+
+        let unreadable = store.preset_path("Unreadable").unwrap();
+        std::fs::create_dir_all(unreadable.parent().unwrap()).unwrap();
+        std::fs::write(&unreadable, "this is not = valid = toml").unwrap();
+        assert_eq!(
+            preset_layout(&store, "Unreadable").unwrap_err(),
+            LayoutProblem::Unreadable
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_games_offers_only_layouts_that_the_runtime_can_build() {
+        let empty: ksx_config::PresetFile =
+            toml::from_str("name = \"Empty\"\n[bindings]\n").unwrap();
+        let invalid: ksx_config::PresetFile =
+            toml::from_str("name = \"Broken\"\n[bindings]\nwarp = \"S\"\n").unwrap();
+        assert!(empty.to_core().is_ok(), "an empty layout is valid");
+        assert!(
+            invalid.to_core().is_err(),
+            "the fixture must be semantic, not parse-invalid"
+        );
+        assert_eq!(
+            valid_layout_names(&[invalid, empty]),
+            vec!["Empty"],
+            "a layout that would refuse Play must not be offered by create/edit"
+        );
+    }
+
+    #[test]
+    fn saved_game_rows_carry_full_entry_revisions_and_product_safe_verdicts() {
+        let mut entry = ksx_config::GameEntry {
+            title: "Missing Game".to_owned(),
+            notes: String::new(),
+            path: std::env::temp_dir()
+                .join(format!("ksx-never-there-{}.exe", std::process::id()))
+                .display()
+                .to_string(),
+            arguments: String::new(),
+            process_name: None,
+            launcher_grace_ms: None,
+            block_keyboards: Default::default(),
+            block_mice: false,
+            slots: Vec::new(),
+        };
+        let first = profile_detail(&entry);
+        assert_eq!(
+            first.revision,
+            crate::profile_edit::profile_revision(&entry)
+        );
+        assert_eq!(first.state, "broken");
+        for internal in ["profile", "preset", "slot", "toml", "cli"] {
+            assert!(
+                !first.verdict.to_ascii_lowercase().contains(internal),
+                "customer verdict leaked {internal:?}: {}",
+                first.verdict
+            );
+        }
+
+        entry.notes = "edited somewhere else".to_owned();
+        assert_ne!(
+            first.revision,
+            profile_detail(&entry).revision,
+            "even hidden editable semantics invalidate an open form"
+        );
+    }
+
     /// The macro editor's WHOLE read side, against a real store: the file's
     /// own shape comes through untranslated (`ms` and `frames` stay apart,
     /// `allow_short` as written), the policies come through as the words the
@@ -1387,7 +1629,16 @@ steps = [{ hold = ["back"], ms = 200 }]
         let missing = collect_macros(&store, "IPAC P2");
         assert!(!missing.available);
         assert!(missing.reason.contains("IPAC P2"), "{}", missing.reason);
-        assert!(missing.reason.contains("IPAC P1"), "{}", missing.reason);
+        assert!(
+            missing.reason.contains("Return to Setup"),
+            "{}",
+            missing.reason
+        );
+        assert!(
+            !missing.reason.contains("IPAC P1"),
+            "the primary remedy must not disclose another layout's storage identity: {}",
+            missing.reason
+        );
 
         let plain: ksx_config::PresetFile =
             toml::from_str("name = \"Plain\"\n[bindings]\nA = \"S\"\n").unwrap();

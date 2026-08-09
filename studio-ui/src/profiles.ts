@@ -39,6 +39,8 @@ function wireForms(root: HTMLElement): void {
     const form = ev.target as HTMLFormElement | null;
     if (!form || form.method.toLowerCase() !== "post") return;
     ev.preventDefault();
+    const confirmation = form.dataset.confirm;
+    if (confirmation && !window.confirm(confirmation)) return;
     void submitForm(form);
   });
 }
@@ -68,11 +70,11 @@ async function submitForm(form: HTMLFormElement): Promise<void> {
       applyFlash(flash);
     } else {
       applyFlash(
-        `error: ksx studio answered ${res.status} without a result — the form was not accepted, and nothing was written`,
+        "error: that change could not be accepted. Nothing was changed. Reopen ksx and try again.",
       );
     }
   } catch {
-    applyFlash("error: request failed — is ksx studio still running?");
+    applyFlash("error: the change could not be sent. Reopen ksx and try again.");
   }
   void poll();
 }

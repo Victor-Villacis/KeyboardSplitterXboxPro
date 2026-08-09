@@ -27,6 +27,7 @@ import { h, createSignal, createList, createShow } from "@getforma/core";
 // ── Wire types: serde field names from crates/ksx-api/src/machine.rs ────────
 
 export interface ProfileDetail {
+  revision: string;
   title: string;
   path: string;
   arguments: string;
@@ -52,6 +53,8 @@ export interface PresetRow {
   bound: number;
   macros: number;
   protected: boolean;
+  usable: boolean;
+  problem?: string | null;
   source: string;
 }
 
@@ -88,12 +91,19 @@ export interface SessionView {
 // string and every branch below arrives in `payload.view`.
 
 interface ProfileRowView {
+  revision: string;
   title: string;
   path: string;
+  arguments: string;
+  slots: string;
+  max_slots: string;
+  preset: string;
+  layout_options: OptionView[];
   detail: string;
   verdict: string;
   statecls: string;
   statelabel: string;
+  play_disabled: boolean;
 }
 
 interface BrokenRowView {
@@ -136,11 +146,10 @@ export interface ProfilesDerived {
   broken_summary: string;
   presets_summary: string;
   templates_summary: string;
-  /** The template-card intro, ROSTER INCLUDED. It was static copy here that
-   *  named four templates while the registry ships six — SURFACES.md §1a
-   *  drift, live in the first review. snapshot.rs composes it from the same
-   *  list `template_rows` renders. */
+  /** The concise template-card intro. The full served roster lives in the
+   *  optional comparison disclosure below. */
   templates_intro: string;
+  play_status: string;
   daemon_cmd: string;
   /** `ksx_core::MAX_SLOTS`. The ONE place this number comes from. */
   max_slots: number;
@@ -156,6 +165,7 @@ export interface ProfilesDerived {
   pill_idle: boolean;
   pill_down: boolean;
   no_daemon: boolean;
+  can_stop: boolean;
   any_broken: boolean;
   rows_live: boolean;
   rows_plain: boolean;
@@ -224,6 +234,7 @@ const [canMakeProfile, setCanMakeProfile] = createSignal(false);
 const [noPresetsYet, setNoPresetsYet] = createSignal(false);
 const [presetsUnreadable, setPresetsUnreadable] = createSignal(false);
 const [canMakePreset, setCanMakePreset] = createSignal(false);
+const [canStop, setCanStop] = createSignal(false);
 
 const [profileRows, setProfileRows] = createSignal<ProfileRowView[]>([]);
 const [brokenRows, setBrokenRows] = createSignal<BrokenRowView[]>([]);
@@ -245,7 +256,7 @@ export function applyProfiles(p: ProfilesPayload): void {
   const d = p.view;
 
   setGeneratedAt(p.profiles.generated_at);
-  setSessionLine(p.session.line);
+  setSessionLine(d.play_status);
   setDaemonCmd(d.daemon_cmd);
   setGamesPath(p.profiles.games_path);
   setPresetRoot(p.presets.config_root);
@@ -263,6 +274,7 @@ export function applyProfiles(p: ProfilesPayload): void {
   setPillIdle(d.pill_idle);
   setPillDown(d.pill_down);
   setNoDaemon(d.no_daemon);
+  setCanStop(d.can_stop);
   setRowsLive(d.rows_live);
   setRowsPlain(d.rows_plain);
   setAnyBroken(d.any_broken);
@@ -286,11 +298,12 @@ export function applyProfiles(p: ProfilesPayload): void {
  *  controls, but keep the last-known lists on screen — their timestamp stops
  *  advancing, which is the honest tell. */
 export function applyUnreachable(): void {
-  setSessionLine("ksx-studio not responding — retrying every 2 s");
+  setSessionLine("This screen is temporarily unavailable. Reopen ksx and try again.");
   setPillRunning(false);
   setPillIdle(false);
   setPillDown(true);
   setNoDaemon(true);
+  setCanStop(false);
   setRowsLive(false);
   setRowsPlain(true);
 }
@@ -298,12 +311,40 @@ export function applyUnreachable(): void {
 const FLASH_MS = 5000;
 let flashTimer: ReturnType<typeof setTimeout> | undefined;
 
+const UNKNOWN_FLASH =
+  "error: Saved Games could not finish that request. Reopen ksx and try again.";
+const PROFILE_FLASH_ALLOWLIST: readonly string[] = [
+  "Saved game added.",
+  "Saved game updated.",
+  "Saved game deleted.",
+  "Controller layout created.",
+  "Play started.",
+  "Play stopped.",
+  "error: Saved game could not be added. Check the game name, program location, players, and controller layout; nothing was changed.",
+  "error: Saved game could not be updated. Refresh the page, then check its details; nothing was changed.",
+  "error: Saved game could not be deleted. Refresh the page and try again; nothing was changed.",
+  "error: Controller layout could not be created. Choose a different name or starter layout; nothing was changed.",
+  "error: That game could not be started. Open Edit and check its program and controllers.",
+  "error: Play could not be stopped. Reopen ksx and try again.",
+  UNKNOWN_FLASH,
+  "error: that change could not be accepted. Nothing was changed. Reopen ksx and try again.",
+  "error: the change could not be sent. Reopen ksx and try again.",
+];
+
+/** The payload and redirect URL are both input boundaries in the browser.
+ * Accept only presentation copy owned by this screen. */
+export function safeProfileFlash(flash: string | null | undefined): string {
+  const candidate = (flash ?? "").trim();
+  if (candidate === "") return "";
+  return PROFILE_FLASH_ALLOWLIST.includes(candidate) ? candidate : UNKNOWN_FLASH;
+}
+
 export function applyFlash(flash: string | null | undefined): void {
   if (flashTimer !== undefined) {
     clearTimeout(flashTimer);
     flashTimer = undefined;
   }
-  const line = (flash ?? "").trim();
+  const line = safeProfileFlash(flash);
   if (line === "") {
     setFlashLine("");
     setFlashOk(false);
@@ -335,18 +376,10 @@ export function ProfilesIsland() {
       h(
         "nav",
         { class: "topnav", "aria-label": "screens" },
-        h("a", { class: "navlink", href: "/start" }, "Start"),
-        h("a", { class: "navlink", href: "/" }, "Status"),
-        h("a", { class: "navlink", href: "/map" }, "Mapper"),
-        h("a", { class: "navlink", href: "/check" }, "Check"),
-        h("a", { class: "navlink", href: "/pads" }, "Pads"),
-        h("a", { class: "navlink", href: "/devices" }, "Devices"),
-        h(
-          "a",
-          { class: "navlink on", href: "/profiles", "aria-current": "page" },
-          "Profiles",
-        ),
-        h("a", { class: "navlink", href: "/setup" }, "Setup"),
+        h("a", { class: "navlink", href: "/start" }, "Setup"),
+        h("a", { class: "navlink", href: "/map" }, "Controls"),
+        h("a", { class: "navlink", href: "/check" }, "Test"),
+        h("span", { class: "navlink on", "aria-current": "page" }, "Games"),
       ),
       createShow(
         () => pillRunning(),
@@ -358,7 +391,7 @@ export function ProfilesIsland() {
       ),
       createShow(
         () => pillDown(),
-        () => h("span", { class: "pill pill-down" }, "no daemon"),
+        () => h("span", { class: "pill pill-down" }, "needs attention"),
       ),
     ),
     h(
@@ -374,26 +407,19 @@ export function ProfilesIsland() {
             h(
               "h2",
               null,
-              "No daemon — ksx Studio can see your config but cannot change anything.",
+              "The background service is not responding",
             ),
             h(
               "p",
               { class: "alarmlead" },
-              "Everything below is a real reading of this machine. Creating a ",
-              "profile or a preset writes to disk and works without a daemon; ",
-              "SWITCHING to a profile starts a session, and that needs one. ",
-              "Two ways to start one:",
+              "You can still create or edit saved games. To play one, close ",
+              "this window and reopen ksx from the desktop shortcut. If ksx is ",
+              "already in the notification area, choose Open Studio there.",
             ),
             h(
-              "ol",
-              { class: "alarmways" },
-              h("li", null, "the ksx tray icon → Start emulation, or"),
-              h(
-                "li",
-                null,
-                "run this in a shell: ",
-                h("code", { class: "mono copyable" }, () => daemonCmd()),
-              ),
+              "span",
+              { class: "product-hidden" },
+              () => daemonCmd(),
             ),
           ),
       ),
@@ -409,7 +435,7 @@ export function ProfilesIsland() {
           h(
             "section",
             { class: "card alarm warn" },
-            h("h2", null, "Broken profiles"),
+            h("h2", null, "Games that need attention"),
             h("p", { class: "alarmlead" }, () => brokenSummary()),
             h(
               "ul",
@@ -425,7 +451,6 @@ export function ProfilesIsland() {
                       "div",
                       { class: "pmeta" },
                       h("span", { class: "ptitle" }, b.title),
-                      h("span", { class: "pdetail" }, b.path),
                       h("span", { class: "pdetail" }, b.verdict),
                     ),
                   ),
@@ -434,9 +459,9 @@ export function ProfilesIsland() {
             h(
               "p",
               { class: "cardline" },
-              "Fix `path` for these in games.toml — the file is ",
-              h("span", { class: "mono" }, () => gamesPath()),
-              " — or make a new profile below and stop using the old one.",
+              "Open “Edit or delete” on the affected game and correct its ",
+              "program. You can also remove a saved game you no longer use.",
+              h("span", { class: "product-hidden" }, () => gamesPath()),
             ),
           ),
       ),
@@ -444,8 +469,21 @@ export function ProfilesIsland() {
       h(
         "section",
         { class: "card hero session" },
-        h("h2", null, "Session"),
+        h("h2", null, "Play status"),
         h("p", { class: "state" }, () => sessionLine()),
+        createShow(
+          () => canStop(),
+          () =>
+            h(
+              "form",
+              { method: "post", action: "/profiles/stop" },
+              h(
+                "button",
+                { class: "btn btn-danger-ghost", type: "submit" },
+                "Stop playing",
+              ),
+            ),
+        ),
         createShow(
           () => flashOk(),
           () => h("p", { class: "flash flash-ok" }, () => flashLine()),
@@ -459,13 +497,12 @@ export function ProfilesIsland() {
       h(
         "section",
         { class: "card wide profilecard" },
-        h("h2", null, "Profiles"),
+        h("h2", null, "Saved games"),
         h(
           "p",
           { class: "cardline" },
-          "Each profile is a games.toml entry: the program to launch and the ",
-          "slots it hands out. Switching to one starts a session under it — ",
-          "the same verb the tray and `ksx daemon --game` use.",
+          "A saved game remembers what to launch, how many players it has, ",
+          "and which controller layout they use. Choose Play game to start it now.",
         ),
         h("p", { class: "cardline mono" }, () => profilesSummary()),
         // A REFUSED read is not an empty list. Before this box existed, an
@@ -479,15 +516,19 @@ export function ProfilesIsland() {
             h(
               "div",
               { class: "warnbox" },
-              h("p", { class: "warn" }, () => profilesError()),
+              h("p", { class: "warn" }, "Saved games are temporarily unavailable."),
               h(
                 "p",
                 { class: "cardline" },
-                "This is not an empty games.toml — it is a read that refused, ",
-                "so ksx does not know what is in it. The file it tried to ",
-                "read is ",
-                h("span", { class: "mono" }, () => gamesPath()),
-                ".",
+                "This is a read failure, not an empty saved-game list. Reopen ksx ",
+                "and try again. Your saved games have not been replaced.",
+                h("span", { class: "product-hidden" }, () => gamesPath()),
+              ),
+              h(
+                "details",
+                { class: "st-more" },
+                h("summary", null, "Support details"),
+                h("p", { class: "pdetail" }, () => profilesError()),
               ),
             ),
         ),
@@ -503,35 +544,212 @@ export function ProfilesIsland() {
               { class: "plist" },
               createList(
                 () => profileRows(),
-                (g) => g.title + "|" + g.statelabel + "|" + g.path,
+                (g) =>
+                  g.title +
+                  "|" +
+                  g.revision +
+                  "|" +
+                  g.path +
+                  "|" +
+                  g.arguments +
+                  "|" +
+                  g.slots +
+                  "|" +
+                  g.max_slots +
+                  "|" +
+                  g.preset +
+                  "|" +
+                  g.detail +
+                  "|" +
+                  g.verdict +
+                  "|" +
+                  g.statecls +
+                  "|" +
+                  g.statelabel,
                 (g) =>
                   h(
                     "li",
-                    null,
+                    { class: "profile-row" },
                     h(
                       "div",
-                      { class: "pmeta" },
-                      h("span", { class: "ptitle" }, g.title),
-                      h("span", { class: "pdetail" }, g.detail),
-                      h("span", { class: "pdetail" }, g.path),
-                      h("span", { class: "pdetail" }, g.verdict),
-                    ),
-                    h("span", { class: g.statecls }, g.statelabel),
-                    h(
-                      "form",
-                      { method: "post", action: "/profiles/switch" },
-                      h("input", {
-                        type: "hidden",
-                        name: "profile",
-                        value: g.title,
-                      }),
-                      // One word: the row already names the profile, and a
-                      // phone row that also carries a state pill has no
-                      // width to spend on a sentence.
+                      { class: "profile-row-head" },
                       h(
-                        "button",
-                        { class: "btn btn-row", type: "submit" },
-                        "Switch",
+                        "div",
+                        { class: "pmeta" },
+                        h("span", { class: "ptitle" }, g.title),
+                        h("span", { class: "pdetail" }, g.detail),
+                        h("span", { class: "pdetail" }, g.verdict),
+                      ),
+                      h("span", { class: g.statecls }, g.statelabel),
+                      h(
+                        "form",
+                        {
+                          class: "profile-switch",
+                          method: "post",
+                          action: "/profiles/switch",
+                        },
+                        h("input", {
+                          type: "hidden",
+                          name: "profile",
+                          value: g.title,
+                        }),
+                        h(
+                          "button",
+                          {
+                            class: "btn btn-row",
+                            type: "submit",
+                            disabled: g.play_disabled,
+                          },
+                          "Play game",
+                        ),
+                      ),
+                    ),
+                    h(
+                      "details",
+                      { class: "disclosure profile-edit" },
+                      h("summary", null, "Edit or delete"),
+                      h(
+                        "form",
+                        {
+                          class: "grid profile-edit-grid",
+                          method: "post",
+                          action: "/profiles/update",
+                        },
+                        h("input", {
+                          type: "hidden",
+                          name: "original_title",
+                          value: g.title,
+                        }),
+                        h("input", {
+                          type: "hidden",
+                          name: "revision",
+                          value: g.revision,
+                        }),
+                        h(
+                          "label",
+                          { class: "bindlabel" },
+                          "Game name",
+                          h("input", {
+                            type: "text",
+                            name: "title",
+                            required: "",
+                            value: g.title,
+                          }),
+                        ),
+                        h(
+                          "label",
+                          { class: "bindlabel" },
+                          "Program or game link",
+                          h("input", {
+                            type: "text",
+                            name: "path",
+                            required: "",
+                            value: g.path,
+                          }),
+                        ),
+                        h(
+                          "label",
+                          { class: "bindlabel" },
+                          "Launch options (optional)",
+                          h("input", {
+                            type: "text",
+                            name: "arguments",
+                            value: g.arguments,
+                          }),
+                        ),
+                        h(
+                          "label",
+                          { class: "bindlabel" },
+                          "Players",
+                          h("input", {
+                            type: "number",
+                            name: "slots",
+                            min: "1",
+                            max: g.max_slots,
+                            required: "",
+                            value: g.slots,
+                          }),
+                        ),
+                        h(
+                          "label",
+                          { class: "bindlabel" },
+                          "Controller layout for every player",
+                          h(
+                            "select",
+                            { name: "preset", required: "" },
+                            h(
+                              "option",
+                              {
+                                value: g.preset,
+                                selected: true,
+                                hidden: true,
+                              },
+                              g.preset,
+                            ),
+                            createList(
+                              () => presetOptions(),
+                              (o) => o.value,
+                              (o) => h("option", { value: o.value }, o.label),
+                            ),
+                          ),
+                        ),
+                        h(
+                          "label",
+                          { class: "checkline" },
+                          h("input", {
+                            type: "checkbox",
+                            name: "rebase_devices",
+                            value: "true",
+                          }),
+                          "Use the device choices currently saved in Setup",
+                        ),
+                        h(
+                          "button",
+                          { class: "btn btn-primary", type: "submit" },
+                          "Save changes",
+                        ),
+                      ),
+                      h(
+                        "p",
+                        { class: "profile-edit-note" },
+                        "Saving applies the named controller layout to every ",
+                        "player. Device choices stay as they are unless you ",
+                        "select the checkbox.",
+                      ),
+                      h(
+                        "form",
+                        {
+                          class: "profile-delete",
+                          method: "post",
+                          action: "/profiles/delete",
+                          "data-confirm": "Delete this saved game? Controller layouts will remain.",
+                        },
+                        h("input", {
+                          type: "hidden",
+                          name: "title",
+                          value: g.title,
+                        }),
+                        h("input", {
+                          type: "hidden",
+                          name: "revision",
+                          value: g.revision,
+                        }),
+                        h(
+                          "label",
+                          { class: "checkline" },
+                          h("input", {
+                            type: "checkbox",
+                            name: "confirm_delete",
+                            value: "yes",
+                            required: "",
+                          }),
+                          "I want to delete this saved game",
+                        ),
+                        h(
+                          "button",
+                          { class: "btn btn-danger-ghost", type: "submit" },
+                          "Delete saved game",
+                        ),
                       ),
                     ),
                   ),
@@ -546,20 +764,192 @@ export function ProfilesIsland() {
               { class: "plist" },
               createList(
                 () => profileRows(),
-                (g) => g.title + "|" + g.statelabel + "|" + g.path,
+                (g) =>
+                  g.title +
+                  "|" +
+                  g.revision +
+                  "|" +
+                  g.path +
+                  "|" +
+                  g.arguments +
+                  "|" +
+                  g.slots +
+                  "|" +
+                  g.max_slots +
+                  "|" +
+                  g.preset +
+                  "|" +
+                  g.detail +
+                  "|" +
+                  g.verdict +
+                  "|" +
+                  g.statecls +
+                  "|" +
+                  g.statelabel,
                 (g) =>
                   h(
                     "li",
-                    null,
+                    { class: "profile-row" },
                     h(
                       "div",
-                      { class: "pmeta" },
-                      h("span", { class: "ptitle" }, g.title),
-                      h("span", { class: "pdetail" }, g.detail),
-                      h("span", { class: "pdetail" }, g.path),
-                      h("span", { class: "pdetail" }, g.verdict),
+                      { class: "profile-row-head" },
+                      h(
+                        "div",
+                        { class: "pmeta" },
+                        h("span", { class: "ptitle" }, g.title),
+                        h("span", { class: "pdetail" }, g.detail),
+                        h("span", { class: "pdetail" }, g.verdict),
+                      ),
+                      h("span", { class: g.statecls }, g.statelabel),
                     ),
-                    h("span", { class: g.statecls }, g.statelabel),
+                    h(
+                      "details",
+                      { class: "disclosure profile-edit" },
+                      h("summary", null, "Edit or delete"),
+                      h(
+                        "form",
+                        {
+                          class: "grid profile-edit-grid",
+                          method: "post",
+                          action: "/profiles/update",
+                        },
+                        h("input", {
+                          type: "hidden",
+                          name: "original_title",
+                          value: g.title,
+                        }),
+                        h("input", {
+                          type: "hidden",
+                          name: "revision",
+                          value: g.revision,
+                        }),
+                        h(
+                          "label",
+                          { class: "bindlabel" },
+                          "Game name",
+                          h("input", {
+                            type: "text",
+                            name: "title",
+                            required: "",
+                            value: g.title,
+                          }),
+                        ),
+                        h(
+                          "label",
+                          { class: "bindlabel" },
+                          "Program or game link",
+                          h("input", {
+                            type: "text",
+                            name: "path",
+                            required: "",
+                            value: g.path,
+                          }),
+                        ),
+                        h(
+                          "label",
+                          { class: "bindlabel" },
+                          "Launch options (optional)",
+                          h("input", {
+                            type: "text",
+                            name: "arguments",
+                            value: g.arguments,
+                          }),
+                        ),
+                        h(
+                          "label",
+                          { class: "bindlabel" },
+                          "Players",
+                          h("input", {
+                            type: "number",
+                            name: "slots",
+                            min: "1",
+                            max: g.max_slots,
+                            required: "",
+                            value: g.slots,
+                          }),
+                        ),
+                        h(
+                          "label",
+                          { class: "bindlabel" },
+                          "Controller layout for every player",
+                          h(
+                            "select",
+                            { name: "preset", required: "" },
+                            h(
+                              "option",
+                              {
+                                value: g.preset,
+                                selected: true,
+                                hidden: true,
+                              },
+                              g.preset,
+                            ),
+                            createList(
+                              () => presetOptions(),
+                              (o) => o.value,
+                              (o) => h("option", { value: o.value }, o.label),
+                            ),
+                          ),
+                        ),
+                        h(
+                          "label",
+                          { class: "checkline" },
+                          h("input", {
+                            type: "checkbox",
+                            name: "rebase_devices",
+                            value: "true",
+                          }),
+                          "Use the device choices currently saved in Setup",
+                        ),
+                        h(
+                          "button",
+                          { class: "btn btn-primary", type: "submit" },
+                          "Save changes",
+                        ),
+                      ),
+                      h(
+                        "p",
+                        { class: "profile-edit-note" },
+                        "Saving applies the named controller layout to every ",
+                        "player. Device choices stay as they are unless you ",
+                        "select the checkbox.",
+                      ),
+                      h(
+                        "form",
+                        {
+                          class: "profile-delete",
+                          method: "post",
+                          action: "/profiles/delete",
+                          "data-confirm": "Delete this saved game? Controller layouts will remain.",
+                        },
+                        h("input", {
+                          type: "hidden",
+                          name: "title",
+                          value: g.title,
+                        }),
+                        h("input", {
+                          type: "hidden",
+                          name: "revision",
+                          value: g.revision,
+                        }),
+                        h(
+                          "label",
+                          { class: "checkline" },
+                          h("input", {
+                            type: "checkbox",
+                            name: "confirm_delete",
+                            value: "yes",
+                            required: "",
+                          }),
+                          "I want to delete this saved game",
+                        ),
+                        h(
+                          "button",
+                          { class: "btn btn-danger-ghost", type: "submit" },
+                          "Delete saved game",
+                        ),
+                      ),
+                    ),
                   ),
               ),
             ),
@@ -569,14 +959,14 @@ export function ProfilesIsland() {
       h(
         "section",
         { class: "card wide" },
-        h("h2", null, "New profile"),
+        h("h2", null, "Add a saved game"),
         h(
           "p",
           { class: "cardline" },
-          "Writes a [[game]] entry into games.toml and seeds one slot per ",
-          "player, all on the preset you choose. The keyboard stays unset — ",
-          "every board drives the slot until `ksx setup` wires a specific ",
-          "one. A timestamped backup of games.toml is taken first.",
+          "Save a game or launcher together with its player count and ",
+          "controller layout. Each player inherits the matching device from ",
+          "your saved Setup, so its controllers are ready. Paste the program location ",
+          "exactly as Windows gives it; surrounding quotation marks are fine.",
         ),
         createShow(
           () => canMakeProfile(),
@@ -587,7 +977,7 @@ export function ProfilesIsland() {
               h(
                 "label",
                 { class: "bindlabel", for: "np-title" },
-                "title — the name `ksx run --game` takes",
+                "Game name",
                 h("input", {
                   id: "np-title",
                   type: "text",
@@ -599,7 +989,7 @@ export function ProfilesIsland() {
               h(
                 "label",
                 { class: "bindlabel", for: "np-path" },
-                "path — the .exe, or a launcher URL",
+                "Program or game link",
                 h("input", {
                   id: "np-path",
                   type: "text",
@@ -611,7 +1001,7 @@ export function ProfilesIsland() {
               h(
                 "label",
                 { class: "bindlabel", for: "np-args" },
-                "arguments (optional)",
+                "Launch options (optional)",
                 h("input", {
                   id: "np-args",
                   type: "text",
@@ -622,7 +1012,7 @@ export function ProfilesIsland() {
               h(
                 "label",
                 { class: "bindlabel", for: "np-slots" },
-                "slots — one per player",
+                "Players",
                 h("input", {
                   id: "np-slots",
                   type: "number",
@@ -636,7 +1026,7 @@ export function ProfilesIsland() {
               h(
                 "label",
                 { class: "bindlabel", for: "np-preset" },
-                "preset every slot starts on",
+                "Controller layout for every player",
                 h(
                   "select",
                   { id: "np-preset", name: "preset" },
@@ -650,7 +1040,7 @@ export function ProfilesIsland() {
               h(
                 "button",
                 { class: "btn btn-primary", type: "submit" },
-                "Create profile",
+                "Save game",
               ),
             ),
         ),
@@ -663,8 +1053,8 @@ export function ProfilesIsland() {
               h(
                 "p",
                 { class: "warn" },
-                "No presets on disk, and a profile's slots have to start on ",
-                "one. Make a preset from an in-box template below first — the ",
+                "There are no controller layouts yet. Make one from a starter ",
+                "layout below first — the ",
                 "form comes back the moment there is one.",
               ),
             ),
@@ -680,15 +1070,19 @@ export function ProfilesIsland() {
             h(
               "div",
               { class: "warnbox" },
-              h("p", { class: "warn" }, () => presetsError()),
+              h("p", { class: "warn" }, "Controller layouts are temporarily unavailable."),
               h(
                 "p",
                 { class: "cardline" },
-                "This is not an empty presets folder — it is a read that ",
-                "refused, so ksx does not know what is in it. Both forms on ",
-                "this page are withheld until it can be read: creating a ",
-                "profile needs a preset that exists, and creating a preset ",
-                "needs to know the name is free.",
+                "This is a read failure, not an empty layout list. Reopen ksx ",
+                "and try again. Creation stays unavailable until the saved ",
+                "layouts can be read safely.",
+              ),
+              h(
+                "details",
+                { class: "st-more" },
+                h("summary", null, "Support details"),
+                h("p", { class: "pdetail" }, () => presetsError()),
               ),
             ),
         ),
@@ -697,17 +1091,13 @@ export function ProfilesIsland() {
       h(
         "section",
         { class: "card wide" },
-        h("h2", null, "Presets"),
+        h("h2", null, "Controller layouts"),
         h(
           "p",
           { class: "cardline" },
-          "A preset is one pad's key map. Slots point at them by name; the ",
-          "mapper edits them. `default` and `empty` are built in — the ",
-          "\"built-in\" pill marks them — but the pill is not what protects a ",
-          "file: creating from this page never overwrites ANYTHING, yours ",
-          "included. A name that is already taken is refused, and the refusal ",
-          "names `--force`, which is the CLI's consent step for replacing a ",
-          "preset (it takes a timestamped backup first).",
+          "A controller layout is one virtual controller's button map. You can ",
+          "edit any layout from Controls. Built-in layouts stay protected, and ",
+          "creating a new one never overwrites an existing layout.",
         ),
         h("p", { class: "cardline mono" }, () => presetsSummary()),
         h(
@@ -735,39 +1125,37 @@ export function ProfilesIsland() {
       h(
         "section",
         { class: "card wide" },
-        h("h2", null, "New preset from a template"),
-        // SERVED, roster and all. This paragraph used to be static copy that
-        // named four templates — while the registry ships six, and the
-        // <select> below already offered all six. A roster in prose is the
-        // template list implemented a second time in copy, which is exactly
-        // the drift docs/SURFACES.md §1a bans; snapshot.rs composes this
-        // sentence from the same list the rows below render.
+        h("h2", null, "New controller layout"),
+        // Served concise intro. The complete roster remains derived from the
+        // same payload and is available in the comparison disclosure below.
         h("p", { class: "cardline" }, () => templatesIntro()),
         h("p", { class: "cardline mono" }, () => templatesSummary()),
-        // The summary above ends in a colon and used to be followed by a
-        // FORM. `TemplateRow.detail` — the panel note ksx-api describes as
-        // the thing without which "a template nobody can identify from a list
-        // is a template nobody uses" — was transmitted on every request and
-        // rendered nowhere. Here is the list the colon promised.
+        // `TemplateRow.detail` is the panel note that lets a person compare
+        // layouts. Keep the complete list available without making everybody
+        // read six long descriptions before reaching the form.
         h(
-          "ul",
-          { class: "plist" },
-          createList(
-            () => templateRows(),
-            (t) => t.id,
-            (t) =>
-              h(
-                "li",
-                null,
+          "details",
+          { class: "st-more" },
+          h("summary", null, "Compare starter layouts"),
+          h(
+            "ul",
+            { class: "plist" },
+            createList(
+              () => templateRows(),
+              (t) => t.id,
+              (t) =>
                 h(
-                  "div",
-                  { class: "pmeta" },
-                  h("span", { class: "ptitle" }, t.id),
-                  h("span", { class: "pdetail" }, t.label),
-                  h("span", { class: "pdetail" }, t.detail),
+                  "li",
+                  null,
+                  h(
+                    "div",
+                    { class: "pmeta" },
+                    h("span", { class: "ptitle" }, t.label),
+                    h("span", { class: "pdetail" }, t.detail),
+                  ),
+                  h("span", { class: "pill pill-idle" }, t.players),
                 ),
-                h("span", { class: "pill pill-idle" }, t.players),
-              ),
+            ),
           ),
         ),
         createShow(
@@ -779,7 +1167,7 @@ export function ProfilesIsland() {
               h(
                 "label",
                 { class: "bindlabel", for: "npr-name" },
-                "name for the new preset",
+                "Name for the new layout",
                 h("input", {
                   id: "npr-name",
                   type: "text",
@@ -791,7 +1179,7 @@ export function ProfilesIsland() {
               h(
                 "label",
                 { class: "bindlabel", for: "npr-template" },
-                "template",
+                "Starter layout",
                 h(
                   "select",
                   { id: "npr-template", name: "template" },
@@ -805,7 +1193,7 @@ export function ProfilesIsland() {
               h(
                 "label",
                 { class: "bindlabel", for: "npr-player" },
-                "player block — each option above names the range it has",
+                "Which player's keys to copy — use the range shown in Starter layout",
                 h("input", {
                   id: "npr-player",
                   type: "number",
@@ -825,15 +1213,14 @@ export function ProfilesIsland() {
               h(
                 "button",
                 { class: "btn btn-primary", type: "submit" },
-                "Create preset",
+                "Create layout",
               ),
             ),
         ),
         h(
           "p",
           { class: "cardline" },
-          "presets are written to ",
-          h("span", { class: "mono" }, () => presetRoot()),
+          h("span", { class: "product-hidden" }, () => presetRoot()),
         ),
       ),
       // ── NOTES: anything the reads had to say out loud ─────────────────
@@ -843,23 +1230,27 @@ export function ProfilesIsland() {
           h(
             "section",
             { class: "card" },
-            h("h2", null, "Notes from the config read"),
             h(
-              "ul",
-              { class: "plist" },
-              createList(
-                () => noteRows(),
-                (n) => n.line,
-                (n) =>
-                  h(
-                    "li",
-                    null,
+              "details",
+              { class: "st-more" },
+              h("summary", null, "Support details"),
+              h(
+                "ul",
+                { class: "plist" },
+                createList(
+                  () => noteRows(),
+                  (n) => n.line,
+                  (n) =>
                     h(
-                      "div",
-                      { class: "pmeta" },
-                      h("span", { class: "pdetail" }, n.line),
+                      "li",
+                      null,
+                      h(
+                        "div",
+                        { class: "pmeta" },
+                        h("span", { class: "pdetail" }, n.line),
+                      ),
                     ),
-                  ),
+                ),
               ),
             ),
           ),
@@ -871,11 +1262,9 @@ export function ProfilesIsland() {
       h(
         "p",
         null,
-        "Profiles and presets re-read every 2 s in place; every button is one ",
-        "backend verb. Without JavaScript the page auto-refreshes every 5 s ",
-        "instead. Generated ",
+        "This page stays up to date while it is open. Last checked ",
         h("span", { class: "mono" }, () => generatedAt()),
-        ". Serving 127.0.0.1 only.",
+        ".",
       ),
     ),
   );

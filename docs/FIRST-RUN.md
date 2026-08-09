@@ -5,17 +5,20 @@ no interest in device instance paths. This file is the flow they walk, stated as
 a spec, and it is the acceptance test for whether ksx is a product or a toolkit
 with a web page attached.
 
-Written 2026-08-08 from the owner's description, after an audit found the
-install path offers to run `ksx doctor`, the Start menu shows five entries of
-jargon, and the split-vs-freeze choice — the one question that decides whether
-a player can still type — exists in `ksx-core` and is reachable only by editing
-TOML by hand.
+Written 2026-08-08 from the owner's description. The original audit found an
+installer that offered `ksx doctor`, five jargon-heavy Start-menu entries, and
+a split-vs-freeze choice reachable only by editing TOML. Those findings are
+historical: the product flow described below is now implemented. The physical
+fresh-user acceptance in §7 remains the release gate.
 
-> **The CLI is a development surface and is not the product.** `ksx <verb>` stays
-> complete and stays documented, because `docs/SURFACES.md` §3 makes the CLI the
-> place every capability lives. It is not what a customer is handed, not what the
-> installer advertises, and no step below may require it. If a step in this file
-> can only be done from a shell, that step is unfinished.
+> **The CLI is a development surface and is not the product.** Existing
+> `ksx <verb>` contracts stay complete and documented, and new backend
+> capabilities should get a CLI driver. The current matrix is honest about two
+> debts: `ksx stage` and `ksx games new|update|delete` remain planned while their
+> typed backend contracts and Studio faces exist (`docs/SURFACES.md` §3c and
+> §10). The installer advertises neither, and no step below may require them. If
+> a step in this file can only be done from a shell, that product step is
+> unfinished.
 
 ## §1 The seven moments
 
@@ -24,8 +27,12 @@ Numbered because the rest of this file and the code refer to them.
 1. **Get it.** A `.exe` from the releases page. One file.
 2. **Install it.** Double-click, click through, done. It offers to start ksx —
    and a desktop icon exists whether or not they accept.
-3. **Start it.** Tray icon appears, ksx opens in its own window. Nothing is
-   captured, no pads exist, no daemon work has happened beyond being ready.
+3. **Start it.** The console-free `ksx-launcher.exe` starts the installed
+   `ksx.exe open`, the tray icon appears, and Studio opens directly at
+   `/start` in its own app window. An idle control host is running, but no
+   emulation session exists: nothing is captured and no pads exist. The tray's
+   operate-only cabinet window and saved-setup Start action remain gray until
+   first-run Save gives them a runnable setup.
 4. **Choose a keyboard.** They see their real devices, named. They pick one.
 5. **Choose a controller.** They pick what it should become. It appears
    **ready** — and they can change their mind freely, because nothing has been
@@ -33,20 +40,28 @@ Numbered because the rest of this file and the code refer to them.
 6. **Map it.** Press a key, pick the button. Macros if they want. Then the one
    question that matters: **split or freeze?**
 7. **Play.** Start it live. The pad connects, the keyboard becomes a controller,
-   and Guide opens Game Bar so they can launch a game without leaving it.
+   and Guide can ask Windows to open Game Bar when **Allow your controller to
+   open Game Bar** is enabled in Windows Settings > Gaming > Game Bar. From
+   there they can use the gaming UI their Windows account already has set up.
 
 ## §2 What "ready" means, and why staging is a real type
 
-Moment 5 is where the current design breaks. Today a persona choice is a
-`[[slot]]` written to `config.toml`, and pads appear when a *session* starts.
-So "pick PS4, look at it, change to Xbox 360" would be three file writes and
-two backups, for a decision the user has not made yet.
+**A staged setup is its own implemented value and never touches disk.** It
+holds the chosen device, persona and complete authoring preset per controller,
+plus the blocking choice. It lives in the daemon for the length of the visit.
+`StagedSlotView::authoring` is optional for wire compatibility, but every live
+slot served by the current daemon supplies it.
 
-**A staged setup is its own value and never touches disk.** It holds: the chosen
-device, the chosen persona per slot, the bindings so far, and the blocking
-choice. It lives in the daemon for the length of the visit. Nothing is claimed,
-nothing is plugged, no config file is written, until the user says so at moment
-7 — and even then, saving and playing are separate acts.
+`/map?target=stage&slot=N` reuses the ordinary visual mapper for buttons,
+multiple keys, turbo and macros. The backend prepares a pure staged bind or
+macro edit, validates conflicts across all staged controllers, and sends one
+`StageEdit::SetBindings` only when accepted. A refusal leaves the staged value
+unchanged. It takes no disk backup and triggers no config reload because no
+file is being edited.
+
+Nothing is claimed, nothing is plugged and no config file is written until the
+user acts at moment 7. Save and Play remain separate: Save commits the staged
+value; Play starts that same value without first saving it.
 
 This is not a UI convenience. It is the difference between an app you can
 explore and one that punishes you for clicking.
@@ -105,12 +120,25 @@ Two things must be said on that screen, not buried:
   `Studio (serve only)`, `cabinet`, `setup wizard`) are surfaces and dev tools,
   not products. They stay reachable — the verbs are not deleted — but a menu of
   five names a new user cannot rank is a menu that teaches nothing.
-- **PATH stays opt-in and unchecked.** It is a developer convenience, and this
-  file's premise is that the customer never opens a shell.
+- **Every customer entry targets `ksx-launcher.exe`.** It is a Windows GUI
+  subsystem binary that starts the sibling `ksx.exe open` with
+  `CREATE_NO_WINDOW`; the Start shortcut, desktop shortcut and post-install
+  launch are the same action. The elevated installer uses `runasoriginaluser`
+  so the daemon and Chromium profile belong to the person who installed ksx,
+  not to the administrator account that approved Setup.
+- **No PATH task or registry mutation.** CLI/dev verbs remain installed for
+  support and development, but the customer is offered no terminal integration
+  or shortcut to them.
 
 ## §5 What the first screen must do (moments 3–4)
 
-Clean, because it genuinely is: no config, no daemon session, no pads.
+Clean, because it genuinely is: no config, no emulation session, no capture and
+no pads. A plain idle daemon/control host must stay alive even when the default
+configuration has no slots; otherwise `/start` could not stage the first one.
+An explicitly requested empty game profile or a broken configuration still
+refuses. `ksx open` waits for this host and Studio, then opens `/start` (with the
+existing bounded browser fallback if the preferred Chromium app window cannot
+be opened).
 
 - **Devices are listed without being asked for**, with a visible rescan. A user
   who just plugged something in must not have to know a scan exists.
@@ -140,6 +168,14 @@ Each of these has already happened once in this project's history.
 - A failed read renders as an empty result — "you have no devices" when the
   truth is "I could not enumerate" (`SURFACES.md` §1b).
 - A user is asked to type or paste a device path. Ever.
+- A customer shortcut flashes a console window.
+- An empty default configuration kills the control host before `/start` can
+  stage the first controller.
+- A fresh empty configuration offers an active cabinet window or saved-setup
+  Start action in the tray; both stay gray until Save, while Open ksx remains
+  available.
+- A staged mapper GET or accepted edit writes a file before Save, or a refused
+  edit changes the staged setup.
 - An action that looked like a menu choice turns out to have installed a driver
   or claimed a board. Claiming is always explicit, always separately confirmed,
   and per `SURFACES.md` §3 never on the browser surface at all.
@@ -152,5 +188,21 @@ machine that has never run it, getting from a downloaded `.exe` to a controller
 moving in a game **without opening a terminal, without editing a file, and
 without being told what to do next by us**.
 
-Until that is true, every green test suite in this repo is measuring something
-narrower than the product.
+The acceptance run uses the exact CI-built installer and a fresh standard
+Windows user. It records the installer SHA/version and verifies: the default
+ViGEmBus checkbox and outcome; one customer shortcut; the unelevated original
+user and correct browser profile; no console flash; empty-config idle bootstrap
+to `/start`; staged multi-key/turbo/macro editing; Play before Save; Save and
+restart parity; profile create/update/delete/switch without TOML or CLI; and a
+real virtual controller moving in a game. Until that is true, every green test
+suite in this repo is measuring something narrower than the product.
+
+The Guide clause has an OS prerequisite and a physical acceptance gate. The
+first-run screen must name the Windows setting above and offer
+`ms-settings:gaming-gamebar` as the direct remedy; ksx must not silently change
+that per-user preference. Unit tests can prove that the default layout maps
+Player 1's Left Windows key and Player 2's Numpad `*` key to Guide, but they
+cannot prove that Windows displayed Game Bar. Moment 7 remains unverified until
+a fresh Windows user with Game Bar enabled turns on that controller setting,
+presses each default Guide key after Play, and observes Game Bar open from the
+virtual pad without using a terminal or another keyboard.

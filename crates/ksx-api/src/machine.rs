@@ -119,17 +119,35 @@ pub trait MachineSource: Send + Sync {
         ))
     }
 
-    /// Add a `[[game]]` profile to games.toml.
+    /// Add a game profile.
     ///
-    /// The remedy names Studio rather than a CLI verb because there is no CLI
-    /// verb: `ksx setup` writes INTO an existing profile and refuses when the
-    /// title is absent, and `ksx config import` replaces the whole file. This
-    /// is the surface docs/SURFACES.md §3 gives "Edit config, profiles" to,
-    /// and until a `ksx games new` exists the honest remedy is to say so.
+    /// There is no equivalent CLI verb, so an implementation-free provider
+    /// points to profile management without assuming which consumer called it.
     fn profile_new(&self, _spec: &NewProfile) -> Result<String, Refusal> {
         Err(Refusal::not_here(
-            "creating a games.toml profile",
-            "run `ksx studio` and use its Profiles page",
+            "creating a game profile",
+            "use a ksx surface that supports profile management",
+        ))
+    }
+
+    /// Update one game profile, identified by its title before the edit.
+    ///
+    /// `original_title` makes renames unambiguous. Device selectors are kept
+    /// by default; [`UpdateProfile::rebase_devices`] is the explicit request
+    /// to take them from the machine's current controller setup instead.
+    fn profile_update(&self, _spec: &UpdateProfile) -> Result<String, Refusal> {
+        Err(Refusal::not_here(
+            "updating a game profile",
+            "use a ksx surface that supports profile management",
+        ))
+    }
+
+    /// Delete exactly one game profile. Presets and the base controller setup
+    /// are separate resources and are never implied by this request.
+    fn profile_delete(&self, _spec: &DeleteProfile) -> Result<String, Refusal> {
+        Err(Refusal::not_here(
+            "deleting a game profile",
+            "use a ksx surface that supports profile management",
         ))
     }
 
@@ -1200,7 +1218,7 @@ pub struct PresetsView {
 }
 
 /// One preset on disk.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresetRow {
     pub name: String,
     /// Bound controls (the inert `"None"` placeholders not counted).
@@ -1209,8 +1227,37 @@ pub struct PresetRow {
     pub macros: usize,
     /// A built-in that must not be overwritten (`default`, `empty`).
     pub protected: bool,
+    /// This file successfully converted to the runtime controller layout.
+    ///
+    /// Old providers did not send this field; treating an omitted value as
+    /// usable preserves their wire behavior while current providers can keep
+    /// a broken file visible without offering it in a Saved Games form.
+    #[serde(default = "serde_true")]
+    pub usable: bool,
+    /// Product-safe reason this layout cannot be selected. Detailed parser
+    /// diagnostics belong in logs/support output, not in the customer form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
     /// Where it came from — a path, or the built-in's name.
     pub source: String,
+}
+
+fn serde_true() -> bool {
+    true
+}
+
+impl Default for PresetRow {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            bound: 0,
+            macros: 0,
+            protected: false,
+            usable: true,
+            problem: None,
+            source: String::new(),
+        }
+    }
 }
 
 /// The games.toml profiles, preflighted.
@@ -1232,6 +1279,10 @@ pub struct ProfilesView {
 /// program it names is actually on this disk.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileDetail {
+    /// Opaque identity-and-content revision used by update/delete forms.
+    /// Consumers must return it unchanged and must not interpret it.
+    #[serde(default)]
+    pub revision: String,
     pub title: String,
     /// The `path` key verbatim: an executable, or a `steam://`-style URL.
     pub path: String,
@@ -1274,10 +1325,51 @@ pub struct NewProfile {
     /// empty shell would answer "I can't make a profile" with a profile that
     /// cannot be used.
     pub slots: u8,
-    /// The preset every seeded slot starts on. The device stays unset —
-    /// wiring a board to a slot is `ksx setup`'s job and the /devices page's,
-    /// not something a create form should guess.
+    /// The preset every seeded slot starts on. Device selectors and the other
+    /// controller-specific settings come from the matching saved base slots;
+    /// creation refuses rather than writing an unwired controller.
     pub preset: String,
+}
+
+/// Edit one existing game profile.
+///
+/// The title before the edit is separate from the desired title so a rename
+/// never becomes "find whichever row now has this new name". Player count and
+/// preset are whole-profile choices: the resulting slots are numbered
+/// `1..=slots`, and every one uses `preset`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateProfile {
+    /// The stable lookup key from the profile row being edited.
+    pub original_title: String,
+    /// The opaque revision served with the row. A stale or missing revision
+    /// refuses before any write so two open forms cannot overwrite each other.
+    #[serde(default)]
+    pub revision: String,
+    pub title: String,
+    /// The program to launch: a full path to an .exe, or a launcher URL.
+    pub path: String,
+    #[serde(default)]
+    pub arguments: String,
+    pub slots: u8,
+    pub preset: String,
+    /// `false`: preserve each existing game slot's keyboard/mouse selectors;
+    /// newly added slots come from the matching base controller.
+    ///
+    /// `true`: deliberately replace every resulting slot's selectors from the
+    /// matching base controller. Existing per-game persona, SOCD, and macro
+    /// choices remain profile-specific; the selected preset is still applied
+    /// to every resulting slot.
+    #[serde(default)]
+    pub rebase_devices: bool,
+}
+
+/// Delete one existing game profile by title.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteProfile {
+    pub title: String,
+    /// The opaque revision served with the row being removed.
+    #[serde(default)]
+    pub revision: String,
 }
 
 /// A new preset, seeded from an in-box template.
@@ -2117,12 +2209,23 @@ mod tests {
                 Nothing.preset_new(&NewPreset::default()).unwrap_err(),
             ),
             ("ksx config export", Nothing.profiles().unwrap_err()),
-            // The one row whose remedy names a SURFACE rather than a verb,
-            // because no CLI verb creates a profile yet. It still names
-            // something a person can run, which is the invariant.
+            // These verbs have no CLI. Their defaults still give a
+            // consumer-neutral way forward instead of inventing a command.
             (
-                "ksx studio",
+                "profile management",
                 Nothing.profile_new(&NewProfile::default()).unwrap_err(),
+            ),
+            (
+                "profile management",
+                Nothing
+                    .profile_update(&UpdateProfile::default())
+                    .unwrap_err(),
+            ),
+            (
+                "profile management",
+                Nothing
+                    .profile_delete(&DeleteProfile::default())
+                    .unwrap_err(),
             ),
             ("ksx autostart", Nothing.autostart().unwrap_err()),
             ("ksx doctor", Nothing.doctor().unwrap_err()),
@@ -2166,6 +2269,34 @@ mod tests {
                 "the refusal for {command} must name it: {refusal}"
             );
         }
+    }
+
+    #[test]
+    fn profile_update_and_delete_requests_are_serde_compatible() {
+        let update: UpdateProfile = serde_json::from_str(
+            r#"{"original_title":"SF","title":"Street Fighter","path":"C:\\\\sf.exe","slots":2,"preset":"Arcade"}"#,
+        )
+        .unwrap();
+        assert_eq!(update.arguments, "");
+        assert_eq!(update.revision, "", "old clients deserialize safely");
+        assert!(!update.rebase_devices, "preservation is the wire default");
+        let delete: DeleteProfile = serde_json::from_str(
+            &serde_json::to_string(&DeleteProfile {
+                title: "Street Fighter".to_owned(),
+                revision: "g1-test".to_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(delete.title, "Street Fighter");
+        assert_eq!(delete.revision, "g1-test");
+
+        let old_layout: PresetRow = serde_json::from_str(
+            r#"{"name":"Arcade","bound":20,"macros":0,"protected":false,"source":"Arcade"}"#,
+        )
+        .unwrap();
+        assert!(old_layout.usable, "omission is the compatibility default");
+        assert_eq!(old_layout.problem, None);
     }
 
     /// Both enumerations answered — the ordinary machine.

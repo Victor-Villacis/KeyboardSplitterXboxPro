@@ -3,16 +3,16 @@
 ; Build (Inno Setup 6.3 or newer; nothing else is required):
 ;
 ;     cargo build --release -p ksx-app --features studio,cabinet
+;     cargo build --release -p ksx-launcher
 ;     iscc packaging\ksx.iss
 ;
 ; The output lands in packaging\out\ksx-<version>-setup.exe.
 ;
-; The feature flags are not optional for a SHIPPED build: the Start-menu
-; entries below run `ksx open`, `ksx studio` and `ksx cabinet`, and those
-; subcommands only exist when their feature is on (docs/ENHANCEMENTS.md E7
-; rule A — the default build links neither UI, which is the right default for
-; a headless cabinet and the wrong one for an installer aimed at a desktop).
-; `open` is gated with `studio` because it is Studio it opens.
+; The feature flags are not optional for a SHIPPED build: the customer launcher
+; runs `ksx open`, which exists only with `studio`; the cabinet surface remains
+; available inside ksx.exe for installations that operate it programmatically.
+; The launcher is a separate GUI-subsystem executable so opening the product
+; never flashes ksx.exe's development console.
 ;
 ; ---------------------------------------------------------------------------
 ; What this installer does and does not do
@@ -58,8 +58,8 @@
 ;                         copy of the .ico, because build.rs stamps the same
 ;                         icon group into the exe as resource 1 — one file to
 ;                         keep current instead of two;
-;   [Icons]               the Start-menu entries, which inherit the exe's icon
-;                         for the same reason.
+;   [Icons]               the customer shortcuts, which target a separately
+;                         stamped launcher carrying the same icon group.
 ;
 ; The .ico carries eight SIZE-SPECIFIC entries (16/20/24/32 simplified,
 ; 48/64/128/256 detailed), so the 16 px wizard title bar and the 256 px
@@ -76,11 +76,8 @@
 #define AppPublisher   "Victor Villacis"
 #define AppURL         "https://github.com/Victor-Villacis/KeyboardSplitterXboxPro"
 #define AppExe         "ksx.exe"
+#define LauncherExe    "ksx-launcher.exe"
 #define RepoRoot       ".."
-; The Start-menu subfolder every surface that is NOT the product lives in.
-; Spelled once because it appears on five entries and a typo makes a sixth
-; folder rather than an error. See the [Icons] section for why it exists.
-#define AdvancedGroup  "ksx (advanced)"
 
 [Setup]
 ; Never change AppId: it is what makes an install an UPGRADE rather than a
@@ -99,7 +96,9 @@ DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 LicenseFile={#RepoRoot}\LICENSE-MIT
-InfoAfterFile={#RepoRoot}\docs\QUICKSTART.md
+; The old InfoAfterFile pointed at docs\QUICKSTART.md, a terminal-first
+; engineering runbook. Finish now hands the customer directly to the guided
+; app; support documentation remains installed under {app}\docs.
 
 ; ksx installs for the machine (it registers autostart and talks to a
 ; kernel driver), so it needs an elevated install into Program Files.
@@ -138,8 +137,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; it is a choice they have to be able to reverse: see the [Code] section, which
 ; says so on the last page of the wizard.
 ;
-; ASCII ONLY, and this is the checkbox the rule was written for — see the note
-; on `addtopath` below.
+; ASCII ONLY: this file has no UTF-8 BOM, so user-visible text is interpreted
+; in the system code page. Comments may keep their punctuation.
 Name: "vigembus"; Description: "Install the ViGEmBus controller driver (required to create virtual controllers)"; GroupDescription: "Controller driver - bundled with ksx, nothing is downloaded:"
 ; CHECKED, deliberately — docs/FIRST-RUN.md §4 bullet 1. It used to carry
 ; `Flags: unchecked`, and the audit's finding was concrete: this installer's
@@ -148,20 +147,12 @@ Name: "vigembus"; Description: "Install the ViGEmBus controller driver (required
 ; through. An icon on the desktop is what "installed" looks like to the person
 ; FIRST-RUN.md is written about.
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
-; UNCHECKED, equally deliberately — §4 bullet 4. PATH buys exactly one thing:
-; typing `ksx` in a terminal. FIRST-RUN.md's premise is that the customer never
-; opens one (and docs/SURFACES.md §3 keeps the CLI a development surface), so
-; the default must not be "edit a machine-wide environment variable to buy the
-; installing user nothing".
-;
-; ASCII ONLY in this Description, and in every Comment below. This file has no
-; UTF-8 BOM, so ISCC reads it in the system code page: a byte above 127 in a
-; string the USER sees becomes mojibake in a shortcut tooltip or a wizard
-; checkbox. Comments are discarded by the compiler and may keep their dashes.
-Name: "addtopath";   Description: "Add ksx to PATH (for the `ksx` command in a terminal; not needed to use ksx)"; GroupDescription: "Integration"; Flags: unchecked
 
 [Files]
 Source: "{#RepoRoot}\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+; GUI-subsystem hand-off used by every customer entry point. ksx.exe stays
+; installed beside it for internal/dev verbs and for this launcher's `open`.
+Source: "{#RepoRoot}\target\release\{#LauncherExe}"; DestDir: "{app}"; Flags: ignoreversion
 ; The bundled ViGEmBus setup. It must land in `<exe dir>\drivers\` for
 ; `ksx install-drivers` to find it — and `<exe dir>` must be under Program
 ; Files (or another directory a standard user cannot write) or that search
@@ -179,77 +170,16 @@ Source: "{#RepoRoot}\docs\*.md";        DestDir: "{app}\docs"; Flags: ignorevers
 
 [Icons]
 ; ---------------------------------------------------------------------------
-; ONE entry at the top level, and it is the product (docs/FIRST-RUN.md §4
-; bullet 3).
+; ONE customer product entry. The optional desktop icon is the same act.
 ; ---------------------------------------------------------------------------
 ;
-; This section used to put FIVE names in front of a new user: "ksx", "ksx
-; daemon (tray only)", "ksx Studio (serve only)", "ksx cabinet" and "ksx setup
-; wizard". Four of those are surfaces and development verbs. Nothing on screen
-; told a first-time user which one was the application, and three of them —
-; a tray icon with no window, a server with no client, a 10-foot panel meant to
-; be driven by an arcade stick — LOOK BROKEN when opened with a mouse on a
-; desktop. A menu that cannot be ranked teaches nothing and mis-teaches
-; plenty.
-;
-; The four are NOT deleted; deleting them would take the tray-only daemon (the
-; right thing on a cabinet or over RDP) and the serve-only Studio (the
-; documented recovery path, docs/M9-DECISION.md §4 item 7) away from the only
-; people who need them. They move one level down, into a folder named
-; "ksx (advanced)". A folder is a question a user answers before reading its
-; contents: someone who opens it has already decided they want something other
-; than "ksx", which is precisely the population those entries serve. And since
-; FIRST-RUN.md's premise is that the customer never types `ksx <verb>`, a
-; Start-menu folder is also the only place these stay reachable at all without
-; a shell.
-;
-; No IconFilename= on any entry whose target IS ksx.exe: the exe carries the
-; icon group as resource 1 (crates\ksx-app\build.rs), so the shortcut inherits
-; it. A separate IconFilename pointing at a copied .ico would be a second thing
-; to keep in step, and the first one to go stale. The one exception is the
-; doctor entry, whose target is the command processor — see it below.
-;
-; THE PLAIN "ksx" ENTRY RUNS `open`, NOT `daemon` (docs/M9-DECISION.md §4
-; item 1). It used to run the daemon, which put a tray icon on screen and
-; nothing else: the entry a person double-clicks appeared to do nothing, and
-; the way to actually see ksx was to type a URL. `open` starts the daemon if
-; one is not running, waits for it and for Studio, and then shows a window.
-Name: "{group}\{#AppName}";       Filename: "{app}\{#AppExe}"; Parameters: "open"; Comment: "Open ksx"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "open"; Comment: "Open ksx"; Tasks: desktopicon
-
-; --- ksx (advanced) --------------------------------------------------------
-; Everything below is a surface or a dev verb, and every one of them is the
-; right answer to SOME question — just never to "I just installed this, what
-; do I click?".
-;
-; `open`, `studio` and `cabinet` exist only in a build carrying those features
-; — see the build line in the header.
-;
-; The tray-only daemon is the plain entry's OLD behaviour, kept because
-; starting the tray without opening a window is what you want on a cabinet,
-; over RDP, or when Studio is not the point.
-Name: "{group}\{#AdvancedGroup}\daemon (tray only)"; Filename: "{app}\{#AppExe}"; Parameters: "daemon"; Comment: "Start the ksx tray daemon without opening a window"
-; This entry SERVES Studio and opens nothing; the window is what "ksx" is for.
-Name: "{group}\{#AdvancedGroup}\Studio (serve only)"; Filename: "{app}\{#AppExe}"; Parameters: "studio"; Comment: "Serve ksx Studio on 127.0.0.1:4460 for another device to open"
-Name: "{group}\{#AdvancedGroup}\cabinet panel"; Filename: "{app}\{#AppExe}"; Parameters: "cabinet"; Comment: "The 10-foot cabinet panel, driven by the arcade panel rather than a mouse"
-Name: "{group}\{#AdvancedGroup}\setup wizard"; Filename: "{app}\{#AppExe}"; Parameters: "setup"; Comment: "The console setup wizard"
-; `ksx doctor` stays one click away — it is just not the hand-off any more
-; (§4 bullet 2, and the [Run] section below).
-;
-; Through the command processor and not straight at ksx.exe, because ksx.exe is
-; a CONSOLE subsystem binary (crates\ksx-backend\src\console.rs, deliberately): a
-; shortcut that ran `doctor` directly would print its driver tables into a
-; console that closes the instant the process exits, which shows the one user
-; who came here for those tables nothing at all. `/k` keeps the window. That
-; target is cmd.exe, so this is the one entry that must name an icon.
-Name: "{group}\{#AdvancedGroup}\driver check (ksx doctor)"; Filename: "{cmd}"; Parameters: "/k ""{app}\{#AppExe}"" doctor"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExe}"; IconIndex: 0; Comment: "Check drivers and hardware, in a window that stays open"
-
-[Registry]
-; PATH, machine-wide, appended — `uninsdeletevalue` on a shared key would be
-; wrong, so the removal is scoped to our own entry by Inno's PATH handling.
-Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; \
-    ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; \
-    Tasks: addtopath; Check: NeedsAddPath(ExpandConstant('{app}'))
+; The target is a Windows GUI-subsystem executable. It resolves its sibling
+; ksx.exe, runs exactly `ksx.exe open` with CREATE_NO_WINDOW, waits for the
+; window hand-off, then exits (or shows a normal error dialog if it failed).
+; There are no customer shortcuts for CLI verbs and no command-line Parameters
+; here for Windows to expose or Inno to quote differently.
+Name: "{group}\{#AppName}";       Filename: "{app}\{#LauncherExe}"; WorkingDir: "{app}"; Comment: "Open ksx"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#LauncherExe}"; WorkingDir: "{app}"; Comment: "Open ksx"; Tasks: desktopicon
 
 [Run]
 ; The hand-off is THE PRODUCT (docs/FIRST-RUN.md §4 bullet 2). This line used
@@ -259,9 +189,9 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
 ; they did not ask, and it is the last screen of the install, so it is also
 ; their first impression of ksx.
 ;
-; `open` is the same verb both icons run. It starts the daemon if one is not
-; running, waits for it and for Studio, then puts a window on screen
-; (crates\ksx-backend\src\studio_launch.rs) — moment 3 of FIRST-RUN.md §1.
+; The launcher is the same executable both icons run. It starts `ksx.exe open`
+; without allocating a console; that verb starts the daemon if needed, waits
+; for Studio, then puts a window on screen — moment 3 of FIRST-RUN.md §1.
 ; `nowait` because that wait is seconds long and the wizard must not hold its
 ; Finish button hostage for it; `open` exits by design once the window is up.
 ;
@@ -276,7 +206,7 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
 ; Chromium profile ksx owns under the ELEVATING account's %LOCALAPPDATA%, which
 ; on a machine where a standard user typed an admin's credentials is not the
 ; profile the user gets tomorrow.
-Filename: "{app}\{#AppExe}"; Parameters: "open"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: postinstall nowait skipifsilent runasoriginaluser
+Filename: "{app}\{#LauncherExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: postinstall nowait skipifsilent runasoriginaluser
 
 [UninstallDelete]
 ; `ksx install-drivers`'s own report, written by the [Code] section below. It
@@ -300,28 +230,6 @@ Filename: "{app}\{#AppExe}"; Parameters: "autostart --disable"; Flags: runhidden
 // on, so it is not the place to bet on "accepted".
 var
   DriverNote: string;
-
-// True when the install dir is not already on the machine PATH.
-// Case-insensitive and separator-anchored, so "C:\ksx" does not match
-// "C:\ksx-old".
-//
-// NOTE: `//` and not a { } comment. Pascal Script ends a brace comment at the
-// FIRST `}`, so writing {app} inside one closes it early and the rest of the
-// sentence is parsed as code — which is exactly how this file failed to
-// compile the first time anything actually ran ISCC against it.
-function NeedsAddPath(Param: string): Boolean;
-var
-  OldPath: string;
-begin
-  if not RegQueryStringValue(HKLM,
-    'SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
-    'Path', OldPath) then
-  begin
-    Result := True;
-    exit;
-  end;
-  Result := Pos(';' + Uppercase(Param) + ';', ';' + Uppercase(OldPath) + ';') = 0;
-end;
 
 // ---------------------------------------------------------------------------
 // The bundled ViGEmBus install

@@ -15,6 +15,7 @@ default-members = [
     "crates/ksx-games",
     "crates/ksx-backend",
     "crates/ksx-app",
+    "crates/ksx-launcher",
     "crates/ksx-studio",
     "crates/ksx-cabinet",
     "crates/ksx-fuzz",

@@ -18,13 +18,12 @@
 // until it was rewritten to walk `manifest.routes`, which is the same
 // declaration `routes` already is.)
 //
-// 2026-08-06: @getforma/compiler 0.3.1 + @getforma/build 0.2.0 are consumed
-// from disk (`file:` deps in package.json — npm publishing was down; the note
-// there says when to swap back). What that wave bought this file: the island
-// BYPRODUCT scrub is gone (build no longer emits `*.islands.js/json`), and
-// shows/islands are name-addressable so render.rs dropped its positional
-// seams. What it did NOT touch: @getforma/core, so the ledger-#13 show-branch
-// patch below stays.
+// Release baseline: published @getforma/compiler 0.3.1,
+// @getforma/build 0.2.0 and @getforma/core 2.0.0. package-lock.json resolves
+// all three from the npm registry, so `npm ci` needs no sibling forma-tools
+// checkout or machine-local junction. Compiler/build removed the island
+// BYPRODUCT scrub and positional seams; core 2.0.0 retired ledger #13(b)'s
+// show-branch bundle patch (closure note below).
 
 import { build } from "@getforma/build";
 import { readFileSync, writeFileSync } from "fs";
@@ -266,7 +265,7 @@ for (const [source, out, extra] of ART) {
 
 // ---------------------------------------------------------------------------
 // FMIR version guard (docs/research/forma-spike-1-fmir-compat.md "cheap
-// insurance"): forma-server 0.1.4 renders FMIR v2 only. Refuse to emit
+// insurance"): forma-server 0.2.0 renders FMIR v2 only. Refuse to emit
 // anything a compiler bump silently made incompatible — for EVERY route.
 // ---------------------------------------------------------------------------
 // Every route in the manifest, not a hand-kept list: a page whose IR is
@@ -283,7 +282,7 @@ for (const route of Object.keys(manifest.routes)) {
   if (magic !== "FMIR" || version !== 2) {
     throw new Error(
       `IR guard failed: ${irName} is ${magic} v${version}, expected FMIR v2 ` +
-        "(forma-server 0.1.4 contract)",
+        "(forma-server 0.2.0 contract)",
     );
   }
   if (!manifest.routes[route].js?.length) {

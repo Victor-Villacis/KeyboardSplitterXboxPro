@@ -358,20 +358,6 @@ pub(crate) fn daemon_command(session: &SessionView) -> String {
     }
 }
 
-/// The headline of the no-daemon banner, on both pages, word for word.
-///
-/// It is deliberately blunt about the SPLIT — read works, write does not —
-/// because the failure Victor hit was a page that looked completely normal and
-/// silently ignored every click.
-///
-/// The string itself lives in the TypeScript (`StatusIsland.ts` /
-/// `MapIsland.ts`) because it is static markup, not injected data — so this is
-/// the test oracle that keeps the two pages saying the same sentence, and is
-/// compiled only for tests.
-#[cfg(test)]
-pub(crate) const NO_DAEMON_HEADLINE: &str =
-    "No daemon — ksx Studio can see your config but cannot change anything.";
-
 /// Pick the art for a persona LABEL ("PlayStation (DS4) pad") or persona id
 /// ("playstation"). Anything un-PlayStation renders as the Xbox pad — the
 /// cabinet's default persona.
@@ -1232,23 +1218,28 @@ mod tests {
         );
         let page = EmbeddedPage::load("/").unwrap();
         let out = render_status(&page, &sample(), &idle_session(), None);
+        let footer = out
+            .html
+            .split_once("<footer>")
+            .and_then(|(_, rest)| rest.split_once("</footer>"))
+            .map(|(footer, _)| footer)
+            .expect("status page has no footer");
         assert!(
-            out.html.contains("Gamepad-Asset-Pack (MIT) by AL2009man"),
+            footer.contains("Gamepad-Asset-Pack (MIT) by AL2009man")
+                && footer.contains("https://github.com/AL2009man/Gamepad-Asset-Pack"),
             "{}",
             out.html
         );
-        // And the header links into every sibling screen. The nav is STATIC
-        // MARKUP duplicated per island, so a new page is invisible until this
-        // one links to it — which is exactly the regression this asserts.
-        assert!(out.html.contains(r#"href="/map""#), "{}", out.html);
-        assert!(out.html.contains(r#"href="/setup""#), "{}", out.html);
-        // …and into /pads, twice: the nav rail, and the deep link on the
-        // Virtual pads card — a page reachable only from the top nav is a
-        // page nobody finds.
+        // The customer rail is the three-stage Setup → Controls → Test flow.
+        // Pad maintenance remains discoverable from the relevant status card,
+        // without becoming a fourth primary-workflow stage.
+        assert!(out.html.contains(r#"href="/start">Setup"#), "{}", out.html);
+        assert!(out.html.contains(r#"href="/map">Controls"#), "{}", out.html);
+        assert!(out.html.contains(r#"href="/check">Test"#), "{}", out.html);
         assert_eq!(
             out.html.matches(r#"href="/pads""#).count(),
-            2,
-            "the /pads nav link AND the pad-card deep link must both be here: {}",
+            1,
+            "the pad-card maintenance link must remain discoverable: {}",
             out.html
         );
     }

@@ -377,7 +377,7 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
     };
     let Some(verb) = request.get("verb").and_then(|v| v.as_str()) else {
         return err_msg(
-            r#"request has no "verb" (status | start | stop | reload | map | map-macro | map-restore | map-clear-all | map-backups | slot-assign | stage | stage-edit | stage-commit | stage-play | learn-key | learn-poll | learn-cancel)"#,
+            r#"request has no "verb" (status | start | stop | reload | map | map-macro | map-restore | map-clear-all | map-backups | slot-assign | stage | stage-edit | stage-bind | stage-macro | stage-commit | stage-play | learn-key | learn-poll | learn-cancel)"#,
         );
     };
     match verb {
@@ -425,6 +425,8 @@ pub fn handle_request(line: &str, deps: &PipeDeps, settle: Duration) -> serde_js
         // file, no driver, no session — which is what makes exploring free.
         "stage" => stage_view(&deps.state),
         "stage-edit" => handle_stage_edit(&request, deps),
+        "stage-bind" => handle_stage_bind(&request, &deps.state),
+        "stage-macro" => handle_stage_macro(&request, &deps.state),
         "stage-commit" => handle_stage_commit(deps),
         "stage-play" => handle_stage_play(deps, settle),
         // Learn needs an IDLE daemon, and this refusal is deliberate — it was
@@ -854,6 +856,22 @@ fn stage_json(outcome: &ksx_api::StageOutcome) -> serde_json::Value {
         .unwrap_or_else(|err| err_msg(format!("the staged setup could not be described: {err}")))
 }
 
+fn bind_json(outcome: &ksx_api::BindOutcome) -> serde_json::Value {
+    serde_json::to_value(outcome).unwrap_or_else(|err| {
+        err_msg(format!(
+            "the staged binding answer could not be described: {err}"
+        ))
+    })
+}
+
+fn macro_json(outcome: &ksx_api::MacroOutcome) -> serde_json::Value {
+    serde_json::to_value(outcome).unwrap_or_else(|err| {
+        err_msg(format!(
+            "the staged macro answer could not be described: {err}"
+        ))
+    })
+}
+
 /// The staged setup as it stands. **A read: it changes nothing.**
 fn stage_view(state: &SharedState) -> serde_json::Value {
     let Ok(s) = state.lock() else {
@@ -900,15 +918,117 @@ fn handle_stage_edit(request: &serde_json::Value, deps: &PipeDeps) -> serde_json
             "the daemon's state lock is poisoned, so the staged setup could not be edited",
         ));
     };
-    match edit.apply(&s.staged) {
+    stage_json(&apply_stage_edit(&edit, &mut s))
+}
+
+/// Apply one already-typed stage edit while the caller owns the daemon state
+/// lock. Keeping this tail separate lets the staged binding/macro transactions
+/// prepare against and apply to the same snapshot without a read/write gap.
+fn apply_stage_edit(edit: &ksx_api::StageEdit, state: &mut DaemonState) -> ksx_api::StageOutcome {
+    match edit.apply(&state.staged) {
         Ok(next) => {
-            s.staged = next;
-            stage_json(&ksx_api::StageOutcome::ok(&s.staged, describe(&edit)))
+            state.staged = next;
+            ksx_api::StageOutcome::ok(&state.staged, describe(edit))
         }
         // The setup is handed back UNCHANGED, which is the whole promise: a
         // user told "no" is still looking at a true screen.
-        Err(refusal) => stage_json(&ksx_api::StageOutcome::refused(&s.staged, &refusal)),
+        Err(refusal) => ksx_api::StageOutcome::refused(&state.staged, &refusal),
     }
+}
+
+fn bind_refusal(code: &str, error: impl Into<String>) -> ksx_api::BindOutcome {
+    ksx_api::BindOutcome {
+        ok: false,
+        error: Some(error.into()),
+        code: Some(code.to_owned()),
+        ..ksx_api::BindOutcome::default()
+    }
+}
+
+fn macro_refusal(code: &str, error: impl Into<String>) -> ksx_api::MacroOutcome {
+    ksx_api::MacroOutcome {
+        ok: false,
+        error: Some(error.into()),
+        code: Some(code.to_owned()),
+        ..ksx_api::MacroOutcome::default()
+    }
+}
+
+/// Prepare, conflict-check, and apply one staged binding while holding the one
+/// staged-state lock. This closes both races in the former `stage` +
+/// `stage-edit` composition: two same-slot writers now merge serially, and two
+/// different slots cannot both win an unforced duplicate-key check.
+fn stage_bind(request: &ksx_api::StagedBindRequest, state: &SharedState) -> ksx_api::BindOutcome {
+    let Ok(mut state) = state.lock() else {
+        return bind_refusal(
+            ksx_api::codes::NOT_HERE,
+            "the daemon's state lock is poisoned, so the staged binding could not be edited",
+        );
+    };
+    let setup = ksx_api::StagedSetupView::of(&state.staged);
+    let prepared = match ksx_api::staged_bind_edit(&setup, request) {
+        Ok(prepared) => prepared,
+        Err(outcome) => return outcome,
+    };
+    let outcome = apply_stage_edit(&prepared.edit, &mut state);
+    prepared.finish(&outcome)
+}
+
+fn handle_stage_bind(request: &serde_json::Value, state: &SharedState) -> serde_json::Value {
+    let request: ksx_api::StagedBindRequest = match serde_json::from_value(request.clone()) {
+        Ok(request) => request,
+        Err(err) => {
+            return bind_json(&bind_refusal(
+                ksx_api::codes::BAD_REQUEST,
+                format!(
+                "stage-bind needs an exact slot number, a function, and its whole key list: {err}"
+            ),
+            ))
+        }
+    };
+    if request.preset.trim().is_empty() {
+        return bind_json(&bind_refusal(
+            ksx_api::codes::BAD_REQUEST,
+            "stage-bind needs the controller layout name observed with its exact player number",
+        ));
+    }
+    bind_json(&stage_bind(&request, state))
+}
+
+/// The macro counterpart of [`stage_bind`], with exact-slot selection and
+/// whole-table validation inside the same critical section as application.
+fn stage_macro(
+    request: &ksx_api::StagedMacroRequest,
+    state: &SharedState,
+) -> ksx_api::MacroOutcome {
+    let Ok(mut state) = state.lock() else {
+        return macro_refusal(
+            ksx_api::codes::NOT_HERE,
+            "the daemon's state lock is poisoned, so the staged macro could not be edited",
+        );
+    };
+    let setup = ksx_api::StagedSetupView::of(&state.staged);
+    let prepared = match ksx_api::staged_macro_edit_for_setup(&setup, request) {
+        Ok(prepared) => prepared,
+        Err(outcome) => return outcome,
+    };
+    let outcome = apply_stage_edit(&prepared.edit, &mut state);
+    prepared.finish(&outcome)
+}
+
+fn handle_stage_macro(request: &serde_json::Value, state: &SharedState) -> serde_json::Value {
+    let request: ksx_api::StagedMacroRequest = match serde_json::from_value(request.clone()) {
+        Ok(request) => request,
+        Err(err) => {
+            return macro_json(&macro_refusal(
+                ksx_api::codes::BAD_REQUEST,
+                format!(
+                    "stage-macro needs an exact slot number and one complete macro write: {err}"
+                ),
+            ))
+        }
+    };
+    macro_json(&stage_macro(&request, state))
 }
 
 /// The one line a successful edit prints. Composed here, once, so the browser
@@ -916,33 +1036,36 @@ fn handle_stage_edit(request: &serde_json::Value, deps: &PipeDeps) -> serde_json
 fn describe(edit: &ksx_api::StageEdit) -> String {
     match edit {
         ksx_api::StageEdit::ChooseDevice { label, .. } => {
-            format!("using \"{label}\" — nothing has been claimed or written")
+            format!("Using \"{label}\". This choice stays on this screen until Save or Play.")
         }
         ksx_api::StageEdit::AddSlot { layout, .. } => match layout {
-            Some(_) => "controller staged with its layout — nothing is plugged, and nothing has \
-                        been written"
+            Some(_) => "Controller added with its layout. It will appear only when you press Play."
                 .to_owned(),
             // Said out loud, because it is the state `commit()` refuses: the
             // pad would plug and do nothing, and the flash is where a user
             // finds that out while it is still one click to fix.
-            None => "controller staged with NO bindings — give it a layout or map a control, or \
-                     it will plug a pad that does nothing"
+            None => "Controller added without controls. Choose a layout or map its controls \
+                     before Play."
                 .to_owned(),
         },
         ksx_api::StageEdit::SetLayout { number, layout, .. } => {
-            format!("slot {number} now uses the \"{layout}\" layout — in memory, not in a file")
+            format!(
+                "Player {number} now uses the \"{layout}\" layout. This change is still on this screen."
+            )
         }
         ksx_api::StageEdit::SetPersona { number, .. } => {
-            format!("slot {number} changed — free, because nothing was written")
+            format!("Player {number}'s controller changed. This change is still on this screen.")
         }
-        ksx_api::StageEdit::SetBindings { number, .. } => format!("slot {number}'s bindings"),
+        ksx_api::StageEdit::SetBindings { number, .. } => {
+            format!("Player {number}'s controls were updated.")
+        }
         ksx_api::StageEdit::RemoveSlot { number } => {
-            format!("slot {number} removed — no file, no backup, no trace")
+            format!("Player {number} was removed from this setup.")
         }
         ksx_api::StageEdit::SetBlocking { .. } => {
-            "answered — and LeftCtrl five times always stops emulation, in either mode".to_owned()
+            "Answered. LeftCtrl five times always stops Play, in either mode.".to_owned()
         }
-        ksx_api::StageEdit::Discard => "started over".to_owned(),
+        ksx_api::StageEdit::Discard => "Started over.".to_owned(),
     }
 }
 
@@ -953,7 +1076,7 @@ fn describe(edit: &ksx_api::StageEdit) -> String {
 /// "saving and playing are separate acts", and `SURFACES.md` §3's rule that
 /// claiming is always explicit and separately confirmed.
 fn handle_stage_commit(deps: &PipeDeps) -> serde_json::Value {
-    let Ok(s) = deps.state.lock() else {
+    let Ok(mut s) = deps.state.lock() else {
         return stage_json(&ksx_api::StageOutcome::unavailable(
             "the daemon's state lock is poisoned, so the staged setup could not be saved",
         ));
@@ -972,6 +1095,12 @@ fn handle_stage_commit(deps: &PipeDeps) -> serde_json::Value {
     };
     match (deps.stage_commit)(&spec) {
         Ok(written) => {
+            // The operate-only cabinet and the tray's saved-setup Start action
+            // become meaningful at this exact boundary: before it, the setup
+            // exists only as a Studio draft; after it, disk has a runnable
+            // configuration. Keep the first-run tray honest immediately,
+            // without requiring a daemon restart.
+            s.cabinet_ready = true;
             let mut outcome = ksx_api::StageOutcome::ok(&s.staged, written.message());
             outcome.saved = Some(written.config.display().to_string());
             outcome.backup = written.backup.map(|path| path.display().to_string());
@@ -1024,17 +1153,10 @@ fn handle_stage_play(deps: &PipeDeps, settle: Duration) -> serde_json::Value {
         ));
     }
 
+    // `PlayStaged` is one control-loop replacement operation. If a session is
+    // already live, the loop tears it down completely and starts this setup;
+    // it never asks the browser to coordinate a stop/start race.
     let baseline = snapshot(&deps.state).run;
-    if matches!(baseline, RunState::Running { .. } | RunState::Starting) {
-        return stage_json(&ksx_api::StageOutcome::refused(
-            &staged,
-            &ksx_api::Refusal::with_remedy(
-                ksx_api::codes::REFUSED,
-                "a session is already running, so the staged setup was not started",
-                "stop it first (`ksx session stop`), then play again",
-            ),
-        ));
-    }
     if deps
         .tx
         .send(DaemonCommand::PlayStaged(Box::new(spec)))
@@ -1565,7 +1687,7 @@ pub mod server {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
 
     use crossbeam_channel::unbounded;
 
@@ -1865,6 +1987,26 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
                 layout: "keyboard-wasd".into(),
                 player: None,
             })),
+            Request::StageBind(Box::new(ksx_api::StagedBindRequest {
+                number: 1,
+                preset: "IPAC P1".into(),
+                function: "Guide".into(),
+                keys: vec!["LeftWindows".into()],
+                ..ksx_api::StagedBindRequest::default()
+            })),
+            Request::StageMacro(Box::new(ksx_api::StagedMacroRequest {
+                number: 1,
+                write: ksx_api::MacroWrite {
+                    preset: "IPAC P1".into(),
+                    name: "coin-pulse".into(),
+                    steps: vec![ksx_api::MacroStepView {
+                        hold: vec!["A".into()],
+                        ms: Some(50),
+                        ..ksx_api::MacroStepView::default()
+                    }],
+                    ..ksx_api::MacroWrite::default()
+                },
+            })),
             Request::StageEdit(Box::new(ksx_api::StageEdit::SetBlocking {
                 blocking: "bound-keys".into(),
             })),
@@ -1898,7 +2040,9 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
                         Response::Action(_)
                     )
                     | (Request::Map(_), Response::Map(_))
+                    | (Request::StageBind(_), Response::Map(_))
                     | (Request::MapMacro(_), Response::Macro(_))
+                    | (Request::StageMacro(_), Response::Macro(_))
                     | (
                         Request::MapRestore(_) | Request::MapClearAll(_),
                         Response::Restore(_)
@@ -1933,10 +2077,22 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
                     assert_eq!(answer.preset.as_deref(), Some("IPAC P1"));
                     assert!(answer.path.is_some());
                 }
-                (_, Response::Macro(answer)) => {
+                (Request::MapMacro(_), Response::Macro(answer)) => {
                     assert!(answer.ok, "{said}");
                     assert_eq!(answer.name.as_deref(), Some("hadouken"));
                     assert!(answer.backup.is_some(), "every macro write leaves an undo");
+                }
+                (Request::StageBind(_), Response::Map(answer)) => {
+                    assert!(answer.ok, "{said}");
+                    assert!(!answer.reloaded, "staging cannot claim a live reload");
+                }
+                (Request::StageMacro(_), Response::Macro(answer)) => {
+                    assert!(answer.ok, "{said}");
+                    assert!(
+                        answer.backup.is_none(),
+                        "memory-only staging has no file backup"
+                    );
+                    assert!(!answer.reloaded, "staging cannot claim a live reload");
                 }
                 (_, Response::Restore(answer)) => {
                     assert!(answer.ok, "{said}");
@@ -2195,6 +2351,30 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
         assert_eq!(answered["ok"], true, "{answered}");
     }
 
+    /// Build N deliberately blank staged controllers. Blank layouts keep the
+    /// concurrency assertions about only the keys each thread writes, while
+    /// the normal stage-edit path still validates and owns the setup.
+    fn stage_blank_slots(deps: &PipeDeps, count: u8) {
+        let chosen = handle_request(
+            r#"{"verb":"stage-edit","edit":"choose-device","selector":"usb:d209:0430:00",
+                "alias":"panel","label":"I-PAC"}"#,
+            deps,
+            FAST,
+        );
+        assert_eq!(chosen["ok"], true, "{chosen}");
+        for number in 1..=count {
+            let added = handle_request(
+                &format!(
+                    r#"{{"verb":"stage-edit","edit":"add-slot","number":{number},
+                        "persona":"playstation","preset":"P{number}"}}"#
+                ),
+                deps,
+                FAST,
+            );
+            assert_eq!(added["ok"], true, "{added}");
+        }
+    }
+
     /// **The whole point of §2, over the wire: staging writes nothing and
     /// starts nothing.**
     ///
@@ -2322,6 +2502,138 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
         assert_eq!(typo["code"], ksx_api::codes::BAD_REQUEST, "{typo}");
     }
 
+    #[test]
+    fn stale_stage_bind_and_macro_slots_are_refused_without_touching_slot_one() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let deps = deps(tx, state.clone(), no_profiles());
+        stage_blank_slots(&deps, 1);
+        let before = state.lock().unwrap().staged.clone();
+
+        let bind = handle_request(
+            r#"{"verb":"stage-bind","number":9,"preset":"P9","function":"A","keys":["G"]}"#,
+            &deps,
+            FAST,
+        );
+        assert_eq!(bind["ok"], false, "{bind}");
+        assert_eq!(bind["code"], ksx_api::codes::BAD_SLOT, "{bind}");
+
+        let mac = handle_request(
+            r#"{"verb":"stage-macro","number":9,"preset":"P1","name":"m",
+                "steps":[{"hold":["A"],"ms":50}]}"#,
+            &deps,
+            FAST,
+        );
+        assert_eq!(mac["ok"], false, "{mac}");
+        assert_eq!(mac["code"], ksx_api::codes::BAD_SLOT, "{mac}");
+        assert_eq!(
+            state.lock().unwrap().staged,
+            before,
+            "neither stale target may be redirected to the first slot"
+        );
+    }
+
+    #[test]
+    fn concurrent_same_slot_stage_binds_merge_without_lost_updates() {
+        // Repeated starts make thread scheduling irrelevant to the assertion:
+        // every round begins empty and both writes must be present after the
+        // two transactions complete, whichever lock acquisition wins first.
+        for round in 0..16 {
+            let state = shared(RunState::Stopped);
+            let (tx, _rx) = unbounded();
+            let deps = deps(tx, state.clone(), no_profiles());
+            stage_blank_slots(&deps, 1);
+            let barrier = Arc::new(Barrier::new(3));
+            let spawn = |function: &'static str,
+                         key: &'static str,
+                         state: SharedState,
+                         barrier: Arc<Barrier>| {
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    stage_bind(
+                        &ksx_api::StagedBindRequest {
+                            number: 1,
+                            preset: "P1".into(),
+                            function: function.into(),
+                            keys: vec![key.into()],
+                            ..ksx_api::StagedBindRequest::default()
+                        },
+                        &state,
+                    )
+                })
+            };
+            let a = spawn("A", "G", state.clone(), barrier.clone());
+            let b = spawn("B", "H", state.clone(), barrier.clone());
+            barrier.wait();
+            assert!(a.join().unwrap().ok, "round {round}: A write refused");
+            assert!(b.join().unwrap().ok, "round {round}: B write refused");
+
+            let setup = ksx_api::StagedSetupView::of(&state.lock().unwrap().staged);
+            let mapper = ksx_api::staged_mapper_snapshot(&setup);
+            let bindings = &mapper.slots[0].bindings;
+            assert_eq!(
+                bindings.get("A"),
+                Some(&vec!["G".to_owned()]),
+                "round {round}"
+            );
+            assert_eq!(
+                bindings.get("B"),
+                Some(&vec!["H".to_owned()]),
+                "round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_unforced_cross_slot_duplicate_allows_exactly_one_writer() {
+        for round in 0..16 {
+            let state = shared(RunState::Stopped);
+            let (tx, _rx) = unbounded();
+            let deps = deps(tx, state.clone(), no_profiles());
+            stage_blank_slots(&deps, 2);
+            let barrier = Arc::new(Barrier::new(3));
+            let spawn =
+                |number: u8, function: &'static str, state: SharedState, barrier: Arc<Barrier>| {
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        stage_bind(
+                            &ksx_api::StagedBindRequest {
+                                number,
+                                preset: format!("P{number}"),
+                                function: function.into(),
+                                keys: vec!["G".into()],
+                                force: false,
+                                ..ksx_api::StagedBindRequest::default()
+                            },
+                            &state,
+                        )
+                    })
+                };
+            let one = spawn(1, "A", state.clone(), barrier.clone());
+            let two = spawn(2, "B", state.clone(), barrier.clone());
+            barrier.wait();
+            let outcomes = [one.join().unwrap(), two.join().unwrap()];
+            assert_eq!(
+                outcomes.iter().filter(|outcome| outcome.ok).count(),
+                1,
+                "round {round}: {outcomes:?}"
+            );
+            let refused = outcomes.iter().find(|outcome| !outcome.ok).unwrap();
+            assert_eq!(refused.code.as_deref(), Some(ksx_api::codes::CONFLICT));
+
+            let setup = ksx_api::StagedSetupView::of(&state.lock().unwrap().staged);
+            let mapper = ksx_api::staged_mapper_snapshot(&setup);
+            let owners = mapper
+                .slots
+                .iter()
+                .flat_map(|slot| slot.bindings.values())
+                .flatten()
+                .filter(|key| key.eq_ignore_ascii_case("G"))
+                .count();
+            assert_eq!(owners, 1, "round {round}: duplicate crossed slots");
+        }
+    }
+
     /// Removing a staged controller is free and complete, and "Start over"
     /// always works.
     #[test]
@@ -2338,7 +2650,10 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
         );
         assert_eq!(removed["ok"], true, "{removed}");
         assert!(
-            removed["message"].as_str().unwrap().contains("no trace"),
+            removed["message"]
+                .as_str()
+                .unwrap()
+                .contains("removed from this setup"),
             "{removed}"
         );
         assert!(removed["setup"]["slots"].as_array().unwrap().is_empty());
@@ -2386,6 +2701,37 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
         assert_eq!(
             refused["error"], view["setup"]["not_ready"],
             "Save must refuse in the words the screen was already showing"
+        );
+    }
+
+    /// A successful first-run Save immediately unlocks the operate-only tray
+    /// actions. Requiring a daemon restart here would leave the cabinet item
+    /// gray even though the setup it needs is already on disk.
+    #[test]
+    fn saving_the_first_setup_marks_cabinet_controls_ready() {
+        let state = shared(RunState::Stopped);
+        let (tx, _rx) = unbounded();
+        let mut deps = deps(tx, state.clone(), no_profiles());
+        deps.stage_commit = Box::new(|_| {
+            Ok(crate::stage::Committed {
+                config: std::path::PathBuf::from(r"C:\cfg\config.toml"),
+                backup: None,
+                presets: vec![std::path::PathBuf::from(r"C:\cfg\presets\P1.toml")],
+                preset_backups: Vec::new(),
+                alias: "panel".to_owned(),
+                slots: vec![1],
+            })
+        });
+        stage_ready(&deps);
+
+        assert!(!state.lock().unwrap().cabinet_ready);
+        let saved = handle_request(r#"{"verb":"stage-commit"}"#, &deps, FAST);
+        assert_eq!(saved["ok"], true, "{saved}");
+        let menu = state.lock().unwrap().menu();
+        assert!(menu[1].2, "cabinet controls should unlock after Save");
+        assert!(
+            menu[2].2,
+            "the saved setup should be startable from the tray"
         );
     }
 
@@ -2507,8 +2853,8 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
         assert!(rx.try_recv().is_err(), "nothing may be enqueued");
     }
 
-    /// Playing an incomplete setup is refused before anything is enqueued, and
-    /// so is playing while a session is already running.
+    /// Playing an incomplete setup is refused before anything is enqueued.
+    /// A live session is different: Play enqueues one replacement command.
     #[test]
     fn playing_refuses_before_enqueuing_anything() {
         let state = shared(RunState::Stopped);
@@ -2521,13 +2867,23 @@ steps = [{ hold = ["dpad.down"], ms = 50 }, { hold = ["A"], frames = 2 }]
 
         stage_ready(&deps);
         state.lock().unwrap().run = RunState::Running { slots: 4 };
-        let busy = handle_request(r#"{"verb":"stage-play"}"#, &deps, FAST);
-        assert_eq!(busy["ok"], false, "{busy}");
+        let worker = std::thread::spawn({
+            let state = state.clone();
+            move || {
+                let command = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                state.lock().unwrap().run = RunState::Starting;
+                std::thread::sleep(Duration::from_millis(20));
+                state.lock().unwrap().run = RunState::Running { slots: 1 };
+                command
+            }
+        });
+        let replaced = handle_request(r#"{"verb":"stage-play"}"#, &deps, Duration::from_secs(1));
+        assert_eq!(replaced["ok"], true, "{replaced}");
+        assert_eq!(replaced["playing"], true, "{replaced}");
         assert!(
-            busy["error"].as_str().unwrap().contains("already running"),
-            "{busy}"
+            matches!(worker.join().unwrap(), DaemonCommand::PlayStaged(_)),
+            "a running session must be replaced by one staged-play command"
         );
-        assert!(rx.try_recv().is_err(), "nothing may be enqueued");
     }
 
     #[test]

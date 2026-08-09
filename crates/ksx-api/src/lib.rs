@@ -90,19 +90,22 @@ pub use live::{
 pub use live_pipe::PipeLiveSource;
 pub use machine::{
     pad_bus_codes, setup_states, setup_steps, AdviceRow, AutostartView, BoardRow, ConfigExport,
-    ConfiguredDevice, DevicePickSpec, DevicePickView, DeviceRemoveSpec, DeviceRemoveView,
-    DeviceScanView, DevicesView, DoctorRow, DoctorView, ExportRequest, ImportReport, ImportRequest,
-    ImportWrite, KeyboardRow, MachineSource, NewPreset, NewProfile, PadBusView, PadsSpawnSpec,
-    PadsView, PresetRow, PresetsView, ProfileDetail, ProfilesView, PrunePlanView, SetupDeviceRow,
-    SetupSlotRow, SetupStep, SetupView, SpawnOffer, SpawnOption, TemplateRow, UsbRow,
-    VirtualPadRow, WinusbView, CAVEAT_NOT_A_KEYBOARD, CLAIM_LEAD, INSTALL_BUS_REMEDY,
-    NO_BOARDS_LINE, NO_BUS_READ_REMEDY, RELEASE_LEAD, UNREAD_BOARDS_LINE, UNREAD_CONFIGURED_LINE,
+    ConfiguredDevice, DeleteProfile, DevicePickSpec, DevicePickView, DeviceRemoveSpec,
+    DeviceRemoveView, DeviceScanView, DevicesView, DoctorRow, DoctorView, ExportRequest,
+    ImportReport, ImportRequest, ImportWrite, KeyboardRow, MachineSource, NewPreset, NewProfile,
+    PadBusView, PadsSpawnSpec, PadsView, PresetRow, PresetsView, ProfileDetail, ProfilesView,
+    PrunePlanView, SetupDeviceRow, SetupSlotRow, SetupStep, SetupView, SpawnOffer, SpawnOption,
+    TemplateRow, UpdateProfile, UsbRow, VirtualPadRow, WinusbView, CAVEAT_NOT_A_KEYBOARD,
+    CLAIM_LEAD, INSTALL_BUS_REMEDY, NO_BOARDS_LINE, NO_BUS_READ_REMEDY, RELEASE_LEAD,
+    UNREAD_BOARDS_LINE, UNREAD_CONFIGURED_LINE,
 };
 pub use pipe::{PipeTransport, TransportError, NO_CHANNEL};
 pub use refusal::{codes, Refusal, Refused};
 pub use stage::{
-    preset_name_for_slot, BlockingOption, PersonaOption, StageEdit, StageOutcome, StagedDeviceView,
-    StagedSetupView, StagedSlotView,
+    preset_name_for_slot, staged_bind_edit, staged_macro_edit, staged_macro_edit_for_setup,
+    staged_macro_snapshot, staged_mapper_slot, staged_mapper_snapshot, staged_slot_bind_edit,
+    BlockingOption, PersonaOption, StageEdit, StageOutcome, StagedBindEdit, StagedBindRequest,
+    StagedDeviceView, StagedMacroEdit, StagedMacroRequest, StagedSetupView, StagedSlotView,
 };
 pub use status::{
     MacroSnapshot, MacroStepView, MacroView, MapperSlot, MapperSnapshot, PadRow, ProfileRow,

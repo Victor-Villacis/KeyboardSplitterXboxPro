@@ -384,15 +384,14 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
     }
 }
 
-/// **`docs/FIRST-RUN.md` §4 bullet 2.** The post-install offer hands over the
-/// product.
+/// **The post-install offer hands over the product without opening a console.**
 ///
 /// Fails against the audited version, whose only `[Run]` line was
 /// `Parameters: "doctor"; Description: "Check drivers and hardware now (ksx
 /// doctor)"`. A user who ticked the single checkbox the installer offers got a
 /// console of driver tables — a developer verb — as their first sight of ksx.
 #[test]
-fn the_post_install_offer_opens_ksx_and_runs_no_diagnostic() {
+fn the_post_install_offer_uses_the_console_free_launcher() {
     let text = script();
     let run = section(&text, "[Run]");
     let offers: Vec<&String> = run
@@ -408,22 +407,48 @@ fn the_post_install_offer_opens_ksx_and_runs_no_diagnostic() {
     );
     let offer = offers[0];
     assert_eq!(
-        field(offer, "Parameters").as_deref(),
-        Some("open"),
-        "the hand-off must be `ksx open` (FIRST-RUN.md §4 bullet 2): {offer}"
+        field(offer, "Filename").as_deref(),
+        Some("{app}\\{#LauncherExe}"),
+        "the hand-off must target the GUI-subsystem launcher, not console-subsystem \
+         ksx.exe: {offer}"
     );
+    assert_eq!(
+        field(offer, "Parameters"),
+        None,
+        "the launcher owns the one customer action (`ksx.exe open`), so the \
+         installer must not carry a second argument contract: {offer}"
+    );
+    let flags = field(offer, "Flags").unwrap_or_default();
+    for required in ["nowait", "runasoriginaluser"] {
+        assert!(
+            flags.split_whitespace().any(|flag| flag == required),
+            "the post-install launcher needs `{required}`: {offer}"
+        );
+    }
     for line in &run {
         assert_ne!(
             field(line, "Parameters").as_deref(),
             Some("doctor"),
-            "no [Run] entry may run the diagnostic; doctor lives on the advanced \
-             Start-menu folder now: {line}"
+            "no [Run] entry may run the diagnostic: {line}"
         );
     }
 }
 
-/// **`docs/FIRST-RUN.md` §4 bullets 1 and 4.** The desktop icon is on by
-/// default; PATH is not.
+/// The installer's last page must not replace the guided app with the legacy
+/// terminal-first Quickstart. Engineering docs are installed for support, but
+/// they are not the customer hand-off.
+#[test]
+fn the_installer_does_not_show_a_cli_runbook_after_install() {
+    let text = script();
+    let setup = section(&text, "[Setup]");
+    assert!(
+        !setup.iter().any(|line| line.starts_with("InfoAfterFile=")),
+        "Finish must hand off to the app, not render a Markdown/CLI runbook: {setup:?}"
+    );
+}
+
+/// **The desktop icon is on by default; the customer installer has no PATH
+/// integration at all.**
 ///
 /// Fails against the audited version in both directions at once: `desktopicon`
 /// carried `Flags: unchecked` — so declining the launch prompt left nothing on
@@ -431,7 +456,7 @@ fn the_post_install_offer_opens_ksx_and_runs_no_diagnostic() {
 /// all, so every install edited a machine-wide environment variable to buy a
 /// customer who never opens a shell precisely nothing.
 #[test]
-fn the_desktop_icon_is_default_and_path_is_not() {
+fn the_desktop_icon_is_default_and_path_is_not_a_customer_task() {
     let text = script();
     let tasks = section(&text, "[Tasks]");
     let find = |name: &str| -> String {
@@ -450,30 +475,37 @@ fn the_desktop_icon_is_default_and_path_is_not() {
         "the desktop icon must be checked by default (FIRST-RUN.md §4 bullet 1): {desktop}"
     );
 
-    let path = find("addtopath");
     assert!(
-        field(&path, "Flags")
-            .unwrap_or_default()
-            .contains("unchecked"),
-        "PATH must stay opt-in and unchecked (FIRST-RUN.md §4 bullet 4): {path}"
+        !tasks
+            .iter()
+            .any(|line| field(line, "Name").as_deref() == Some("addtopath")),
+        "the customer installer must not advertise a terminal integration task: {tasks:?}"
+    );
+    assert!(
+        !text.lines().any(|line| line.trim() == "[Registry]")
+            && !text.contains("ValueName: \"Path\""),
+        "removing the PATH checkbox must also remove the registry mutation behind it"
     );
 }
 
-/// **`docs/FIRST-RUN.md` §4 bullet 3.** One Start-menu entry, and it is the
-/// product.
+/// **One Start-menu entry, and it is the same console-free product launcher as
+/// the desktop icon.**
 ///
 /// Fails against the audited version, which put five names at the top level of
 /// the Start-menu group — `ksx`, `ksx daemon (tray only)`, `ksx Studio (serve
 /// only)`, `ksx cabinet`, `ksx setup wizard` — and gave a new user no way to
 /// rank them.
 ///
-/// It fails against the other wrong fix too: deleting the four. They stay
-/// reachable without a shell, so this asserts they moved one level down rather
-/// than out of the installer.
 #[test]
-fn the_start_menu_offers_one_thing_and_keeps_the_rest_one_level_down() {
+fn customer_shortcuts_offer_only_the_console_free_product_launcher() {
     let text = script();
     let icons = section(&text, "[Icons]");
+    assert_eq!(
+        icons.len(),
+        2,
+        "[Icons] may contain only the Start-menu product entry and its optional \
+         desktop twin; CLI/dev surfaces are not customer shortcuts: {icons:?}"
+    );
     let group: Vec<(String, String)> = icons
         .iter()
         .filter_map(|line| {
@@ -496,27 +528,17 @@ fn the_start_menu_offers_one_thing_and_keeps_the_rest_one_level_down() {
         "{#AppName}",
         "the one entry is ksx itself, not a verb: {line}"
     );
-    assert_eq!(
-        field(line, "Parameters").as_deref(),
-        Some("open"),
-        "and it opens the app rather than starting a daemon behind a tray icon \
-         (docs/M9-DECISION.md §4 item 1): {line}"
-    );
-
-    // The verbs are not deleted. Every other surface keeps a shortcut one level
-    // down, which for a user who never opens a shell is the only place it
-    // exists at all.
-    let nested: Vec<&String> = group
-        .iter()
-        .filter(|(n, _)| n.contains('\\'))
-        .map(|(_, line)| line)
-        .collect();
-    for verb in ["daemon", "studio", "cabinet", "setup"] {
-        assert!(
-            nested
-                .iter()
-                .any(|line| field(line.as_str(), "Parameters").as_deref() == Some(verb)),
-            "`ksx {verb}` must keep a shortcut in the advanced folder, not lose one: {nested:?}"
+    for entry in &icons {
+        assert_eq!(
+            field(entry, "Filename").as_deref(),
+            Some("{app}\\{#LauncherExe}"),
+            "every customer shortcut must target the GUI-subsystem launcher: {entry}"
+        );
+        assert_eq!(
+            field(entry, "Parameters"),
+            None,
+            "the launcher owns `ksx.exe open`; shortcut arguments would duplicate \
+             that contract: {entry}"
         );
     }
 
@@ -528,14 +550,59 @@ fn the_start_menu_offers_one_thing_and_keeps_the_rest_one_level_down() {
         })
         .expect("a desktop icon entry");
     assert_eq!(
-        field(desktop, "Parameters").as_deref(),
-        Some("open"),
-        "the desktop icon and the Start-menu entry are the same act: {desktop}"
-    );
-    assert_eq!(
         field(desktop, "Tasks").as_deref(),
         Some("desktopicon"),
         "the desktop icon stays tied to its task: {desktop}"
+    );
+    assert!(
+        !group.iter().any(|(name, _)| name.contains('\\')),
+        "there must be no nested advanced/dev shortcut folder: {group:?}"
+    );
+    assert!(
+        !text.contains("AdvancedGroup"),
+        "the removed advanced shortcut group must not survive as dead installer configuration"
+    );
+}
+
+/// The installer lays down both halves of the hand-off, and CI builds both
+/// before invoking ISCC. A shortcut to an uninstalled launcher is a product
+/// that installs successfully and then appears to do nothing.
+#[test]
+fn installer_and_ci_package_the_launcher_beside_ksx() {
+    let text = script();
+    let files = section(&text, "[Files]");
+    let sources: Vec<String> = files
+        .iter()
+        .filter_map(|line| field(line, "Source"))
+        .collect();
+    for expected in [
+        "{#RepoRoot}\\target\\release\\{#AppExe}",
+        "{#RepoRoot}\\target\\release\\{#LauncherExe}",
+    ] {
+        assert!(
+            sources.iter().any(|source| source == expected),
+            "the installer must copy {expected}: {sources:?}"
+        );
+    }
+
+    let workflow = workflow("build-installer.yml");
+    let app_build = "cargo build --release -p ksx-app --features cabinet,studio";
+    let launcher_build = "cargo build --release -p ksx-launcher";
+    assert!(
+        workflow.contains(app_build),
+        "the shipping workflow must build ksx.exe with both UI features"
+    );
+    assert!(
+        workflow.contains(launcher_build),
+        "the shipping workflow must build ksx-launcher.exe before ISCC packages it"
+    );
+    let launcher_at = workflow.find(launcher_build).expect("asserted above");
+    let iscc_at = workflow
+        .find("& $iscc /Qp 'packaging\\ksx.iss'")
+        .expect("build-installer.yml invokes ISCC");
+    assert!(
+        launcher_at < iscc_at,
+        "the launcher must exist before ISCC reads its [Files] entry"
     );
 }
 

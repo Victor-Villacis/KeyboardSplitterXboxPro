@@ -60,11 +60,9 @@
 //! anchors are read out of the tree, so a claim of a shipped face fails the
 //! moment the thing backing it is gone.
 //!
-//! It also cannot see a verb a row does not name. §10 records one live example:
-//! `/profiles/new` creates a games.toml profile and there is no `ksx games new`,
-//! so §2's build order ran 1 → 3 with the CLI skipped. The row says "owns" and
-//! the guard agrees, because the row names `slot assign` and `config import` and
-//! both exist. A guard cannot check a claim nobody wrote down.
+//! A profile CRUD row now names the still-planned CLI verbs explicitly, so the
+//! guard no longer hides their absence inside configuration verbs that happen
+//! to exist.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -248,10 +246,12 @@ fn studio_routes() -> &'static BTreeSet<String> {
         let chain = &text[start..start + guard];
 
         let mut out = BTreeSet::new();
-        for (at, _) in chain.match_indices(".route(\"") {
-            let rest = &chain[at + ".route(\"".len()..];
-            if let Some(end) = rest.find('"') {
-                out.insert(rest[..end].to_string());
+        for (at, _) in chain.match_indices(".route(") {
+            let rest = chain[at + ".route(".len()..].trim_start();
+            if let Some(rest) = rest.strip_prefix('"') {
+                if let Some(end) = rest.find('"') {
+                    out.insert(rest[..end].to_string());
+                }
             }
         }
         assert!(
@@ -511,12 +511,18 @@ const ANCHORS: &[Anchors] = &[
         studio: &["/map", "/map/bind"],
     },
     Anchors {
-        capability: "Edit config, profiles",
+        capability: "Edit configuration",
         cli: &["slot list", "slot assign", "config export", "config import"],
         // `Ask::Assign` IS the "slot→preset only" cell: the Presets screen
         // builds one, and `assign_destination` decides which file it lands in.
         egui: &["Ask::Assign"],
-        studio: &["/setup/slot", "/profiles/new"],
+        studio: &["/setup/slot", "/setup/import"],
+    },
+    Anchors {
+        capability: "Create / update / delete profiles",
+        cli: &["games new", "games update", "games delete"],
+        egui: &["Screen::Profiles"],
+        studio: &["/profiles/new", "/profiles/update", "/profiles/delete"],
     },
     Anchors {
         capability: "Device pick / remove",
@@ -536,9 +542,9 @@ const ANCHORS: &[Anchors] = &[
         capability: "\"Press a button, see it light\"",
         cli: &["monitor"],
         egui: &["Screen::ButtonCheck"],
-        // §8: "no feed on AppState, no frame type, no handler". The feed is the
-        // load-bearing half — a page without one is a layout.
-        studio: &["/buttons", "/api/feed"],
+        // §5/§8: `/check` carries the roster and `/api/live` carries the SSE
+        // frames. Both are load-bearing — a page without the feed is a layout.
+        studio: &["/check", "/api/live"],
     },
     Anchors {
         capability: "Is it working: pads, drivers",
@@ -909,8 +915,8 @@ fn the_guard_is_still_bound_to_the_documents_and_the_tree_it_reads() {
     // Only where the ROW SAYS THE VERB IS THERE. A `planned` CLI cell anchored
     // on a name that does not resolve is not a stale anchor — it is the claim
     // (§3c). The egui and Studio columns have always worked this way:
-    // `Screen::Mapper` and `/buttons` name nothing, which is exactly what makes
-    // their cells honest, and the CLI column was the odd one out until the
+    // `Screen::Mapper` and `/winusb/claim` name nothing, which is exactly what
+    // makes their cells honest, and the CLI column was the odd one out until the
     // first row with a genuinely planned CLI half arrived.
     //
     // Nothing is lost by narrowing it. A `owns` cell whose verb was renamed or

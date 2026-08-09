@@ -19,10 +19,9 @@ import { h, createSignal, createList, createShow } from "@getforma/core";
 //   - The persona list is a ROSTER with a can_plug flag per entry. Hardcoding
 //     five names would keep offering `dualsense` after it starts plugging, or
 //     keep offering it while it cannot.
-//   - The split-or-freeze wording, the escape hatch and the per-session scope
-//     are §3's own words about what the CAPTURE THREAD does. Paraphrasing the
-//     first one is not a style slip: it is the only thing standing between a
-//     frozen keyboard and a reboot.
+//   - The split-or-freeze wording, the escape hatch and its scope are safety
+//     facts. Paraphrasing the first one is not a style slip: it is the only
+//     thing standing between a frozen keyboard and a reboot.
 //
 // Compiler constraints honored below (see render.rs): dynamic text/attrs are
 // bare `() => signalName()` calls, list sources are bare `() => listSignal()`,
@@ -46,6 +45,8 @@ export interface StartLines {
   ready_line: string;
   play_line: string;
   guide_line: string;
+  escape_line: string;
+  scope_line: string;
   stage_error: string;
   scan_error: string;
   presets_error: string;
@@ -61,6 +62,7 @@ export interface StartFlags {
   bus_warn: boolean;
   has_device: boolean;
   has_boards: boolean;
+  has_experimental: boolean;
   no_boards: boolean;
   has_other: boolean;
   has_notes: boolean;
@@ -109,6 +111,7 @@ export interface StartSlotRow {
   xinput: string;
   preset: string;
   bindings: string;
+  map_href: string;
 }
 
 export interface StartOptionRow {
@@ -142,6 +145,7 @@ export interface StartTextRow {
 
 export interface StartRows {
   boards: StartBoardRow[];
+  experimental: StartBoardRow[];
   other: StartOtherRow[];
   notes: StartTextRow[];
   slots: StartSlotRow[];
@@ -228,6 +232,7 @@ const [presetsDown, setPresetsDown] = createSignal(false);
 const [busWarn, setBusWarn] = createSignal(false);
 const [hasDevice, setHasDevice] = createSignal(false);
 const [hasBoards, setHasBoards] = createSignal(false);
+const [hasExperimental, setHasExperimental] = createSignal(false);
 const [noBoards, setNoBoards] = createSignal(false);
 const [hasOther, setHasOther] = createSignal(false);
 const [hasNotes, setHasNotes] = createSignal(false);
@@ -245,6 +250,7 @@ const [flashOk, setFlashOk] = createSignal(false);
 const [flashError, setFlashError] = createSignal(false);
 
 const [boardRows, setBoardRows] = createSignal<StartBoardRow[]>([]);
+const [experimentalRows, setExperimentalRows] = createSignal<StartBoardRow[]>([]);
 const [otherRows, setOtherRows] = createSignal<StartOtherRow[]>([]);
 const [noteRows, setNoteRows] = createSignal<StartTextRow[]>([]);
 const [slotRows, setSlotRows] = createSignal<StartSlotRow[]>([]);
@@ -288,11 +294,8 @@ export function applyStart(p: StartPayload): void {
   setStageError(l.stage_error);
   setScanError(l.scan_error);
   setPresetsError(l.presets_error);
-  // §3's two must-says, straight off the staged view. Not composed here and
-  // not composed in the seam either — they are `ksx_api::ESCAPE_HATCH_LINE`
-  // and `BLOCKING_SCOPE_LINE`.
-  setEscapeLine(p.staged.escape_hatch);
-  setScopeLine(p.staged.blocking_scope);
+  setEscapeLine(l.escape_line);
+  setScopeLine(l.scope_line);
   setNextPreset(p.staged.next_preset ?? "");
 
   setPillRunning(f.pill_running);
@@ -304,6 +307,7 @@ export function applyStart(p: StartPayload): void {
   setBusWarn(f.bus_warn);
   setHasDevice(f.has_device);
   setHasBoards(f.has_boards);
+  setHasExperimental(f.has_experimental);
   setNoBoards(f.no_boards);
   setHasOther(f.has_other);
   setHasNotes(f.has_notes);
@@ -319,6 +323,7 @@ export function applyStart(p: StartPayload): void {
   setSessionLive(f.session_live);
 
   setBoardRows(r.boards);
+  setExperimentalRows(r.experimental);
   setOtherRows(r.other);
   setNoteRows(r.notes);
   setSlotRows(r.slots);
@@ -337,19 +342,19 @@ export function applyStart(p: StartPayload): void {
  *  The wording here is the one thing this file owns, and it has no backend twin
  *  by definition: the backend is the thing not answering. */
 export function applyUnreachable(): void {
-  setSessionLine("ksx-studio not responding — retrying every 2 s");
+  setSessionLine("ksx is not responding — retrying");
   setPillRunning(false);
   setPillIdle(false);
   setPillDown(true);
   setStageDown(true);
   setStageError(
-    "ksx Studio is not answering. Nothing below can be staged, saved or started until it does — and nothing on this page has been written, so there is nothing to undo.",
+    "ksx is not responding. Reopen the app and try again. Nothing on this page has been changed.",
   );
   setCanAdd(false);
   setReady(false);
   setNotReady(true);
   setReadyLine(
-    "ksx Studio is not answering, so neither Save nor Play can be performed.",
+    "ksx is not responding, so Save and Play are temporarily unavailable.",
   );
   setCanDiscard(false);
 }
@@ -395,26 +400,21 @@ export function StartIsland() {
       h(
         "nav",
         { class: "topnav", "aria-label": "screens" },
-        h("a", { class: "navlink on", href: "/start", "aria-current": "page" }, "Start"),
-        h("a", { class: "navlink", href: "/" }, "Status"),
-        h("a", { class: "navlink", href: "/map" }, "Mapper"),
-        h("a", { class: "navlink", href: "/check" }, "Check"),
-        h("a", { class: "navlink", href: "/pads" }, "Pads"),
-        h("a", { class: "navlink", href: "/devices" }, "Devices"),
-        h("a", { class: "navlink", href: "/profiles" }, "Profiles"),
-        h("a", { class: "navlink", href: "/setup" }, "Setup"),
+        h("a", { class: "navlink on", href: "/start", "aria-current": "page" }, "Setup"),
+        h("a", { class: "navlink", href: "/map" }, "Controls"),
+        h("a", { class: "navlink", href: "/check" }, "Test"),
       ),
       createShow(
         () => pillRunning(),
-        () => h("span", { class: "pill pill-run" }, "running"),
+        () => h("span", { class: "pill pill-run" }, "playing"),
       ),
       createShow(
         () => pillIdle(),
-        () => h("span", { class: "pill pill-idle" }, "idle"),
+        () => h("span", { class: "pill pill-idle" }, "ready"),
       ),
       createShow(
         () => pillDown(),
-        () => h("span", { class: "pill pill-down" }, "no daemon"),
+        () => h("span", { class: "pill pill-down" }, "needs attention"),
       ),
     ),
     h(
@@ -428,15 +428,8 @@ export function StartIsland() {
           h(
             "section",
             { class: "card alarm" },
-            h("h2", null, "No staged setup"),
+            h("h2", null, "Setup needs to restart"),
             h("p", { class: "alarmlead" }, () => stageError()),
-            h(
-              "p",
-              { class: "alarmlead" },
-              "The setup you build here lives in the ksx daemon for the length of ",
-              "your visit — not in this page and not in a file. Start it from the ",
-              "tray icon, and this screen picks up where it left off.",
-            ),
           ),
       ),
       createShow(
@@ -446,12 +439,17 @@ export function StartIsland() {
             "section",
             { class: "card alarm" },
             h("h2", null, "Your devices could not be read"),
-            h("p", { class: "alarmlead" }, () => scanError()),
             h(
               "p",
               { class: "alarmlead" },
-              "This is not a reading of an empty machine — nothing was read at all, ",
-              "so no list below is evidence about what is plugged in.",
+              "Reopen ksx and try again. The empty list below does not mean ",
+              "your keyboards are unplugged.",
+            ),
+            h(
+              "details",
+              { class: "st-more" },
+              h("summary", null, "Support details"),
+              h("p", { class: "pdetail" }, () => scanError()),
             ),
           ),
       ),
@@ -474,7 +472,7 @@ export function StartIsland() {
           () =>
             h(
               "p",
-              { class: "dv-line mono" },
+              { class: "dv-note" },
               () => deviceDetail(),
             ),
         ),
@@ -485,10 +483,8 @@ export function StartIsland() {
             h(
               "p",
               { class: "dv-line" },
-              "Each one says what ksx can do with it, because that is not ",
-              "guessable from the name: a Bluetooth keyboard can be split but ",
-              "never taken off the Windows keyboard stack, and a board with no ",
-              "keyboard interface is not on this list at all.",
+              "Choose the keyboard you recognize. Bluetooth keyboards can be ",
+              "split too; unusual devices appear separately below.",
             ),
         ),
         h(
@@ -540,18 +536,13 @@ export function StartIsland() {
                   h("span", { class: b.chosen_cls }, "chosen"),
                 ),
                 h("p", { class: "dv-note" }, b.verdict),
-                // What it can DO, because it is not guessable: a Bluetooth
-                // keyboard can be split but never WinUSB-claimed.
-                h("p", { class: "dv-line" }, b.backends),
                 h("p", { class: b.caveat_cls }, b.caveat),
-                h("p", { class: b.cannot_type_cls }, b.cannot_type),
-                // SMALL PRINT, for a support conversation. Never the name of
-                // the thing on this screen (FIRST-RUN.md §5), and never
-                // something anyone is asked to type (§6).
                 h(
                   "details",
                   { class: "st-more" },
-                  h("summary", null, "Windows device path (for support)"),
+                  h("summary", null, "Technical details"),
+                  h("p", { class: "dv-line" }, b.backends),
+                  h("p", { class: b.cannot_type_cls }, b.cannot_type),
                   h("p", { class: "dv-line mono" }, b.path),
                 ),
                 h(
@@ -564,6 +555,85 @@ export function StartIsland() {
                 ),
               ),
           ),
+        ),
+        createShow(
+          () => hasExperimental(),
+          () =>
+            h(
+              "details",
+              { class: "st-more dv-experimental" },
+              h("summary", null, "Other devices (optional)"),
+              h(
+                "p",
+                { class: "dv-note" },
+                "These devices can sometimes work, but they do not identify themselves as ",
+                "keyboards. They are here for unusual controllers and experimentation; choose ",
+                "one only when you recognize it.",
+              ),
+              h(
+                "ul",
+                { class: "plist dv-list" },
+                createList(
+                  () => experimentalRows(),
+                  (b) =>
+                    b.name +
+                    "|" +
+                    b.transport +
+                    "|" +
+                    b.backends +
+                    "|" +
+                    b.verdict +
+                    "|" +
+                    b.caveat +
+                    "|" +
+                    b.caveat_cls +
+                    "|" +
+                    b.cannot_type +
+                    "|" +
+                    b.cannot_type_cls +
+                    "|" +
+                    b.path +
+                    "|" +
+                    b.selector +
+                    "|" +
+                    b.alias +
+                    "|" +
+                    b.chosen_cls +
+                    "|" +
+                    b.button,
+                  (b) =>
+                    h(
+                      "li",
+                      { class: "dv-row" },
+                      h(
+                        "div",
+                        { class: "dv-head" },
+                        h("span", { class: "dv-name" }, b.name),
+                        h("span", { class: "pill pill-idle" }, b.transport),
+                        h("span", { class: b.chosen_cls }, "chosen"),
+                      ),
+                      h("p", { class: "dv-note" }, b.verdict),
+                      h("p", { class: b.caveat_cls }, b.caveat),
+                      h(
+                        "details",
+                        { class: "st-more" },
+                        h("summary", null, "Technical details"),
+                        h("p", { class: "dv-line" }, b.backends),
+                        h("p", { class: b.cannot_type_cls }, b.cannot_type),
+                        h("p", { class: "dv-line mono" }, b.path),
+                      ),
+                      h(
+                        "form",
+                        { class: "dv-form", method: "post", action: "/start/device" },
+                        h("input", { type: "hidden", name: "selector", value: b.selector }),
+                        h("input", { type: "hidden", name: "alias", value: b.alias }),
+                        h("input", { type: "hidden", name: "label", value: b.name }),
+                        h("button", { class: "btn", type: "submit" }, b.button),
+                      ),
+                    ),
+                ),
+              ),
+            ),
         ),
         // "There is nothing here" — licensed by ONE flag, the one that is only
         // ever true when the enumeration actually answered.
@@ -616,12 +686,18 @@ export function StartIsland() {
           () => hasNotes(),
           () =>
             h(
-              "ul",
-              { class: "plist dv-list" },
-              createList(
-                () => noteRows(),
-                (n) => n.text,
-                (n) => h("li", { class: "dv-row quiet" }, h("span", { class: "dv-line" }, n.text)),
+              "details",
+              { class: "st-more" },
+              h("summary", null, "Support details"),
+              h(
+                "ul",
+                { class: "plist dv-list" },
+                createList(
+                  () => noteRows(),
+                  (n) => n.text,
+                  (n) =>
+                    h("li", { class: "dv-row quiet" }, h("span", { class: "dv-line" }, n.text)),
+                ),
               ),
             ),
         ),
@@ -650,7 +726,9 @@ export function StartIsland() {
               "|" +
               s.preset +
               "|" +
-              s.bindings,
+              s.bindings +
+              "|" +
+              s.map_href,
             (s) =>
               h(
                 "li",
@@ -666,17 +744,60 @@ export function StartIsland() {
                   h("span", { class: "pdetail" }, s.bindings),
                 ),
                 h(
-                  "form",
-                  { method: "post", action: "/start/controller/remove" },
-                  h("input", { type: "hidden", name: "number", value: s.number }),
-                  h("button", { class: "btn btn-ghost", type: "submit" }, "Remove"),
+                  "div",
+                  { class: "pactrow" },
+                  h("a", { class: "btn btn-primary", href: s.map_href }, "Choose controls"),
+                  h(
+                    "form",
+                    { method: "post", action: "/start/controller/remove" },
+                    h("input", { type: "hidden", name: "number", value: s.number }),
+                    h("button", { class: "btn btn-ghost", type: "submit" }, "Remove"),
+                  ),
                 ),
               ),
           ),
         ),
         createShow(
           () => hasSlots(),
-          () => h("p", { class: "dv-line" }, () => xinputLine()),
+          () =>
+            h(
+              "div",
+              null,
+              h("p", { class: "dv-line" }, () => xinputLine()),
+              h(
+                "form",
+                { class: "pactrow", method: "post", action: "/start/controller/persona" },
+                h(
+                  "label",
+                  { class: "bindlabel", for: "persona-slot" },
+                  "change",
+                  h(
+                    "select",
+                    { id: "persona-slot", name: "number" },
+                    createList(
+                      () => slotOptions(),
+                      (o) => o.value + "|" + o.label,
+                      (o) => h("option", { value: o.value }, o.label),
+                    ),
+                  ),
+                ),
+                h(
+                  "label",
+                  { class: "bindlabel", for: "persona-change" },
+                  "to",
+                  h(
+                    "select",
+                    { id: "persona-change", name: "persona" },
+                    createList(
+                      () => personaOptions(),
+                      (o) => o.value + "|" + o.label,
+                      (o) => h("option", { value: o.value }, o.label),
+                    ),
+                  ),
+                ),
+                h("button", { class: "btn", type: "submit" }, "Change controller"),
+              ),
+            ),
         ),
         createShow(
           () => canAdd(),
@@ -728,7 +849,7 @@ export function StartIsland() {
             h(
               "p",
               { class: "warn" },
-              "Every slot ksx has is staged. Remove one to stage a different ",
+              "This setup already has the maximum number of controllers. Remove one to add a different ",
               "controller.",
             ),
         ),
@@ -766,7 +887,18 @@ export function StartIsland() {
         h("p", { class: "cardline" }, () => presetLine()),
         createShow(
           () => presetsDown(),
-          () => h("p", { class: "warn" }, () => presetsError()),
+          () =>
+            h(
+              "div",
+              { class: "warnbox" },
+              h("p", { class: "warn" }, "Controller layouts are temporarily unavailable."),
+              h(
+                "details",
+                { class: "st-more" },
+                h("summary", null, "Support details"),
+                h("p", { class: "pdetail" }, () => presetsError()),
+              ),
+            ),
         ),
         // GIVE A CONTROLLER A LAYOUT. Two selects and one submit, rather than
         // a form per staged row: a createList inside a createList is not a
@@ -831,11 +963,6 @@ export function StartIsland() {
           ),
         ),
         h("p", { class: "dv-note" }, () => mapperLine()),
-        h(
-          "p",
-          { class: "pactrow" },
-          h("a", { class: "btn btn-ghost", href: "/map" }, "Open the mapper (edits saved files)"),
-        ),
       ),
       h(
         "section",
@@ -880,8 +1007,8 @@ export function StartIsland() {
             h(
               "p",
               { class: "dv-line" },
-              "You can change this answer as often as you like — it is part of ",
-              "the staged setup, so nothing is written until you save.",
+              "You can change this answer as often as you like. It stays on ",
+              "this screen until you save.",
             ),
         ),
         // The two things §3 requires on this screen, not buried. Both are
@@ -927,9 +1054,9 @@ export function StartIsland() {
         h(
           "p",
           { class: "cardline" },
-          "Saving and playing are separate. Save writes config.toml and one ",
-          "preset per controller; Play starts a session from what is on this ",
-          "screen and writes nothing at all. Either works without the other.",
+          "Saving and playing are separate. Save keeps this setup for later; ",
+          "Play uses what is on this screen now and saves nothing. Either works ",
+          "without the other.",
         ),
         createShow(
           () => sessionLive(),
@@ -937,8 +1064,8 @@ export function StartIsland() {
             h(
               "p",
               { class: "warn" },
-              "A session is already running. Playing this setup replaces it — the ",
-              "pads it plugged go, and the keyboards it captured are given back.",
+              "A game is already using this app. Play now will stop that session and replace ",
+              "it with the setup on this screen. Nothing is saved unless you choose Save.",
             ),
         ),
         createShow(
@@ -970,6 +1097,15 @@ export function StartIsland() {
             ),
         ),
         h("p", { class: "dv-note" }, () => guideLine()),
+        h(
+          "p",
+          { class: "pactrow" },
+          h(
+            "a",
+            { class: "btn btn-ghost", href: "ms-settings:gaming-gamebar" },
+            "Open Windows Game Bar settings",
+          ),
+        ),
         createShow(
           () => canDiscard(),
           () =>
@@ -984,6 +1120,22 @@ export function StartIsland() {
             ),
         ),
       ),
+      h(
+        "section",
+        { class: "card wide" },
+        h("h2", null, "Saved games"),
+        h(
+          "p",
+          { class: "cardline" },
+          "Create, repair or remove saved games that remember a program, ",
+          "player count and controller layout.",
+        ),
+        h(
+          "p",
+          { class: "pactrow" },
+          h("a", { class: "btn btn-ghost", href: "/profiles" }, "Manage saved games"),
+        ),
+      ),
     ),
     h(
       "footer",
@@ -991,10 +1143,10 @@ export function StartIsland() {
       h(
         "p",
         null,
-        "Nothing on this page claims a board, installs a driver or writes a ",
-        "file until you press Save — and Play writes nothing even then. Session: ",
-        h("span", { class: "mono" }, () => sessionLine()),
-        ". Serving 127.0.0.1 only.",
+        "Your choices stay on this screen until you press Save. Play uses them ",
+        "for this session without saving.",
+        h("span", { class: "product-hidden", "aria-hidden": "true" }, () => sessionLine()),
+        ".",
       ),
     ),
   );

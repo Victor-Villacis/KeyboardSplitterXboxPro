@@ -22,7 +22,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::refusal::{codes, Refusal};
-use crate::stage::{StageEdit, StageOutcome, StagedSetupView};
+use crate::stage::{
+    StageEdit, StageOutcome, StagedBindRequest, StagedMacroRequest, StagedSetupView,
+};
 use crate::status::MacroStepView;
 use crate::wire::{
     BackupView, MacroWriteKind, MapMacroRequest, MapRequest, MapResponse, RestoreMode,
@@ -205,6 +207,36 @@ pub trait ControlSource: Send + Sync {
             "this control source has no staged setup to edit — a daemon holds it \
              (`ksx daemon`)",
         )
+    }
+
+    /// Atomically prepare and apply one binding edit to an exact staged slot.
+    ///
+    /// The default keeps custom/in-process control sources source-compatible.
+    /// The pipe client overrides it with the daemon's `stage-bind` transaction,
+    /// where the read, conflict check, and write share one state lock.
+    fn stage_bind(&self, request: &StagedBindRequest) -> BindOutcome {
+        let setup = self.staged();
+        match crate::stage::staged_bind_edit(&setup, request) {
+            Ok(prepared) => {
+                let stage = self.stage_edit(&prepared.edit);
+                prepared.finish(&stage)
+            }
+            Err(outcome) => outcome,
+        }
+    }
+
+    /// Atomically prepare and apply one macro edit to an exact staged slot.
+    /// See [`Self::stage_bind`] for why the pipe implementation overrides the
+    /// compatibility default below.
+    fn stage_macro(&self, request: &StagedMacroRequest) -> MacroOutcome {
+        let setup = self.staged();
+        match crate::stage::staged_macro_edit_for_setup(&setup, request) {
+            Ok(prepared) => {
+                let stage = self.stage_edit(&prepared.edit);
+                prepared.finish(&stage)
+            }
+            Err(outcome) => outcome,
+        }
     }
 
     /// **Save.** Turn the staged setup into `config.toml` + preset files,

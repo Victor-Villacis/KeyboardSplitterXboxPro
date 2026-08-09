@@ -4,7 +4,9 @@ For whoever takes this over. It says what ksx is, how it is built, what is
 finished, what is not, and — most usefully — **which beliefs about this codebase
 turned out to be false**, because several of them cost a day each to discover.
 
-Written 2026-08-09 at `v0.1.0`, the first release a stranger can install.
+Updated 2026-08-09 for the current unreleased product-flow release candidate.
+The baseline is ten commits after `v0.1.0`; the work described as **current**
+below is not released merely because it passes local tests.
 
 ---
 
@@ -31,7 +33,7 @@ what else improves:
 
 ## §2 The shape of the code
 
-15 crates. The dependency direction is the architecture, and it is worth
+16 crates. The dependency direction is the architecture, and it is worth
 learning before touching anything:
 
 ```
@@ -43,6 +45,7 @@ ksx-capture ─────► core, platform capture backends behind one trait
 ksx-output ──────► core, hidmaestro  ViGEm pads, persona routing
 ksx-backend ─────► all of the above  every verb's logic, the daemon, the supervisor
 ksx-app ─────────► backend + surfaces  ONE FILE: clap definitions and a match
+ksx-launcher ────► Windows only        GUI-subsystem customer hand-off to `ksx.exe open`
 ksx-studio ──────► api, core, config   the browser UI
 ksx-cabinet ─────► api                 the 10-foot egui panel
 ```
@@ -54,14 +57,20 @@ a slogan, and it is the single most important line in the graph.
 
 `ksx-app` was 50,665 lines until 2026-08-09. It is now 3,798: clap derives and
 one dispatch `match`. If you are looking for logic, it is in `ksx-backend`.
+`ksx-launcher` is not a fourth surface; it is the console-free Windows hand-off
+used by the installer and shortcuts.
 
 ### The three surfaces, and why there are three
 
 `docs/SURFACES.md` is the authority; the short version:
 
-- **CLI** — every capability lives here first. It is the cheapest thing to test
-  and the only one CI can drive headlessly. It is a **development surface**: the
-  product does not require it (`docs/FIRST-RUN.md`).
+- **CLI** — the development surface and the intended first driver for backend
+  capabilities. It is the cheapest thing to test and the only surface CI can
+  drive headlessly. Two current parity debts are named rather than hidden:
+  staged setup and profile CRUD have typed backend contracts and Studio faces,
+  while `ksx stage` and `ksx games new|update|delete` remain planned
+  (`docs/SURFACES.md` §3c and §10). The product does not require either CLI face
+  (`docs/FIRST-RUN.md`).
 - **Studio** (browser) — the workbench. Authoring: mapping, devices, profiles,
   the first-run flow. Better than immediate-mode GUI at a 25-binding preset.
 - **egui cabinet panel** — the appliance. At a cabinet there is no mouse and no
@@ -72,15 +81,35 @@ one dispatch `match`. If you are looking for logic, it is in `ksx-backend`.
 
 ## §3 What is done
 
-**Shipped and released as `v0.1.0`:** a Windows installer that puts an icon on
+**Released baseline (`v0.1.0` plus the ten commits now on master):** a Windows installer that puts an icon on
 the desktop, installs the ViGEmBus driver from a checkbox, and hands off to the
 app; `ksx open` starting the daemon and opening a chrome-less window; a
 first-run flow that lists real devices by human names, stages a controller you
 can change your mind about before anything is written or plugged, asks
-split-or-freeze in the user's own words, and plays without saving; six Studio
+split-or-freeze in the user's own words, and plays without saving; eight Studio
 pages; a live input feed with a button-check view; `ksx play` replaying a
 recorded session; a unified USB+Bluetooth device list; the persona menu; 2,069
-tests.
+tests. That paragraph describes the inherited baseline, not the untagged work
+in the current branch.
+
+**Current unreleased release candidate:** every customer shortcut and the
+post-install hand-off target `ksx-launcher.exe`, which starts the sibling
+console-subsystem `ksx.exe open` with `CREATE_NO_WINDOW`. `ksx open` starts and
+waits for a plain daemon, then opens Studio directly at `/start` in ksx's own
+Chromium app profile. An empty default configuration now starts an **idle
+control host** rather than exiting: no session, capture, claim or pad exists,
+but the pipe/tray remain available so first-run staging is possible.
+
+`/start` now opens the full existing Forma mapper against an in-memory staged
+controller (`target=stage`) for chords, turbo and macros. Refused edits leave
+the stage unchanged; accepted edits touch no disk. Save and Play remain
+separate, including Play-before-Save. Studio's saved-game screen now creates,
+updates, deletes and switches profiles; creation inherits the working base
+device assignments, updates preserve them unless explicitly refreshed, and
+deletion keeps controller layouts. Pasted executable paths normalize one
+matching quote pair. Guide copy names both default keys, the Windows Game Bar
+controller prerequisite and a direct Settings link; ksx does not silently
+change the per-user Windows setting.
 
 **Milestones:** M0–M3, M6.5, M7, M9, M10a are done. M4, M5, M6 are
 code-complete and **cabinet-gate pending** (§4). M8 is a complete client blocked
@@ -98,25 +127,21 @@ session with **Interception uninstalled**, then a 14-day soak with zero recovery
 actions. Nothing else can close these — they are measurements and a removal, not
 code.
 
-### 2. The first-run flow is 4 of 7 moments
+### 2. The first-run software flow is complete; physical Moment 7 is not
 
 `docs/FIRST-RUN.md` §1 numbers seven moments and §7 is the acceptance test: *a
-person who has never seen ksx gets from a downloaded `.exe` to a controller
-moving in a game, with no terminal, no file editing, and nobody telling them
-what to do next.* Moments 2, 3, 4, 5 pass. The gaps:
+person who has never seen ksx gets from the exact downloaded installer to a
+controller moving in a game, with no terminal, no file editing, and nobody
+telling them what to do next.* The missing staged mapper and wrong landing page
+described by the old handoff are closed: `/map?target=stage` routes bindings and
+macros into `StageEdit::SetBindings`, and `ksx open` lands on `/start`.
 
-- **Moment 6, the per-key half.** A staged slot takes a whole in-box layout in
-  one click, and that works. But `/map` accepts `?slot=` and `?preset=` only —
-  no staged target — so changing one button, or writing a macro, means Save
-  first and then the mapper. `StageEdit::SetBindings` exists in `ksx-api` and no
-  route sends it. The finished shape is one target field on the mapper's
-  existing writes; **do not build a second mapper** (`docs/MAPPER-UX.md` is
-  ~23k lines of finished UX).
-- **Moment 7, unverified.** The software path is complete and the Guide binding
-  now exists on the default layout, but nobody has walked it end to end on a
-  machine that did not already have ViGEmBus.
-- `ksx open` lands on `/` (status), not `/start`. A first-time user has to
-  notice a nav link.
+**Moment 7 remains unverified on physical Windows hardware.** Software tests
+prove the Guide bits, P1 Left Windows/P2 Numpad `*` bindings and Settings
+remedy. They do not prove a clean install produced a real pad, that the app
+opened with no console flash under the original user, or that Windows displayed
+Game Bar after its per-user controller toggle was enabled. `docs/GATES.md`'s
+release-product gate is the authority.
 
 ### 3. LAN access + pairing token + QR (task #23)
 
@@ -129,8 +154,8 @@ insufficient on a LAN, because `curl` sends none either.
 
 ### 4. Smaller, tracked
 
-Build B (the setup wizard) and Build C's polish in `docs/MAPPER-UX.md`; the
-any-HID-as-input easter egg; code signing (an unsigned installer throws
+Remaining mapper polish in `docs/MAPPER-UX.md`; the any-HID-as-input easter
+egg; code signing (an unsigned installer throws
 SmartScreen at every new user — Azure Trusted Signing is ~$10/month).
 
 ---
@@ -225,6 +250,11 @@ commit in the notes.
 **fails** if they disagree — deliberately, rather than patching one, because
 `AppVersion` is also `VersionInfoVersion` and the Apps & Features row.
 
+A clean CI/ISCC run proves compilation, packaging and reproducible committed
+Forma assets. It does **not** prove installation behavior. Before tagging, run
+the fresh-customer product gate and the still-open Gate 3 in `docs/GATES.md`;
+record the exact setup.exe SHA in the gate log.
+
 ---
 
 ## §8 The map of the docs
@@ -241,7 +271,7 @@ commit in the notes.
 | supervised hardware runbooks | `GATES.md` |
 | the panel is dead / a claim went wrong | `RECOVERY.md` |
 | driver policy: pins, signatures, consent | `DRIVERS.md` |
-| the mapper's UX spec and its unbuilt halves | `MAPPER-UX.md` |
+| the mapper's UX contract and remaining polish | `MAPPER-UX.md` |
 | Studio's visual language | `DESIGN-SYSTEM.md` |
 | why there is no native config UI | `M9-DECISION.md` |
 | the idea/enhancement ledger | `ENHANCEMENTS.md` |

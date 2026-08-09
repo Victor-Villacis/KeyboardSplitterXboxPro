@@ -12,7 +12,6 @@
 //! meant. Nothing here has behaviour; the seam is the point.
 
 pub use ksx_api::control::*;
-/// The three restore destinations. `RESTORE_MODES` is the wire spelling a form
-/// post is validated against before it has a [`RestoreMode`]; the enum is what
-/// the verb takes, so "restore" can never travel as an unchecked string.
-pub use ksx_api::wire::{RestoreMode, RESTORE_MODES};
+/// The three restore destinations. The enum is what the verb takes, so
+/// "restore" can never travel as an unchecked string.
+pub use ksx_api::wire::RestoreMode;

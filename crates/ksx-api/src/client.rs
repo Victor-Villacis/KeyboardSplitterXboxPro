@@ -21,7 +21,9 @@ use crate::control::{
     SessionView, SlotOutcome,
 };
 use crate::refusal::{codes, Refusal};
-use crate::stage::{StageEdit, StageOutcome, StagedSetupView};
+use crate::stage::{
+    StageEdit, StageOutcome, StagedBindRequest, StagedMacroRequest, StagedSetupView,
+};
 use crate::wire::{
     BackupView, BackupsRequest, ClearAllRequest, LearnResponse, Request, Response, RestoreMode,
     RestoreRequest, SlotAssignRequest,
@@ -331,6 +333,14 @@ impl<S: VerbSink> ControlSource for Client<S> {
         self.stage(Request::StageEdit(Box::new(edit.clone())))
     }
 
+    fn stage_bind(&self, request: &StagedBindRequest) -> BindOutcome {
+        self.map(Request::StageBind(Box::new(request.clone())))
+    }
+
+    fn stage_macro(&self, request: &StagedMacroRequest) -> MacroOutcome {
+        self.macro_outcome(Request::StageMacro(Box::new(request.clone())))
+    }
+
     fn stage_commit(&self) -> StageOutcome {
         self.stage(Request::StageCommit)
     }
@@ -346,7 +356,13 @@ impl<S: VerbSink> ControlSource for Client<S> {
             // this build cannot spell is a policy the daemon would refuse.
             Err(refusal) => return MacroOutcome::failed(refusal.message),
         };
-        let request = Request::MapMacro(typed);
+        self.macro_outcome(Request::MapMacro(typed))
+    }
+}
+
+impl<S: VerbSink> Client<S> {
+    /// The shared tail of saved and staged whole-macro writes.
+    fn macro_outcome(&self, request: Request) -> MacroOutcome {
         match self.call(&request) {
             Ok(Response::Macro(answer)) => MacroOutcome {
                 ok: answer.ok,
@@ -365,9 +381,7 @@ impl<S: VerbSink> ControlSource for Client<S> {
             Err(refusal) => MacroOutcome::failed(refusal.message),
         }
     }
-}
 
-impl<S: VerbSink> Client<S> {
     /// The shared tail of `bind` and `bind_keys`.
     fn map(&self, request: Request) -> BindOutcome {
         match self.call(&request) {
@@ -412,6 +426,10 @@ mod tests {
         fn last(&self) -> Request {
             self.asked.lock().unwrap().last().cloned().expect("asked")
         }
+
+        fn asked_count(&self) -> usize {
+            self.asked.lock().unwrap().len()
+        }
     }
 
     impl VerbSink for Fake {
@@ -451,6 +469,59 @@ mod tests {
         assert_eq!(sent.keys, ["S", "Enter"]);
         assert!(sent.key.is_none(), "one field, not both");
         assert!(sent.reload);
+    }
+
+    #[test]
+    fn staged_writes_are_single_atomic_verbs_with_no_legacy_retry() {
+        let bind_client = Client::new(Fake::answering(Response::Map(MapResponse {
+            ok: false,
+            code: Some(codes::BAD_REQUEST.into()),
+            error: Some("unknown verb stage-bind — upgrade the daemon".into()),
+            ..MapResponse::default()
+        })));
+        let bind = StagedBindRequest {
+            number: 2,
+            preset: "Player 2".into(),
+            function: "A".into(),
+            keys: vec!["G".into()],
+            ..StagedBindRequest::default()
+        };
+        let refused = bind_client.stage_bind(&bind);
+        assert!(!refused.ok);
+        assert_eq!(
+            bind_client.sink().asked_count(),
+            1,
+            "no stage + stage-edit fallback"
+        );
+        assert_eq!(
+            bind_client.sink().last(),
+            Request::StageBind(Box::new(bind))
+        );
+
+        let macro_request = StagedMacroRequest {
+            number: 2,
+            write: MacroWrite {
+                preset: "Player 2".into(),
+                name: "dash".into(),
+                steps: vec![MacroStepView {
+                    hold: vec!["A".into()],
+                    ms: Some(50),
+                    ..MacroStepView::default()
+                }],
+                ..MacroWrite::default()
+            },
+        };
+        let macro_client = Client::new(Fake::answering(Response::Macro(MacroResponse {
+            ok: true,
+            message: Some("Macro updated for Player 2.".into()),
+            ..MacroResponse::default()
+        })));
+        assert!(macro_client.stage_macro(&macro_request).ok);
+        assert_eq!(macro_client.sink().asked_count(), 1);
+        assert_eq!(
+            macro_client.sink().last(),
+            Request::StageMacro(Box::new(macro_request))
+        );
     }
 
     /// The no-channel refusal is the one every surface renders as "nothing

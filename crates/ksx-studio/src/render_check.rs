@@ -24,12 +24,11 @@
 //! # The seam decides nothing about controls
 //!
 //! The chip roster is `MapperSlot::bindings`' key set — every function the
-//! preset names, unbound ones included, in the canonical spelling the preset
-//! file, the mapper's legend and the live frame all use. Nothing here knows
-//! that an Xbox pad has an `A` button. That matters more here than on most
-//! pages, because a hardcoded roster would look right on a stock preset and
-//! quietly omit exactly the control somebody added and is now standing at the
-//! cabinet trying to test.
+//! saved layout names, unbound ones included. Its canonical spelling stays in
+//! `data-control` for the live lookup; the visible chip uses the controller's
+//! customer-facing identity. The roster itself is never hardcoded, because a
+//! stock-only list would quietly omit exactly the extension control somebody
+//! added and is now standing at the cabinet trying to test.
 
 use forma_ir::parser::IrModule;
 use forma_ir::slot::{SlotData, SlotValue};
@@ -43,6 +42,7 @@ use crate::snapshot::CheckPayload;
 /// test fails until these match again.
 const LIST_SLOT_KEYS: &str = "list:keyRows:array";
 const LIST_SLOT_CHIPS: &str = "list:chips:array";
+const LIST_SLOT_EMPTY_PLAYERS: &str = "list:emptyPlayers:array";
 
 /// The island table this page compiles to: exactly one island — the whole
 /// screen. Its name is the `activateIslands` registry key in
@@ -80,9 +80,102 @@ const UNBOUND: &str = "unbound";
 /// prose is (docs/SURFACES.md §1) — and this one names the CLI equivalent,
 /// because a cabinet with no browser still has a terminal.
 fn feed_hint() -> String {
-    "Frames come from the running daemon's input feed, live. `ksx monitor` \
-     shows the same stream in a terminal."
-        .to_owned()
+    "Press a key and its controller actions light immediately. Nothing is changed here.".to_owned()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CheckEmptyState {
+    heading: &'static str,
+    line: &'static str,
+    href: &'static str,
+    action: &'static str,
+}
+
+/// Keep the three kinds of empty paint apart. `MapperSnapshot::unavailable`
+/// deliberately carries a sentinel instead of pretending a failed read found
+/// no controllers, while a present slot with no binding keys is a third,
+/// fixable Controls state.
+fn empty_state(mapper: &ksx_api::MapperSnapshot) -> Option<CheckEmptyState> {
+    if mapper.generated_at == "(unavailable)" || mapper.config_root == "(unavailable)" {
+        return Some(CheckEmptyState {
+            heading: "Controls could not be checked",
+            line: "Reopen ksx, then use Setup to confirm a controller and Controls to check its \
+                   buttons. Nothing was changed.",
+            href: "/start",
+            action: "Open Setup",
+        });
+    }
+    if mapper.slots.is_empty() {
+        return Some(CheckEmptyState {
+            heading: "No controller is ready to test",
+            line: "Add a controller in Setup, then come back to test its buttons.",
+            href: "/start",
+            action: "Open Setup",
+        });
+    }
+    if mapper.slots.iter().all(|slot| slot.bindings.is_empty()) {
+        return Some(CheckEmptyState {
+            heading: "No controls are ready to test",
+            line: "Open Controls and choose a ready-made layout or add button keys, then come \
+                   back here.",
+            href: "/map",
+            action: "Open Controls",
+        });
+    }
+    None
+}
+
+/// The live feed addresses canonical function names, but the chip's visible
+/// label should read like the controller in somebody's hands. This mirrors the
+/// controller identities in `CheckIsland.ts`; extension names are humanized so
+/// a dotted implementation token never becomes primary copy.
+fn control_label(persona: &str, control: &str) -> String {
+    let playstation = crate::render::art_for(persona) == crate::render::ART_DS4;
+    let known = match control {
+        "A" => Some(if playstation { "✕" } else { "A" }),
+        "B" => Some(if playstation { "○" } else { "B" }),
+        "X" => Some(if playstation { "□" } else { "X" }),
+        "Y" => Some(if playstation { "△" } else { "Y" }),
+        "lt" => Some(if playstation { "L2" } else { "LT" }),
+        "lb" => Some(if playstation { "L1" } else { "LB" }),
+        "rb" => Some(if playstation { "R1" } else { "RB" }),
+        "rt" => Some(if playstation { "R2" } else { "RT" }),
+        "guide" => Some(if playstation { "PS" } else { "Guide" }),
+        "back" => Some(if playstation { "Share" } else { "View" }),
+        "start" => Some(if playstation { "Options" } else { "Menu" }),
+        "lthumb" => Some("L3"),
+        "rthumb" => Some("R3"),
+        "ly.max" => Some("Left stick ↑"),
+        "ly.min" => Some("Left stick ↓"),
+        "lx.min" => Some("Left stick ←"),
+        "lx.max" => Some("Left stick →"),
+        "dpad.up" => Some("D-pad ↑"),
+        "dpad.down" => Some("D-pad ↓"),
+        "dpad.left" => Some("D-pad ←"),
+        "dpad.right" => Some("D-pad →"),
+        "ry.max" => Some("Right stick ↑"),
+        "ry.min" => Some("Right stick ↓"),
+        "rx.min" => Some("Right stick ←"),
+        "rx.max" => Some("Right stick →"),
+        _ => None,
+    };
+    if let Some(label) = known {
+        return label.to_owned();
+    }
+    if let Some(name) = control.strip_prefix("macro.") {
+        return format!("Button sequence “{name}”");
+    }
+    let words = control
+        .split(['.', '_', '-'])
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if words.is_empty() {
+        return "Other control".to_owned();
+    }
+    let mut chars = words.chars();
+    let first = chars.next().expect("non-empty control label");
+    format!("{}{}", first.to_uppercase(), chars.as_str())
 }
 
 /// The [`CheckPayload`] for one mapper read and one session view.
@@ -102,18 +195,29 @@ pub(crate) fn payload(
 
 /// Scalar slot values, keyed by the signal names in CheckIsland.ts.
 fn scalar_slots(payload: &CheckPayload) -> serde_json::Value {
+    let empty = empty_state(&payload.mapper);
     serde_json::json!({
         "generatedAt": payload.mapper.generated_at,
-        "sourceLine": payload.mapper.source,
+        "sourceLine": "Press a keyboard or panel key and watch every controller action it drives.",
+        "emptyHeading": empty.map_or("", |state| state.heading),
+        "emptyLine": empty.map_or("", |state| state.line),
+        "emptyHref": empty.map_or("/start", |state| state.href),
+        "emptyAction": empty.map_or("Open Setup", |state| state.action),
         "feedHint": payload.feed_hint,
-        "sessionLine": payload.session.line,
+        "sessionLine": if payload.session.running {
+            "Play is active."
+        } else if payload.session.reachable {
+            "Ready to test."
+        } else {
+            "Live testing needs ksx to be reopened."
+        },
         // The FEED's own state is the client's to word — it is the only thing
         // on this page the server cannot know, because the stream is opened by
         // the browser. The SSR value says so rather than claiming a state:
         // "live" painted server-side would be a lie for however long the
         // EventSource takes to connect, and on a machine with no daemon it
         // would never stop being one.
-        "feedLine": "opening the live feed…",
+        "feedLine": "connecting to live input…",
         // Loss counters are per-frame and arrive with the frames. Nothing to
         // say before the first one.
         "lossLine": "",
@@ -146,11 +250,53 @@ fn chip_values(payload: &CheckPayload) -> SlotValue {
                     SlotValue::Text(format!("P{}", slot.number)),
                 ),
                 ("control".to_owned(), SlotValue::Text(control.clone())),
+                (
+                    "label".to_owned(),
+                    SlotValue::Text(control_label(&slot.persona, control)),
+                ),
                 ("keys".to_owned(), SlotValue::Text(label)),
             ]));
         }
     }
     SlotValue::array(chips)
+}
+
+/// A mixed roster must not make a real player disappear merely because that
+/// player's layout names no controls. These rows share the populated card with
+/// the working players' chips and point at the exact Controls destination.
+fn empty_player_values(payload: &CheckPayload) -> SlotValue {
+    SlotValue::array(
+        payload
+            .mapper
+            .slots
+            .iter()
+            .filter(|slot| slot.bindings.is_empty())
+            .map(|slot| {
+                SlotValue::object(vec![
+                    (
+                        "player".to_owned(),
+                        SlotValue::Text(format!("Player {} has no controls yet", slot.number)),
+                    ),
+                    (
+                        "line".to_owned(),
+                        SlotValue::Text(
+                            "Open Controls and choose a ready-made layout or add button keys for \
+                             this player."
+                                .to_owned(),
+                        ),
+                    ),
+                    (
+                        "href".to_owned(),
+                        SlotValue::Text(format!("/map?slot={}", slot.number)),
+                    ),
+                    (
+                        "action".to_owned(),
+                        SlotValue::Text("Open Controls".to_owned()),
+                    ),
+                ])
+            })
+            .collect(),
+    )
 }
 
 /// The list array payloads, keyed by their (unique) slot names.
@@ -160,9 +306,10 @@ fn chip_values(payload: &CheckPayload) -> SlotValue {
 /// server rendering this page has no moment to report. Painting a remembered
 /// keystroke into an SSR document would put a press on screen that is not
 /// happening.
-fn list_values(payload: &CheckPayload) -> [(&'static str, SlotValue); 2] {
+fn list_values(payload: &CheckPayload) -> [(&'static str, SlotValue); 3] {
     [
         (LIST_SLOT_KEYS, SlotValue::array(Vec::new())),
+        (LIST_SLOT_EMPTY_PLAYERS, empty_player_values(payload)),
         (LIST_SLOT_CHIPS, chip_values(payload)),
     ]
 }
@@ -173,7 +320,7 @@ fn list_values(payload: &CheckPayload) -> [(&'static str, SlotValue); 2] {
 /// every combined condition is computed once, here and in `check.ts`, instead
 /// of relying on a parent branch having rendered.
 fn show_values(payload: &CheckPayload) -> [(&'static str, bool); SHOW_COUNT] {
-    let has_slots = payload.mapper.slots.iter().any(|s| !s.bindings.is_empty());
+    let has_slots = empty_state(&payload.mapper).is_none();
     [
         ("show:hasSlots", has_slots),
         ("show:noSlots", !has_slots),
@@ -293,6 +440,7 @@ mod tests {
                 })
                 .collect::<BTreeMap<_, _>>(),
             backup: None,
+            session_backup: false,
             turbo: BTreeMap::new(),
             macros_off: false,
         }
@@ -391,7 +539,7 @@ mod tests {
     fn the_server_paint_never_asserts_a_live_feed() {
         let page = EmbeddedPage::load("/check").unwrap();
         let html = rendered(&render_check(&page, &cabinet()).html);
-        assert!(html.contains("opening the live feed"), "{html}");
+        assert!(html.contains("connecting to live input"), "{html}");
         for (name, value) in show_values(&cabinet()) {
             if name == "show:live" {
                 assert!(!value, "the server cannot know the feed is up");
@@ -399,23 +547,163 @@ mod tests {
         }
     }
 
-    /// With no slots the page says why instead of rendering an empty grid that
-    /// looks like a cabinet with nothing pressed.
+    /// An unavailable mapper read, a successful empty roster, and a controller
+    /// whose layout names no controls are three different customer states.
+    /// None may borrow the old "No controllers" claim.
     #[test]
-    fn a_cabinet_with_no_slots_says_so_rather_than_showing_an_empty_grid() {
+    fn unavailable_empty_and_zero_control_rosters_have_distinct_remedies() {
         let page = EmbeddedPage::load("/check").unwrap();
-        let mut empty = cabinet();
-        empty.mapper = ksx_api::MapperSnapshot::unavailable(
+        let mut unavailable = cabinet();
+        unavailable.mapper = ksx_api::MapperSnapshot::unavailable(
             "no slots are configured — `ksx slot assign` creates one",
         );
-        let out = render_check(&page, &empty);
-        let html = rendered(&out.html);
-        assert!(html.contains("No slots to check"), "{html}");
-        assert!(html.contains("ksx slot assign"), "{html}");
+        let unavailable_html = rendered(&render_check(&page, &unavailable).html);
         assert!(
-            !html.contains("data-control="),
-            "no chips without slots: {html}"
+            unavailable_html.contains("Controls could not be checked"),
+            "{unavailable_html}"
         );
+        assert!(
+            unavailable_html.contains(r#"href="/start""#)
+                && unavailable_html.contains("Open Setup"),
+            "{unavailable_html}"
+        );
+        assert!(
+            !unavailable_html.contains("ksx slot assign"),
+            "the customer-facing failure exposed a CLI remedy: {unavailable_html}"
+        );
+
+        let mut empty = cabinet();
+        empty.mapper.slots.clear();
+        let empty_html = rendered(&render_check(&page, &empty).html);
+        assert!(
+            empty_html.contains("No controller is ready to test"),
+            "{empty_html}"
+        );
+        assert!(
+            empty_html.contains("Add a controller in Setup"),
+            "{empty_html}"
+        );
+
+        let mut zero_controls = cabinet();
+        zero_controls.mapper.slots = vec![slot(1, &[])];
+        let zero_html = rendered(&render_check(&page, &zero_controls).html);
+        assert!(
+            zero_html.contains("No controls are ready to test"),
+            "{zero_html}"
+        );
+        assert!(
+            zero_html.contains(r#"href="/map""#) && zero_html.contains("Open Controls"),
+            "{zero_html}"
+        );
+
+        for html in [&unavailable_html, &empty_html, &zero_html] {
+            assert!(!html.contains("No controllers to check"), "{html}");
+            assert!(!html.contains("data-control="), "no chips expected: {html}");
+        }
+        assert_ne!(unavailable_html, empty_html);
+        assert_ne!(empty_html, zero_html);
+    }
+
+    #[test]
+    fn chips_show_controller_labels_while_live_lookup_keeps_canonical_names() {
+        let page = EmbeddedPage::load("/check").unwrap();
+        let html = rendered(&render_check(&page, &cabinet()).html);
+        assert!(html.contains(r#"data-control="dpad.up""#), "{html}");
+        assert!(html.contains("D-pad ↑"), "{html}");
+        assert!(
+            !html.contains(">dpad.up<"),
+            "the implementation token became a visible chip label: {html}"
+        );
+
+        for (persona, control, expected) in [
+            ("xbox360", "start", "Menu"),
+            ("playstation", "A", "✕"),
+            ("xbox360", "rx.min", "Right stick ←"),
+            ("xbox360", "macro.dash", "Button sequence “dash”"),
+            ("xbox360", "extra.button", "Extra button"),
+        ] {
+            assert_eq!(control_label(persona, control), expected);
+        }
+        for client_literal in ["Menu", "✕", "Right stick ←", "Button sequence"] {
+            assert!(
+                CHECK_ISLAND_TS.contains(client_literal),
+                "the client labeler drifted from Rust: {client_literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mixed_roster_keeps_the_player_with_no_controls_visible_and_fixable() {
+        let page = EmbeddedPage::load("/check").unwrap();
+        let mut mixed = cabinet();
+        mixed.mapper.slots = vec![slot(1, &[("A", &["G"])]), slot(2, &[])];
+        let html = rendered(&render_check(&page, &mixed).html);
+        assert!(html.contains(r#"data-slot="1""#), "{html}");
+        assert!(html.contains("Player 2 has no controls yet"), "{html}");
+        assert!(
+            html.contains(r#"href="/map?slot=2""#) && html.contains("Open Controls"),
+            "{html}"
+        );
+        assert!(
+            !html.contains(r#"data-slot="2""#),
+            "an empty player should have a remedy row, not a fake live chip: {html}"
+        );
+    }
+
+    #[test]
+    fn live_refusals_are_sanitized_before_they_reach_the_status_line() {
+        let sanitizer = CHECK_TS
+            .split("export function customerFeedReason(")
+            .nth(1)
+            .expect("customerFeedReason exists")
+            .split("\n}")
+            .next()
+            .expect("customerFeedReason ends");
+        assert!(
+            sanitizer.contains("temporarily unavailable") && sanitizer.contains("Reopen ksx"),
+            "the unknown-refusal branch has no safe remedy: {sanitizer}"
+        );
+        assert!(
+            !sanitizer.contains("return reason"),
+            "an unknown provider refusal can still render raw: {sanitizer}"
+        );
+        assert!(
+            CHECK_TS.contains(r#"|| "unavailable""#),
+            "an empty unavailable event must not paint itself as live"
+        );
+    }
+
+    #[test]
+    fn client_and_server_empty_state_copy_stays_in_lockstep() {
+        let mut empty = cabinet().mapper;
+        empty.slots.clear();
+        let zero = ksx_api::MapperSnapshot {
+            slots: vec![slot(1, &[])],
+            ..empty.clone()
+        };
+        for mapper in [
+            ksx_api::MapperSnapshot::unavailable("raw provider failure"),
+            empty,
+            zero,
+        ] {
+            let state = empty_state(&mapper).expect("an empty presentation state");
+            for literal in [state.heading, state.line, state.href, state.action] {
+                assert!(
+                    CHECK_ISLAND_TS.contains(literal),
+                    "CheckIsland.ts drifted from Rust's {literal:?}"
+                );
+            }
+        }
+        for mixed_literal in [
+            "has no controls yet",
+            "add button keys for this player",
+            "Open Controls",
+        ] {
+            assert!(
+                CHECK_ISLAND_TS.contains(mixed_literal),
+                "mixed-player remedy drifted: {mixed_literal}"
+            );
+        }
     }
 
     /// **With scripting off the page says the echo cannot work.**
@@ -447,18 +735,24 @@ mod tests {
         );
     }
 
-    /// The nav reaches every sibling page, and marks this one.
+    /// The customer rail is the three-stage Setup → Controls → Test flow, and
+    /// marks this final stage as current.
     #[test]
     fn the_nav_reaches_every_sibling_page() {
         let page = EmbeddedPage::load("/check").unwrap();
         let html = render_check(&page, &cabinet()).html;
-        for route in ["/", "/map", "/pads", "/devices", "/profiles", "/setup"] {
-            assert!(
-                html.contains(&format!(r#"href="{route}""#)),
-                "the nav lost {route}: {html}"
-            );
-        }
-        assert!(html.contains(r#"aria-current="page""#), "{html}");
+        assert!(
+            html.contains(r#"<a class="navlink" href="/start">Setup</a>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<a class="navlink" href="/map">Controls</a>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<a class="navlink on" href="/check" aria-current="page">Test</a>"#),
+            "{html}"
+        );
     }
 
     /// **The two-attribute contract, both sides.**
@@ -616,7 +910,7 @@ mod tests {
             .collect();
         assert_eq!(
             array_slots,
-            [LIST_SLOT_KEYS, LIST_SLOT_CHIPS],
+            [LIST_SLOT_KEYS, LIST_SLOT_EMPTY_PLAYERS, LIST_SLOT_CHIPS],
             "list slot names drifted between the compiler/CheckIsland.ts and the              LIST_SLOT_* constants; slots: {names:?}"
         );
         let ir_shows: std::collections::BTreeSet<&str> = names

@@ -144,6 +144,7 @@ impl StatusSource for Store {
                 keyboard: "HID\\FIXTURE".into(),
                 bindings: BTreeMap::from([("A".to_owned(), vec!["G".to_owned()])]),
                 backup: None,
+                session_backup: false,
                 turbo: BTreeMap::new(),
                 macros_off: false,
             }],

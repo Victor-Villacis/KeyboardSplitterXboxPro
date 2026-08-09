@@ -176,10 +176,25 @@ function counters(envelope: LiveEnvelope): void {
           `keep up, so something you pressed may not be shown.`
       : "",
     off > 0
-      ? `${off} key press(es) came from a keyboard bound to no slot and were left ` +
+      ? `${off} key press(es) came from a keyboard assigned to no player and were left ` +
           `out. If nothing is lighting up, check you are pressing the panel.`
       : "",
   );
+}
+
+export function customerFeedReason(reason: string | null | undefined): string {
+  if (!reason) return "live";
+  const lower = reason.toLowerCase();
+  if (lower.includes("daemon") || lower.includes("control channel") || lower.includes("pipe")) {
+    return "Live testing needs ksx to be reopened.";
+  }
+  if (lower.includes("no session") || lower.includes("not running")) {
+    return "Press Play in Setup to start live testing.";
+  }
+  // Refusals originate below the presentation boundary and may contain pipe
+  // names, commands, paths, or other support detail. An unfamiliar one still
+  // gets a useful customer action; its raw text never becomes primary copy.
+  return "Live testing is temporarily unavailable. Reopen ksx and try again.";
 }
 
 /** One EventSource for the page's life. It reconnects by itself, on the
@@ -189,7 +204,7 @@ function connect(): void {
   const source = new EventSource("/api/live");
 
   source.addEventListener("open", () => {
-    applyFeedState("connected — waiting for the first frame", true);
+    applyFeedState("connected — waiting for input", true);
   });
 
   source.addEventListener("frame", (ev) => {
@@ -197,15 +212,14 @@ function connect(): void {
     try {
       envelope = JSON.parse((ev as MessageEvent<string>).data) as LiveEnvelope;
     } catch {
-      applyFeedState("the feed sent a frame this page could not read", false);
+      applyFeedState("live input sent something this page could not read", false);
       return;
     }
-    // The daemon's OWN sentence when it has one ("no session is running —
-    // start emulation and the panel's keys will show here"). Not re-derived
-    // from `running: false` here: one fact, one wording, composed where it is
-    // known (ksx_api::LiveEnvelope).
+    // The provider owns the reason, but it crosses a customer presentation
+    // boundary before it is shown: raw paths, commands and channel names stay
+    // in support detail rather than becoming this screen's status line.
     const reason = envelope.unavailable;
-    applyFeedState(reason ? reason : "live", !reason);
+    applyFeedState(customerFeedReason(reason), !reason);
     counters(envelope);
     pushKeys(envelope);
     paint(envelope);
@@ -218,18 +232,15 @@ function connect(): void {
     } catch {
       // fall through to the generic sentence below
     }
-    const message = refusal.message ?? "the live feed is unavailable";
-    applyFeedState(
-      refusal.remedy ? `${message} (${refusal.remedy})` : message,
-      false,
-    );
+    const reason = refusal.message?.trim() || refusal.remedy?.trim() || "unavailable";
+    applyFeedState(customerFeedReason(reason), false);
   });
 
   // `error` on an EventSource is not fatal — the browser is already
   // reconnecting on the server's `retry:` interval. Saying "reconnecting"
   // rather than "failed" is the honest word for what is actually happening.
   source.addEventListener("error", () => {
-    applyFeedState("reconnecting to the live feed…", false);
+    applyFeedState("reconnecting to live input…", false);
   });
 }
 
@@ -245,7 +256,7 @@ activateIslands({
     const seed = embeddedPayload<CheckPayload>();
     if (seed) applyCheck(seed);
     applyKeys([]);
-    applyFeedState("opening the live feed…", false);
+    applyFeedState("connecting to live input…", false);
     applyCounters("", "");
     connect();
     window.setInterval(() => void pollRoster(), ROSTER_MS);

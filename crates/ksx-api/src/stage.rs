@@ -31,13 +31,18 @@
 //! no file write at all — `FIRST-RUN.md` §2's "saving and playing are separate
 //! acts", stated as two verbs.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 
 use ksx_core::stage::{StagedDevice, StagedSetup};
-use ksx_core::{Blocking, DeviceSelector, Persona, MAX_SLOTS, MAX_XINPUT_SLOTS};
+use ksx_core::{Blocking, DeviceSelector, Key, Persona, TurboBinding, MAX_SLOTS, MAX_XINPUT_SLOTS};
 
+use crate::control::{BindConflict, BindOutcome, MacroOutcome, MacroWrite};
 use crate::machine::TemplateRow;
 use crate::refusal::{codes, Refusal};
+use crate::status::{MacroSnapshot, MapperSlot, MapperSnapshot};
+use crate::wire::MacroWriteKind;
 
 /// The chosen input device, as a surface shows it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +90,14 @@ pub struct StagedSlotView {
     pub is_xinput: bool,
     /// The preset name — and the name of the file a save would write.
     pub preset: String,
+    /// The complete preset table being authored in memory.
+    ///
+    /// `Some` on every view composed from a live [`StagedSetup`]. Optional on
+    /// the wire so a newer surface can still read a staged view sent by an
+    /// older daemon; such a view remains readable, but cannot safely prepare a
+    /// mapper edit until it is refreshed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authoring: Option<ksx_config::PresetFile>,
     /// **How many bindings a key can actually reach**
     /// ([`ksx_core::Preset::live_bindings`]).
     ///
@@ -260,9 +273,9 @@ pub struct StagedSetupView {
     /// The layout id "Add a controller" offers first.
     ///
     /// **Served, because a first-run user must not have to choose one to get
-    /// moving.** It is the first non-blank template in the roster, which is
-    /// `arcade-6button` — the factory chart an unprogrammed I-PAC already
-    /// sends, and what MAME has read for thirty years.
+    /// moving.** It is the named `keyboard-2p` desktop layout: unlike the
+    /// declaration-order `arcade-6button` choice it replaced, it gives both
+    /// player blocks distinct keys and includes Guide.
     pub default_layout: String,
     /// The blocking answers, in §3's own words.
     pub blocking_options: Vec<BlockingOption>,
@@ -306,6 +319,7 @@ impl StagedSetupView {
                     persona_label: slot.persona.label().to_owned(),
                     is_xinput: slot.persona.is_xinput(),
                     preset: slot.preset.name.clone(),
+                    authoring: Some(ksx_config::PresetFile::from_core(&slot.preset)),
                     bindings: slot.preset.live_bindings(),
                 })
                 .collect(),
@@ -523,6 +537,912 @@ impl StageEdit {
     }
 }
 
+/// One whole binding-row edit aimed at an in-memory staged controller.
+///
+/// This deliberately mirrors the existing mapper's request shape. `number`
+/// selects the player and `preset` pins the controller-layout identity that
+/// was visible when the action began.
+/// An empty `keys` list (or the single canonical placeholder `None`) clears
+/// the row. `turbo_hz = None` preserves an existing rate, while `Some(0)`
+/// removes it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedBindRequest {
+    pub number: u8,
+    /// Controller-layout name observed with `number` when the action began.
+    /// The daemon checks both pieces of identity so removing and recreating a
+    /// player at the same number cannot receive a stale browser write.
+    #[serde(default)]
+    pub preset: String,
+    pub function: String,
+    #[serde(default)]
+    pub keys: Vec<String>,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub turbo_hz: Option<u32>,
+}
+
+/// One whole macro edit aimed at an exact in-memory staged controller.
+///
+/// The slot number is deliberately part of the request instead of being
+/// inferred from the preset name. Two staged controllers may legitimately
+/// author presets with similar names, and a stale browser tab must be refused
+/// rather than redirected to whichever controller happens to be first.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedMacroRequest {
+    pub number: u8,
+    #[serde(flatten)]
+    pub write: MacroWrite,
+}
+
+/// A binding edit prepared entirely in memory.
+///
+/// A server sends [`Self::edit`] through `ControlSource::stage_edit`, then
+/// passes that answer to [`Self::finish`]. The mapper can therefore return its
+/// existing [`BindOutcome`] without inventing a staged-only response shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedBindEdit {
+    pub edit: StageEdit,
+    pub outcome: BindOutcome,
+}
+
+impl StagedBindEdit {
+    /// Keep the precomposed mapper success when the stage accepted the edit,
+    /// or amend it with the stage's exact refusal when the transport/daemon did
+    /// not. No reload is ever claimed: staged bindings are memory only.
+    pub fn finish(mut self, stage: &StageOutcome) -> BindOutcome {
+        if !stage.ok {
+            self.outcome.ok = false;
+            self.outcome.message = None;
+            self.outcome.error = Some(
+                stage
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "the staged setup was not changed".to_owned()),
+            );
+            self.outcome.code = Some(
+                stage
+                    .code
+                    .clone()
+                    .unwrap_or_else(|| codes::REFUSED.to_owned()),
+            );
+        }
+        self.outcome.reloaded = false;
+        self.outcome
+    }
+}
+
+/// A macro edit prepared entirely in memory, with the existing macro editor's
+/// outcome already composed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedMacroEdit {
+    pub edit: StageEdit,
+    pub outcome: MacroOutcome,
+}
+
+impl StagedMacroEdit {
+    /// The macro counterpart of [`StagedBindEdit::finish`]. A staged write has
+    /// neither a disk backup nor a live-session reload, even after success.
+    pub fn finish(mut self, stage: &StageOutcome) -> MacroOutcome {
+        if !stage.ok {
+            self.outcome.ok = false;
+            self.outcome.message = None;
+            self.outcome.error = Some(
+                stage
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "the staged setup was not changed".to_owned()),
+            );
+            self.outcome.code = Some(
+                stage
+                    .code
+                    .clone()
+                    .unwrap_or_else(|| codes::REFUSED.to_owned()),
+            );
+        }
+        self.outcome.backup = None;
+        self.outcome.reloaded = false;
+        self.outcome
+    }
+}
+
+/// Prepare a staged binding edit from the complete setup view.
+///
+/// This is the convenient server entry point: it locates `request.number`,
+/// checks every other staged slot for duplicate keys, and returns either one
+/// atomic [`StageEdit::SetBindings`] or the ordinary mapper refusal.
+#[allow(clippy::result_large_err)] // the refusal intentionally is the existing complete outcome
+pub fn staged_bind_edit(
+    setup: &StagedSetupView,
+    request: &StagedBindRequest,
+) -> Result<StagedBindEdit, BindOutcome> {
+    if !setup.reachable {
+        return Err(bind_refusal(
+            codes::NOT_HERE,
+            setup
+                .error
+                .clone()
+                .unwrap_or_else(|| "this unsaved setup is unavailable".to_owned()),
+            Vec::new(),
+        ));
+    }
+    let Some(slot) = setup
+        .slots
+        .iter()
+        .find(|slot| slot.number == request.number)
+    else {
+        return Err(bind_refusal(
+            codes::BAD_SLOT,
+            format!(
+                "Player {} is no longer in this unsaved setup. Nothing changed.",
+                request.number
+            ),
+            Vec::new(),
+        ));
+    };
+    staged_slot_bind_edit(slot, &setup.slots, request)
+}
+
+/// Prepare a binding edit when the caller already selected the target slot.
+/// `slots` must be the setup's complete staged roster so cross-slot duplicate
+/// detection cannot silently omit a controller.
+#[allow(clippy::result_large_err)] // the refusal intentionally is the existing complete outcome
+pub fn staged_slot_bind_edit(
+    slot: &StagedSlotView,
+    slots: &[StagedSlotView],
+    request: &StagedBindRequest,
+) -> Result<StagedBindEdit, BindOutcome> {
+    if request.number != slot.number {
+        return Err(bind_refusal(
+            codes::BAD_SLOT,
+            format!(
+                "This binding was aimed at Player {}, not Player {}. Nothing changed.",
+                request.number, slot.number
+            ),
+            Vec::new(),
+        ));
+    }
+    let Some(file) = slot.authoring.as_ref() else {
+        return Err(bind_refusal(
+            codes::NOT_HERE,
+            format!(
+                "Player {}'s controller layout is not available. Refresh the unsaved setup before mapping.",
+                slot.number
+            ),
+            Vec::new(),
+        ));
+    };
+    if !request.preset.trim().is_empty() && !request.preset.trim().eq_ignore_ascii_case(&file.name)
+    {
+        return Err(bind_refusal(
+            codes::BAD_SLOT,
+            format!(
+                "This binding was opened for controller layout \"{}\", but Player {} now uses \"{}\". Nothing changed.",
+                request.preset.trim(),
+                slot.number,
+                file.name
+            ),
+            Vec::new(),
+        ));
+    }
+    let mut core = file.to_core().map_err(|err| {
+        bind_refusal(
+            codes::BAD_REQUEST,
+            format!(
+                "Player {}'s controller layout cannot be edited: {err}",
+                slot.number
+            ),
+            Vec::new(),
+        )
+    })?;
+    let keys = canonical_keys(&request.keys)
+        .map_err(|message| bind_refusal(codes::BAD_REQUEST, message, Vec::new()))?;
+
+    enum Target {
+        Pad {
+            binding: ksx_core::Binding,
+            canonical: String,
+        },
+        Macro {
+            index: u16,
+            canonical: String,
+        },
+    }
+
+    let function = request.function.trim();
+    let target = if let Some(name) = ksx_config::macro_name(function) {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(bind_refusal(
+                codes::BAD_REQUEST,
+                "a macro trigger needs a name after `macro.`",
+                Vec::new(),
+            ));
+        }
+        let Some(index) = core.macros.index_of(name) else {
+            let known = core
+                .macros
+                .defs
+                .iter()
+                .map(|mac| mac.name.clone())
+                .collect::<Vec<_>>();
+            return Err(bind_refusal(
+                codes::UNKNOWN_MACRO,
+                format!(
+                    "Player {} has no macro \"{name}\"{}",
+                    slot.number,
+                    if known.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (known: {})", known.join(", "))
+                    }
+                ),
+                Vec::new(),
+            ));
+        };
+        let canonical = ksx_config::macro_function_name(&core.macros.defs[usize::from(index)].name);
+        Target::Macro { index, canonical }
+    } else {
+        let binding = ksx_config::parse_function(function)
+            .map_err(|err| bind_refusal(codes::BAD_REQUEST, err.to_string(), Vec::new()))?;
+        Target::Pad {
+            binding,
+            canonical: ksx_config::function_name(&binding),
+        }
+    };
+
+    let mut found = staged_cross_conflicts(slots, slot.number, &keys)
+        .map_err(|message| bind_refusal(codes::BAD_REQUEST, message, Vec::new()))?;
+    if let Target::Macro { index, .. } = &target {
+        for key in &keys {
+            for trigger in &core.macros.triggers {
+                if trigger.index == *index || trigger.key != *key || trigger.key == Key::None {
+                    continue;
+                }
+                if let Some(other) = core.macros.get(trigger.index) {
+                    found.push((
+                        key.name().to_owned(),
+                        BindConflict {
+                            // A pad multi-bind inside one controller layout is
+                            // intentional and needs no question. Two MACRO
+                            // triggers on one key are different: they launch
+                            // two sequences, so the browser must ask before a
+                            // forced fan-out instead of taking its legacy
+                            // same-preset auto-retry.
+                            scope: "macro".to_owned(),
+                            preset: file.name.clone(),
+                            function: ksx_config::macro_function_name(&other.name),
+                            file: String::new(),
+                            profile: None,
+                            slot: Some(slot.number),
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    dedupe_staged_conflicts(&mut found);
+    let conflicts: Vec<BindConflict> = found.iter().map(|(_, row)| row.clone()).collect();
+    if !request.force {
+        if let Some((key, row)) = found.first() {
+            return Err(bind_refusal(
+                codes::CONFLICT,
+                format!(
+                    "{}; choose “Use anyway” only if every listed control or macro should receive that key",
+                    row.describe(key)
+                ),
+                conflicts,
+            ));
+        }
+    }
+
+    let (canonical, also_drives, turbo_hz, turbo_effective_hz) = match target {
+        Target::Pad { binding, canonical } => {
+            core.entries
+                .retain(|(_, bound)| ksx_config::function_name(bound) != canonical);
+            core.chords
+                .retain(|chord| ksx_config::function_name(&chord.binding) != canonical);
+            if keys.is_empty() {
+                // Keep the mapper row visible after a clear. `None` is the
+                // preset format's canonical inert placeholder.
+                core.entries.push((Key::None, binding));
+            } else {
+                core.entries
+                    .extend(keys.iter().copied().map(|key| (key, binding)));
+            }
+
+            match request.turbo_hz {
+                Some(0) | None if keys.is_empty() => {
+                    core.turbo.retain(|row| row.binding != binding)
+                }
+                None => {}
+                Some(0) => core.turbo.retain(|row| row.binding != binding),
+                Some(hz) => {
+                    core.turbo.retain(|row| row.binding != binding);
+                    core.turbo.push(TurboBinding::new(binding, hz));
+                }
+            }
+            let also = other_functions_for_keys(&core, &keys, &canonical);
+            let turbo = core
+                .turbo
+                .iter()
+                .copied()
+                .find(|row| row.binding == binding);
+            (
+                canonical,
+                also,
+                turbo.map(|row| row.hz),
+                turbo.map(TurboBinding::effective_hz),
+            )
+        }
+        Target::Macro { index, canonical } => {
+            if request.turbo_hz.is_some_and(|hz| hz != 0) {
+                return Err(bind_refusal(
+                    codes::BAD_REQUEST,
+                    format!(
+                        "{canonical} is a macro trigger; its repeat rate belongs in the macro body, not on its trigger key"
+                    ),
+                    Vec::new(),
+                ));
+            }
+            core.macros
+                .triggers
+                .retain(|trigger| trigger.index != index);
+            core.macros.triggers.extend(
+                keys.iter()
+                    .copied()
+                    .map(|key| ksx_core::MacroTrigger::new(key, index)),
+            );
+            let also = other_functions_for_keys(&core, &keys, &canonical);
+            (canonical, also, None, None)
+        }
+    };
+
+    let rewritten = ksx_config::PresetFile::from_core(&core);
+    // The conversion is expected to be valid by construction. Keep the check
+    // at the API edge so a future core field cannot produce a stage edit the
+    // daemon alone would reject.
+    rewritten.to_core().map_err(|err| {
+        bind_refusal(
+            codes::BAD_REQUEST,
+            format!(
+                "Player {}'s controller layout would be invalid: {err}",
+                slot.number
+            ),
+            Vec::new(),
+        )
+    })?;
+    let message = if keys.is_empty() {
+        format!("Cleared {canonical} for Player {}.", slot.number)
+    } else {
+        format!(
+            "Player {}: {canonical} = {}",
+            slot.number,
+            keys.iter()
+                .map(|key| key.name())
+                .collect::<Vec<_>>()
+                .join(" · ")
+        )
+    };
+    Ok(StagedBindEdit {
+        edit: StageEdit::SetBindings {
+            number: slot.number,
+            preset: Box::new(rewritten),
+        },
+        outcome: BindOutcome {
+            ok: true,
+            message: Some(message),
+            conflicts,
+            also_drives,
+            turbo_hz,
+            turbo_effective_hz,
+            // Staging is neither a disk write nor a live hot reload.
+            reloaded: false,
+            ..BindOutcome::default()
+        },
+    })
+}
+
+/// Prepare a whole-macro write for one staged slot.
+///
+/// Body replacement, deletion (including every trigger row), and enable
+/// toggles follow [`MacroWrite`]'s existing meanings. Validation is the same
+/// `ksx_config::validate` rule set used for files, but this helper never opens
+/// a store, takes a backup, or reloads a session.
+#[allow(clippy::result_large_err)] // the refusal intentionally is the existing complete outcome
+pub fn staged_macro_edit(
+    slot: &StagedSlotView,
+    write: &MacroWrite,
+) -> Result<StagedMacroEdit, MacroOutcome> {
+    let Some(file) = slot.authoring.as_ref() else {
+        return Err(macro_refusal(
+            codes::NOT_HERE,
+            format!(
+                "Player {}'s controller layout is not available. Refresh the unsaved setup before editing macros.",
+                slot.number
+            ),
+            Vec::new(),
+        ));
+    };
+    if !write.preset.trim().eq_ignore_ascii_case(&file.name) {
+        return Err(macro_refusal(
+            codes::UNKNOWN_PRESET,
+            format!(
+                "This macro edit was opened for controller layout \"{}\", but Player {} now uses \"{}\". Nothing changed.",
+                write.preset.trim(),
+                slot.number,
+                file.name
+            ),
+            Vec::new(),
+        ));
+    }
+    let request = write
+        .to_request()
+        .map_err(|refusal| macro_refusal(&refusal.code, refusal.message, Vec::new()))?;
+    let name = request.name.trim();
+    if name.is_empty() {
+        let message = "a macro needs a name; it is the name used by its `macro.<name>` trigger row";
+        return Err(macro_refusal(
+            codes::MACRO_INVALID,
+            message,
+            vec![message.to_owned()],
+        ));
+    }
+
+    let existing = file
+        .macros
+        .keys()
+        .find(|known| known.eq_ignore_ascii_case(name))
+        .cloned();
+    let mut next = file.clone();
+    let mut warnings = Vec::new();
+    let (deleted, enabled, toggled, message) = match request.write {
+        MacroWriteKind::Toggle(enabled) => {
+            let Some(key) = existing else {
+                return Err(unknown_staged_macro(slot.number, file, name));
+            };
+            next.macros
+                .get_mut(&key)
+                .expect("the existing macro key came from this map")
+                .enabled = enabled;
+            (
+                false,
+                enabled,
+                true,
+                format!(
+                    "Macro \"{key}\" is {} for Player {}.",
+                    if enabled { "enabled" } else { "disabled" },
+                    slot.number
+                ),
+            )
+        }
+        MacroWriteKind::Delete => {
+            let Some(key) = existing else {
+                return Err(unknown_staged_macro(slot.number, file, name));
+            };
+            next.macros.remove(&key);
+            next.bindings.retain(|function, _| {
+                !ksx_config::macro_name(function)
+                    .is_some_and(|bound| bound.eq_ignore_ascii_case(&key))
+            });
+            (
+                true,
+                true,
+                false,
+                format!(
+                    "Macro \"{key}\" and its trigger keys were removed for Player {}.",
+                    slot.number
+                ),
+            )
+        }
+        MacroWriteKind::Body(body) => {
+            let (problems, advisories) = staged_macro_body_issues(&file.name, name, &body);
+            if !problems.is_empty() {
+                return Err(macro_refusal(
+                    codes::MACRO_INVALID,
+                    format!("macro \"{name}\" is invalid"),
+                    problems,
+                ));
+            }
+            warnings = advisories;
+            let key = existing.unwrap_or_else(|| name.to_owned());
+            let enabled = body.enabled;
+            next.macros.insert(key.clone(), *body);
+            (
+                false,
+                enabled,
+                false,
+                format!("Macro \"{key}\" was updated for Player {}.", slot.number),
+            )
+        }
+    };
+
+    if !toggled {
+        let before = staged_preset_problems(file);
+        let broke: Vec<String> = staged_preset_problems(&next)
+            .into_iter()
+            .filter(|problem| !before.contains(problem))
+            .filter(|problem| !warnings.contains(problem))
+            .collect();
+        if !broke.is_empty() {
+            return Err(macro_refusal(
+                codes::MACRO_INVALID,
+                format!(
+                    "Macro \"{name}\" would make Player {}'s controller layout invalid",
+                    slot.number
+                ),
+                broke,
+            ));
+        }
+        if let Err(err) = next.to_core() {
+            return Err(macro_refusal(
+                codes::MACRO_INVALID,
+                err.to_string(),
+                vec![err.to_string()],
+            ));
+        }
+    }
+
+    Ok(StagedMacroEdit {
+        edit: StageEdit::SetBindings {
+            number: slot.number,
+            preset: Box::new(next),
+        },
+        outcome: MacroOutcome {
+            ok: true,
+            message: Some(message),
+            warnings,
+            deleted,
+            enabled,
+            toggled,
+            // A staged edit has no disk road-home and does not hot reload.
+            backup: None,
+            reloaded: false,
+            ..MacroOutcome::default()
+        },
+    })
+}
+
+/// Prepare a staged macro edit from the complete setup view, selecting only
+/// the exact slot named by the request.
+///
+/// This setup-scoped entry point is the macro counterpart of
+/// [`staged_bind_edit`]. It exists so a daemon can perform selection,
+/// preparation, validation, and application while holding its one staged
+/// state lock; no caller has to guess by preset name or fall back to slot 1.
+#[allow(clippy::result_large_err)] // the refusal intentionally is the existing complete outcome
+pub fn staged_macro_edit_for_setup(
+    setup: &StagedSetupView,
+    request: &StagedMacroRequest,
+) -> Result<StagedMacroEdit, MacroOutcome> {
+    if !setup.reachable {
+        return Err(macro_refusal(
+            codes::NOT_HERE,
+            setup
+                .error
+                .clone()
+                .unwrap_or_else(|| "this unsaved setup is unavailable".to_owned()),
+            Vec::new(),
+        ));
+    }
+    let Some(slot) = setup
+        .slots
+        .iter()
+        .find(|slot| slot.number == request.number)
+    else {
+        return Err(macro_refusal(
+            codes::BAD_SLOT,
+            format!(
+                "Player {} is no longer in this unsaved setup. Nothing changed.",
+                request.number
+            ),
+            Vec::new(),
+        ));
+    };
+    staged_macro_edit(slot, &request.write)
+}
+
+/// Convert one staged slot to the saved mapper's existing slot shape.
+pub fn staged_mapper_slot(slot: &StagedSlotView, keyboard: &str) -> Result<MapperSlot, Refusal> {
+    let file = slot.authoring.as_ref().ok_or_else(|| {
+        Refusal::new(
+            codes::NOT_HERE,
+            format!(
+                "Player {}'s controller layout is not available. Refresh the unsaved setup.",
+                slot.number
+            ),
+        )
+    })?;
+    let core = file.to_core().map_err(|err| {
+        Refusal::new(
+            codes::BAD_REQUEST,
+            format!(
+                "Player {}'s controller layout cannot be shown: {err}",
+                slot.number
+            ),
+        )
+    })?;
+    let mut bindings: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, binding) in &core.entries {
+        let keys = bindings
+            .entry(ksx_config::function_name(binding))
+            .or_default();
+        if *key != Key::None {
+            keys.push(key.name().to_owned());
+        }
+    }
+    let turbo = core
+        .turbo
+        .iter()
+        .map(|row| (ksx_config::function_name(&row.binding), row.hz))
+        .collect();
+    Ok(MapperSlot {
+        number: slot.number,
+        persona: slot.persona.clone(),
+        persona_label: slot.persona_label.clone(),
+        preset: file.name.clone(),
+        keyboard: keyboard.to_owned(),
+        bindings,
+        // Nothing staged has ever been backed up to disk.
+        backup: None,
+        session_backup: false,
+        turbo,
+        macros_off: false,
+    })
+}
+
+/// Convert a complete staged setup to the mapper's existing point-in-time
+/// snapshot. All labels are stable in-memory facts; no clock or config root is
+/// read, which keeps this conversion pure and deterministic.
+pub fn staged_mapper_snapshot(setup: &StagedSetupView) -> MapperSnapshot {
+    if !setup.reachable {
+        return MapperSnapshot::unavailable(
+            setup
+                .error
+                .as_deref()
+                .unwrap_or("the staged setup is unavailable"),
+        );
+    }
+    let keyboard = setup
+        .device
+        .as_ref()
+        .map(|device| device.alias.as_str())
+        .unwrap_or("(any)");
+    let mut slots = Vec::with_capacity(setup.slots.len());
+    for slot in &setup.slots {
+        match staged_mapper_slot(slot, keyboard) {
+            Ok(slot) => slots.push(slot),
+            Err(refusal) => return MapperSnapshot::unavailable(&refusal.message),
+        }
+    }
+    MapperSnapshot {
+        generated_at: "(staged)".to_owned(),
+        source: "unsaved setup".to_owned(),
+        profile: None,
+        config_root: "(not saved)".to_owned(),
+        slots,
+    }
+}
+
+/// Convert one staged preset to the macro editor's existing snapshot.
+pub fn staged_macro_snapshot(slot: &StagedSlotView) -> MacroSnapshot {
+    match &slot.authoring {
+        Some(file) => MacroSnapshot::from_preset(file),
+        None => MacroSnapshot::unavailable(&format!(
+            "Player {}'s controller layout is not available. Refresh the unsaved setup.",
+            slot.number
+        )),
+    }
+}
+
+fn bind_refusal(
+    code: &str,
+    message: impl Into<String>,
+    conflicts: Vec<BindConflict>,
+) -> BindOutcome {
+    BindOutcome {
+        ok: false,
+        error: Some(message.into()),
+        code: Some(code.to_owned()),
+        conflicts,
+        reloaded: false,
+        ..BindOutcome::default()
+    }
+}
+
+fn macro_refusal(code: &str, message: impl Into<String>, problems: Vec<String>) -> MacroOutcome {
+    MacroOutcome {
+        ok: false,
+        error: Some(message.into()),
+        code: Some(code.to_owned()),
+        problems,
+        backup: None,
+        reloaded: false,
+        ..MacroOutcome::default()
+    }
+}
+
+fn unknown_staged_macro(number: u8, file: &ksx_config::PresetFile, name: &str) -> MacroOutcome {
+    let known = file.macros.keys().cloned().collect::<Vec<_>>();
+    macro_refusal(
+        codes::UNKNOWN_MACRO,
+        format!(
+            "Player {number} has no macro \"{name}\"{}",
+            if known.is_empty() {
+                String::new()
+            } else {
+                format!(" (known: {})", known.join(", "))
+            }
+        ),
+        Vec::new(),
+    )
+}
+
+fn canonical_keys(words: &[String]) -> Result<Vec<Key>, String> {
+    let mut out = Vec::new();
+    let mut none = false;
+    for word in words {
+        let word = word.trim();
+        if word.is_empty() {
+            return Err(
+                "a binding key name cannot be blank; send an empty key list to clear it".to_owned(),
+            );
+        }
+        let Some(key) = Key::ALL
+            .iter()
+            .copied()
+            .find(|key| key.name().eq_ignore_ascii_case(word))
+        else {
+            return Err(format!("unknown key name '{word}'"));
+        };
+        if key == Key::None {
+            none = true;
+        } else if !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    if none && !out.is_empty() {
+        return Err(
+            "`None` is the clear placeholder and cannot be mixed with live keys".to_owned(),
+        );
+    }
+    Ok(out)
+}
+
+fn staged_cross_conflicts(
+    slots: &[StagedSlotView],
+    target: u8,
+    keys: &[Key],
+) -> Result<Vec<(String, BindConflict)>, String> {
+    let mut found = Vec::new();
+    for slot in slots.iter().filter(|slot| slot.number != target) {
+        let file = slot.authoring.as_ref().ok_or_else(|| {
+            format!(
+                "staged slot {} has no authoring snapshot; refresh before checking duplicate keys",
+                slot.number
+            )
+        })?;
+        let core = file.to_core().map_err(|err| {
+            format!(
+                "staged preset \"{}\" cannot be checked for duplicate keys: {err}",
+                file.name
+            )
+        })?;
+        for key in keys {
+            for function in functions_for_key(&core, *key) {
+                found.push((
+                    key.name().to_owned(),
+                    BindConflict {
+                        scope: "stage".to_owned(),
+                        preset: file.name.clone(),
+                        function,
+                        file: String::new(),
+                        profile: None,
+                        slot: Some(slot.number),
+                    },
+                ));
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn functions_for_key(preset: &ksx_core::Preset, key: Key) -> Vec<String> {
+    let mut functions = Vec::new();
+    functions.extend(
+        preset
+            .entries
+            .iter()
+            .filter(|(bound, _)| *bound == key)
+            .map(|(_, binding)| ksx_config::function_name(binding)),
+    );
+    functions.extend(
+        preset
+            .chords
+            .iter()
+            .filter(|chord| chord.key == key)
+            .map(|chord| ksx_config::function_name(&chord.binding)),
+    );
+    functions.extend(
+        preset
+            .macros
+            .triggers
+            .iter()
+            .filter(|trigger| trigger.key == key)
+            .filter_map(|trigger| preset.macros.get(trigger.index))
+            .map(|mac| ksx_config::macro_function_name(&mac.name)),
+    );
+    functions.sort();
+    functions.dedup();
+    functions
+}
+
+fn other_functions_for_keys(preset: &ksx_core::Preset, keys: &[Key], target: &str) -> Vec<String> {
+    let mut functions = keys
+        .iter()
+        .flat_map(|key| functions_for_key(preset, *key))
+        .filter(|function| function != target)
+        .collect::<Vec<_>>();
+    functions.sort();
+    functions.dedup();
+    functions
+}
+
+fn dedupe_staged_conflicts(conflicts: &mut Vec<(String, BindConflict)>) {
+    let mut seen = BTreeSet::new();
+    conflicts.retain(|(key, row)| {
+        seen.insert((
+            key.clone(),
+            row.scope.clone(),
+            row.preset.clone(),
+            row.function.clone(),
+            row.slot,
+        ))
+    });
+}
+
+fn staged_macro_body_issues(
+    preset_name: &str,
+    name: &str,
+    body: &ksx_config::MacroFile,
+) -> (Vec<String>, Vec<String>) {
+    let solo = ksx_config::PresetFile {
+        name: preset_name.to_owned(),
+        bindings: BTreeMap::new(),
+        macros: std::iter::once((name.to_owned(), body.clone())).collect(),
+    };
+    let mut problems = Vec::new();
+    let mut advisories = Vec::new();
+    for issue in ksx_config::validate(
+        &ksx_config::ConfigFile::default(),
+        std::slice::from_ref(&solo),
+    ) {
+        if issue.is_advisory() {
+            advisories.push(issue.to_string());
+        } else {
+            problems.push(issue.to_string());
+        }
+    }
+    if body.steps.is_empty() {
+        problems.push(
+            "an empty step list is not a macro delete; use the delete flag if removal is intended"
+                .to_owned(),
+        );
+    }
+    (problems, advisories)
+}
+
+fn staged_preset_problems(file: &ksx_config::PresetFile) -> BTreeSet<String> {
+    ksx_config::validate(
+        &ksx_config::ConfigFile::default(),
+        std::slice::from_ref(file),
+    )
+    .into_iter()
+    .filter(|issue| !issue.is_advisory())
+    .map(|issue| issue.to_string())
+    .collect()
+}
+
 /// The preset a controller staged into slot `number` binds, by default.
 ///
 /// "Player 1", not "slot1" or "preset-1": it is shown to someone who has never
@@ -550,10 +1470,9 @@ pub fn preset_name_for_slot(number: u8) -> String {
 /// 1. It is the wrong chart for the machine. An arcade template describes a
 ///    panel wired to an encoder's factory chart, and a laptop is not one.
 /// 2. **It silently broke FIRST-RUN.md moment 7.** No arcade template binds
-///    `Guide` — a real panel has no spare button for it — so the promise that
-///    "Guide opens Game Bar so they can launch a game without leaving it"
-///    could not happen on the default path, and a user whose keyboard had just
-///    become a controller had no way to reach a game with it.
+///    `Guide` — a real panel has no spare button for it — so the default path
+///    could not send the controller button that asks Windows to open Game Bar
+///    when the user's Game Bar setting allows it.
 ///
 /// # Why `keyboard-2p` and not `keyboard-wasd`
 ///
@@ -753,6 +1672,34 @@ mod tests {
         }
         .apply(&StagedSetup::new())
         .unwrap()
+    }
+
+    fn authored_preset() -> ksx_config::PresetFile {
+        toml::from_str(
+            r#"
+name = "Player 1"
+
+[bindings]
+A = "S"
+B = { key = "D", turbo_hz = 7 }
+rt = { key = "Q", when = ["W"] }
+"macro.hadouken" = "P"
+
+[macros.hadouken]
+steps = [{ hold = ["dpad.down", "A"], frames = 3, allow_short = true }]
+"#,
+        )
+        .expect("the authoring fixture is a preset file")
+    }
+
+    fn staged_with_preset(file: &ksx_config::PresetFile) -> StagedSetup {
+        staged()
+            .add_slot(
+                1,
+                Persona::Xbox360,
+                file.to_core().expect("the authoring fixture loads"),
+            )
+            .expect("slot 1 stages")
     }
 
     /// **Every number a surface would otherwise hardcode is served.**
@@ -1295,27 +2242,487 @@ mod tests {
         let text = serde_json::to_string(&StageEdit::Discard).unwrap();
         assert_eq!(text, r#"{"edit":"discard"}"#);
     }
+
+    #[test]
+    fn every_live_slot_carries_a_full_authoring_snapshot_with_old_wire_fallback() {
+        let file = authored_preset();
+        let setup = staged_with_preset(&file);
+        let view = StagedSetupView::of(&setup);
+        let slot = &view.slots[0];
+        assert_eq!(
+            slot.authoring.as_ref(),
+            Some(&ksx_config::PresetFile::from_core(
+                &setup.slot(1).unwrap().preset
+            ))
+        );
+        assert!(slot
+            .authoring
+            .as_ref()
+            .unwrap()
+            .macros
+            .contains_key("hadouken"));
+
+        let mut old_wire = serde_json::to_value(slot).unwrap();
+        old_wire
+            .as_object_mut()
+            .expect("a slot is an object")
+            .remove("authoring");
+        let old: StagedSlotView = serde_json::from_value(old_wire).unwrap();
+        assert_eq!(old.authoring, None, "an older daemon remains readable");
+    }
+
+    #[test]
+    fn staged_bindings_canonicalize_multi_keys_and_round_trip_turbo_chords_and_macros() {
+        let setup = staged_with_preset(&authored_preset());
+        let before = StagedSetupView::of(&setup);
+        let prepared = staged_bind_edit(
+            &before,
+            &StagedBindRequest {
+                number: 1,
+                preset: "Player 1".into(),
+                function: "a".into(),
+                keys: vec!["g".into(), "enter".into(), "G".into()],
+                force: false,
+                turbo_hz: Some(12),
+            },
+        )
+        .expect("a free multi-key binding stages");
+        assert!(prepared.outcome.ok);
+        assert_eq!(
+            prepared.outcome.message.as_deref(),
+            Some("Player 1: A = G · Enter")
+        );
+        assert_eq!(prepared.outcome.turbo_hz, Some(12));
+        assert!(!prepared.outcome.reloaded, "no live reload claim");
+
+        let StageEdit::SetBindings { preset, .. } = &prepared.edit else {
+            panic!("the helper must compose one whole SetBindings edit")
+        };
+        let core = preset.to_core().unwrap();
+        let a_keys = core
+            .entries
+            .iter()
+            .filter(|(_, binding)| ksx_config::function_name(binding) == "A")
+            .map(|(key, _)| key.name())
+            .collect::<Vec<_>>();
+        assert_eq!(a_keys, vec!["G", "Enter"], "canonical and deduplicated");
+        assert_eq!(core.chords.len(), 1, "an unrelated chord survives");
+        assert_eq!(core.macros.defs.len(), 1, "macro bodies survive");
+        assert_eq!(core.macros.triggers.len(), 1, "macro triggers survive");
+        assert!(core
+            .entries
+            .iter()
+            .any(|(key, binding)| *key == Key::D && ksx_config::function_name(binding) == "B"));
+
+        let changed = prepared.edit.apply(&setup).unwrap();
+        let changed_view = StagedSetupView::of(&changed);
+        let round_trip = changed_view.slots[0].authoring.as_ref().unwrap();
+        assert_eq!(round_trip.to_core().unwrap(), core);
+
+        // The clear spelling is the mapper's empty list or the preset's
+        // explicit `None`; either way the edit writes one inert row and drops
+        // that function's turbo clock.
+        let cleared = staged_bind_edit(
+            &changed_view,
+            &StagedBindRequest {
+                number: 1,
+                preset: "Player 1".into(),
+                function: "A".into(),
+                keys: vec!["none".into()],
+                force: false,
+                turbo_hz: None,
+            },
+        )
+        .expect("None is the canonical clear placeholder");
+        assert_eq!(
+            cleared.outcome.message.as_deref(),
+            Some("Cleared A for Player 1.")
+        );
+        let StageEdit::SetBindings { preset, .. } = &cleared.edit else {
+            unreachable!()
+        };
+        let core = preset.to_core().unwrap();
+        assert!(core.entries.iter().any(|(key, binding)| {
+            *key == Key::None && ksx_config::function_name(binding) == "A"
+        }));
+        assert!(!core
+            .turbo
+            .iter()
+            .any(|row| ksx_config::function_name(&row.binding) == "A"));
+    }
+
+    #[test]
+    fn missing_and_recreated_player_binding_targets_are_refused_in_customer_words() {
+        let setup = staged_with_preset(&authored_preset());
+        let view = StagedSetupView::of(&setup);
+        let missing = staged_bind_edit(
+            &view,
+            &StagedBindRequest {
+                number: 9,
+                preset: "Player 9".into(),
+                function: "A".into(),
+                keys: vec!["G".into()],
+                ..StagedBindRequest::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(missing.code.as_deref(), Some(codes::BAD_SLOT));
+        assert_eq!(
+            missing.error.as_deref(),
+            Some("Player 9 is no longer in this unsaved setup. Nothing changed.")
+        );
+
+        let recycled = staged_bind_edit(
+            &view,
+            &StagedBindRequest {
+                number: 1,
+                preset: "The layout that was removed".into(),
+                function: "A".into(),
+                keys: vec!["G".into()],
+                ..StagedBindRequest::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(recycled.code.as_deref(), Some(codes::BAD_SLOT));
+        let error = recycled.error.as_deref().unwrap_or_default();
+        assert!(error.contains("controller layout"), "{error}");
+        assert!(error.contains("Nothing changed"), "{error}");
+        assert!(
+            !error.contains("staged") && !error.contains("preset file"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_cross_staged_slot_duplicate_refuses_without_mutating_and_force_is_explicit() {
+        let layout = default_layout();
+        let one = StageEdit::AddSlot {
+            number: Some(1),
+            persona: "xbox360".into(),
+            preset: "Player 1".into(),
+            layout: Some(layout.clone()),
+        }
+        .apply(&staged())
+        .unwrap();
+        let two = StageEdit::AddSlot {
+            number: Some(2),
+            persona: "playstation".into(),
+            preset: "Player 2".into(),
+            layout: Some(layout),
+        }
+        .apply(&one)
+        .unwrap();
+        let view = StagedSetupView::of(&two);
+        let before = view.clone();
+        let occupied = view.slots[1]
+            .authoring
+            .as_ref()
+            .unwrap()
+            .to_core()
+            .unwrap()
+            .entries
+            .iter()
+            .find(|(key, _)| *key != Key::None)
+            .map(|(key, _)| key.name().to_owned())
+            .unwrap();
+        let request = StagedBindRequest {
+            number: 1,
+            preset: "Player 1".into(),
+            function: "A".into(),
+            keys: vec![occupied],
+            force: false,
+            turbo_hz: None,
+        };
+        let refused = staged_bind_edit(&view, &request).unwrap_err();
+        assert_eq!(refused.code.as_deref(), Some(codes::CONFLICT));
+        assert_eq!(refused.conflicts[0].scope, "stage");
+        assert_eq!(refused.conflicts[0].slot, Some(2));
+        assert_eq!(view, before, "a pure refusal changes no staged value");
+        let error = refused.error.as_deref().unwrap_or_default();
+        assert!(error.contains("Use anyway"), "{error}");
+        assert!(
+            !error.contains("force") && !error.contains("staged"),
+            "{error}"
+        );
+
+        let forced = staged_bind_edit(
+            &view,
+            &StagedBindRequest {
+                force: true,
+                ..request
+            },
+        )
+        .expect("force stages the duplicate without touching the other slot");
+        assert!(forced.outcome.ok);
+        assert!(!forced.outcome.conflicts.is_empty());
+        assert!(!forced.outcome.reloaded);
+    }
+
+    #[test]
+    fn staged_macro_body_toggle_delete_and_trigger_rows_are_one_memory_only_round_trip() {
+        let setup = staged_with_preset(&authored_preset());
+        let view = StagedSetupView::of(&setup);
+        let body = MacroWrite {
+            preset: "Player 1".into(),
+            name: "HADOUKEN".into(),
+            steps: vec![crate::MacroStepView {
+                hold: vec!["dpad.down".into(), "A".into()],
+                frames: Some(4),
+                allow_short: true,
+                ..crate::MacroStepView::default()
+            }],
+            repeat: "turbo".into(),
+            turbo_hz: Some(10),
+            enabled: Some(false),
+            // Even if a saved-preset form asks for reload, staging never claims
+            // that it happened.
+            reload: true,
+            ..MacroWrite::default()
+        };
+        let prepared = staged_macro_edit(&view.slots[0], &body).expect("valid macro body");
+        assert!(prepared.outcome.ok);
+        assert_eq!(
+            prepared.outcome.message.as_deref(),
+            Some("Macro \"hadouken\" was updated for Player 1.")
+        );
+        assert!(!prepared.outcome.enabled);
+        assert_eq!(prepared.outcome.backup, None);
+        assert!(!prepared.outcome.reloaded);
+        let with_body = prepared.edit.apply(&setup).unwrap();
+
+        let with_body_view = StagedSetupView::of(&with_body);
+        let trigger = staged_bind_edit(
+            &with_body_view,
+            &StagedBindRequest {
+                number: 1,
+                preset: "Player 1".into(),
+                function: "MACRO.Hadouken".into(),
+                keys: vec!["p".into(), "leftcontrol".into()],
+                force: false,
+                turbo_hz: None,
+            },
+        )
+        .expect("macro trigger rows use the same binding helper");
+        let with_trigger = trigger.edit.apply(&with_body).unwrap();
+        let macro_view = staged_macro_snapshot(&StagedSetupView::of(&with_trigger).slots[0]);
+        assert!(macro_view.available);
+        assert_eq!(macro_view.macros[0].name, "hadouken");
+        assert_eq!(macro_view.macros[0].triggers, vec!["P", "LeftControl"]);
+        assert!(macro_view.macros[0].disabled);
+        assert_eq!(macro_view.macros[0].repeat, "turbo");
+        assert_eq!(macro_view.macros[0].turbo_hz, Some(10));
+
+        let with_trigger_view = StagedSetupView::of(&with_trigger);
+        let toggle = staged_macro_edit(
+            &with_trigger_view.slots[0],
+            &MacroWrite {
+                preset: "Player 1".into(),
+                name: "hadouken".into(),
+                enabled: Some(true),
+                ..MacroWrite::default()
+            },
+        )
+        .expect("an enable toggle keeps body and triggers");
+        assert!(toggle.outcome.toggled && toggle.outcome.enabled);
+        let enabled = toggle.edit.apply(&with_trigger).unwrap();
+        let enabled_macro = staged_macro_snapshot(&StagedSetupView::of(&enabled).slots[0]);
+        assert_eq!(enabled_macro.macros[0].steps[0].frames, Some(4));
+        assert_eq!(enabled_macro.macros[0].triggers, vec!["P", "LeftControl"]);
+        assert!(!enabled_macro.macros[0].disabled);
+
+        let enabled_view = StagedSetupView::of(&enabled);
+        let delete = staged_macro_edit(
+            &enabled_view.slots[0],
+            &MacroWrite {
+                preset: "Player 1".into(),
+                name: "HADOUKEN".into(),
+                delete: true,
+                ..MacroWrite::default()
+            },
+        )
+        .expect("delete removes the body and its triggers");
+        assert!(delete.outcome.deleted);
+        assert_eq!(delete.outcome.backup, None);
+        let deleted = delete.edit.apply(&enabled).unwrap();
+        let deleted_view = StagedSetupView::of(&deleted);
+        let file = deleted_view.slots[0].authoring.as_ref().unwrap();
+        assert!(file.macros.is_empty());
+        assert!(!file.bindings.keys().any(|function| {
+            ksx_config::macro_name(function)
+                .is_some_and(|name| name.eq_ignore_ascii_case("hadouken"))
+        }));
+    }
+
+    #[test]
+    fn a_key_that_already_starts_another_macro_needs_an_explicit_decision() {
+        let setup = staged_with_preset(&authored_preset());
+        let view = StagedSetupView::of(&setup);
+        let second = staged_macro_edit(
+            &view.slots[0],
+            &MacroWrite {
+                preset: "Player 1".into(),
+                name: "uppercut".into(),
+                steps: vec![crate::MacroStepView {
+                    hold: vec!["A".into()],
+                    ms: Some(50),
+                    ..crate::MacroStepView::default()
+                }],
+                ..MacroWrite::default()
+            },
+        )
+        .expect("the second macro is valid")
+        .edit
+        .apply(&setup)
+        .unwrap();
+        let view = StagedSetupView::of(&second);
+        let request = StagedBindRequest {
+            number: 1,
+            preset: "Player 1".into(),
+            function: "macro.uppercut".into(),
+            keys: vec!["P".into()],
+            ..StagedBindRequest::default()
+        };
+        let refused = staged_bind_edit(&view, &request).unwrap_err();
+        assert_eq!(refused.code.as_deref(), Some(codes::CONFLICT));
+        assert_eq!(refused.conflicts.len(), 1);
+        assert_eq!(refused.conflicts[0].scope, "macro");
+        assert_eq!(refused.conflicts[0].function, "macro.hadouken");
+        let error = refused.error.as_deref().unwrap_or_default();
+        assert!(error.contains("Use anyway"), "{error}");
+        assert!(!error.contains("force"), "{error}");
+
+        let forced = staged_bind_edit(
+            &view,
+            &StagedBindRequest {
+                force: true,
+                ..request
+            },
+        )
+        .expect("an explicit decision may share a macro trigger");
+        assert!(forced.outcome.ok);
+    }
+
+    #[test]
+    fn invalid_staged_macro_is_refused_with_no_mutation_backup_or_reload_claim() {
+        let setup = staged_with_preset(&authored_preset());
+        let view = StagedSetupView::of(&setup);
+        let before = view.slots[0].clone();
+        let refused = staged_macro_edit(
+            &view.slots[0],
+            &MacroWrite {
+                preset: "Player 1".into(),
+                name: "hadouken".into(),
+                steps: vec![crate::MacroStepView {
+                    hold: vec!["warp".into()],
+                    ms: Some(10),
+                    frames: Some(1),
+                    ..crate::MacroStepView::default()
+                }],
+                ..MacroWrite::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(refused.code.as_deref(), Some(codes::MACRO_INVALID));
+        assert!(!refused.problems.is_empty());
+        assert_eq!(refused.backup, None);
+        assert!(!refused.reloaded);
+        assert_eq!(view.slots[0], before);
+    }
+
+    #[test]
+    fn staged_mapper_and_macro_views_match_the_existing_saved_shapes_without_io() {
+        let setup = staged_with_preset(&authored_preset());
+        let view = StagedSetupView::of(&setup);
+        let slot = staged_mapper_slot(&view.slots[0], "panel").unwrap();
+        assert_eq!(slot.number, 1);
+        assert_eq!(slot.preset, "Player 1");
+        assert_eq!(slot.keyboard, "panel");
+        assert_eq!(slot.bindings.get("A"), Some(&vec!["S".to_owned()]));
+        assert_eq!(slot.bindings.get("B"), Some(&vec!["D".to_owned()]));
+        assert_eq!(slot.turbo.get("B"), Some(&7));
+        assert_eq!(slot.backup, None, "an in-memory preset has no disk backup");
+
+        let snapshot = staged_mapper_snapshot(&view);
+        assert_eq!(snapshot.generated_at, "(staged)");
+        assert_eq!(snapshot.config_root, "(not saved)");
+        assert_eq!(
+            snapshot.slots,
+            vec![staged_mapper_slot(&view.slots[0], "panel").unwrap()]
+        );
+
+        let macros = staged_macro_snapshot(&view.slots[0]);
+        assert!(macros.available);
+        assert_eq!(macros.preset, slot.preset);
+        assert_eq!(macros.macros.len(), 1);
+        assert_eq!(macros.macros[0].triggers, vec!["P"]);
+        assert_eq!(macros.macros[0].steps[0].frames, Some(3));
+        assert!(macros.macros[0].steps[0].allow_short);
+    }
+
+    #[test]
+    fn prepared_mapper_outcomes_adopt_a_later_stage_refusal() {
+        let setup = staged_with_preset(&authored_preset());
+        let view = StagedSetupView::of(&setup);
+        let prepared = staged_bind_edit(
+            &view,
+            &StagedBindRequest {
+                number: 1,
+                function: "A".into(),
+                keys: vec!["G".into()],
+                ..StagedBindRequest::default()
+            },
+        )
+        .unwrap();
+        let refused = StageOutcome {
+            ok: false,
+            error: Some("daemon rejected the stage edit".into()),
+            code: Some("stage-raced".into()),
+            setup: view,
+            ..StageOutcome::default()
+        };
+        let outcome = prepared.finish(&refused);
+        assert!(!outcome.ok);
+        assert_eq!(outcome.code.as_deref(), Some("stage-raced"));
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("daemon rejected the stage edit")
+        );
+        assert!(!outcome.reloaded);
+    }
+
     /// **FIRST-RUN.md moment 7, and the reason `DEFAULT_LAYOUT` is a name.**
     ///
-    /// Moment 7 promises "Guide opens Game Bar so they can launch a game
-    /// without leaving it". A first-run user never chooses a layout — they take
-    /// the offered one — so if that layout does not bind Guide, the promise is
-    /// one the flow cannot keep and nothing anywhere says so.
+    /// Moment 7 offers Guide as the controller shortcut that can ask Windows to
+    /// open Game Bar when the user's Windows setting allows it. A first-run
+    /// user may take the offered layout unchanged, so both player blocks must
+    /// carry the exact physical keys the screen describes.
     ///
     /// Fails against the previous `roster().find(|l| !l.blank)`: that returned
     /// `arcade-6button`, which binds Start and Back and no Guide, because a
     /// real arcade panel has no spare button for one.
     #[test]
-    fn the_offered_layout_binds_guide_because_moment_7_promises_it() {
+    fn the_offered_layout_binds_the_documented_guide_key_for_both_players() {
         let offered = default_layout();
-        let preset = instantiate(&offered, "Player 1", 1, None)
-            .expect("the offered layout must instantiate");
-        assert!(
-            preset
+        let guide_keys = |player, name| {
+            instantiate(&offered, name, player, None)
+                .expect("the offered layout must instantiate")
                 .entries
                 .iter()
-                .any(|entry| format!("{:?}", entry).contains("Guide")),
-            "the layout offered to a first-run user ({offered}) binds no Guide, so              FIRST-RUN.md moment 7 cannot happen on the default path"
+                .filter_map(|(key, binding)| {
+                    (*binding == ksx_core::Binding::Button(ksx_core::XButton::Guide))
+                        .then_some(*key)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            guide_keys(1, "Player 1"),
+            vec![ksx_core::Key::LeftWindows],
+            "the offered layout ({offered}) must keep P1's documented Guide key"
+        );
+        assert_eq!(
+            guide_keys(2, "Player 2"),
+            vec![ksx_core::Key::NumpadAsterisk],
+            "the offered layout ({offered}) must keep P2's documented Guide key"
         );
     }
 

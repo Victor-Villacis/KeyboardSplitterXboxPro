@@ -105,7 +105,7 @@ const ISLAND_COMPONENT: &str = "MapIsland";
 /// show, never insert one, or every boolean after it shifts" (ledger
 /// #4/#14, adopted 2026-08-06). [`show_values`] yields `(slot name, value)`
 /// pairs; the layout test pins the exact name set.
-const MAP_SHOW_COUNT: usize = 19;
+const MAP_SHOW_COUNT: usize = 21;
 
 /// Bare-named slots the mapper renders and the seam deliberately never fills.
 ///
@@ -679,9 +679,9 @@ fn turbo_title(slot: &MapperSlot, function: &str) -> String {
             );
             if effective != hz {
                 line.push_str(&format!(
-                    " The file asks for {hz} Hz and gets about {effective} Hz: a press AND a \
-                     release must each survive a 60 Hz poll ({MIN_STEP_MS} ms), so ~15 Hz is the \
-                     fastest anything can be delivered."
+                    " {hz} Hz was requested and about {effective} Hz is delivered. The game \
+                     needs enough time to notice both the press and the release, so about 15 Hz \
+                     is the reliable limit."
                 ));
             }
             line
@@ -802,6 +802,7 @@ fn key_chip_fields(function: &str, keys: &[String], live: bool) -> Vec<(String, 
 }
 
 fn slot_tabs(payload: &MapPayload, selected: Option<&MapperSlot>) -> SlotValue {
+    let staged = payload.target == "stage";
     SlotValue::array(
         payload
             .mapper
@@ -819,7 +820,11 @@ fn slot_tabs(payload: &MapPayload, selected: Option<&MapperSlot>) -> SlotValue {
                     // GET when there is no JavaScript to intercept it.
                     (
                         "href".to_owned(),
-                        SlotValue::Text(format!("/map?slot={}", s.number)),
+                        SlotValue::Text(if staged {
+                            format!("/map?target=stage&slot={}", s.number)
+                        } else {
+                            format!("/map?slot={}", s.number)
+                        }),
                     ),
                     (
                         "cls".to_owned(),
@@ -833,7 +838,10 @@ fn slot_tabs(payload: &MapPayload, selected: Option<&MapperSlot>) -> SlotValue {
                     ),
                     ("preset".to_owned(), SlotValue::Text(s.preset.clone())),
                     ("pad".to_owned(), SlotValue::Text(s.persona_label.clone())),
-                    ("kbd".to_owned(), SlotValue::Text(s.keyboard.clone())),
+                    (
+                        "kbd".to_owned(),
+                        SlotValue::Text(input_label(&s.keyboard).to_owned()),
+                    ),
                     (
                         "rowcls".to_owned(),
                         SlotValue::Text(if active { "strow on" } else { "strow" }.to_owned()),
@@ -844,11 +852,35 @@ fn slot_tabs(payload: &MapPayload, selected: Option<&MapperSlot>) -> SlotValue {
     )
 }
 
+/// Hardware selectors identify machines; this table needs a customer label.
+fn input_label(input: &str) -> &str {
+    let input = input.trim();
+    if input.is_empty() || input == "(any)" {
+        return "Any keyboard";
+    }
+    let lower = input.to_ascii_lowercase();
+    if ["usb:", "hid:", "instance:", "device:"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        || input.contains('\\')
+        || lower.contains("vid_")
+        || lower.contains("pid_")
+        || lower.contains("#{")
+    {
+        "Assigned keyboard"
+    } else {
+        input
+    }
+}
+
 /// Can the mapper actually record right now? Needs a reachable daemon, no
 /// running session (captured keys never reach the observer), and a daemon
 /// that knows the learn verbs at all.
 fn learnable(payload: &MapPayload) -> bool {
-    payload.session.reachable && !payload.session.running && payload.learn.state != "unavailable"
+    payload.mapper.generated_at != "(unavailable)"
+        && payload.session.reachable
+        && !payload.session.running
+        && payload.learn.state != "unavailable"
 }
 
 /// Can a binding be WRITTEN right now? Deliberately wider than [`learnable`]:
@@ -867,44 +899,33 @@ fn writable(payload: &MapPayload) -> bool {
 /// The read-only reason — one honest sentence, worst problem first. Empty
 /// when the mapper is live.
 fn reason_line(payload: &MapPayload) -> String {
-    if payload.mapper.slots.is_empty() {
-        return format!("nothing to map — {}", payload.mapper.source);
+    if payload.mapper.generated_at == "(unavailable)" {
+        return payload.mapper.source.clone();
     }
-    if !payload.session.reachable {
-        return "read-only: no daemon control channel — start the daemon (tray, or `ksx daemon`), \
-                or bind from a shell with the command below"
+    if payload.mapper.slots.is_empty() {
+        return "No controller is ready to edit. Add one in Setup, then return to Controls."
             .to_owned();
     }
+    if !payload.session.reachable {
+        return if payload.target == "stage" {
+            "Setup's background helper is not available. Close and reopen ksx; nothing has been \
+             changed."
+                .to_owned()
+        } else {
+            "Controls are temporarily read-only. Close and reopen ksx, then try again.".to_owned()
+        };
+    }
     if payload.session.running {
-        return "read-only while emulation runs: the panel's keys are captured, so ksx cannot \
-                hear them for mapping. Use \"Pause emulation & map\" above, or bind from a \
-                shell with the command below"
+        return "read-only while Play is active: the keyboard's keys are being used by the \
+                controller. Choose \"Pause & edit\" above, then resume when you are done."
             .to_owned();
     }
     if payload.learn.state == "unavailable" {
-        return format!(
-            "read-only: the daemon does not answer the learn verbs ({}) — restart it on the \
-             current ksx build, or bind from a shell with the command below",
-            payload
-                .learn
-                .error
-                .as_deref()
-                .unwrap_or("no reason reported")
-        );
+        return "Automatic key learning is unavailable. Close and reopen ksx, or choose a key \
+                from the list below."
+            .to_owned();
     }
     String::new()
-}
-
-/// The prefilled CLI fallback for the selected slot (placeholders for what a
-/// click/keypress would fill).
-fn cli_line(slot: Option<&MapperSlot>) -> String {
-    match slot {
-        Some(slot) => format!(
-            "ksx map --preset \"{}\" --function <FUNCTION> --key <KEY>",
-            slot.preset
-        ),
-        None => "ksx map --preset <NAME> --function <FUNCTION> --key <KEY>".to_owned(),
-    }
 }
 
 /// The third restore button's label — the timestamp is the whole point, so it
@@ -1095,7 +1116,7 @@ fn step_warning(step: &MacroStepView) -> String {
 fn step_warning_long(step: &MacroStepView) -> String {
     match (step.ms, step.frames) {
         (Some(_), Some(_)) => {
-            "says both ms and frames — exactly one, or the file is refused".to_owned()
+            "uses both milliseconds and frames — choose exactly one timing method".to_owned()
         }
         (None, None) => {
             "no duration — give it ms or frames (a step with none is refused)".to_owned()
@@ -1107,12 +1128,12 @@ fn step_warning_long(step: &MacroStepView) -> String {
             if let Some(f) = step.frames {
                 let plural = if f == 1 { "" } else { "s" };
                 let each = format!(
-                    "{f} frame{plural} is shorter than the {MIN_STEP_FRAMES}-frame floor \
-                     ({MIN_STEP_MS} ms — a press has to survive two 60 Hz polls)"
+                    "{f} frame{plural} is shorter than the reliable {MIN_STEP_FRAMES}-frame \
+                     minimum ({MIN_STEP_MS} ms — the game needs enough time to notice it)"
                 );
                 return if step.allow_short {
                     format!(
-                        "{each} — allow_short is on, so it runs as written and the game may \
+                        "{each} — Allow short is on, so it runs as written and the game may \
                          never see it"
                     )
                 } else {
@@ -1125,12 +1146,12 @@ fn step_warning_long(step: &MacroStepView) -> String {
             let ms = step.ms.unwrap_or(0);
             if step.allow_short {
                 format!(
-                    "{ms} ms is shorter than ~2 poll intervals ({MIN_STEP_MS} ms) — allow_short \
+                    "{ms} ms is shorter than the reliable {MIN_STEP_MS} ms minimum — Allow short \
                      is on, so it runs as written and the game may never see it"
                 )
             } else {
                 format!(
-                    "{ms} ms is shorter than ~2 poll intervals ({MIN_STEP_MS} ms) — the game may \
+                    "{ms} ms is shorter than the reliable {MIN_STEP_MS} ms minimum — the game may \
                      never see it, so ksx raises this step to {MIN_STEP_MS} ms"
                 )
             }
@@ -1141,10 +1162,9 @@ fn step_warning_long(step: &MacroStepView) -> String {
 /// The sampling rule, stated ONCE, where the amber rows can point at it (§0.2).
 /// The per-row flag is short so it always fits; this is what it means.
 pub(crate) const MACRO_RULE_LINE: &str =
-    "Amber steps are shorter than ~2 poll intervals — 33 ms, or 2 frames if you are counting \
-     frames — which is the shortest thing a game can be relied on to see. A 1-frame step is \
-     not unreliable, it is invisible. ksx raises a short step to 33 ms so it lands; a step \
-     marked allow_short runs exactly as written and can be missed entirely. Neither is ever \
+    "Amber steps are shorter than the reliable minimum — 33 ms, or 2 frames if you are counting \
+     frames. A 1-frame step may be invisible to the game. ksx raises a short step to 33 ms so it lands; a step \
+     marked Allow short runs exactly as written and can be missed entirely. Neither is ever \
      silent, and Save asks before it writes either one.";
 
 /// THE RING, stated once, under the grid: what the eight columns of a direction
@@ -1159,14 +1179,12 @@ pub(crate) const MACRO_RING_LINE: &str =
     "Each direction group runs ↑ ↖ ← ↙ ↓ ↘ → ↗ (numpad 8 7 4 1 2 3 6 9), so a motion is a \
      SHAPE: a quarter-circle forward is a staircase, a half-circle a straight line, a dragon \
      punch a hook. The four diagonals are picks, not new bindings — ticking ↘ (down-right, \
-     numpad 3; a move list spells it d/f, which is only down-FORWARD while you face right — ksx \
-     has no idea which way you are facing) stores dpad.down + dpad.right on that step, which is \
-     what a diagonal has always been in this file. THERE ARE THREE OF THESE GROUPS — D-PAD, \
+     numpad 3; a move list spells it d/f, which is only down-FORWARD while you face right) \
+     combines down and right in one step. THERE ARE THREE OF THESE GROUPS — D-PAD, \
      LEFT STICK and RIGHT STICK — and the grid scrolls sideways to reach them, so the one you \
      want may be off the edge; the band above the arrows names whichever you are looking at. \
-     Tick the diagonal on the group your preset's own direction keys drive, because a motion \
-     written on the other one is published faithfully and read by nobody. Each row spells the \
-     pair it wrote beside its name.";
+     Use the same group as this controller layout so the game reads the motion. Each row spells \
+     the direction pair beside its name.";
 
 /// A macro's run length at the durations the engine will use.
 fn total_ms(mac: &MacroView) -> u32 {
@@ -1269,8 +1287,8 @@ fn frame_math(step: Option<&MacroStepView>, rate: f64) -> String {
     };
     match (step.ms, step.frames) {
         (Some(_), Some(_)) => format!(
-            "This step says both ms and frames — keep exactly one, or the preset will not \
-             load. {floor}"
+            "This step uses both milliseconds and frames — keep exactly one timing method. \
+             {floor}"
         ),
         (None, None) => format!("This step has no duration — give it ms or frames. {floor}"),
         (None, Some(frames)) => {
@@ -1326,7 +1344,12 @@ fn macro_tabs(payload: &MapPayload, current: Option<&MacroView>) -> SlotValue {
                     (
                         "href".to_owned(),
                         SlotValue::Text(format!(
-                            "/map?slot={}&macro={}",
+                            "/map?{}slot={}&macro={}",
+                            if payload.target == "stage" {
+                                "target=stage&"
+                            } else {
+                                ""
+                            },
                             payload.selected,
                             urlencode_value(&m.name)
                         )),
@@ -1961,20 +1984,6 @@ fn macro_toml(mac: &MacroView) -> String {
     out
 }
 
-/// The trigger's `ksx map` line — complete rather than a template when a key
-/// is already bound, and a template naming no macro when the preset holds
-/// none (there is nothing to point a key at yet).
-fn macro_cli(preset: &str, mac: Option<&MacroView>) -> String {
-    let Some(mac) = mac else {
-        return format!("ksx map --preset \"{preset}\" --function macro.<NAME> --key <KEY>");
-    };
-    let key = mac.triggers.first().map_or("<KEY>", String::as_str);
-    format!(
-        "ksx map --preset \"{preset}\" --function {} --key {key}",
-        macro_function(&mac.name)
-    )
-}
-
 /// Which keys start this macro, in words.
 fn macro_trigger_line(mac: Option<&MacroView>) -> String {
     let Some(mac) = mac else {
@@ -2583,18 +2592,18 @@ fn macro_motion_line(slot: Option<&MapperSlot>) -> String {
                 them yourself in that group's ↖ ↗ ↙ ↘ columns.";
     match driven.len() {
         0 => format!(
-            "These write {} — this preset binds no direction keys of its own, so there is \
+            "These write {} — this controller layout has no direction keys of its own, so there is \
              nothing to match. If the game reads a stick, retick the rows. {tail}",
             pick.describe()
         ),
         1 => format!(
-            "These write {} — the same mechanism this preset's own direction keys drive, so \
+            "These write {} — the same mechanism this controller layout's direction keys drive, so \
              the game reads them. (A motion written on the other mechanism is published \
              faithfully and read by nobody: that is the trap.) {tail}",
             pick.describe()
         ),
         _ => format!(
-            "These write {}. This preset's own direction keys drive {}, so either would be \
+            "These write {}. This controller layout's direction keys drive {}, so either would be \
              read — a pad has three ways to say \"right\" and a game reads whichever one it \
              was written for. {tail}",
             pick.describe(),
@@ -2607,22 +2616,14 @@ fn macro_motion_line(slot: Option<&MapperSlot>) -> String {
     }
 }
 
-/// The slot-wide `macros = "off"` switch, in words — and the exact line to
-/// change. Empty for every slot that runs macros, which is every slot until
-/// somebody says otherwise.
-///
-/// A SENTENCE and not a button, deliberately. The switch lives in config.toml
-/// (or in the games.toml profile), and Studio writes presets only — every verb
-/// on this page goes through `map`/`map-macro`. A toggle that silently did
-/// nothing is worse than a line that says which file to edit, so this is the
-/// line. Mirrored in MapIsland.ts `slotMacrosLineFor`.
+/// The slot-wide macro switch, in customer language. Empty for every slot that
+/// runs macros. Studio does not yet own this setting, so it states the limit
+/// without sending a customer to a config file. Mirrored in MapIsland.ts.
 fn slot_macros_line(slot: Option<&MapperSlot>) -> String {
     match slot {
         Some(slot) if slot.macros_off => format!(
-            "Slot {} says macros = \"off\" — the TOURNAMENT SWITCH. Nothing in this card runs on \
-             it, whatever each macro's own switch says, and nothing is deleted. To bring them \
-             back, set macros = \"on\" on that [[slot]] in config.toml (or on the slot of the \
-             games.toml profile you are running) and reload the session.",
+            "Macros are off for Player {}, so nothing in this card will run. Nothing has been \
+             deleted. Rebuild this player in Setup and save it to turn macros on.",
             slot.number
         ),
         _ => String::new(),
@@ -2675,20 +2676,32 @@ fn preset_name(payload: &MapPayload, selected: Option<&MapperSlot>) -> String {
 fn macro_policy_line(mac: Option<&MacroView>) -> String {
     match mac {
         Some(mac) => {
-            let repeat = if mac.repeat.is_empty() {
-                "once"
+            let release = if mac.on_release == "abort" {
+                "stop when released"
             } else {
-                mac.repeat.as_str()
+                "finish after release"
+            };
+            let retrigger = if mac.retrigger == "restart" {
+                "restart if pressed again"
+            } else {
+                "ignore extra presses"
+            };
+            let interrupt = match mac.interrupt.as_str() {
+                "any-input" => "other input stops it",
+                "opposing" => "opposite input stops it",
+                _ => "other input does not stop it",
+            };
+            let repeat = match mac.repeat.as_str() {
+                "turbo" => "auto-repeat with a gap",
+                "while-held" => "repeat immediately while held",
+                _ => "once per press",
             };
             let rate = match (mac.turbo_hz, mac.gap_ms) {
                 (Some(hz), _) => format!(" ({hz} Hz)"),
                 (None, Some(ms)) => format!(" ({ms} ms gap)"),
                 (None, None) => String::new(),
             };
-            format!(
-                "on release: {} · retrigger: {} · interrupt: {} · repeat: {repeat}{rate}",
-                mac.on_release, mac.retrigger, mac.interrupt
-            )
+            format!("{release} · {retrigger} · {interrupt} · {repeat}{rate}")
         }
         None => String::new(),
     }
@@ -2723,15 +2736,13 @@ fn turbo_math(mac: Option<&MacroView>) -> String {
             let asked = match (mac.turbo_hz, mac.gap_ms) {
                 (Some(hz), _) => format!("Requested {hz} Hz"),
                 (None, Some(ms)) => format!("Requested a {ms} ms gap"),
-                (None, None) => {
-                    "No rate given — a turbo with no rate is refused by the loader".to_owned()
-                }
+                (None, None) => "No repeat rate has been set".to_owned(),
             };
             format!(
                 "{asked} → effective ~{effective} Hz, because the sequence itself is {run} ms \
                  long and the neutral gap between runs is {gap} ms{why}: one full press/release \
-                 cycle takes {cycle} ms. Each half has to survive a 60 Hz poll ({MIN_STEP_MS} \
-                 ms), which is what caps this — the rate is capped, never refused."
+                 cycle takes {cycle} ms. The game needs at least {MIN_STEP_MS} ms to notice each \
+                 half, so the rate is capped rather than rejected."
             )
         }
         _ => "One run per press. Holding the trigger changes nothing, which is what stops a \
@@ -2760,8 +2771,7 @@ fn turbo_gap_ms(mac: &MacroView, run: u32) -> (u32, &'static str) {
     if asked < MIN_STEP_MS {
         (
             MIN_STEP_MS,
-            " (raised to the sampling floor — a gap the game never samples is not a gap, it \
-             reads as one long hold)",
+            " (raised to the reliable minimum so the game can notice the release)",
         )
     } else {
         (asked, "")
@@ -2775,29 +2785,32 @@ fn turbo_gap_ms(mac: &MacroView, run: u32) -> (u32, &'static str) {
 /// there is a Save button, and the note says what it writes.)
 fn macro_note(payload: &MapPayload, mac: Option<&MacroView>) -> String {
     if !payload.macros.available {
-        return format!(
-            "This preset's macros could not be read ({}), so there is nothing to edit and \
-             nothing here can be saved. That is NOT the same as \"this preset has no macros\" \
-             — it means nobody could tell this page either way.",
-            payload.macros.reason
-        );
+        return "Macros for this controller could not be read, so nothing here can be edited or \
+                saved. Return to Setup and choose a working controller layout."
+            .to_owned();
     }
     if payload.macros.macros.is_empty() {
-        return "This preset has no macros yet. Type a name above and press ＋ New macro: it \
-                is written into the preset straight away (one empty 50 ms step), and then you \
-                paint the grid and press Save macro."
+        return "This controller has no macros yet. Type a name above and press ＋ New macro, \
+                then paint the grid and press Save macro."
             .to_owned();
     }
     let Some(mac) = mac else {
         return "Pick a macro above to edit it, or type a name and press ＋ New macro.".to_owned();
     };
-    format!(
-        "Steps and policies are a DRAFT until you press Save macro — that writes the whole \
-         \"{}\" table into the preset file (a timestamped backup is taken first) and swaps it \
-         into a running session with the pads left plugged. New, Rename and Delete write \
-         immediately. Every one of them can be undone from the toast it leaves.",
-        mac.name
-    )
+    if payload.target == "stage" {
+        format!(
+            "Steps and policies are a draft until you press Save macro. That updates \"{}\" in \
+             this unsaved setup only; Play will use it immediately and nothing is written until \
+             you choose Save in Setup.",
+            mac.name
+        )
+    } else {
+        format!(
+            "Steps and policies are a draft until you press Save macro. That updates \"{}\" in \
+             the saved controller layout and leaves a recovery copy.",
+            mac.name
+        )
+    }
 }
 
 fn scalar_slots(
@@ -2808,34 +2821,45 @@ fn scalar_slots(
 ) -> serde_json::Value {
     let slot_line = match selected {
         Some(s) => format!("P{} · {} · {}", s.number, s.persona_label, s.preset),
-        None => "no mappable slots".to_owned(),
+        None => "No controller selected".to_owned(),
     };
     serde_json::json!({
+        "rootCls": if selected.is_some() { "studio mapper" } else { "studio mapper mapper-empty" },
         "slotLine": slot_line,
-        "sourceLine": format!(
-            "{} — config root: {}",
-            payload.mapper.source, payload.mapper.config_root
-        ),
+        "sourceLine": if selected.is_none() {
+            if payload.mapper.generated_at == "(unavailable)" {
+                "This controller layout needs attention in Setup".to_owned()
+            } else {
+                "Add a keyboard and controller in Setup to begin".to_owned()
+            }
+        } else if payload.target == "stage" {
+            "Unsaved setup — changes stay here until Save or Play".to_owned()
+        } else {
+            "Saved layout — changes apply immediately".to_owned()
+        },
         "reasonLine": reason_line(payload),
-        "cliLine": cli_line(selected),
         // FIX 1: the copyable remedy, carrying this machine's profile flag.
         "daemonCmd": daemon_command(&payload.session),
         "backupLine": backup_line(selected),
         // v14: the preset surface's identity block. Derived, never a new
         // payload field — the slot already carries the preset name and the
         // snapshot the config root.
-        "presetLine": selected.map_or("(no preset)", |s| s.preset.as_str()),
-        "presetPath": match selected {
+        "presetLine": selected.map_or("No layout selected", |s| s.preset.as_str()),
+        "presetPath": if payload.target == "stage" {
+            "not saved yet".to_owned()
+        } else { match selected {
             Some(s) => format!(
                 r"{}\presets\{}.toml",
                 payload.mapper.config_root, s.preset
             ),
             None => payload.mapper.config_root.clone(),
-        },
+        }},
         "backupFact": match selected.and_then(|s| s.backup.as_deref()) {
             Some(label) => format!("newest {label}"),
+            None if payload.target == "stage" => "not applicable until Save".to_owned(),
             None => "none yet — the first restore writes one".to_owned(),
         },
+        "stageBackCls": if payload.target == "stage" { "card stageback" } else { "card stageback hide" },
         "modalPrompt": "",
         "modalBinding": "",
         "countdownText": "",
@@ -2847,6 +2871,9 @@ fn scalar_slots(
         "savedLine": flash.unwrap_or(""),
         // Which slot every no-JS form outside the legend list posts about.
         "slotNum": selected.map(|s| s.number).unwrap_or(payload.selected).to_string(),
+        // First-run form submissions must stay in memory even with scripting
+        // disabled; the server treats any other value as the saved mapper.
+        "mapTarget": if payload.target == "stage" { "stage" } else { "saved" },
         // Auto-save is invisible until it says so (Victor: "where is save?").
         // Empty on SSR — the page has not written anything yet.
         "savedAt": "",
@@ -2860,10 +2887,19 @@ fn scalar_slots(
         "selCountLine": "",
         // The preset-actions card: a class string, never a show (ledger #13
         // — its bindings must survive; the off look is just a class).
-        "actionsCls": if payload.session.reachable {
+        "actionsCls": if payload.target == "stage" {
+            "card pactions stage-hidden"
+        } else if payload.session.reachable {
             "card pactions"
         } else {
             "card pactions off"
+        },
+        "sessionUndoCls": if payload.target != "stage"
+            && selected.is_some_and(|slot| slot.session_backup)
+        {
+            "pactform"
+        } else {
+            "pactform off"
         },
         // ── v11: the macro editor ──────────────────────────────────────
         // Not one new `createShow` between them: every state here is a class
@@ -2882,7 +2918,6 @@ fn scalar_slots(
         // nothing to start. Never a placeholder name the daemon would reject.
         "macroFnName": mac.map_or_else(String::new, |m| macro_function(&m.name)),
         "macroName": mac.map_or_else(String::new, |m| m.name.clone()),
-        "macroCliLine": macro_cli(&preset_name(payload, selected), mac),
         "macroToml": mac.map_or_else(String::new, macro_toml),
         "macroCardCls": if payload.macros.available {
             "card macrocard"
@@ -2902,9 +2937,15 @@ fn scalar_slots(
         },
         // Client-only: an SSR paint has edited nothing, has no step selected
         // for the duration editor, and cannot save (every write on this card
-        // is a fetch). "saved" is the honest resting state for a card whose
-        // grid is exactly what the file says.
-        "macroDirtyLine": if mac.is_some() { "saved" } else { "" },
+        // is a fetch). Name the in-memory target on a staged paint so the
+        // resting state never implies that a file was written.
+        "macroDirtyLine": if mac.is_none() {
+            ""
+        } else if payload.target == "stage" {
+            "matches this unsaved setup"
+        } else {
+            "saved"
+        },
         "macroSaveCls": "btn btn-mini macsave off",
         // v14: the per-macro ON/OFF switch. Two class-string scalars and no
         // show, like everything else on this card, and the button reads as the
@@ -2925,6 +2966,11 @@ fn scalar_slots(
         // lives in config.toml, and Studio has no config writer. See
         // `slot_macros_line`.
         "slotMacrosLine": slot_macros_line(selected),
+        "slotMacrosCls": if selected.is_some_and(|slot| slot.macros_off) {
+            "macslotremedy"
+        } else {
+            "macslotremedy off"
+        },
         // FIX 2: this line REPORTS which step the frame maths is about; it no
         // longer instructs anybody to select one, because a duration is now
         // edited in the row's own box. `macroDurValue`/`macroDurCls` went with
@@ -2968,7 +3014,12 @@ fn show_values(
     // "error" is reported as one, everything else as a plain confirmation.
     let flash = flash.map(str::trim).filter(|f| !f.is_empty());
     let flash_err = flash.is_some_and(|f| f.starts_with("error"));
+    let staged = payload.target == "stage";
     [
+        // Test still reads saved bindings. A staged mapper therefore names
+        // the Play prerequisite and never emits a link that loses context.
+        ("show:savedTarget", !staged),
+        ("show:stagedTarget", staged),
         ("show:pillRunning", running),
         (
             "show:pillIdle",
@@ -3171,6 +3222,7 @@ mod tests {
             keyboard: r"HID\VID_D209&PID_0430&REV_0056&MI_00".to_owned(),
             bindings,
             backup: Some("2026-08-05 14:32:07 UTC".to_owned()),
+            session_backup: true,
             turbo,
             macros_off: false,
         }
@@ -3203,6 +3255,7 @@ mod tests {
             selected: 1,
             macros: MacroSnapshot::read("IPAC P1", vec![hadouken()]),
             macro_selected: String::new(),
+            target: "saved".to_owned(),
         }
     }
 
@@ -3515,7 +3568,7 @@ mod tests {
             out.html
         );
         assert!(
-            out.html.contains("Every binding saves immediately"),
+            out.html.contains("Every control change saves immediately"),
             "{}",
             out.html
         );
@@ -3829,24 +3882,21 @@ mod tests {
         );
     }
 
-    /// No daemon: read-only with the reason AND the prefilled CLI line —
-    /// never a dead-looking page.
+    /// No helper: read-only with a consumer remedy, while the technical
+    /// fallback remains present but hidden from the product surface.
     #[test]
-    fn an_unreachable_daemon_renders_read_only_with_the_cli_fallback() {
+    fn an_unreachable_daemon_renders_read_only_with_a_consumer_remedy() {
         let mut payload = sample();
         payload.session = SessionView::unreachable("no daemon control channel");
         payload.learn = LearnView::unavailable("no daemon control channel");
         let out = render_map(&page(), &payload, None);
         assert!(
-            out.html.contains("read-only: no daemon control channel"),
+            out.html.contains("Controls are temporarily read-only"),
             "{}",
             out.html
         );
-        assert!(
-            out.html.contains("ksx map --preset \"IPAC P1\" --function"),
-            "{}",
-            out.html
-        );
+        assert!(!out.html.contains("ksx map --preset"), "{}", out.html);
+        assert!(out.html.contains("Close and reopen ksx"), "{}", out.html);
         // Zones still render (read-only browsing), bindings included.
         assert!(out.html.contains(r#"data-fn="A""#), "{}", out.html);
         assert!(out.html.contains(">G<"), "{}", out.html);
@@ -3861,7 +3911,7 @@ mod tests {
     /// FIX 0. A running session still cannot be mapped — the daemon's refusal
     /// is deliberate (daemon/pipe.rs writes out why) — but the page turns it
     /// into ONE CLICK instead of a dead end: the banner explains the capture,
-    /// and "Pause emulation & map" is right there.
+    /// and "Pause & edit" is right there.
     #[test]
     fn a_running_session_offers_pause_and_map_instead_of_a_dead_end() {
         let mut payload = sample();
@@ -3871,15 +3921,11 @@ mod tests {
         let out = render_map(&page(), &payload, None);
         assert!(
             out.html
-                .contains("Emulation is running: panel keys are captured"),
+                .contains("Play is active, so automatic key learning is paused"),
             "{}",
             out.html
         );
-        assert!(
-            out.html.contains("Pause emulation &amp; map"),
-            "{}",
-            out.html
-        );
+        assert!(out.html.contains("Pause &amp; edit"), "{}", out.html);
         assert!(out.html.contains(r#"data-act="pause-map""#), "{}", out.html);
         // …and every control looks as inert as it is, without being a
         // `disabled` button that would swallow the click that explains why.
@@ -3927,24 +3973,22 @@ mod tests {
         assert_eq!(slots["macroEnableCls"], "btn btn-mini macen off dead");
     }
 
-    /// The SLOT's master switch: a sentence naming the file to edit, because
-    /// Studio has no config writer and a control that did nothing would be
-    /// worse than none. Silent on every slot that runs macros.
+    /// The slot-wide switch states the product limitation and points back to
+    /// Setup. Silent on every slot that runs macros.
     #[test]
-    fn a_slot_with_macros_off_says_which_line_to_change() {
+    fn a_slot_with_macros_off_states_the_product_limit() {
         let mut payload = sample();
         payload.mapper.slots[0].macros_off = true;
         let line = slot_macros_line(payload.mapper.slots.first());
         for part in [
-            "Slot 1",
-            "macros = \"off\"",
-            "TOURNAMENT",
-            "nothing is deleted",
-            "config.toml",
-            "games.toml",
+            "Player 1",
+            "Macros are off",
+            "Nothing has been deleted",
+            "Rebuild this player in Setup",
         ] {
             assert!(line.contains(part), "{line}");
         }
+        assert!(!line.contains(".toml"), "{line}");
         // ...and it reaches the page.
         let slots = scalar_slots(
             &payload,
@@ -3962,11 +4006,10 @@ mod tests {
 
     /// FIX 1, the headline case: Victor quit the tray daemon and then clicked
     /// controls that silently did nothing. The banner has to be the FIRST
-    /// thing in <main>, name the split (read works, write does not) and print
-    /// the exact command — profile flag included, because plain `ksx daemon`
-    /// refuses to start on a games.toml cabinet.
+    /// thing in <main> and give the desktop-app recovery path. The technical
+    /// command may remain in hidden support markup, but not in the remedy.
     #[test]
-    fn an_unreachable_daemon_shouts_at_the_top_of_the_page_with_the_command() {
+    fn an_unreachable_helper_shouts_at_the_top_with_a_consumer_remedy() {
         let mut payload = sample();
         payload.session = SessionView {
             profile: Some("Steam".into()),
@@ -3976,8 +4019,8 @@ mod tests {
         let out = render_map(&page(), &payload, None);
 
         assert!(
-            out.html.contains(crate::render::NO_DAEMON_HEADLINE),
-            "the banner headline drifted from NO_DAEMON_HEADLINE: {}",
+            out.html.contains("Controls need the background helper"),
+            "the recovery headline is missing: {}",
             out.html
         );
         assert!(
@@ -3986,11 +4029,11 @@ mod tests {
             "the command must carry the profile flag: {}",
             out.html
         );
-        assert!(out.html.contains("tray icon"), "{}", out.html);
+        assert!(out.html.contains("Close and reopen ksx"), "{}", out.html);
         // Unmissable means BEFORE the content it is about.
         let banner = out
             .html
-            .find(crate::render::NO_DAEMON_HEADLINE)
+            .find("Controls need the background helper")
             .expect("banner present");
         let stage = out.html.find("stagecard").expect("stage present");
         assert!(
@@ -4024,6 +4067,54 @@ mod tests {
         assert!(out.html.contains(r#"data-act="restore-defaults""#));
     }
 
+    /// “Undo this session” is a different recovery point from the newest
+    /// whole-layout backup. It is visible only when the read model proves the
+    /// daemon-lifetime copy exists, and never while editing an unsaved setup.
+    #[test]
+    fn session_undo_is_gated_by_its_own_recovery_capability() {
+        let mut payload = sample();
+        let slots = scalar_slots(
+            &payload,
+            payload.mapper.slots.first(),
+            Some(&hadouken()),
+            None,
+        );
+        assert_eq!(slots["sessionUndoCls"], "pactform");
+
+        payload.mapper.slots[0].session_backup = false;
+        let slots = scalar_slots(
+            &payload,
+            payload.mapper.slots.first(),
+            Some(&hadouken()),
+            None,
+        );
+        assert_eq!(slots["sessionUndoCls"], "pactform off");
+
+        payload.mapper.slots[0].session_backup = true;
+        payload.target = "stage".to_owned();
+        let slots = scalar_slots(
+            &payload,
+            payload.mapper.slots.first(),
+            Some(&hadouken()),
+            None,
+        );
+        assert_eq!(slots["sessionUndoCls"], "pactform off");
+    }
+
+    #[test]
+    fn hardware_selectors_are_never_customer_keyboard_labels() {
+        for selector in [
+            r"HID\VID_D209&PID_0430",
+            "usb:d209:0430:00",
+            "instance:arcade-panel",
+            r"C:\devices\panel",
+        ] {
+            assert_eq!(input_label(selector), "Assigned keyboard", "{selector}");
+        }
+        assert_eq!(input_label("(any)"), "Any keyboard");
+        assert_eq!(input_label("Player 1 panel"), "Player 1 panel");
+    }
+
     /// Auto-save is only reassuring if the page says so in words — and since
     /// v8 the same paragraph has to state the OTHER half of the bargain: no
     /// action asks "are you sure?", because each one reports itself with an
@@ -4032,19 +4123,14 @@ mod tests {
     fn the_preset_card_states_the_save_model_plainly() {
         let out = render_map(&page(), &sample(), None);
         assert!(
-            out.html.contains("Every binding saves immediately"),
+            out.html.contains("Every control change saves immediately"),
             "{}",
             out.html
         );
         assert!(out.html.contains("Undo"), "{}", out.html);
         assert!(
-            out.html.contains("restore options"),
+            out.html.contains("recovery choices"),
             "the wider road home went unmentioned: {}",
-            out.html
-        );
-        assert!(
-            out.html.contains("timestamped backup"),
-            "the promise that makes an optimistic write safe: {}",
             out.html
         );
     }
@@ -4091,19 +4177,24 @@ mod tests {
         );
     }
 
-    /// A daemon that predates the learn verbs: honest reason with the pipe's
-    /// own error text.
+    /// A helper that predates automatic learning gets a usable recovery path,
+    /// not an internal verb or raw pipe error.
     #[test]
     fn a_pre_mapper_daemon_is_reported_not_hidden() {
         let mut payload = sample();
         payload.learn = LearnView::unavailable("unknown verb 'learn-poll'");
+        let reason = reason_line(&payload);
+        assert!(
+            reason.contains("Automatic key learning is unavailable"),
+            "{reason}"
+        );
+        assert!(!reason.contains("unknown verb"), "{reason}");
         let out = render_map(&page(), &payload, None);
         assert!(
-            out.html.contains("does not answer the learn verbs"),
+            out.html.contains("Automatic key learning is unavailable"),
             "{}",
             out.html
         );
-        assert!(out.html.contains("unknown verb"), "{}", out.html);
     }
 
     /// Ledger #5 parity, mapper edition: the embedded payload block IS the
@@ -4234,36 +4325,80 @@ mod tests {
             "{}",
             out.html
         );
-        // The nav is STATIC MARKUP duplicated per island, so a new screen is
-        // invisible until every existing one links to it. Asserted here, on
-        // this page, because a dropped link is otherwise a silent regression.
-        assert!(out.html.contains(r#"href="/""#), "{}", out.html);
-        assert!(out.html.contains(r#"href="/setup""#), "{}", out.html);
+        assert!(out.html.contains(r#"href="/start""#), "{}", out.html);
+        assert!(out.html.contains(r#"href="/check""#), "{}", out.html);
     }
 
-    /// The nav rail reaches every screen from here.
-    ///
-    /// It is STATIC MARKUP inside this page's own island — there is no shared
-    /// nav component and nothing server-injected — so a new page is invisible
-    /// from the mapper until `MapIsland.ts` is edited, with nothing anywhere to
-    /// report the omission. This test is that report.
+    /// Navigation must never turn an in-memory mapper into a saved mapper by
+    /// following the current-screen item, and Test must tell the truth about
+    /// the target it can inspect.
     #[test]
-    fn the_nav_reaches_every_screen() {
-        let out = render_map(&page(), &sample(), None);
-        for href in [
-            r#"href="/""#,
-            r#"href="/pads""#,
-            r#"href="/devices""#,
-            r#"href="/profiles""#,
-            r#"href="/setup""#,
-        ] {
-            assert!(out.html.contains(href), "missing {href}: {}", out.html);
-        }
+    fn navigation_preserves_the_mapper_target() {
+        let saved = render_map(&page(), &sample(), None);
         assert!(
-            out.html.contains(r#"aria-current="page""#),
-            "the current screen must be marked: {}",
-            out.html
+            saved.html.contains(r#"href="/check""#),
+            "saved controls should offer Test: {}",
+            saved.html
         );
+        assert!(
+            saved.html.contains(r#"aria-current="page""#),
+            "{}",
+            saved.html
+        );
+        assert!(
+            !saved.html.contains(r#"href="/map""#),
+            "the current Controls item must not be a context-losing link: {}",
+            saved.html
+        );
+
+        let mut payload = sample();
+        payload.target = "stage".to_owned();
+        let staged = render_map(&page(), &payload, None);
+        assert!(staged.html.contains("Test after Play"), "{}", staged.html);
+        assert!(
+            staged.html.contains(r#"aria-disabled="true""#),
+            "the staged Test item must be explicitly disabled: {}",
+            staged.html
+        );
+        assert!(
+            !staged.html.contains(r#"href="/check""#),
+            "staged controls must not link to a saved-only Test page: {}",
+            staged.html
+        );
+    }
+
+    #[test]
+    fn target_navigation_show_values_are_mutually_exclusive() {
+        let payload = sample();
+        let saved = show_values(&payload, selected_slot(&payload), None)
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(saved.get("show:savedTarget"), Some(&true));
+        assert_eq!(saved.get("show:stagedTarget"), Some(&false));
+
+        let mut payload = sample();
+        payload.target = "stage".to_owned();
+        let staged = show_values(&payload, selected_slot(&payload), None)
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(staged.get("show:savedTarget"), Some(&false));
+        assert_eq!(staged.get("show:stagedTarget"), Some(&true));
+    }
+
+    #[test]
+    fn staged_macro_status_does_not_claim_a_file_was_saved() {
+        let mut payload = sample();
+        payload.target = "stage".to_owned();
+        let selected = selected_slot(&payload);
+        let mac = selected_macro(&payload);
+        let scalars = scalar_slots(&payload, selected, mac.as_ref(), None);
+        assert_eq!(
+            scalars["macroDirtyLine"],
+            serde_json::Value::String("matches this unsaved setup".to_owned())
+        );
+        let note = macro_note(&payload, mac.as_ref());
+        assert!(note.contains("this unsaved setup"), "{note}");
+        assert!(!note.contains("preset file"), "{note}");
     }
 
     /// v9, the headline: with JavaScript switched off the page is still a
@@ -4981,8 +5116,8 @@ mod tests {
             "the ring, with the lookup digits: {html}"
         );
         assert!(
-            html.contains("stores dpad.down + dpad.right on that step"),
-            "what a pick WRITES, in the file's own words: {html}"
+            html.contains("combines down and right in one step"),
+            "what a diagonal pick means in customer language: {html}"
         );
         // The digits are a LOOKUP KEY, not a label: no numpad digit reaches the
         // glyph row. Every direction header is one arrow and nothing else — a
@@ -5018,8 +5153,7 @@ mod tests {
         );
         // …and the ring line says the same thing once, for the whole card.
         assert!(
-            html.contains("only down-FORWARD while you face right")
-                && html.contains("ksx has no idea which way you are facing"),
+            html.contains("only down-FORWARD while you face right"),
             "the ring line owns the facing caveat: {html}"
         );
         // THE OFF-SCREEN GROUP. 37 columns do not fit: measured on the real
@@ -5036,30 +5170,40 @@ mod tests {
         );
     }
 
-    /// The three policy selects offer exactly what ksx-core accepts, spelled
-    /// the way a config file stores it. A word this page invents is a select
-    /// that writes a preset the loader refuses.
+    /// The three policy selects submit exactly what ksx-core accepts while
+    /// presenting customer-language labels instead of storage tokens.
     #[test]
     fn the_policy_vocabularies_match_ksx_core() {
         use ksx_core::macros::{Interrupt, OnRelease, Retrigger};
         let out = render_map(&page(), &sample(), None);
         for word in OnRelease::ALL.iter().map(|p| p.as_str()) {
             assert!(
-                out.html.contains(&format!("<option>{word}</option>")),
+                out.html.contains(&format!(r#"<option value="{word}">"#)),
                 "{word}"
             );
         }
         for word in Retrigger::ALL.iter().map(|p| p.as_str()) {
             assert!(
-                out.html.contains(&format!("<option>{word}</option>")),
+                out.html.contains(&format!(r#"<option value="{word}">"#)),
                 "{word}"
             );
         }
         for word in Interrupt::ALL.iter().map(|p| p.as_str()) {
             assert!(
-                out.html.contains(&format!("<option>{word}</option>")),
+                out.html.contains(&format!(r#"<option value="{word}">"#)),
                 "{word}"
             );
+        }
+        for label in [
+            "Finish the sequence",
+            "Stop immediately",
+            "Keep the current run",
+            "Restart from the beginning",
+            "Keep running",
+            "Stop on any input",
+            "Stop on opposite input",
+        ] {
+            assert!(out.html.contains(label), "{label}");
         }
         // Defaults FIRST in each list: the select is a draft control, and an
         // SSR paint cannot mark an option selected, so the resting value has
@@ -5145,7 +5289,7 @@ mod tests {
         );
         assert!(
             html.contains(
-                "on release: finish · retrigger: ignore · interrupt: none · repeat: once"
+                "finish after release · ignore extra presses · other input does not stop it · once per press"
             ),
             "{html}"
         );
@@ -5160,7 +5304,7 @@ mod tests {
         assert!(html.contains(r#"class="macbtn off""#), "{html}");
     }
 
-    /// The sampling rule, VISIBLE (§0.2). A step below ~2 poll intervals is
+    /// The timing rule, VISIBLE (§0.2). A step below the reliable minimum is
     /// flagged inline with the reason — never silently accepted, and never
     /// silently rewritten either: the flag says which of the two happened.
     #[test]
@@ -5173,13 +5317,13 @@ mod tests {
         assert!(html.contains("macrow short"), "the amber row class: {html}");
         assert!(
             html.contains(
-                "5 ms is shorter than ~2 poll intervals (33 ms) — the game may never \
-                           see it, so ksx raises this step to 33 ms"
+                "5 ms is shorter than the reliable 33 ms minimum — the game may never \
+                 see it, so ksx raises this step to 33 ms"
             ),
             "{html}"
         );
         assert!(
-            html.contains("allow_short is on, so it runs as written and the game may never see it"),
+            html.contains("Allow short is on, so it runs as written and the game may never see it"),
             "the opt-out is flagged too, differently: {html}"
         );
         // A step at or above the floor says nothing at all.
@@ -5202,7 +5346,7 @@ mod tests {
         );
         assert_eq!(
             step_warning_long(&step(&[], Some(50), Some(3), false)),
-            "says both ms and frames — exactly one, or the file is refused"
+            "uses both milliseconds and frames — choose exactly one timing method"
         );
         assert!(step_warning_long(&step(&[], None, None, false)).contains("no duration"));
     }
@@ -5286,22 +5430,13 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(r#"formaction="/map/clear""#), "{html}");
-        assert!(
-            html.contains(r#"ksx map --preset "IPAC P1" --function macro.hadouken --key P"#),
-            "the exact CLI line, with the key it already has: {html}"
-        );
+        assert!(!html.contains("ksx map --preset"), "{html}");
         // …and a macro with no trigger prints the template, not a lie.
         let mut payload = sample();
         payload.macros.macros[0].triggers.clear();
         let out = render_map(&page(), &payload, None);
         assert!(out.html.contains("no trigger key yet"), "{}", out.html);
-        assert!(
-            out.html
-                .contains("--function macro.hadouken --key &lt;KEY&gt;")
-                || out.html.contains("--function macro.hadouken --key <KEY>"),
-            "{}",
-            out.html
-        );
+        assert!(!out.html.contains("--function"), "{}", out.html);
     }
 
     /// The card says what it DOES, and the three states are told apart: the
@@ -5313,14 +5448,14 @@ mod tests {
     fn the_editor_says_what_it_cannot_do_and_why() {
         let out = render_map(&page(), &sample(), None);
         assert!(
-            out.html.contains("are a DRAFT until you press Save macro"),
+            out.html.contains("are a draft until you press Save macro"),
             "the save model is stated where the grid is: {}",
             out.html
         );
         assert!(
             out.html
-                .contains("New, Rename and Delete write immediately"),
-            "…and so is the half that does NOT wait for Save: {}",
+                .contains("updates \"hadouken\" in the saved controller layout"),
+            "the save destination is stated in consumer language: {}",
             out.html
         );
         // The dead read-only copy is GONE — it described a card that could not
@@ -5340,7 +5475,7 @@ mod tests {
         empty.macros = crate::snapshot::MacroSnapshot::read("IPAC P1", Vec::new());
         let out = render_map(&page(), &empty, None);
         assert!(
-            out.html.contains("This preset has no macros yet"),
+            out.html.contains("This controller has no macros yet"),
             "{}",
             out.html
         );
@@ -5454,7 +5589,7 @@ mod tests {
         );
         // The faults keep saying what they are here too.
         assert!(frame_math(Some(&step(&[], Some(5), Some(1), false)), 60.0)
-            .starts_with("This step says both ms and frames"));
+            .starts_with("This step uses both milliseconds and frames"));
         assert!(frame_math(Some(&step(&[], None, None, false)), 60.0)
             .starts_with("This step has no duration"));
     }
@@ -5554,20 +5689,19 @@ mod tests {
                 && html.contains("is ONE step holding ↓ and →, not two steps."),
             "the sentence itself: {html}"
         );
-        // …and the answer to it, in the same breath: you PICK the diagonal, and
-        // ksx writes the pair. That is Victor's insight, stated where the
-        // mistake used to be made.
+        // …and the answer to it, in the same breath: pick the diagonal and the
+        // two directions are held together. No storage schema is required.
         assert!(
             html.contains("So pick the diagonal:")
-                && html.contains("ticking ↘ stores ")
-                && html.contains("dpad.down + dpad.right"),
+                && html.contains("ticking ↘ holds ")
+                && html.contains("↓ and → together for that step"),
             "the lens is not explained where it is used: {html}"
         );
         // Before the only nested disclosure this card has, so nothing has to be
         // opened to read it. (The card is a <details>; this is about not
         // burying the rule INSIDE another one.)
         let toml = html
-            .find(r#"<details class="mactomlbox">"#)
+            .find(r#"<details class="mactomlbox product-hidden">"#)
             .unwrap_or_else(|| panic!("the TOML block moved: {html}"));
         assert!(at < toml, "the rule is buried under a disclosure: {html}");
         // And the intro no longer says "a quarter-circle is three rows" without
@@ -5578,7 +5712,7 @@ mod tests {
         );
     }
 
-    /// FIX 1c — the motion helpers generate on the mechanism THIS PRESET's own
+    /// FIX 1c — the motion helpers generate on the mechanism this layout's own
     /// direction keys drive. A pad has three ways to say "right" and ksx
     /// publishes exactly what a step names, so a quarter-circle written in dpad
     /// holds on a stick preset is published faithfully and read by nobody —
@@ -5632,7 +5766,7 @@ mod tests {
         let out = render_map(&page(), &payload, None);
         assert!(
             out.html
-                .contains("this preset binds no direction keys of its own"),
+                .contains("this controller layout has no direction keys of its own"),
             "{}",
             out.html
         );
@@ -5653,7 +5787,8 @@ mod tests {
         let one = step(&["A"], None, Some(1), false);
         assert_eq!(step_warning(&one), "1 fr — raised to 2 fr");
         assert!(
-            step_warning_long(&one).starts_with("1 frame is shorter than the 2-frame floor (33 ms"),
+            step_warning_long(&one)
+                .starts_with("1 frame is shorter than the reliable 2-frame minimum (33 ms"),
             "{}",
             step_warning_long(&one)
         );
@@ -5664,7 +5799,7 @@ mod tests {
         );
         let opted = step(&["A"], None, Some(1), true);
         assert_eq!(step_warning(&opted), "1 fr — may be missed");
-        assert!(step_warning_long(&opted).contains("allow_short is on"));
+        assert!(step_warning_long(&opted).contains("Allow short is on"));
         // An ms author still hears milliseconds — the unit is the AUTHOR's.
         assert_eq!(
             step_warning(&step(&["A"], Some(5), None, false)),
@@ -5832,15 +5967,18 @@ mod tests {
         );
     }
 
-    /// The copy-and-paste path is still there and is no longer the point: a
-    /// collapsed detail, labelled as the sharing/hand-editing route.
+    /// The legacy copy-and-paste path stays in the IR for compatibility, but
+    /// the product surface hides it completely.
     #[test]
-    fn the_toml_block_is_secondary_now() {
+    fn the_toml_block_is_hidden_from_the_product_surface() {
         let out = render_map(&page(), &sample(), None);
         let html = &out.html;
-        assert!(html.contains(r#"<details class="mactomlbox">"#), "{html}");
         assert!(
-            html.contains("Advanced — this macro as TOML"),
+            html.contains(r#"<details class="mactomlbox product-hidden">"#),
+            "{html}"
+        );
+        assert!(
+            html.contains("Advanced — share or hand-edit this macro"),
             "the summary says what it is for: {html}"
         );
         assert!(
@@ -5888,7 +6026,7 @@ mod tests {
             "the trigger row names its own job: {html}"
         );
         assert!(
-            html.contains("A macro with no trigger is inert"),
+            html.contains("A macro with no trigger never runs until you add one"),
             "…and what happens if you skip it: {html}"
         );
     }
@@ -6019,7 +6157,7 @@ mod tests {
         mac.repeat = "turbo".to_owned();
         mac.turbo_hz = Some(10);
         assert!(
-            macro_policy_line(Some(&mac)).contains("repeat: turbo (10 Hz)"),
+            macro_policy_line(Some(&mac)).contains("auto-repeat with a gap (10 Hz)"),
             "{}",
             macro_policy_line(Some(&mac))
         );

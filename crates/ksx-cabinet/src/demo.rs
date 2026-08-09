@@ -76,6 +76,7 @@ impl StatusSource for DemoStatus {
                     keyboard: if n <= 2 { "IPAC 2" } else { "IPAC 4" }.into(),
                     bindings: Default::default(),
                     backup: None,
+                    session_backup: false,
                     turbo: Default::default(),
                     macros_off: false,
                 })
@@ -165,6 +166,8 @@ impl MachineSource for DemoMachine {
                 bound: 14,
                 macros: 2,
                 protected: name == "default",
+                usable: true,
+                problem: None,
                 source: format!(r"C:\…\presets\{name}.toml"),
             })
             .collect(),

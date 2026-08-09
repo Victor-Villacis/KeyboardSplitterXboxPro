@@ -64,6 +64,8 @@ export interface MapperSlot {
   bindings: Record<string, string[]>;
   /** Newest timestamped backup label, or null when there is none. */
   backup: string | null;
+  /** True only when “Undo this session” has a real recovery point. */
+  session_backup?: boolean;
   /** AUTO-FIRE (docs/INPUT-TRANSFORMS.md §3): canonical function name → the
    *  rate it auto-fires at, as authored. Keyed by FUNCTION because that is
    *  what turbo is a property of — several keys on one control share ONE
@@ -155,6 +157,9 @@ export interface MapPayload {
   macros: MacroSnapshot;
   /** Which macro the SSR paint chose (`/map?macro=NAME`). */
   macro_selected: string;
+  /** `stage` edits the in-memory first-run setup; `saved` edits a stored
+   * controller layout. Older payloads omit this and therefore mean saved. */
+  target?: string;
 }
 
 /** v11's grid rows. One list item per STEP: its number, its duration in the
@@ -474,9 +479,6 @@ export function isPlaystation(persona: string): boolean {
 const [slotLine, setSlotLine] = createSignal("no mappable slots");
 const [sourceLine, setSourceLine] = createSignal("not collected");
 const [reasonLine, setReasonLine] = createSignal("");
-const [cliLine, setCliLine] = createSignal(
-  "ksx map --preset <NAME> --function <FUNCTION> --key <KEY>",
-);
 const [daemonCmd, setDaemonCmd] = createSignal("ksx daemon");
 const [backupLine, setBackupLine] = createSignal("Restore backup");
 /** v14, the preset surface's identity block: which file, where, and whether a
@@ -488,6 +490,10 @@ const [backupFact, setBackupFact] = createSignal("none yet — the first restore
  *  form outside the legend list carries (preset actions, the bind-by-name
  *  panel). The server resolves the preset from it. */
 const [slotNum, setSlotNum] = createSignal("1");
+/** Whether mapper writes target the saved layout or first-run's in-memory
+ *  setup. Kept as a hidden form value so the no-JavaScript path cannot
+ *  accidentally turn an unsaved edit into a disk write. */
+const [mapTarget, setMapTarget] = createSignal("saved");
 const [modalPrompt, setModalPrompt] = createSignal("");
 const [modalBinding, setModalBinding] = createSignal("");
 const [countdownText, setCountdownText] = createSignal("");
@@ -512,6 +518,9 @@ const [pillRunning, setPillRunning] = createSignal(false);
 const [pillIdle, setPillIdle] = createSignal(false);
 const [pillDown, setPillDown] = createSignal(false);
 const [pillPaused, setPillPaused] = createSignal(false);
+/** Mutually-exclusive nav branches. Named getters keep the SSR seam stable. */
+const [savedTarget, setSavedTarget] = createSignal(true);
+const [stagedTarget, setStagedTarget] = createSignal(false);
 const [noDaemon, setNoDaemon] = createSignal(false);
 const [sessionRunning, setSessionRunning] = createSignal(false);
 const [pausedBar, setPausedBar] = createSignal(false);
@@ -520,6 +529,7 @@ const [canLearn, setCanLearn] = createSignal(false);
 const [artXbox, setArtXbox] = createSignal(false);
 const [artDs4, setArtDs4] = createSignal(false);
 const [hasBackup, setHasBackup] = createSignal(false);
+const [sessionUndoCls, setSessionUndoCls] = createSignal("pactform off");
 const [savedOk] = createSignal(false);
 const [savedErr] = createSignal(false);
 const [modalOpen, setModalOpen] = createSignal(false);
@@ -540,6 +550,13 @@ const [toasts, setToasts] = createSignal<ToastRow[]>([]);
  *  restore, "card pactions off" (inert look, clicks flash the reason) when
  *  not. A class string, not a show — the card never unmounts. */
 const [actionsCls, setActionsCls] = createSignal("card pactions off");
+/** Prominent return path while the existing mapper is aimed at first-run
+ * memory instead of a saved layout. A class string avoids another show slot. */
+const [stageBackCls, setStageBackCls] = createSignal("card stageback hide");
+/** A controller-less Setup is a normal first-run state. Keep the mapper's
+ *  implementation panels out of that state instead of exposing an empty
+ *  editor (and its disk-oriented recovery controls) to a new customer. */
+const [rootCls, setRootCls] = createSignal("studio mapper mapper-empty");
 
 // ── v11: the macro editor's own signals (twins in MapPage.ts) ──────────────
 // v12 defaults say "nothing is loaded", never a made-up macro name: the old
@@ -560,9 +577,6 @@ const [macroTriggerLine, setMacroTriggerLine] = createSignal(
 );
 const [macroFnName, setMacroFnName] = createSignal("");
 const [macroName, setMacroName] = createSignal("");
-const [macroCliLine, setMacroCliLine] = createSignal(
-  "ksx map --preset <NAME> --function macro.<NAME> --key <KEY>",
-);
 const [macroToml, setMacroToml] = createSignal("");
 const [macroCardCls, setMacroCardCls] = createSignal("card macrocard off");
 const [macroGridCls, setMacroGridCls] = createSignal("macgrid empty");
@@ -606,6 +620,7 @@ const [macroEnableLabel, setMacroEnableLabel] = createSignal("Enabled");
  *  the sentence. The macro card renders it above the grid, because a card full
  *  of steps that cannot run has to say so before it shows them. */
 const [slotMacrosLine, setSlotMacrosLine] = createSignal("");
+const [slotMacrosCls, setSlotMacrosCls] = createSignal("macslotremedy off");
 /** v12: the frame arithmetic, live, wherever a duration is edited (Victor: "a
  *  60fps frame is only like sixteenth milliseconds? maybe we can show that
  *  math"). Carries the sampling floor in the SAME units, so "too short" needs
@@ -650,6 +665,10 @@ let liveMapping = false;
  *  the learn verbs still has `map`). This is what gates the no-JS forms,
  *  which pick a key instead of listening for one. */
 let canWrite = false;
+
+export function editingStage(): boolean {
+  return lastPayload?.target === "stage";
+}
 
 // ── v7 multi-select (FEATURE 2) ────────────────────────────────────────────
 // Victor's file-explorer analogy: Ctrl/Shift-click ADDS a control to a
@@ -757,7 +776,6 @@ export function selectSlot(num: number): void {
 
 export function selectFn(fn: string | null): void {
   selectedFn = fn;
-  refreshCliLine();
 }
 
 export function selectedFnName(): string | null {
@@ -766,16 +784,6 @@ export function selectedFnName(): string | null {
 
 export function learnAllowed(): boolean {
   return canLearn();
-}
-
-function refreshCliLine(): void {
-  const slot = currentSlot();
-  const fnPart = selectedFn ?? "<FUNCTION>";
-  setCliLine(
-    slot
-      ? `ksx map --preset "${slot.preset}" --function ${fnPart} --key <KEY>`
-      : "ksx map --preset <NAME> --function <FUNCTION> --key <KEY>",
-  );
 }
 
 // ── Derivations (mirror render_map.rs; pinned there by unit tests) ─────────
@@ -949,9 +957,8 @@ function turboTitle(slot: MapperSlot, fn: string): string {
     `${turboOffMs(hz)} ms released, one clock however many keys point at it.`;
   if (effective !== hz) {
     line +=
-      ` The file asks for ${hz} Hz and gets about ${effective} Hz: a press AND a release ` +
-      `must each survive a 60 Hz poll (${MIN_STEP_MS} ms), so ~15 Hz is the fastest ` +
-      "anything can be delivered.";
+      ` ${hz} Hz was requested and about ${effective} Hz is delivered. The game needs enough ` +
+      "time to notice both the press and the release, so about 15 Hz is the reliable limit.";
   }
   return line;
 }
@@ -1037,16 +1044,22 @@ function legendRowsFor(slot: MapperSlot): LegendRow[] {
 }
 
 function learnable(p: MapPayload): boolean {
-  return p.session.reachable && !p.session.running && p.learn.state !== "unavailable";
+  return (
+    p.mapper.generated_at !== "(unavailable)" &&
+    p.session.reachable &&
+    !p.session.running &&
+    p.learn.state !== "unavailable"
+  );
 }
 
 function reason(p: MapPayload): string {
-  if (p.mapper.slots.length === 0) return `nothing to map — ${p.mapper.source}`;
+  if (p.mapper.generated_at === "(unavailable)") return p.mapper.source;
+  if (p.mapper.slots.length === 0)
+    return "No controller is ready to edit. Add one in Setup, then return to Controls.";
   if (!p.session.reachable)
-    return (
-      "read-only: no daemon control channel — start the daemon (tray, or `ksx daemon`), " +
-      "or bind from a shell with the command below"
-    );
+    return p.target === "stage"
+      ? "Setup's background helper is not available. Close and reopen ksx; nothing has been changed."
+      : "Controls are temporarily read-only. Close and reopen ksx, then try again.";
   if (p.session.running)
     return (
       // WORD FOR WORD what render_map.rs's `reason_line` renders — this is the
@@ -1056,17 +1069,27 @@ function reason(p: MapPayload): string {
       // 2026-08-06, which also named a control that does not exist; the button
       // is labelled "Pause emulation & map". Pinned by the SSR/hydration
       // parity suite (pwtest/ssr-hydration-parity.test.mjs).
-      "read-only while emulation runs: the panel's keys are captured, so ksx cannot " +
-      'hear them for mapping. Use "Pause emulation & map" above, or bind from a ' +
-      "shell with the command below"
+      "read-only while Play is active: the keyboard's keys are being used by the controller. " +
+      'Choose "Pause & edit" above, then resume when you are done.'
     );
   if (p.learn.state === "unavailable")
     return (
-      "read-only: the daemon does not answer the learn verbs " +
-      `(${p.learn.error ?? "no reason reported"}) — restart it on the current ksx build, ` +
-      "or bind from a shell with the command below"
+      "Automatic key learning is unavailable. Close and reopen ksx, or choose a key from the list below."
     );
   return "";
+}
+
+/** Hardware selectors are stable machine identities, not customer labels. */
+export function inputLabel(input: string): string {
+  const trimmed = input.trim();
+  if (trimmed === "" || trimmed === "(any)") return "Any keyboard";
+  if (
+    /^(usb|hid|instance|device):/i.test(trimmed) ||
+    /\\|vid_[0-9a-f]{4}|pid_[0-9a-f]{4}|#[{]?[0-9a-f-]{8}/i.test(trimmed)
+  ) {
+    return "Assigned keyboard";
+  }
+  return trimmed;
 }
 
 /** Write one /api/map payload into every signal. Keeps the client's own slot
@@ -1074,13 +1097,19 @@ function reason(p: MapPayload): string {
  *  per poll. */
 export function applyMap(p: MapPayload): void {
   lastPayload = p;
+  const staged = p.target === "stage";
+  setMapTarget(staged ? "stage" : "saved");
+  setSavedTarget(!staged);
+  setStagedTarget(staged);
   if (!p.mapper.slots.some((s) => s.number === selectedSlot)) {
     selectedSlot = p.selected;
   }
   const slot = currentSlot();
+  setRootCls(slot === null ? "studio mapper mapper-empty" : "studio mapper");
   // Derived BEFORE the row builders run — they read it for the dead look.
   liveMapping = learnable(p) && slot !== null;
-  canWrite = p.session.reachable && slot !== null;
+  canWrite =
+    p.mapper.generated_at !== "(unavailable)" && p.session.reachable && slot !== null;
   // The daemon is answering and running again: whatever we paused has been
   // started back up, so drop the paused affordance.
   if (p.session.reachable && p.session.running) {
@@ -1093,11 +1122,11 @@ export function applyMap(p: MapPayload): void {
       num: String(s.number),
       label: `P${s.number} · ${s.preset}`,
       cls: slot && s.number === slot.number ? "tab active" : "tab",
-      href: `/map?slot=${s.number}`,
+      href: staged ? `/map?target=stage&slot=${s.number}` : `/map?slot=${s.number}`,
       player: `P${s.number}`,
       preset: s.preset,
       pad: s.persona_label,
-      kbd: s.keyboard,
+      kbd: inputLabel(s.keyboard),
       rowcls: slot && s.number === slot.number ? "strow on" : "strow",
     })),
   );
@@ -1105,17 +1134,23 @@ export function applyMap(p: MapPayload): void {
   setZones(slot ? zoneRows(slot) : []);
   setLegendRows(slot ? legendRowsFor(slot) : []);
   setSlotLine(
-    slot ? `P${slot.number} · ${slot.persona_label} · ${slot.preset}` : "no mappable slots",
+    slot ? `P${slot.number} · ${slot.persona_label} · ${slot.preset}` : "No controller selected",
   );
-  setSourceLine(`${p.mapper.source} — config root: ${p.mapper.config_root}`);
-  setPresetLine(slot ? slot.preset : "(no preset)");
-  setPresetPath(
-    slot ? `${p.mapper.config_root}\\presets\\${slot.preset}.toml` : p.mapper.config_root,
+  setSourceLine(
+    slot === null
+      ? p.mapper.generated_at === "(unavailable)"
+        ? "This controller layout needs attention in Setup"
+        : "Add a keyboard and controller in Setup to begin"
+      : staged
+      ? "Unsaved setup — changes stay here until Save or Play"
+      : "Saved layout — changes apply immediately",
   );
+  setPresetLine(slot ? slot.preset : "No layout selected");
+  setPresetPath(staged ? "not saved yet" : slot ? `${p.mapper.config_root}\\presets\\${slot.preset}.toml` : p.mapper.config_root);
   setBackupFact(
     slot && slot.backup
       ? `newest ${slot.backup}`
-      : "none yet — the first restore writes one",
+      : staged ? "not applicable until Save" : "none yet — the first restore writes one",
   );
   setGeneratedAt(p.mapper.generated_at);
 
@@ -1123,13 +1158,17 @@ export function applyMap(p: MapPayload): void {
   setReasonLine(reason(p));
   setReadOnly(!live);
   setCanLearn(live);
-  setActionsCls(p.session.reachable ? "card pactions" : "card pactions off");
+  setActionsCls(staged ? "card pactions stage-hidden" : p.session.reachable ? "card pactions" : "card pactions off");
+  setStageBackCls(staged ? "card stageback" : "card stageback hide");
   setArtXbox(slot !== null && !isPlaystation(slot.persona));
   setArtDs4(slot !== null && isPlaystation(slot.persona));
   setDaemonCmd(
     p.session.profile ? `ksx daemon --game "${p.session.profile}"` : "ksx daemon",
   );
-  setHasBackup(slot !== null && slot.backup !== null);
+  setHasBackup(!staged && slot !== null && slot.backup !== null);
+  setSessionUndoCls(
+    !staged && slot?.session_backup === true ? "pactform" : "pactform off",
+  );
   setBackupLine(slot?.backup ? `Restore backup from ${slot.backup}` : "Restore backup");
 
   // v11: seed the macro draft from the file, but never over an edit in
@@ -1161,7 +1200,6 @@ export function applyMap(p: MapPayload): void {
   setSessionRunning(running);
   setPausedBar(idle && paused);
 
-  refreshCliLine();
 }
 
 // ── FIX 0: pause for mapping, and the road back ────────────────────────────
@@ -1252,7 +1290,8 @@ export function previousKeys(fn: string): string[] {
  *  write a key list, this returns true for everything and every one of those
  *  paths becomes undoable with no other change. */
 export function writableKeys(keys: string[]): boolean {
-  return keys.length <= 1;
+  void keys;
+  return true;
 }
 
 /** "S · Enter" — a key list as this page says it out loud. */
@@ -1265,21 +1304,22 @@ export function keyList(keys: string[]): string {
 export function blockedReason(): string | null {
   const p = lastPayload;
   if (!p) return "no snapshot yet";
+  if (p.mapper.generated_at === "(unavailable)") return p.mapper.source;
   if (p.mapper.slots.length === 0) return "there is nothing to map";
-  if (!p.session.reachable) return "no daemon running";
-  if (p.session.running) return "emulation is running";
-  if (p.learn.state === "unavailable") return "this daemon has no learner";
+  if (!p.session.reachable) return "the background helper is not ready";
+  if (p.session.running) return "Play is active";
+  if (p.learn.state === "unavailable") return "automatic key learning is unavailable";
   return null;
 }
 
 /** The studio server itself stopped answering: keep the page, say so. */
 export function applyMapUnreachable(): void {
-  setReasonLine("ksx-studio not responding — retrying every 2 s");
+  setReasonLine("Controls are not responding — retrying automatically");
   setReadOnly(true);
   setCanLearn(false);
   liveMapping = false;
   canWrite = false;
-  setActionsCls("card pactions off");
+  setActionsCls(editingStage() ? "card pactions stage-hidden" : "card pactions off");
   setPillRunning(false);
   setPillIdle(false);
   setPillPaused(false);
@@ -1289,12 +1329,12 @@ export function applyMapUnreachable(): void {
   setPausedBar(false);
 }
 
-/** "Saved 14:32:07" — auto-save made visible (Victor: "where is save?"). */
+/** Make immediate writes visible without claiming staged memory was saved. */
 export function markSaved(): void {
   const now = new Date();
   const two = (n: number) => String(n).padStart(2, "0");
   setSavedAt(
-    `Saved ${two(now.getHours())}:${two(now.getMinutes())}:${two(now.getSeconds())}`,
+    `${editingStage() ? "Updated setup" : "Saved"} ${two(now.getHours())}:${two(now.getMinutes())}:${two(now.getSeconds())}`,
   );
 }
 
@@ -1348,8 +1388,7 @@ export function showLearnTurbo(fn: string | null): void {
       "This control does not auto-fire: hold its key and it stays down. Type a number of " +
         "presses a second and press \u201cSet turbo\u201d to make it fire while the key is held \u2014 " +
         "one clock for the control, however many keys point at it. 10\u201312 Hz is the usual " +
-        "cabinet setting; above ~15 Hz nothing more gets through, because a press AND a " +
-        "release must each survive a 60 Hz poll.",
+        "cabinet setting; above about 15 Hz the game cannot reliably notice separate presses.",
     );
     return;
   }
@@ -1358,8 +1397,8 @@ export function showLearnTurbo(fn: string | null): void {
     effective === hz
       ? `This control auto-fires at ${hz} Hz while any of its keys is held. ` +
           "\u201cNo turbo\u201d (or 0) turns it off."
-      : `This control asks for ${hz} Hz and actually fires at about ${effective} Hz \u2014 a ` +
-          "press AND a release must each survive a 60 Hz poll, so ~15 Hz is the ceiling. " +
+      : `This control asks for ${hz} Hz and actually fires at about ${effective} Hz \u2014 the ` +
+          "game needs time to notice each press and release, so about 15 Hz is the limit. " +
           "\u201cNo turbo\u201d (or 0) turns it off.",
   );
 }
@@ -1673,7 +1712,7 @@ function stepWarning(step: MacroStepView): string {
 /** The same flag in full, for the row's title. */
 function stepWarningLong(step: MacroStepView): string {
   if (step.ms !== null && step.frames !== null) {
-    return "says both ms and frames — exactly one, or the file is refused";
+    return "uses both milliseconds and frames — choose exactly one timing method";
   }
   if (step.ms === null && step.frames === null) {
     return "no duration — give it ms or frames (a step with none is refused)";
@@ -1681,18 +1720,18 @@ function stepWarningLong(step: MacroStepView): string {
   if (!stepIsShort(step)) return "";
   if (step.frames !== null) {
     const f = step.frames;
-    const each = `${f} frame${f === 1 ? "" : "s"} is shorter than the ${MIN_STEP_FRAMES}-frame ` +
-      `floor (${MIN_STEP_MS} ms — a press has to survive two 60 Hz polls)`;
+    const each = `${f} frame${f === 1 ? "" : "s"} is shorter than the reliable ${MIN_STEP_FRAMES}-frame ` +
+      `minimum (${MIN_STEP_MS} ms — the game needs enough time to notice it)`;
     return step.allow_short
-      ? `${each} — allow_short is on, so it runs as written and the game may never see it`
+      ? `${each} — Allow short is on, so it runs as written and the game may never see it`
       : `${each} — the game may never see it, so ksx raises this step to ` +
           `${MIN_STEP_FRAMES} frames (${MIN_STEP_MS} ms)`;
   }
   const ms = step.ms as number;
   return step.allow_short
-    ? `${ms} ms is shorter than ~2 poll intervals (${MIN_STEP_MS} ms) — allow_short is on, ` +
+    ? `${ms} ms is shorter than the reliable ${MIN_STEP_MS} ms minimum — Allow short is on, ` +
         "so it runs as written and the game may never see it"
-    : `${ms} ms is shorter than ~2 poll intervals (${MIN_STEP_MS} ms) — the game may never ` +
+    : `${ms} ms is shorter than the reliable ${MIN_STEP_MS} ms minimum — the game may never ` +
         `see it, so ksx raises this step to ${MIN_STEP_MS} ms`;
 }
 
@@ -1782,7 +1821,7 @@ function frameMath(step: MacroStepView | undefined, rate: number): string {
   const floor = `The engine can only see steps of ${floorText(rate)} or longer.`;
   if (!step) return `Pick a step's ⏱ to retime it. ${floor}`;
   if (step.ms !== null && step.frames !== null) {
-    return `This step says both ms and frames — keep exactly one, or the preset will not load. ${floor}`;
+    return `This step uses both milliseconds and frames — keep exactly one timing method. ${floor}`;
   }
   if (step.ms === null && step.frames === null) {
     return `This step has no duration — give it ms or frames. ${floor}`;
@@ -1833,7 +1872,7 @@ function turboMath(mac: MacroView | null): string {
     asked = `Requested a ${mac.gap_ms} ms gap`;
     wanted = mac.gap_ms;
   } else {
-    asked = "No rate given — a turbo with no rate is refused by the loader";
+    asked = "No repeat rate has been set";
     wanted = MIN_STEP_MS;
   }
   const raised = wanted < MIN_STEP_MS;
@@ -1842,22 +1881,20 @@ function turboMath(mac: MacroView | null): string {
   if (cycle === 0) return "This macro has no steps, so there is nothing to repeat.";
   const effective = Math.floor((1000 + Math.floor(cycle / 2)) / cycle);
   const why = raised
-    ? " (raised to the sampling floor — a gap the game never samples is not a gap, it " +
-      "reads as one long hold)"
+    ? " (raised to the reliable minimum so the game can notice the release)"
     : "";
   return (
     `${asked} → effective ~${effective} Hz, because the sequence itself is ${run} ms long ` +
     `and the neutral gap between runs is ${gap} ms${why}: one full press/release cycle ` +
-    `takes ${cycle} ms. Each half has to survive a 60 Hz poll (${MIN_STEP_MS} ms), which ` +
-    "is what caps this — the rate is capped, never refused."
+    `takes ${cycle} ms. The game needs at least ${MIN_STEP_MS} ms to notice each half, so ` +
+    "the rate is capped rather than rejected."
   );
 }
 
 const MACRO_RULE_LINE =
-  "Amber steps are shorter than ~2 poll intervals — 33 ms, or 2 frames if you are counting " +
-  "frames — which is the shortest thing a game can be relied on to see. A 1-frame step is " +
-  "not unreliable, it is invisible. ksx raises a short step to 33 ms so it lands; a step " +
-  "marked allow_short runs exactly as written and can be missed entirely. Neither is ever " +
+  "Amber steps are shorter than the reliable minimum — 33 ms, or 2 frames if you are counting " +
+  "frames. A 1-frame step may be invisible to the game. ksx raises a short step to 33 ms so it lands; a step " +
+  "marked Allow short runs exactly as written and can be missed entirely. Neither is ever " +
   "silent, and Save asks before it writes either one.";
 
 /** THE RING, stated once, under the grid: what the eight columns of a direction
@@ -1873,14 +1910,12 @@ const MACRO_RING_LINE =
   "Each direction group runs ↑ ↖ ← ↙ ↓ ↘ → ↗ (numpad 8 7 4 1 2 3 6 9), so a motion is a " +
   "SHAPE: a quarter-circle forward is a staircase, a half-circle a straight line, a dragon " +
   "punch a hook. The four diagonals are picks, not new bindings — ticking ↘ (down-right, " +
-  "numpad 3; a move list spells it d/f, which is only down-FORWARD while you face right — ksx " +
-  "has no idea which way you are facing) stores dpad.down + dpad.right on that step, which is " +
-  "what a diagonal has always been in this file. THERE ARE THREE OF THESE GROUPS — D-PAD, " +
+  "numpad 3; a move list spells it d/f, which is only down-FORWARD while you face right) " +
+  "combines down and right in one step. THERE ARE THREE OF THESE GROUPS — D-PAD, " +
   "LEFT STICK and RIGHT STICK — and the grid scrolls sideways to reach them, so the one you " +
   "want may be off the edge; the band above the arrows names whichever you are looking at. " +
-  "Tick the diagonal on the group your preset's own direction keys drive, because a motion " +
-  "written on the other one is published faithfully and read by nobody. Each row spells the " +
-  "pair it wrote beside its name.";
+  "Use the same group as this controller layout so the game reads the motion. Each row spells " +
+  "the direction pair beside its name.";
 
 /** The body "＋ New macro" WRITES: one real 50 ms step, at the default
  *  policies. A macro with no steps is refused by the loader (and by the
@@ -2027,21 +2062,20 @@ export function macroIsOnDisk(): boolean {
 export function macroNameProblem(name: string, except?: string | null): string | null {
   const clean = name.trim();
   if (clean === "") {
-    return "A macro needs a name — it is half of the `macro.<name>` key that starts it.";
+    return "A macro needs a name before it can be created.";
   }
   if (clean.length > 64) return "That name is longer than 64 characters.";
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(clean)) {
     return (
       `"${clean}" has characters a macro name cannot use. Use letters, digits, dash, ` +
-      "underscore or dot, starting with a letter or digit — the name is a TOML table key " +
-      "and half of the `macro.<name>` function, and both have to hold it without quoting."
+      "underscore or dot, starting with a letter or digit."
     );
   }
   const taken = macroNames().find(
     (n) => n.toLowerCase() === clean.toLowerCase() && n.toLowerCase() !== (except ?? "").toLowerCase(),
   );
   if (taken !== undefined) {
-    return `"${taken}" already exists in this preset. Pick another name, or open that macro and edit it.`;
+    return `"${taken}" already exists in this controller layout. Pick another name, or open that macro and edit it.`;
   }
   return null;
 }
@@ -2348,7 +2382,7 @@ export function macroRestoreHold(target: MacroStepView, hold: string[]): string 
   if (at < 0) {
     return (
       "that step is gone — the draft was reloaded (a macro switch, a slot switch, or " +
-      "Revert to file), so there is nothing to put back."
+      "Discard draft changes), so there is nothing to put back."
     );
   }
   target.hold = [...hold];
@@ -2887,19 +2921,19 @@ export function macroMotionLineFor(slot: MapperSlot | null): string {
     "group's ↖ ↗ ↙ ↘ columns.";
   if (driven.length === 0) {
     return (
-      `These write ${mechanismLabel(pick)} — this preset binds no direction keys of its own, ` +
+      `These write ${mechanismLabel(pick)} — this controller layout has no direction keys of its own, ` +
       `so there is nothing to match. If the game reads a stick, retick the rows. ${tail}`
     );
   }
   if (driven.length > 1) {
     return (
-      `These write ${mechanismLabel(pick)}. This preset's own direction keys drive ` +
+      `These write ${mechanismLabel(pick)}. This controller layout's direction keys drive ` +
       `${driven.map(mechanismLabel).join(" and ")}, so either would be read — a pad has three ` +
       `ways to say "right" and a game reads whichever one it was written for. ${tail}`
     );
   }
   return (
-    `These write ${mechanismLabel(pick)} — the same mechanism this preset's own direction ` +
+    `These write ${mechanismLabel(pick)} — the same mechanism this controller layout's direction ` +
     `keys drive, so the game reads them. (A motion written on the other mechanism is ` +
     `published faithfully and read by nobody: that is the trap.) ${tail}`
   );
@@ -3439,7 +3473,7 @@ function macroTabsFor(p: MapPayload, mac: MacroView, slotNumber: number): MacroT
   return p.macros.macros.map((m) => ({
     name: m.name,
     label: `${m.name} · ${m.steps.length} steps`,
-    href: `/map?slot=${slotNumber}&macro=${encodeURIComponent(m.name)}`,
+    href: `${p.target === "stage" ? "/map?target=stage&" : "/map?"}slot=${slotNumber}&macro=${encodeURIComponent(m.name)}`,
     cls: m.name.toLowerCase() === mac.name.toLowerCase() ? "mactab active" : "mactab",
   }));
 }
@@ -3450,7 +3484,7 @@ function macroTabsForNone(p: MapPayload, slotNumber: number): MacroTab[] {
   return p.macros.macros.map((m) => ({
     name: m.name,
     label: `${m.name} · ${m.steps.length} steps`,
-    href: `/map?slot=${slotNumber}&macro=${encodeURIComponent(m.name)}`,
+    href: `${p.target === "stage" ? "/map?target=stage&" : "/map?"}slot=${slotNumber}&macro=${encodeURIComponent(m.name)}`,
     cls: "mactab",
   }));
 }
@@ -3507,11 +3541,27 @@ function macroTomlFor(mac: MacroView): string {
 export function slotMacrosLineFor(slot: MapperSlot | undefined): string {
   if (!slot?.macros_off) return "";
   return (
-    `Slot ${slot.number} says macros = "off" — the TOURNAMENT SWITCH. Nothing in this ` +
-    `card runs on it, whatever each macro's own switch says, and nothing is deleted. To ` +
-    `bring them back, set macros = "on" on that [[slot]] in config.toml (or on the slot of ` +
-    `the games.toml profile you are running) and reload the session.`
+    `Macros are off for Player ${slot.number}, so nothing in this card will run. ` +
+    "Nothing has been deleted. Rebuild this player in Setup and save it to turn macros on."
   );
+}
+
+function policySummary(mac: MacroView): string {
+  const release = mac.on_release === "abort" ? "stop when released" : "finish after release";
+  const retrigger = mac.retrigger === "restart" ? "restart if pressed again" : "ignore extra presses";
+  const interrupt =
+    mac.interrupt === "any-input"
+      ? "other input stops it"
+      : mac.interrupt === "opposing"
+        ? "opposite input stops it"
+        : "other input does not stop it";
+  const repeat =
+    mac.repeat === "turbo"
+      ? "auto-repeat with a gap"
+      : mac.repeat === "while-held"
+        ? "repeat immediately while held"
+        : "once per press";
+  return `${release} · ${retrigger} · ${interrupt} · ${repeat}`;
 }
 
 function macroTriggerLineFor(mac: MacroView): string {
@@ -3522,16 +3572,12 @@ function macroTriggerLineFor(mac: MacroView): string {
 
 function macroNoteFor(p: MapPayload | null, mac: MacroView | null): string {
   if (!p || !p.macros.available) {
-    return (
-      `This preset's macros could not be read (${p?.macros.reason ?? "no snapshot yet"}), so ` +
-      "there is nothing to edit and nothing here can be saved. That is NOT the same as " +
-      "\"this preset has no macros\" — it means nobody could tell this page either way."
-    );
+    return "Macros for this controller could not be read, so nothing here can be edited or saved. Return to Setup and choose a working controller layout.";
   }
   if (p.macros.macros.length === 0) {
     return (
-      "This preset has no macros yet. Type a name above and press ＋ New macro: it is " +
-      "written into the preset straight away (one empty 50 ms step), and then you paint the " +
+      "This controller has no macros yet. Type a name above and press ＋ New macro: it is " +
+      `${p.target === "stage" ? "added to this unsaved setup" : "added to the saved layout"} straight away (one empty 50 ms step), and then you paint the ` +
       "grid and press Save macro."
     );
   }
@@ -3539,10 +3585,9 @@ function macroNoteFor(p: MapPayload | null, mac: MacroView | null): string {
     return "Pick a macro above to edit it, or type a name and press ＋ New macro.";
   }
   return (
-    `Steps and policies are a DRAFT until you press Save macro — that writes the whole ` +
-    `"${mac.name}" table into the preset file (a timestamped backup is taken first) and ` +
-    "swaps it into a running session with the pads left plugged. New, Rename and Delete " +
-    "write immediately. Every one of them can be undone from the toast it leaves."
+    p.target === "stage"
+      ? `Steps and policies are a draft until you press Save macro. That updates "${mac.name}" in this unsaved setup; nothing is written or plugged in. New, Rename and Delete update the setup immediately.`
+      : `Steps and policies are a draft until you press Save macro. That updates "${mac.name}" in the saved layout and leaves a recovery copy. New, Rename and Delete apply immediately.`
   );
 }
 
@@ -3576,7 +3621,6 @@ function refreshMacro(): void {
     setMacroTriggerLine("");
     setMacroFnName("");
     setMacroName("");
-    setMacroCliLine(`ksx map --preset "${preset}" --function macro.<NAME> --key <KEY>`);
     setMacroToml("");
     setMacroCardCls(p?.macros.available ? "card macrocard" : "card macrocard off");
     setMacroDirtyLine("");
@@ -3584,6 +3628,7 @@ function refreshMacro(): void {
     setMacroEnableCls("btn btn-mini macen off dead");
     setMacroEnableLabel("Enabled");
     setSlotMacrosLine(slotMacrosLineFor(slot));
+    setSlotMacrosCls(slot?.macros_off ? "macslotremedy" : "macslotremedy off");
     setMacroStepLine("");
     setMacroConfirmCls("macconfirm off");
     setMacroConfirmLine("");
@@ -3607,8 +3652,7 @@ function refreshMacro(): void {
   setMacroRuleLine(MACRO_RULE_LINE);
   setMacroRingLine(MACRO_RING_LINE);
   setMacroPolicyLine(
-    `on release: ${mac.on_release} · retrigger: ${mac.retrigger} · ` +
-      `interrupt: ${mac.interrupt} · repeat: ${mac.repeat || "once"}` +
+    policySummary(mac) +
       (mac.turbo_hz !== null
         ? ` (${mac.turbo_hz} Hz)`
         : mac.gap_ms !== null
@@ -3627,15 +3671,17 @@ function refreshMacro(): void {
   setMacroTriggerLine(macroTriggerLineFor(mac));
   setMacroFnName(`macro.${mac.name}`);
   setMacroName(mac.name);
-  setMacroCliLine(
-    `ksx map --preset "${preset}" --function macro.${mac.name} --key ` +
-      `${mac.triggers[0] ?? "<KEY>"}`,
-  );
   setMacroToml(macroTomlFor(mac));
   setMacroCardCls(p?.macros.available ? "card macrocard" : "card macrocard off");
   setMacroGridCls(mac.steps.length === 0 ? "macgrid empty" : "macgrid");
   setMacroDirtyLine(
-    macroDirty ? "unsaved changes — press Save macro to write them to the preset" : "saved",
+    macroDirty
+      ? p?.target === "stage"
+        ? "unsaved changes — Save macro keeps them in this setup"
+        : "unsaved changes — Save macro updates the saved layout"
+      : p?.target === "stage"
+        ? "matches this unsaved setup"
+        : "saved",
   );
   setMacroSaveCls(macroDirty ? "btn btn-mini macsave dirty" : "btn btn-mini macsave off");
   // The switch reads as the STATE it is in, not as the action it performs: a
@@ -3644,6 +3690,7 @@ function refreshMacro(): void {
   setMacroEnableCls(mac.disabled ? "btn btn-mini macen offstate" : "btn btn-mini macen on");
   setMacroEnableLabel(mac.disabled ? "DISABLED — click to enable" : "Enabled");
   setSlotMacrosLine(slotMacrosLineFor(slot));
+  setSlotMacrosCls(slot?.macros_off ? "macslotremedy" : "macslotremedy off");
   setMacroTrigCls(macroFromDisk ? "mactrigger" : "mactrigger off");
   const step = macroStep === null ? undefined : mac.steps[macroStep];
   setMacroStepLine(
@@ -3728,7 +3775,7 @@ export function macroStepAllowShort(): boolean {
 export function MapIsland() {
   return h(
     "div",
-    { class: "studio mapper" },
+    { class: () => rootCls() },
     h(
       "header",
       { class: "top" },
@@ -3741,26 +3788,38 @@ export function MapIsland() {
       h(
         "nav",
         { class: "topnav", "aria-label": "screens" },
-        h("a", { class: "navlink", href: "/start" }, "Start"),
-        h("a", { class: "navlink", href: "/" }, "Status"),
-        h("a", { class: "navlink on", href: "/map", "aria-current": "page" }, "Mapper"),
-        h("a", { class: "navlink", href: "/check" }, "Check"),
-        h("a", { class: "navlink", href: "/pads" }, "Pads"),
-        h("a", { class: "navlink", href: "/devices" }, "Devices"),
-        h("a", { class: "navlink", href: "/profiles" }, "Profiles"),
-        h("a", { class: "navlink", href: "/setup" }, "Setup"),
+        h("a", { class: "navlink", href: "/start" }, "Setup"),
+        h("span", { class: "navlink on", "aria-current": "page" }, "Controls"),
+        createShow(
+          () => savedTarget(),
+          () => h("a", { class: "navlink", href: "/check" }, "Test"),
+        ),
+        createShow(
+          () => stagedTarget(),
+          () =>
+            h(
+              "span",
+              {
+                class: "navlink navlink-disabled",
+                role: "link",
+                "aria-disabled": "true",
+                title: "Play this setup before opening Test",
+              },
+              "Test after Play",
+            ),
+        ),
       ),
       createShow(
         () => pillRunning(),
-        () => h("span", { class: "pill pill-run" }, "running"),
+        () => h("span", { class: "pill pill-run" }, "playing"),
       ),
       createShow(
         () => pillIdle(),
-        () => h("span", { class: "pill pill-idle" }, "idle"),
+        () => h("span", { class: "pill pill-idle" }, "ready"),
       ),
       createShow(
         () => pillDown(),
-        () => h("span", { class: "pill pill-down" }, "no daemon"),
+        () => h("span", { class: "pill pill-down" }, "needs attention"),
       ),
       createShow(
         () => pillPaused(),
@@ -3770,6 +3829,22 @@ export function MapIsland() {
     h(
       "main",
       null,
+      h(
+        "section",
+        { class: () => stageBackCls() },
+        h(
+          "div",
+          null,
+          h("h2", null, "Editing this unsaved setup"),
+          h(
+            "p",
+            { class: "cardline" },
+            "Bindings, auto-fire and macros update the controller you staged in Setup. ",
+            "Nothing is written and no virtual controller appears while you edit.",
+          ),
+        ),
+        h("a", { class: "btn btn-primary", href: "/start" }, "Back to Setup"),
+      ),
       // ── FIX 1: the no-daemon banner. TOP of the page, not buried at the
       // bottom of a card — the failure it exists for is a page that looks
       // completely normal and silently ignores every click. ──────────────
@@ -3782,25 +3857,15 @@ export function MapIsland() {
             h(
               "h2",
               null,
-              "No daemon — ksx Studio can see your config but cannot change anything.",
+              "Controls need the background helper",
             ),
             h(
               "p",
               { class: "alarmlead" },
-              "Bindings below are the real ones on disk. Nothing you click here can ",
-              "be saved until a daemon is running. Two ways to start one:",
+              "Close and reopen ksx, then return to Controls. The controller layout shown ",
+              "below is read-only until the helper answers, and nothing has been changed.",
             ),
-            h(
-              "ol",
-              { class: "alarmways" },
-              h("li", null, "the ksx tray icon → Start emulation, or"),
-              h(
-                "li",
-                null,
-                "run this in a shell: ",
-                h("code", { class: "mono copyable" }, () => daemonCmd()),
-              ),
-            ),
+            h("span", { class: "product-hidden", "aria-hidden": "true" }, () => daemonCmd()),
           ),
       ),
       // ── FIX 0: emulation is running, so the learner cannot hear the panel.
@@ -3814,14 +3879,13 @@ export function MapIsland() {
             h(
               "h2",
               null,
-              "Emulation is running: panel keys are captured, so ksx can't hear them ",
-              "for mapping.",
+              "Play is active, so automatic key learning is paused.",
             ),
             h(
               "p",
               { class: "alarmlead" },
-              "Pausing unplugs the pads and gives the panel back to Windows; ",
-              "Resume starts the same profile again when you are done.",
+              "Pause to teach controls by pressing keys. This temporarily disconnects the ",
+              "virtual controllers; Resume reconnects the same setup when you are done.",
             ),
             h(
               "div",
@@ -3832,10 +3896,12 @@ export function MapIsland() {
               h(
                 "form",
                 { class: "pactform", method: "post", action: "/map/session/stop" },
+                h("input", { type: "hidden", name: "slot", value: () => slotNum() }),
+                h("input", { type: "hidden", name: "target", value: () => mapTarget() }),
                 h(
                   "button",
                   { class: "btn btn-primary", "data-act": "pause-map", type: "submit" },
-                  "Pause emulation & map",
+                  "Pause & edit",
                 ),
               ),
             ),
@@ -3848,12 +3914,12 @@ export function MapIsland() {
           h(
             "section",
             { class: "card alarm paused" },
-            h("h2", null, "Emulation is paused for mapping."),
+            h("h2", null, "Play is paused for editing."),
             h(
               "p",
               { class: "alarmlead" },
-              "The cabinet has no virtual pads right now. Map what you need, then ",
-              "put it back:",
+              "The virtual controllers are temporarily disconnected. Map what you need, ",
+              "then reconnect them:",
             ),
             h(
               "div",
@@ -3861,10 +3927,22 @@ export function MapIsland() {
               h(
                 "button",
                 { class: "btn btn-primary", "data-act": "resume", type: "button" },
-                "Resume emulation",
+                "Resume Play",
               ),
             ),
           ),
+      ),
+      h(
+        "section",
+        { class: "card map-empty-card" },
+        h("h2", null, "No controller to edit yet"),
+        h(
+          "p",
+          { class: "cardline" },
+          "Choose a keyboard and add a controller in Setup. Controls will be ready as soon as ",
+          "that controller appears — nothing needs to be saved first.",
+        ),
+        h("a", { class: "btn btn-primary", href: "/start" }, "Go to Setup"),
       ),
       // ── Slot context strip ────────────────────────────────────────────
       // ── The slot rail ────────────────────────────────────────────────
@@ -3903,7 +3981,6 @@ export function MapIsland() {
             "section",
             { class: "card warnbox" },
             h("p", { class: "warn" }, () => reasonLine()),
-            h("p", { class: "clifall" }, h("code", { class: "mono" }, () => cliLine())),
           ),
       ),
       createShow(
@@ -3935,8 +4012,8 @@ export function MapIsland() {
               "Bindings list below carries its own ✕ that removes only that ",
               "key. Ctrl-click (or “Select multiple”) picks several controls ",
               "and maps them all to ONE key. Saves are immediate — nothing ",
-              "asks “are you sure?”; every action reports itself with an Undo ",
-              "button (Ctrl-Z undoes the newest) — and a running session takes ",
+              "asks “are you sure?”; single-control changes offer Undo when it is safe ",
+              "(Ctrl-Z undoes the newest) — and a running session takes ",
               "them live without unplugging the pads.",
             ),
           ),
@@ -4113,6 +4190,7 @@ export function MapIsland() {
                   "form",
                   { class: l.bindcls, method: "post", action: "/map/bind" },
                   h("input", { type: "hidden", name: "slot", value: l.slot }),
+                  h("input", { type: "hidden", name: "target", value: () => mapTarget() }),
                   h("input", { type: "hidden", name: "function", value: l.fn }),
                   h(
                     "select",
@@ -4267,7 +4345,7 @@ export function MapIsland() {
         h(
           "div",
           { class: "phead" },
-          h("h2", { class: "sr-head" }, "This preset's macros"),
+          h("h2", { class: "sr-head" }, "Macros for this controller layout"),
           // THE save. One button, always in the same place, and its class says
           // whether there is anything to write — the answer to "why can't you
           // just save it? do I need to go to a folder and open it up?".
@@ -4277,7 +4355,7 @@ export function MapIsland() {
               class: () => macroSaveCls(),
               "data-act": "macro-save",
               type: "button",
-              title: "write this whole macro into the preset file",
+              title: "save this whole macro",
             },
             "Save macro",
           ),
@@ -4313,7 +4391,7 @@ export function MapIsland() {
                 class: "btn btn-mini macsaveno",
                 "data-act": "macro-save-cancel",
                 type: "button",
-                title: "leave the preset alone and go back to the grid",
+                title: "leave the draft unchanged and go back to the grid",
               },
               "Not yet",
             ),
@@ -4330,10 +4408,9 @@ export function MapIsland() {
           { class: "macconcept" },
           "A step holds everything you tick in that row AT ONCE — a diagonal ",
           "is ONE step holding ↓ and →, not two steps. So pick the diagonal: ",
-          "every direction group has ↖ ↗ ↙ ↘ of its own, and ticking ↘ stores ",
-          "dpad.down + dpad.right, which is what a diagonal has always been in ",
-          "the file. Every row says what it holds, in words, beside its number, ",
-          "and spells out the pair it wrote.",
+          "every direction group has ↖ ↗ ↙ ↘ of its own, and ticking ↘ holds ",
+          "↓ and → together for that step. Every row says what it holds, in ",
+          "words, beside its number.",
         ),
         // What this card IS, before any of its controls. A first-time reader
         // should not have to open docs/INPUT-TRANSFORMS.md to use it.
@@ -4347,9 +4424,8 @@ export function MapIsland() {
           "is ↓ and → together on ONE row), then →. A TRIGGER is the ",
           "panel key that STARTS the macro: bind one in the Trigger section at ",
           "the bottom, and from then on that single key press plays the whole ",
-          "sequence. The two are separate on purpose — the sequence lives in ",
-          "the preset's [macros] table, the trigger is an ordinary binding ",
-          "pointing at it.",
+          "sequence. The two are kept separately on purpose, so you can change ",
+          "the sequence or the trigger without rebuilding the other one.",
         ),
         h("p", { class: "savenote" }, () => macroNote()),
         h(
@@ -4389,17 +4465,21 @@ export function MapIsland() {
               class: "btn btn-mini macnew",
               "data-act": "macro-new",
               type: "button",
-              title: "create this macro in the preset now",
+              title: "create this macro in the current controller layout",
             },
             "＋ New macro",
           ),
         ),
         h("p", { class: "machead" }, () => macroHead()),
-        // The slot-wide switch, above everything it silences. Empty (and so
-        // invisible) on every slot that runs macros — see `slotMacrosLine` for
-        // why this is a sentence and not a button.
-        h("p", { class: "macslotoff" }, () => slotMacrosLine()),
-        h("p", { class: "macpolicy mono" }, () => macroPolicyLine()),
+        // The player-wide switch, above everything it silences, with a real
+        // route out rather than a diagnosis that strands the user.
+        h(
+          "div",
+          { class: () => slotMacrosCls() },
+          h("p", { class: "macslotoff" }, () => slotMacrosLine()),
+          h("a", { class: "btn btn-mini", href: "/start" }, "Open Setup to turn macros on"),
+        ),
+        h("p", { class: "macpolicy" }, () => macroPolicyLine()),
         // FIX 1c — COMMON MOTIONS. These are the sequences everybody is
         // actually trying to build, and they are exactly where the
         // two-controls-per-row concept bites: the middle step of a
@@ -4790,7 +4870,7 @@ export function MapIsland() {
           h(
             "button",
             { class: "btn btn-mini", "data-act": "macro-revert", type: "button" },
-            "Revert to file",
+            "Discard draft changes",
           ),
           // RENAME is a real write: save under the new name, then delete the
           // old table, then move the trigger keys across — one action, one
@@ -4841,7 +4921,7 @@ export function MapIsland() {
               class: "btn btn-mini macdelmac",
               "data-act": "macro-delete",
               type: "button",
-              title: "delete this macro from the preset (its trigger rows go with it)",
+              title: "delete this macro (its trigger keys go with it)",
             },
             "Delete macro",
           ),
@@ -4858,20 +4938,20 @@ export function MapIsland() {
             h(
               "label",
               { class: "bindlabel macjs" },
-              "on release",
+              "When the trigger is released",
               h(
                 "select",
                 { class: "macsel", "data-macpol": "on_release" },
-                h("option", null, "finish"),
-                h("option", null, "abort"),
+                h("option", { value: "finish" }, "Finish the sequence"),
+                h("option", { value: "abort" }, "Stop immediately"),
               ),
             ),
             h(
               "span",
               { class: "machint" },
-              "letting go of the trigger mid-run: finish runs the sequence out (the ",
-              "fighting-game expectation — you tap the button and the quarter-circle ",
-              "comes out whole), abort stops it and releases everything in one batch.",
+              "Finishing lets the current sequence run to its last step (the fighting-game ",
+              "expectation — tap the button and the quarter-circle comes out whole). Stopping ",
+              "ends it immediately and releases every held control.",
             ),
           ),
           h(
@@ -4880,20 +4960,20 @@ export function MapIsland() {
             h(
               "label",
               { class: "bindlabel macjs" },
-              "retrigger",
+              "When pressed again",
               h(
                 "select",
                 { class: "macsel", "data-macpol": "retrigger" },
-                h("option", null, "ignore"),
-                h("option", null, "restart"),
+                h("option", { value: "ignore" }, "Keep the current run"),
+                h("option", { value: "restart" }, "Restart from the beginning"),
               ),
             ),
             h(
               "span",
               { class: "machint" },
-              "pressing the trigger again mid-run: ignore swallows the press (the ",
-              "default, because restart stutters the sequence back to step 0 on any ",
-              "switch bounce a real panel has), restart starts over from step 1.",
+              "Choose whether another press leaves the current sequence alone or starts it ",
+              "again from the beginning. Keeping the current run is safer for a panel switch ",
+              "that may bounce.",
             ),
           ),
           h(
@@ -4902,22 +4982,20 @@ export function MapIsland() {
             h(
               "label",
               { class: "bindlabel macjs" },
-              "interrupt",
+              "When another control is pressed",
               h(
                 "select",
                 { class: "macsel", "data-macpol": "interrupt" },
-                h("option", null, "none"),
-                h("option", null, "any-input"),
-                h("option", null, "opposing"),
+                h("option", { value: "none" }, "Keep running"),
+                h("option", { value: "any-input" }, "Stop on any input"),
+                h("option", { value: "opposing" }, "Stop on opposite input"),
               ),
             ),
             h(
               "span",
               { class: "machint" },
-              "doing something ELSE mid-run: none never interrupts, any-input aborts ",
-              "on any other bound key of this slot going down, opposing aborts only on ",
-              "input that contradicts the macro — a direction against one the current ",
-              "step holds, or a key that starts a different macro.",
+              "Choose whether other controls leave the sequence alone, stop it on any input, ",
+              "or stop it only for an opposite direction or another macro trigger.",
             ),
           ),
           // ── v13: AUTOREPEAT — the option Victor went looking for ──────
@@ -4930,24 +5008,20 @@ export function MapIsland() {
             h(
               "label",
               { class: "bindlabel macjs" },
-              "repeat",
+              "After the sequence ends",
               h(
                 "select",
                 { class: "macsel", "data-macpol": "repeat" },
-                h("option", null, "once"),
-                h("option", null, "while-held"),
-                h("option", null, "turbo"),
+                h("option", { value: "once" }, "Run once per press"),
+                h("option", { value: "while-held" }, "Repeat immediately while held"),
+                h("option", { value: "turbo" }, "Repeat with an auto-fire gap"),
               ),
             ),
             h(
               "span",
               { class: "machint" },
-              "what the END of a run does while the trigger is STILL held: once ",
-              "stops (the default, and what keeps a special move from becoming a ",
-              "machine gun), while-held runs it again immediately with no gap — for ",
-              "a motion — and turbo runs it again with a deliberate NEUTRAL GAP, so ",
-              "the game sees two presses instead of one long hold. That gap is the ",
-              "whole difference, and it is why auto-fire needs a rate.",
+              "Run once for a normal move, repeat immediately for a continuous motion, or ",
+              "repeat with a short neutral gap so the game sees separate auto-fire presses.",
             ),
             h(
               "label",
@@ -4959,7 +5033,7 @@ export function MapIsland() {
                 min: "0",
                 step: "1",
                 value: () => macroTurboValue(),
-                "aria-label": "turbo rate",
+                "aria-label": "auto-repeat rate",
               }),
             ),
             h(
@@ -4970,10 +5044,10 @@ export function MapIsland() {
                 "select",
                 {
                   class: "macturbounit",
-                  title: "two spellings of one number — switching moves the value, never doubles it",
+                  title: "switch between presses per second and time between repeats",
                 },
-                h("option", { value: "turbo_hz" }, "presses/sec (turbo_hz)"),
-                h("option", { value: "gap_ms" }, "gap ms (gap_ms)"),
+                h("option", { value: "turbo_hz" }, "presses per second"),
+                h("option", { value: "gap_ms" }, "time between repeats (ms)"),
               ),
             ),
             // THE MATH, live — the same promise the duration field makes.
@@ -4995,8 +5069,7 @@ export function MapIsland() {
             "This is an ordinary binding, saved the moment you set it: it points ",
             "the panel key at this macro instead of at a pad button, so pressing ",
             "it plays the sequence above from step 1. Several keys can start the ",
-            "same macro. A macro with no trigger is inert — it exists in the ",
-            "preset and nothing ever runs it.",
+            "same macro. A macro with no trigger never runs until you add one.",
           ),
           h("p", { class: "mactrigline" }, () => macroTriggerLine()),
           h(
@@ -5019,6 +5092,7 @@ export function MapIsland() {
             "form",
             { class: "macbind nojs", method: "post", action: "/map/bind" },
             h("input", { type: "hidden", name: "slot", value: () => slotNum() }),
+            h("input", { type: "hidden", name: "target", value: () => mapTarget() }),
             h("input", { type: "hidden", name: "function", value: () => macroFnName() }),
             h(
               "select",
@@ -5060,7 +5134,6 @@ export function MapIsland() {
               "Clear trigger",
             ),
           ),
-          h("p", { class: "clifall" }, h("code", { class: "mono copyable" }, () => macroCliLine())),
         ),
         // ── Advanced: the TOML block ─────────────────────────────────────
         // DEMOTED in v12 and collapsed by default. It was the only way to keep
@@ -5070,15 +5143,13 @@ export function MapIsland() {
         // hand-editing the preset — secondary, and it looks it.
         h(
           "details",
-          { class: "mactomlbox" },
-          h("summary", null, "Advanced — this macro as TOML (for sharing, or hand-editing the file)"),
+          { class: "mactomlbox product-hidden" },
+          h("summary", null, "Advanced — share or hand-edit this macro"),
           h(
             "p",
             { class: "savenote" },
-            "You do not need this to keep your work: Save macro writes the same ",
-            "table into the preset for you. Copy it to send a sequence to ",
-            "someone else, or to paste it into presets\\<preset>.toml by hand ",
-            "(the Preset card above names the config root).",
+            "You do not need this to keep your work. Save macro does that for you. ",
+            "This technical copy is only for sharing a sequence or advanced hand-editing.",
           ),
           h("pre", { class: "mono mactoml" }, () => macroToml()),
           h(
@@ -5102,10 +5173,9 @@ export function MapIsland() {
           "p",
           { class: "savenote" },
           "This panel exists so the mapper works with JavaScript switched off: ",
-          "clicking a control and pressing its panel key needs a live poller, ",
+          "clicking a control and pressing its panel key needs automatic key listening, ",
           "picking a key from a list does not. Every row in the Bindings list ",
-          "above carries the same four buttons. Writes go over the same daemon ",
-          "verb as everything else and are saved immediately. Bind REPLACES ",
+          "above carries the same four buttons. Changes apply immediately. Bind REPLACES ",
           "whatever the control had; Add keeps it and adds one more key, so ",
           "several keys can drive one control (press any of them); Remove that ",
           "key takes only the key picked above and leaves the rest.",
@@ -5113,16 +5183,15 @@ export function MapIsland() {
         h(
           "p",
           { class: "savenote" },
-          "Both lists spell things exactly as the preset file and ",
-          "`ksx map` do: lx / ly are the left stick and rx / ry the right, ",
+          "The control list uses compact names: lx / ly are the left stick and rx / ry the right, ",
           ".min is left or down and .max is right or up, and a key is its ",
-          "legacy name (DashUnderscore is the - key, CommaLeftArrow the comma). ",
-          "What you pick here is character-for-character what gets written.",
+          "key name (DashUnderscore is the - key, CommaLeftArrow the comma).",
         ),
         h(
           "form",
           { class: "bindform", method: "post", action: "/map/bind" },
           h("input", { type: "hidden", name: "slot", value: () => slotNum() }),
+          h("input", { type: "hidden", name: "target", value: () => mapTarget() }),
           h(
             "label",
             { class: "bindlabel", for: "bindfn" },
@@ -5231,7 +5300,7 @@ export function MapIsland() {
             "label",
             { class: "bindforce" },
             h("input", { type: "checkbox", name: "force", value: "1" }),
-            "let this key drive another slot's control too",
+            "let this key drive another player's control too",
           ),
         ),
       ),
@@ -5253,18 +5322,15 @@ export function MapIsland() {
         h(
           "div",
           { class: "phead" },
-          h("h2", null, "Presets & files"),
+          h("h2", null, "Saved layout"),
           // Auto-save, made visible. Empty until this page writes something.
           h("span", { class: "savedat mono" }, () => savedAt()),
         ),
         h(
           "p",
           { class: "savenote" },
-          "Every binding saves immediately — there is no Save button, and no ",
-          "action asks “are you sure?”. Each one reports what it did and offers ",
-          "Undo for a few seconds (Ctrl-Z takes the newest). The restore options ",
-          "below are the wider road home, and every one of them writes a ",
-          "timestamped backup first.",
+          "Every control change saves immediately and reports what it did. A safe Undo appears ",
+          "for single-control changes; the recovery choices below cover wider changes.",
         ),
         // What you are editing, and where it lives on disk.
         h(
@@ -5273,14 +5339,14 @@ export function MapIsland() {
           h("span", { class: "presetname mono" }, () => presetLine()),
           h(
             "span",
-            { class: "presetfact" },
-            h("b", null, "file"),
+            { class: "presetfact product-hidden" },
+            h("b", null, "technical location"),
             h("span", null, () => presetPath()),
           ),
           h(
             "span",
             { class: "presetfact" },
-            h("b", null, "backups"),
+            h("b", null, "recovery"),
             h("span", null, () => backupFact()),
           ),
         ),
@@ -5293,10 +5359,10 @@ export function MapIsland() {
           h(
             "div",
             { class: "strow sthead" },
-            h("span", { class: "stcell stnum" }, "slot"),
-            h("span", { class: "stcell stpreset" }, "preset"),
-            h("span", { class: "stcell stpersona" }, "pad"),
-            h("span", { class: "stcell stkbd" }, "keyboard"),
+            h("span", { class: "stcell stnum" }, "player"),
+            h("span", { class: "stcell stpreset" }, "layout"),
+            h("span", { class: "stcell stpersona" }, "controller"),
+            h("span", { class: "stcell stkbd" }, "input"),
           ),
           createList(
             () => slotTabs(),
@@ -5325,6 +5391,7 @@ export function MapIsland() {
             "form",
             { class: "pactform", method: "post", action: "/map/preset/clear-all" },
             h("input", { type: "hidden", name: "slot", value: () => slotNum() }),
+            h("input", { type: "hidden", name: "target", value: () => mapTarget() }),
             h(
               "button",
               { class: "btn btn-row", "data-act": "clear-all", type: "submit" },
@@ -5333,8 +5400,9 @@ export function MapIsland() {
           ),
           h(
             "form",
-            { class: "pactform", method: "post", action: "/map/preset/restore" },
+            { class: () => sessionUndoCls(), method: "post", action: "/map/preset/restore" },
             h("input", { type: "hidden", name: "slot", value: () => slotNum() }),
+            h("input", { type: "hidden", name: "target", value: () => mapTarget() }),
             h("input", { type: "hidden", name: "mode", value: "session-backup" }),
             h(
               "button",
@@ -5352,6 +5420,7 @@ export function MapIsland() {
                 "form",
                 { class: "pactform", method: "post", action: "/map/preset/restore" },
                 h("input", { type: "hidden", name: "slot", value: () => slotNum() }),
+                h("input", { type: "hidden", name: "target", value: () => mapTarget() }),
                 h("input", { type: "hidden", name: "mode", value: "latest-backup" }),
                 h(
                   "button",
@@ -5367,6 +5436,7 @@ export function MapIsland() {
             "form",
             { class: "pactform", method: "post", action: "/map/preset/restore" },
             h("input", { type: "hidden", name: "slot", value: () => slotNum() }),
+            h("input", { type: "hidden", name: "target", value: () => mapTarget() }),
             h("input", { type: "hidden", name: "mode", value: "defaults" }),
             h(
               "button",
@@ -5603,10 +5673,9 @@ export function MapIsland() {
       h(
         "p",
         null,
-        "Writes go through the daemon pipe's `map` verb (same writer as `ksx map`); ",
-        "bindings re-read every 2 s. Generated ",
+        "Controls refresh automatically. Last snapshot ",
         h("span", { class: "mono" }, () => generatedAt()),
-        ". Serving 127.0.0.1 only.",
+        ".",
       ),
       h(
         "p",

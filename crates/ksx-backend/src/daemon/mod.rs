@@ -326,6 +326,13 @@ pub struct ApplyReport {
 pub struct DaemonState {
     pub run: RunState,
     pub game: Option<String>,
+    /// Whether disk contains a runnable setup for the operate-only cabinet UI.
+    ///
+    /// A fresh install deliberately starts with this false: Studio is the
+    /// authoring surface, so the tray must gray both the cabinet window and
+    /// its saved-setup Start action until first-run Save succeeds. A running
+    /// unsaved staged session may still open the cabinet while it is live.
+    pub cabinet_ready: bool,
     pub last: Option<LastSession>,
     /// Refreshed by the control loop while a session runs; cleared when it is
     /// reaped, at which point [`Self::last`] is the truth again.
@@ -414,13 +421,18 @@ impl DaemonState {
     /// use those from the tray are already at a desk.
     pub fn menu(&self) -> Vec<(DaemonCommand, &'static str, bool)> {
         let running = matches!(self.run, RunState::Running { .. } | RunState::Starting);
+        let cabinet_available = self.cabinet_ready || running;
         vec![
             (DaemonCommand::OpenStudio, "Open ksx", true),
-            (DaemonCommand::OpenCabinet, "Open cabinet UI", true),
+            (
+                DaemonCommand::OpenCabinet,
+                "Open cabinet UI",
+                cabinet_available,
+            ),
             (
                 DaemonCommand::Start { game: None },
                 "Start emulation",
-                !running,
+                self.cabinet_ready && !running,
             ),
             (DaemonCommand::Stop, "Stop emulation", running),
             (DaemonCommand::Reload, "Reload config", true),
@@ -719,10 +731,6 @@ pub fn control_loop_with(
             // where the plan comes from: `set_staged` points the factory at a
             // setup that exists only in memory.
             Ok(DaemonCommand::PlayStaged(spec)) => {
-                if session.is_some() {
-                    let _ = writeln!(out, "already running");
-                    continue;
-                }
                 if !factory.set_staged(Some(*spec)) {
                     // Never silent: a factory that cannot run a staged setup
                     // would otherwise start whatever is on disk while the
@@ -733,6 +741,21 @@ pub fn control_loop_with(
                          start it with `ksx run`"
                     );
                     continue;
+                }
+                // Play is a replacement operation, not a second start. The
+                // command loop owns the live session, so accepting one command
+                // lets it stop the old pipeline completely before it creates
+                // the staged one. There is never a moment with two sets of
+                // virtual pads or two owners of the panel. Validate/adopt the
+                // staged override first: a factory that cannot even adopt the
+                // request leaves the current session untouched. Device
+                // resolution still happens during `start`; if hardware has
+                // disappeared, the old session has already been stopped and
+                // the failed replacement is reported normally.
+                if let Some(live) = session.take() {
+                    let _ = writeln!(out, "replacing the running session with the unsaved setup…");
+                    live.stop.store(true, Ordering::SeqCst);
+                    reap(live, &state, out);
                 }
                 panel.arm_escapes();
                 panel.set_emulating(true);
@@ -1160,6 +1183,24 @@ fn set_game(state: &SharedState, game: Option<String>) {
     }
 }
 
+/// Resolve what a newly-started daemon may run.
+///
+/// A plain daemon is also the control host for first-run staging, so an empty
+/// default layout is an idle state rather than a process-level refusal. An
+/// explicitly selected game is different: the caller asked for that profile,
+/// and every failure to resolve it must remain visible. All other plan errors
+/// are broken configuration and remain startup refusals too.
+fn resolve_startup_plan(
+    root: &ksx_config::ConfigRoot,
+    game: Option<&str>,
+) -> Result<Option<crate::run::plan::RunPlan>, crate::run::plan::PlanError> {
+    match crate::run::plan::resolve_as(root, game, "ksx daemon") {
+        Ok(plan) => Ok(Some(plan)),
+        Err(crate::run::plan::PlanError::NoSlots { .. }) if game.is_none() => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// CLI entry point for `ksx daemon`.
 ///
 /// The tray runs on **this** thread (a Win32 message pump must own a thread
@@ -1183,11 +1224,11 @@ pub fn run(
 ) -> anyhow::Result<()> {
     let root = ksx_config::ConfigRoot::discover()?;
     // Fail fast on a broken configuration rather than showing a tray icon that
-    // can only ever report errors.
-    // `resolve_as`, not `resolve`: a "nothing to run" refusal here must suggest
-    // `ksx daemon --game "…"`. Suggesting `ksx run` would hand a daemon user a
-    // foreground session and let them conclude the daemon cannot do profiles.
-    let plan = match crate::run::plan::resolve_as(&root, game.as_deref(), "ksx daemon") {
+    // can only ever report errors. The one non-error is a plain daemon with no
+    // slots: it is the idle control host Studio needs to build and play a
+    // staged setup. `Some(--game)` and every error other than NoSlots still
+    // refuse here.
+    let plan = match resolve_startup_plan(&root, game.as_deref()) {
         Ok(plan) => plan,
         Err(err) => {
             eprintln!("refusing to start the daemon:\n{err}");
@@ -1195,18 +1236,22 @@ pub fn run(
         }
     };
 
-    // M6: the claim is made HERE, once, and released when this function
-    // returns (or when the process dies, which needs no cleanup — the binding
-    // outlives us either way). Everything after this point borrows it. A claim
-    // failure is a refusal to start: a daemon that could not take the panel it
-    // was configured for would silently be a daemon with a dead panel.
+    // M6: a configured daemon makes its claim HERE, once, and releases it when
+    // this function returns (or when the process dies, which needs no cleanup
+    // — the binding outlives us either way). An idle first-run host has no plan,
+    // so it deliberately claims nothing; staged Play is the first operation
+    // allowed to build a session and touch hardware or pads. A configured
+    // plan's claim failure remains a startup refusal.
     #[cfg(windows)]
-    let claimed = match crate::capture::claim_panel(&plan) {
-        Ok(panel) => panel,
-        Err(err) => {
-            eprintln!("refusing to start the daemon: {err}");
-            std::process::exit(crate::run::EXIT_CANNOT_START);
-        }
+    let claimed = match plan.as_ref() {
+        Some(plan) => match crate::capture::claim_panel(plan) {
+            Ok(panel) => panel,
+            Err(err) => {
+                eprintln!("refusing to start the daemon: {err}");
+                std::process::exit(crate::run::EXIT_CANNOT_START);
+            }
+        },
+        None => None,
     };
     #[cfg(not(windows))]
     let claimed: Option<Arc<panel::Panel>> = {
@@ -1233,7 +1278,10 @@ pub fn run(
     };
 
     let (tx, rx) = crossbeam_channel::unbounded::<DaemonCommand>();
-    let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+    let state: SharedState = Arc::new(Mutex::new(DaemonState {
+        cabinet_ready: plan.is_some(),
+        ..DaemonState::default()
+    }));
     if autostart {
         let _ = tx.send(DaemonCommand::Start { game: None });
     }
@@ -1542,6 +1590,93 @@ mod tests {
         }
     }
 
+    /// A private installed-style config root for startup-policy tests.
+    struct StartupRoot(std::path::PathBuf);
+
+    impl StartupRoot {
+        fn new(tag: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "ksx-daemon-startup-{tag}-{}-{serial}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create isolated daemon config root");
+            Self(dir)
+        }
+
+        fn root(&self) -> ksx_config::ConfigRoot {
+            ksx_config::ConfigRoot::at(&self.0)
+        }
+
+        fn write(&self, name: &str, text: &str) {
+            std::fs::write(self.0.join(name), text).expect("write daemon startup fixture");
+        }
+    }
+
+    impl Drop for StartupRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Regression for v0.1.0: a fresh install had no `[[slot]]`, so
+    /// `ksx daemon` exited before Studio could stage the first one. The plain
+    /// daemon must instead become an idle control host, represented by `None`:
+    /// there is no startup plan from which to create a session, claim a panel,
+    /// or attach pads.
+    #[test]
+    fn empty_default_configuration_boots_an_idle_control_host() {
+        let config = StartupRoot::new("empty");
+        let plan = resolve_startup_plan(&config.root(), None)
+            .expect("NoSlots is an idle state for a plain daemon");
+        assert!(
+            plan.is_none(),
+            "an empty first-run daemon must not manufacture a runnable plan"
+        );
+    }
+
+    /// Naming a game is an explicit request, not first-run discovery. Even the
+    /// same `NoSlots` error must stay a refusal when it came from `--game`.
+    #[test]
+    fn an_explicit_empty_game_profile_is_still_refused() {
+        let config = StartupRoot::new("empty-game");
+        config.write(
+            "games.toml",
+            "[[game]]\ntitle = \"Empty\"\npath = 'C:\\empty.exe'\n",
+        );
+
+        let Err(err) = resolve_startup_plan(&config.root(), Some("Empty")) else {
+            panic!("`ksx daemon --game Empty` must refuse a profile with no usable slot");
+        };
+        assert!(
+            matches!(
+                &err,
+                crate::run::plan::PlanError::NoSlots {
+                    source: crate::run::plan::PlanSource::Game(title),
+                    ..
+                } if title == "Empty"
+            ),
+            "the explicit profile must preserve its typed NoSlots refusal: {err}"
+        );
+    }
+
+    /// `NoSlots` for the implicit default layout is the only admitted error.
+    /// A malformed config must still fail before the tray/control host starts.
+    #[test]
+    fn a_non_no_slots_plan_error_is_still_refused() {
+        let config = StartupRoot::new("broken");
+        config.write("config.toml", "schema_version = [\n");
+
+        let Err(err) = resolve_startup_plan(&config.root(), None) else {
+            panic!("a malformed default config must remain a daemon startup refusal");
+        };
+        assert!(
+            matches!(&err, crate::run::plan::PlanError::Config(_)),
+            "only NoSlots may become idle, not {err}"
+        );
+    }
+
     /// A [`PanelKeyboard`] that records the transitions it is told to make.
     struct RecordingPanel {
         trace: Trace,
@@ -1647,6 +1782,7 @@ mod tests {
         trace: Option<Trace>,
         health: Option<ksx_capture::HealthHandle>,
         game: Option<String>,
+        staged: Option<ksx_core::CommitSpec>,
         /// What `resolve_plan()` answers. `None` = "I cannot tell", which is
         /// the default and makes every factory in these tests bounce.
         plan: Option<crate::run::plan::RunPlan>,
@@ -1674,6 +1810,7 @@ mod tests {
                 trace: None,
                 health: None,
                 game: Some("Street Fighter".into()),
+                staged: None,
                 plan: None,
                 shape: None,
                 swap: crate::run::supervisor::HotSwapSlot::default(),
@@ -1712,6 +1849,11 @@ mod tests {
 
         fn set_game(&mut self, game: Option<String>) {
             self.game = game;
+        }
+
+        fn set_staged(&mut self, spec: Option<ksx_core::CommitSpec>) -> bool {
+            self.staged = spec;
+            true
         }
 
         fn resolve_plan(&self) -> anyhow::Result<crate::run::plan::RunPlan> {
@@ -1792,6 +1934,41 @@ mod tests {
             "reload must build a new session from disk: {text}"
         );
         assert!(text.contains("reloading configuration"), "{text}");
+    }
+
+    /// Studio's Play button means “run this unsaved setup now”, including
+    /// when an older session is live. The control loop must replace it as one
+    /// serialized operation: accepting a second independent start would leave
+    /// two pad sets attached, while refusing would contradict the primary UI.
+    #[test]
+    fn staged_play_replaces_a_running_session_in_one_control_loop_command() {
+        let mut factory = FakeFactory::default();
+        let spec = ksx_core::CommitSpec {
+            device: ksx_core::StagedDevice {
+                selector: ksx_core::DeviceSelector::parse("usb:d209:0430:00").unwrap(),
+                alias: "panel".to_owned(),
+                label: "Arcade panel".to_owned(),
+            },
+            slots: tiny_plan(1, ksx_core::Persona::Xbox360).slots,
+            blocking: ksx_core::Blocking::Off,
+        };
+        let (_, text) = drive(
+            &mut factory,
+            &[
+                DaemonCommand::Start { game: None },
+                DaemonCommand::PlayStaged(Box::new(spec.clone())),
+                DaemonCommand::Quit,
+            ],
+        );
+
+        assert_eq!(
+            *factory.makes.lock().unwrap(),
+            2,
+            "the old pipeline must be reaped and one staged pipeline created: {text}"
+        );
+        assert_eq!(factory.staged, Some(spec));
+        assert!(text.contains("replacing the running session"), "{text}");
+        assert!(!text.contains("already running"), "{text}");
     }
 
     // -- FIX 3: ApplyBindings, the mapper's save path ----------------------
@@ -2123,6 +2300,7 @@ mod tests {
         let state = DaemonState {
             run: RunState::Running { slots: 4 },
             game: Some("Street Fighter".into()),
+            cabinet_ready: true,
             last: Some(LastSession {
                 reboot_required: true,
                 ..LastSession::default()
@@ -2142,6 +2320,7 @@ mod tests {
                 message: "x".repeat(400),
             },
             game: Some("y".repeat(200)),
+            cabinet_ready: false,
             last: None,
             live: None,
             apply: None,
@@ -2165,6 +2344,7 @@ mod tests {
         let state = DaemonState {
             run: RunState::Running { slots: 4 },
             game: Some("Street Fighter".into()),
+            cabinet_ready: true,
             last: None,
             live: Some(LiveHealth {
                 reboot_required: true,
@@ -2217,6 +2397,7 @@ mod tests {
         let state = DaemonState {
             run: RunState::Running { slots: 4 },
             game: None,
+            cabinet_ready: true,
             last: Some(LastSession {
                 reboot_required: true,
                 ..LastSession::default()
@@ -2235,6 +2416,7 @@ mod tests {
         let state = DaemonState {
             run: RunState::Running { slots: 4 },
             game: None,
+            cabinet_ready: true,
             last: Some(LastSession {
                 dropped_events: 3,
                 ..LastSession::default()
@@ -2264,6 +2446,7 @@ mod tests {
                 ..LastSession::default()
             }),
             game: None,
+            cabinet_ready: true,
             apply: None,
             staged: Default::default(),
         };
@@ -2362,19 +2545,33 @@ mod tests {
 
     #[test]
     fn the_menu_disables_what_cannot_be_done_right_now() {
-        // The two surfaces lead the menu — "Open ksx" then "Open cabinet UI"
-        // (see the test below) — and are always available; the session verbs
-        // sit behind them.
+        // Studio is how a fresh install becomes configured. The operate-only
+        // cabinet and saved-setup Start action are deliberately gray until
+        // there is something on disk for them to operate.
         let start = 2;
         let stopped = DaemonState::default().menu();
+        assert!(stopped[0].2, "Studio is always the road into the product");
+        assert!(!stopped[1].2, "a fresh install has no cabinet setup yet");
         assert_eq!(
             stopped[start],
-            (DaemonCommand::Start { game: None }, "Start emulation", true)
+            (
+                DaemonCommand::Start { game: None },
+                "Start emulation",
+                false,
+            )
         );
         assert_eq!(
             stopped[start + 1],
             (DaemonCommand::Stop, "Stop emulation", false)
         );
+
+        let configured = DaemonState {
+            cabinet_ready: true,
+            ..DaemonState::default()
+        }
+        .menu();
+        assert!(configured[1].2, "a saved setup can open cabinet controls");
+        assert!(configured[start].2, "a saved setup can start from the tray");
 
         let running = DaemonState {
             run: RunState::Running { slots: 4 },
@@ -2383,9 +2580,7 @@ mod tests {
         .menu();
         assert!(!running[start].2, "cannot start what is already running");
         assert!(running[start + 1].2, "stop must be available while running");
-        // Everything else is always available — including both surfaces, which
-        // is the point of opening a window: you look at ksx when it is running
-        // AND when it will not.
+        // A live staged session may open the cabinet even before it is saved.
         assert!(running[..start].iter().all(|(_, _, enabled)| *enabled));
         assert!(running[start + 2..].iter().all(|(_, _, enabled)| *enabled));
     }
@@ -2608,7 +2803,10 @@ mod tests {
         assert!(menu[0].2, "always available — it is how you look at ksx");
         assert_eq!(menu[1].0, DaemonCommand::OpenCabinet);
         assert_eq!(menu[1].1, "Open cabinet UI");
-        assert!(menu[1].2, "the cabinet is second, not conditional");
+        assert!(
+            !menu[1].2,
+            "the cabinet is second but gray until first-run has a setup"
+        );
         // ...and Quit is still last, and still the tray's alone. Closing a
         // window must never do what this item does — and, since the default
         // item is index 0, a bold "Quit" is a click away from ending a session

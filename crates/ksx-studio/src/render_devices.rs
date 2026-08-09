@@ -1456,19 +1456,29 @@ mod tests {
         assert!(out.html.contains(r#"id="__ksx-payload""#), "{}", out.html);
     }
 
-    /// The nav is static markup duplicated per island, so a page is invisible
-    /// until every sibling links to it. Pin the whole rail from here as well as
-    /// from the other two pages' tests.
+    /// Specialist screens keep the customer rail intact: Setup → Controls →
+    /// Test. Devices remains reachable from the relevant setup affordance, not
+    /// as another primary-workflow stage.
     #[test]
     fn the_nav_reaches_every_sibling_page() {
         let page = EmbeddedPage::load("/devices").unwrap();
         let out = render_devices(&page, &cabinet(), None);
-        assert!(out.html.contains(r#"href="/""#), "{}", out.html);
-        assert!(out.html.contains(r#"href="/map""#), "{}", out.html);
-        assert!(out.html.contains(r#"href="/pads""#), "{}", out.html);
         assert!(
-            out.html.contains(r#"aria-current="page""#),
-            "the current route must be marked: {}",
+            out.html
+                .contains(r#"<a class="navlink" href="/start">Setup</a>"#),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html
+                .contains(r#"<a class="navlink" href="/map">Controls</a>"#),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html
+                .contains(r#"<a class="navlink" href="/check">Test</a>"#),
+            "{}",
             out.html
         );
     }

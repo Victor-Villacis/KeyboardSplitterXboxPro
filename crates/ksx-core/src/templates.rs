@@ -592,11 +592,10 @@ const KEYBOARD_2P: &[Row] = &[
         button(XButton::Back),
         [Key::Tab, Key::Numpad0, Key::None, Key::None],
     ),
-    // GUIDE, and it is not decoration. `docs/FIRST-RUN.md` moment 7 ends with
-    // "Guide opens Game Bar so they can launch a game without leaving it" —
-    // which is how someone whose keyboard has just become a controller starts
-    // the game at all. A layout that binds every other button and not this one
-    // strands them: the pad works, and there is no way to reach a game with it.
+    // GUIDE, and it is not decoration. `docs/FIRST-RUN.md` moment 7 lets the
+    // controller ask Windows to open Game Bar when that per-user Windows
+    // setting is enabled. A layout that binds every other button and not this
+    // one cannot even make that request.
     //
     // `keyboard-wasd` already bound it (`LeftWindows`) and this layout did not,
     // which is the inconsistency rather than the choice — every persona exposes
@@ -655,14 +654,15 @@ collides.",
         id: "keyboard-2p",
         summary: "Two players sharing ONE keyboard: WASD vs the arrows",
         panel: "Two people on one ordinary keyboard, no encoder — the couch \
-co-op case. Player 1 keeps the left hand on WASD (hat AND left stick) with \
-Space=A, C=B, R=X, F=Y, Q/E bumpers, Z/X triggers, LeftShift/V thumbsticks, \
-1=Start, Tab=Back. Player 2 sits to the right of the letters: the arrows are \
-the hat and left stick, the numpad is the pad face (Numpad 8·4·6·2 = Y·X·B·A) \
-with Numpad7/9 bumpers, Numpad1/3 triggers, RightShift/Numpad5 thumbsticks, \
-NumpadEnter=Start, Numpad0=Back. The two blocks share no key, so one press \
-moves one player. Neither has a right stick — there is no room for one on half \
-a keyboard; use keyboard-wasd on a keyboard each when a game needs it.",
+ co-op case. Player 1 keeps the left hand on WASD (hat AND left stick) with \
+ Space=A, C=B, R=X, F=Y, Q/E bumpers, Z/X triggers, LeftShift/V thumbsticks, \
+ 1=Start, Tab=Back, Left Windows=Guide. Player 2 sits to the right of the \
+ letters: the arrows are the hat and left stick, the numpad is the pad face \
+ (Numpad 8·4·6·2 = Y·X·B·A) with Numpad7/9 bumpers, Numpad1/3 triggers, \
+ RightShift/Numpad5 thumbsticks, NumpadEnter=Start, Numpad0=Back, \
+ Numpad *=Guide. The two blocks share no key, so one press moves one player. \
+ Neither has a right stick — there is no room for one on half a keyboard; use \
+ keyboard-wasd on a keyboard each when a game needs it.",
         players: 2,
         body: Body::Rows(KEYBOARD_2P),
     },
@@ -1059,6 +1059,13 @@ mod tests {
                 "{control:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_two_player_keyboard_names_both_guide_keys_in_its_panel_copy() {
+        let panel = find("keyboard-2p").unwrap().panel;
+        assert!(panel.contains("Left Windows=Guide"), "{panel}");
+        assert!(panel.contains("Numpad *=Guide"), "{panel}");
     }
 
     /// `default` and `empty` are the built-ins, copied — same entries, a new

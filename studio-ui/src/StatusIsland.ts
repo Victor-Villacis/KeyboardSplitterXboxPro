@@ -280,14 +280,9 @@ export function StatusIsland() {
       h(
         "nav",
         { class: "topnav", "aria-label": "screens" },
-        h("a", { class: "navlink", href: "/start" }, "Start"),
-        h("a", { class: "navlink on", href: "/", "aria-current": "page" }, "Status"),
-        h("a", { class: "navlink", href: "/map" }, "Mapper"),
-        h("a", { class: "navlink", href: "/check" }, "Check"),
-        h("a", { class: "navlink", href: "/pads" }, "Pads"),
-        h("a", { class: "navlink", href: "/devices" }, "Devices"),
-        h("a", { class: "navlink", href: "/profiles" }, "Profiles"),
-        h("a", { class: "navlink", href: "/setup" }, "Setup"),
+        h("a", { class: "navlink", href: "/start" }, "Setup"),
+        h("a", { class: "navlink", href: "/map" }, "Controls"),
+        h("a", { class: "navlink", href: "/check" }, "Test"),
       ),
       createShow(
         () => pillRunning(),

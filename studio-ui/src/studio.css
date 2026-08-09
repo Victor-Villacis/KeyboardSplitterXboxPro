@@ -545,6 +545,25 @@ header.top {
     inset 0 0 0 1px var(--accent-line);
 }
 
+/* Current and unavailable destinations are intentionally not anchors. Keep
+   their hover states from suggesting that a click will navigate somewhere. */
+.navlink.on[aria-current="page"] {
+  cursor: default;
+}
+
+.navlink.on[aria-current="page"]:hover {
+  color: var(--text-primary);
+  background: var(--surface-raised);
+}
+
+.navlink-disabled,
+.navlink-disabled:hover,
+.navlink-disabled:active {
+  color: var(--text-tertiary);
+  background: transparent;
+  cursor: not-allowed;
+}
+
 .studio > main {
   flex: 1 1 auto;
   width: 100%;
@@ -1332,6 +1351,119 @@ input[type="checkbox"] {
 }
 
 .clifall {
+  display: none;
+}
+
+/* Profile rows carry a quiet editor below the summary line. Keeping it in a
+   disclosure makes the common Switch action immediate without hiding the
+   repair path that the profile QA needed. */
+.plist li.profile-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--sp-3);
+}
+
+.profile-row-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+}
+
+.profile-row-head .pmeta {
+  flex: 1 1 auto;
+}
+
+.plist .profile-switch {
+  margin-left: auto;
+}
+
+.profile-edit {
+  width: 100%;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.plist .profile-edit > summary {
+  margin: 0;
+  width: fit-content;
+  padding: var(--sp-2) 0;
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+}
+
+.plist .profile-edit[open] > summary {
+  margin: 0 0 var(--sp-3);
+  border-bottom: 0;
+}
+
+.plist .profile-edit-grid {
+  margin: 0;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: var(--sp-3);
+}
+
+.profile-edit-grid .btn-primary {
+  align-self: end;
+}
+
+.profile-edit-note {
+  margin: var(--sp-3) 0;
+  color: var(--text-tertiary);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+}
+
+.plist .profile-delete {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin: 0;
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--danger-line);
+}
+
+.product-hidden,
+.hide,
+.pactions.stage-hidden {
+  display: none !important;
+}
+
+/* Controls is part of the primary rail even before Setup has a controller.
+ * In that ordinary first-run state, show one useful next step—not the empty
+ * controller canvas, disk recovery panel, or no-JS implementation fallback. */
+.map-empty-card {
+  display: none;
+}
+
+.mapper-empty .map-empty-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+}
+
+.mapper-empty .slotstrip,
+.mapper-empty .warnbox,
+.mapper-empty .stagecard,
+.mapper-empty .legendcard,
+.mapper-empty .bindcard,
+.mapper-empty .pactions {
+  display: none !important;
+}
+
+.stageback {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  border-color: var(--accent-line);
+  background: var(--accent-dim);
+}
+
+.stageback h2,
+.stageback p {
   margin: 0;
 }
 
@@ -2771,6 +2903,26 @@ details.card[open] > summary::before,
 
 .pactform {
   display: contents;
+}
+
+.pactform.off {
+  display: none;
+}
+
+.macslotremedy.off {
+  display: none;
+}
+
+.macslotremedy {
+  margin-block: var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-md);
+  background: var(--warn-dim);
+}
+
+.macslotremedy .macslotoff {
+  margin-top: 0;
 }
 
 .studio.js .nojs {

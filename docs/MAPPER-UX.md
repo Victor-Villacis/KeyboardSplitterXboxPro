@@ -159,21 +159,17 @@ into MAME's `joystick_map`. Direction glyphs are unified on arrows everywhere,
 including the art's zone labels: a diagonal that did not look like the same
 family as its two parents would defeat the lens.
 
-**Build A — finish v5 to spec (now).** Layout fix (in flight: clean hover
-zones + legend) plus: press-to-select (panel press focuses the control on
-the open mapper — reuses the learn observer in a passive "select" mode,
-idle-only like learn), softened conflict semantics per commandment 7,
-restore-defaults affordance (per-preset: session-start backup + built-in
-floor), and persona-aware prompt vocabulary everywhere.
+**Build A — core shipped.** The visual controller, legend, multi-key editing,
+conflict handling, recovery actions, macros, and persona-aware vocabulary are
+in Studio. Remaining polish is passive press-to-select and live echo directly
+on the mapping surface; `/check` is the shipped reference consumer for echo.
 
-**Build B — the wizard.** "Set up this slot": ES's flow, ksx's engine —
-sequential position-named prompts (SOUTH/EAST/WEST/NORTH, dpad, shoulders,
-sticks-as-wedges), auto-advance on press, hold-any-key-to-skip, inline
-ALREADY TAKEN, audit before commit (warn if start/back unmapped — the
-panel's exit keys), transactional (nothing written until OK; DISCARD always
-visible). Per-slot, then "next slot →" chaining for P1→P4 first contact.
-This is also the seed of the M7 setup wizard — same component, pointed at a
-fresh machine.
+**Build B — product first run shipped.** `/start` holds a complete setup in the
+idle daemon, and `/map?target=stage&slot=N` points this same mapper at it.
+Bindings, multiple keys, auto-fire, and macros remain in memory; refusals do
+not mutate the draft. Setup then asks split-or-freeze and keeps Save separate
+from Play. The older sequential `ksx setup` prompt remains a developer CLI
+surface, not the installed customer's wizard.
 
 **Build C — button check: SHIPPED (2026-08-08), and so is the socket under
 it.** `/check`, one click from the mapper on every screen's nav: press panel
@@ -207,17 +203,11 @@ feed it needs now exists and `/check` is the reference consumer.
 
 ## Explicitly deferred (recorded so they're chosen, not forgotten)
 
-- ~~MAME-style OR-chaining (multiple physical keys per control)~~ — **UI
-  SHIPPED (v10)**: every reader shows a control's whole key list (the art
-  shows the first plus `+N`, the legend one chip per key), the learn modal
-  offers "Add another key" beside "Replace binding", each chip has its own ✕
-  that removes just that key, and the no-JS row form carries Add / Remove key
-  beside Bind / Clear. What is still deferred is the WRITE half: the daemon's
-  `map` verb takes one `"key"` and is replace-per-function, so Studio can
-  express a set of nothing (clear) or one, and refuses a two-key write in
-  words instead of dropping keys (`ControlSource::bind_keys`). A `"keys"`
-  list on that verb makes add/remove-one atomic — and undoable — with no
-  further UI change.
+- ~~MAME-style OR-chaining (multiple physical keys per control)~~ — **fully
+  shipped.** Readers show the whole key list; add/remove/replace/clear and Undo
+  send one complete `keys` vector. Staged writes perform selection, duplicate
+  checking, and application under the daemon's one stage lock, so concurrent
+  edits cannot silently lose a key or create an unforced cross-player duplicate.
 - Steam-style activators (hold/double-press) — engine feature first, UI
   after; belongs with shift-layers vocabulary from the PadForge audit.
 - Community preset sharing (Steam's playtime-ranked configs) — M7+.
@@ -270,8 +260,7 @@ the capabilities that stack only for us, ranked by leverage:
    proved config UIs should be drivable from the thing being configured —
    on a cabinet, that's the panel).
 
-Build placement: #1 lands IN Build C (and pulls Build C earlier — no longer
-socket-blocked for its core); #4/#7 fold into Build A; #3 ships its QR half
-with Build B's wizard (the "new machine" moment); #2 begins as soon as the
-MCP shim (E5) exists — the verbs are already there; #5/#6 ride later Studio
-passes.
+Current placement: Build B's product first run and Build C's live check are
+shipped. Direct mapper echo, QR/LAN pairing, PWA presentation, the command
+palette, and multi-surface sync remain future work; none is part of the current
+fresh-install acceptance claim.

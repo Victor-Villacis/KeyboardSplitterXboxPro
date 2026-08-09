@@ -1758,6 +1758,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ksx-launcher"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.60.2",
+ "winresource",
+]
+
+[[package]]
 name = "ksx-legacy-import"
 version = "0.1.0"
 dependencies = [

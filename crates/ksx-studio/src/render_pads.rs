@@ -941,23 +941,28 @@ mod tests {
         assert_eq!(shows(Some("error: a session is running")), (false, true));
     }
 
-    /// The nav must reach every screen from this one, or a page is a dead end.
+    /// Specialist screens keep the customer rail intact: Setup → Controls →
+    /// Test. Pad maintenance is not promoted to a fourth workflow stage.
     #[test]
     fn the_nav_reaches_the_other_screens() {
         let page = EmbeddedPage::load("/pads").unwrap();
         let out = render_pads(&page, &payload());
-        for href in [
-            r#"href="/""#,
-            r#"href="/map""#,
-            r#"href="/devices""#,
-            r#"href="/profiles""#,
-            r#"href="/setup""#,
-        ] {
-            assert!(out.html.contains(href), "missing {href}: {}", out.html);
-        }
         assert!(
-            out.html.contains(r#"aria-current="page""#),
-            "the current screen must be marked: {}",
+            out.html
+                .contains(r#"<a class="navlink" href="/start">Setup</a>"#),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html
+                .contains(r#"<a class="navlink" href="/map">Controls</a>"#),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html
+                .contains(r#"<a class="navlink" href="/check">Test</a>"#),
+            "{}",
             out.html
         );
     }

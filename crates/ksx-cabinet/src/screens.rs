@@ -1444,6 +1444,7 @@ mod tests {
                     keyboard: "(any)".into(),
                     bindings: Default::default(),
                     backup: None,
+                    session_backup: false,
                     turbo: Default::default(),
                     macros_off: false,
                 }],

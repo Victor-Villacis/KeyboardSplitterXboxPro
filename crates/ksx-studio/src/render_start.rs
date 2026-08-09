@@ -57,10 +57,12 @@ use crate::snapshot::{
 /// `() => boardRows()` compiles to `list:boardRows:array`. Rename a list signal
 /// in `StartIsland.ts` and the layout test fails until these match again.
 const LIST_SLOT_BOARDS: &str = "list:boardRows:array";
+const LIST_SLOT_EXPERIMENTAL: &str = "list:experimentalRows:array";
 const LIST_SLOT_OTHER: &str = "list:otherRows:array";
 const LIST_SLOT_NOTES: &str = "list:noteRows:array";
 const LIST_SLOT_SLOTS: &str = "list:slotRows:array";
 const LIST_SLOT_PERSONAS: &str = "list:personaOptions:array";
+const LIST_SLOT_PERSONAS_2: &str = "list:personaOptions#2:array";
 const LIST_SLOT_GAPS: &str = "list:gapRows:array";
 const LIST_SLOT_BLOCKING: &str = "list:blockingRows:array";
 /// The layout menu appears TWICE — once on "Add a controller", once on "give
@@ -71,13 +73,14 @@ const LIST_SLOT_LAYOUTS: &str = "list:layoutOptions:array";
 const LIST_SLOT_LAYOUTS_2: &str = "list:layoutOptions#2:array";
 const LIST_SLOT_LAYOUT_ROWS: &str = "list:layoutRows:array";
 const LIST_SLOT_SLOT_OPTIONS: &str = "list:slotOptions:array";
+const LIST_SLOT_SLOT_OPTIONS_2: &str = "list:slotOptions#2:array";
 
 #[cfg(test)]
 const ISLAND_COMPONENT: &str = "StartIsland";
 
 /// How many `createShow` pairs this page has. Name-addressable since compiler
 /// 0.3.1, so this is a staleness tripwire rather than a mapping.
-const SHOW_COUNT: usize = 24;
+const SHOW_COUNT: usize = 25;
 
 /// Bare-named slots the island renders and the seam deliberately never fills.
 /// EMPTY, and that is the claim.
@@ -117,10 +120,8 @@ fn scalar_slots(payload: &StartPayload, flash: Option<&str>) -> serde_json::Valu
         "readyLine": lines.ready_line,
         "playLine": lines.play_line,
         "guideLine": lines.guide_line,
-        // §3's two must-says, straight off the staged view. Composed in
-        // `ksx-api` beside the type that answers the question, never here.
-        "escapeLine": payload.staged.escape_hatch,
-        "scopeLine": payload.staged.blocking_scope,
+        "escapeLine": lines.escape_line,
+        "scopeLine": lines.scope_line,
         "stageError": lines.stage_error,
         "scanError": lines.scan_error,
         "presetsError": lines.presets_error,
@@ -198,6 +199,10 @@ fn slot_row(slot: &StartSlotRow) -> SlotValue {
             "bindings".to_owned(),
             SlotValue::Text(slot.bindings.clone()),
         ),
+        (
+            "map_href".to_owned(),
+            SlotValue::Text(slot.map_href.clone()),
+        ),
     ])
 }
 
@@ -244,13 +249,17 @@ fn layout_row(layout: &StartLayoutRow) -> SlotValue {
     ])
 }
 
-fn list_values(payload: &StartPayload) -> [(&'static str, SlotValue); 11] {
+fn list_values(payload: &StartPayload) -> [(&'static str, SlotValue); 14] {
     let rows = &payload.rows;
     let layouts = || SlotValue::array(rows.layouts.iter().map(option_row).collect());
     [
         (
             LIST_SLOT_BOARDS,
             SlotValue::array(rows.boards.iter().map(board_row).collect()),
+        ),
+        (
+            LIST_SLOT_EXPERIMENTAL,
+            SlotValue::array(rows.experimental.iter().map(board_row).collect()),
         ),
         (
             LIST_SLOT_OTHER,
@@ -269,6 +278,10 @@ fn list_values(payload: &StartPayload) -> [(&'static str, SlotValue); 11] {
             SlotValue::array(rows.personas.iter().map(option_row).collect()),
         ),
         (
+            LIST_SLOT_PERSONAS_2,
+            SlotValue::array(rows.personas.iter().map(option_row).collect()),
+        ),
+        (
             LIST_SLOT_GAPS,
             SlotValue::array(rows.gaps.iter().map(gap_row).collect()),
         ),
@@ -284,6 +297,10 @@ fn list_values(payload: &StartPayload) -> [(&'static str, SlotValue); 11] {
         ),
         (
             LIST_SLOT_SLOT_OPTIONS,
+            SlotValue::array(rows.slot_numbers.iter().map(option_row).collect()),
+        ),
+        (
+            LIST_SLOT_SLOT_OPTIONS_2,
             SlotValue::array(rows.slot_numbers.iter().map(option_row).collect()),
         ),
     ]
@@ -306,6 +323,7 @@ fn show_values(payload: &StartPayload, flash: Option<&str>) -> [(&'static str, b
         ("show:busWarn", f.bus_warn),
         ("show:hasDevice", f.has_device),
         ("show:hasBoards", f.has_boards),
+        ("show:hasExperimental", f.has_experimental),
         ("show:noBoards", f.no_boards),
         ("show:hasOther", f.has_other),
         ("show:hasNotes", f.has_notes),
@@ -672,6 +690,20 @@ mod tests {
             !p.rows.gaps.is_empty(),
             "the roster carries un-pluggable personas"
         );
+        // The reference scan has one ordinary keyboard and one board that
+        // cannot be picked. Populate the opt-in arbitrary-HID list here too:
+        // this test's purpose is the row-field contract, not device
+        // classification, and an empty list would skip that contract entirely.
+        let mut experimental = p
+            .rows
+            .boards
+            .first()
+            .cloned()
+            .expect("the fixture carries an ordinary pickable board");
+        experimental.name = "Experimental HID".into();
+        experimental.caveat = "does not identify itself as a keyboard".into();
+        experimental.caveat_cls = "dv-warn".into();
+        p.rows.experimental.push(experimental);
         p.flash = Some("saved".into());
 
         for (list_slot, value) in list_values(&p) {
@@ -728,7 +760,8 @@ mod tests {
         let out = render_start(&page, &fresh(), None);
 
         assert!(out.html.contains("Ultimarc I-PAC 4X"), "{}", out.html);
-        // The name leads the row; the path is inside a disclosure below it.
+        // The name leads the row; the path is inside the Technical details
+        // disclosure below it rather than presented as the identifier.
         let name_at = out.html.find("Ultimarc I-PAC 4X").unwrap();
         let path_at = out
             .html
@@ -739,8 +772,9 @@ mod tests {
             "the device path precedes the human name, so it is reading as the identifier"
         );
         assert!(
-            out.html.contains("Windows device path (for support)"),
-            "the path must be labelled as support small print: {}",
+            out.html[name_at..path_at].contains("Technical details")
+                && out.html[name_at..path_at].contains(r#"class="dv-line mono""#),
+            "the path must stay inside technical small print: {}",
             out.html
         );
 
@@ -849,11 +883,20 @@ mod tests {
             "{}",
             out.html
         );
-        assert!(out.html.contains("no pad is on the bus"), "{}", out.html);
+        assert!(
+            out.html.contains("still only on this screen"),
+            "{}",
+            out.html
+        );
         assert!(out.html.contains("Remove leaves no trace"), "{}", out.html);
         // It arrived with a LAYOUT, so the row says what it binds rather than
         // promising a controller that does nothing.
         assert!(out.html.contains("controls bound"), "{}", out.html);
+        assert!(
+            out.html.contains(r#"href="/map?target=stage&amp;slot=1""#),
+            "the staged row must open the mapper on that in-memory slot: {}",
+            out.html
+        );
         assert!(
             out.html.contains(r#"action="/start/controller/remove""#),
             "{}",
@@ -879,13 +922,13 @@ mod tests {
         );
 
         assert!(
-            out.html.contains("not ready — nothing is bound to it"),
+            out.html.contains("not ready — no controls are mapped"),
             "{}",
             out.html
         );
         assert!(
             out.html
-                .contains("this pad would plug and do nothing, so Play refuses it by name"),
+                .contains("Play would create a controller that does nothing"),
             "{}",
             out.html
         );
@@ -907,7 +950,7 @@ mod tests {
             out.html
         );
         assert!(
-            out.html.contains("would plug a pad that does"),
+            out.html.contains("Player 1 has no controls yet"),
             "{}",
             out.html
         );
@@ -976,39 +1019,115 @@ mod tests {
             out.html
         );
         // The one that binds nothing is offered WITH what it costs.
-        assert!(out.html.contains("Binds nothing at all"), "{}", out.html);
+        assert!(out.html.contains("No keys are assigned"), "{}", out.html);
         assert!(
-            out.html.contains("Play will refuse it by name"),
+            out.html
+                .contains("Play will ask you to finish its controls"),
             "{}",
             out.html
         );
-        // ...and the mapper is still described as what it is — a FILE editor —
-        // rather than as step 3 of a flow that has saved nothing.
+        // ...and the existing mapper is now aimed at the in-memory slot. Its
+        // copy must state both sides of that contract: edits return to this
+        // unsaved setup, and Play consumes them without an implicit Save.
         assert!(
             out.html
-                .contains("no file is written and no mapper is opened"),
-            "{}",
-            out.html
-        );
-        assert!(
-            !out.html.contains("Save first: that writes one preset"),
-            "the page must no longer send a first-run user to the mapper to map: {}",
-            out.html
-        );
-        // The SEAM is stated where the link is. Mapping a button in the mapper
-        // does not change what Play does here, and a person cannot guess that
-        // — they would find it out by playing a pad that ignores the button
-        // they just mapped.
-        assert!(
-            out.html
-                .contains("Play on this page always starts exactly what is shown above"),
+                .contains("Controls lets you choose each controller button"),
             "{}",
             out.html
         );
         assert!(
-            out.html.contains("Open the mapper (edits saved files)"),
-            "the link must say what it opens: {}",
+            out.html.contains("keyboard key that activates it"),
+            "{}",
             out.html
+        );
+        assert!(
+            out.html.contains("Changes return here immediately"),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html
+                .contains("Every edit stays in this setup until you choose Save"),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains("Play uses it immediately without saving"),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html.contains(r#"href="/map?target=stage&amp;slot=1""#)
+                && out.html.contains("Choose controls"),
+            "the link must target the staged mapper: {}",
+            out.html
+        );
+        assert!(
+            !out.html.contains("Save first"),
+            "the page must not require a disk write before mapping: {}",
+            out.html
+        );
+    }
+
+    #[test]
+    fn controls_are_gated_until_a_controller_exists_and_primary_copy_is_plain_language() {
+        let page = EmbeddedPage::load("/start").unwrap();
+        let fresh = render_start(&page, &fresh(), None);
+        assert!(
+            !fresh.html.contains(r#"href="/map?target=stage"#),
+            "an empty setup offered a dead Controls destination: {}",
+            fresh.html
+        );
+
+        let staged_payload = payload(stage(&[choose(), add("xbox360")]));
+        let staged = render_start(&page, &staged_payload, None);
+        assert!(
+            staged
+                .html
+                .contains(r#"href="/map?target=stage&amp;slot=1""#),
+            "the controller row lost its Controls destination: {}",
+            staged.html
+        );
+        for forbidden in [
+            "visual mapper",
+            "capture thread",
+            "player block",
+            "split-or-freeze",
+            "preset \"",
+            "slot 1",
+        ] {
+            assert!(
+                !staged_payload.lines.mapper_line.contains(forbidden)
+                    && !staged_payload.lines.play_line.contains(forbidden)
+                    && !staged_payload.lines.ready_line.contains(forbidden)
+                    && !staged_payload.lines.escape_line.contains(forbidden)
+                    && !staged_payload.lines.scope_line.contains(forbidden)
+                    && staged_payload
+                        .rows
+                        .layout_details
+                        .iter()
+                        .all(|row| !row.players.contains(forbidden)),
+                "customer copy still contains {forbidden:?}: {staged_payload:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_running_game_is_an_explicit_replacement_not_a_second_session() {
+        let page = EmbeddedPage::load("/start").unwrap();
+        let mut running = payload(stage(&[choose(), add("xbox360"), answer()]));
+        running.session.running = true;
+        running.session.line = "running".into();
+        let running = running.composed();
+        let html = render_start(&page, &running, None).html;
+        assert!(
+            html.contains("stop that session and replace it with the setup on this screen"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("Stop it before playing")
+                && !html.contains("Play will not replace what is running"),
+            "the page preserved the old stop-first refusal: {html}"
         );
     }
 
@@ -1133,17 +1252,33 @@ mod tests {
         // Under Freeze the second one means the keyboard stops typing, which is
         // not a thing to discover by pressing a button.
         assert!(
-            ready.html.contains("becomes a controller"),
+            ready
+                .html
+                .contains("uses the keyboard you picked to operate them"),
             "{}",
             ready.html
         );
         assert!(
-            ready.html.contains("gives the keyboard back"),
+            ready.html.contains("returns the keyboard to normal"),
             "the way out has to be beside the way in: {}",
             ready.html
         );
-        // The Guide fact — moment 7's one thing about the pad itself.
-        assert!(ready.html.contains("Game Bar"), "{}", ready.html);
+        // The Guide prerequisite is Windows-owned and must never read like a
+        // guarantee from ksx.
+        assert!(
+            ready
+                .html
+                .contains("Allow your controller to open Game Bar"),
+            "{}",
+            ready.html
+        );
+        assert!(
+            ready
+                .html
+                .contains("ksx does not change that Windows setting"),
+            "{}",
+            ready.html
+        );
 
         // A keyboard with no controller drives nothing, and ksx-core says so.
         // The page must show THAT sentence rather than an enabled button.
@@ -1186,9 +1321,14 @@ mod tests {
             out.html
         );
         assert!(out.html.contains("disabled"), "{}", out.html);
-        // The reason names the question, so the disabled button is not a
-        // mystery.
-        assert!(out.html.contains("split-or-freeze"), "{}", out.html);
+        // The reason names the customer decision, so the disabled button is
+        // not a mystery without exposing its internal wire name.
+        assert!(
+            out.html
+                .contains("Choose whether this keyboard should freeze or keep typing"),
+            "{}",
+            out.html
+        );
         // ...and the question is STILL not answered on the user's behalf.
         assert!(out.html.contains("Not asked yet"), "{}", out.html);
         assert!(
@@ -1236,10 +1376,25 @@ mod tests {
         let mut p = fresh();
         p.staged = StagedSetupView::unreachable("no daemon answered the control pipe");
         let down = render_start(&page, &p.composed(), None);
-        assert!(down.html.contains("No staged setup"), "{}", down.html);
         assert!(
-            down.html.contains("no daemon answered the control pipe"),
+            down.html.contains("Setup needs to restart"),
             "{}",
+            down.html
+        );
+        assert!(
+            down.html.contains("The background helper did not answer"),
+            "{}",
+            down.html
+        );
+        assert!(
+            down.html
+                .contains("include the Technical details shown here"),
+            "the recovery path must remain available on the page: {}",
+            down.html
+        );
+        assert!(
+            !down.html.contains("use Health"),
+            "the primary workflow must not point at the retired Health page: {}",
             down.html
         );
         assert!(
@@ -1320,7 +1475,9 @@ mod tests {
             blind.html
         );
         assert!(
-            !blind.html.contains("so saving creates them"),
+            !blind
+                .html
+                .contains("These controller names are new, so Save will create them"),
             "a failed preset read asserted what the folder holds: {}",
             blind.html
         );
@@ -1448,6 +1605,7 @@ mod tests {
                 presets: vec![ksx_api::PresetRow {
                     name: "Player 1".into(),
                     bound: 7,
+                    usable: true,
                     ..ksx_api::PresetRow::default()
                 }],
                 ..payload(stage(&[choose(), add("xbox360")]))
@@ -1455,9 +1613,13 @@ mod tests {
             .composed(),
             None,
         );
-        assert!(out.html.contains("already exists on disk"), "{}", out.html);
-        assert!(out.html.contains("REPLACES it"), "{}", out.html);
-        assert!(out.html.contains("Restore backup"), "{}", out.html);
+        assert!(
+            out.html.contains("already has a saved version"),
+            "{}",
+            out.html
+        );
+        assert!(out.html.contains("Save will replace it"), "{}", out.html);
+        assert!(out.html.contains("recovery copy"), "{}", out.html);
     }
 
     /// **Nothing on this page claims, plugs or installs, and no GET writes.**
@@ -1492,7 +1654,13 @@ mod tests {
         // The footer states the contract the whole page rests on.
         assert!(
             out.html
-                .contains("installs a driver or writes a file until you press Save"),
+                .contains("Your choices stay on this screen until you press Save"),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html
+                .contains("Play uses them for this session without saving"),
             "{}",
             out.html
         );
@@ -1528,25 +1696,17 @@ mod tests {
         assert!(out.html.contains(r#"id="__ksx-payload""#), "{}", out.html);
     }
 
-    /// The nav is static markup duplicated per island, so a page is invisible
-    /// until every sibling links to it — and this is the page a first-run user
-    /// has to find first.
+    /// The first-run header is the compact customer navigation: Setup,
+    /// Controls and Test. Saved games is a task link in the page body. The
+    /// operator/developer pages deliberately do not crowd this first screen.
     #[test]
-    fn the_nav_reaches_every_sibling_page() {
+    fn the_first_run_customer_links_reach_each_task() {
         let page = EmbeddedPage::load("/start").unwrap();
         let out = render_start(&page, &fresh(), None);
-        for href in [
-            "/",
-            "/map",
-            "/check",
-            "/pads",
-            "/devices",
-            "/profiles",
-            "/setup",
-        ] {
+        for href in ["/start", "/map", "/check", "/profiles"] {
             assert!(
                 out.html.contains(&format!(r#"href="{href}""#)),
-                "the nav does not reach {href}: {}",
+                "the first-run customer links do not reach {href}: {}",
                 out.html
             );
         }
@@ -1576,12 +1736,14 @@ mod tests {
         p.staged.max_xinput_slots = 2;
         let out = render_start(&page, &p.composed(), None);
         assert!(
-            out.html.contains("1 of Windows' 2 XInput slots"),
+            out.html
+                .contains("1 of 2 available Xbox-style controller places"),
             "{}",
             out.html
         );
         assert!(
-            out.html.contains("players 3+ exist"),
+            out.html
+                .contains("Additional players use PlayStation-style controllers"),
             "the sentence past the ceiling counts from the SERVED ceiling: {}",
             out.html
         );

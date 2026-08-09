@@ -1011,7 +1011,7 @@ mod tests {
     }
 
     /// Every page links onward. The board step goes to `/devices` rather than
-    /// duplicating it, and the nav reaches the other two screens.
+    /// duplicating it, while the customer rail stays Setup → Controls → Test.
     ///
     /// `/devices` is task #22 and is NOT served by this crate yet (see the
     /// module's MERGE DEPENDENCY note), so the step also names the shell verb
@@ -1024,12 +1024,22 @@ mod tests {
         let out = render_setup(&page, &configured(), None);
         assert!(out.html.contains(r#"href="/devices""#), "{}", out.html);
         assert!(out.html.contains("ksx device pick"), "{}", out.html);
-        assert!(out.html.contains(r#"href="/""#), "{}", out.html);
-        assert!(out.html.contains(r#"href="/map""#), "{}", out.html);
-        assert!(out.html.contains(r#"href="/pads""#), "{}", out.html);
         assert!(
-            out.html.contains(r#"class="navlink on" href="/setup""#),
-            "the current route must be marked: {}",
+            out.html
+                .contains(r#"<a class="navlink" href="/start">Setup</a>"#),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html
+                .contains(r#"<a class="navlink" href="/map">Controls</a>"#),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.html
+                .contains(r#"<a class="navlink" href="/check">Test</a>"#),
+            "{}",
             out.html
         );
     }

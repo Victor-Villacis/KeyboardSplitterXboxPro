@@ -17,7 +17,7 @@ import { h, createSignal, createList, createShow } from "@getforma/core";
 //
 // So this page is the OTHER half of commandment 4: "render as summary, legend
 // as TABLE". One flat grid of chips, each carrying its slot number, its
-// canonical control name and the key that drives it. Big targets, no
+// customer-facing control label and the key that drives it. Big targets, no
 // geometry, and the fan-out is if anything more legible: press G and four
 // chips labelled P1 P2 P3 P4 light in the same row of your eye.
 //
@@ -131,9 +131,12 @@ interface ControlChip {
   slot: string;
   /** `P1`, for the eye. */
   player: string;
-  /** The canonical control name (`A`, `dpad.up`, `lt`) — the vocabulary the
-   *  preset file, the legend and the live frame all spell it in. */
+  /** The canonical control name (`A`, `dpad.up`, `lt`) used only as the
+   *  live-frame lookup key. */
   control: string;
+  /** The same control in the words or symbols a player sees on the controller.
+   *  `control` stays canonical for the live-feed lookup; this is display-only. */
+  label: string;
   /** The keys that drive it, joined — or the provider's "unbound" tag. */
   keys: string;
 }
@@ -145,8 +148,19 @@ interface KeyRow {
   state: string;
 }
 
+interface EmptyPlayerRow {
+  player: string;
+  line: string;
+  href: string;
+  action: string;
+}
+
 const [generatedAt, setGeneratedAt] = createSignal("");
 const [sourceLine, setSourceLine] = createSignal("");
+const [emptyHeading, setEmptyHeading] = createSignal("");
+const [emptyLine, setEmptyLine] = createSignal("");
+const [emptyHref, setEmptyHref] = createSignal("/start");
+const [emptyAction, setEmptyAction] = createSignal("Open Setup");
 const [feedHint, setFeedHint] = createSignal("");
 const [sessionLine, setSessionLine] = createSignal("");
 /** The FEED's own state line — the daemon's `unavailable` sentence, or this
@@ -158,6 +172,7 @@ const [lossLine, setLossLine] = createSignal("");
 const [offPanelLine, setOffPanelLine] = createSignal("");
 
 const [chips, setChips] = createList<ControlChip>([]);
+const [emptyPlayers, setEmptyPlayers] = createList<EmptyPlayerRow>([]);
 const [keyRows, setKeyRows] = createList<KeyRow>([]);
 
 const [live, setLive] = createSignal(false);
@@ -170,6 +185,87 @@ const [quiet, setQuiet] = createSignal(false);
 
 // ── Appliers — copiers, never derivers ─────────────────────────────────────
 
+interface EmptyState {
+  heading: string;
+  line: string;
+  href: string;
+  action: string;
+}
+
+/** Mapper snapshots deliberately use an unavailable sentinel rather than an
+ *  empty healthy roster. Keep that state separate from a successful read with
+ *  no controllers, and from a controller whose layout names no controls. */
+function emptyState(mapper: MapperSnapshot): EmptyState | null {
+  if (mapper.generated_at === "(unavailable)" || mapper.config_root === "(unavailable)") {
+    return {
+      heading: "Controls could not be checked",
+      line:
+        "Reopen ksx, then use Setup to confirm a controller and Controls to check its buttons. Nothing was changed.",
+      href: "/start",
+      action: "Open Setup",
+    };
+  }
+  if (mapper.slots.length === 0) {
+    return {
+      heading: "No controller is ready to test",
+      line: "Add a controller in Setup, then come back to test its buttons.",
+      href: "/start",
+      action: "Open Setup",
+    };
+  }
+  if (mapper.slots.every((slot) => Object.keys(slot.bindings).length === 0)) {
+    return {
+      heading: "No controls are ready to test",
+      line:
+        "Open Controls and choose a ready-made layout or add button keys, then come back here.",
+      href: "/map",
+      action: "Open Controls",
+    };
+  }
+  return null;
+}
+
+/** Canonical names stay in `data-control` for the live feed, but never have to
+ *  be the label a customer reads. These are the same controller identities the
+ *  Controls screen draws; unknown extension controls are still humanized. */
+export function controlLabel(persona: string, control: string): string {
+  const playstation = /playstation|ds4|ps4/i.test(persona);
+  const standard: Record<string, string> = {
+    A: playstation ? "✕" : "A",
+    B: playstation ? "○" : "B",
+    X: playstation ? "□" : "X",
+    Y: playstation ? "△" : "Y",
+    lt: playstation ? "L2" : "LT",
+    lb: playstation ? "L1" : "LB",
+    rb: playstation ? "R1" : "RB",
+    rt: playstation ? "R2" : "RT",
+    guide: playstation ? "PS" : "Guide",
+    back: playstation ? "Share" : "View",
+    start: playstation ? "Options" : "Menu",
+    lthumb: "L3",
+    rthumb: "R3",
+    "ly.max": "Left stick ↑",
+    "ly.min": "Left stick ↓",
+    "lx.min": "Left stick ←",
+    "lx.max": "Left stick →",
+    "dpad.up": "D-pad ↑",
+    "dpad.down": "D-pad ↓",
+    "dpad.left": "D-pad ←",
+    "dpad.right": "D-pad →",
+    "ry.max": "Right stick ↑",
+    "ry.min": "Right stick ↓",
+    "rx.min": "Right stick ←",
+    "rx.max": "Right stick →",
+  };
+  const known = standard[control];
+  if (known) return known;
+  if (control.startsWith("macro.")) {
+    return `Button sequence “${control.slice("macro.".length)}”`;
+  }
+  const words = control.replace(/[._-]+/g, " ").trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : "Other control";
+}
+
 /** Slot roster → chips. The CONTROL LIST is the backend's: it is the key set
  *  of `MapperSlot.bindings`, which is every function the preset names, unbound
  *  ones included (they arrive as an empty key list). A hardcoded roster here
@@ -177,25 +273,48 @@ const [quiet, setQuiet] = createSignal(false);
  *  cabinet's four-slot list is the standing reminder of what that costs. */
 export function applyCheck(p: CheckPayload): void {
   setGeneratedAt(p.mapper.generated_at);
-  setSourceLine(p.mapper.source);
+  setSourceLine("Press a keyboard or panel key and watch every controller action it drives.");
   setFeedHint(p.feed_hint);
-  setSessionLine(p.session.line);
+  setSessionLine(
+    p.session.running
+      ? "Play is active."
+      : p.session.reachable
+        ? "Ready to test."
+        : "Live testing needs ksx to be reopened.",
+  );
+
+  const empty = emptyState(p.mapper);
+  setEmptyHeading(empty?.heading ?? "");
+  setEmptyLine(empty?.line ?? "");
+  setEmptyHref(empty?.href ?? "/start");
+  setEmptyAction(empty?.action ?? "Open Setup");
 
   const rows: ControlChip[] = [];
+  const missing: EmptyPlayerRow[] = [];
   for (const slot of p.mapper.slots) {
+    if (Object.keys(slot.bindings).length === 0) {
+      missing.push({
+        player: `Player ${slot.number} has no controls yet`,
+        line: "Open Controls and choose a ready-made layout or add button keys for this player.",
+        href: `/map?slot=${slot.number}`,
+        action: "Open Controls",
+      });
+    }
     for (const control of Object.keys(slot.bindings)) {
       const keys = slot.bindings[control] ?? [];
       rows.push({
         slot: String(slot.number),
         player: "P" + String(slot.number),
         control,
+        label: controlLabel(slot.persona, control),
         keys: keys.length ? keys.join(" · ") : "unbound",
       });
     }
   }
   setChips(rows);
-  setHasSlots(rows.length > 0);
-  setNoSlots(rows.length === 0);
+  setEmptyPlayers(missing);
+  setHasSlots(empty === null && rows.length > 0);
+  setNoSlots(empty !== null || rows.length === 0);
 }
 
 /** The feed's own state, in words. `down` is the visible half — a page that
@@ -230,25 +349,20 @@ export function CheckIsland() {
     h(
       "nav",
       { class: "topnav", "aria-label": "screens" },
-      h("a", { class: "navlink", href: "/start" }, "Start"),
-      h("a", { class: "navlink", href: "/" }, "Status"),
-      h("a", { class: "navlink", href: "/map" }, "Mapper"),
+      h("a", { class: "navlink", href: "/start" }, "Setup"),
+      h("a", { class: "navlink", href: "/map" }, "Controls"),
       h(
         "a",
         { class: "navlink on", href: "/check", "aria-current": "page" },
-        "Check",
+        "Test",
       ),
-      h("a", { class: "navlink", href: "/pads" }, "Pads"),
-      h("a", { class: "navlink", href: "/devices" }, "Devices"),
-      h("a", { class: "navlink", href: "/profiles" }, "Profiles"),
-      h("a", { class: "navlink", href: "/setup" }, "Setup"),
     ),
     h(
       "header",
       { class: "head" },
       h("h1", null, "Button check"),
       h("p", { class: "sub" }, () => sourceLine()),
-      h("p", { class: "sub mono" }, () => generatedAt()),
+      h("p", { class: "product-hidden" }, () => generatedAt()),
     ),
 
     // **The no-JS truth, first and unmissable.** This whole page is a live
@@ -271,12 +385,7 @@ export function CheckIsland() {
         h(
           "p",
           { class: "alarmlead" },
-          "This screen watches the daemon's input stream as it happens, which needs scripting switched on. Nothing below will light up. The binding table is still correct — it is read from disk on the server — so it still answers what each key SHOULD do; it cannot answer whether it did.",
-        ),
-        h(
-          "p",
-          { class: "alarmlead" },
-          "Without scripting, `ksx monitor` in a terminal is the same check: one line per key as it arrives.",
+          "Live testing needs scripting switched on. Reopen ksx in its normal app window; the saved control list below remains readable, but it cannot light up here.",
         ),
       ),
     ),
@@ -284,7 +393,7 @@ export function CheckIsland() {
     h(
       "section",
       { class: "card feedcard" },
-      h("h2", null, "Feed"),
+      h("h2", null, "Live input"),
       h("p", { class: "dvalue" }, () => feedLine()),
       h("p", { class: "sub" }, () => sessionLine()),
       h("p", { class: "sub" }, () => feedHint()),
@@ -304,7 +413,7 @@ export function CheckIsland() {
         h(
           "p",
           { class: "sub" },
-          "Chips below show the bindings on disk; they cannot light until the feed is back.",
+          "The controls below show the saved layout; they cannot light until live input is back.",
         ),
     ),
 
@@ -344,8 +453,13 @@ export function CheckIsland() {
         h(
           "section",
           { class: "card" },
-          h("h2", null, "No slots to check"),
-          h("p", { class: "sub" }, () => sourceLine()),
+          h("h2", null, () => emptyHeading()),
+          h("p", { class: "sub" }, () => emptyLine()),
+          h(
+            "p",
+            { class: "pactrow" },
+            h("a", { class: "btn btn-primary", href: () => emptyHref() }, () => emptyAction()),
+          ),
         ),
     ),
     createShow(
@@ -354,18 +468,34 @@ export function CheckIsland() {
         h(
           "section",
           { class: "card chipcard" },
-          h("h2", null, "Virtual controls"),
+          h("h2", null, "Controller buttons"),
           h(
             "p",
             { class: "sub" },
-            "One chip per control per slot. A key bound to several slots lights all of them at once — that is the fan-out, made visible.",
+            "Each controller button shows the key that controls it. A key shared by several players lights all of them at once.",
+          ),
+          createList(
+            () => emptyPlayers(),
+            (p) => p.player + "|" + p.href,
+            (p) =>
+              h(
+                "div",
+                { class: "warnbox" },
+                h("h3", null, p.player),
+                h("p", { class: "sub" }, p.line),
+                h(
+                  "p",
+                  { class: "pactrow" },
+                  h("a", { class: "btn btn-primary", href: p.href }, p.action),
+                ),
+              ),
           ),
           h(
             "div",
             { class: "chipgrid", id: "chipgrid" },
             createList(
               () => chips(),
-              (c) => c.slot + "|" + c.control + "|" + c.keys,
+              (c) => c.slot + "|" + c.control + "|" + c.label + "|" + c.keys,
               (c) =>
                 h(
                   "div",
@@ -375,7 +505,7 @@ export function CheckIsland() {
                     "data-control": c.control,
                   },
                   h("span", { class: "chipslot" }, c.player),
-                  h("span", { class: "chipname" }, c.control),
+                  h("span", { class: "chipname" }, c.label),
                   h("span", { class: "chipkeys mono" }, c.keys),
                 ),
             ),
@@ -389,7 +519,7 @@ export function CheckIsland() {
         h(
           "p",
           { class: "sub" },
-          "Live. Frames arrive as they happen; a press shorter than a frame still flashes.",
+          "Live. Even a very short button press flashes here.",
         ),
     ),
   );

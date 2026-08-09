@@ -324,6 +324,19 @@ impl Store {
     /// Load `games.toml` (or `games.json`). Missing file → empty games list.
     pub fn load_games(&self) -> Result<Loaded<GamesFile>, ConfigError> {
         let source = self.games_source();
+        self.load_games_from_source(&source)
+    }
+
+    /// Load games through one already-resolved source.
+    ///
+    /// Writers use this together with [`Self::save_games_to_source`] so the
+    /// file they validate and back up cannot change from `games.json` to
+    /// `games.toml` (or the reverse) between steps merely because a sibling
+    /// spelling appeared. `source` should come from [`Self::games_source`].
+    pub fn load_games_from_source(
+        &self,
+        source: &Source,
+    ) -> Result<Loaded<GamesFile>, ConfigError> {
         let mut warnings = source.warnings();
         let Some(raw) = read_utf8(&source.path)? else {
             return Ok(Loaded {
@@ -331,7 +344,7 @@ impl Store {
                 warnings,
             });
         };
-        let mut loaded = read_typed::<GamesFile>(&source, &raw)?;
+        let mut loaded = read_typed::<GamesFile>(source, &raw)?;
         warnings.append(&mut loaded.warnings);
         Ok(Loaded {
             value: loaded.value,
@@ -341,8 +354,18 @@ impl Store {
 
     pub fn save_games(&self, games: &GamesFile) -> Result<PathBuf, ConfigError> {
         let source = self.games_source();
-        write_atomic(&source.path, &render(games, &source)?)?;
-        Ok(source.path)
+        self.save_games_to_source(&source, games)
+    }
+
+    /// Save games through the same resolved source a writer loaded and backed
+    /// up. See [`Self::load_games_from_source`].
+    pub fn save_games_to_source(
+        &self,
+        source: &Source,
+        games: &GamesFile,
+    ) -> Result<PathBuf, ConfigError> {
+        write_atomic(&source.path, &render(games, source)?)?;
+        Ok(source.path.clone())
     }
 
     /// Load every `presets/*.toml` and every `presets/*.json` with no TOML of

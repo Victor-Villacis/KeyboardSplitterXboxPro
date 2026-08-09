@@ -156,6 +156,13 @@ pub struct MapperSlot {
     /// still true (and still worth showing) when nothing answers the pipe.
     #[serde(default)]
     pub backup: Option<String>,
+    /// Whether the daemon-lifetime “before I started editing” recovery copy
+    /// exists for this layout. Kept separate from [`Self::backup`], which is a
+    /// timestamped copy created by a whole-layout action: either one can exist
+    /// without the other, and a surface must not offer an Undo button for the
+    /// wrong kind of recovery point.
+    #[serde(default)]
+    pub session_backup: bool,
     /// Canonical function name → its AUTO-FIRE rate in hertz, as authored
     /// (docs/INPUT-TRANSFORMS.md §3). Absent = the control does not auto-fire,
     /// which is every control of every preset written before turbo existed.
@@ -218,6 +225,68 @@ impl MacroSnapshot {
             reason: String::new(),
             preset: preset.to_owned(),
             macros,
+        }
+    }
+
+    /// Compose the macro editor's existing read model from an in-memory preset
+    /// file. No store, path or daemon is consulted: staged setup can therefore
+    /// use the same macro cards as the saved-preset mapper without first
+    /// writing anything.
+    pub fn from_preset(preset: &ksx_config::PresetFile) -> Self {
+        let macros = preset
+            .macros
+            .iter()
+            .map(|(name, def)| MacroView {
+                name: name.clone(),
+                steps: def.steps.iter().map(MacroStepView::from_file).collect(),
+                on_release: def.on_release.as_str().to_owned(),
+                retrigger: def.retrigger.as_str().to_owned(),
+                interrupt: def.interrupt.as_str().to_owned(),
+                repeat: def.repeat.as_str().to_owned(),
+                turbo_hz: def.turbo_hz,
+                gap_ms: def.gap_ms,
+                triggers: macro_trigger_keys(preset, name),
+                disabled: !def.enabled,
+            })
+            .collect();
+        Self::read(&preset.name, macros)
+    }
+}
+
+/// The keys authored on one `macro.<name>` binding row.
+///
+/// A staged authoring snapshot is emitted by `PresetFile::from_core`, hence its
+/// macro rows are flat. Recursing through every `BindingEntry` variant costs
+/// little and also keeps this helper correct for a compatible client that sent
+/// a hand-authored nested table instead.
+fn macro_trigger_keys(preset: &ksx_config::PresetFile, name: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for (function, entry) in &preset.bindings {
+        let Some(bound_name) = ksx_config::macro_name(function) else {
+            continue;
+        };
+        if bound_name.eq_ignore_ascii_case(name) {
+            binding_entry_keys(entry, &mut keys);
+        }
+    }
+    keys.retain(|key| !key.eq_ignore_ascii_case("None"));
+    keys
+}
+
+fn binding_entry_keys(entry: &ksx_config::BindingEntry, out: &mut Vec<String>) {
+    match entry {
+        ksx_config::BindingEntry::Key(key) => out.push(key.clone()),
+        ksx_config::BindingEntry::Keys(keys) => out.extend(keys.iter().cloned()),
+        ksx_config::BindingEntry::Guarded(guarded) => out.push(guarded.key.clone()),
+        ksx_config::BindingEntry::Many(entries) => {
+            for entry in entries {
+                binding_entry_keys(entry, out);
+            }
+        }
+        ksx_config::BindingEntry::Group(group) => {
+            for entry in group.values() {
+                binding_entry_keys(entry, out);
+            }
         }
     }
 }

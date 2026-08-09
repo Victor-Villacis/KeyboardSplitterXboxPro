@@ -46,6 +46,29 @@ jobs:
       # both said "clippy clean" about different diagnostics on 2026-08-07.
       - name: Toolchain (pinned by rust-toolchain.toml)
         run: rustup show active-toolchain
+      - uses: actions/setup-node@v4
+        with:
+          # @getforma/core 2.0.0 declares this minimum. Pinning the floor proves
+          # the authoring project does not accidentally rely on a newer Node.
+          node-version: '20.19.0'
+          cache: npm
+          cache-dependency-path: studio-ui/package-lock.json
+      - name: Studio assets reproduce from registry dependencies
+        working-directory: studio-ui
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Studio registry install failed' }
+          node build.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Studio asset build failed' }
+          git -C .. diff --exit-code -- crates/ksx-studio/assets
+          if ($LASTEXITCODE -ne 0) {
+            throw 'committed Studio assets differ from a clean Forma build'
+          }
+          $untracked = git -C .. ls-files --others --exclude-standard -- crates/ksx-studio/assets
+          if ($untracked) {
+            throw "Studio build emitted untracked assets:`n$($untracked -join "`n")"
+          }
       - uses: Swatinem/rust-cache@v2
       - name: Format
         # vendored vigem-client keeps upstream formatting; check only our crates.

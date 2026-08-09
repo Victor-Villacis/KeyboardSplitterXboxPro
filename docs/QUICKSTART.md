@@ -1,357 +1,126 @@
-# Quickstart — from a fresh machine to four working players
+# Quickstart — install, choose a keyboard, and play
 
-You have never run ksx. You have a PC, a panel (an arcade encoder, or just some
-keyboards), and twenty minutes. This is the whole path.
+This is the customer path on Windows 11. It needs no terminal, no configuration
+file, and no knowledge of the developer CLI.
 
-Nothing here assumes you have seen the legacy Keyboard Splitter, and nothing
-here asks you to write TOML. If you *want* to write TOML, everything below has
-a plain-text file behind it and you can edit it by hand at any point — that is
-a design rule, not an accident (`docs/USE-CASES.md`, non-negotiable 6).
+## 1. Install ksx
 
----
+Download `ksx-<version>-setup.exe` from the release page and run it.
 
-## 0. What ksx is about to do
+- Leave **Install the ViGEmBus controller driver** selected unless it is
+  already installed.
+- Leave **Launch ksx** selected to open the app when setup finishes, or use the
+  **ksx** shortcut afterward.
+- The optional desktop icon and the Start-menu entry open the same app. Neither
+  opens a command window.
 
-One keyboard becomes several Xbox (or PlayStation) controllers. A four-player
-arcade panel is *one* USB keyboard sending four blocks of scancodes; ksx reads
-those blocks, splits them by slot, and drives four virtual pads. Games see
-controllers. They never see a keyboard.
+The installer is not code-signed yet, so Windows may show a SmartScreen warning.
+The release notes publish the installer SHA-256 so the download can be checked.
 
-While a session is running, ksx **blocks** the keyboards it is using — only
-those, and only while emulating — so your panel's `1` does not also type "1"
-into whatever has focus. Every other keyboard keeps typing normally.
+## 2. Choose the keyboard or arcade panel
 
-> **Read the escapes before your first session.** With the panel captured,
-> `Ctrl+C` cannot reach ksx. `LeftCtrl` pressed five times toggles capture off;
-> `Ctrl`+`Alt`+`Del` stops emulation. Both are evaluated inside the capture
-> thread, so they work even when everything else is wedged. `README.md`
-> §Emergency escapes has the details, `docs/RECOVERY.md` has the rest.
+ksx opens directly to **Setup** and scans the machine.
 
----
+1. Find the keyboard or arcade encoder by its ordinary device name.
+2. Select **Use this device**.
+3. If the device does not identify itself as a keyboard, open **Other devices
+   (optional)**. That list is deliberately separate from the normal path.
 
-## 1. Drivers (once per machine)
+This choice is only a draft. Selecting a device does not disconnect it, create
+a controller, or write anything to disk.
 
-Two drivers, different jobs:
+## 3. Choose a controller
 
-| | What it does | Needed? |
-|---|---|---|
-| **ViGEmBus** | creates the virtual controllers | **always** |
-| **Interception** | reads and blocks the keyboards | for the Interception capture mode (see §2) |
+Pick the virtual controller the keyboard should become, then add it. You can
+change its type or remove it while the setup is still a draft.
 
-### ViGEmBus
+ksx supports as many as 16 players. Xbox-style controllers occupy the four
+places Windows games normally expose through XInput; supported additional
+players use PlayStation-style controllers. The Setup screen shows the exact
+capacity of the installed build instead of assuming four players.
 
-**If you installed ksx from the setup `.exe` and left "Install the ViGEmBus
-controller driver" ticked, this is already done and you can skip to §2.** The
-wizard is where it happens because that is the one moment ksx has an
-administrator token — it never asks for one on its own. If the install could
-not be completed, the wizard said so on its last page and named the way back.
+Choose a ready-made controller layout that resembles the physical controls.
+The default two-player keyboard layout includes:
 
-Not sure? ksx tells you rather than making you check: the Start screen says
-before the Play button whether a controller can be created on this machine,
-and `ksx doctor` prints the same verdict with the version.
+- Player 1 Guide/Home: **Left Windows**
+- Player 2 Guide/Home: **Numpad \***
 
-The driver is bundled, never downloaded, and verified against two independent
-pins — its SHA-256 and its Authenticode signer — before anything runs it. That
-is true from the wizard and from a shell, because both go through the same
-command:
+## 4. Map the controls
 
-```powershell
-ksx install-drivers                 # report + verify, run nothing
-ksx install-drivers --yes           # execute (elevated terminal required)
-```
+Select **Map controls** on a player, or open **Controls**.
 
-ksx never self-elevates. If it needs an admin token it says so and stops — and
-with ViGEmBus already installed and healthy, the command above does nothing at
-all and says so.
+- Click a controller control, then press the physical key for it.
+- Add more than one key to a control when useful.
+- Configure chords, auto-fire, and macros in the same editor.
+- Use the player tabs to move between controllers.
 
-### Interception
+While editing this unsaved setup, changes remain in the background service's
+draft. They do not write controller-layout files. A refused edit leaves the
+draft unchanged.
 
-ksx does **not** install it — its licence is LGPL/non-commercial, so bundling
-its installer is fine and shipping it inside a commercial product is not
-(`docs/DRIVERS.md`). Get it from
-[the project](https://github.com/oblitum/Interception), run
-`install-interception.exe /install` from an elevated prompt, and reboot.
+## 5. Decide whether to split or freeze the keyboard
 
-### Check
+Return to **Setup** and answer the required question:
 
-```powershell
-ksx doctor
-```
+- **Split it:** only mapped keys become controller input; unused keys can still
+  type or be assigned to another player.
+- **Freeze it:** while Play is active, every other key on that keyboard is
+  ignored. This prevents accidental typing during a game.
 
-Verdicts with stable codes; exit 2 means something will genuinely not work.
-Run this first whenever anything is strange — it is faster than guessing.
+**LeftCtrl five times is always the escape hatch.** It stops keyboard capture
+even if the app window is closed or unresponsive.
 
----
+## 6. Save, Play, or both
 
-## 2. Which capture mode
+These are separate actions:
 
-Two ways for ksx to read your panel. Pick with the table, not with a coin.
+- **Save this setup** keeps the keyboard, controllers, layouts, and split/freeze
+  choice for later. It does not start Play.
+- **Play now** uses exactly what is on the screen without saving it first.
 
-| | **Interception** (default) | **WinUSB claim** |
-|---|---|---|
-| Extra driver | yes (third-party) | no — Windows' in-box `winusb.sys` |
-| Two identical encoders | ❌ **cannot tell them apart** — ksx refuses to start rather than guess | ✅ identity is the USB port path |
-| Panel when ksx is not running | types normally | **dead** (the daemon re-injects its keys while running; nothing types when it is not) |
-| Device limit | 10 keyboards, and ids drift on replug/resume | none |
-| Signing future | cross-signed cert expired 2012; dies when Microsoft's 2026 policy flips to enforcement | WHQL, unaffected |
-| Undo | uninstall + reboot | `ksx winusb release --yes`, no reboot |
+When Play begins, the virtual controllers appear and the chosen keyboard starts
+driving them. Open **Test** to see short and long presses light up.
 
-**Start with Interception** unless one of these is true:
+Guide/Home opens Xbox Game Bar only when Game Bar is available and Windows'
+**Allow your controller to open Game Bar** setting is enabled. Setup includes
+an **Open Windows Game Bar settings** button. ksx never changes that Windows
+setting silently.
 
-- you have **two identical boards** (two I-PAC2s, two of the same cheap
-  keyboard) — Interception cannot separate them, and this is the common shape
-  for a 4-player build. Go straight to WinUSB.
-- you are setting up a machine to still work after the 2026 cross-signing
-  cutover, and you can commit to ksx being resident (autostart) so the panel
-  keeps typing in menus.
-
-WinUSB has its own runbook — `docs/MIGRATION-WINUSB.md`, and read
-`docs/RECOVERY.md` §2 **before** you start it. Everything below works
-identically on either mode.
-
----
-
-## 3. See your panel
-
-```powershell
-ksx devices
-```
-
-Read-only: it opens nothing, claims nothing, sets no filter. You get one row
-per keyboard with its id, and Ultimarc boards are tagged `[I-PAC]`.
-
-If two rows share an id, that is the identical-boards problem above.
-
----
-
-## 4. Get a preset — the fast way
-
-A preset is a key → controller-function map. ksx ships ready-made ones, so a
-standard panel needs **no mapping session at all**:
-
-```powershell
-ksx preset list --templates
-```
-
-| Template | The panel it is for |
-|---|---|
-| `arcade-6button` | Two-player, six-button fighting panel on the factory/MAME chart. P1 = arrows + `LeftCtrl` `LeftAlt` `Space` `LeftShift` `Z` `X`, start `1`, coin `5`. P2 = `R` `F` `D` `G` + `A` `S` `Q` `W` `I` `K`, start `2`, coin `6`. Buttons 7–8, if wired, become LB and LT. |
-| `arcade-4way` | Four-player, two-button cabinet on MAME's four-player chart (P1–P4 blocks). |
-| `keyboard-wasd` | One ordinary keyboard: WASD = left stick, arrows = right stick, numpad = D-pad, `Space`=A, `C`=B, `R`=X, `F`=Y. |
-| `keyboard-2p` | Two players on ONE keyboard, no encoder (P1–P2 blocks). P1 = WASD + `Space` `C` `R` `F`, `Q`/`E`, `Z`/`X`, `LeftShift`/`V`, start `1`, back `Tab`. P2 = arrows + the numpad as the pad face (`8`·`4`·`6`·`2` = Y·X·B·A), `Numpad7`/`9` bumpers, `Numpad1`/`3` triggers, `RightShift`/`Numpad5` thumbsticks, `NumpadEnter` start, `Numpad0` back. No right stick on either — half a keyboard has no room. |
-| `default` | The legacy app's layout, for people migrating. |
-| `empty` | Every control listed, nothing bound — a blank worksheet. |
-
-Every arcade template — and `keyboard-2p` — binds each stick direction to
-**both** the D-pad and the left stick, because some games read only one of them.
-That is ksx fan-out, not a duplicate; `ksx map --function dpad.up --clear`
-removes half of it if you ever want only the stick.
-
-Make yourself two presets off one encoder — the primary arcade topology:
-
-```powershell
-ksx preset new "P1" --from-template arcade-6button --player 1
-ksx preset new "P2" --from-template arcade-6button --player 2
-```
-
-`--player` picks the key block, not the slot: on an I-PAC, player 2's buttons
-are a *different set of scancodes from the same board*. That is exactly what
-makes one keyboard drive four pads.
-
-The same two commands with `keyboard-2p` are the couch case — a two-player
-Steam game, one desk keyboard, no arcade hardware at all:
-
-```powershell
-ksx preset new "Couch P1" --from-template keyboard-2p --player 1
-ksx preset new "Couch P2" --from-template keyboard-2p --player 2
-```
-
-Add `--dry-run` to see the TOML without writing it. `--force` overwrites an
-existing preset and copies the old one to `<preset>.toml.bak-<timestamp>` first.
-
----
-
-## 5. Get a preset — the sure way
-
-Your panel is not on any chart, or it was reprogrammed, or you would rather
-press the buttons than trust a table:
-
-```powershell
-ksx setup
-```
-
-The wizard, in order:
-
-1. **"Hold a key on the panel for player 1."** You identify the panel by
-   *pressing* it — never by picking a hardware id out of a list, which on a
-   cabinet with two identical boards is not a question anyone can answer.
-2. **One control at a time.** The prompt names a POSITION — `SOUTH`, not `A`,
-   because the letter is somewhere else on a Nintendo pad and most panels are
-   labelled by position anyway. Press the button; it binds and moves on.
-3. **Skip by pressing nothing.** Each prompt shows a countdown
-   (`--step-secs`, default 6) and skips the control when it runs out. **Two
-   silent prompts in a row end the run** and skip everything left — bailing out
-   of the optional tail costs about twelve seconds.
-4. **ALREADY TAKEN.** A key that already drives another control in this run is
-   refused the moment you press it, with the control that holds it named, and
-   the prompt stays put.
-5. **`Escape` cancels** the whole run. It is the only reserved key.
-6. **A review screen, then an audit.** It warns when the panel can reach
-   neither START nor BACK — on a cabinet, those are the exit keys, and finding
-   out you have none *after* the panel is captured is a bad afternoon.
-7. **Nothing is written until you say yes.** "No" discards everything. Only
-   after "yes" does it ask whether to wire the slot up, and it asks rather than
-   assumes.
-8. **"Set up the next player?"** — so P1 through P4 is one continuous run.
-
-Two things to know before you start it:
-
-- **Stop emulation first.** While `ksx run` has the panel captured, its
-  keystrokes are suppressed below win32k and the wizard hears nothing at all.
-- `--dry-run` walks the whole wizard and writes nothing; `--json` prints the
-  outcome as one object on stdout (prompts stay on stderr).
-- `--profile "MAME 4P"` wires finished slots into that `games.toml` profile
-  instead of `config.toml`.
-
----
+## 7. Save a game (optional)
 
-## 6. Wire the slots
+Open **Manage saved games** from the bottom of Setup when ksx should remember a
+program or launcher link.
 
-`ksx setup` offers to do this for you, and so does the picker:
+1. Enter a game name.
+2. Paste the program path or launcher link. Surrounding quotation marks are
+   accepted and removed safely.
+3. Choose the player count and controller layout.
+4. Select **Save game**.
 
-```powershell
-ksx device scan                  # boards, not devnodes: which one is your panel
-ksx device pick <ID> --alias "Cabinet panel"
-```
-
-`pick` writes the `[[device]]` block for you, and it writes a **`usb:`
-selector** — `usb:d209:0430:00`, meaning "the I-PAC's keyboard interface" — so
-the entry keeps naming your board after you move it to another socket. Do not
-hand-author the id if you can avoid it: the full `USB\…\7&25EEA38C&0&0000`
-spelling below is one specific board in one specific machine, it is not
-something you can look up, and there is a whole design document about why
-(`docs/DEVICE-IDENTITY.md`).
-
-By hand, `config.toml` (or `ksx.toml` next to the exe, if you are running
-portable) looks like:
-
-```toml
-schema_version = 1
-
-[[device]]
-# What `ksx device pick` writes. The alias is what slots refer to.
-id = 'usb:d209:0430:00'
-alias = "Cabinet panel"
-
-# A full devnode path still works — every config written before selectors
-# existed holds one — but it names one board on one machine:
-#   id = 'HID\VID_D209&PID_0430&MI_00\8&2A0D0500&0&0000'   # from `ksx devices`
-
-[[slot]]
-number = 1
-keyboard = "Cabinet panel"
-preset = "P1"
-
-[[slot]]
-number = 2
-keyboard = "Cabinet panel"       # SAME board — this is the fan-out
-preset = "P2"
-```
-
-Four players is four `[[slot]]` blocks. One board can feed all of them; several
-boards can feed one each (give each its own `[[device]]` and alias); a mix is
-fine.
-
-Slots 5–16 exist too, but XInput only has four user indices — pads beyond four
-need `persona = "playstation"` on the slot (`ksx pads --help` explains the
-difference).
-
-Check it without touching a single driver:
-
-```powershell
-ksx run --dry-run
-```
-
-It prints the resolved plan — which preset each slot got, how many bindings it
-has, which devices may be captured and which slots they feed — and exits. Exit 2
-means the configuration does not resolve, and it says why.
-
----
-
-## 7. Play
-
-```powershell
-ksx run
-```
-
-Pads are plugged, the assigned keyboards are captured, and the escape banner is
-printed **before** any blocking starts. Press a button on the panel; the
-controller moves.
-
-Attach a game to it:
-
-```toml
-# games.toml
-[[game]]
-title = "MAME 4P"
-path = "C:\\mame\\mame.exe"
-process_name = "mame.exe"
-```
-
-```powershell
-ksx run --game "MAME 4P"
-```
-
-The game starts *after* the pads exist (a game launched earlier sees zero
-controllers), and emulation stops when it exits.
-
-For a cabinet, make it permanent:
-
-```powershell
-ksx daemon                      # tray icon; start/stop on demand
-ksx autostart --enable          # ...at every logon
-```
-
----
-
-## 8. Fix one binding
-
-You do not re-run the wizard to change one button — that is the whole point of
-having two flows (`docs/MAPPER-UX.md` commandment 3):
-
-```powershell
-ksx map --preset "P1" --function A --key G          # bind
-ksx map --preset "P1" --function A --key S --key G  # two keys, one control
-ksx map --preset "P1" --function A --clear          # unbind
-ksx map --preset "P1" --list-backups                # every write leaves one
-ksx map --preset "P1" --restore latest-backup       # undo
-```
-
-Or open the mapper and click:
-
-```powershell
-ksx studio          # then http://127.0.0.1:4460/map
-```
-
-(Studio is a compile-time feature: `cargo build -p ksx-app --features studio`.
-The default build links no web stack at all.)
-
----
-
-## When it goes wrong
-
-| Symptom | First thing to try |
-|---|---|
-| Anything at all | `ksx doctor` |
-| "refused to start", exit 2 | it printed why — usually two boards with one id, or a preset name that does not exist |
-| The wizard hears nothing | a session is running (stop it), or the panel is WinUSB-claimed (`ksx winusb status`) |
-| Keyboard stuck captured | `LeftCtrl` ×5, or `Ctrl`+`Alt`+`Del`, or kill `ksx.exe` — process death always returns the keyboards |
-| Everything is on fire | `docs/RECOVERY.md` |
-
-## Where to go next
-
-- `README.md` — the commands in full, exit codes, the driver story
-- `docs/USE-CASES.md` — which topologies are proven, which are untested
-- `docs/INPUT-TRANSFORMS.md` — chords, macros, turbo, SOCD
-- `docs/MAPPER-UX.md` — why the mapper works the way it does
-- `docs/CONTROL-SURFACE.md` — every verb, CLI and pipe and web
+Each player inherits the corresponding device choice from the saved Setup, so
+the saved game is runnable rather than an empty controller shell. Existing
+saved games can be switched, edited, rebased to the latest Setup device
+choices, or deleted entirely in Studio. Controller layouts are kept when a
+saved game is deleted.
+
+## If Setup says the background service is unavailable
+
+Close the ksx window and reopen **ksx** from the desktop or Start menu. If ksx
+is already in the notification area, choose **Open Studio** there. No terminal
+command is part of the customer recovery path.
+
+The Setup and Saved Games screens keep raw device paths and read errors inside
+**Technical details** or **Support details** disclosures. Include those details
+when reporting a problem.
+
+## What still requires physical release acceptance
+
+Automated tests prove the installer contracts, no-console launcher, empty-setup
+bootstrap, staged mapper, profile editing, and Guide bindings. They do not
+prove a clean-machine install, a real controller in a real game, Windows Game
+Bar activation, or the cabinet's long hardware soak. The exact supervised
+release checklist and its unrun status are in [`GATES.md`](GATES.md), Gate 4.
+
+Developers and maintainers should start with [`HANDOFF.md`](HANDOFF.md), then
+use [`ARCHITECTURE.md`](ARCHITECTURE.md), [`SURFACES.md`](SURFACES.md), and the
+developer CLI reference in the repository README.

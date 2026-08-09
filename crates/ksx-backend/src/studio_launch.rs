@@ -65,7 +65,10 @@ pub const PORT: u16 = 4460;
 /// "type this on your phone" is frequently the *useful* outcome, and a UI that
 /// only knows how to launch a local browser cannot offer it.
 pub fn url() -> String {
-    format!("http://127.0.0.1:{PORT}/")
+    // The product opens on the guided setup. The status dashboard remains at
+    // `/` for returning users who deliberately choose Health, but it is not a
+    // useful first screen on an unconfigured machine.
+    format!("http://127.0.0.1:{PORT}/start")
 }
 
 // ---------------------------------------------------------------------------
@@ -533,7 +536,7 @@ mod tests {
         assert_eq!(
             argv,
             vec![
-                "--app=http://127.0.0.1:4460/".to_owned(),
+                "--app=http://127.0.0.1:4460/start".to_owned(),
                 r"--user-data-dir=C:\Users\victor\AppData\Local\ksx\browser-profile".to_owned(),
                 "--no-first-run".to_owned(),
                 "--no-default-browser-check".to_owned(),
@@ -636,7 +639,7 @@ mod tests {
     /// telling the user a working address.
     #[test]
     fn the_window_opens_the_address_the_module_publishes() {
-        assert_eq!(url(), format!("http://127.0.0.1:{PORT}/"));
+        assert_eq!(url(), format!("http://127.0.0.1:{PORT}/start"));
         let argv = app_argv(&url(), Path::new(r"C:\p"));
         assert_eq!(argv[0], format!("--app={}", url()));
         assert!(argv[0].contains(&PORT.to_string()));

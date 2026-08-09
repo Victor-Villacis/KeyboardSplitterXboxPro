@@ -33,7 +33,9 @@ use crate::snapshot::ProfilesPayload;
 const LIST_SLOT_BROKEN: &str = "list:brokenRows:array";
 const LIST_SLOT_PROFILES_LIVE: &str = "list:profileRows:array";
 const LIST_SLOT_PROFILES_PLAIN: &str = "list:profileRows#2:array";
-const LIST_SLOT_PRESET_OPTIONS: &str = "list:presetOptions:array";
+const LIST_SLOT_PRESET_OPTIONS_LIVE: &str = "list:presetOptions:array";
+const LIST_SLOT_PRESET_OPTIONS_PLAIN: &str = "list:presetOptions#2:array";
+const LIST_SLOT_PRESET_OPTIONS_NEW: &str = "list:presetOptions#3:array";
 const LIST_SLOT_PRESETS: &str = "list:presetRows:array";
 const LIST_SLOT_TEMPLATES: &str = "list:templateRows:array";
 const LIST_SLOT_TEMPLATE_OPTIONS: &str = "list:templateOptions:array";
@@ -41,7 +43,85 @@ const LIST_SLOT_NOTES: &str = "list:noteRows:array";
 
 /// How many `createShow` pairs this page has; the layout test pins both the
 /// count and every name.
-const SHOW_COUNT: usize = 15;
+const SHOW_COUNT: usize = 16;
+
+/// Actions whose outcomes can be presented on Saved Games. Provider and form
+/// text never crosses this boundary: every action maps to copy owned here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProfilesAction {
+    CreateGame,
+    UpdateGame,
+    DeleteGame,
+    CreateLayout,
+    Play,
+    Stop,
+}
+
+const PROFILE_CREATE_OK: &str = "Saved game added.";
+const PROFILE_UPDATE_OK: &str = "Saved game updated.";
+const PROFILE_DELETE_OK: &str = "Saved game deleted.";
+const PROFILE_LAYOUT_OK: &str = "Controller layout created.";
+const PROFILE_PLAY_OK: &str = "Play started.";
+const PROFILE_STOP_OK: &str = "Play stopped.";
+const PROFILE_CREATE_ERROR: &str = "error: Saved game could not be added. Check the game name, program location, players, and controller layout; nothing was changed.";
+const PROFILE_UPDATE_ERROR: &str = "error: Saved game could not be updated. Refresh the page, then check its details; nothing was changed.";
+const PROFILE_DELETE_ERROR: &str =
+    "error: Saved game could not be deleted. Refresh the page and try again; nothing was changed.";
+const PROFILE_LAYOUT_ERROR: &str = "error: Controller layout could not be created. Choose a different name or starter layout; nothing was changed.";
+const PROFILE_PLAY_ERROR: &str =
+    "error: That game could not be started. Open Edit and check its program and controllers.";
+const PROFILE_STOP_ERROR: &str = "error: Play could not be stopped. Reopen ksx and try again.";
+const PROFILE_UNKNOWN_FLASH_ERROR: &str =
+    "error: Saved Games could not finish that request. Reopen ksx and try again.";
+
+const PROFILE_FLASH_ALLOWLIST: [&str; 13] = [
+    PROFILE_CREATE_OK,
+    PROFILE_UPDATE_OK,
+    PROFILE_DELETE_OK,
+    PROFILE_LAYOUT_OK,
+    PROFILE_PLAY_OK,
+    PROFILE_STOP_OK,
+    PROFILE_CREATE_ERROR,
+    PROFILE_UPDATE_ERROR,
+    PROFILE_DELETE_ERROR,
+    PROFILE_LAYOUT_ERROR,
+    PROFILE_PLAY_ERROR,
+    PROFILE_STOP_ERROR,
+    PROFILE_UNKNOWN_FLASH_ERROR,
+];
+
+/// Query strings are user-controlled, including the redirect target emitted
+/// by our own forms. Only presentation copy owned by this module is rendered.
+pub(crate) fn profiles_flash_from_query(flash: Option<&str>) -> Option<&'static str> {
+    let flash = flash?.trim();
+    if flash.is_empty() {
+        return None;
+    }
+    Some(
+        PROFILE_FLASH_ALLOWLIST
+            .into_iter()
+            .find(|safe| *safe == flash)
+            .unwrap_or(PROFILE_UNKNOWN_FLASH_ERROR),
+    )
+}
+
+/// Collapse any provider result to one action-specific customer outcome.
+pub(crate) fn profiles_action_flash(action: ProfilesAction, succeeded: bool) -> &'static str {
+    match (action, succeeded) {
+        (ProfilesAction::CreateGame, true) => PROFILE_CREATE_OK,
+        (ProfilesAction::UpdateGame, true) => PROFILE_UPDATE_OK,
+        (ProfilesAction::DeleteGame, true) => PROFILE_DELETE_OK,
+        (ProfilesAction::CreateLayout, true) => PROFILE_LAYOUT_OK,
+        (ProfilesAction::Play, true) => PROFILE_PLAY_OK,
+        (ProfilesAction::Stop, true) => PROFILE_STOP_OK,
+        (ProfilesAction::CreateGame, false) => PROFILE_CREATE_ERROR,
+        (ProfilesAction::UpdateGame, false) => PROFILE_UPDATE_ERROR,
+        (ProfilesAction::DeleteGame, false) => PROFILE_DELETE_ERROR,
+        (ProfilesAction::CreateLayout, false) => PROFILE_LAYOUT_ERROR,
+        (ProfilesAction::Play, false) => PROFILE_PLAY_ERROR,
+        (ProfilesAction::Stop, false) => PROFILE_STOP_ERROR,
+    }
+}
 
 #[cfg(test)]
 const ISLAND_COMPONENT: &str = "ProfilesIsland";
@@ -74,7 +154,7 @@ fn scalar_slots(view: &ProfilesPayload, flash: Option<&str>) -> serde_json::Valu
     let d = &view.view;
     serde_json::json!({
         "generatedAt": view.profiles.generated_at,
-        "sessionLine": view.session.line,
+        "sessionLine": d.play_status,
         "flashLine": flash.unwrap_or(""),
         "daemonCmd": d.daemon_cmd,
         "gamesPath": view.profiles.games_path,
@@ -83,8 +163,7 @@ fn scalar_slots(view: &ProfilesPayload, flash: Option<&str>) -> serde_json::Valu
         "brokenSummary": d.broken_summary,
         "presetsSummary": d.presets_summary,
         "templatesSummary": d.templates_summary,
-        // Roster included — the island used to carry it as static copy, four
-        // templates named while the registry ships six (SURFACES.md §1a).
+        // Concise intro; the complete served roster is in templateRows.
         "templatesIntro": d.templates_intro,
         // The refusal sentences themselves. Empty when the read succeeded;
         // shown by `show:profilesUnreadable` / `show:presetsUnreadable`.
@@ -106,7 +185,7 @@ fn text(value: &str) -> SlotValue {
 ///
 /// Every row was already composed by [`ProfilesDerived`]; this is the
 /// `SlotValue` shim and nothing else.
-fn list_values(view: &ProfilesPayload) -> [(&'static str, SlotValue); 8] {
+fn list_values(view: &ProfilesPayload) -> [(&'static str, SlotValue); 10] {
     let d = &view.view;
     let broken_rows = SlotValue::array(
         d.broken_rows
@@ -125,12 +204,32 @@ fn list_values(view: &ProfilesPayload) -> [(&'static str, SlotValue); 8] {
             .iter()
             .map(|g| {
                 SlotValue::object(vec![
+                    ("revision".to_owned(), text(&g.revision)),
                     ("title".to_owned(), text(&g.title)),
                     ("path".to_owned(), text(&g.path)),
+                    ("arguments".to_owned(), text(&g.arguments)),
+                    ("slots".to_owned(), text(&g.slots)),
+                    ("max_slots".to_owned(), text(&g.max_slots)),
+                    ("preset".to_owned(), text(&g.preset)),
+                    (
+                        "layout_options".to_owned(),
+                        SlotValue::array(
+                            g.layout_options
+                                .iter()
+                                .map(|option| {
+                                    SlotValue::object(vec![
+                                        ("value".to_owned(), text(&option.value)),
+                                        ("label".to_owned(), text(&option.label)),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
                     ("detail".to_owned(), text(&g.detail)),
                     ("verdict".to_owned(), text(&g.verdict)),
                     ("statecls".to_owned(), text(&g.statecls)),
                     ("statelabel".to_owned(), text(&g.statelabel)),
+                    ("play_disabled".to_owned(), SlotValue::Bool(g.play_disabled)),
                 ])
             })
             .collect(),
@@ -192,8 +291,10 @@ fn list_values(view: &ProfilesPayload) -> [(&'static str, SlotValue); 8] {
     [
         (LIST_SLOT_BROKEN, broken_rows),
         (LIST_SLOT_PROFILES_LIVE, rows.clone()),
+        (LIST_SLOT_PRESET_OPTIONS_LIVE, preset_options.clone()),
         (LIST_SLOT_PROFILES_PLAIN, rows),
-        (LIST_SLOT_PRESET_OPTIONS, preset_options),
+        (LIST_SLOT_PRESET_OPTIONS_PLAIN, preset_options.clone()),
+        (LIST_SLOT_PRESET_OPTIONS_NEW, preset_options),
         (LIST_SLOT_PRESETS, preset_rows),
         (LIST_SLOT_TEMPLATES, template_rows),
         (LIST_SLOT_TEMPLATE_OPTIONS, template_options),
@@ -225,6 +326,7 @@ fn show_values(view: &ProfilesPayload, flash: Option<&str>) -> [(&'static str, b
         ("show:pillIdle", d.pill_idle),
         ("show:pillDown", d.pill_down),
         ("show:noDaemon", d.no_daemon),
+        ("show:canStop", d.can_stop),
         ("show:flashOk", flash.is_some() && !flash_err),
         ("show:flashError", flash_err),
         ("show:anyBroken", d.any_broken),
@@ -280,6 +382,9 @@ pub(crate) fn render_profiles(
     view: &ProfilesPayload,
     flash: Option<&str>,
 ) -> PageOutput {
+    // Defence in depth: callers cannot accidentally turn this rendering seam
+    // back into a query-string reflector.
+    let flash = profiles_flash_from_query(flash);
     let payload = ProfilesPayload {
         flash: flash.map(str::to_owned),
         ..view.clone()
@@ -288,7 +393,7 @@ pub(crate) fn render_profiles(
     let slots = build_slots(&page.module, &payload, flash);
     let prefix = body_prefix(&payload, "/profiles");
     with_icon_links(render_page(&PageConfig {
-        title: "ksx Studio — profiles & presets",
+        title: "ksx Studio — saved games",
         route_pattern: "/profiles",
         manifest: &page.manifest,
         config_script: None,
@@ -318,6 +423,7 @@ mod tests {
                 games_path: "C:\\cfg\\ksx\\games.toml".into(),
                 profiles: vec![
                     ProfileDetail {
+                        revision: "g1-sf".into(),
                         title: "Street Fighter".into(),
                         path: "C:\\games\\sf.exe".into(),
                         arguments: String::new(),
@@ -328,6 +434,7 @@ mod tests {
                         broken_path: None,
                     },
                     ProfileDetail {
+                        revision: "g1-mame".into(),
                         title: "MAME 4P".into(),
                         path: "D:\\emu\\mame\\mame.exe".into(),
                         arguments: String::new(),
@@ -340,6 +447,7 @@ mod tests {
                         broken_path: Some("D:\\emu\\mame\\mame.exe".into()),
                     },
                     ProfileDetail {
+                        revision: "g1-steam".into(),
                         title: "Steam".into(),
                         path: "steam://rungameid/620".into(),
                         arguments: String::new(),
@@ -360,6 +468,8 @@ mod tests {
                         bound: 25,
                         macros: 1,
                         protected: false,
+                        usable: true,
+                        problem: None,
                         source: "C:\\cfg\\ksx\\presets\\Arcade.toml".into(),
                     },
                     PresetRow {
@@ -367,6 +477,8 @@ mod tests {
                         bound: 20,
                         macros: 0,
                         protected: true,
+                        usable: true,
+                        problem: None,
                         source: "default".into(),
                     },
                 ],
@@ -448,8 +560,10 @@ mod tests {
             [
                 LIST_SLOT_BROKEN,
                 LIST_SLOT_PROFILES_LIVE,
+                LIST_SLOT_PRESET_OPTIONS_LIVE,
                 LIST_SLOT_PROFILES_PLAIN,
-                LIST_SLOT_PRESET_OPTIONS,
+                LIST_SLOT_PRESET_OPTIONS_PLAIN,
+                LIST_SLOT_PRESET_OPTIONS_NEW,
                 LIST_SLOT_PRESETS,
                 LIST_SLOT_TEMPLATES,
                 LIST_SLOT_TEMPLATE_OPTIONS,
@@ -509,36 +623,108 @@ mod tests {
         );
     }
 
-    /// THE regression this page exists for: a profile whose .exe is gone is
-    /// visible as broken, with the exact path, before anything is launched.
+    /// A saved game whose program is gone is actionable before Play without
+    /// putting a machine path in the primary warning copy.
     #[test]
-    fn a_broken_profile_names_the_path_that_is_wrong() {
+    fn a_broken_game_is_actionable_without_exposing_its_path_in_the_alarm() {
         let out = render_profiles(&page(), &sample(), None);
         assert!(out.html.contains("data-forma-ssr"), "{}", out.html);
-        assert!(out.html.contains("Broken profiles"), "{}", out.html);
         assert!(
-            out.html
-                .contains("1 profile points at a program that is not there:"),
+            out.html.contains("Games that need attention"),
             "{}",
             out.html
         );
-        // The path is in the ALARM CARD ITSELF, not merely somewhere on the
-        // page: "MAME 4P is broken" with the string printed two cards further
-        // down is a second search, which is the state this page replaced.
+        assert!(
+            out.html
+                .contains("1 saved game points at a program that is not there:"),
+            "{}",
+            out.html
+        );
         let card = out
             .html
-            .split_once("Broken profiles")
+            .split_once("Games that need attention")
             .and_then(|(_, rest)| rest.split_once("</section>"))
             .map(|(card, _)| card)
             .expect("the broken card");
         assert!(card.contains("MAME 4P"), "{card}");
-        assert!(card.contains("D:\\emu\\mame\\mame.exe"), "{card}");
-        assert!(card.contains("which does not exist"), "{card}");
-        // …and the games.toml path, because "fix it" is not actionable
-        // without the file it is in.
-        assert!(card.contains("C:\\cfg\\ksx\\games.toml"), "{card}");
+        assert!(card.contains("The program could not be found"), "{card}");
+        assert!(!card.contains("D:\\emu\\mame\\mame.exe"), "{card}");
         // The healthy profile is not in the alarm card.
         assert!(!card.contains("Street Fighter"), "{card}");
+
+        // The actual value remains in the affected row's Edit form, where it
+        // can be corrected without asking the customer to locate a config
+        // file or copy a path out of an alarm.
+        let row = ssr_body(&out.html)
+            .split(r#"<li class="profile-row">"#)
+            .skip(1)
+            .filter_map(|rest| rest.split_once("</li>").map(|(row, _)| row))
+            .find(|row| row.contains("MAME 4P"))
+            .expect("MAME edit row");
+        assert!(row.contains(r#"value="D:\emu\mame\mame.exe""#), "{row}");
+        assert!(row.contains("Play game</button>"), "{row}");
+        assert!(row.contains("disabled"), "{row}");
+    }
+
+    /// Edit selects must preserve each row independently. The compiler cannot
+    /// connect a list nested over `row.layout_options` to its per-row array,
+    /// so the authored component renders one hidden selected current option
+    /// and follows it with the shared valid-layout choices.
+    #[test]
+    fn edit_selects_preserve_two_distinct_current_layouts_for_ssr_and_hydration() {
+        let mut view = sample();
+        view.profiles.profiles[0].presets = vec!["Arcade".into()];
+        view.profiles.profiles[2].presets = vec!["default".into()];
+        let out = render_profiles(&page(), &view, None);
+        let body = ssr_body(&out.html);
+
+        for (title, current) in [("Street Fighter", "Arcade"), ("Steam", "default")] {
+            let row = body
+                .split(r#"<li class="profile-row">"#)
+                .skip(1)
+                .filter_map(|rest| rest.split_once("</li>").map(|(row, _)| row))
+                .find(|row| row.contains(title))
+                .unwrap_or_else(|| panic!("missing {title} row: {body}"));
+            let select = row
+                .split_once("<select")
+                .and_then(|(_, rest)| rest.split_once("</select>"))
+                .map(|(select, _)| select)
+                .unwrap_or_else(|| panic!("missing edit select in {title}: {row}"));
+            let selected = select
+                .split("<option")
+                .skip(1)
+                .filter_map(|option| option.split_once("</option>").map(|(option, _)| option))
+                .find(|option| option.contains("selected"))
+                .unwrap_or_else(|| panic!("no selected option in {title}: {select}"));
+            assert!(selected.contains("hidden"), "{title}: {selected}");
+            assert!(
+                selected.contains(&format!(r#"value="{current}""#)),
+                "{title}: {selected}"
+            );
+        }
+
+        let island_json = out
+            .html
+            .split_once(r#"<script id="__forma_islands" type="application/json">"#)
+            .and_then(|(_, rest)| rest.split_once("</script>"))
+            .map(|(json, _)| json)
+            .expect("island props block");
+        let props: serde_json::Value = serde_json::from_str(island_json).expect("island props");
+        assert_eq!(
+            props.pointer("/0/list:profileRows:array/0/preset"),
+            Some(&serde_json::json!("Arcade"))
+        );
+        assert_eq!(
+            props.pointer("/0/list:profileRows:array/2/preset"),
+            Some(&serde_json::json!("default"))
+        );
+        assert!(
+            props
+                .pointer("/0/list:presetOptions:array")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|options| options.len() == 2),
+            "{props}"
+        );
     }
 
     /// A `steam://` profile is never green: preflight cannot resolve it, so
@@ -601,7 +787,11 @@ mod tests {
         let mut view = sample();
         view.profiles.profiles.retain(|p| p.state != "broken");
         let out = render_profiles(&page(), &view, None);
-        assert!(!out.html.contains("Broken profiles"), "{}", out.html);
+        assert!(
+            !out.html.contains("Games that need attention"),
+            "{}",
+            out.html
+        );
     }
 
     /// The create forms are the answer to "I can't create a new profile", so
@@ -701,26 +891,36 @@ mod tests {
         let mut view = sample();
         view.session = SessionView::unreachable("no daemon answered the control channel");
         let out = render_profiles(&page(), &view, None);
+        let body = ssr_body(&out.html);
+        assert!(!body.contains(r#"action="/profiles/switch""#), "{body}");
+        assert!(body.contains(r#"action="/profiles/new""#), "{body}");
         assert!(
-            !out.html.contains(r#"action="/profiles/switch""#),
-            "{}",
-            out.html
+            body.contains("The background service is not responding"),
+            "{body}"
         );
-        assert!(out.html.contains(r#"action="/profiles/new""#));
-        assert!(out.html.contains(crate::render::NO_DAEMON_HEADLINE));
+        assert!(
+            body.contains("You can still create or edit saved games"),
+            "{body}"
+        );
     }
 
-    /// The flash is attacker-writable (it arrives from a query string) and is
-    /// rendered escaped, on this page like every other.
+    /// The flash is attacker-writable (it arrives from a query string).
+    /// Escaping is not enough: internal but HTML-safe prose is replaced too.
     #[test]
-    fn a_hostile_flash_is_escaped() {
+    fn a_hostile_flash_is_replaced_with_owned_copy() {
         let out = render_profiles(
             &page(),
             &sample(),
-            Some(r#"error: <script>alert("x")</script>"#),
+            Some(r#"error: daemon C:\secret\games.toml --preset slot CLI"#),
         );
-        assert!(!out.html.contains("<script>alert"), "{}", out.html);
-        assert!(out.html.contains("&lt;script&gt;"), "{}", out.html);
+        assert!(!out.html.contains("C:\\secret"), "{}", out.html);
+        assert!(!out.html.contains("--preset"), "{}", out.html);
+        assert!(
+            out.html
+                .contains("Saved Games could not finish that request"),
+            "{}",
+            out.html
+        );
     }
 
     /// One struct, one serializer: the block the page embeds is the shape
@@ -747,12 +947,14 @@ mod tests {
     /// The nav is static markup per island, so a sibling page is invisible
     /// until every island lists it. Pin this page's own links.
     #[test]
-    fn the_nav_reaches_both_siblings() {
+    fn the_nav_reaches_the_product_workflow() {
         let out = render_profiles(&page(), &sample(), None);
-        assert!(out.html.contains(r#"href="/""#), "{}", out.html);
-        assert!(out.html.contains(r#"href="/map""#), "{}", out.html);
-        assert!(out.html.contains(r#"href="/pads""#), "{}", out.html);
-        assert!(out.html.contains(r#"aria-current="page""#), "{}", out.html);
+        let body = ssr_body(&out.html);
+        for route in ["/start", "/map", "/check"] {
+            assert!(body.contains(&format!(r#"href="{route}""#)), "{body}");
+        }
+        assert!(body.contains(r#"aria-current="page""#), "{body}");
+        assert!(body.contains(">Games</span>"), "{body}");
     }
 
     #[test]
@@ -761,22 +963,19 @@ mod tests {
         crate::render::assert_complete_head("/profiles", &out.html);
     }
 
-    /// A read that refused renders as a NOTE beside an empty list, never as an
-    /// empty list on its own — "no profiles" and "games.toml is unreadable"
-    /// are not the same sentence.
+    /// Config-read notes remain available under the consumer-facing support
+    /// disclosure; moving the diagnostic out of the primary workflow must not
+    /// swallow it.
     #[test]
-    fn a_refused_read_is_rendered_not_swallowed() {
+    fn config_read_notes_are_rendered_not_swallowed() {
         let view = ProfilesPayload {
             notes: vec!["games.toml could not be read: expected `=` at line 4".into()],
             ..ProfilesPayload::default()
         };
         let out = render_profiles(&page(), &view, None);
-        assert!(
-            out.html.contains("Notes from the config read"),
-            "{}",
-            out.html
-        );
-        assert!(out.html.contains("expected `=` at line 4"));
+        let body = ssr_body(&out.html);
+        assert!(body.contains("Support details"), "{body}");
+        assert!(body.contains("expected `=` at line 4"), "{body}");
     }
 
     /// A REFUSED read must not render as an assertion of absence.
@@ -795,33 +994,37 @@ mod tests {
     #[test]
     fn a_read_that_refused_never_says_there_is_nothing_here() {
         let view = ProfilesPayload {
-            profiles_error: Some("games.toml could not be read: expected `=` at line 4".into()),
-            presets_error: Some("the presets folder could not be read: access denied".into()),
+            profiles_error: Some("Saved games could not be read. Reopen ksx and try again.".into()),
+            presets_error: Some(
+                "Controller layouts could not be read. Reopen ksx and try again.".into(),
+            ),
             session: idle_session(),
             ..ProfilesPayload::default()
         };
         let out = render_profiles(&page(), &view, None);
+        let body = ssr_body(&out.html);
 
-        // NOT the count sentences. These are the exact strings the shipped
-        // version printed for this payload.
+        // NOT the successful-read empty states. A read that never completed
+        // cannot assert that either saved collection is empty.
         assert!(
-            !out.html.contains("no profiles in games.toml"),
-            "a failed read rendered as 'you have no profiles': {}",
-            out.html
+            !body.contains("No saved profiles yet."),
+            "a failed read rendered as 'you have no profiles': {body}"
         );
         assert!(
-            !out.html.contains("no presets on disk"),
-            "a failed read rendered as 'you have no presets': {}",
-            out.html
+            !body.contains("No controller layouts yet."),
+            "a failed read rendered as 'you have no controller layouts': {body}"
         );
-        // …the refusal itself, in the card it is about.
+        // …the two refusals themselves, in the cards they are about.
         assert!(
-            out.html.contains("could NOT be read"),
-            "the failure must be stated where the list would have been: {}",
-            out.html
+            body.contains("Saved games could not be read"),
+            "the profile failure must be stated where its list would have been: {body}"
         );
-        assert!(out.html.contains("expected `=` at line 4"), "{}", out.html);
-        assert!(out.html.contains("access denied"), "{}", out.html);
+        assert!(
+            body.contains("Controller layouts could not be read"),
+            "the layout failure must be stated where its list would have been: {body}"
+        );
+        assert!(!body.contains("games.toml"), "{body}");
+        assert!(!body.contains("access denied"), "{body}");
     }
 
     /// The presets half of the same failure, which was the worse one: a
@@ -840,26 +1043,23 @@ mod tests {
             ..ProfilesPayload::default()
         };
         let out = render_profiles(&page(), &view, None);
+        let body = ssr_body(&out.html);
         assert!(
-            !out.html
-                .contains("Make a preset from an in-box template below"),
-            "a failed presets read must not send the user to the template \
-             form — its <select> is empty for the same reason: {}",
-            out.html
+            !body.contains("Make one from a starter layout below first"),
+            "a failed layouts read must not send the user to the starter-layout \
+             form — its <select> is empty for the same reason: {body}"
         );
         assert!(
-            !out.html.contains(r#"action="/profiles/preset/new""#),
-            "the template form must be withheld when the read that fills it \
-             refused: {}",
-            out.html
+            !body.contains(r#"action="/profiles/preset/new""#),
+            "the starter-layout form must be withheld when the read that fills it \
+             refused: {body}"
         );
         assert!(
-            !out.html.contains(r#"action="/profiles/new""#),
-            "and so must the profile form, whose preset <select> is the same \
-             list: {}",
-            out.html
+            !body.contains(r#"action="/profiles/new""#),
+            "and so must the profile form, whose controller-layout <select> is \
+             the same list: {body}"
         );
-        assert!(out.html.contains("access denied"), "{}", out.html);
+        assert!(body.contains("access denied"), "{body}");
 
         // The control: presets that genuinely ARE empty still get the
         // actionable empty state and the template form. Without this the
@@ -869,17 +1069,12 @@ mod tests {
             ..ProfilesPayload::default()
         };
         let out = render_profiles(&page(), &empty, None);
+        let body = ssr_body(&out.html);
         assert!(
-            out.html
-                .contains("Make a preset from an in-box template below"),
-            "{}",
-            out.html
+            body.contains("Make one from a starter layout below first"),
+            "{body}"
         );
-        assert!(
-            out.html.contains(r#"action="/profiles/preset/new""#),
-            "{}",
-            out.html
-        );
+        assert!(body.contains(r#"action="/profiles/preset/new""#), "{body}");
     }
 
     /// The in-box templates are LISTED, with the panel note that identifies
@@ -897,7 +1092,7 @@ mod tests {
         // whole-document `contains` would have passed against the version
         // that rendered neither.
         let body = ssr_body(&out.html);
-        assert!(body.contains("2 in-box templates:"), "{body}");
+        assert!(body.contains("2 starter layouts"), "{body}");
         assert!(
             body.contains("Two people on one ordinary keyboard, no encoder"),
             "the panel note is the point of the list: {body}"
@@ -914,7 +1109,8 @@ mod tests {
             ..ProfilesPayload::default()
         };
         let out = render_profiles(&page(), &empty, None);
-        assert!(!out.html.contains("0 in-box templates:"), "{}", out.html);
-        assert!(out.html.contains("no in-box templates"), "{}", out.html);
+        let body = ssr_body(&out.html);
+        assert!(!body.contains("0 starter layouts"), "{body}");
+        assert!(body.contains("No starter layouts are available."), "{body}");
     }
 }

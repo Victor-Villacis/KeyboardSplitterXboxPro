@@ -68,6 +68,12 @@ pub enum Request {
     /// Boxed because [`crate::StageEdit::SetBindings`] carries a whole preset
     /// table, and an enum is as wide as its widest arm.
     StageEdit(Box<crate::StageEdit>),
+    /// One binding-row edit against an exact staged slot. Selection,
+    /// cross-slot conflict detection, and application are one daemon
+    /// transaction rather than a `stage` read followed by `stage-edit`.
+    StageBind(Box<crate::StagedBindRequest>),
+    /// The macro counterpart of [`Self::StageBind`].
+    StageMacro(Box<crate::StagedMacroRequest>),
     /// **Save** the staged setup. The one staging verb that writes.
     StageCommit,
     /// **Play** the staged setup, with nothing written.
@@ -93,6 +99,8 @@ impl Request {
             Self::SlotAssign(_) => "slot-assign",
             Self::Stage => "stage",
             Self::StageEdit(_) => "stage-edit",
+            Self::StageBind(_) => "stage-bind",
+            Self::StageMacro(_) => "stage-macro",
             Self::StageCommit => "stage-commit",
             Self::StagePlay => "stage-play",
             Self::LearnKey => "learn-key",
@@ -626,7 +634,11 @@ impl Response {
                 Self::Action(serde_json::from_value(value).map_err(read(verb))?)
             }
             Request::Map(_) => Self::Map(serde_json::from_value(value).map_err(read(verb))?),
+            Request::StageBind(_) => Self::Map(serde_json::from_value(value).map_err(read(verb))?),
             Request::MapMacro(_) => Self::Macro(serde_json::from_value(value).map_err(read(verb))?),
+            Request::StageMacro(_) => {
+                Self::Macro(serde_json::from_value(value).map_err(read(verb))?)
+            }
             Request::MapRestore(_) | Request::MapClearAll(_) => {
                 Self::Restore(serde_json::from_value(value).map_err(read(verb))?)
             }

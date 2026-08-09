@@ -24,9 +24,9 @@ import {
   clearSelection,
   closeModal,
   currentBinding,
-  currentPreset,
   currentSlot,
   dismissToast,
+  editingStage,
   holdToasts,
   identityLabel,
   isMultiMode,
@@ -93,6 +93,7 @@ import {
   type MacroOutcome,
   type MacroView,
   type MapPayload,
+  type MapperSlot,
   type ToastOptions,
 } from "./MapIsland";
 
@@ -108,6 +109,60 @@ const LEARN_POLL_MS = 33;
 const LEARN_TOTAL_MS = 10_000;
 
 type Json = Record<string, unknown>;
+
+/** One immutable destination captured when an action begins. Async writes and
+ * their later Undo must never consult the currently selected tab: the user is
+ * free to keep browsing while a request is in flight. */
+interface WriteTarget {
+  kind: "saved" | "stage";
+  slot: number;
+  preset: string;
+  /** The slot snapshot at action creation, used for read-modify-write inputs. */
+  view: MapperSlot;
+}
+
+function captureWriteTarget(): WriteTarget | null {
+  const slot = currentSlot();
+  if (!slot) return null;
+  return {
+    kind: editingStage() ? "stage" : "saved",
+    slot: slot.number,
+    preset: slot.preset,
+    view: slot,
+  };
+}
+
+/** Route a write to the destination captured at action creation. */
+function targetFields(target: WriteTarget): Json {
+  return target.kind === "stage" ? { target: "stage", slot: target.slot } : {};
+}
+
+function targetMapUrl(target: WriteTarget): string {
+  const stage = target.kind === "stage" ? "target=stage&" : "";
+  return `/api/map?${stage}slot=${encodeURIComponent(String(target.slot))}`;
+}
+
+/** Re-read the destination an action captured without changing which tab the
+ * user is looking at now. Multi-write reporting and Undo eligibility must be
+ * based on this payload, not on global selection after an await. */
+async function readWriteTarget(target: WriteTarget): Promise<MapPayload | null> {
+  try {
+    return await fetchJSON<MapPayload>(targetMapUrl(target));
+  } catch {
+    return null;
+  }
+}
+
+function payloadKeys(payload: MapPayload, target: WriteTarget, fn: string): string[] {
+  if (fn.startsWith("macro.")) {
+    const name = fn.slice("macro.".length);
+    return (
+      payload.macros.macros.find((mac) => mac.name.toLowerCase() === name.toLowerCase())?.triggers ??
+      []
+    );
+  }
+  return payload.mapper.slots.find((slot) => slot.number === target.slot)?.bindings[fn] ?? [];
+}
 
 interface VerbOutcome {
   ok: boolean;
@@ -128,7 +183,12 @@ async function poll(): Promise<void> {
     // Everything else in the payload is slot-independent, so this is the only
     // parameter the poller needs.
     const slot = currentSlot();
-    const url = slot ? `/api/map?slot=${encodeURIComponent(String(slot.number))}` : "/api/map";
+    const target = editingStage() ? "target=stage&" : "";
+    const url = slot
+      ? `/api/map?${target}slot=${encodeURIComponent(String(slot.number))}`
+      : editingStage()
+        ? "/api/map?target=stage"
+        : "/api/map";
     applyMap(await fetchJSON<MapPayload>(url));
   } catch {
     applyMapUnreachable();
@@ -168,6 +228,18 @@ function oops(text: string): string {
   return pushToast(text, { kind: "err" });
 }
 
+/** Provider text is diagnostic input, not customer copy. Controls presents
+ * action-specific authored text and reads structured conflict/chord fields
+ * separately; arbitrary paths, hardware IDs and parser errors never cross
+ * this boundary, even when they do not contain a familiar technical noun. */
+function safeDetail(_raw: string | null | undefined, fallback: string): string {
+  return fallback;
+}
+
+function bindFailure(outcome: BindOutcome): string {
+  return safeDetail(outcome.error, "That control could not be changed. Nothing changed.");
+}
+
 /** The daemon's chord advisory, sharpened.
  *
  *  `ksx map` reports a chord whose constituent key is ALSO bound on its own
@@ -183,12 +255,15 @@ const CHORD_FLASH_RISK =
   "receives that press and can act on it — the light punch comes out before " +
   "the chord lands.";
 
-/** The daemon's own note (from "note:" on) plus the risk framing, or "". */
+/** An authored explanation when the typed write carries the chord marker.
+ * The provider message is used only as a boolean signal; none of its key,
+ * hardware, path, or parser text is copied into customer UI. */
 function chordAdvisory(message: string | null): string {
   if (!message || !message.includes(CHORD_FLASH_MARK)) return "";
-  const at = message.indexOf("note:");
-  const note = at >= 0 ? message.slice(at + "note:".length).trim() : message;
-  return ` Heads up: ${note}.${CHORD_FLASH_RISK}`;
+  return (
+    " Heads up: one key in this chord also starts a control on its own before the chord is complete." +
+    CHORD_FLASH_RISK
+  );
 }
 
 /** Put one control back on the exact key LIST it held before — the undo of
@@ -196,14 +271,14 @@ function chordAdvisory(message: string | null): string {
  *  writer that takes a whole set. Whether the offer is made at all is
  *  [`writableKeys`]'s call, made before the toast is pushed. */
 function undoOneBinding(
-  preset: string,
+  target: WriteTarget,
   fn: string,
   keys: string[],
 ): () => Promise<string | null> {
   return async () => {
-    const outcome = await bindKeys(preset, fn, keys, true);
+    const outcome = await bindKeys(target, fn, keys, true);
     if (!outcome.ok) {
-      return outcome.error ?? outcome.code ?? "the daemon refused the write";
+      return bindFailure(outcome);
     }
     markSaved();
     await poll();
@@ -211,26 +286,18 @@ function undoOneBinding(
   };
 }
 
-/** The sentence a toast adds when the edit LANDED but cannot be taken back —
- *  because putting the control's old keys back would need a multi-key write
- *  this daemon has no shape for. Named once: it is the only honest reason an
- *  Undo button is missing from a successful single-control edit. */
-const NO_UNDO_MULTI =
-  " (Putting several keys back is one write this daemon's map verb cannot make, " +
-  "so there is no Undo here — the Preset card's restore options are the way back.)";
-
 /** The toast options for a single-control edit: an Undo when the previous key
  *  list can honestly be restored, and nothing pretending otherwise when it
  *  cannot. */
 function undoOptions(
-  preset: string,
+  target: WriteTarget,
   fn: string,
   before: string[],
   name: string,
 ): ToastOptions {
   if (!writableKeys(before)) return {};
   return {
-    undo: undoOneBinding(preset, fn, before),
+    undo: undoOneBinding(target, fn, before),
     undone:
       before.length === 0
         ? `${name} is unbound again.`
@@ -238,40 +305,17 @@ function undoOptions(
   };
 }
 
-/** The same, for a whole group: every affected control back to its own
- *  previous key, in one batch. Partial failure is REPORTED, never swallowed. */
-function undoGroup(
-  preset: string,
-  before: Map<string, string[]>,
-): () => Promise<string | null> {
-  return async () => {
-    const failed: string[] = [];
-    for (const [fn, keys] of before) {
-      const outcome = await bindKeys(preset, fn, keys, true);
-      if (!outcome.ok) {
-        failed.push(`${identityLabel(fn)} (${outcome.error ?? outcome.code ?? "refused"})`);
-      }
-    }
-    markSaved();
-    await poll();
-    return failed.length === 0 ? null : `could not put back ${failed.join("; ")}`;
-  };
-}
-
-/** A group can only be undone if every control in it can be written back as
- *  it was ([`writableKeys`]) — otherwise one member would come back with half
- *  its keys, and a half-true Undo is worse than none. */
-function groupUndoable(before: Map<string, string[]>): boolean {
-  return Array.from(before.values()).every(writableKeys);
-}
-
 /** The undo of a whole-preset write: restore the backup it just took. Only
  *  offered when a backup is actually on disk (checked against the poll that
  *  follows the action) — an Undo that might lie is not offered at all. */
-function undoFromBackup(preset: string): () => Promise<string | null> {
+function undoFromBackup(target: WriteTarget): () => Promise<string | null> {
   return async () => {
-    const out = await verb("/api/preset/restore", { preset, mode: "latest-backup" });
-    if (!out.ok) return out.error ?? "the daemon refused the restore";
+    const out = await verb("/api/preset/restore", {
+      ...targetFields(target),
+      preset: target.preset,
+      mode: "latest-backup",
+    });
+    if (!out.ok) return safeDetail(out.error, "That recovery point could not be restored.");
     markSaved();
     await poll();
     return null;
@@ -290,12 +334,19 @@ function undoFromBackup(preset: string): () => Promise<string | null> {
 /** What the armed learn will write to. Empty = nothing armed, one entry = the
  *  single rebind, several = "map all to one key". */
 let learnTargets: string[] = [];
+/** Destination and pre-action bindings captured with the armed learner. */
+let learnWrite:
+  | { target: WriteTarget; before: Map<string, string[]> }
+  | null = null;
 /** Supersede guard. The single-fn flow could compare `learningFn` by value;
  *  a list cannot, so every arm bumps a generation and late polls check it. */
 let learnGen = 0;
 let learnTimer: number | undefined;
 /** The hit waiting on the conflict dialog's verdict. */
 let pendingKey: string | null = null;
+let pendingWrite:
+  | { target: WriteTarget; fn: string; before: string[] }
+  | null = null;
 /** What the next captured key DOES to a control that already has one.
  *
  *  "replace" is the default on every arm, deliberately: it is what every
@@ -376,9 +427,19 @@ async function startLearn(fns: string[]): Promise<void> {
     await cancelLearn();
     return;
   }
+  const target = captureWriteTarget();
+  if (!target) {
+    oops("No controller is selected, so there is nowhere to save that key.");
+    return;
+  }
   learnTargets = fns;
+  learnWrite = {
+    target,
+    before: new Map(fns.map((fn) => [fn, previousKeys(fn)])),
+  };
   const gen = ++learnGen;
   pendingKey = null;
+  pendingWrite = null;
   learnMode = "replace";
   selectFn(fns[0]);
   armFocusGuard();
@@ -387,8 +448,11 @@ async function startLearn(fns: string[]): Promise<void> {
     if (learnGen !== gen) return; // superseded while the POST was in flight
     if (started.state !== "listening") {
       learnTargets = [];
+      learnWrite = null;
       disarmFocusGuard();
-      oops(`Can't listen for a key: ${started.error ?? `learn refused (${started.state})`}.`);
+      oops(
+        `Can't listen for a key: ${safeDetail(started.error, "automatic key listening is not ready")}.`,
+      );
       return;
     }
     const single = fns.length === 1;
@@ -406,13 +470,13 @@ async function startLearn(fns: string[]): Promise<void> {
     showLearnTurbo(single ? fns[0] : null);
     const box = islandRoot?.querySelector<HTMLInputElement>(".mturboin");
     if (box) {
-      const slot = currentSlot();
-      box.value = single && slot ? String(turboHzOf(slot, fns[0]) ?? "") : "";
+      box.value = single ? String(turboHzOf(target.view, fns[0]) ?? "") : "";
     }
     stopLearnTimer();
     learnTimer = window.setInterval(() => void pollLearn(), LEARN_POLL_MS);
   } catch {
     learnTargets = [];
+    learnWrite = null;
     disarmFocusGuard();
     oops("Can't listen for a key: the request failed — is ksx studio still running?");
   }
@@ -420,6 +484,7 @@ async function startLearn(fns: string[]): Promise<void> {
 
 async function pollLearn(): Promise<void> {
   const targets = learnTargets;
+  const write = learnWrite;
   const gen = learnGen;
   if (targets.length === 0) {
     stopLearnTimer();
@@ -440,18 +505,29 @@ async function pollLearn(): Promise<void> {
     case "hit":
       stopLearnTimer();
       learnTargets = [];
+      learnWrite = null;
       disarmFocusGuard();
       closeModal();
-      if (learn.key) {
-        if (targets.length !== 1) await mapAll(targets, learn.key);
+      if (learn.key && write) {
+        if (targets.length !== 1) await mapAll(targets, learn.key, write.target, write.before);
         // The modal's own choice: join the control's key list, or take it over.
-        else if (learnMode === "add") await addKey(targets[0], learn.key);
-        else await saveBinding(targets[0], learn.key, false);
+        else if (learnMode === "add") {
+          await addKey(targets[0], learn.key, write.target, write.before.get(targets[0]) ?? []);
+        } else {
+          await saveBinding(
+            targets[0],
+            learn.key,
+            false,
+            write.target,
+            write.before.get(targets[0]) ?? [],
+          );
+        }
       }
       break;
     case "timeout":
       stopLearnTimer();
       learnTargets = [];
+      learnWrite = null;
       disarmFocusGuard();
       closeModal();
       oops(`Timed out: no key was pressed within 10 s for ${names}. Nothing changed.`);
@@ -459,6 +535,7 @@ async function pollLearn(): Promise<void> {
     case "cancelled":
       stopLearnTimer();
       learnTargets = [];
+      learnWrite = null;
       disarmFocusGuard();
       closeModal();
       break;
@@ -466,9 +543,12 @@ async function pollLearn(): Promise<void> {
       // failed / unavailable / idle-after-restart: report and stop.
       stopLearnTimer();
       learnTargets = [];
+      learnWrite = null;
       disarmFocusGuard();
       closeModal();
-      oops(`The learner stopped: ${learn.error ?? `learn ${learn.state}`}. Nothing changed.`);
+      oops(
+        `Key listening stopped: ${safeDetail(learn.error, "the background helper stopped listening")}. Nothing changed.`,
+      );
       break;
   }
 }
@@ -476,8 +556,10 @@ async function pollLearn(): Promise<void> {
 async function cancelLearn(): Promise<void> {
   stopLearnTimer();
   learnTargets = [];
+  learnWrite = null;
   learnGen += 1;
   pendingKey = null;
+  pendingWrite = null;
   learnMode = "replace";
   disarmFocusGuard();
   closeModal();
@@ -491,7 +573,7 @@ async function cancelLearn(): Promise<void> {
 /** One `map` write. Transport failure is folded into the same shape so no
  *  caller can forget it — the multi-write loop below depends on that. */
 async function bindOnce(
-  preset: string,
+  target: WriteTarget,
   fn: string,
   key: string | null,
   force: boolean,
@@ -501,7 +583,8 @@ async function bindOnce(
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        preset,
+        ...targetFields(target),
+        preset: target.preset,
         function: fn,
         key,
         force,
@@ -532,7 +615,7 @@ async function bindOnce(
  *  set of two or more comes back as an honest refusal instead of a write that
  *  drops keys. Same never-throws shape as [`bindOnce`]. */
 async function bindKeys(
-  preset: string,
+  target: WriteTarget,
   fn: string,
   keys: string[],
   force: boolean,
@@ -546,7 +629,8 @@ async function bindKeys(
       // about", which is what leaves an existing rate alone — so "Add another
       // key" cannot silently switch a control's auto-fire off. 0 clears it.
       body: JSON.stringify({
-        preset,
+        ...targetFields(target),
+        preset: target.preset,
         function: fn,
         keys,
         force,
@@ -580,8 +664,8 @@ function modalTurboInput(): number | null {
  *  because a rate is a binding property and losing one to a mis-tap must be as
  *  recoverable as losing a key. */
 async function setTurbo(fn: string, hz: number | null): Promise<void> {
-  const slot = currentSlot();
-  if (!slot) return;
+  const target = captureWriteTarget();
+  if (!target) return;
   if (hz === null) {
     pushToast(
       "Type a number of presses a second first — or press “No turbo” to switch it off.",
@@ -597,10 +681,12 @@ async function setTurbo(fn: string, hz: number | null): Promise<void> {
     });
     return;
   }
-  const before = turboHzOf(slot, fn) ?? 0;
-  const outcome = await bindKeys(slot.preset, fn, keys, false, hz);
+  const before = turboHzOf(target.view, fn) ?? 0;
+  const outcome = await bindKeys(target, fn, keys, false, hz);
   if (!outcome.ok) {
-    pushToast(outcome.error ?? `could not set turbo on ${name}`, { kind: "error" });
+    pushToast(safeDetail(outcome.error, `Could not set auto-fire on ${name}. Nothing changed.`), {
+      kind: "error",
+    });
     return;
   }
   const effective = outcome.turbo_effective_hz ?? null;
@@ -609,12 +695,12 @@ async function setTurbo(fn: string, hz: number | null): Promise<void> {
       ? `${name} no longer auto-fires.`
       : effective !== null && effective !== hz
         ? `${name} auto-fires at about ${effective} Hz — ${hz} Hz was asked for, but a press ` +
-          "AND a release must each survive a 60 Hz poll."
+          "and a release both need enough time for the game to notice them."
         : `${name} auto-fires at ${hz} Hz.`;
   pushToast(line, {
     kind: "ok",
     undo: async () => {
-      await bindKeys(slot.preset, fn, keys, false, before);
+      await bindKeys(target, fn, keys, false, before);
       await poll();
     },
   });
@@ -627,10 +713,14 @@ async function setTurbo(fn: string, hz: number | null): Promise<void> {
  *  docs/INPUT-TRANSFORMS.md §1a). `force` is true for the same reason the
  *  multi-select arm forces: this is a DELIBERATE fan-out, and force removes
  *  nothing from anybody — it only says yes to a cross-slot duplicate. */
-async function addKey(fn: string, key: string): Promise<void> {
-  const slot = currentSlot();
-  if (!slot) return;
-  const before = previousKeys(fn);
+async function addKey(
+  fn: string,
+  key: string,
+  target: WriteTarget | null = captureWriteTarget(),
+  capturedBefore?: string[],
+): Promise<void> {
+  if (!target) return;
+  const before = capturedBefore ?? previousKeys(fn);
   const name = identityLabel(fn);
   if (before.some((k) => k.toLowerCase() === key.toLowerCase())) {
     pushToast(`${name} already has ${key} — nothing to add.`, { kind: "warn" });
@@ -638,20 +728,19 @@ async function addKey(fn: string, key: string): Promise<void> {
     return;
   }
   const after = [...before, key];
-  const outcome = await bindKeys(slot.preset, fn, after, true);
+  const outcome = await bindKeys(target, fn, after, true);
   if (!outcome.ok) {
-    oops(`${name} was not changed: ${outcome.error ?? "the daemon refused the write"}`);
+    oops(`${name} was not changed: ${bindFailure(outcome)}`);
     void poll();
     return;
   }
   markSaved();
-  const opts = undoOptions(slot.preset, fn, before, name);
+  const opts = undoOptions(target, fn, before, name);
   let line =
     after.length > 1
       ? `${name} now has ${keyList(after)} — any one of them presses it.`
       : `${name} is now ${key}.`;
   if (isPaused()) line += " Resume emulation when you're done.";
-  if (!opts.undo) line += NO_UNDO_MULTI;
   pushToast(line, opts);
   void poll();
 }
@@ -659,8 +748,8 @@ async function addKey(fn: string, key: string): Promise<void> {
 /** Remove ONE key from a control and leave the others — the legend chips' ✕.
  *  Taking the last one is an ordinary clear, said in those words. */
 async function removeKey(fn: string, key: string): Promise<void> {
-  const slot = currentSlot();
-  if (!slot) return;
+  const target = captureWriteTarget();
+  if (!target) return;
   const before = previousKeys(fn);
   const after = before.filter((k) => k.toLowerCase() !== key.toLowerCase());
   const name = identityLabel(fn);
@@ -672,38 +761,43 @@ async function removeKey(fn: string, key: string): Promise<void> {
     void poll();
     return;
   }
-  const outcome = await bindKeys(slot.preset, fn, after, false);
+  const outcome = await bindKeys(target, fn, after, false);
   if (!outcome.ok) {
-    oops(`${name} was not changed: ${outcome.error ?? "the daemon refused the write"}`);
+    oops(`${name} was not changed: ${bindFailure(outcome)}`);
     void poll();
     return;
   }
   markSaved();
-  const opts = undoOptions(slot.preset, fn, before, name);
+  const opts = undoOptions(target, fn, before, name);
   let line =
     after.length > 0
       ? `${key} removed — ${name} still has ${keyList(after)}.`
       : `${key} removed — ${name} is now unbound.`;
   if (isPaused()) line += " Resume emulation when you're done.";
-  if (!opts.undo) line += NO_UNDO_MULTI;
   pushToast(line, opts);
   void poll();
 }
 
 /** Write one binding — `key: null` CLEARS it (the `ksx map --clear` verb, same
  *  writer, no GUI-only path). */
-async function saveBinding(fn: string, key: string | null, force: boolean): Promise<void> {
-  const slot = currentSlot();
-  if (!slot) return;
+async function saveBinding(
+  fn: string,
+  key: string | null,
+  force: boolean,
+  target: WriteTarget | null = captureWriteTarget(),
+  capturedBefore?: string[],
+): Promise<void> {
+  if (!target) return;
   // Remembered BEFORE the write — this is the entire undo. (Re-entry through
   // the conflict retry below re-reads it, which is still pre-write.)
-  const before = previousKeys(fn);
+  const before = capturedBefore ?? previousKeys(fn);
   const was = keyList(before);
   const name = identityLabel(fn);
-  const outcome = await bindOnce(slot.preset, fn, key, force);
+  const outcome = await bindOnce(target, fn, key, force);
   if (outcome.ok) {
     closeModal();
     pendingKey = null;
+    pendingWrite = null;
     markSaved();
     let line =
       key === null
@@ -715,8 +809,7 @@ async function saveBinding(fn: string, key: string | null, force: boolean): Prom
     // its first entry ([`writableKeys`] is what decides whether that write
     // exists). A write that changed nothing has nothing to undo either.
     const changed = was !== (key ?? "");
-    const opts = changed ? undoOptions(slot.preset, fn, before, name) : {};
-    if (changed && !opts.undo && before.length > 1) line += NO_UNDO_MULTI;
+    const opts = changed ? undoOptions(target, fn, before, name) : {};
     pushToast(line, {
       ...opts,
       kind: outcome.message?.includes(CHORD_FLASH_MARK) ? "warn" : "ok",
@@ -731,27 +824,32 @@ async function saveBinding(fn: string, key: string | null, force: boolean): Prom
     // badges re-derive from disk on the next poll, so the page shows what
     // actually happened rather than what we assumed.
     if (outcome.conflicts.every((c) => c.scope === "preset")) {
-      await saveBinding(fn, key, true);
+      await saveBinding(fn, key, true, target, before);
       return;
     }
     // Cross-slot (another preset in a profile that uses this one) stays as it
     // was: informational, the caller decides. Fan-out is the product.
     pendingKey = key;
+    pendingWrite = { target, fn, before };
     const lines = outcome.conflicts.map((c) =>
       c.scope === "preset"
-        ? `${key} also drives this preset's ${c.function}`
-        : `${key} is "${c.preset}"'s ${c.function}` +
-          (c.profile ? ` (slot ${c.slot} of "${c.profile}")` : ""),
+        ? `${key} already controls ${identityLabel(c.function)} here`
+        : c.scope === "macro"
+          ? `${key} already starts ${identityLabel(c.function)}`
+        : `${key} already controls ${identityLabel(c.function)}` +
+          (c.slot ? ` for Player ${c.slot}` : " for another player"),
     );
     showConflict(
       prompt(fn).replace("Press the panel key for", "Bind") + ` = ${key}?`,
       lines.join("; ") +
-        " — Replace binds it here anyway (other presets are never edited).",
+        " — Replace also uses it here; the other player's controls are not changed.",
     );
   } else {
     closeModal();
+    pendingKey = null;
+    pendingWrite = null;
     oops(
-      `${name} was not changed: ${outcome.error ?? "the daemon refused the write"}.`,
+      `${name} was not changed: ${bindFailure(outcome)}`,
     );
   }
   void poll(); // zone tags refresh from disk truth
@@ -765,18 +863,23 @@ async function saveBinding(fn: string, key: string | null, force: boolean): Prom
  *  deliberate map-all is the same intent, and it removes nothing either way.
  *  Sequential on purpose: the writer is one file, and a partial result must be
  *  reportable control by control. */
-async function mapAll(fns: string[], key: string): Promise<void> {
-  const slot = currentSlot();
-  if (!slot) return;
-  // One remembered key per control: the group undo puts each one back where
-  // it was, which is not the same as "clear them all" (some were bound).
-  const before = new Map<string, string[]>(fns.map((fn) => [fn, previousKeys(fn)]));
+async function mapAll(
+  fns: string[],
+  key: string,
+  target: WriteTarget | null = captureWriteTarget(),
+  capturedBefore?: Map<string, string[]>,
+): Promise<void> {
+  if (!target) return;
+  void capturedBefore;
   const progress = pushToast(`Binding ${fns.length} controls to ${key}…`);
   const refused: string[] = [];
+  const accepted: string[] = [];
   for (const fn of fns) {
-    const outcome = await bindOnce(slot.preset, fn, key, true);
-    if (!outcome.ok) {
-      refused.push(`${identityLabel(fn)} (${outcome.error ?? outcome.code ?? "refused"})`);
+    const outcome = await bindOnce(target, fn, key, true);
+    if (outcome.ok) {
+      accepted.push(fn);
+    } else {
+      refused.push(`${identityLabel(fn)} (${bindFailure(outcome)})`);
     }
   }
   // Report from the FILE, not from the requests. A daemon whose `map` verb
@@ -786,26 +889,34 @@ async function mapAll(fns: string[], key: string): Promise<void> {
   // would be exactly the silent-wipe lie MAPPER-UX commandment 7 forbids.
   // One extra poll, and the sentence is whatever the preset really says.
   await poll();
-  const kept = fns.filter((fn) => currentBinding(fn) === key);
-  const lost = fns.filter((fn) => currentBinding(fn) !== key);
+  const verified = await readWriteTarget(target);
+  const kept = verified
+    ? fns.filter((fn) =>
+        payloadKeys(verified, target, fn).some((bound) => bound.toLowerCase() === key.toLowerCase()),
+      )
+    : accepted;
+  const lost = fns.filter((fn) => !kept.includes(fn));
   if (kept.length > 0) markSaved();
 
   let line: string;
-  let bad = refused.length > 0;
-  if (kept.length === fns.length) {
+  let bad = refused.length > 0 || verified === null;
+  if (verified === null) {
+    line =
+      `Player ${target.slot} could not be checked after the change, so the result is not ` +
+      "being guessed. Refresh Controls before continuing.";
+  } else if (kept.length === fns.length) {
     line =
       `${key} now drives ${kept.length} controls: ` +
       `${kept.map(identityLabel).join(" · ")}.`;
     if (isPaused()) line += " Resume emulation when you're done.";
   } else if (kept.length > 0 && refused.length === 0) {
-    // Every write was accepted and they still did not stack: this daemon
-    // moves the key instead of sharing it. Name the mechanism, not a shrug.
+    // Every write was accepted and they still did not stack. Name what the
+    // player can do next without exposing the compatibility mechanism.
     bad = true;
     line =
       `${key} ended up on ${kept.map(identityLabel).join(" · ")} only — ` +
-      `${lost.map(identityLabel).join(" · ")} did not keep it. This daemon's ` +
-      "map verb still MOVES a key between controls instead of letting one key " +
-      "drive several; the legend below shows what is really in the preset.";
+      `${lost.map(identityLabel).join(" · ")} did not keep it. This version cannot share ` +
+      "one key across those controls; the list below shows what is active.";
   } else {
     bad = true;
     line =
@@ -814,21 +925,19 @@ async function mapAll(fns: string[], key: string): Promise<void> {
         : `nothing was bound to ${key}`;
   }
   if (refused.length > 0) line += ` — REFUSED: ${refused.join("; ")}`;
-  // Undo is offered even on a partial result: putting every control back
-  // where it was is exactly the right answer to a write that half-landed.
-  const undoable = kept.length > 0 && groupUndoable(before);
+  // A batch is several independent writes and can only be rolled back as
+  // several more independent writes. Do not label that best-effort sequence
+  // “Undo”; the individual controls below remain editable.
+  if (kept.length > 0) line += " Adjust any individual control below if you want to change it back.";
   replaceToast(progress, line, {
     kind: bad ? "err" : "ok",
-    undo: undoable ? undoGroup(slot.preset, before) : null,
-    undone: `Put ${before.size} control${before.size === 1 ? "" : "s"} back the way they were.`,
   });
   clearSelection();
 }
 
 /** Clear every selected control in one action (the selection bar's second
- *  button). It just happens — the toast names how many went, and its Undo
- *  puts each one back on the key it actually had (MAPPER-UX commandment 5's
- *  road home, without the toll of a confirm on every correct use). */
+ *  button). The writes are independent, so the result is reported without a
+ *  misleading group Undo. */
 async function clearSelectedBindings(): Promise<void> {
   const fns = selectedFns();
   if (fns.length === 0) return;
@@ -836,15 +945,14 @@ async function clearSelectedBindings(): Promise<void> {
     refuseSelection();
     return;
   }
-  const slot = currentSlot();
-  if (!slot) return;
-  const before = new Map<string, string[]>(fns.map((fn) => [fn, previousKeys(fn)]));
+  const target = captureWriteTarget();
+  if (!target) return;
   const done: string[] = [];
   const failed: string[] = [];
   for (const fn of fns) {
-    const outcome = await bindOnce(slot.preset, fn, null, false);
+    const outcome = await bindOnce(target, fn, null, false);
     if (outcome.ok) done.push(identityLabel(fn));
-    else failed.push(`${identityLabel(fn)} (${outcome.error ?? outcome.code ?? "refused"})`);
+    else failed.push(`${identityLabel(fn)} (${bindFailure(outcome)})`);
   }
   if (done.length > 0) markSaved();
   let line =
@@ -852,10 +960,9 @@ async function clearSelectedBindings(): Promise<void> {
       ? `Cleared ${done.length} control${done.length === 1 ? "" : "s"}: ${done.join(" · ")}.`
       : "Nothing was cleared.";
   if (failed.length > 0) line += ` FAILED: ${failed.join("; ")}`;
+  if (done.length > 0) line += " Adjust any individual control below if you want to change it back.";
   pushToast(line, {
     kind: failed.length > 0 ? "err" : "ok",
-    undo: done.length > 0 && groupUndoable(before) ? undoGroup(slot.preset, before) : null,
-    undone: `Put ${before.size} control${before.size === 1 ? "" : "s"} back the way they were.`,
   });
   clearSelection();
   void poll();
@@ -868,20 +975,19 @@ async function clearBinding(fn: string): Promise<void> {
     refuse(fn);
     return;
   }
+  const target = captureWriteTarget();
+  if (!target) return;
+  const before = previousKeys(fn);
   if (learning()) await cancelLearn();
-  await saveBinding(fn, null, false);
+  await saveBinding(fn, null, false, target, before);
 }
 
 /** The answer to a click that cannot do anything. Never a no-op: it names the
- *  control, the reason, and the shell command that works anyway. */
+ * control and the reason in product language. */
 function refuse(fn: string): void {
   selectFn(fn);
   const reason = blockedReason() ?? "mapping is unavailable";
-  const slot = currentSlot();
-  const cli = slot
-    ? `ksx map --preset "${slot.preset}" --function ${fn} --key <KEY>`
-    : `ksx map --preset <NAME> --function ${fn} --key <KEY>`;
-  oops(`Can't learn ${identityLabel(fn)} — ${reason}. From a shell: ${cli}`);
+  oops(`Can't learn ${identityLabel(fn)} — ${reason}.`);
 }
 
 /** The same answer for an action that is about a SELECTION, not one control. */
@@ -902,7 +1008,7 @@ async function pauseAndMap(): Promise<void> {
       `Emulation is paused${profile ? ` ("${profile}")` : ""} — map away, then Resume emulation.`,
     );
   } else {
-    replaceToast(progress, `Emulation is still running: ${out.error ?? "the daemon refused to stop"}.`, {
+    replaceToast(progress, `Play is still active: ${safeDetail(out.error, "it could not be paused")}.`, {
       kind: "err",
     });
   }
@@ -915,9 +1021,9 @@ async function resumeEmulation(): Promise<void> {
   const out = await verb("/api/session/start", profile ? { profile } : {});
   if (out.ok) {
     clearPaused();
-    replaceToast(progress, out.message ?? "Emulation resumed.");
+    replaceToast(progress, safeDetail(out.message, "Emulation resumed."));
   } else {
-    replaceToast(progress, `Emulation did not start: ${out.error ?? "the daemon refused"}.`, {
+    replaceToast(progress, `Play did not resume: ${safeDetail(out.error, "the background helper could not start it")}.`, {
       kind: "err",
     });
   }
@@ -948,7 +1054,7 @@ function restoreDone(mode: RestoreMode, preset: string): string {
         "Q/E triggers, arrows = left stick, Esc = Start). Every binding it had is gone."
       );
     case "session-backup":
-      return `"${preset}" is back to how it was when the daemon started.`;
+      return `"${preset}" is back to how it was when you began editing.`;
     case "latest-backup":
       return `"${preset}" is back to its newest timestamped backup.`;
   }
@@ -956,25 +1062,26 @@ function restoreDone(mode: RestoreMode, preset: string): string {
 
 /** Finish any whole-preset write: refresh from disk, then offer the backup
  *  that write took as the way back — if the page can actually see one. */
-function afterPresetWrite(preset: string): ToastOptions {
-  if ((currentSlot()?.backup ?? null) === null) {
+function afterPresetWrite(target: WriteTarget, verified: MapPayload | null): ToastOptions {
+  const backup = verified?.mapper.slots.find((slot) => slot.number === target.slot)?.backup ?? null;
+  if (backup === null) {
     return { kind: "warn" };
   }
   return {
-    undo: undoFromBackup(preset),
-    undone: `"${preset}" is back to how it was before that.`,
+    undo: undoFromBackup(target),
+    undone: `"${target.preset}" is back to how it was before that.`,
   };
 }
 
 async function presetWrite(
-  preset: string,
+  target: WriteTarget,
   request: Promise<VerbOutcome>,
   done: string,
   failedLead: string,
 ): Promise<void> {
   const out = await request;
   if (!out.ok) {
-    oops(`${failedLead}: ${out.error ?? "the daemon refused"}.`);
+    oops(`${failedLead}: ${safeDetail(out.error, "that recovery action could not be completed")}.`);
     void poll();
     return;
   }
@@ -982,34 +1089,36 @@ async function presetWrite(
   // Poll BEFORE reporting: the backup label the Undo button depends on comes
   // from disk, and so does the legend the user is about to read.
   await poll();
-  const opts = afterPresetWrite(preset);
+  const opts = afterPresetWrite(target, await readWriteTarget(target));
   pushToast(
     opts.undo
       ? done
-      : `${done} No backup was found on disk, so this one cannot be undone from here — ` +
-        "the restore options in the Preset card are the way back.",
+      : `${done} No recovery point was available, so this action has no one-click Undo. ` +
+        "The Saved layout card shows any recovery choices that do exist.",
     opts,
   );
 }
 
 async function restorePreset(mode: RestoreMode): Promise<void> {
-  const preset = currentPreset();
-  if (!preset) return;
+  const target = captureWriteTarget();
+  if (!target) return;
+  const preset = target.preset;
   await presetWrite(
-    preset,
-    verb("/api/preset/restore", { preset, mode }),
+    target,
+    verb("/api/preset/restore", { ...targetFields(target), preset, mode }),
     restoreDone(mode, preset),
     `"${preset}" was not restored`,
   );
 }
 
 async function clearAll(): Promise<void> {
-  const preset = currentPreset();
-  if (!preset) return;
+  const target = captureWriteTarget();
+  if (!target) return;
+  const preset = target.preset;
   await presetWrite(
-    preset,
-    verb("/api/preset/clear-all", { preset }),
-    `Every binding in "${preset}" is cleared — this slot's pad ignores the panel ` +
+    target,
+    verb("/api/preset/clear-all", { ...targetFields(target), preset }),
+    `Every binding in "${preset}" is cleared — Player ${target.slot}'s controller ignores the panel ` +
       "until something is mapped again.",
     `"${preset}" was not cleared`,
   );
@@ -1033,12 +1142,21 @@ async function submitNoJsForm(
     new FormData(form).forEach((value, key) => {
       if (typeof value === "string") body.append(key, value);
     });
+    if (editingStage() && !body.has("target")) {
+      body.append("target", "stage");
+      const slot = currentSlot();
+      if (slot && !body.has("slot")) body.append("slot", String(slot.number));
+    }
     if (submitter instanceof HTMLButtonElement && submitter.name) {
       body.append(submitter.name, submitter.value);
     }
     const res = await fetch(action, { method: "POST", body, redirect: "follow" });
     const flash = new URL(res.url).searchParams.get("flash") ?? "done.";
-    pushToast(flash, { kind: flash.startsWith("error") ? "err" : "ok" });
+    const failed = flash.startsWith("error");
+    pushToast(
+      safeDetail(flash, failed ? "That change could not be completed. Nothing changed." : "The change was completed."),
+      { kind: failed ? "err" : "ok" },
+    );
   } catch {
     oops("The request failed — is ksx studio still running?");
   }
@@ -1127,13 +1245,18 @@ function clearNewMacroName(): void {
 
 /** One whole-table write (or delete). Never throws — transport failure comes
  *  back in the same shape, so no caller can forget it. */
-async function macroWrite(preset: string, mac: MacroView, remove = false): Promise<MacroOutcome> {
+async function macroWrite(
+  target: WriteTarget,
+  mac: MacroView,
+  remove = false,
+): Promise<MacroOutcome> {
   try {
     return await fetchJSON<MacroOutcome>("/api/macro/save", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        preset,
+        ...targetFields(target),
+        preset: target.preset,
         name: mac.name,
         // A delete carries no body: an EMPTY step list is a refusal on the
         // daemon side precisely so an editor that lost its grid cannot delete
@@ -1174,7 +1297,7 @@ async function macroWrite(preset: string, mac: MacroView, remove = false): Promi
 
 /** The TOGGLE request: `enabled` and no body. See `macroToggleEnabled`. */
 async function macroSetEnabled(
-  preset: string,
+  target: WriteTarget,
   name: string,
   enabled: boolean,
 ): Promise<MacroOutcome> {
@@ -1184,7 +1307,13 @@ async function macroSetEnabled(
       headers: { "content-type": "application/json" },
       // NO `steps`: that is what makes this a toggle rather than a write of
       // whatever the grid happens to be holding.
-      body: JSON.stringify({ preset, name, enabled, reload: true }),
+      body: JSON.stringify({
+        ...targetFields(target),
+        preset: target.preset,
+        name,
+        enabled,
+        reload: true,
+      }),
     });
   } catch {
     return {
@@ -1206,36 +1335,42 @@ async function macroSetEnabled(
  *  duration in two units — and swallowing them would leave the user guessing
  *  which step is wrong). */
 function macroRefusal(out: MacroOutcome): string {
-  const lead = out.error ?? out.code ?? "the daemon refused the write";
-  return out.problems.length === 0 ? lead : `${lead} — ${out.problems.join("; ")}`;
+  const lead = safeDetail(out.error, "The macro could not be changed. Nothing changed.");
+  const problems = out.problems
+    .map((problem) => safeDetail(problem, "One step or setting is not valid."))
+    .filter((problem, index, all) => all.indexOf(problem) === index);
+  return problems.length === 0 ? lead : `${lead} — ${problems.join("; ")}`;
 }
 
 /** The advisories a SUCCESSFUL write still has to say out loud (a step below
  *  the sampling floor was raised, or runs as written and may be missed). */
 function macroNotes(out: MacroOutcome): string {
-  return out.warnings.length === 0 ? "" : ` Note: ${out.warnings.join("; ")}.`;
+  const warnings = out.warnings.map((warning) =>
+    safeDetail(warning, "One very short step may be missed by the game."),
+  );
+  return warnings.length === 0 ? "" : ` Note: ${warnings.join("; ")}.`;
 }
 
 /** Put a macro back exactly as it was — the undo of a save, a delete, or half
  *  of a rename. `null` = it did not exist before, so the undo is a delete. */
 function undoMacroTo(
-  preset: string,
+  target: WriteTarget,
   before: MacroView | null,
   name: string,
 ): () => Promise<string | null> {
   return async () => {
     if (before === null) {
-      const out = await macroWrite(preset, { ...newMacroBody(name) }, true);
+      const out = await macroWrite(target, { ...newMacroBody(name) }, true);
       if (!out.ok) return macroRefusal(out);
     } else {
-      const out = await macroWrite(preset, before);
+      const out = await macroWrite(target, before);
       if (!out.ok) return macroRefusal(out);
       // The table is back; so are its trigger rows, which live in [bindings]
       // and are written by the `map` verb, not by this one.
       if (before.triggers.length > 0) {
-        const back = await bindKeys(preset, `macro.${before.name}`, before.triggers, true);
+        const back = await bindKeys(target, `macro.${before.name}`, before.triggers, true);
         if (!back.ok) {
-          return `the macro is back, but its trigger key(s) are not: ${back.error ?? "refused"}`;
+          return `the macro is back, but its trigger key(s) are not: ${bindFailure(back)}`;
         }
       }
     }
@@ -1250,11 +1385,11 @@ function undoMacroTo(
 /** What a macro verb needs before it can do anything, or the sentence saying
  *  why it cannot. Never a silent return: a button that answers nothing is the
  *  one thing this page does not ship. */
-function macroTarget(): { mac: MacroView; preset: string } | null {
+function macroTarget(): { mac: MacroView; target: WriteTarget } | null {
   const mac = currentMacro();
-  const preset = currentPreset();
-  if (!preset) {
-    oops("No slot is selected, so there is no preset to write a macro into.");
+  const target = captureWriteTarget();
+  if (!target) {
+    oops("No controller is selected, so there is nowhere to save that macro.");
     return null;
   }
   if (!mac) {
@@ -1263,7 +1398,7 @@ function macroTarget(): { mac: MacroView; preset: string } | null {
     );
     return null;
   }
-  return { mac, preset };
+  return { mac, target };
 }
 
 /** SAVE: the whole draft table into the preset.
@@ -1278,9 +1413,13 @@ function macroTarget(): { mac: MacroView; preset: string } | null {
 async function macroSave(confirmed = false): Promise<void> {
   const target = macroTarget();
   if (!target) return;
-  const { mac, preset } = target;
+  const { mac, target: writeTarget } = target;
+  const preset = writeTarget.preset;
   if (!macroIsDirty()) {
-    pushToast(`"${mac.name}" already matches the preset file — nothing to save.`, { kind: "warn" });
+    pushToast(
+      `"${mac.name}" already matches ${editingStage() ? "this unsaved setup" : "the saved layout"} — nothing to save.`,
+      { kind: "warn" },
+    );
     return;
   }
   // The question, once. `macroAskAboutShortSteps` answers false when there is
@@ -1289,9 +1428,9 @@ async function macroSave(confirmed = false): Promise<void> {
   macroClearShortStepQuestion();
   // Read BEFORE the write: this is the entire undo.
   const before = macroOnDiskCopy(mac.name);
-  const out = await macroWrite(preset, mac);
+  const out = await macroWrite(writeTarget, mac);
   if (!out.ok) {
-    oops(`"${mac.name}" was NOT saved: ${macroRefusal(out)}. The preset file is untouched.`);
+    oops(`"${mac.name}" was not saved: ${macroRefusal(out)}`);
     return;
   }
   markMacroSaved(mac.name);
@@ -1309,21 +1448,22 @@ async function macroSave(confirmed = false): Promise<void> {
   if (out.reloaded) line += " The running session is already playing this version.";
   pushToast(line, {
     kind: out.warnings.length > 0 || short !== "" ? "warn" : "ok",
-    undo: undoMacroTo(preset, before, mac.name),
+    undo: undoMacroTo(writeTarget, before, mac.name),
     undone:
       before === null
         ? `"${mac.name}" is gone again.`
-        : `"${mac.name}" is back to the version that was in the file.`,
+        : `"${mac.name}" is back to its previously saved version.`,
   });
 }
 
 /** NEW: create the macro in the preset, right now, with one starter step. */
 async function macroNew(): Promise<void> {
-  const preset = currentPreset();
-  if (!preset) {
-    oops("No slot is selected, so there is no preset to create a macro in.");
+  const target = captureWriteTarget();
+  if (!target) {
+    oops("No controller is selected, so there is nowhere to create a macro.");
     return;
   }
+  const preset = target.preset;
   const name = newMacroName();
   const problem = macroNameProblem(name);
   if (problem !== null) {
@@ -1336,11 +1476,11 @@ async function macroNew(): Promise<void> {
   if (macroIsDirty() && leaving) {
     pushToast(
       `Unsaved changes to "${leaving.name}" were discarded — Save macro writes them, ` +
-        "creating another macro does not. (The preset file is unchanged.)",
+        "creating another macro does not. The saved layout is unchanged.",
       { kind: "warn" },
     );
   }
-  const out = await macroWrite(preset, newMacroBody(name));
+  const out = await macroWrite(target, newMacroBody(name));
   if (!out.ok) {
     oops(`"${name}" was NOT created: ${macroRefusal(out)}`);
     return;
@@ -1355,7 +1495,7 @@ async function macroNew(): Promise<void> {
       "Save macro, then bind a trigger key at the bottom of this card." +
       macroNotes(out),
     {
-      undo: undoMacroTo(preset, null, name),
+      undo: undoMacroTo(target, null, name),
       undone: `"${name}" is gone again.`,
     },
   );
@@ -1366,29 +1506,29 @@ async function macroNew(): Promise<void> {
  *  no rename verb, and inventing one here would be a second macro writer.
  *  Reported as ONE action, and its Undo is the exact inverse. */
 async function macroRenameTo(
-  preset: string,
+  target: WriteTarget,
   from: MacroView,
   to: string,
 ): Promise<string | null> {
   const moved: MacroView = { ...from, name: to, steps: from.steps, triggers: [...from.triggers] };
-  const wrote = await macroWrite(preset, moved);
+  const wrote = await macroWrite(target, moved);
   if (!wrote.ok) return `${macroRefusal(wrote)} — nothing was renamed`;
-  const removed = await macroWrite(preset, from, true);
+  const removed = await macroWrite(target, from, true);
   if (!removed.ok) {
     return (
       `"${to}" was written, but the old "${from.name}" table could NOT be removed ` +
-      `(${macroRefusal(removed)}) — the preset now holds both. Delete one of them.`
+      `(${macroRefusal(removed)}) — the controller layout now holds both. Delete one of them.`
     );
   }
   // Deleting the old table took its `macro.<old>` trigger rows with it (they
   // would not load without it), so the keys have to be pointed at the new
   // name. That is an ordinary binding write, through the `map` verb.
   if (from.triggers.length > 0) {
-    const bound = await bindKeys(preset, `macro.${to}`, from.triggers, true);
+    const bound = await bindKeys(target, `macro.${to}`, from.triggers, true);
     if (!bound.ok) {
       return (
         `"${from.name}" is now "${to}", but its trigger key(s) ${keyList(from.triggers)} ` +
-        `could not be moved across (${bound.error ?? "refused"}) — set the trigger again below`
+        `could not be moved across (${bindFailure(bound)}) — set the trigger again below`
       );
     }
   }
@@ -1396,9 +1536,10 @@ async function macroRenameTo(
 }
 
 async function macroRename(): Promise<void> {
-  const target = macroTarget();
-  if (!target) return;
-  const { mac, preset } = target;
+  const selected = macroTarget();
+  if (!selected) return;
+  const { mac, target } = selected;
+  const preset = target.preset;
   const to = typedMacroName();
   if (to === mac.name) {
     pushToast("That is already this macro's name — nothing to rename.", { kind: "warn" });
@@ -1412,7 +1553,7 @@ async function macroRename(): Promise<void> {
   if (to.toLowerCase() === mac.name.toLowerCase()) {
     pushToast(
       `Macro names are matched without case, so "${to}" and "${mac.name}" are the same ` +
-        "table and the file keeps the spelling it already has. Nothing was changed — pick a " +
+        "name. The saved spelling stays as it is. Nothing was changed — pick a " +
         "different name.",
       { kind: "warn" },
     );
@@ -1424,7 +1565,7 @@ async function macroRename(): Promise<void> {
     return;
   }
   const from = { ...mac, triggers: [...mac.triggers] };
-  const failure = await macroRenameTo(preset, from, to);
+  const failure = await macroRenameTo(target, from, to);
   await poll();
   if (failure !== null) {
     oops(`Rename problem: ${failure}.`);
@@ -1443,7 +1584,7 @@ async function macroRename(): Promise<void> {
         : ". It has no trigger key yet — set one below."),
     {
       undo: async () => {
-        const back = await macroRenameTo(preset, { ...from, name: to }, from.name);
+        const back = await macroRenameTo(target, { ...from, name: to }, from.name);
         markSaved();
         await poll();
         seedMacro(from.name);
@@ -1466,12 +1607,13 @@ async function macroRename(): Promise<void> {
  *
  *  So this deliberately ignores the draft and reads the ON-DISK state. */
 async function macroToggleEnabled(): Promise<void> {
-  const target = macroTarget();
-  if (!target) return;
-  const { mac, preset } = target;
+  const selected = macroTarget();
+  if (!selected) return;
+  const { mac, target } = selected;
+  const preset = target.preset;
   if (!macroIsOnDisk()) {
     pushToast(
-      `"${mac.name}" is not in the preset file yet, so there is nothing to switch off. ` +
+      `"${mac.name}" has not been saved to this controller layout yet, so there is nothing to switch off. ` +
         "Press Save macro first.",
       { kind: "warn" },
     );
@@ -1479,11 +1621,11 @@ async function macroToggleEnabled(): Promise<void> {
   }
   const onDisk = macroOnDiskCopy(mac.name);
   const wasDisabled = onDisk?.disabled === true;
-  const out = await macroSetEnabled(preset, mac.name, wasDisabled);
+  const out = await macroSetEnabled(target, mac.name, wasDisabled);
   if (!out.ok) {
     oops(
       `"${mac.name}" was NOT switched ${wasDisabled ? "on" : "off"}: ${macroRefusal(out)}. ` +
-        "The preset file is untouched.",
+        "The controller layout is unchanged.",
     );
     return;
   }
@@ -1499,7 +1641,7 @@ async function macroToggleEnabled(): Promise<void> {
     kind: "ok",
     // The undo is the opposite flag — one field back, exactly like the write.
     undo: async () => {
-      await macroSetEnabled(preset, mac.name, !wasDisabled);
+      await macroSetEnabled(target, mac.name, !wasDisabled);
       await poll();
       syncMacroControls();
     },
@@ -1511,17 +1653,18 @@ async function macroToggleEnabled(): Promise<void> {
 
 /** DELETE: remove the table (and the trigger rows that would dangle). */
 async function macroDelete(): Promise<void> {
-  const target = macroTarget();
-  if (!target) return;
-  const { mac, preset } = target;
+  const selected = macroTarget();
+  if (!selected) return;
+  const { mac, target } = selected;
+  const preset = target.preset;
   if (!macroIsOnDisk()) {
-    pushToast(`"${mac.name}" is not in the preset file, so there is nothing to delete.`, {
+    pushToast(`"${mac.name}" has not been saved to this controller layout, so there is nothing to delete.`, {
       kind: "warn",
     });
     return;
   }
   const before = macroOnDiskCopy(mac.name) ?? { ...mac, triggers: macroDraftTriggers() };
-  const out = await macroWrite(preset, mac, true);
+  const out = await macroWrite(target, mac, true);
   if (!out.ok) {
     oops(`"${mac.name}" was NOT deleted: ${macroRefusal(out)}`);
     return;
@@ -1536,7 +1679,7 @@ async function macroDelete(): Promise<void> {
         ? ` — ${keyList(before.triggers)} no longer starts anything.`
         : "."),
     {
-      undo: undoMacroTo(preset, before, mac.name),
+      undo: undoMacroTo(target, before, mac.name),
       undone: `"${mac.name}" is back, exactly as it was.`,
     },
   );
@@ -1603,7 +1746,7 @@ function macroMotion(name: string): void {
   const said = macroInsertMotion(name);
   if (said === null) return;
   syncMacroControls();
-  pushToast(`${said} (Nothing is written until you do — "Revert to file" undoes this.)`);
+  pushToast(`${said} (Nothing is saved until you press Save macro — “Discard draft changes” undoes this.)`);
 }
 
 /** Switch the editor to another of the preset's macros. Unsaved grid edits are
@@ -1614,7 +1757,7 @@ function macroSwitch(name: string | null): void {
   if (macroIsDirty() && leaving) {
     pushToast(
       `Unsaved changes to "${leaving.name}" were discarded — Save macro writes them, ` +
-        "switching macros does not. (The preset file is unchanged.)",
+        "switching macros does not. The controller layout is unchanged.",
       { kind: "warn" },
     );
   }
@@ -1628,8 +1771,8 @@ async function macroCopy(): Promise<void> {
   try {
     await navigator.clipboard.writeText(text);
     pushToast(
-      "The [macros] block is on the clipboard — for sharing or hand-editing. " +
-        "(Save macro already writes it into the preset for you.)",
+      "The advanced macro copy is on the clipboard for sharing or hand-editing. " +
+        "Save macro already keeps it in the controller layout for you.",
     );
   } catch {
     oops("Could not reach the clipboard — select the block and copy it by hand.");
@@ -1712,7 +1855,7 @@ function wire(root: HTMLElement): void {
       window.history.replaceState(
         null,
         "",
-        `/map?slot=${slot ? slot.number : 1}&macro=${encodeURIComponent(macro)}`,
+        `/map?${editingStage() ? "target=stage&" : ""}slot=${slot ? slot.number : 1}&macro=${encodeURIComponent(macro)}`,
       );
       return;
     }
@@ -1728,8 +1871,10 @@ function wire(root: HTMLElement): void {
 
     const act = target.closest<HTMLElement>("[data-act]")?.dataset.act;
     if (act === "replace") {
-      const fn = selectedFnName();
-      if (fn && pendingKey) void saveBinding(fn, pendingKey, true);
+      const pending = pendingWrite;
+      if (pending && pendingKey) {
+        void saveBinding(pending.fn, pendingKey, true, pending.target, pending.before);
+      }
       return;
     }
     if (act === "cancel") {
@@ -1817,7 +1962,7 @@ function wire(root: HTMLElement): void {
     if (act === "macro-save-cancel") {
       macroClearShortStepQuestion();
       pushToast(
-        "Nothing was written — the preset file is untouched. The amber rows are the short " +
+        "Nothing was saved — the controller layout is unchanged. The amber rows are the short " +
           "steps: pick one's ⏱ and give it 33 ms (2 frames) or more, and the flag goes away. " +
           "If you meant it, Save anyway writes it exactly as authored.",
         { kind: "warn" },
@@ -2170,7 +2315,11 @@ activateIslands({
       // feedback for an action nobody just took.
       const flash = (query.get("flash") ?? "").trim();
       if (flash !== "") {
-        pushToast(flash, { kind: flash.startsWith("error") ? "err" : "ok" });
+        const failed = flash.startsWith("error");
+        pushToast(
+          safeDetail(flash, failed ? "That change could not be completed. Nothing changed." : "The change was completed."),
+          { kind: failed ? "err" : "ok" },
+        );
         window.history.replaceState(
           null,
           "",

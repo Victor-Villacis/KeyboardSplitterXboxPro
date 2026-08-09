@@ -1,25 +1,22 @@
-//! ksx-studio — the optional Forma-powered web page: cabinet status + session
-//! control (M10).
+//! ksx-studio — the optional Forma-powered local application for first run,
+//! status, mapping, checks, pads, devices, profiles and configuration (M10).
 //!
-//! One page, one screen (docs/research/padforge-ui-lessons.md — no tabs, no
-//! nav): a SESSION panel (daemon state, profile dropdown, Start / Stop /
-//! Reload as plain HTML forms) above the cabinet status — driver health
-//! (ViGEmBus / Interception), the pads the bus is exposing, autostart
-//! registration, the games.toml profile list.
+//! Eight focused routes expose those tasks: `/start`, `/`, `/map`, `/check`,
+//! `/pads`, `/devices`, `/profiles` and `/setup`. Each route owns one screen;
+//! the navigation connects them without turning the product back into a
+//! multi-panel dashboard.
 //!
-//! v4 rendering model — SSR first paint + one live island:
-//! forma-server 0.1.4 renders the embedded FMIR per request (complete page,
-//! no JS required), and the whole screen is a Forma ISLAND whose client
-//! runtime seeds its signals from server props BEFORE adoption (the
-//! islands protocol; dogfood ledger #5) and then polls `GET /api/status`
-//! every 2 s, rewriting the same signals in place — pills, state line, pad
-//! tiles and profiles update without a reload. With JavaScript disabled the
-//! page IS the v3 experience: full SSR plus a `<noscript>` meta refresh
-//! every 5 s. The client bundle loads under forma's strict nonce'd CSP
-//! (`connect-src 'self'` covers the poller, `form-action 'self'` the
-//! forms).
+//! Rendering model — SSR first paint + one live island per route:
+//! forma-server 0.2.0 renders the embedded FMIR per request (a complete page,
+//! no JS required), and each screen's Forma island seeds its signals from
+//! server props BEFORE adoption (the islands protocol; dogfood ledger #5).
+//! Route clients then use the same-origin APIs and streams to update those
+//! signals in place. With JavaScript disabled the server-rendered screens
+//! remain usable; the status route also carries a `<noscript>` meta refresh.
+//! Client bundles load under Forma's strict nonce'd CSP (`connect-src 'self'`
+//! covers live data, `form-action 'self'` the forms).
 //!
-//! `/setup` (M10) is the third screen and the config's own: what this machine
+//! `/setup` (M10) is the configuration screen: what this machine
 //! holds, and the two verbs a person performs on a configuration — **Export**
 //! (`GET /setup/export.json`, the whole root as one JSON document) and
 //! **Import** (`POST /setup/import`, dry run unless the write box is ticked).
@@ -45,23 +42,23 @@
 //!
 //! `assets/` holds the **committed** output of the `studio-ui/` npm project
 //! (FMIR module, manifest, CSS, service worker), embedded via `rust-embed`.
-//! `cargo build` needs nothing but Rust. Node ≥ 18 is needed only to
+//! `cargo build` needs nothing but Rust. Node ≥ 20.19 is needed only to
 //! REGENERATE the UI after editing `studio-ui/src/`:
 //!
 //! ```text
 //! cd studio-ui
-//! npm install
+//! npm ci
 //! node build.mjs      # rebuilds crates/ksx-studio/assets/, then run the ksx gate
 //! ```
 //!
 //! # Data injection
 //!
-//! The same per-request data is emitted twice, deliberately: server-side
+//! The same per-request route data is emitted twice, deliberately: server-side
 //! FMIR slot injection for the SSR first paint (scalars, lists AND
 //! `createShow` booleans, all by slot name since compiler 0.3.1), and a
-//! `StatusPayload` JSON in the `__ksx-payload` script block for client
-//! hydration — the identical shape `GET /api/status` serves the poller,
-//! pinned by a parity test. forma-ir additionally emits its own
+//! typed JSON payload in the `__ksx-payload` script block for client
+//! hydration — the same shape each route's live endpoint returns, pinned by
+//! parity tests. forma-ir additionally emits its own
 //! `data-forma-props` from the island's slot_ids, carrying the rendered slot
 //! values. See `render.rs` for the mechanism, the rationale, and the E7
 //! dogfood history — cycle one closed when `@getforma/compiler` 0.2.0

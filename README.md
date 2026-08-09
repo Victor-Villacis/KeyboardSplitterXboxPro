@@ -1,7 +1,10 @@
 # KeyboardSplitterXboxPro (`ksx`)
 
 Split one or more keyboards — including arcade encoders like the Ultimarc I-PAC that
-present as keyboards — into up to **4 virtual Xbox 360 controllers** on Windows 11.
+present as keyboards — into as many as **16 virtual game controllers** on Windows 11.
+The first four can be Xbox 360-style controllers; supported additional players use
+PlayStation-style controllers without pretending Windows' four-controller XInput limit
+does not exist.
 
 This is a ground-up **Rust** rebuild of djlastnight's
 [KeyboardSplitterXbox](https://github.com/djlastnight/KeyboardSplitterXbox)
@@ -14,7 +17,10 @@ from this repo's `legacy-csharp-final` tag) rather than vendored — see
 
 **[Releases](https://github.com/Victor-Villacis/KeyboardSplitterXboxPro/releases)**
 — one file, `ksx-<version>-setup.exe`. Double-click it, click through the
-wizard, and ksx opens. Windows 11, 64-bit. Nothing else to install first.
+wizard, and ksx opens directly to Setup with a notification-area icon. The
+customer shortcut is console-free; Studio runs on localhost in an Edge/Chrome
+app window, not Electron and not a normal default-browser tab. Windows 11,
+64-bit. Nothing else to install first.
 
 Windows will say **"Windows protected your PC"**, because the installer is not
 code-signed: click **More info**, then **Run anyway**. Every release body
@@ -30,11 +36,9 @@ file to start with.
 what ksx is, how the crates fit together, what is finished, what is not, and
 the half-dozen beliefs about this codebase that turned out to be false.
 
-**New here?** [`docs/QUICKSTART.md`](docs/QUICKSTART.md) goes from a fresh
-machine to four working players: drivers, which capture mode to pick, and then
-either `ksx preset new --from-template arcade-6button` (a standard panel needs
-no mapping at all) or `ksx setup` (press each button once, and it writes the
-config for you).
+**New here?** [`docs/QUICKSTART.md`](docs/QUICKSTART.md) is the actual customer
+journey: install, choose a keyboard and controller, map it, choose split or
+freeze, then Save, Play, or both. It requires no terminal or file editing.
 
 ## Why rebuild it
 
@@ -61,7 +65,13 @@ XOutput and friends is in [`docs/research/`](docs/research/).
   your keyboards. No reboot, ever.
 - All-keys-up release rule, opposite-axis snap, state-diffed pad updates.
 
-## `ksx run`
+## Developer CLI and operator reference
+
+The installed customer workflow does not require any command below. These are
+development, diagnosis, recovery, and cabinet-integration surfaces for people
+working on ksx itself. Customer setup lives in Studio as described above.
+
+### `ksx run`
 
 Plugs the virtual pads, captures the keyboards your slots are bound to, and
 translates. Everything else on the machine keeps typing.
@@ -81,7 +91,7 @@ keyboard is still normal), then capture in passthrough, then blocking — for th
 bound keyboards only — and only **then** the game. A game started before the
 pads exist enumerates zero controllers and never asks again.
 
-### Launching a game (`--game`)
+#### Launching a game (`--game`)
 
 When the profile has a `path`, `ksx run --game` starts it after the pads are up
 and stops emulation when it exits (exit 0). Two behaviours ported from the
@@ -113,7 +123,7 @@ the emergency escapes still end the session.
 **ksx never kills a game it started.** Stopping emulation leaves the game
 running; your keyboard simply starts typing into it again.
 
-### Emergency escapes
+#### Emergency escapes
 
 Printed as a banner before anything can block a keystroke, and evaluated on
 **every** keyboard, captured or not — so they work from a keyboard the config
@@ -130,7 +140,7 @@ evaluated **inside the capture thread**, before the pass/suppress decision, so
 they keep working when everything downstream (engine, output thread, a ViGEm
 driver call) is wedged.
 
-#### `Ctrl+C` does not work while your keyboards are captured
+##### `Ctrl+C` does not work while your keyboards are captured
 
 Interception suppresses captured strokes *below win32k*, so Windows never
 generates a `CTRL_C_EVENT` and `ksx`'s console handler never runs. Use
@@ -142,7 +152,7 @@ filters with no cleanup at all — but you need an input device you can still ac
 from. The mouse is never captured in M4, so a mouse-driven Task Manager is
 always a way out.
 
-### Exit codes
+#### Exit codes
 
 | code | meaning |
 |---|---|
@@ -154,7 +164,7 @@ always a way out.
 The 2/3 line is exactly "was a keyboard filter ever armed". A 2 means the
 machine is untouched.
 
-## The other commands
+### Other commands
 
 ```sh
 ksx setup                         # first contact: press the panel, it writes the config
@@ -170,7 +180,7 @@ ksx import-legacy --dry-run       # legacy XML -> TOML
 ksx winusb status                 # WinUSB claim state per USB interface (read-only)
 ```
 
-### `ksx setup` — the first-contact wizard
+#### `ksx setup` — the developer first-contact wizard
 
 Identify the panel by **pressing** it ("hold a key on the panel for player 1"),
 then one position-named prompt per control (`SOUTH`, not `A`) with auto-advance,
@@ -185,7 +195,7 @@ nothing; `--json` prints the outcome.
 Stop emulation first: a captured panel's keys are suppressed below win32k and
 the wizard cannot hear them.
 
-### `ksx play` — replay a recorded session
+#### `ksx play` — replay a recorded session
 
 `ksx monitor --record demo.jsonl` writes a timeline: one JSON object per key
 event, with the milliseconds it happened at. `ksx play demo.jsonl` makes that
@@ -219,7 +229,7 @@ unassigned keyboard does in a live session.
 `--dry-run` resolves the recording against the plan and prints what would drive
 what, touching no driver.
 
-### `ksx daemon` — stay resident with a tray icon
+#### `ksx daemon` — stay resident with a tray icon
 
 ```sh
 ksx daemon --game "MAME 4P"       # tray icon; emulation on demand
@@ -240,7 +250,7 @@ machine until reboot.)
 
 Exit codes: 0 clean, 1 error, 2 the configuration does not resolve.
 
-### `ksx autostart` — cold boot to a live tray
+#### `ksx autostart` — cold boot to a live tray
 
 ```sh
 ksx autostart --enable --game "MAME 4P"
@@ -268,7 +278,7 @@ and exits 2 when it finds one.
 
 Exit codes: 0 done, 1 error, 2 refused / stale.
 
-### `ksx install-drivers` — the bundled ViGEmBus, verified
+#### `ksx install-drivers` — the bundled ViGEmBus, verified
 
 ```sh
 ksx install-drivers                 # report + verify; runs nothing
@@ -309,7 +319,7 @@ See [`docs/DRIVERS.md`](docs/DRIVERS.md) for the four checks and the state codes
 Exit codes: 0 nothing to do / installed, 1 error, 2 refused (verification
 failed, installer missing, elevation needed), 3 the installer ran and failed.
 
-### `ksx winusb` — escape the 2026 driver cliff
+#### `ksx winusb` — escape the 2026 driver cliff
 
 ```sh
 ksx winusb status                       # read-only: which interfaces, which driver, claimable?
@@ -352,7 +362,7 @@ Exit codes: 0 reported/done, 1 error, 2 refused (unknown or ambiguous device,
 not a keyboard interface, already claimed, elevation needed, **or it is the only
 keyboard**), 3 pnputil ran and failed.
 
-### Frontend integration
+#### Frontend integration
 
 LaunchBox and RetroBat wiring, plus a wrapper that always stops ksx:
 [`docs/INTEGRATION.md`](docs/INTEGRATION.md) and

@@ -1,7 +1,7 @@
 name: Build installer
 
-# The shippable `ksx.exe` and the `setup.exe` a customer downloads, defined once
-# and called from two places:
+# The shippable `ksx.exe`, its console-free customer launcher, and the
+# `setup.exe` a customer downloads, defined once and called from two places:
 #
 #   ci.yml       every branch — an installer that stopped building is found the
 #                day it breaks, not the day someone tries to ship;
@@ -152,10 +152,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # cabinet + studio is the shipping combination: the egui panel UI plus the
-      # local web config server. CI's feature matrix proves it compiles; this
-      # builds it optimized.
+      # local web config server. The launcher is deliberately a separate package:
+      # ksx.exe stays a console application for its development CLI, while the
+      # customer shortcut gets a GUI-subsystem process that starts `ksx open`
+      # with CREATE_NO_WINDOW.
       - name: Build release
-        run: cargo build --release --features cabinet,studio
+        shell: pwsh
+        run: |
+          cargo build --release -p ksx-app --features cabinet,studio
+          if ($LASTEXITCODE -ne 0) { throw 'ksx-app release build failed' }
+          cargo build --release -p ksx-launcher
+          if ($LASTEXITCODE -ne 0) { throw 'ksx-launcher release build failed' }
 
       # Print the hash in the log so a downloaded artifact can be verified
       # against the run that produced it — and hand it up as a job output, so
@@ -165,12 +172,20 @@ jobs:
         shell: pwsh
         run: |
           $exe = 'target/release/ksx.exe'
+          $launcher = 'target/release/ksx-launcher.exe'
+          if (-not (Test-Path $launcher)) {
+            throw 'the customer launcher was not built at target/release/ksx-launcher.exe'
+          }
           $h = (Get-FileHash $exe -Algorithm SHA256).Hash
           $mb = [math]::Round((Get-Item $exe).Length / 1MB, 2)
+          $launcherHash = (Get-FileHash $launcher -Algorithm SHA256).Hash
+          $launcherKb = [math]::Round((Get-Item $launcher).Length / 1KB, 1)
           Write-Host "ksx.exe  $mb MB"
           Write-Host "SHA256   $h"
+          Write-Host "ksx-launcher.exe  $launcherKb KB"
+          Write-Host "SHA256            $launcherHash"
           "sha256=$h" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
-          "### ksx.exe`n`n- size: $mb MB`n- SHA256: ``$h```n- commit: ``$env:GITHUB_SHA``" |
+          "### ksx executables`n`n- ksx.exe: $mb MB, SHA256 ``$h```n- ksx-launcher.exe: $launcherKb KB, SHA256 ``$launcherHash```n- commit: ``$env:GITHUB_SHA``" |
             Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
 
       - uses: actions/upload-artifact@v4
@@ -181,8 +196,9 @@ jobs:
           retention-days: 30
 
       # A bare ksx.exe is not something a person can use. `packaging/ksx.iss`
-      # describes the whole install — the Start-menu entry, the desktop icon,
-      # PATH as an opt-in, the bundled ViGEmBus driver folder, an uninstaller.
+      # describes the whole install — the console-free launcher, the single
+      # customer Start-menu entry, the desktop icon, the bundled ViGEmBus
+      # driver folder, and an uninstaller.
       #
       # Inno Setup ships preinstalled on windows-latest, so this needs no new
       # dependency. ISCC is not on PATH, hence the explicit path.

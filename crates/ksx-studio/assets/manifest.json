@@ -1,121 +1,121 @@
 {
   "version": 1,
-  "build_hash": "6f67a63d259003adb360cb4d67ef321721a63881f0ac59ac04115f44d45f17d4",
+  "build_hash": "7d4363752145c70d88ab2988d17658472c61017228ca313dc0ea3b527420dbb0",
   "assets": {
-    "check.ir": "check.65f0e962.ir",
-    "check.js": "check.f7359148.js",
-    "devices.ir": "devices.d4adb97e.ir",
-    "devices.js": "devices.f28f8867.js",
-    "map.ir": "map.7d173eb8.ir",
-    "map.js": "map.17a81dad.js",
-    "pads.ir": "pads.f1251924.ir",
-    "pads.js": "pads.a1ccf0c2.js",
-    "profiles.ir": "profiles.8873fdff.ir",
-    "profiles.js": "profiles.5d951e39.js",
-    "setup.ir": "setup.ce0c4b25.ir",
-    "setup.js": "setup.647022a2.js",
-    "start.ir": "start.2493b585.ir",
-    "start.js": "start.26bf616e.js",
-    "status.ir": "status.7ff62708.ir",
-    "status.js": "status.f7a44552.js",
-    "studio.css": "studio.56142be1.css"
+    "check.ir": "check.d94030d6.ir",
+    "check.js": "check.83278503.js",
+    "devices.ir": "devices.6f3ec2f5.ir",
+    "devices.js": "devices.000c34a6.js",
+    "map.ir": "map.2cc55cf6.ir",
+    "map.js": "map.6e4a7bfd.js",
+    "pads.ir": "pads.bc0593fd.ir",
+    "pads.js": "pads.07037a19.js",
+    "profiles.ir": "profiles.e6a90697.ir",
+    "profiles.js": "profiles.cb32feda.js",
+    "setup.ir": "setup.8394a720.ir",
+    "setup.js": "setup.68ccb14d.js",
+    "start.ir": "start.afd46da4.ir",
+    "start.js": "start.1c119cfc.js",
+    "status.ir": "status.0a37de68.ir",
+    "status.js": "status.8170c885.js",
+    "studio.css": "studio.53dd4c65.css"
   },
   "routes": {
     "/start": {
       "js": [
-        "start.26bf616e.js"
+        "start.1c119cfc.js"
       ],
       "css": [
-        "studio.56142be1.css"
+        "studio.53dd4c65.css"
       ],
       "fonts": [],
-      "total_size_br": 39592,
+      "total_size_br": 40271,
       "budget_warn_threshold": 200000,
-      "ir": "start.2493b585.ir"
+      "ir": "start.afd46da4.ir"
     },
     "/": {
       "js": [
-        "status.f7a44552.js"
+        "status.8170c885.js"
       ],
       "css": [
-        "studio.56142be1.css"
+        "studio.53dd4c65.css"
       ],
       "fonts": [],
-      "total_size_br": 38719,
+      "total_size_br": 39338,
       "budget_warn_threshold": 200000,
-      "ir": "status.7ff62708.ir"
+      "ir": "status.0a37de68.ir"
     },
     "/map": {
       "js": [
-        "map.17a81dad.js"
+        "map.6e4a7bfd.js"
       ],
       "css": [
-        "studio.56142be1.css"
+        "studio.53dd4c65.css"
       ],
       "fonts": [],
-      "total_size_br": 63787,
+      "total_size_br": 64758,
       "budget_warn_threshold": 200000,
-      "ir": "map.7d173eb8.ir"
+      "ir": "map.2cc55cf6.ir"
     },
     "/check": {
       "js": [
-        "check.f7359148.js"
+        "check.83278503.js"
       ],
       "css": [
-        "studio.56142be1.css"
+        "studio.53dd4c65.css"
       ],
       "fonts": [],
-      "total_size_br": 38011,
+      "total_size_br": 39384,
       "budget_warn_threshold": 200000,
-      "ir": "check.65f0e962.ir"
+      "ir": "check.d94030d6.ir"
     },
     "/pads": {
       "js": [
-        "pads.a1ccf0c2.js"
+        "pads.07037a19.js"
       ],
       "css": [
-        "studio.56142be1.css"
+        "studio.53dd4c65.css"
       ],
       "fonts": [],
-      "total_size_br": 38896,
+      "total_size_br": 39530,
       "budget_warn_threshold": 200000,
-      "ir": "pads.f1251924.ir"
+      "ir": "pads.bc0593fd.ir"
     },
     "/devices": {
       "js": [
-        "devices.f28f8867.js"
+        "devices.000c34a6.js"
       ],
       "css": [
-        "studio.56142be1.css"
+        "studio.53dd4c65.css"
       ],
       "fonts": [],
-      "total_size_br": 39740,
+      "total_size_br": 40350,
       "budget_warn_threshold": 200000,
-      "ir": "devices.d4adb97e.ir"
+      "ir": "devices.6f3ec2f5.ir"
     },
     "/profiles": {
       "js": [
-        "profiles.5d951e39.js"
+        "profiles.cb32feda.js"
       ],
       "css": [
-        "studio.56142be1.css"
+        "studio.53dd4c65.css"
       ],
       "fonts": [],
-      "total_size_br": 39181,
+      "total_size_br": 40190,
       "budget_warn_threshold": 200000,
-      "ir": "profiles.8873fdff.ir"
+      "ir": "profiles.e6a90697.ir"
     },
     "/setup": {
       "js": [
-        "setup.647022a2.js"
+        "setup.68ccb14d.js"
       ],
       "css": [
-        "studio.56142be1.css"
+        "studio.53dd4c65.css"
       ],
       "fonts": [],
-      "total_size_br": 39501,
+      "total_size_br": 40122,
       "budget_warn_threshold": 200000,
-      "ir": "setup.ce0c4b25.ir"
+      "ir": "setup.8394a720.ir"
     }
   }
 }

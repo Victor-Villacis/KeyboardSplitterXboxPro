@@ -1,9 +1,11 @@
 # Cabinet Gates — supervised runbooks
 
-Two milestones end with Victor physically at the cabinet. These are the scripts
-for those sessions: exact commands, what each one should print, and what to do
-the moment one of them doesn't. A session walking Victor through a gate should
-follow these top to bottom and never improvise past a failed step.
+Four release gates require a person at a real Windows machine. The first three
+close cabinet milestones; the fourth proves that the artifact CI built is a
+product a new customer can install and use. These are the scripts for those
+sessions: exact actions, what each one should show, and what to do the moment
+one of them does not. A session walking Victor through a gate should follow it
+top to bottom and never improvise past a failed step.
 
 - **GATE 1 — "M5 rest"**: autostart at boot, the tray daemon, and the frontend
   wrapper. Software-only; Interception semantics; every failure is recoverable
@@ -11,8 +13,12 @@ follow these top to bottom and never improvise past a failed step.
 - **GATE 2 — "M6 WinUSB rebind"**: the first time ksx changes what a device *is*
   to Windows. Read the preconditions twice. The whole gate is a round trip —
   claim, verify, release — and the machine ends it exactly as it started.
+- **GATE 3 — "closing the books"**: one real four-player latency run, the
+  frontend wrapper, deliberate Interception removal, and the fourteen-day soak.
+- **GATE 4 — "fresh customer"**: the exact CI installer, a clean Windows user,
+  and the complete launcher-to-Game-Bar journey with no terminal or TOML.
 
-## Shared rules (both gates)
+## Shared rules (cabinet gates 1–3)
 
 - **conhost, not Windows Terminal.** Windows Terminal 1.24/1.25 fail-fasts when
   virtual pads send input — even as a background window — taking every tab with
@@ -553,6 +559,232 @@ almost always "the daemon is not running" (`RECOVERY.md` §2, first table).
 
 ---
 
+# GATE 4 — fresh customer: exact installer to a working controller
+
+This is the product gate, not another source-code gate. It starts with the
+`setup.exe` produced by CI and a Windows user who has never run ksx. The person
+walking the journey does not open a terminal, edit TOML, paste a device path or
+receive whispered instructions. The observer may collect hashes, process-owner
+evidence and before/after file state, but none of that may become a step the
+customer has to perform.
+
+**STATUS: NOT RUN. Nothing below is a claim that this gate passed.**
+
+## What software tests prove — and what they do not
+
+The repository tests prove the contracts in isolation: CI builds `ksx.exe` and
+the GUI-subsystem `ksx-launcher.exe` before ISCC packages them; installer tests
+pin the shortcuts, their absence of arguments and the driver task; launcher
+tests pin the sibling `ksx.exe open` plan and `CREATE_NO_WINDOW`; daemon tests
+admit an empty implicit setup as an idle control host; API and HTTP tests cover
+staged bindings, macros, Play-before-Save and profile create/update/delete/switch;
+template and Studio tests pin the two default Guide keys and the direct Game Bar
+Settings link.
+
+Those tests cannot prove that UAC returned to the original user, no console
+flashed, the bundled driver installed on a clean machine, Windows exposed a
+real virtual pad, a game consumed it, or Game Bar opened. This gate proves those
+claims. A clean CI run or a compiled installer is necessary evidence, never a
+substitute for this run.
+
+## Preconditions — preserve the customer conditions
+
+- Use the **exact CI-built installer** intended for release, not a local Inno
+  build and not loose binaries. Before running it, record below its file name,
+  product version, source commit and published SHA-256; independently hash the
+  downloaded file and require an exact match.
+- Use a supported, fully updated Windows 10/11 physical machine or a disposable
+  clean Windows image that can expose ViGEmBus controllers to the host gaming
+  stack. ViGEmBus must be absent before the run. If it is already installed,
+  this is not a first-driver-install test; restore a clean snapshot or use a
+  different safe machine.
+- Create a fresh **standard** local Windows user. `%APPDATA%\ksx` and
+  `%LOCALAPPDATA%\ksx` must not exist for that user. Have a different
+  administrator account available for the installer UAC prompt; using the same
+  account does not test `runasoriginaluser`.
+- Plug in two known, visibly distinguishable keyboards and call them **Keyboard
+  A** and **Keyboard B** in the run log. Keyboard B must have a numpad: Phase 4
+  uses the pair to prove an explicit profile-device refresh changed slot device
+  values, and Phase 5 uses B's Numpad `*` Guide binding. Have a known game that
+  reads XInput and Windows' Game Controllers panel available. Xbox Game Bar must be
+  installed and allowed by policy for this user; its controller setting starts
+  disabled so the on-screen prerequisite and remedy are exercised.
+- Screen-record from before the installer Finish button through the first
+  `/start` paint if possible. A two-second console flash is a failure that a
+  screenshot taken afterward cannot capture.
+- The observer records the pre-run controller list, process list and ksx file
+  state. These are observations, not instructions shown to the test user.
+
+**ABORT before install if:** the installer hash/version/commit do not agree with
+the release candidate; the Windows user is not fresh; ViGEmBus is already
+present; or the UAC test would require using the customer's own standard-user
+credentials as the administrator.
+
+## Phase 1 — install the artifact, including the driver
+
+1. While signed in as the fresh standard user, double-click the downloaded
+   installer. Supply the separate administrator's credentials at UAC.
+2. Confirm **Install the ViGEmBus controller driver** is visible and ticked by
+   default. Leave it ticked. Confirm the desktop-icon task is selected.
+3. Complete setup without launching a shell. The installer may continue if its
+   driver child fails by design, but **this gate may not**: inspect the wizard's
+   result and `{app}\install-drivers.log`, and require a successful ViGEmBus
+   install. Record the installed driver version.
+4. Confirm Apps & Features shows the expected ksx product version and the
+   install directory contains the release-candidate `ksx.exe`,
+   `ksx-launcher.exe` and sealed driver bundle.
+5. Confirm there is exactly one **ksx** entry in the Start menu and the default
+   desktop icon. Both shortcuts must target `ksx-launcher.exe` with no arguments;
+   there must be no customer entries for daemon, Studio, cabinet, doctor or a
+   setup wizard.
+
+**PASS Phase 1:** the exact artifact is installed, the bundled ViGEmBus step is
+successful and recorded, and every visible customer shortcut has the single
+launcher target. A successful app install with a failed/declined driver is a
+useful supported state, but it does not pass this release gate.
+
+## Phase 2 — Finish hands back to the right user and boots idle
+
+1. Leave **Launch ksx** ticked on Finish and click Finish. Watch the whole
+   handoff. **No console window may appear, even briefly.**
+2. The customer gets one chrome-less ksx app window at `/start`, not a terminal,
+   the status dashboard or a normal browser tab. It has no address bar and does
+   not ask the user to choose a URL.
+3. In Task Manager's **User name** and **Command line** columns, confirm both
+   surviving `ksx.exe` children — `daemon` and `studio --port 4460` — belong to
+   the fresh standard user, not the administrator whose credentials satisfied
+   UAC. Confirm the browser profile was created below that user's
+   `%LOCALAPPDATA%\ksx`, not the administrator's profile.
+4. With no `[[slot]]` configured, `/start` must report the daemon reachable and
+   idle. The process stays alive as the staging control host, while no keyboard
+   is captured and no virtual controller exists. The keyboard still types and
+   Game Controllers shows zero ksx pads.
+5. Open the tray menu. **Open ksx** remains available; **Open cabinet UI** and
+   **Start emulation** are visibly disabled because there is no saved setup for
+   either to operate. Neither disabled item may create a window, capture a key
+   or plug a pad.
+6. Close the app window, use the desktop shortcut once and the single Start-menu
+   entry once. Each opens `/start` without a console flash; neither creates a
+   second customer-facing product entry or asks for elevation.
+
+**PASS Phase 2:** the elevated installer has handed off to the original
+standard user, every launch is console-free, and an empty configuration is a
+healthy idle first-run state rather than a daemon startup refusal.
+
+## Phase 3 — author in memory, Play before Save, then prove Save parity
+
+1. On `/start`, choose Keyboard A by its human-readable name. Add two Xbox 360
+   controllers using the in-box two-player keyboard layout. Do not click Save.
+2. Open each staged controller's mapper. Change one ordinary binding and create
+   a small, visibly testable macro plus its trigger. Return to `/start` and
+   answer **split or freeze**. Change one choice and change it back once: looking
+   and reconsidering must remain free.
+3. The observer compares `config.toml`, the preset directory and backups with
+   the pre-run state. Staging bindings and macros must have written none of
+   them. A refusal, if deliberately exercised with a duplicate key, must leave
+   the staged view unchanged.
+4. Click **Play now** without ever clicking Save. Two controllers must appear.
+   In Game Controllers and the known game, verify the changed binding and macro
+   exactly match what the staged mapper showed. Confirm no config, preset or
+   backup was created by Play.
+5. Stop the session from Studio. Click **Save this setup** once, close ksx, and
+   launch it again from the customer shortcut. Start the saved setup and verify
+   the same devices, personas, binding, macro and split/freeze choice. Saving is
+   now allowed to create the config/preset files; restarting must not translate
+   them into different behavior.
+
+**PASS Phase 3:** staged editing and Play were memory-only, the staged mapper
+was the behavior that ran, and the first explicit Save survives a complete
+stop/relaunch with identical output.
+
+## Phase 4 — profile create, switch, edit, refresh and delete in Studio
+
+1. From `/profiles`, create a profile for the known game, select the saved
+   **controller layout** and choose two players. Do not open TOML or a terminal.
+   Immediately switch to that profile and start it: a Studio-created profile
+   must be runnable because its slots inherited the working base device
+   selectors.
+2. Edit that profile's title, program/game link or arguments, player count and
+   controller layout through the visible form. Leave **Use the device choices
+   currently saved in Setup** unchecked. Save, reopen the editor and start it
+   again; the existing Keyboard A selectors must have been preserved.
+3. Stop the session. Return to `/start`, choose **Start over**, select Keyboard
+   B, and stage the same two controllers, layout and split/freeze answer. Repeat
+   the deliberately changed binding and macro from Phase 3 before Save so this
+   device-only test does not replace the behavior already proved. Click **Save
+   this setup**. The observer now uses `/setup`'s **Export — download this
+   configuration** control and keeps the JSON as `before-rebase`; this is
+   technical evidence, not a document the customer has to read or edit. Require
+   the base slots to name Keyboard B while the target profile still names
+   Keyboard A.
+4. Reopen the profile editor, change no ordinary field, tick **Use the device
+   choices currently saved in Setup**, and save. The observer exports again as
+   `after-rebase` and compares the two documents. In exactly the target profile,
+   each slot's `keyboard`/`mouse` selectors must now match the corresponding
+   Keyboard B base slot. Its `persona`, `socd`, `macros` and controller-layout
+   (`preset`) values must be byte-for-byte unchanged, as must every unrelated
+   profile. A success flash or unchanged visible row is not evidence for this
+   step; the exported before/after values are.
+5. Delete the renamed profile using its confirmation. Exactly that profile
+   disappears; unrelated profiles and the selected controller layout remain.
+   Refresh the page and restart ksx once to prove the result was not only
+   browser state.
+
+**PASS Phase 4:** create → switch/play → edit → explicit device refresh → delete
+is complete in Studio, with no config-file editing or CLI remedy. The two
+exports prove creation/preservation/refresh semantics rather than asking the
+normal profile row to expose device-selector jargon.
+
+## Phase 5 — real pad output and the Game Bar prerequisite
+
+1. Return to `/start` and use **Open Windows Game Bar settings**. It must open
+   `ms-settings:gaming-gamebar` directly. Confirm ksx did not silently change
+   the preference, then enable **Allow your controller to open Game Bar** for
+   this user.
+2. Play the saved two-controller setup on Keyboard B. Confirm both virtual
+   controllers move in Game Controllers and the known XInput game, not only on
+   ksx's own status page.
+3. Press Player 1's default **Left Windows = Guide** key and observe Game Bar
+   open from the virtual controller. Close it. Press Player 2's default
+   **Numpad `*` = Guide** key and observe it open again. Seeing the mapping in
+   Studio or a unit test is not this proof; Windows must display Game Bar twice.
+4. Stop the session. Both pads disappear, the keyboard types normally, there
+   are no ghost controllers, and ksx can be closed and relaunched without a
+   console or elevation prompt.
+
+**PASS Phase 5:** Windows and a real game consume the virtual pads, both default
+Guide keys reach Game Bar after the user enables its prerequisite, and cleanup
+returns the machine to an idle, typing state.
+
+## GATE 4 PASS criteria
+
+Every phase above passes against one recorded installer SHA and version. There
+is no partial pass for “source tests were green,” “the installer compiled,” “one
+pad appeared,” or “the Game Bar mapping exists.” Any failure stays in the run
+log with the last known clean state; fix it, produce a new CI artifact with a
+new hash, and restart this gate from Phase 1.
+
+## GATE 4 RUN LOG
+
+**STATUS: NOT RUN.** Fill every field during the supervised run:
+
+- Installer file / product version / source commit / published SHA-256:
+- Independently measured SHA-256:
+- Windows edition + build / test-user type / separate admin used:
+- Keyboard A / Keyboard B human names and exported slot device values:
+- ViGEmBus before / installed version / `{app}\install-drivers.log` result:
+- Start + desktop shortcut targets / extra customer shortcuts:
+- Original-user process + browser-profile evidence / console-flash result:
+- Empty-config idle `/start` / capture state / initial pad count:
+- Staged binding + macro / before-Play disk comparison / Play result:
+- Save + full restart parity:
+- Profile create/switch/edit/rebase/delete + before/after export result:
+- Real game + Player 1 Left Windows Guide + Player 2 Numpad `*` Guide:
+- Stop/cleanup result:
+- **Verdict: NOT RUN**
+
+---
+
 # GATE 1 RUN LOG — 2026-08-05 (Victor + session)
 
 **Phase A — PASSED.** Tray lifecycle clean: idle tooltip, Start → 4 X360 pads
@@ -591,6 +823,11 @@ pre-gate months of boots with no task.
 completion pass when the 5big returns is listed above.
 
 # GATE 2 PAUSE — 2026-08-05
+
+> **Historical snapshot, superseded as current state.** This pause records what
+> was true on 2026-08-05 before the later Gate 2 activity summarized in Gate 3's
+> “State going in” paragraph (2026-08-08). It is preserved as evidence, does not
+> mean the machine is still untouched, and is not a Gate 2 PASS log.
 
 Paused by Victor before any system change. State: preconditions surveyed only —
 baseline saved to `%APPDATA%\ksx\winusb-before.json`, dry-run reviewed (INF

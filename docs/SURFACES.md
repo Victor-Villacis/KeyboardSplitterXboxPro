@@ -164,10 +164,11 @@ surface does a human perform this task on*, and that is answered by the matrix.
 |---|---|---|---|
 | First run: stage a setup, save or play | planned (`ksx stage`) | — | **primary** |
 | Author presets / key mappings | owns | — | **primary** |
-| Edit config, profiles | owns | slot→preset only | **primary** |
+| Edit configuration | owns | slot→preset only | **primary** |
+| Create / update / delete profiles | planned | view | **primary** |
 | Device pick / remove | owns | planned | **primary** |
 | WinUSB claim / release | owns | planned | never (needs elevation) |
-| "Press a button, see it light" | input only (`ksx monitor`) | **primary** | planned (§8) |
+| "Press a button, see it light" | input only (`ksx monitor`) | **primary** | view (§8) |
 | Is it working: pads, drivers | owns | **primary** | view |
 | Spawn test pads / prune the bus | owns | — | **primary** (§3a) |
 | Start / stop / switch profile | owns | **primary** | convenience |
@@ -181,7 +182,7 @@ cost an audit to catch.
 
 Four cells were corrected, each against the code:
 
-- **Edit config — egui.** Was "—". The egui *does* write config: the Presets
+- **Edit configuration — egui.** Was "—". The egui *does* write config: the Presets
   screen builds an `Ask::Assign`, which becomes a `SlotAssignRequest` that
   rewrites a `[[slot]]`'s preset. It also decides **which file** the write lands
   in (`config.toml` or a `games.toml` profile) in `assign_destination`, whose
@@ -189,7 +190,7 @@ Four cells were corrected, each against the code:
   decision caused. That is a targeting decision taken in a surface; it is the
   strongest live counter-example to §1 in the tree, and it stays until the
   destination rule moves behind the verb.
-- **Edit config — Studio.** *Superseded 2026-08-08; see below.* Was
+- **Edit configuration — Studio.** *Superseded 2026-08-08; see below.* Was
   "**primary**". At the audit no Studio route wrote `config.toml` or
   `games.toml`; the only config-adjacent route re-read. Every `/map/*` write
   went to a preset file. `AppState` held no `MachineSource`, and `ControlSource`
@@ -213,12 +214,16 @@ Two more were corrected on 2026-08-08, and this time by the guard rather than
 by a person reading the table — both in the direction that is cheaper to make
 and harder to notice, a face that SHIPPED while the cell still said `planned`:
 
-- **Edit config — Studio.** Was "planned primary". `/setup` and `/profiles`
-  have since shipped and the plan is the surface: `/setup/import` rewrites the
-  whole config root, `/setup/slot` posts the same `ControlSource::assign_slot`
-  that `ksx slot assign` performs, and `/profiles/new` writes a games.toml
-  profile through `MachineSource::profile_new`. **primary**, which is where the
-  bullet above already said it belonged.
+- **Edit configuration — Studio.** Was "planned primary". `/setup` has since
+  shipped and the plan is the surface: `/setup/import` rewrites the whole
+  config root and `/setup/slot` posts the same `ControlSource::assign_slot`
+  that `ksx slot assign` performs. **primary**, which is where the bullet above
+  already said it belonged.
+- **Profile management — Studio.** `/profiles` now creates, updates and deletes
+  saved game profiles through typed `MachineSource` verbs, and switches through
+  the existing control verb. The CLI CRUD half is explicitly planned rather
+  than hidden inside a broader "owns" claim; the cabinet list remains a view
+  and its operating switch belongs to the start/stop row below.
 - **Device pick / remove — Studio.** Was "planned (#22)"; #22 shipped
   `/devices`, `/devices/pick` and `/devices/remove`. The egui half stays planned
   and drops the issue number, because #22 was never about the cabinet — its five
@@ -239,18 +244,20 @@ four `stage*` pipe verbs, and Studio's `/start` performing all of them. What
 does not: any way to stage a setup from a terminal. The four verbs are on the
 control pipe, so the CLI half is a driver over `ControlSource`, not new logic.
 
-**Moment 6 is half here, and the half that is missing is named.** A staged
-controller gets its bindings from a SERVED in-box layout
-(`StageEdit::SetLayout` → `StagedSetup::set_bindings`, offered at
-`/start/controller/layout`), which is why `commit()` can require a slot to bind
-something before it will save or play one. What is *not* built is per-key
-editing of a staged slot: the mapper is a preset-FILE editor, so mapping a
-button there does not change what `/start`'s Play starts. The page says so
-beside the link (`snapshot.rs`'s `MAPPER_LINE`) rather than leaving it to be
-discovered. The finished shape is `/map` able to open a staged slot and hand
-back — one target field on the mapper's existing writes, not a second mapper:
-`docs/MAPPER-UX.md` describes ~23k lines of finished UX and duplicating it is
-the worst outcome available.
+**Moment 6 is implemented without a second mapper.** A staged controller can
+start from a served layout, then `/map?target=stage&slot=N` opens the existing
+button/chord/turbo/macro authoring UI against the slot's optional full
+`PresetFile` snapshot. `staged_bind_edit` and `staged_macro_edit` prepare pure
+edits, validate cross-stage conflicts and apply one `StageEdit::SetBindings`
+only after acceptance. Refusal leaves the stage unchanged; force has the same
+explicit conflict meaning as the saved mapper. No staged GET/edit touches disk,
+takes a backup or claims a config reload. Save and Play remain separate.
+
+The daemon's empty-default startup is part of this row too: it stays alive as
+an idle staging/control host with no session, capture, claim or pads. Explicit
+empty game profiles and other plan failures still refuse. The terminal driver
+`ksx stage` remains planned; it must call this same control contract rather
+than growing a second staging implementation.
 
 **This row is also why the guard's bookkeeping changed.** It used to require
 every CLI anchor to exist in the clap tree, whatever its cell said — which is
@@ -375,16 +382,30 @@ button check), `/pads` (the ViGEm bus and its two verbs), `/devices` (the
 picker), `/profiles` (profiles & presets) and `/setup` (the configuration).
 
 `/start` and `/setup` are the two that look like each other and are not, and
-the difference is a contract rather than a layout. **Every `/setup` step reads
-`config.toml` and writes to it** (§9 flow 1: "each reads the config as it
-stands and writes one complete thing"). **`/start` reads no config and writes
-no file at all** until the button marked Save — it drives
-`ksx_core::StagedSetup`, which is held in the daemon for the length of a visit
-and has no path to a file (`FIRST-RUN.md` §2). Rebuilding `/setup` around a
-staged value was the alternative and it was rejected: one screen holding both
-rules is a screen where a user cannot tell which controls commit, which is the
-confusion staging exists to remove. Two pages, and the flash after Save is
-where the first becomes the second.
+the difference is a contract rather than a layout. **`/setup` is the
+disk-backed maintenance checklist**, but not every control on it is a write:
+the board step links to `/devices`, slot assignment performs one saved-config
+write, the proof step only operates the daemon learner, Export is a read, and
+Import is a dry run unless its consent box is ticked. A write that does happen
+is a complete backend act rather than a half-written wizard step.
+
+**`/start` does not use the saved config as its draft.** It drives
+`ksx_core::StagedSetup`, held in the daemon for the length of a visit and with
+no path to a file (`FIRST-RUN.md` §2). Its staged choices and accepted mapper
+edits remain in memory; Play starts that value without saving; only the button
+marked Save crosses the disk boundary. Rebuilding `/setup` around a staged
+value was the alternative and it was rejected: one screen holding both rules
+is a screen where a user cannot tell which controls commit, which is the
+confusion staging exists to remove. Two pages, with Save as the explicit
+boundary between an in-memory proposal and a disk-backed configuration.
+
+`/start` also links every staged controller into the full `/map?target=stage`
+authoring path. `/profiles` owns customer-facing create/update/delete/switch:
+new profiles inherit matching saved base devices and controller behavior;
+updates preserve profile-specific devices by default (or explicitly refresh
+keyboard/mouse selectors); the selected layout applies to every resulting
+player; delete removes exactly one profile and keeps layouts. Update/delete
+use backups and stale-write guards in the backend.
 
 `/check` is the one page that performs no verb at all, and the one fed by a
 channel that is not the control pipe: `GET /api/live` is Server-Sent Events
@@ -400,13 +421,15 @@ layer over the router rather than a check per handler, because "the mapper
 alone grew eight form endpoints in three milestones" and the failure mode
 being prevented is forgetting one.
 
-`/setup` is where the config itself lives, and it has exactly **two verbs**:
-Export downloads the whole root as one JSON document, Import pastes one back
-(dry run unless the write box is ticked — `ksx config import`'s consent shape,
-unchanged). Neither takes a path: `MachineSource::config_export|config_import`
-are in-memory on purpose, because a person who asked a page for their
-configuration should not be handed a directory to go and find. A config root
-appears on that page once, in small print, for a bug report to quote.
+For the **whole config root**, `/setup` has exactly two verbs: Export downloads
+it as one JSON document, and Import pastes one back (dry run unless the write
+box is ticked — `ksx config import`'s consent shape, unchanged). Neither takes
+a path: `MachineSource::config_export|config_import` are in-memory on purpose,
+because a person who asked a page for their configuration should not be handed
+a directory to go and find. These are not the page's only actions: the
+checklist also reaches slot assignment and the learner's prove/cancel pair, and
+its board step links to `/devices`. A config root appears on that page once, in
+small print, for a bug report to quote.
 
 `/map` is good enough to stop treating as supplemental tooling. Authoring a
 25-binding preset is a pointer-and-keyboard task and the browser is simply
@@ -418,7 +441,13 @@ only way to start a session, a cabinet in attract mode would need a web server,
 a free port and a browser running before anyone could play. That is a worse
 appliance than the one that exists now.
 
-## §6 Launching goes egui → Studio, never the reverse
+## §6 Product launch and cabinet-to-Studio navigation
+
+Windows customer launch is `ksx-launcher.exe` → sibling `ksx.exe open` → an
+idle or configured daemon → Studio `/start`. The launcher is a GUI-subsystem
+handoff used by the installer and customer shortcuts, not another surface.
+The empty-config daemon owns the control pipe/tray while doing no emulation
+work, which is what makes first-run staging reachable.
 
 The cabinet app has an "Open Studio" action. That direction is correct: the
 process already running at the machine can open the workbench.
@@ -437,9 +466,11 @@ the direction that works.
 
 **A LAN bind is not the same class of problem as a Node dev server on a laptop.**
 That comparison is tempting and wrong. A dev server serves files nobody attacks;
-Studio can **start and stop input capture, claim and release USB devices, and
-rewrite config**. A home network is not a trust boundary — a guest phone, a smart
-TV or a compromised IoT device is on the same WiFi.
+Studio can **start and stop input capture, stream per-key activity, create test
+pads and rewrite config**. It deliberately cannot claim or release a USB device
+— those elevated acts remain CLI-only — but the capabilities it does expose are
+already sensitive. A home network is not a trust boundary: a guest phone, a
+smart TV or a compromised IoT device is on the same WiFi.
 
 So LAN access is: bind beyond loopback, require a token, reject anything
 unauthenticated. Two consequences worth writing down before the work starts:
@@ -502,46 +533,56 @@ output.** Breakpoints and media queries therefore already fire on phones;
 what they fire *against* is layouts nobody has tuned, which is the actual
 work (task #24).
 
-**ButtonCheck is not on Studio to be made responsive.** There is no live-input
-channel in `ksx-studio` at all — no feed on `AppState`, no frame type, no
-handler. The strongest argument in this section therefore rests on a capability
-that exists only in the egui, and the first step is a backend-to-surface wiring
-job, not a CSS pass. §2's build order already says which comes first.
+**The missing Studio live channel was real at the audit and is now closed.** At
+that point there was no feed on `AppState`, no frame type and no handler, so the
+phone argument rested on an egui-only capability. Today `/check` gets its
+control roster from the ordinary snapshot and lights it from `GET /api/live`,
+an SSE bridge over the daemon's outbound feed pipe (§5). The matrix therefore
+calls Studio a `view`, not `planned`: it renders live backend state and performs
+no decision or write.
 
-Order follows that: the live feed, then a responsive pass on `/` and status,
-`/map` last. Mapping asks you to press the key it is capturing, which a phone
-cannot do for a desk keyboard — so it is the least valuable page on the
-smallest screen.
+What remains is the responsive pass itself: tune `/check` first for the behind-
+the-cabinet phone use case, then `/` and status, with `/map` last. Mapping asks
+you to press the key it is capturing, which a phone cannot do for a desk
+keyboard, so it is the least valuable page on the smallest screen.
 
 ## §9 User flows worth writing down
 
-Four journeys carry nearly all the product's surface area:
+Five journeys carry nearly all the product's surface area:
 
-1. **First-time setup** — no config: find the board, name it, claim it, wire a
-   slot, prove a button lights. Since 2026-08-08 this is **two** journeys on
-   two pages, and which one a person is on is decided by whether they have ever
-   run ksx.
+1. **First-time setup and later repair** — two related journeys on two pages,
+   not an automatic history-based fork. `ksx open` always lands on `/start`;
+   someone maintaining a saved configuration deliberately chooses `/setup`.
+   Neither browser journey claims a board: `/devices` can name and pick one for
+   config, and only prints the separately confirmed CLI support command for a
+   WinUSB claim.
 
    **Studio's `/start`** is the download-to-gaming path (`docs/FIRST-RUN.md`
    moments 4–7): pick a keyboard from a list nobody had to ask for, pick what it
-   should become, answer split-or-freeze, then save or play. It reads no config
-   and writes no file until Save, because the person walking it has not decided
-   anything yet and must not be punished for exploring. Its whole state is one
-   `ksx_core::StagedSetup` in the daemon.
+   should become, map buttons/chords/turbo/macros in the reused mapper, answer
+   split-or-freeze, then save or play. It reads the live device/pad state and
+   available controller layouts, but it does not seed the proposal from
+   `config.toml` and writes no file until Save. The person walking it has not
+   decided anything yet and must not be punished for exploring. Play can happen
+   without Save. Its whole draft is one `ksx_core::StagedSetup` in the idle
+   daemon/control host. The final Guide instruction is conditional on Windows'
+   controller-to-Game-Bar setting and links directly to that Settings page.
 
    **Studio's `/setup`** (§5) is the same territory for someone who already has
-   a configuration: the checklist is
-   decided in the backend (`ksx-backend::onboard::plan_steps`, pure) and rendered,
-   never re-derived per surface; each step is one backend verb, and the board
-   step LINKS to the devices screen instead of duplicating it. Every step is
-   resumable because none of them is a wizard step: each reads the config as it
-   stands and writes one complete thing, so an abandoned run leaves a valid
-   config rather than a half-written one.
+   a configuration: the checklist is decided in the backend
+   (`ksx-backend::onboard::plan_steps`, pure) and rendered, never re-derived per
+   surface. The board step LINKS to the devices screen instead of duplicating
+   it; slot assignment is one complete saved-config act; the proof step uses the
+   learner and writes nothing. Because there is no multi-step pending wizard
+   transaction, an abandoned run leaves the last complete config valid.
 2. **Change a mapping** — running cabinet, one binding is wrong.
 3. **"It doesn't work"** — the diagnostic path, which must terminate in a cause
    and not a shrug.
 4. **Start a session** — the everyday path, and the one that must never need a
    keyboard.
+5. **Manage saved games** — create, repair, rename or delete a profile and
+   switch to it entirely in Studio. Program paths are edited in the profile
+   disclosure; no TOML or CLI is part of the customer flow.
 
 Each should name the surface it happens on. Where a flow crosses surfaces, that
 crossing is a design smell worth a second look.
@@ -586,17 +627,11 @@ crossing is a design smell worth a second look.
 - **Device pick UI** — Studio, following the existing CLI verb (§3). Also the
   egui: §3 row 3 no longer claims a view exists there. `/setup`'s first step
   links to `/devices` rather than growing a second picker.
-- **`ksx games new` — the CLI half of profile creation, owed.** Studio's
-  `/profiles` page creates a games.toml profile through
-  `MachineSource::profile_new` over a pure plan in `ksx-backend`'s `profile_edit`
-  — but there is no CLI verb for it, so §2's build order ran 1 → 3 with 2
-  skipped. That is backwards and it shows: `profile_edit` is gated
-  `#[cfg(any(feature = "studio", feature = "cabinet"))]` because Studio is its
-  only caller, which is a backend module whose existence depends on a UI
-  feature flag. `plan_new` / `apply_new` are pure and already carry the
-  refusals; the CLI verb is a thin driver over them, and it removes the gate.
-  Until then §3's "Edit config, profiles | CLI owns" row is aspirational for
-  the CREATE half.
+- **`ksx games new|update|delete` — the CLI half of profile CRUD, owed.**
+  Studio's `/profiles` page calls typed `MachineSource` verbs over pure
+  plan/apply pairs in `ksx-backend::profile_edit`; the CLI row is now honestly
+  `planned` instead of hiding that absence inside configuration verbs. A future
+  CLI is a thin driver over these same planners, not new profile logic.
 - **Cabinet slot list scrolling** — egui, operating surface, still broken above
   four slots. The body *is* inside a `ScrollArea`; what is missing is any
   scroll-to-focus call, so the joystick can move the cursor to a row that is
